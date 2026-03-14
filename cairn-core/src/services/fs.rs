@@ -1,0 +1,229 @@
+//! File system service for I/O operations.
+//!
+//! Abstracts filesystem access to enable testing without real files.
+
+use std::path::Path;
+
+#[cfg(any(test, feature = "test-utils"))]
+use mockall::automock;
+
+/// Trait for file system operations.
+///
+/// This abstraction allows tests to mock file operations
+/// without touching the real filesystem.
+#[cfg_attr(any(test, feature = "test-utils"), automock)]
+pub trait FileSystem: Send + Sync {
+    /// Check if a path exists.
+    fn exists(&self, path: &Path) -> bool;
+
+    /// Create a directory and all parent directories.
+    fn create_dir_all(&self, path: &Path) -> Result<(), String>;
+
+    /// Read file contents as bytes.
+    fn read(&self, path: &Path) -> Result<Vec<u8>, String>;
+
+    /// Read file contents as string.
+    fn read_to_string(&self, path: &Path) -> Result<String, String>;
+
+    /// Write bytes to a file, creating it if needed.
+    fn write(&self, path: &Path, contents: &[u8]) -> Result<(), String>;
+
+    /// Write string to a file, creating it if needed.
+    fn write_str(&self, path: &Path, contents: &str) -> Result<(), String>;
+
+    /// Remove a file.
+    fn remove_file(&self, path: &Path) -> Result<(), String>;
+
+    /// Remove a directory and all its contents.
+    fn remove_dir_all(&self, path: &Path) -> Result<(), String>;
+
+    /// Copy a file from one location to another.
+    /// Creates parent directories of the destination if they don't exist.
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), String>;
+}
+
+/// Production filesystem implementation using std::fs.
+pub struct RealFileSystem;
+
+impl FileSystem for RealFileSystem {
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(path).map_err(|e| format!("Failed to create directory: {}", e))
+    }
+
+    fn read(&self, path: &Path) -> Result<Vec<u8>, String> {
+        std::fs::read(path).map_err(|e| format!("Failed to read file: {}", e))
+    }
+
+    fn read_to_string(&self, path: &Path) -> Result<String, String> {
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))
+    }
+
+    fn write(&self, path: &Path, contents: &[u8]) -> Result<(), String> {
+        std::fs::write(path, contents).map_err(|e| format!("Failed to write file: {}", e))
+    }
+
+    fn write_str(&self, path: &Path, contents: &str) -> Result<(), String> {
+        std::fs::write(path, contents).map_err(|e| format!("Failed to write file: {}", e))
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<(), String> {
+        std::fs::remove_file(path).map_err(|e| format!("Failed to remove file: {}", e))
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> Result<(), String> {
+        std::fs::remove_dir_all(path).map_err(|e| format!("Failed to remove directory: {}", e))
+    }
+
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<(), String> {
+        // Create parent directories if needed
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+        }
+        std::fs::copy(from, to).map_err(|e| format!("Failed to copy file: {}", e))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn real_fs_create_and_check_exists() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        let new_dir = temp.path().join("subdir");
+        assert!(!fs.exists(&new_dir));
+
+        fs.create_dir_all(&new_dir).unwrap();
+        assert!(fs.exists(&new_dir));
+    }
+
+    #[test]
+    fn real_fs_write_and_read() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        let file = temp.path().join("test.txt");
+        fs.write(&file, b"hello").unwrap();
+
+        let contents = fs.read(&file).unwrap();
+        assert_eq!(contents, b"hello");
+    }
+
+    #[test]
+    fn real_fs_write_str_and_read_to_string() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        let file = temp.path().join("test.txt");
+        fs.write_str(&file, "hello world").unwrap();
+
+        let contents = fs.read_to_string(&file).unwrap();
+        assert_eq!(contents, "hello world");
+    }
+
+    #[test]
+    fn real_fs_remove_file() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        let file = temp.path().join("test.txt");
+        fs.write_str(&file, "content").unwrap();
+        assert!(fs.exists(&file));
+
+        fs.remove_file(&file).unwrap();
+        assert!(!fs.exists(&file));
+    }
+
+    #[test]
+    fn real_fs_remove_dir_all() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        let dir = temp.path().join("mydir");
+        fs.create_dir_all(&dir.join("subdir")).unwrap();
+        fs.write_str(&dir.join("file.txt"), "content").unwrap();
+        assert!(fs.exists(&dir));
+
+        fs.remove_dir_all(&dir).unwrap();
+        assert!(!fs.exists(&dir));
+    }
+
+    #[test]
+    fn mock_fs_returns_configured_values() {
+        let mut mock = MockFileSystem::new();
+        mock.expect_exists().returning(|_| true);
+        mock.expect_read_to_string()
+            .returning(|_| Ok("mocked content".to_string()));
+
+        assert!(mock.exists(Path::new("/any/path")));
+        assert_eq!(
+            mock.read_to_string(Path::new("/file")).unwrap(),
+            "mocked content"
+        );
+    }
+
+    #[test]
+    fn real_fs_copy_file() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        // Create source file
+        let src = temp.path().join("source.txt");
+        fs.write_str(&src, "hello world").unwrap();
+
+        // Copy to destination
+        let dst = temp.path().join("dest.txt");
+        fs.copy_file(&src, &dst).unwrap();
+
+        // Verify contents
+        let contents = fs.read_to_string(&dst).unwrap();
+        assert_eq!(contents, "hello world");
+    }
+
+    #[test]
+    fn real_fs_copy_file_creates_parent_dirs() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        // Create source file
+        let src = temp.path().join("source.txt");
+        fs.write_str(&src, "content").unwrap();
+
+        // Copy to nested destination
+        let dst = temp.path().join("nested").join("subdir").join("dest.txt");
+        fs.copy_file(&src, &dst).unwrap();
+
+        // Verify file exists and has correct content
+        assert!(fs.exists(&dst));
+        let contents = fs.read_to_string(&dst).unwrap();
+        assert_eq!(contents, "content");
+    }
+
+    #[test]
+    fn real_fs_copy_file_overwrites_existing() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        // Create source and existing destination
+        let src = temp.path().join("source.txt");
+        fs.write_str(&src, "new content").unwrap();
+
+        let dst = temp.path().join("dest.txt");
+        fs.write_str(&dst, "old content").unwrap();
+
+        // Copy should overwrite
+        fs.copy_file(&src, &dst).unwrap();
+
+        let contents = fs.read_to_string(&dst).unwrap();
+        assert_eq!(contents, "new content");
+    }
+}
