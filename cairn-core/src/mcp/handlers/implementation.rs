@@ -2,14 +2,13 @@
 //!
 //! Handles: add_comment, return
 
-use crate::diesel_models::{NewComment, UpdateRunChangeset};
+use crate::diesel_models::NewComment;
 use crate::jobs::queries::{
     find_node_in_snapshot, get_node_name_for_job, get_task_parent_info, load_execution_snapshot,
 };
 use crate::mcp::types::{AddCommentPayload, McpCallbackRequest};
-use crate::models::RunStatus;
 use crate::orchestrator::Orchestrator;
-use crate::schema::{artifacts, comments, jobs, runs};
+use crate::schema::{artifacts, comments, jobs};
 use diesel::prelude::*;
 
 use super::{lookup_run, RunContext};
@@ -73,6 +72,16 @@ pub async fn handle_add_comment(orch: &Orchestrator, request: &McpCallbackReques
         return format!("Failed to insert comment: {}", e);
     }
 
+    orch.sync(crate::sync::SyncMessage::Comment(
+        crate::sync::SyncComment {
+            id: comment_id.clone(),
+            issue_id: issue_id.clone(),
+            content: payload.content.clone(),
+            source: Some("agent".to_string()),
+            created_at: Some(now as i64),
+        },
+    ));
+
     // Emit db-change event so frontend can refresh comments
     let _ = services.emitter.emit(
         "db-change",
@@ -83,8 +92,22 @@ pub async fn handle_add_comment(orch: &Orchestrator, request: &McpCallbackReques
 }
 
 /// Handle return tool call - submit final output and complete the job
+///
+/// ## Lifecycle Design
+///
+/// **Job status:** Deferred until after checkpoint resolution, then written via
+/// `transition_job`. This ensures:
+/// - State machine validation (Running→Complete, Running→Blocked, Running→Failed)
+/// - Failure cascade to downstream DAG jobs
+/// - Execution/issue status recomputation
+/// - `TriggerEvent::JobEnded` emission
+///
+/// **Run status:** NOT touched here. The run stays "running" until the reader
+/// thread processes the Result event and calls `transition_to_warm_state` →
+/// `transition_run(Idle)`. This makes the Running→Idle transition valid.
 pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    use crate::diesel_models::{NewArtifact, UpdateJobChangeset};
+    use crate::diesel_models::NewArtifact;
+    use crate::models::JobStatus;
 
     // The payload is the raw artifact output (already validated by cairn-mcp against schema)
     let payload = &request.payload;
@@ -97,17 +120,9 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
 
     let services = &orch.services;
 
-    // Collect data needed for DAG advancement and checkpoint execution outside the lock
-    let (
-        run_id,
-        job_id,
-        artifact_type,
-        artifact_uri,
-        execution_id,
-        checkpoint_info,
-        worktree_path,
-        is_blocked,
-    ) = {
+    // Phase 1: Inside db lock — store artifact, read checkpoint info, read execution context.
+    // Do NOT write job or run status here.
+    let (run_id, job_id, artifact_type, artifact_uri, checkpoint_info, worktree_path) = {
         let db_state = &orch.db;
 
         let mut conn = match db_state.conn.lock() {
@@ -127,7 +142,6 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
         // 1. Source node's own outputSchema.schemaType
         // 2. Downstream ActionNode's inputSchema.schemaType
         // 3. Downstream ArtifactNode's artifactType
-        // This matches the priority logic in find_downstream_artifact_schema() in job.rs
         let (artifact_type, output_name) =
             resolve_artifact_type_and_output(diesel_conn, &ctx.job_id, &ctx.job_type);
 
@@ -182,65 +196,29 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
             version
         );
 
+        // Sync the new artifact to cloud
+        orch.sync(crate::sync::SyncMessage::Artifact(
+            crate::sync::SyncArtifact {
+                id: artifact_id.clone(),
+                job_id: Some(ctx.job_id.clone()),
+                data: Some(data_json.clone()),
+                version: Some(version),
+                updated_at: Some(now as i64),
+            },
+        ));
+
         // Get checkpoint info to determine how to handle completion
         let checkpoint_info = get_checkpoint_info(diesel_conn, &ctx.job_id);
 
-        // Determine initial status based on checkpoint type:
-        // - approval/prompt: block immediately
-        // - programmatic: mark complete (will verify after lock release)
-        // - none: complete
-        let (initial_status, is_blocked) = match &checkpoint_info {
-            Some(info)
-                if info.checkpoint_type == "approval" || info.checkpoint_type == "prompt" =>
-            {
-                ("blocked", true)
-            }
-            _ => ("complete", false),
-        };
-
-        // Mark job with initial status
-        let job_update = UpdateJobChangeset {
-            status: Some(initial_status),
-            updated_at: Some(now),
-            completed_at: if is_blocked { None } else { Some(Some(now)) },
-            ..Default::default()
-        };
-
-        if let Err(e) = diesel::update(jobs::table.find(&ctx.job_id))
-            .set(&job_update)
-            .execute(diesel_conn)
-        {
-            log::error!("Failed to update job status: {}", e);
-        }
-
-        // Get execution_id and worktree for post-lock operations
-        let (execution_id, worktree_path): (Option<String>, Option<String>) = jobs::table
+        // Get worktree for programmatic checkpoint execution
+        let worktree_path: Option<String> = jobs::table
             .find(&ctx.job_id)
-            .select((jobs::execution_id, jobs::worktree_path))
+            .select(jobs::worktree_path)
             .first(diesel_conn)
             .ok()
-            .unwrap_or((None, None));
+            .flatten();
 
-        if is_blocked {
-            log::info!(
-                "Job {} blocked at checkpoint - awaiting approval",
-                ctx.job_id
-            );
-
-            // Update issue status to waiting(checkpoint) if this job has an issue
-            if let Some(ref issue_id) = ctx.issue_id {
-                use crate::schema::issues;
-                let _ = diesel::update(issues::table.find(issue_id))
-                    .set((
-                        issues::status.eq("waiting"),
-                        issues::wait_state.eq(Some("checkpoint")),
-                        issues::updated_at.eq(now),
-                    ))
-                    .execute(diesel_conn);
-            }
-        }
-
-        // Emit events for frontend
+        // Emit artifact event for frontend
         let _ = services.emitter.emit(
             "artifact-submitted",
             serde_json::json!({
@@ -255,16 +233,6 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
         let _ = services
             .emitter
             .emit("db-change", serde_json::json!({ "table": "artifacts" }));
-        let _ = services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "jobs", "action": "update"}),
-        );
-        if is_blocked {
-            let _ = services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "issues", "action": "update"}),
-            );
-        }
 
         // Build artifact URI while we have the context and db lock
         let artifact_uri = build_artifact_uri(diesel_conn, &ctx, &ctx.job_id);
@@ -274,21 +242,19 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
             ctx.job_id,
             artifact_type,
             artifact_uri,
-            execution_id,
             checkpoint_info,
             worktree_path,
-            is_blocked,
         )
     };
 
-    // Mark run completed (process stays alive for warm retention)
-    mark_run_completed(orch, &run_id);
-
-    // Handle programmatic checkpoint if present (outside db lock)
-    let mut should_advance_dag = !is_blocked;
-
-    if let Some(ref info) = checkpoint_info {
-        if info.checkpoint_type == "programmatic" {
+    // Phase 2: Determine final job status based on checkpoint type.
+    // Job stays Running during this phase — transition only when outcome is known.
+    let job_target = match &checkpoint_info {
+        Some(info) if info.checkpoint_type == "approval" || info.checkpoint_type == "prompt" => {
+            log::info!("Job {} blocked at checkpoint - awaiting approval", job_id);
+            JobStatus::Blocked
+        }
+        Some(info) if info.checkpoint_type == "programmatic" => {
             let command = info.command.clone().unwrap_or_else(|| "exit 0".to_string());
 
             if let Some(ref worktree) = worktree_path {
@@ -305,27 +271,11 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
                 {
                     Ok(true) => {
                         log::info!("Programmatic checkpoint passed for job {}", job_id);
-                        // Job already marked complete - continue with DAG advancement
+                        JobStatus::Complete
                     }
                     Ok(false) | Err(_) => {
                         log::warn!("Programmatic checkpoint failed for job {}", job_id);
-                        // Mark job as failed
-                        if let Ok(mut conn) = orch.db.conn.lock() {
-                            let now = chrono::Utc::now().timestamp() as i32;
-                            let _ = diesel::update(jobs::table.find(&job_id))
-                                .set((
-                                    jobs::status.eq("failed"),
-                                    jobs::updated_at.eq(now),
-                                    jobs::completed_at.eq(Some(now)),
-                                ))
-                                .execute(&mut *conn);
-
-                            let _ = services.emitter.emit(
-                                "db-change",
-                                serde_json::json!({"table": "jobs", "action": "update"}),
-                            );
-                        }
-                        should_advance_dag = false;
+                        JobStatus::Failed
                     }
                 }
             } else {
@@ -333,31 +283,40 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
                     "No worktree found for programmatic checkpoint on job {}",
                     job_id
                 );
+                JobStatus::Complete
             }
+        }
+        _ => JobStatus::Complete,
+    };
+
+    // Phase 3: Apply step outcome via unified reducer (transition + system message +
+    // manager wake + DAG advance signal).
+    {
+        use crate::transitions::outcome::{
+            apply_step_outcome, emit_outcome_effects, OutcomeContext, OutcomeSource, StepOutcome,
+        };
+
+        let outcome = match job_target {
+            JobStatus::Complete => StepOutcome::Complete,
+            JobStatus::Failed => StepOutcome::Failed,
+            JobStatus::Blocked => StepOutcome::Blocked,
+            _ => unreachable!(),
+        };
+        let ctx = OutcomeContext {
+            run_id: Some(&run_id),
+            source: OutcomeSource::Return,
+        };
+
+        match apply_step_outcome(orch, &job_id, &ctx, outcome) {
+            Ok((_result, effects)) => {
+                emit_outcome_effects(orch, effects);
+            }
+            Err(e) => log::error!("Failed to apply step outcome for {}: {}", job_id, e),
         }
     }
 
-    // Advance DAG with action execution (async, outside db lock)
-    if should_advance_dag {
-        if let Some(exec_id) = execution_id {
-            match crate::execution::advancement::advance_execution_with_actions(orch, &exec_id)
-                .await
-            {
-                Ok(ready_jobs) => {
-                    if !ready_jobs.is_empty() {
-                        log::info!(
-                            "DAG advancement: {} agent jobs now ready in execution {}",
-                            ready_jobs.len(),
-                            exec_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to advance execution DAG: {}", e);
-                }
-            }
-        }
-    }
+    // Flag the process so the reader thread suppresses the synthetic interrupt message
+    orch.process_state.mark_terminal_tool(&run_id);
 
     // Schedule interrupt after a short delay to ensure MCP response is delivered first.
     // This stops Claude from generating more after receiving the tool result.
@@ -367,20 +326,11 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
         // Small delay to let the MCP response get through
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        if let Some(stdin_handle) = process_state.get_stdin_handle(&run_id_clone) {
-            if let Ok(mut stdin_guard) = stdin_handle.lock() {
-                if let Some(ref mut stdin) = *stdin_guard {
-                    let request_id = uuid::Uuid::new_v4().to_string();
-                    if crate::claude::stdin::send_interrupt_request(stdin.as_mut(), &request_id)
-                        .is_ok()
-                    {
-                        log::info!(
-                            "Sent interrupt after turn-ender tool for run {}",
-                            &run_id_clone[..run_id_clone.len().min(8)]
-                        );
-                    }
-                }
-            }
+        if crate::backends::stdin::send_interrupt(&process_state, &run_id_clone).is_ok() {
+            log::info!(
+                "Sent interrupt after turn-ender tool for run {}",
+                &run_id_clone[..run_id_clone.len().min(8)]
+            );
         }
     });
 
@@ -391,41 +341,6 @@ pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) ->
         "Output submitted successfully ({}, type: {})",
         artifact_ref, artifact_type
     )
-}
-
-/// Helper to mark run as completed (process stays alive for warm retention)
-///
-/// Note: We intentionally do NOT kill the Claude process here. The process
-/// will transition to warm state when it emits its Result event, allowing
-/// it to be reused for follow-up messages. The session.rs reader thread
-/// handles process lifecycle via transition_to_warm_state().
-fn mark_run_completed(orch: &Orchestrator, run_id: &str) {
-    let services = &orch.services;
-    // Mark run as completed
-    if let Ok(mut conn) = orch.db.conn.lock() {
-        let now = chrono::Utc::now().timestamp() as i32;
-        let status_str = RunStatus::Completed.to_string();
-        let run_update = UpdateRunChangeset {
-            status: Some(&status_str),
-            completed_at: Some(Some(now)),
-            updated_at: Some(now),
-            ..Default::default()
-        };
-        let _ = diesel::update(runs::table.find(run_id))
-            .set(&run_update)
-            .execute(&mut *conn);
-    }
-
-    // Emit db-change for runs table
-    let _ = services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "runs", "action": "update"}),
-    );
-
-    log::info!(
-        "Run {} marked completed, process retained for warm state",
-        &run_id[..run_id.len().min(8)]
-    );
 }
 
 /// Checkpoint information for a job's node.

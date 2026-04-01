@@ -10,7 +10,7 @@ use crate::schema::*;
 pub struct DbChat {
     pub id: String,
     pub project_id: String,
-    pub claude_session_id: Option<String>,
+    pub current_session_id: Option<String>,
     pub status: String,
     pub created_at: i32,
     pub updated_at: i32,
@@ -21,7 +21,7 @@ pub struct DbChat {
 pub struct NewChat<'a> {
     pub id: &'a str,
     pub project_id: &'a str,
-    pub claude_session_id: Option<&'a str>,
+    pub current_session_id: Option<&'a str>,
     pub status: &'a str,
     pub created_at: i32,
     pub updated_at: i32,
@@ -30,7 +30,7 @@ pub struct NewChat<'a> {
 #[derive(Debug, AsChangeset, Default)]
 #[diesel(table_name = chats)]
 pub struct UpdateChatChangeset<'a> {
-    pub claude_session_id: Option<Option<&'a str>>,
+    pub current_session_id: Option<Option<&'a str>>,
     pub status: Option<&'a str>,
     pub updated_at: Option<i32>,
 }

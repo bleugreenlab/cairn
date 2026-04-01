@@ -1,27 +1,26 @@
 //! Recipe types - workflow definitions.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Recipe trigger - when a recipe can be started
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum RecipeTrigger {
     #[default]
-    Issue,
-    Project,
+    #[serde(alias = "issue")]
     Manual,
     Schedule,
-    Webhook,
+    JobEnded,
+    SkillCalled,
 }
 
 impl std::fmt::Display for RecipeTrigger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecipeTrigger::Issue => write!(f, "issue"),
-            RecipeTrigger::Project => write!(f, "project"),
             RecipeTrigger::Manual => write!(f, "manual"),
             RecipeTrigger::Schedule => write!(f, "schedule"),
-            RecipeTrigger::Webhook => write!(f, "webhook"),
+            RecipeTrigger::JobEnded => write!(f, "job_ended"),
+            RecipeTrigger::SkillCalled => write!(f, "skill_called"),
         }
     }
 }
@@ -31,44 +30,144 @@ impl std::str::FromStr for RecipeTrigger {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "issue" => Ok(RecipeTrigger::Issue),
-            "project" => Ok(RecipeTrigger::Project),
-            "manual" => Ok(RecipeTrigger::Manual),
+            "manual" | "issue" => Ok(RecipeTrigger::Manual),
             "schedule" => Ok(RecipeTrigger::Schedule),
-            "webhook" => Ok(RecipeTrigger::Webhook),
+            "job_ended" => Ok(RecipeTrigger::JobEnded),
+            "skill_called" => Ok(RecipeTrigger::SkillCalled),
             _ => Err(format!("Unknown recipe trigger: {}", s)),
         }
     }
 }
 
-/// Recipe context - where the recipe executes
+/// Trigger scope - where the recipe executes
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
-pub enum RecipeContext {
+pub enum TriggerScope {
     #[default]
     Issue,
     Project,
 }
 
-impl std::fmt::Display for RecipeContext {
+impl std::fmt::Display for TriggerScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecipeContext::Issue => write!(f, "issue"),
-            RecipeContext::Project => write!(f, "project"),
+            TriggerScope::Issue => write!(f, "issue"),
+            TriggerScope::Project => write!(f, "project"),
         }
     }
 }
 
-impl std::str::FromStr for RecipeContext {
+impl std::str::FromStr for TriggerScope {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "issue" => Ok(RecipeContext::Issue),
-            "project" => Ok(RecipeContext::Project),
-            _ => Err(format!("Unknown recipe context: {}", s)),
+            "issue" => Ok(TriggerScope::Issue),
+            "project" => Ok(TriggerScope::Project),
+            _ => Err(format!("Unknown trigger scope: {}", s)),
         }
     }
+}
+
+/// Agent filter mode — allow or exclude listed agents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentFilterMode {
+    Allow,
+    Exclude,
+}
+
+/// Structured agent filter with allow/exclude semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFilter {
+    pub mode: AgentFilterMode,
+    pub ids: Vec<String>,
+}
+
+/// Custom deserializer for node_filter that accepts both the old String format
+/// and the new AgentFilter struct for backward compatibility.
+fn deserialize_node_filter<'de, D>(deserializer: D) -> Result<Option<AgentFilter>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NodeFilterValue {
+        Struct(AgentFilter),
+        String(String),
+    }
+
+    let opt: Option<NodeFilterValue> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(NodeFilterValue::Struct(filter)) => Ok(Some(filter)),
+        Some(NodeFilterValue::String(s)) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec![s],
+                }))
+            }
+        }
+    }
+}
+
+/// Serialize AgentFilter — skip if None.
+fn serialize_node_filter<S>(value: &Option<AgentFilter>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(filter) => filter.serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Event filter for event-driven triggers (JobEnded, SkillCalled)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventFilter {
+    /// For JobEnded: filter by job status (e.g., ["complete", "failed"])
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_status: Option<Vec<String>>,
+    /// For SkillCalled: filter by skill IDs (e.g., ["code-review"])
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_ids: Option<Vec<String>>,
+    /// Filter by agent config ID (allow/exclude list)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_node_filter",
+        serialize_with = "serialize_node_filter"
+    )]
+    pub node_filter: Option<AgentFilter>,
+
+    // --- Accumulation ---
+    /// Fire after every N matching events (default/absent/1 = immediate)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every: Option<i32>,
+    /// Group events by this field in the event payload (required when every > 1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
+    /// Scope override for accumulation: "global", "project", "issue"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accumulation_scope: Option<AccumulationScope>,
+    /// Only count events within this window (seconds). Older events are pruned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_window_secs: Option<i64>,
+}
+
+/// Accumulation scope — how events are grouped for counting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AccumulationScope {
+    Global,
+    #[default]
+    Project,
+    Issue,
 }
 
 /// Recipe - a workflow definition
@@ -79,7 +178,6 @@ pub struct Recipe {
     pub name: String,
     pub description: Option<String>,
     pub trigger: RecipeTrigger,
-    pub context: RecipeContext,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub is_default: bool,
@@ -92,6 +190,19 @@ pub struct Recipe {
     pub updated_at: i64,
 }
 
+impl Recipe {
+    /// Get the trigger scope from the trigger node's config.
+    /// Defaults to Issue if no trigger node or no scope specified.
+    pub fn scope(&self) -> TriggerScope {
+        self.nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .and_then(|n| n.trigger_config.as_ref())
+            .and_then(|tc| tc.scope.clone())
+            .unwrap_or(TriggerScope::Issue)
+    }
+}
+
 /// Input for creating a recipe
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -99,7 +210,6 @@ pub struct CreateRecipe {
     pub name: String,
     pub description: Option<String>,
     pub trigger: Option<RecipeTrigger>,
-    pub context: Option<RecipeContext>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub nodes: Option<Vec<RecipeNode>>,
@@ -113,7 +223,6 @@ pub struct UpdateRecipe {
     pub name: Option<String>,
     pub description: Option<Option<String>>,
     pub trigger: Option<RecipeTrigger>,
-    pub context: Option<RecipeContext>,
     #[allow(dead_code)]
     pub workspace_id: Option<Option<String>>,
     #[allow(dead_code)]
@@ -217,9 +326,11 @@ pub struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_type: Option<RecipeTrigger>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<TriggerScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_config: Option<ScheduleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook_filters: Option<WebhookFilters>,
+    pub event_filter: Option<EventFilter>,
 
     // Agent config
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -358,25 +469,16 @@ pub struct ScheduleConfig {
     pub catchup_window_hours: i32,
 }
 
-/// Webhook filters for webhook-triggered recipes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WebhookFilters {
-    pub event_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TriggerConfig {
     pub trigger_type: RecipeTrigger,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<TriggerScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_config: Option<ScheduleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook_filters: Option<WebhookFilters>,
+    pub event_filter: Option<EventFilter>,
 }
 
 /// Worktree mode for agent nodes
@@ -737,8 +839,9 @@ impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
             (
                 cfg.trigger_type.map(|t| TriggerConfig {
                     trigger_type: t,
+                    scope: cfg.scope,
                     schedule_config: cfg.schedule_config,
-                    webhook_filters: cfg.webhook_filters,
+                    event_filter: cfg.event_filter,
                 }),
                 agent_config,
                 action_config,
@@ -823,23 +926,40 @@ mod tests {
 
     #[test]
     fn recipe_trigger_display() {
-        assert_eq!(RecipeTrigger::Issue.to_string(), "issue");
-        assert_eq!(RecipeTrigger::Project.to_string(), "project");
         assert_eq!(RecipeTrigger::Manual.to_string(), "manual");
+        assert_eq!(RecipeTrigger::Schedule.to_string(), "schedule");
+        assert_eq!(RecipeTrigger::JobEnded.to_string(), "job_ended");
+        assert_eq!(RecipeTrigger::SkillCalled.to_string(), "skill_called");
     }
 
     #[test]
     fn recipe_trigger_from_str() {
         assert_eq!(
-            "issue".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Issue
-        );
-        assert_eq!(
-            "project".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Project
-        );
-        assert_eq!(
             "manual".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::Manual
+        );
+        assert_eq!(
+            "schedule".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::Schedule
+        );
+        assert_eq!(
+            "job_ended".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::JobEnded
+        );
+        assert_eq!(
+            "skill_called".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::SkillCalled
+        );
+    }
+
+    #[test]
+    fn recipe_trigger_from_str_legacy_issue_maps_to_manual() {
+        assert_eq!(
+            "issue".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::Manual
+        );
+        assert_eq!(
+            "ISSUE".parse::<RecipeTrigger>().unwrap(),
             RecipeTrigger::Manual
         );
     }
@@ -847,12 +967,12 @@ mod tests {
     #[test]
     fn recipe_trigger_from_str_case_insensitive() {
         assert_eq!(
-            "ISSUE".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Issue
+            "MANUAL".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::Manual
         );
         assert_eq!(
-            "Manual".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Manual
+            "Schedule".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::Schedule
         );
     }
 
@@ -865,53 +985,236 @@ mod tests {
 
     #[test]
     fn recipe_trigger_default() {
-        assert_eq!(RecipeTrigger::default(), RecipeTrigger::Issue);
+        assert_eq!(RecipeTrigger::default(), RecipeTrigger::Manual);
+    }
+
+    #[test]
+    fn recipe_trigger_serde_alias_issue() {
+        // Deserializing "issue" from JSON/YAML should produce Manual
+        let trigger: RecipeTrigger = serde_json::from_str("\"issue\"").unwrap();
+        assert_eq!(trigger, RecipeTrigger::Manual);
     }
 
     // =========================================================================
-    // RecipeContext tests
+    // TriggerScope tests
     // =========================================================================
 
     #[test]
-    fn recipe_context_display() {
-        assert_eq!(RecipeContext::Issue.to_string(), "issue");
-        assert_eq!(RecipeContext::Project.to_string(), "project");
+    fn trigger_scope_display() {
+        assert_eq!(TriggerScope::Issue.to_string(), "issue");
+        assert_eq!(TriggerScope::Project.to_string(), "project");
     }
 
     #[test]
-    fn recipe_context_from_str() {
+    fn trigger_scope_from_str() {
         assert_eq!(
-            "issue".parse::<RecipeContext>().unwrap(),
-            RecipeContext::Issue
+            "issue".parse::<TriggerScope>().unwrap(),
+            TriggerScope::Issue
         );
         assert_eq!(
-            "project".parse::<RecipeContext>().unwrap(),
-            RecipeContext::Project
-        );
-    }
-
-    #[test]
-    fn recipe_context_from_str_case_insensitive() {
-        assert_eq!(
-            "ISSUE".parse::<RecipeContext>().unwrap(),
-            RecipeContext::Issue
-        );
-        assert_eq!(
-            "Project".parse::<RecipeContext>().unwrap(),
-            RecipeContext::Project
+            "project".parse::<TriggerScope>().unwrap(),
+            TriggerScope::Project
         );
     }
 
     #[test]
-    fn recipe_context_from_str_invalid() {
-        let result = "invalid".parse::<RecipeContext>();
+    fn trigger_scope_from_str_invalid() {
+        let result = "invalid".parse::<TriggerScope>();
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unknown recipe context"));
+        assert!(result.unwrap_err().contains("Unknown trigger scope"));
     }
 
     #[test]
-    fn recipe_context_default() {
-        assert_eq!(RecipeContext::default(), RecipeContext::Issue);
+    fn trigger_scope_default() {
+        assert_eq!(TriggerScope::default(), TriggerScope::Issue);
+    }
+
+    // =========================================================================
+    // Recipe::scope() tests
+    // =========================================================================
+
+    #[test]
+    fn recipe_scope_returns_trigger_node_scope() {
+        let recipe = Recipe {
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_default: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![RecipeNode {
+                id: "t1".into(),
+                name: "Trigger".into(),
+                node_type: RecipeNodeType::Trigger,
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: Some(TriggerConfig {
+                    trigger_type: RecipeTrigger::Manual,
+                    scope: Some(TriggerScope::Project),
+                    schedule_config: None,
+                    event_filter: None,
+                }),
+                agent_config: None,
+                action_config: None,
+                artifact_config: None,
+                checkpoint_config: None,
+                condition_config: None,
+                context_config: None,
+            }],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(recipe.scope(), TriggerScope::Project);
+    }
+
+    #[test]
+    fn recipe_scope_defaults_to_issue_when_no_trigger_node() {
+        let recipe = Recipe {
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_default: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(recipe.scope(), TriggerScope::Issue);
+    }
+
+    #[test]
+    fn recipe_scope_defaults_to_issue_when_trigger_has_no_scope() {
+        let recipe = Recipe {
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_default: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![RecipeNode {
+                id: "t1".into(),
+                name: "Trigger".into(),
+                node_type: RecipeNodeType::Trigger,
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: Some(TriggerConfig {
+                    trigger_type: RecipeTrigger::Manual,
+                    scope: None,
+                    schedule_config: None,
+                    event_filter: None,
+                }),
+                agent_config: None,
+                action_config: None,
+                artifact_config: None,
+                checkpoint_config: None,
+                condition_config: None,
+                context_config: None,
+            }],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(recipe.scope(), TriggerScope::Issue);
+    }
+
+    // =========================================================================
+    // EventFilter tests
+    // =========================================================================
+
+    #[test]
+    fn event_filter_serde_roundtrip() {
+        let filter = EventFilter {
+            job_status: Some(vec!["complete".into(), "failed".into()]),
+            skill_ids: None,
+            node_filter: Some(AgentFilter {
+                mode: AgentFilterMode::Allow,
+                ids: vec!["Builder".into()],
+            }),
+            every: None,
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let parsed: EventFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.job_status,
+            Some(vec!["complete".into(), "failed".into()])
+        );
+        assert!(parsed.skill_ids.is_none());
+        assert_eq!(
+            parsed.node_filter,
+            Some(AgentFilter {
+                mode: AgentFilterMode::Allow,
+                ids: vec!["Builder".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn event_filter_deserialize_old_string_format() {
+        // Old format: nodeFilter was a plain string
+        let json = r#"{"jobStatus":["complete"],"nodeFilter":"Builder"}"#;
+        let parsed: EventFilter = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.node_filter,
+            Some(AgentFilter {
+                mode: AgentFilterMode::Allow,
+                ids: vec!["Builder".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn event_filter_deserialize_old_empty_string() {
+        let json = r#"{"nodeFilter":""}"#;
+        let parsed: EventFilter = serde_json::from_str(json).unwrap();
+        assert!(parsed.node_filter.is_none());
+    }
+
+    #[test]
+    fn event_filter_deserialize_new_struct_format() {
+        let json = r#"{"nodeFilter":{"mode":"exclude","ids":["build","review"]}}"#;
+        let parsed: EventFilter = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.node_filter,
+            Some(AgentFilter {
+                mode: AgentFilterMode::Exclude,
+                ids: vec!["build".into(), "review".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn event_filter_omits_none_fields() {
+        let filter = EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".into()]),
+            node_filter: None,
+            every: None,
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        assert!(!json.contains("jobStatus"));
+        assert!(json.contains("skillIds"));
+        assert!(!json.contains("nodeFilter"));
     }
 
     // =========================================================================
@@ -1253,7 +1556,7 @@ mod tests {
         assert!(node.trigger_config.is_some());
         assert_eq!(
             node.trigger_config.unwrap().trigger_type,
-            RecipeTrigger::Issue
+            RecipeTrigger::Manual
         );
     }
 

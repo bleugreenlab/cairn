@@ -1,0 +1,556 @@
+//! AccountManager — manages the desktop's connection to cairn.computer.
+//!
+//! Handles device code auth flow, JWT storage/refresh, and connection lifecycle.
+//! Replaces TeamManager for the single-account model.
+
+use std::sync::Arc;
+use tokio::sync::{watch, Mutex};
+
+use super::jwt::{decrypt_jwt_from_storage, encrypt_jwt_for_storage};
+use super::org_tokens::OrgTokenCache;
+use crate::db::DbState;
+use crate::services::EventEmitter;
+
+use super::connection::{AccountConnection, DbAccount, OrgMembership};
+use super::queries;
+
+const CHECK_INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
+const REFRESH_THRESHOLD_SECS: i64 = 15 * 60; // 15 minutes before expiry
+
+/// Manages the desktop's connection to cairn.computer.
+pub struct AccountManager {
+    db: Arc<DbState>,
+    emitter: Arc<dyn EventEmitter>,
+    refresh_handle: Mutex<Option<RefreshHandle>>,
+    org_token_cache: Mutex<OrgTokenCache>,
+    api_config: crate::api::ApiConfig,
+}
+
+struct RefreshHandle {
+    cancel_tx: watch::Sender<bool>,
+}
+
+impl Drop for RefreshHandle {
+    fn drop(&mut self) {
+        let _ = self.cancel_tx.send(true);
+    }
+}
+
+impl AccountManager {
+    pub fn new(db: Arc<DbState>, emitter: Arc<dyn EventEmitter>) -> Self {
+        Self {
+            db,
+            emitter,
+            refresh_handle: Mutex::new(None),
+            org_token_cache: Mutex::new(OrgTokenCache::new()),
+            api_config: crate::api::ApiConfig::default(),
+        }
+    }
+
+    /// Connect with a JWT received via deep link callback.
+    /// The server registers the device and issues the JWT; the deep link
+    /// passes back device_id, plan, and user info.
+    pub async fn connect_with_jwt(
+        &self,
+        jwt: &str,
+        device_id: &str,
+        plan: &str,
+        user_name: &str,
+        user_email: &str,
+        orgs_json: Option<&str>,
+    ) -> Result<AccountConnection, String> {
+        // Clear any cached org tokens from a previous session/user
+        self.org_token_cache.lock().await.clear();
+
+        let claims = super::jwt::decode_jwt_claims(jwt).or_else(|_| {
+            // Device JWTs may not have org_id/org_role — parse manually
+            decode_device_jwt_claims(jwt)
+        })?;
+
+        let org_memberships =
+            orgs_json.and_then(|s| serde_json::from_str::<Vec<OrgMembership>>(s).ok());
+
+        let encrypted_jwt = encrypt_jwt_for_storage(jwt)?;
+        let now = chrono::Utc::now().timestamp() as i32;
+
+        let db_account = DbAccount {
+            user_id: claims.sub.clone(),
+            email: user_email.to_string(),
+            name: user_name.to_string(),
+            device_id: device_id.to_string(),
+            plan: plan.to_string(),
+            jwt_encrypted: Some(encrypted_jwt),
+            jwt_expires_at: Some(claims.exp as i32),
+            org_memberships: org_memberships
+                .as_ref()
+                .and_then(|m| serde_json::to_string(m).ok()),
+            connected_at: now,
+            updated_at: now,
+        };
+
+        {
+            let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+            queries::upsert(&mut conn, &db_account)?;
+        }
+
+        let connection = AccountConnection {
+            user_id: claims.sub,
+            email: user_email.to_string(),
+            name: user_name.to_string(),
+            device_id: device_id.to_string(),
+            plan: plan.to_string(),
+            org_memberships: org_memberships.unwrap_or_default(),
+            connected_at: now as i64,
+        };
+
+        let _ = self.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "account", "action": "upsert"}),
+        );
+
+        // Start JWT refresh
+        self.start_refresh().await;
+
+        Ok(connection)
+    }
+
+    /// Disconnect from the account. Deactivates device on server, stops refresh, removes from DB.
+    pub async fn disconnect(&self) -> Result<(), String> {
+        // Stop refresh
+        let mut handle = self.refresh_handle.lock().await;
+        *handle = None;
+
+        // Attempt API deactivation (best-effort — local state clears regardless)
+        if let Ok(Some(jwt)) = self.get_jwt() {
+            if let Ok(Some(connection)) = self.get_connection() {
+                let url = self.api_config.device_url(&connection.device_id);
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .ok();
+
+                if let Some(client) = client {
+                    match client.delete(&url).bearer_auth(&jwt).send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            log::info!("Device deactivated on server: {}", connection.device_id);
+                        }
+                        Ok(resp) => {
+                            log::warn!(
+                                "Device deactivation returned {}: {}",
+                                resp.status(),
+                                resp.text().await.unwrap_or_default()
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("Device deactivation request failed (proceeding with local disconnect): {}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Clear org token cache
+        self.org_token_cache.lock().await.clear();
+
+        // Delete from DB
+        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+        queries::delete(&mut conn)?;
+
+        let _ = self.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "account", "action": "delete"}),
+        );
+        let _ = self
+            .emitter
+            .emit("account-disconnected", serde_json::json!({}));
+
+        Ok(())
+    }
+
+    /// Get current connection (if any).
+    pub fn get_connection(&self) -> Result<Option<AccountConnection>, String> {
+        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+        queries::get(&mut conn)
+    }
+
+    /// Get the decrypted JWT for API calls.
+    pub fn get_jwt(&self) -> Result<Option<String>, String> {
+        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
+        match queries::get_jwt_data(&mut conn)? {
+            Some((encrypted, _)) => {
+                let jwt = decrypt_jwt_from_storage(&encrypted)?;
+                Ok(Some(jwt))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get a cached org JWT, or fetch a new one by exchanging the device JWT.
+    pub async fn get_or_fetch_org_jwt(&self, org_id: &str) -> Result<Option<String>, String> {
+        // Check cache first
+        {
+            let cache = self.org_token_cache.lock().await;
+            if let Some(token) = cache.get(org_id) {
+                return Ok(Some(token.to_string()));
+            }
+        }
+
+        // Need to fetch — get device JWT
+        let device_jwt = match self.get_jwt()? {
+            Some(jwt) => jwt,
+            None => return Ok(None),
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let (token, expires_at) = super::org_tokens::fetch_org_token(
+            &client,
+            &device_jwt,
+            org_id,
+            &self.api_config.base_url,
+        )
+        .await?;
+
+        // Cache the result
+        {
+            let mut cache = self.org_token_cache.lock().await;
+            cache.set(org_id, token.clone(), expires_at);
+        }
+
+        Ok(Some(token))
+    }
+
+    /// Clear all cached org tokens (e.g. on logout).
+    pub async fn clear_org_tokens(&self) {
+        let mut cache = self.org_token_cache.lock().await;
+        cache.clear();
+    }
+
+    /// Start the JWT refresh background task.
+    pub async fn start_refresh(&self) {
+        let mut handle = self.refresh_handle.lock().await;
+
+        // Stop existing task
+        *handle = None;
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        *handle = Some(RefreshHandle { cancel_tx });
+
+        let db = self.db.clone();
+        let emitter = self.emitter.clone();
+        let api_config = self.api_config.clone();
+        tokio::spawn(refresh_loop(db, emitter, cancel_rx, api_config));
+    }
+
+    /// Start refresh if an account exists. Called on app startup.
+    pub async fn start_refresh_if_connected(&self) {
+        let has_account = {
+            let mut conn = match self.db.conn.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to lock DB to check account: {}", e);
+                    return;
+                }
+            };
+            queries::get(&mut conn).ok().flatten().is_some()
+        };
+
+        if has_account {
+            self.start_refresh().await;
+            log::info!("Started account JWT refresh task");
+        }
+    }
+
+    /// Stop the refresh task (for shutdown).
+    pub async fn stop(&self) {
+        let mut handle = self.refresh_handle.lock().await;
+        *handle = None;
+    }
+}
+
+async fn refresh_loop(
+    db: Arc<DbState>,
+    emitter: Arc<dyn EventEmitter>,
+    mut cancel_rx: watch::Receiver<bool>,
+    api_config: crate::api::ApiConfig,
+) {
+    let mut consecutive_failures: u32 = 0;
+    let client = reqwest::Client::new();
+    const MAX_FAILURES: u32 = 3;
+
+    loop {
+        let sleep = tokio::time::sleep(tokio::time::Duration::from_secs(CHECK_INTERVAL_SECS));
+        tokio::select! {
+            _ = sleep => {},
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    log::info!("Account JWT refresh task cancelled");
+                    return;
+                }
+            }
+        }
+
+        // Load JWT from DB
+        let jwt_data = {
+            let mut conn = match db.conn.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    log::warn!("Account refresh: failed to lock DB: {}", e);
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_FAILURES {
+                        log::error!(
+                            "Account refresh: {} consecutive failures, emitting disconnect",
+                            consecutive_failures
+                        );
+                        let _ = emitter.emit("account-disconnected", serde_json::json!({}));
+                        consecutive_failures = 0;
+                    }
+                    continue;
+                }
+            };
+            queries::get_jwt_data(&mut conn)
+        };
+
+        let (encrypted_jwt, expires_at_opt) = match jwt_data {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                log::debug!("No account JWT found, skipping refresh");
+                continue;
+            }
+            Err(e) => {
+                log::warn!("Account refresh: failed to load JWT: {}", e);
+                consecutive_failures += 1;
+                continue;
+            }
+        };
+
+        let jwt = match decrypt_jwt_from_storage(&encrypted_jwt) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("Account refresh: failed to decrypt JWT: {}", e);
+                consecutive_failures += 1;
+                continue;
+            }
+        };
+
+        let expires_at = match expires_at_opt {
+            Some(exp) => exp,
+            None => continue,
+        };
+
+        let now = chrono::Utc::now().timestamp();
+        let time_until_expiry = expires_at - now;
+
+        if time_until_expiry > REFRESH_THRESHOLD_SECS {
+            log::debug!(
+                "Account JWT still valid for {} minutes, no refresh needed",
+                time_until_expiry / 60
+            );
+            consecutive_failures = 0;
+            continue;
+        }
+
+        log::info!(
+            "Account JWT expires in {} minutes, refreshing...",
+            time_until_expiry / 60
+        );
+
+        match client
+            .post(api_config.device_refresh_url())
+            .bearer_auth(&jwt)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => {
+                        if let (Some(new_token), Some(expires_at_str)) =
+                            (body["token"].as_str(), body["expires_at"].as_str())
+                        {
+                            let new_expires_at =
+                                chrono::DateTime::parse_from_rfc3339(expires_at_str)
+                                    .map(|dt| dt.timestamp())
+                                    .unwrap_or(now + 3600);
+
+                            match encrypt_jwt_for_storage(new_token) {
+                                Ok(enc) => {
+                                    let mut conn = match db.conn.lock() {
+                                        Ok(c) => c,
+                                        Err(e) => {
+                                            log::error!(
+                                                "Account refresh: failed to lock DB to save JWT: {}",
+                                                e
+                                            );
+                                            consecutive_failures += 1;
+                                            continue;
+                                        }
+                                    };
+                                    if let Err(e) =
+                                        queries::update_jwt(&mut conn, &enc, new_expires_at)
+                                    {
+                                        log::error!("Account refresh: failed to save JWT: {}", e);
+                                        consecutive_failures += 1;
+                                    } else {
+                                        log::info!("Account JWT refreshed successfully");
+                                        consecutive_failures = 0;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "Account refresh: failed to encrypt new JWT: {}",
+                                        e
+                                    );
+                                    consecutive_failures += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Account refresh: failed to parse response: {}", e);
+                        consecutive_failures += 1;
+                    }
+                }
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                log::warn!("Account JWT refresh failed: {} - {}", status, body);
+                consecutive_failures += 1;
+            }
+            Err(e) => {
+                log::warn!("Account JWT refresh request failed: {}", e);
+                consecutive_failures += 1;
+            }
+        }
+
+        if consecutive_failures >= MAX_FAILURES {
+            log::error!(
+                "Account refresh: {} consecutive failures, emitting disconnect",
+                consecutive_failures
+            );
+            let _ = emitter.emit("account-disconnected", serde_json::json!({}));
+            consecutive_failures = 0;
+        }
+    }
+}
+
+/// Decode JWT claims for device tokens (no org_id/org_role required).
+fn decode_device_jwt_claims(jwt: &str) -> Result<super::jwt::JwtClaims, String> {
+    use base64::Engine as _;
+
+    let parts: Vec<&str> = jwt.split('.').collect();
+    if parts.len() != 3 {
+        return Err("Invalid JWT format".to_string());
+    }
+
+    let payload_bytes = base64::engine::general_purpose::STANDARD
+        .decode(parts[1])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]))
+        .map_err(|e| format!("Failed to decode JWT payload: {}", e))?;
+
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("Failed to parse JWT payload: {}", e))?;
+
+    Ok(super::jwt::JwtClaims {
+        sub: payload["sub"]
+            .as_str()
+            .ok_or("Missing 'sub' claim")?
+            .to_string(),
+        org_id: payload["org_id"].as_str().unwrap_or("").to_string(),
+        org_role: payload["org_role"].as_str().unwrap_or("").to_string(),
+        exp: payload["exp"].as_i64().ok_or("Missing 'exp' claim")?,
+        name: payload["name"].as_str().map(|s| s.to_string()),
+        email: payload["email"].as_str().map(|s| s.to_string()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+
+    fn make_jwt(payload: &serde_json::Value) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
+        let payload_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(payload).unwrap());
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake-sig");
+        format!("{}.{}.{}", header, payload_b64, signature)
+    }
+
+    #[test]
+    fn decode_device_jwt_with_all_fields() {
+        let payload = serde_json::json!({
+            "sub": "user-123",
+            "exp": 9999999999_i64,
+            "name": "Alice",
+            "email": "alice@example.com",
+            "type": "device",
+            "device_id": "dev-1",
+        });
+
+        let jwt = make_jwt(&payload);
+        let claims = decode_device_jwt_claims(&jwt).unwrap();
+
+        assert_eq!(claims.sub, "user-123");
+        assert_eq!(claims.exp, 9999999999);
+        assert_eq!(claims.name, Some("Alice".to_string()));
+        assert_eq!(claims.email, Some("alice@example.com".to_string()));
+        // Device JWTs don't have org_id/org_role — defaults to empty
+        assert_eq!(claims.org_id, "");
+        assert_eq!(claims.org_role, "");
+    }
+
+    #[test]
+    fn decode_device_jwt_missing_sub_fails() {
+        let payload = serde_json::json!({
+            "exp": 9999999999_i64,
+        });
+        let jwt = make_jwt(&payload);
+        let result = decode_device_jwt_claims(&jwt);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("sub"));
+    }
+
+    #[test]
+    fn decode_device_jwt_missing_exp_fails() {
+        let payload = serde_json::json!({
+            "sub": "user-123",
+        });
+        let jwt = make_jwt(&payload);
+        let result = decode_device_jwt_claims(&jwt);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exp"));
+    }
+
+    #[test]
+    fn decode_device_jwt_invalid_format_fails() {
+        assert!(decode_device_jwt_claims("not-a-jwt").is_err());
+        assert!(decode_device_jwt_claims("only.two").is_err());
+        assert!(decode_device_jwt_claims("").is_err());
+    }
+
+    #[test]
+    fn decode_device_jwt_invalid_base64_fails() {
+        let result = decode_device_jwt_claims("header.!!!invalid!!!.sig");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_device_jwt_standard_base64_also_works() {
+        // Standard base64 (with +/= padding) should also decode
+        let payload = serde_json::json!({
+            "sub": "user-std",
+            "exp": 1234567890_i64,
+        });
+        let payload_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+        let jwt = format!("header.{}.sig", payload_b64);
+
+        let claims = decode_device_jwt_claims(&jwt).unwrap();
+        assert_eq!(claims.sub, "user-std");
+    }
+}

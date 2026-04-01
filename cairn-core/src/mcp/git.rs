@@ -70,6 +70,50 @@ pub fn validate_file_path(worktree_path: &Path, file_path: &str) -> Result<PathB
     }
 }
 
+/// Validate that a file path stays within the worktree WITHOUT creating directories.
+///
+/// Like `validate_file_path` but non-mutating: for new files in missing directories,
+/// walks up to find the nearest existing ancestor and verifies it's inside the worktree.
+/// Used by filechange Phase 1 validation to avoid side effects before all changes are validated.
+pub fn validate_file_path_dry(worktree_path: &Path, file_path: &str) -> Result<PathBuf, String> {
+    let full_path = worktree_path.join(file_path);
+
+    let worktree_canonical = worktree_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve worktree path: {}", e))?;
+
+    if full_path.exists() {
+        let canonical = full_path
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve path: {}", e))?;
+
+        if !canonical.starts_with(&worktree_canonical) {
+            return Err("Path escapes worktree".to_string());
+        }
+
+        Ok(canonical)
+    } else {
+        // Walk up to the nearest existing ancestor to check containment
+        let mut ancestor = full_path.parent();
+        while let Some(dir) = ancestor {
+            if dir.exists() {
+                let canonical_ancestor = dir
+                    .canonicalize()
+                    .map_err(|e| format!("Failed to resolve ancestor path: {}", e))?;
+
+                if !canonical_ancestor.starts_with(&worktree_canonical) {
+                    return Err("Path escapes worktree".to_string());
+                }
+
+                return Ok(full_path);
+            }
+            ancestor = dir.parent();
+        }
+
+        Err("No existing ancestor directory found".to_string())
+    }
+}
+
 /// Validate file path for read operations.
 /// Allows absolute paths anywhere on the filesystem.
 /// Blocks relative path traversal attacks (../.., etc.)
@@ -282,6 +326,91 @@ pub fn git_commit_file(
     push_to_origin(worktree_path);
 
     // Check if a PR exists for this branch
+    let pr_number = get_pr_for_branch(worktree_path);
+
+    Ok(CommitResult { sha, pr_number })
+}
+
+/// Git add and commit (or amend) multiple files atomically.
+pub fn git_commit_files(
+    worktree_path: &Path,
+    file_paths: &[&str],
+    commit_msg: &str,
+) -> Result<CommitResult, String> {
+    // Stage all specified files
+    for file_path in file_paths {
+        let add_output = crate::env::git()
+            .args(["add", file_path])
+            .current_dir(worktree_path)
+            .output()
+            .map_err(|e| format!("Failed to run git add: {}", e))?;
+
+        if !add_output.status.success() {
+            let stderr = String::from_utf8_lossy(&add_output.stderr);
+            // git add of deleted files: use git add -u instead
+            if stderr.contains("did not match any files") {
+                let _ = crate::env::git()
+                    .args(["add", "-u", file_path])
+                    .current_dir(worktree_path)
+                    .output();
+            } else {
+                return Err(format!("git add failed for {}: {}", file_path, stderr));
+            }
+        }
+    }
+
+    // Commit or amend
+    let commit_output = if commit_msg == "^" {
+        let log_output = crate::env::git()
+            .args(["log", "-1", "--format=%H"])
+            .current_dir(worktree_path)
+            .output()
+            .map_err(|e| format!("Failed to check git log: {}", e))?;
+
+        if !log_output.status.success() || log_output.stdout.is_empty() {
+            crate::env::git()
+                .args(["commit", "-m", "Initial changes"])
+                .current_dir(worktree_path)
+                .output()
+                .map_err(|e| format!("Failed to run git commit: {}", e))?
+        } else {
+            crate::env::git()
+                .args(["commit", "--amend", "--no-edit"])
+                .current_dir(worktree_path)
+                .output()
+                .map_err(|e| format!("Failed to run git commit --amend: {}", e))?
+        }
+    } else {
+        crate::env::git()
+            .args(["commit", "-m", commit_msg])
+            .current_dir(worktree_path)
+            .output()
+            .map_err(|e| format!("Failed to run git commit: {}", e))?
+    };
+
+    if !commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+        return Err(format!("git commit failed: {}", stderr));
+    }
+
+    let sha = crate::env::git()
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(worktree_path)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    push_to_origin(worktree_path);
+
     let pr_number = get_pr_for_branch(worktree_path);
 
     Ok(CommitResult { sha, pr_number })

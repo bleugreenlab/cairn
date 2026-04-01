@@ -18,3 +18,24 @@ pub struct GitHubApp {
     pub created_at: i64,
     pub updated_at: i64,
 }
+
+/// Status of the GitHub App connection.
+///
+/// Shared between Tauri and cairn-server so both serialize the same shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubStatus {
+    pub connected: bool,
+    pub app_name: Option<String>,
+    pub app_slug: Option<String>,
+    pub relay_status: RelayStatus,
+}
+
+/// Status of the Relay connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayStatus {
+    pub configured: bool,
+    pub connected: bool,
+    pub webhook_url: Option<String>,
+}

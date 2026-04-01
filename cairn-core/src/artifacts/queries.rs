@@ -48,6 +48,16 @@ pub fn get_latest(conn: &mut SqliteConnection, job_id: &str) -> Result<Option<Ar
     }
 }
 
+/// Mark an artifact as seen (sets seen_at timestamp).
+pub fn mark_seen(conn: &mut SqliteConnection, artifact_id: &str) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp() as i32;
+    diesel::update(artifacts::table.find(artifact_id))
+        .set(artifacts::seen_at.eq(now))
+        .execute(conn)
+        .map_err(|e| format!("Failed to mark artifact seen: {}", e))?;
+    Ok(())
+}
+
 /// Get the latest artifact for each job in an issue.
 pub fn list_for_issue(
     conn: &mut SqliteConnection,

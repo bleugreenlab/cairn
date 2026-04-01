@@ -10,6 +10,7 @@
 //!   │   └── /NODE                            # Job (e.g., planner-1, includes PR data)
 //!   │       ├── /chat                        # Job transcript
 //!   │       ├── /chat/full                   # Full transcript (untruncated)
+//!   │       ├── /chat/turn/N                 # Turn-scoped transcript slice
 //!   │       ├── /artifact                    # Job output
 //!   │       ├── /files                       # Files changed by this node
 //!   │       ├── /terminal/SLUG               # Job-scoped terminal
@@ -61,6 +62,15 @@ pub enum CairnResource {
         node_id: String,
     },
 
+    /// Turn-scoped transcript: `cairn://PROJECT/NUMBER/EXEC/NODE/chat/turn/N`
+    NodeChatTurn {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        turn_seq: i32,
+    },
+
     /// Single event in node chat: `cairn://PROJECT/NUMBER/EXEC/NODE/chat/RUN_SEQ/EVENT_SEQ`
     NodeChatEvent {
         project: String,
@@ -105,6 +115,16 @@ pub enum CairnResource {
         exec_seq: i32,
         node_id: String,
         task_name: String,
+    },
+
+    /// Turn-scoped task transcript: `cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/turn/N`
+    TaskChatTurn {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+        turn_seq: i32,
     },
 
     /// Single event in task chat: `cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/RUN_SEQ/EVENT_SEQ`
@@ -199,6 +219,18 @@ impl CairnResource {
                     project, number, exec_seq, node_id
                 )
             }
+            CairnResource::NodeChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                turn_seq,
+            } => {
+                format!(
+                    "cairn://{}/{}/{}/{}/chat/turn/{}",
+                    project, number, exec_seq, node_id, turn_seq
+                )
+            }
             CairnResource::NodeChatEvent {
                 project,
                 number,
@@ -259,6 +291,19 @@ impl CairnResource {
                 format!(
                     "cairn://{}/{}/{}/{}/task/{}/chat/full",
                     project, number, exec_seq, node_id, task_name
+                )
+            }
+            CairnResource::TaskChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                turn_seq,
+            } => {
+                format!(
+                    "cairn://{}/{}/{}/{}/task/{}/chat/turn/{}",
+                    project, number, exec_seq, node_id, task_name, turn_seq
                 )
             }
             CairnResource::TaskChatEvent {
@@ -385,6 +430,22 @@ impl CairnResource {
                     node_id
                 )
             }
+            CairnResource::NodeChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                turn_seq,
+            } => {
+                format!(
+                    "/p/{}/i/{}/{}/{}/chat/turn/{}",
+                    project.to_lowercase(),
+                    number,
+                    exec_seq,
+                    node_id,
+                    turn_seq
+                )
+            }
             CairnResource::NodeChatEvent {
                 project,
                 number,
@@ -465,6 +526,24 @@ impl CairnResource {
                     exec_seq,
                     node_id,
                     task_name
+                )
+            }
+            CairnResource::TaskChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                turn_seq,
+            } => {
+                format!(
+                    "/p/{}/i/{}/{}/{}/task/{}/chat/turn/{}",
+                    project.to_lowercase(),
+                    number,
+                    exec_seq,
+                    node_id,
+                    task_name,
+                    turn_seq
                 )
             }
             CairnResource::TaskChatEvent {
@@ -550,11 +629,13 @@ impl CairnResource {
             | CairnResource::Node { project, .. }
             | CairnResource::NodeChat { project, .. }
             | CairnResource::NodeChatFull { project, .. }
+            | CairnResource::NodeChatTurn { project, .. }
             | CairnResource::NodeChatEvent { project, .. }
             | CairnResource::NodeArtifact { project, .. }
             | CairnResource::NodeTerminal { project, .. }
             | CairnResource::TaskChat { project, .. }
             | CairnResource::TaskChatFull { project, .. }
+            | CairnResource::TaskChatTurn { project, .. }
             | CairnResource::TaskChatEvent { project, .. }
             | CairnResource::TaskArtifact { project, .. }
             | CairnResource::ProjectMessages { project, .. }
@@ -573,11 +654,13 @@ impl CairnResource {
             | CairnResource::Node { number, .. }
             | CairnResource::NodeChat { number, .. }
             | CairnResource::NodeChatFull { number, .. }
+            | CairnResource::NodeChatTurn { number, .. }
             | CairnResource::NodeChatEvent { number, .. }
             | CairnResource::NodeArtifact { number, .. }
             | CairnResource::NodeTerminal { number, .. }
             | CairnResource::TaskChat { number, .. }
             | CairnResource::TaskChatFull { number, .. }
+            | CairnResource::TaskChatTurn { number, .. }
             | CairnResource::TaskChatEvent { number, .. }
             | CairnResource::TaskArtifact { number, .. }
             | CairnResource::IssueMessages { number, .. }
@@ -597,11 +680,13 @@ impl CairnResource {
             CairnResource::Node { node_id, .. }
             | CairnResource::NodeChat { node_id, .. }
             | CairnResource::NodeChatFull { node_id, .. }
+            | CairnResource::NodeChatTurn { node_id, .. }
             | CairnResource::NodeChatEvent { node_id, .. }
             | CairnResource::NodeArtifact { node_id, .. }
             | CairnResource::NodeTerminal { node_id, .. }
             | CairnResource::TaskChat { node_id, .. }
             | CairnResource::TaskChatFull { node_id, .. }
+            | CairnResource::TaskChatTurn { node_id, .. }
             | CairnResource::TaskChatEvent { node_id, .. }
             | CairnResource::TaskArtifact { node_id, .. }
             | CairnResource::NodeFiles { node_id, .. } => Some(node_id),
@@ -722,6 +807,18 @@ fn parse_issue_scoped(project: &str, number: i32, parts: &[&str]) -> Option<Cair
             node_id: node_id.to_string(),
         }),
 
+        // cairn://PROJECT/NUMBER/EXEC/NODE/chat/turn/N
+        [node_id, "chat", "turn", turn_seq_str] => {
+            let turn_seq = turn_seq_str.parse().ok()?;
+            Some(CairnResource::NodeChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id: node_id.to_string(),
+                turn_seq,
+            })
+        }
+
         // cairn://PROJECT/NUMBER/EXEC/NODE/chat/RUN_SEQ/EVENT_SEQ
         [node_id, "chat", run_seq_str, event_seq_str] => {
             let run_seq = run_seq_str.parse().ok()?;
@@ -778,6 +875,19 @@ fn parse_issue_scoped(project: &str, number: i32, parts: &[&str]) -> Option<Cair
             node_id: node_id.to_string(),
             task_name: task_name.to_string(),
         }),
+
+        // cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/turn/N
+        [node_id, "task", task_name, "chat", "turn", turn_seq_str] => {
+            let turn_seq = turn_seq_str.parse().ok()?;
+            Some(CairnResource::TaskChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id: node_id.to_string(),
+                task_name: task_name.to_string(),
+                turn_seq,
+            })
+        }
 
         // cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/RUN_SEQ/EVENT_SEQ
         [node_id, "task", task_name, "chat", run_seq_str, event_seq_str] => {
@@ -914,6 +1024,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_node_chat_turn() {
+        let result = parse_uri("cairn://CAIRN/123/1/builder-1/chat/turn/3").unwrap();
+        assert_eq!(
+            result,
+            CairnResource::NodeChatTurn {
+                project: "CAIRN".to_string(),
+                number: 123,
+                exec_seq: 1,
+                node_id: "builder-1".to_string(),
+                turn_seq: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_node_chat_turn_does_not_collide_with_event() {
+        // "turn" is a literal, not an integer — should not parse as NodeChatEvent
+        let turn = parse_uri("cairn://CAIRN/123/1/builder-1/chat/turn/3").unwrap();
+        assert!(matches!(turn, CairnResource::NodeChatTurn { .. }));
+
+        // Integer pair should still parse as NodeChatEvent
+        let event = parse_uri("cairn://CAIRN/123/1/builder-1/chat/1/5").unwrap();
+        assert!(matches!(event, CairnResource::NodeChatEvent { .. }));
+    }
+
+    #[test]
     fn test_parse_node_chat_event() {
         let result = parse_uri("cairn://CAIRN/123/1/builder-1/chat/1/5").unwrap();
         assert_eq!(
@@ -988,6 +1124,31 @@ mod tests {
                 task_name: "Explore".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_parse_task_chat_turn() {
+        let result = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/turn/3").unwrap();
+        assert_eq!(
+            result,
+            CairnResource::TaskChatTurn {
+                project: "CAIRN".to_string(),
+                number: 123,
+                exec_seq: 1,
+                node_id: "builder-1".to_string(),
+                task_name: "Explore".to_string(),
+                turn_seq: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_task_chat_turn_does_not_collide_with_event() {
+        let turn = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/turn/3").unwrap();
+        assert!(matches!(turn, CairnResource::TaskChatTurn { .. }));
+
+        let event = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/2/10").unwrap();
+        assert!(matches!(event, CairnResource::TaskChatEvent { .. }));
     }
 
     #[test]
@@ -1165,6 +1326,13 @@ mod tests {
                 exec_seq: 1,
                 node_id: "builder-1".to_string(),
             },
+            CairnResource::NodeChatTurn {
+                project: "CAIRN".to_string(),
+                number: 123,
+                exec_seq: 1,
+                node_id: "builder-1".to_string(),
+                turn_seq: 3,
+            },
             CairnResource::NodeChatEvent {
                 project: "CAIRN".to_string(),
                 number: 123,
@@ -1199,6 +1367,14 @@ mod tests {
                 exec_seq: 1,
                 node_id: "builder-1".to_string(),
                 task_name: "Explore".to_string(),
+            },
+            CairnResource::TaskChatTurn {
+                project: "CAIRN".to_string(),
+                number: 123,
+                exec_seq: 1,
+                node_id: "builder-1".to_string(),
+                task_name: "Explore".to_string(),
+                turn_seq: 3,
             },
             CairnResource::TaskChatEvent {
                 project: "CAIRN".to_string(),
@@ -1319,6 +1495,22 @@ mod tests {
         assert_eq!(
             resource.to_route(),
             "/p/cairn/i/123/1/builder-1/task/Explore/chat"
+        );
+    }
+
+    #[test]
+    fn test_to_route_task_chat_turn() {
+        let resource = CairnResource::TaskChatTurn {
+            project: "CAIRN".to_string(),
+            number: 123,
+            exec_seq: 1,
+            node_id: "builder-1".to_string(),
+            task_name: "Explore".to_string(),
+            turn_seq: 3,
+        };
+        assert_eq!(
+            resource.to_route(),
+            "/p/cairn/i/123/1/builder-1/task/Explore/chat/turn/3"
         );
     }
 

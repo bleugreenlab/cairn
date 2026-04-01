@@ -2,7 +2,11 @@
 name = "cairn-core"
 version = "0.1.0"
 edition = "2021"
-description = "Core business logic library for Cairn - no Tauri dependency"
+description = "Core business logic library for Cairn agent orchestration — no Tauri dependency"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "mcp"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -12,7 +16,7 @@ diesel_migrations = "2.2"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 regex = "1"
 evalexpr = "11"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["time", "rt", "macros", "sync", "net", "process"] }
 portable-pty = "0.8"
 log = "0.4"
@@ -23,18 +27,40 @@ serde_yaml = "0.9"
 json5 = "0.4"
 base64 = "0.22"
 rand = "0.8"
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hostname = "0.4"
+whoami = "1"
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
+async-trait = "0.1"
 cairn-common = { path = "../cairn-common" }
+ignore = "0.4"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
 tempfile = "3"
+fastembed = "5"
+crossbeam-channel = "0.5"
+zip = "4.2"
 
 # Optional: test utilities (mocking)
 mockall = { version = "0.13", optional = true }
+jsonwebtoken = "9.3.1"
 
 [dev-dependencies]
+filetime = "0.2"
 mockall = "0.13"
 serde_json = "1.0"
 tempfile = "3"
+cairn-core = { path = ".", features = ["test-utils"] }
 
 [features]
-test-utils = ["dep:mockall"]
+internal-api = []
+test-utils = ["dep:mockall", "internal-api"]
+
+[[example]]
+name = "backfill_embeddings"
+required-features = ["internal-api"]

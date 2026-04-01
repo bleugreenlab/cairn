@@ -129,7 +129,7 @@ pub fn save_recipe(
     // Determine target path
     let path = if file_recipe.file_path.as_os_str().is_empty() {
         // No existing path - determine from scope
-        let filename = format!("{}.yaml", crate::config::slugify(&file_recipe.recipe.name));
+        let filename = format!("{}.yaml", &file_recipe.recipe.id);
         if file_recipe.is_project_scoped {
             let proj_path =
                 project_path.ok_or("Project path required for project-scoped recipe")?;
@@ -253,6 +253,39 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn minimal_recipe(id: &str, name: &str) -> Recipe {
+        use crate::models::{NodePosition, RecipeNode, RecipeNodeType, RecipeTrigger};
+        Recipe {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            is_default: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![RecipeNode {
+                id: "t1".to_string(),
+                node_type: RecipeNodeType::Trigger,
+                name: "Trigger".to_string(),
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: None,
+                agent_config: None,
+                action_config: None,
+                checkpoint_config: None,
+                artifact_config: None,
+                condition_config: None,
+                context_config: None,
+            }],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
     #[test]
     fn test_load_recipe_roundtrip() {
         let temp = tempdir().unwrap();
@@ -289,5 +322,133 @@ edges: []
             }
             ConfigResult::Err { error, .. } => panic!("Failed to load: {}", error),
         }
+    }
+
+    /// save_recipe with empty file_path should use recipe.id for the filename,
+    /// NOT slugify(recipe.name). This was a bug where a recipe named
+    /// "My Recipe" would be saved as "my-recipe.yaml" instead of "{id}.yaml",
+    /// causing get_recipe (which looks up by id) to fail to find it.
+    #[test]
+    fn save_recipe_uses_id_for_filename() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path();
+
+        let recipe = minimal_recipe("custom-id", "My Fancy Recipe Name");
+        let file_recipe = FileRecipe {
+            recipe,
+            is_project_scoped: false,
+            file_path: PathBuf::new(), // empty → should derive from id
+        };
+
+        let saved_path = save_recipe(config_dir, &file_recipe, None).unwrap();
+
+        // The filename must be "{id}.yaml", not "my-fancy-recipe-name.yaml"
+        assert_eq!(
+            saved_path.file_name().unwrap().to_str().unwrap(),
+            "custom-id.yaml"
+        );
+
+        // Round-trip: get_recipe should find it by id
+        let loaded = get_recipe(config_dir, "custom-id", None)
+            .unwrap()
+            .expect("should find recipe by id");
+        assert_eq!(loaded.recipe.name, "My Fancy Recipe Name");
+    }
+
+    /// save_recipe with an explicit file_path should use that path, not derive one.
+    #[test]
+    fn save_recipe_respects_existing_file_path() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path();
+        let explicit_path = config_dir.join("recipes").join("explicit-name.yaml");
+
+        let recipe = minimal_recipe("some-id", "Some Recipe");
+        let file_recipe = FileRecipe {
+            recipe,
+            is_project_scoped: false,
+            file_path: explicit_path.clone(),
+        };
+
+        let saved_path = save_recipe(config_dir, &file_recipe, None).unwrap();
+        assert_eq!(saved_path, explicit_path);
+    }
+
+    /// save_recipe for a project-scoped recipe with empty file_path should
+    /// place the file under the project's .cairn/recipes/ directory using the id.
+    #[test]
+    fn save_recipe_project_scoped_uses_id() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let mut recipe = minimal_recipe("proj-recipe", "Project Recipe");
+        recipe.workspace_id = None;
+        recipe.project_id = Some("proj-1".to_string());
+
+        let file_recipe = FileRecipe {
+            recipe,
+            is_project_scoped: true,
+            file_path: PathBuf::new(),
+        };
+
+        let saved_path = save_recipe(&config_dir, &file_recipe, Some(&project_dir)).unwrap();
+
+        assert_eq!(
+            saved_path,
+            project_dir
+                .join(".cairn")
+                .join("recipes")
+                .join("proj-recipe.yaml")
+        );
+
+        // Verify it can be loaded back from the project scope
+        let loaded = get_recipe(&config_dir, "proj-recipe", Some(&project_dir))
+            .unwrap()
+            .expect("should find project-scoped recipe");
+        assert!(loaded.is_project_scoped);
+    }
+
+    /// get_recipe should prefer project scope over workspace when both exist.
+    #[test]
+    fn get_recipe_project_shadows_workspace() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let project_dir = temp.path().join("project");
+
+        // Create workspace recipe
+        let ws_recipe = minimal_recipe("shared", "Workspace Version");
+        let ws_file = FileRecipe {
+            recipe: ws_recipe,
+            is_project_scoped: false,
+            file_path: PathBuf::new(),
+        };
+        save_recipe(&config_dir, &ws_file, None).unwrap();
+
+        // Create project recipe with same id
+        let mut proj_recipe = minimal_recipe("shared", "Project Version");
+        proj_recipe.workspace_id = None;
+        proj_recipe.project_id = Some("p1".to_string());
+        let proj_file = FileRecipe {
+            recipe: proj_recipe,
+            is_project_scoped: true,
+            file_path: PathBuf::new(),
+        };
+        save_recipe(&config_dir, &proj_file, Some(&project_dir)).unwrap();
+
+        // With project context, project version wins
+        let loaded = get_recipe(&config_dir, "shared", Some(&project_dir))
+            .unwrap()
+            .expect("should find recipe");
+        assert_eq!(loaded.recipe.name, "Project Version");
+        assert!(loaded.is_project_scoped);
+
+        // Without project context, workspace version is returned
+        let loaded_ws = get_recipe(&config_dir, "shared", None)
+            .unwrap()
+            .expect("should find workspace recipe");
+        assert_eq!(loaded_ws.recipe.name, "Workspace Version");
+        assert!(!loaded_ws.is_project_scoped);
     }
 }

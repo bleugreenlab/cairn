@@ -9,17 +9,166 @@
 //! of `AppHandle`.
 
 use crate::diesel_models::{
-    DbActionConfig, DbActionRun, DbArtifact, DbJob, DbRecipeNode, NewPrData, UpdateIssueChangeset,
+    DbActionConfig, DbActionRun, DbArtifact, DbJob, DbMergeRequest, DbRecipeNode, NewMergeRequest,
+    UpdateActionRunChangeset,
 };
 use crate::models::{
     interpolate_template, ActionConfig, ActionNodeConfig, ExecutionSnapshot, RecipeEdge, RecipeNode,
 };
 use crate::orchestrator::Orchestrator;
-use crate::schema::{action_configs, action_runs, artifacts, executions, issues, jobs, pr_data};
+use crate::schema::{
+    action_configs, action_runs, artifacts, executions, issues, jobs, merge_requests, projects,
+};
 use diesel::prelude::*;
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::process::Command;
+
+// ============================================================================
+// Shared helpers — called by both Tauri and cairn-server hosts
+// ============================================================================
+
+/// Load the DbRecipeNode for an action_run from the execution snapshot.
+///
+/// Both hosts need this when handling `WorkflowEffect::ExecuteAction`.
+pub fn load_action_node(
+    orch: &Orchestrator,
+    action_run_id: &str,
+    execution_id: &str,
+) -> Result<DbRecipeNode, String> {
+    let mut conn = orch
+        .db
+        .conn
+        .lock()
+        .map_err(|e| format!("DB lock failed: {}", e))?;
+
+    let node_id: String = action_runs::table
+        .find(action_run_id)
+        .select(action_runs::recipe_node_id)
+        .first(&mut *conn)
+        .map_err(|e| format!("action_run not found: {}", e))?;
+
+    let nodes = crate::execution::dag::load_nodes_from_execution(&mut conn, execution_id)?;
+
+    nodes
+        .into_iter()
+        .find(|n| n.id == node_id)
+        .ok_or_else(|| format!("Node {} not found in snapshot", node_id))
+}
+
+/// Find the worktree path for the execution that owns an action_run.
+///
+/// Both hosts use identical logic: look up execution_id from the action_run,
+/// then find the first job in that execution with a worktree_path.
+pub fn find_worktree_for_action_run(
+    orch: &Orchestrator,
+    action_run_id: &str,
+) -> Result<String, String> {
+    let mut conn = orch
+        .db
+        .conn
+        .lock()
+        .map_err(|e| format!("Failed to lock database: {}", e))?;
+
+    let execution_id: String = action_runs::table
+        .find(action_run_id)
+        .select(action_runs::execution_id)
+        .first(&mut *conn)
+        .map_err(|e| format!("Action run not found: {}", e))?;
+
+    let worktree: Option<String> = jobs::table
+        .filter(jobs::execution_id.eq(&execution_id))
+        .filter(jobs::worktree_path.is_not_null())
+        .select(jobs::worktree_path)
+        .first(&mut *conn)
+        .ok()
+        .flatten();
+
+    worktree.ok_or_else(|| "No worktree found for action checkpoint".to_string())
+}
+
+/// Complete an action_run after execution: run programmatic checkpoint if
+/// configured, then mark the action_run as complete in the database.
+///
+/// This is the shared post-execution logic that was duplicated in both
+/// Tauri's `advancement.rs` and cairn-server's `event_loop.rs`.
+pub async fn complete_action_run(
+    orch: &Orchestrator,
+    action_run_id: &str,
+    node: &DbRecipeNode,
+    result: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, String> {
+    // Check for programmatic checkpoint in action node config
+    if let Some(ref config_json) = node.config {
+        if let Ok(config) = serde_json::from_str::<crate::models::NodeConfig>(config_json) {
+            if let Some(checkpoint) = config.checkpoint {
+                if matches!(
+                    checkpoint.checkpoint_type,
+                    crate::models::CheckpointType::Programmatic
+                ) {
+                    log::info!(
+                        "Action node {} has programmatic checkpoint, executing...",
+                        node.name
+                    );
+
+                    let command = checkpoint.command.unwrap_or_else(|| "exit 0".to_string());
+                    let worktree = find_worktree_for_action_run(orch, action_run_id)?;
+
+                    match crate::execution::conditions::execute_programmatic_checkpoint(
+                        &worktree, &command,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            log::info!("Action node programmatic checkpoint passed");
+                        }
+                        Ok(false) => {
+                            return Err(format!("Programmatic checkpoint failed: {}", command));
+                        }
+                        Err(e) => {
+                            return Err(format!("Checkpoint execution error: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Mark action_run as complete
+    {
+        let mut conn = orch
+            .db
+            .conn
+            .lock()
+            .map_err(|e| format!("Failed to lock database: {}", e))?;
+
+        let now = chrono::Utc::now().timestamp() as i32;
+        let output_json = result.as_ref().map(|v| v.to_string());
+
+        let changeset = UpdateActionRunChangeset {
+            status: Some("complete"),
+            output: Some(output_json.as_deref()),
+            completed_at: Some(Some(now)),
+            ..Default::default()
+        };
+
+        diesel::update(action_runs::table.find(action_run_id))
+            .set(&changeset)
+            .execute(&mut *conn)
+            .map_err(|e| format!("Failed to update action_run: {}", e))?;
+
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "action_runs", "action": "update"}),
+        );
+    }
+
+    Ok(result)
+}
+
+// ============================================================================
+// Action execution internals
+// ============================================================================
 
 /// Load recipe nodes and edges from execution snapshot.
 fn load_recipe_data_from_snapshot(
@@ -76,17 +225,6 @@ pub async fn execute_action_node(
     } else {
         execute_shell_action(orch, &action_run, &action_config, inputs).await?
     };
-
-    // Handle issue status updates for certain actions
-    if action_config.id == "builtin:create_pr" {
-        if let Some(issue_id) = &action_run.issue_id {
-            update_issue_status_with_wait_state(orch, issue_id, "waiting", Some("pr_review"))?;
-        }
-    } else if action_config.id == "builtin:close_issue" {
-        if let Some(issue_id) = &action_run.issue_id {
-            update_issue_status_with_wait_state(orch, issue_id, "closed", None)?;
-        }
-    }
 
     log::info!(
         "Action node '{}' completed for action_run {}",
@@ -213,7 +351,7 @@ async fn execute_shell_action(
 
 /// Get the working directory for an action.
 fn get_action_working_dir(orch: &Orchestrator, action_run: &DbActionRun) -> Result<String, String> {
-    find_implementation_context(orch, action_run).map(|(wt, _)| wt)
+    find_implementation_context(orch, action_run).map(|(wt, _, _)| wt)
 }
 
 /// Resolve input values for an action from context edges.
@@ -348,7 +486,7 @@ async fn handle_create_pr(
     action_run: &DbActionRun,
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, String> {
-    let (worktree_path, branch_name) = find_implementation_context(orch, action_run)?;
+    let (worktree_path, branch_name, base_branch) = find_implementation_context(orch, action_run)?;
     let (title, body) = extract_pr_details(&inputs, orch, action_run)?;
 
     log::info!("Creating PR for branch {}", branch_name);
@@ -360,6 +498,10 @@ async fn handle_create_pr(
     let mut args = vec!["pr", "create", "--title", &title, "--body"];
     let body_str = body.as_deref().unwrap_or("");
     args.push(body_str);
+    if let Some(ref base) = base_branch {
+        args.push("--base");
+        args.push(base.as_str());
+    }
 
     let output = crate::env::gh()
         .args(&args)
@@ -446,63 +588,83 @@ async fn handle_create_pr(
         (pr_url, pr_number)
     };
 
-    // Store or update pr_data linked to this action_run
+    // Store or update merge_request linked to the parent job
     let now = chrono::Utc::now().timestamp() as i32;
     {
         let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
 
-        // Check if pr_data already exists for this PR number
-        let existing_pr: Option<crate::diesel_models::DbPrData> = pr_data::table
-            .filter(pr_data::pr_number.eq(pr_number))
+        // Resolve the parent job_id for this action_run
+        let parent_job_id = action_run
+            .parent_job_id
+            .as_deref()
+            .ok_or("Action run has no parent_job_id")?;
+
+        // Check if merge_request already exists for this job
+        let existing_mr: Option<DbMergeRequest> = merge_requests::table
+            .filter(merge_requests::job_id.eq(parent_job_id))
             .first(&mut *conn)
             .optional()
-            .map_err(|e| format!("Failed to check existing pr_data: {}", e))?;
+            .map_err(|e| format!("Failed to check existing merge_request: {}", e))?;
 
-        if let Some(existing) = existing_pr {
-            log::info!("Updating existing pr_data for PR #{}", pr_number);
-            diesel::update(pr_data::table.filter(pr_data::id.eq(&existing.id)))
+        if let Some(existing) = existing_mr {
+            log::info!("Updating existing merge_request for job {}", parent_job_id);
+            diesel::update(merge_requests::table.filter(merge_requests::id.eq(&existing.id)))
                 .set((
-                    pr_data::action_run_id.eq(Some(&action_run.id)),
-                    pr_data::pr_url.eq(&pr_url),
+                    merge_requests::github_pr_number.eq(Some(pr_number)),
+                    merge_requests::github_pr_url.eq(Some(&pr_url)),
+                    merge_requests::github_state.eq(Some("OPEN")),
+                    merge_requests::updated_at.eq(now),
                 ))
                 .execute(&mut *conn)
-                .map_err(|e| format!("Failed to update pr_data: {}", e))?;
+                .map_err(|e| format!("Failed to update merge_request: {}", e))?;
         } else {
-            log::info!("Creating new pr_data for PR #{}", pr_number);
-            let pr_data_id = uuid::Uuid::new_v4().to_string();
-            let new_pr_data = NewPrData {
-                id: &pr_data_id,
-                action_run_id: Some(&action_run.id),
-                pr_number,
-                pr_url: &pr_url,
-                pr_status: "open",
-                title: None,
-                body: None,
-                state: None,
-                is_draft: None,
-                review_decision: None,
-                mergeable: None,
+            log::info!("Creating new merge_request for job {}", parent_job_id);
+            let mr_id = uuid::Uuid::new_v4().to_string();
+
+            // Look up project's default branch for target_branch
+            let default_branch: String = projects::table
+                .find(&action_run.project_id)
+                .select(projects::default_branch)
+                .first::<Option<String>>(&mut *conn)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "main".to_string());
+
+            let new_mr = NewMergeRequest {
+                id: &mr_id,
+                job_id: parent_job_id,
+                project_id: &action_run.project_id,
+                issue_id: action_run.issue_id.as_deref(),
+                manager_id: None,
+                title: &title,
+                body: body.as_deref(),
+                source_branch: &branch_name,
+                target_branch: base_branch.as_deref().unwrap_or(&default_branch),
+                status: "open",
+                merge_method: "squash",
                 additions: None,
                 deletions: None,
-                checks_status: None,
+                changed_files: None,
+                commit_count: None,
                 checks_json: None,
-                fetched_at: None,
-                opened_at: Some(now),
-                merged_at: None,
-                closed_at: None,
+                checks_status: None,
+                opened_at: now,
                 updated_at: now,
+                github_pr_number: Some(pr_number),
+                github_pr_url: Some(&pr_url),
+                github_state: Some("OPEN"),
             };
 
-            diesel::insert_into(pr_data::table)
-                .values(&new_pr_data)
+            diesel::insert_into(merge_requests::table)
+                .values(&new_mr)
                 .execute(&mut *conn)
-                .map_err(|e| format!("Failed to create pr_data: {}", e))?;
+                .map_err(|e| format!("Failed to create merge_request: {}", e))?;
         }
     }
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "pr_data", "action": "update"}),
+        serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
 
     Ok(Some(serde_json::json!({ "pr_url": pr_url })))
@@ -513,7 +675,7 @@ async fn handle_merge_pr(
     orch: &Orchestrator,
     action_run: &DbActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
-    let (worktree_path, _) = find_implementation_context(orch, action_run)?;
+    let (worktree_path, _, _) = find_implementation_context(orch, action_run)?;
 
     // Get merge method from settings
     let merge_method = orch.get_settings().merge_type.to_string();
@@ -530,42 +692,39 @@ async fn handle_merge_pr(
         return Err(format!("gh pr merge failed: {}", stderr));
     }
 
-    // Update pr_data status
+    // Update merge_request status
     let now = chrono::Utc::now().timestamp() as i32;
     {
-        let pr_action_run_id = find_pr_action_run_id(orch, action_run)?;
+        let mr_job_id = find_mr_job_id(orch, action_run)?;
         let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
 
-        use crate::diesel_models::UpdatePrDataChangeset;
-        let pr_update = UpdatePrDataChangeset {
-            pr_status: Some("merged"),
+        use crate::diesel_models::UpdateMergeRequestStatus;
+        let mr_update = UpdateMergeRequestStatus {
+            status: Some("merged"),
             merged_at: Some(Some(now)),
             ..Default::default()
         };
 
-        diesel::update(pr_data::table.filter(pr_data::action_run_id.eq(Some(&pr_action_run_id))))
-            .set(&pr_update)
+        diesel::update(merge_requests::table.filter(merge_requests::job_id.eq(&mr_job_id)))
+            .set(&mr_update)
             .execute(&mut *conn)
-            .map_err(|e| format!("Failed to update pr_data: {}", e))?;
+            .map_err(|e| format!("Failed to update merge_request: {}", e))?;
 
-        // Update issue status to merged
+        // Resolve issue as merged
         if let Some(ref issue_id) = action_run.issue_id {
-            let issue_update = UpdateIssueChangeset {
-                status: Some("merged"),
-                updated_at: Some(now),
-                ..Default::default()
-            };
-
-            diesel::update(issues::table.find(issue_id))
-                .set(&issue_update)
-                .execute(&mut *conn)
-                .map_err(|e| format!("Failed to update issue: {}", e))?;
+            crate::transitions::resolve_issue(
+                &mut conn,
+                issue_id,
+                crate::transitions::Resolution::Merged,
+                None,
+            )
+            .map_err(|e| format!("Failed to resolve issue as merged: {}", e))?;
         }
     }
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "pr_data", "action": "update"}),
+        serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
     if action_run.issue_id.is_some() {
         let _ = orch.services.emitter.emit(
@@ -582,7 +741,7 @@ async fn handle_close_pr(
     orch: &Orchestrator,
     action_run: &DbActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
-    let (worktree_path, _) = find_implementation_context(orch, action_run)?;
+    let (worktree_path, _, _) = find_implementation_context(orch, action_run)?;
 
     let output = crate::env::gh()
         .args(["pr", "close"])
@@ -595,28 +754,28 @@ async fn handle_close_pr(
         return Err(format!("gh pr close failed: {}", stderr));
     }
 
-    // Update pr_data status
+    // Update merge_request status
     let now = chrono::Utc::now().timestamp() as i32;
     {
-        let pr_action_run_id = find_pr_action_run_id(orch, action_run)?;
+        let mr_job_id = find_mr_job_id(orch, action_run)?;
         let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
 
-        use crate::diesel_models::UpdatePrDataChangeset;
-        let pr_update = UpdatePrDataChangeset {
-            pr_status: Some("closed"),
+        use crate::diesel_models::UpdateMergeRequestStatus;
+        let mr_update = UpdateMergeRequestStatus {
+            status: Some("closed"),
             closed_at: Some(Some(now)),
             ..Default::default()
         };
 
-        diesel::update(pr_data::table.filter(pr_data::action_run_id.eq(Some(&pr_action_run_id))))
-            .set(&pr_update)
+        diesel::update(merge_requests::table.filter(merge_requests::job_id.eq(&mr_job_id)))
+            .set(&mr_update)
             .execute(&mut *conn)
-            .map_err(|e| format!("Failed to update pr_data: {}", e))?;
+            .map_err(|e| format!("Failed to update merge_request: {}", e))?;
     }
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "pr_data", "action": "update"}),
+        serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
 
     Ok(Some(serde_json::json!({ "closed": true })))
@@ -632,36 +791,47 @@ async fn handle_close_issue(
         .as_ref()
         .ok_or("close_issue requires an issue context")?;
 
-    update_issue_status_with_wait_state(orch, issue_id, "closed", None)?;
+    {
+        let mut conn = orch
+            .db
+            .conn
+            .lock()
+            .map_err(|e| format!("Failed to lock database: {}", e))?;
+        crate::transitions::resolve_issue(
+            &mut conn,
+            issue_id,
+            crate::transitions::Resolution::Closed,
+            None,
+        )
+        .map_err(|e| format!("Failed to resolve issue as closed: {}", e))?;
+    }
+
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "issues", "action": "update"}),
+    );
+
     Ok(Some(serde_json::json!({ "closed": true })))
 }
 
-/// Find the action_run ID that created the PR for this execution.
-fn find_pr_action_run_id(orch: &Orchestrator, action_run: &DbActionRun) -> Result<String, String> {
+/// Find the job_id that has a merge request for this execution.
+fn find_mr_job_id(orch: &Orchestrator, action_run: &DbActionRun) -> Result<String, String> {
     let mut conn = orch
         .db
         .conn
         .lock()
         .map_err(|e| format!("Failed to lock database: {}", e))?;
 
-    let pr: Option<crate::diesel_models::DbPrData> = pr_data::table
-        .filter(pr_data::action_run_id.is_not_null())
-        .inner_join(
-            action_runs::table.on(action_runs::id.eq(pr_data::action_run_id.assume_not_null())),
-        )
-        .filter(action_runs::execution_id.eq(&action_run.execution_id))
-        .select(crate::diesel_models::DbPrData::as_select())
+    // Find a merge_request whose job belongs to this execution
+    let mr_job_id: Option<String> = merge_requests::table
+        .inner_join(jobs::table.on(merge_requests::job_id.eq(jobs::id)))
+        .filter(jobs::execution_id.eq(&action_run.execution_id))
+        .select(merge_requests::job_id)
         .first(&mut *conn)
         .optional()
-        .map_err(|e| format!("Failed to query PR: {}", e))?;
+        .map_err(|e| format!("Failed to query merge request: {}", e))?;
 
-    if let Some(pr) = pr {
-        return pr
-            .action_run_id
-            .ok_or("PR has no action_run_id".to_string());
-    }
-
-    Err("No PR found for this execution".to_string())
+    mr_job_id.ok_or_else(|| "No merge request found for this execution".to_string())
 }
 
 // ============================================================================
@@ -727,7 +897,7 @@ fn extract_pr_details(
 fn find_implementation_context(
     orch: &Orchestrator,
     action_run: &DbActionRun,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, Option<String>), String> {
     let mut conn = orch
         .db
         .conn
@@ -758,7 +928,7 @@ fn find_implementation_context(
         if let Some(impl_job) = source_job {
             if let (Some(wt), Some(branch)) = (impl_job.worktree_path, impl_job.branch) {
                 log::info!("Found implementation context: branch={}", branch);
-                return Ok((wt, branch));
+                return Ok((wt, branch, impl_job.base_branch));
             }
         }
     }
@@ -776,44 +946,471 @@ fn find_implementation_context(
 
     if let Some(impl_job) = impl_job {
         if let (Some(wt), Some(branch)) = (impl_job.worktree_path, impl_job.branch) {
-            return Ok((wt, branch));
+            return Ok((wt, branch, impl_job.base_branch));
         }
     }
 
     Err("No implementation job found with worktree and branch".to_string())
 }
 
-/// Update issue status with optional wait_state.
-fn update_issue_status_with_wait_state(
-    orch: &Orchestrator,
-    issue_id: &str,
-    status: &str,
-    wait_state: Option<&str>,
-) -> Result<(), String> {
-    let mut conn = orch
-        .db
-        .conn
-        .lock()
-        .map_err(|e| format!("Failed to lock database: {}", e))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::diesel_models::{NewActionRun, NewJob};
+    use crate::orchestrator::Orchestrator;
+    use crate::schema::{action_runs, jobs};
+    use crate::services::testing::{MockProcessSpawner, TestServicesBuilder};
+    use crate::test_utils::{create_test_issue, create_test_project, test_diesel_conn};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
 
-    let now = chrono::Utc::now().timestamp() as i32;
+    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection) -> Orchestrator {
+        let db = Arc::new(DbState {
+            conn: Mutex::new(conn),
+        });
+        let process = MockProcessSpawner::new();
+        let services = Arc::new(TestServicesBuilder::new().with_process(process).build());
+        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
+            db.clone(),
+            services.emitter.clone(),
+        ));
+        let sync_tx = Arc::new(Mutex::new(None));
 
-    let changeset = UpdateIssueChangeset {
-        status: Some(status),
-        wait_state: Some(wait_state),
-        updated_at: Some(now),
-        ..Default::default()
-    };
+        Orchestrator {
+            db,
+            services: services.clone(),
+            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
+            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
+                "/tmp",
+            ))),
+            warm_gc: None,
+            pty_state: Arc::new(crate::services::PtyState::default()),
+            permission_responses: tokio::sync::broadcast::channel(16).0,
+            run_completions: tokio::sync::broadcast::channel(64).0,
+            prompt_responses: tokio::sync::broadcast::channel(16).0,
+            trigger_events: tokio::sync::broadcast::channel(256).0,
+            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            identity_store: Arc::new(Mutex::new(None)),
+            mcp_binary_path: "cairn-mcp".to_string(),
+            config_dir: std::path::PathBuf::from("/tmp"),
+            schema_dir: None,
+            mcp_callback_port: 3847,
+            embedding_engine: None,
+            vibe_state: None,
+            account_manager,
+            sync_tx: sync_tx.clone(),
+            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
+            api_config: crate::api::ApiConfig::default(),
+            effect_tx: None,
+            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            provider_usage_snapshots: Default::default(),
+            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
 
-    diesel::update(issues::table.find(issue_id))
-        .set(&changeset)
-        .execute(&mut *conn)
-        .map_err(|e| format!("Failed to update issue: {}", e))?;
+    fn insert_snapshot(
+        conn: &mut diesel::sqlite::SqliteConnection,
+        execution_id: &str,
+        issue_id: &str,
+        nodes_json: serde_json::Value,
+    ) {
+        let now = chrono::Utc::now().timestamp() as i32;
+        let snapshot = serde_json::json!({
+            "recipe": {
+                "id": "recipe-1",
+                "name": "test-recipe",
+                "trigger": "issue",
+                "context": "issue",
+                "nodes": nodes_json,
+                "edges": []
+            },
+            "agents": {},
+            "skills": {},
+            "tools": {},
+            "triggerContext": {
+                "projectId": "test-project",
+                "triggerType": "manual"
+            },
+            "createdAt": 0
+        });
 
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "issues", "action": "update"}),
-    );
+        diesel::sql_query(
+            "INSERT INTO executions (id, recipe_id, issue_id, status, started_at, seq, snapshot) \
+             VALUES (?, 'recipe-1', ?, 'running', ?, 1, ?)",
+        )
+        .bind::<diesel::sql_types::Text, _>(execution_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Some(issue_id))
+        .bind::<diesel::sql_types::Integer, _>(now)
+        .bind::<diesel::sql_types::Text, _>(&snapshot.to_string())
+        .execute(conn)
+        .unwrap();
+    }
 
-    Ok(())
+    fn insert_action_run(
+        conn: &mut diesel::sqlite::SqliteConnection,
+        id: &str,
+        execution_id: &str,
+        recipe_node_id: &str,
+        project_id: &str,
+    ) {
+        let now = chrono::Utc::now().timestamp() as i32;
+        let action_run = NewActionRun {
+            id,
+            execution_id,
+            recipe_node_id,
+            action_config_id: "test-action",
+            issue_id: None,
+            project_id,
+            status: "running",
+            inputs: None,
+            output: None,
+            error_message: None,
+            started_at: Some(now),
+            completed_at: None,
+            created_at: now,
+            parent_job_id: None,
+        };
+        diesel::insert_into(action_runs::table)
+            .values(&action_run)
+            .execute(conn)
+            .unwrap();
+    }
+
+    // =================================================================
+    // load_action_node
+    // =================================================================
+
+    #[test]
+    fn load_action_node_returns_matching_node() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "ACT");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test");
+        let execution_id = Uuid::new_v4().to_string();
+        let action_run_id = Uuid::new_v4().to_string();
+
+        insert_snapshot(
+            &mut conn,
+            &execution_id,
+            &issue_id,
+            serde_json::json!([
+                {
+                    "id": "action-1",
+                    "name": "Create PR",
+                    "nodeType": "action",
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "actionConfig": { "action": "create_pr" }
+                },
+                {
+                    "id": "agent-1",
+                    "name": "Builder",
+                    "nodeType": "agent",
+                    "position": { "x": 0.0, "y": 0.0 }
+                }
+            ]),
+        );
+
+        insert_action_run(
+            &mut conn,
+            &action_run_id,
+            &execution_id,
+            "action-1",
+            &project_id,
+        );
+
+        let orch = test_orchestrator(conn);
+        let node = load_action_node(&orch, &action_run_id, &execution_id).unwrap();
+        assert_eq!(node.id, "action-1");
+        assert_eq!(node.name, "Create PR");
+        assert_eq!(node.node_type, "action");
+    }
+
+    #[test]
+    fn load_action_node_errors_on_missing_action_run() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "ACT");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test");
+        let execution_id = Uuid::new_v4().to_string();
+
+        insert_snapshot(&mut conn, &execution_id, &issue_id, serde_json::json!([]));
+
+        let orch = test_orchestrator(conn);
+        let err = load_action_node(&orch, "nonexistent", &execution_id).unwrap_err();
+        assert!(err.contains("action_run not found"));
+    }
+
+    #[test]
+    fn load_action_node_errors_when_node_not_in_snapshot() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "ACT");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test");
+        let execution_id = Uuid::new_v4().to_string();
+        let action_run_id = Uuid::new_v4().to_string();
+
+        // Snapshot has no nodes
+        insert_snapshot(&mut conn, &execution_id, &issue_id, serde_json::json!([]));
+
+        // Action run points to a node that doesn't exist in snapshot
+        insert_action_run(
+            &mut conn,
+            &action_run_id,
+            &execution_id,
+            "missing-node",
+            &project_id,
+        );
+
+        let orch = test_orchestrator(conn);
+        let err = load_action_node(&orch, &action_run_id, &execution_id).unwrap_err();
+        assert!(err.contains("not found in snapshot"));
+    }
+
+    // =================================================================
+    // find_worktree_for_action_run
+    // =================================================================
+
+    #[test]
+    fn find_worktree_returns_path_from_job() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "ACT");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test");
+        let execution_id = Uuid::new_v4().to_string();
+        let action_run_id = Uuid::new_v4().to_string();
+
+        insert_snapshot(&mut conn, &execution_id, &issue_id, serde_json::json!([]));
+
+        insert_action_run(
+            &mut conn,
+            &action_run_id,
+            &execution_id,
+            "action-1",
+            &project_id,
+        );
+
+        // Insert job with worktree_path in same execution
+        let now = chrono::Utc::now().timestamp() as i32;
+        let job_id = Uuid::new_v4().to_string();
+        let job = NewJob {
+            id: &job_id,
+            execution_id: Some(&execution_id),
+            manager_id: None,
+            recipe_node_id: Some("builder-node"),
+            parent_job_id: None,
+            worktree_path: Some("/tmp/my-worktree"),
+            branch: Some("feature/test"),
+            base_commit: None,
+            current_session_id: None,
+            resume_session_id: None,
+            status: "complete",
+            agent_config_id: None,
+            issue_id: Some(&issue_id),
+            project_id: &project_id,
+            task_description: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            parent_tool_use_id: None,
+            task_index: None,
+            started_at: Some(now),
+            model: None,
+            node_name: None,
+            base_branch: None,
+            current_turn_id: None,
+        };
+        diesel::insert_into(jobs::table)
+            .values(&job)
+            .execute(&mut conn)
+            .unwrap();
+
+        let orch = test_orchestrator(conn);
+        let path = find_worktree_for_action_run(&orch, &action_run_id).unwrap();
+        assert_eq!(path, "/tmp/my-worktree");
+    }
+
+    #[test]
+    fn find_worktree_errors_when_no_job_has_worktree() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "ACT");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test");
+        let execution_id = Uuid::new_v4().to_string();
+        let action_run_id = Uuid::new_v4().to_string();
+
+        insert_snapshot(&mut conn, &execution_id, &issue_id, serde_json::json!([]));
+
+        insert_action_run(
+            &mut conn,
+            &action_run_id,
+            &execution_id,
+            "action-1",
+            &project_id,
+        );
+
+        // Insert job WITHOUT worktree_path
+        let now = chrono::Utc::now().timestamp() as i32;
+        let job_id = Uuid::new_v4().to_string();
+        let job = NewJob {
+            id: &job_id,
+            execution_id: Some(&execution_id),
+            manager_id: None,
+            recipe_node_id: Some("builder-node"),
+            parent_job_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            current_session_id: None,
+            resume_session_id: None,
+            status: "complete",
+            agent_config_id: None,
+            issue_id: Some(&issue_id),
+            project_id: &project_id,
+            task_description: None,
+            created_at: now,
+            updated_at: now,
+            completed_at: Some(now),
+            parent_tool_use_id: None,
+            task_index: None,
+            started_at: Some(now),
+            model: None,
+            node_name: None,
+            base_branch: None,
+            current_turn_id: None,
+        };
+        diesel::insert_into(jobs::table)
+            .values(&job)
+            .execute(&mut conn)
+            .unwrap();
+
+        let orch = test_orchestrator(conn);
+        let err = find_worktree_for_action_run(&orch, &action_run_id).unwrap_err();
+        assert!(err.contains("No worktree found"));
+    }
+
+    #[test]
+    fn find_worktree_errors_on_missing_action_run() {
+        let conn = test_diesel_conn();
+        let orch = test_orchestrator(conn);
+        let err = find_worktree_for_action_run(&orch, "nonexistent").unwrap_err();
+        assert!(err.contains("Action run not found"));
+    }
+
+    // =================================================================
+    // complete_action_run
+    // =================================================================
+
+    #[tokio::test]
+    async fn complete_action_run_marks_status_and_stores_output() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "ACT");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test");
+        let execution_id = Uuid::new_v4().to_string();
+        let action_run_id = Uuid::new_v4().to_string();
+
+        // Node with no checkpoint config
+        insert_snapshot(
+            &mut conn,
+            &execution_id,
+            &issue_id,
+            serde_json::json!([
+                {
+                    "id": "action-1",
+                    "name": "Deploy",
+                    "nodeType": "action",
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "actionConfig": { "action": "deploy" }
+                }
+            ]),
+        );
+
+        insert_action_run(
+            &mut conn,
+            &action_run_id,
+            &execution_id,
+            "action-1",
+            &project_id,
+        );
+
+        let node = {
+            let nodes =
+                crate::execution::dag::load_nodes_from_execution(&mut conn, &execution_id).unwrap();
+            nodes.into_iter().find(|n| n.id == "action-1").unwrap()
+        };
+
+        let orch = test_orchestrator(conn);
+        let result_value = serde_json::json!({ "stdout": "deployed" });
+        let result =
+            complete_action_run(&orch, &action_run_id, &node, Some(result_value.clone())).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(result_value.clone()));
+
+        // Verify DB state
+        let mut conn = orch.db.conn.lock().unwrap();
+        let (status, output, completed_at): (String, Option<String>, Option<i32>) =
+            action_runs::table
+                .find(&action_run_id)
+                .select((
+                    action_runs::status,
+                    action_runs::output,
+                    action_runs::completed_at,
+                ))
+                .first(&mut *conn)
+                .unwrap();
+
+        assert_eq!(status, "complete");
+        assert!(completed_at.is_some());
+        let stored_output: serde_json::Value = serde_json::from_str(&output.unwrap()).unwrap();
+        assert_eq!(stored_output, result_value);
+    }
+
+    #[tokio::test]
+    async fn complete_action_run_with_none_result() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "ACT");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test");
+        let execution_id = Uuid::new_v4().to_string();
+        let action_run_id = Uuid::new_v4().to_string();
+
+        insert_snapshot(
+            &mut conn,
+            &execution_id,
+            &issue_id,
+            serde_json::json!([
+                {
+                    "id": "action-1",
+                    "name": "Cleanup",
+                    "nodeType": "action",
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "actionConfig": { "action": "cleanup" }
+                }
+            ]),
+        );
+
+        insert_action_run(
+            &mut conn,
+            &action_run_id,
+            &execution_id,
+            "action-1",
+            &project_id,
+        );
+
+        let node = {
+            let nodes =
+                crate::execution::dag::load_nodes_from_execution(&mut conn, &execution_id).unwrap();
+            nodes.into_iter().find(|n| n.id == "action-1").unwrap()
+        };
+
+        let orch = test_orchestrator(conn);
+        let result = complete_action_run(&orch, &action_run_id, &node, None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), None);
+
+        // Verify output is null in DB
+        let mut conn = orch.db.conn.lock().unwrap();
+        let (status, output): (String, Option<String>) = action_runs::table
+            .find(&action_run_id)
+            .select((action_runs::status, action_runs::output))
+            .first(&mut *conn)
+            .unwrap();
+
+        assert_eq!(status, "complete");
+        assert!(output.is_none());
+    }
 }

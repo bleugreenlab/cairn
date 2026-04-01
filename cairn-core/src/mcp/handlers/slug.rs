@@ -130,17 +130,21 @@ pub fn ensure_unique_slug(
 /// Build a terminal resource URI using cairn:// scheme
 ///
 /// Format:
-/// - Node terminals: cairn://PROJECT/NUMBER/NODE/terminal/SLUG
+/// - Node terminals: cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG
 /// - Project terminals: cairn://PROJECT/terminal/SLUG
 pub fn build_terminal_uri(
     project_key: &str,
     issue_number: Option<i32>,
+    exec_seq: Option<i32>,
     node_id: Option<&str>,
     slug: &str,
 ) -> String {
-    match (issue_number, node_id) {
-        (Some(num), Some(node)) => {
-            format!("cairn://{}/{}/{}/terminal/{}", project_key, num, node, slug)
+    match (issue_number, exec_seq, node_id) {
+        (Some(num), Some(seq), Some(node)) => {
+            format!(
+                "cairn://{}/{}/{}/{}/terminal/{}",
+                project_key, num, seq, node, slug
+            )
         }
         _ => {
             // Project-level terminal (no issue/node context)

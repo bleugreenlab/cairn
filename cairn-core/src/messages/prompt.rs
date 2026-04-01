@@ -5,6 +5,7 @@
 //! - Recent message history from project + issue channels
 //! - Brief instructions for the message tool
 
+use crate::node_segments::visible_node_segment_or_name;
 use crate::schema::{executions, issues, jobs, projects, runs};
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
@@ -101,15 +102,26 @@ fn find_peer_agents(
     let mut query = jobs::table
         .filter(jobs::issue_id.eq(issue_id))
         .filter(jobs::status.ne("pending"))
-        .select((jobs::id, jobs::node_name, jobs::status, jobs::execution_id))
+        .select((
+            jobs::id,
+            jobs::node_name,
+            jobs::recipe_node_id,
+            jobs::status,
+            jobs::execution_id,
+        ))
         .into_boxed();
 
     if let Some(ref my_job_id) = current_job_id {
         query = query.filter(jobs::id.ne(my_job_id));
     }
 
-    let peers: Vec<(String, Option<String>, String, Option<String>)> =
-        query.load(conn).unwrap_or_default();
+    let peers: Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+    )> = query.load(conn).unwrap_or_default();
 
     // Look up project_key and issue_number for URI construction
     let project_key: Option<String> = issues::table
@@ -132,8 +144,8 @@ fn find_peer_agents(
 
     peers
         .into_iter()
-        .map(|(_id, name, status, exec_id)| {
-            let node_name = name.unwrap_or_else(|| "Agent".to_string());
+        .map(|(_id, name, recipe_node_id, status, exec_id)| {
+            let node_name = name.unwrap_or_else(|| "unknown".to_string());
 
             // Get execution sequence for URI
             let exec_seq = exec_id
@@ -149,7 +161,10 @@ fn find_peer_agents(
 
             let uri = format!(
                 "cairn://{}/{}/{}/{}",
-                project_key, issue_number, exec_seq, node_name
+                project_key,
+                issue_number,
+                exec_seq,
+                visible_node_segment_or_name(recipe_node_id.as_deref(), &node_name)
             );
 
             PeerAgent {

@@ -17,6 +17,10 @@ pub struct DbExecution {
     pub completed_at: Option<i32>,
     pub snapshot: Option<String>,
     pub seq: Option<i32>,
+    pub initiator_sub: Option<String>,
+    pub initiator_auth_mode: Option<String>,
+    pub initiator_org_id: Option<String>,
+    pub triggered_by: String,
 }
 
 #[derive(Debug, Insertable)]
@@ -31,6 +35,10 @@ pub struct NewExecution<'a> {
     pub completed_at: Option<i32>,
     pub snapshot: Option<&'a str>,
     pub seq: Option<i32>,
+    pub initiator_sub: Option<&'a str>,
+    pub initiator_auth_mode: Option<&'a str>,
+    pub initiator_org_id: Option<&'a str>,
+    pub triggered_by: &'a str,
 }
 
 #[derive(Debug, AsChangeset, Default)]

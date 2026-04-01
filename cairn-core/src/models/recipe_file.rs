@@ -9,9 +9,9 @@ use uuid::Uuid;
 
 use super::{
     ActionNodeConfig, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, CheckpointNodeConfig,
-    ConditionErrorBehavior, ConditionNodeConfig, ConditionType, ContextNodeConfig, NodePosition,
-    Recipe, RecipeContext, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger,
-    ScheduleConfig, SchemaConfig, TriggerConfig, WebhookFilters, WorktreeMode,
+    ConditionErrorBehavior, ConditionNodeConfig, ConditionType, ContextNodeConfig, EventFilter,
+    NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger,
+    ScheduleConfig, SchemaConfig, TriggerConfig, TriggerScope, WorktreeMode,
 };
 
 /// Generate a slug from a name (lowercase, hyphens, no special chars)
@@ -58,8 +58,10 @@ pub struct RecipeFile {
     pub description: Option<String>,
     /// When the recipe can be triggered
     pub trigger: RecipeTrigger,
-    /// Execution context
-    pub context: RecipeContext,
+    /// Legacy context field — read during deserialization for migration, never written.
+    /// Value is migrated into the trigger node's scope during into_recipe().
+    #[serde(default, skip_serializing)]
+    context: Option<String>,
     /// Node definitions
     pub nodes: Vec<RecipeFileNode>,
     /// Edge definitions
@@ -95,9 +97,11 @@ pub struct NodeFileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger_type: Option<RecipeTrigger>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<TriggerScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub schedule_config: Option<ScheduleConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub webhook_filters: Option<WebhookFilters>,
+    pub event_filter: Option<EventFilter>,
 
     // Agent config
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,7 +256,7 @@ impl From<Recipe> for RecipeFile {
             name: recipe.name,
             description: recipe.description,
             trigger: recipe.trigger,
-            context: recipe.context,
+            context: None,
             nodes,
             edges,
         }
@@ -286,6 +290,9 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
     // Trigger config
     if let Some(tc) = &node.trigger_config {
         config.trigger_type = Some(tc.trigger_type.clone());
+        config.scope = tc.scope.clone();
+        config.schedule_config = tc.schedule_config.clone();
+        config.event_filter = tc.event_filter.clone();
         has_config = true;
     }
 
@@ -366,12 +373,16 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
 // ============================================================================
 
 impl RecipeFile {
-    /// Convert to Recipe for import, generating new IDs
+    /// Convert to Recipe for import, generating new IDs.
+    ///
+    /// Handles legacy migration: if a top-level `context` field exists and the trigger
+    /// node has no scope, the context value is copied into the trigger node's scope.
     pub fn into_recipe(self, workspace_id: Option<String>, project_id: Option<String>) -> Recipe {
         let mut id_map: HashMap<String, String> = HashMap::new();
+        let legacy_context = self.context.clone();
 
         // Generate new IDs for all nodes
-        let nodes: Vec<RecipeNode> = self
+        let mut nodes: Vec<RecipeNode> = self
             .nodes
             .into_iter()
             .map(|n| {
@@ -380,6 +391,22 @@ impl RecipeFile {
                 n.into_node(new_id, &id_map)
             })
             .collect();
+
+        // Migrate legacy context field into trigger node scope
+        if let Some(ctx) = legacy_context {
+            let scope = ctx.parse::<TriggerScope>().ok();
+            if let Some(scope) = scope {
+                for node in &mut nodes {
+                    if node.node_type == RecipeNodeType::Trigger {
+                        if let Some(ref mut tc) = node.trigger_config {
+                            if tc.scope.is_none() {
+                                tc.scope = Some(scope.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Remap edge references
         let edges: Vec<RecipeEdge> = self
@@ -395,7 +422,6 @@ impl RecipeFile {
             name: self.name,
             description: self.description,
             trigger: self.trigger,
-            context: self.context,
             workspace_id,
             project_id,
             is_default: false,
@@ -499,17 +525,38 @@ impl RecipeFile {
                         if edge.edge_type != RecipeEdgeType::Control {
                             return false;
                         }
-                        // Check if source is an agent node
+                        // Check if source is an agent or executor node
                         let (source_node, _) = parse_node_handle(&edge.from);
-                        self.nodes
-                            .iter()
-                            .any(|n| n.id == source_node && n.node_type == RecipeNodeType::Agent)
+                        self.nodes.iter().any(|n| {
+                            n.id == source_node
+                                && (n.node_type == RecipeNodeType::Agent
+                                    || n.node_type == RecipeNodeType::Executor)
+                        })
                     });
                     if !has_agent_parent {
                         warnings.push(format!(
                             "Node '{}' uses worktree_mode 'inherit' but has no upstream agent node - ensure it follows an agent with worktree_mode 'own'",
                             node.name
                         ));
+                    }
+                }
+            }
+        }
+
+        // Validate accumulation settings on event filters
+        for node in &self.nodes {
+            if node.node_type != RecipeNodeType::Trigger {
+                continue;
+            }
+            if let Some(config) = &node.config {
+                if let Some(filter) = &config.event_filter {
+                    if let Some(every) = filter.every {
+                        if every < 1 {
+                            errors.push(format!(
+                                "Node '{}': eventFilter.every must be >= 1, got {}",
+                                node.name, every
+                            ));
+                        }
                     }
                 }
             }
@@ -533,8 +580,9 @@ impl RecipeFileNode {
         // Build type-specific configs
         let trigger_config = config.trigger_type.map(|t| TriggerConfig {
             trigger_type: t,
+            scope: config.scope.clone(),
             schedule_config: config.schedule_config.clone(),
-            webhook_filters: config.webhook_filters.clone(),
+            event_filter: config.event_filter.clone(),
         });
 
         let agent_config = if config.agent.is_some()
@@ -740,8 +788,7 @@ mod tests {
             id: "test-recipe-id".to_string(),
             name: "Test Recipe".to_string(),
             description: Some("A test recipe".to_string()),
-            trigger: RecipeTrigger::Issue,
-            context: RecipeContext::Issue,
+            trigger: RecipeTrigger::Manual,
             workspace_id: Some("default".to_string()),
             project_id: None,
             is_default: false,
@@ -756,9 +803,10 @@ mod tests {
                     position: NodePosition { x: 0.0, y: 100.0 },
                     parent_id: None,
                     trigger_config: Some(TriggerConfig {
-                        trigger_type: RecipeTrigger::Issue,
+                        trigger_type: RecipeTrigger::Manual,
+                        scope: Some(TriggerScope::Issue),
                         schedule_config: None,
-                        webhook_filters: None,
+                        event_filter: None,
                     }),
                     agent_config: None,
                     action_config: None,
@@ -808,7 +856,7 @@ mod tests {
 
         assert!(yaml.contains("cairnVersion: 1"));
         assert!(yaml.contains("name: Test Recipe"));
-        assert!(yaml.contains("trigger: issue"));
+        assert!(yaml.contains("trigger: manual"));
     }
 
     #[test]
@@ -868,8 +916,8 @@ mod tests {
             cairn_version: 1,
             name: "No Trigger".to_string(),
             description: None,
-            trigger: RecipeTrigger::Issue,
-            context: RecipeContext::Issue,
+            trigger: RecipeTrigger::Manual,
+            context: None,
             nodes: vec![RecipeFileNode {
                 id: "agent-1".to_string(),
                 node_type: RecipeNodeType::Agent,
@@ -892,8 +940,8 @@ mod tests {
             cairn_version: 1,
             name: "Bad Edge".to_string(),
             description: None,
-            trigger: RecipeTrigger::Issue,
-            context: RecipeContext::Issue,
+            trigger: RecipeTrigger::Manual,
+            context: None,
             nodes: vec![RecipeFileNode {
                 id: "trigger-1".to_string(),
                 node_type: RecipeNodeType::Trigger,
@@ -966,13 +1014,123 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_context_field_migration() {
+        // Old format with top-level context: "issue" should migrate into trigger scope
+        let yaml = r#"cairnVersion: 1
+name: Legacy Recipe
+trigger: issue
+context: issue
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: issue
+edges: []
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).unwrap();
+        let recipe = parsed.into_recipe(None, None);
+        let trigger_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .unwrap();
+        let tc = trigger_node.trigger_config.as_ref().unwrap();
+        assert_eq!(tc.trigger_type, RecipeTrigger::Manual); // "issue" maps to Manual
+        assert_eq!(tc.scope, Some(TriggerScope::Issue)); // context migrated to scope
+    }
+
+    #[test]
+    fn test_legacy_context_does_not_overwrite_existing_scope() {
+        // If trigger node already has a scope, the legacy context should not overwrite it
+        let yaml = r#"cairnVersion: 1
+name: Legacy With Scope
+trigger: manual
+context: issue
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: manual
+      scope: project
+edges: []
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).unwrap();
+        let recipe = parsed.into_recipe(None, None);
+        let trigger_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .unwrap();
+        let tc = trigger_node.trigger_config.as_ref().unwrap();
+        // Existing scope "project" should be preserved, not overwritten by context "issue"
+        assert_eq!(tc.scope, Some(TriggerScope::Project));
+    }
+
+    #[test]
+    fn test_no_context_field_leaves_scope_none() {
+        // Modern format without context field — scope stays as-is from trigger node
+        let yaml = r#"cairnVersion: 1
+name: Modern Recipe
+trigger: manual
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: manual
+edges: []
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).unwrap();
+        let recipe = parsed.into_recipe(None, None);
+        let trigger_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .unwrap();
+        let tc = trigger_node.trigger_config.as_ref().unwrap();
+        assert_eq!(tc.scope, None); // No context → no scope migration
+    }
+
+    #[test]
+    fn test_context_field_not_serialized() {
+        // The context field should never appear in serialized YAML output
+        let recipe = Recipe {
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_default: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("context:"),
+            "context field should not appear in serialized YAML, got:\n{}",
+            yaml
+        );
+    }
+
+    #[test]
     fn test_context_node_roundtrip() {
         let recipe = Recipe {
             id: "test-recipe".to_string(),
             name: "Context Test".to_string(),
             description: None,
-            trigger: RecipeTrigger::Issue,
-            context: RecipeContext::Issue,
+            trigger: RecipeTrigger::Manual,
             workspace_id: Some("default".to_string()),
             project_id: None,
             is_default: false,
@@ -987,9 +1145,10 @@ mod tests {
                     position: NodePosition { x: 0.0, y: 0.0 },
                     parent_id: None,
                     trigger_config: Some(TriggerConfig {
-                        trigger_type: RecipeTrigger::Issue,
+                        trigger_type: RecipeTrigger::Manual,
+                        scope: Some(TriggerScope::Issue),
                         schedule_config: None,
-                        webhook_filters: None,
+                        event_filter: None,
                     }),
                     agent_config: None,
                     action_config: None,
@@ -1045,5 +1204,131 @@ mod tests {
             context_config.content,
             "This is the context content.\n\nWith multiple lines."
         );
+    }
+
+    // =========================================================================
+    // Accumulation validation tests
+    // =========================================================================
+
+    fn make_trigger_recipe_with_filter(filter: Option<EventFilter>) -> RecipeFile {
+        RecipeFile {
+            cairn_version: 1,
+            name: "Test".to_string(),
+            description: None,
+            trigger: RecipeTrigger::SkillCalled,
+            context: None,
+            nodes: vec![RecipeFileNode {
+                id: "trigger-1".to_string(),
+                node_type: RecipeNodeType::Trigger,
+                name: "Trigger".to_string(),
+                position: "0@0".to_string(),
+                parent_id: None,
+                config: Some(NodeFileConfig {
+                    trigger_type: Some(RecipeTrigger::SkillCalled),
+                    event_filter: filter,
+                    ..Default::default()
+                }),
+            }],
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_every_zero_is_error() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: None,
+            node_filter: None,
+            every: Some(0),
+            group_by: Some("skillId".to_string()),
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("every must be >= 1")));
+    }
+
+    #[test]
+    fn validate_every_gt1_without_group_by_is_ok() {
+        // groupBy is auto-inferred by the accumulator, so omitting it is fine
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: Some(4),
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_every_1_without_group_by_is_ok() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: Some(1),
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_every_4_with_group_by_is_ok() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: Some(4),
+            group_by: Some("skillId".to_string()),
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_every_negative_is_error() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: None,
+            node_filter: None,
+            every: Some(-1),
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("every must be >= 1")));
+    }
+
+    #[test]
+    fn validate_no_every_is_ok() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: None,
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
     }
 }

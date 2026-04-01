@@ -14,6 +14,7 @@ pub struct DbPrompt {
     pub response: Option<String>,
     pub created_at: i32,
     pub answered_at: Option<i32>,
+    pub turn_id: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -25,6 +26,7 @@ pub struct NewPrompt<'a> {
     pub response: Option<&'a str>,
     pub created_at: i32,
     pub answered_at: Option<i32>,
+    pub turn_id: Option<&'a str>,
 }
 
 #[derive(Debug, AsChangeset, Default)]

@@ -48,47 +48,38 @@ fn deliver_direct(orch: &Orchestrator, message: &Message) {
 /// Send a message via stdin to a warm process to auto-resume it.
 fn stdin_push(orch: &Orchestrator, run_id: &str, message: &Message) {
     // Get session_id and stdin handle together
-    let (session_id, stdin_handle) = {
+    let session_id = {
         let processes = match orch.process_state.processes.lock() {
             Ok(p) => p,
             Err(_) => return,
         };
         match processes.get(run_id) {
             Some(p) => match &p.session_id {
-                Some(sid) => (sid.clone(), p.stdin.clone()),
+                Some(sid) => sid.clone(),
                 None => return,
             },
             None => return,
         }
     };
 
-    let mut stdin_guard = match stdin_handle.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-
-    if let Some(ref mut stdin) = *stdin_guard {
-        let content = format!("[Message from {}] {}", message.sender_name, message.content);
-        match crate::claude::stdin::send_user_message_with_images(
-            stdin,
-            &session_id,
-            &content,
-            None,
-            None,
-            None,
-        ) {
-            Ok(()) => {
-                log::info!(
-                    "Stdin push: direct message to warm process {}",
-                    &run_id[..run_id.len().min(8)]
-                );
-                // Drop the guard before transitioning state (needs process lock)
-                drop(stdin_guard);
-                orch.process_state.transition_to_active(run_id);
-            }
-            Err(e) => {
-                log::warn!("Failed to stdin push to {}: {}", run_id, e);
-            }
+    let content = format!("[Message from {}] {}", message.sender_name, message.content);
+    match crate::backends::stdin::send_user_message(
+        &orch.process_state,
+        run_id,
+        &content,
+        &session_id,
+        None,
+        None,
+    ) {
+        Ok(()) => {
+            log::info!(
+                "Stdin push: direct message to warm process {}",
+                &run_id[..run_id.len().min(8)]
+            );
+            orch.process_state.transition_to_active(run_id);
+        }
+        Err(e) => {
+            log::warn!("Failed to stdin push to {}: {}", run_id, e);
         }
     }
 }

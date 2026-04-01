@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::agents::{agent_to_markdown, parse_agent_markdown, AgentExportData};
-use crate::models::Model;
+use crate::models::{ApprovalPolicy, FilesystemScope, Model};
 
 use super::{id_from_path, ConfigResult};
 
@@ -21,11 +21,17 @@ pub struct FileAgent {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    pub model: Option<Model>,
-    pub permission_mode: Option<String>,
+    #[serde(alias = "model")]
+    pub tier: Option<Model>,
+    pub approval_policy: Option<ApprovalPolicy>,
+    pub filesystem_scope: Option<FilesystemScope>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub hooks: Option<serde_json::Value>,
+    /// Preferred backend when multiple providers are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "backend", alias = "backendPreference")]
+    pub backend_preference: Option<String>,
     /// Whether this agent is project-scoped (vs workspace-scoped)
     pub is_project_scoped: bool,
     /// Path to the source file
@@ -155,12 +161,14 @@ pub fn save_agent(
         name: &agent.name,
         description: &agent.description,
         tools: &agent.tools,
-        model: agent.model.as_ref().map(|m| m.to_string()).as_deref(),
+        tier: agent.tier.as_ref().map(|m| m.to_string()).as_deref(),
         prompt: &agent.prompt,
-        permission_mode: agent.permission_mode.as_deref(),
+        approval_policy: agent.approval_policy,
+        filesystem_scope: agent.filesystem_scope,
         disallowed_tools: agent.disallowed_tools.as_deref(),
         skills: agent.skills.as_deref(),
         hooks: agent.hooks.as_ref(),
+        backend_preference: agent.backend_preference.as_deref(),
     });
 
     // Write file
@@ -273,7 +281,7 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
 
     match parse_agent_markdown(&content) {
         Ok(parsed) => {
-            let model: Option<Model> = parsed.model.and_then(|m| m.parse().ok());
+            let tier: Option<Model> = parsed.tier.and_then(|m| m.parse().ok());
 
             ConfigResult::Ok(FileAgent {
                 id,
@@ -281,11 +289,13 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
                 description: parsed.description,
                 prompt: parsed.prompt,
                 tools: parsed.tools,
-                model,
-                permission_mode: parsed.permission_mode,
+                tier,
+                approval_policy: parsed.approval_policy,
+                filesystem_scope: parsed.filesystem_scope,
                 disallowed_tools: parsed.disallowed_tools,
                 skills: parsed.skills,
                 hooks: parsed.hooks,
+                backend_preference: parsed.backend_preference,
                 is_project_scoped,
                 file_path: path.to_path_buf(),
             })
@@ -313,7 +323,7 @@ description: A test agent
 tools:
   - Read
   - Write
-model: sonnet
+tier: sonnet
 ---
 
 You are a test agent.
@@ -328,7 +338,7 @@ You are a test agent.
                 assert_eq!(agent.name, "Test Agent");
                 assert_eq!(agent.description, "A test agent");
                 assert_eq!(agent.tools, vec!["Read", "Write"]);
-                assert_eq!(agent.model, Some(Model::Sonnet));
+                assert_eq!(agent.tier, Some(Model::new(Model::SONNET)));
                 assert!(!agent.is_project_scoped);
                 assert!(agent.prompt.contains("test agent"));
             }

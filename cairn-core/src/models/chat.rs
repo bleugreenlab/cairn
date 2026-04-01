@@ -43,7 +43,7 @@ impl std::str::FromStr for ChatStatus {
 pub struct Chat {
     pub id: String,
     pub project_id: String,
-    pub claude_session_id: Option<String>,
+    pub current_session_id: Option<String>,
     pub status: ChatStatus,
     pub created_at: i64,
     pub updated_at: i64,
@@ -54,7 +54,7 @@ impl From<DbChat> for Chat {
         Chat {
             id: db.id,
             project_id: db.project_id,
-            claude_session_id: db.claude_session_id,
+            current_session_id: db.current_session_id,
             status: db.status.parse().unwrap_or_default(),
             created_at: db.created_at as i64,
             updated_at: db.updated_at as i64,

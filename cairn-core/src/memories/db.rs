@@ -9,6 +9,12 @@ use crate::schema::{memories, memory_triggers};
 
 /// Convert a DbMemory + DbMemoryTriggers into a domain Memory.
 fn to_memory(db_memory: DbMemory, db_triggers: Vec<DbMemoryTrigger>) -> Memory {
+    let keywords: Vec<String> = db_memory
+        .keywords
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
     Memory {
         id: db_memory.id,
         project_id: db_memory.project_id,
@@ -33,6 +39,9 @@ fn to_memory(db_memory: DbMemory, db_triggers: Vec<DbMemoryTrigger>) -> Memory {
                 pattern: t.pattern,
             })
             .collect(),
+        scope: db_memory.scope,
+        keywords,
+        source_run_id: db_memory.source_run_id,
     }
 }
 
@@ -153,6 +162,7 @@ pub fn load_memory(conn: &mut SqliteConnection, memory_id: &str) -> Result<Memor
 }
 
 /// Create a new memory with its triggers.
+#[allow(clippy::too_many_arguments)]
 pub fn create_memory(
     conn: &mut SqliteConnection,
     id: &str,
@@ -161,6 +171,9 @@ pub fn create_memory(
     confidence: &str,
     source_issue: Option<&str>,
     triggers: &[(i32, &str, &str)], // (trigger_index, json_path, pattern)
+    scope: &str,
+    keywords: Option<&str>,
+    source_run_id: Option<&str>,
 ) -> Result<Memory, String> {
     let now = chrono::Utc::now().timestamp() as i32;
 
@@ -175,6 +188,9 @@ pub fn create_memory(
         surfaced_count: 0,
         last_surfaced_at: None,
         active: 1,
+        scope,
+        keywords,
+        source_run_id,
     };
 
     conn.transaction::<_, diesel::result::Error, _>(|conn| {
@@ -208,6 +224,8 @@ pub fn update_memory(
     content: Option<&str>,
     confidence: Option<&str>,
     active: Option<bool>,
+    scope: Option<&str>,
+    keywords: Option<Option<&str>>,
 ) -> Result<Memory, String> {
     let now = chrono::Utc::now().timestamp() as i32;
 
@@ -237,6 +255,25 @@ pub fn update_memory(
         diesel::update(memories::table.find(id))
             .set((
                 memories::active.eq(if active { 1 } else { 0 }),
+                memories::updated_at.eq(now),
+            ))
+            .execute(conn)
+            .map_err(|e| format!("Failed to update memory: {}", e))?;
+        updated = true;
+    }
+
+    if let Some(scope) = scope {
+        diesel::update(memories::table.find(id))
+            .set((memories::scope.eq(scope), memories::updated_at.eq(now)))
+            .execute(conn)
+            .map_err(|e| format!("Failed to update memory: {}", e))?;
+        updated = true;
+    }
+
+    if let Some(keywords) = keywords {
+        diesel::update(memories::table.find(id))
+            .set((
+                memories::keywords.eq(keywords),
                 memories::updated_at.eq(now),
             ))
             .execute(conn)

@@ -14,6 +14,7 @@ pub struct DbMessage {
     pub sender_run_id: Option<String>,
     pub sender_name: String,
     pub recipient_run_id: Option<String>,
+    pub recipient_manager_id: Option<String>,
     pub content: String,
     pub created_at: i32,
 }
@@ -27,6 +28,7 @@ pub struct NewMessage<'a> {
     pub sender_run_id: Option<&'a str>,
     pub sender_name: &'a str,
     pub recipient_run_id: Option<&'a str>,
+    pub recipient_manager_id: Option<&'a str>,
     pub content: &'a str,
     pub created_at: i32,
 }

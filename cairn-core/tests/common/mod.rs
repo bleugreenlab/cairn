@@ -4,7 +4,7 @@ use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
 use diesel_migrations::MigrationHarness;
 
-use cairn_core::db::MIGRATIONS;
+use cairn_core::internal::db::MIGRATIONS;
 
 /// Create an in-memory SQLite database with all migrations applied.
 pub fn test_conn() -> SqliteConnection {

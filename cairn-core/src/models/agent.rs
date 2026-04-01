@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::common::Model;
+use super::permissions::{ApprovalPolicy, FilesystemScope};
 
 /// Output schema for an agent - either a preset name or custom JSON Schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +36,8 @@ pub struct AgentConfig {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    pub model: Option<Model>,
+    #[serde(alias = "model")]
+    pub tier: Option<Model>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub created_at: i32,
@@ -44,8 +46,14 @@ pub struct AgentConfig {
     pub disallowed_tools: Option<Vec<String>>,
     /// Skills to inject into the prompt
     pub skills: Option<Vec<String>>,
-    /// Permission mode: "default", "acceptEdits", "bypassPermissions", etc.
-    pub permission_mode: Option<String>,
+    /// How tool invocations are approved
+    pub approval_policy: Option<ApprovalPolicy>,
+    /// What the agent can read/write on the filesystem
+    pub filesystem_scope: Option<FilesystemScope>,
+    /// Preferred backend to use when multiple providers are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "backend", alias = "backendPreference")]
+    pub backend_preference: Option<String>,
 }
 
 /// Input for creating an agent config
@@ -57,12 +65,16 @@ pub struct CreateAgentConfig {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    pub model: Option<Model>,
+    #[serde(alias = "model")]
+    pub tier: Option<Model>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
-    pub permission_mode: Option<String>,
+    pub approval_policy: Option<ApprovalPolicy>,
+    pub filesystem_scope: Option<FilesystemScope>,
+    #[serde(rename = "backend", alias = "backendPreference")]
+    pub backend_preference: Option<String>,
 }
 
 /// Input for updating an agent config
@@ -73,13 +85,16 @@ pub struct UpdateAgentConfig {
     pub description: Option<String>,
     pub prompt: Option<String>,
     pub tools: Option<Vec<String>>,
-    pub model: Option<Option<Model>>,
+    #[serde(alias = "model")]
+    pub tier: Option<Option<Model>>,
     pub disallowed_tools: Option<Option<Vec<String>>>,
     pub skills: Option<Option<Vec<String>>>,
     /// New scope: workspace_id = Some("default") for workspace, None for project
     pub workspace_id: Option<Option<String>>,
     /// New scope: project_id = Some(id) for project, None for workspace
     pub project_id: Option<Option<String>>,
-    /// Permission mode: "default", "acceptEdits", "bypassPermissions", etc.
-    pub permission_mode: Option<Option<String>>,
+    pub approval_policy: Option<Option<ApprovalPolicy>>,
+    pub filesystem_scope: Option<Option<FilesystemScope>>,
+    #[serde(rename = "backend", alias = "backendPreference")]
+    pub backend_preference: Option<Option<String>>,
 }

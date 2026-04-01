@@ -18,6 +18,7 @@ fn to_domain(db: DbMessage) -> Message {
         sender_run_id: db.sender_run_id,
         sender_name: db.sender_name,
         recipient_run_id: db.recipient_run_id,
+        recipient_manager_id: db.recipient_manager_id,
         content: db.content,
         created_at: db.created_at as i64,
     }
@@ -43,6 +44,7 @@ pub fn insert_message(
         sender_run_id,
         sender_name,
         recipient_run_id,
+        recipient_manager_id: None,
         content,
         created_at: now,
     };
@@ -300,6 +302,7 @@ mod tests {
             sender_run_id,
             sender_name,
             recipient_run_id: None,
+            recipient_manager_id: None,
             content,
             created_at: ts,
         };

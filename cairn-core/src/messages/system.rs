@@ -5,6 +5,7 @@
 //! of what's happening on the issue.
 
 use crate::models::ChannelType;
+use crate::node_segments::visible_node_segment_or_name;
 use crate::orchestrator::Orchestrator;
 use crate::schema::{executions, issues, jobs, projects, runs};
 use diesel::prelude::*;
@@ -80,16 +81,25 @@ struct JobContext {
 fn lookup_job_context(orch: &Orchestrator, job_id: &str) -> Option<JobContext> {
     let mut conn = orch.db.conn.lock().ok()?;
 
-    // Get job's issue_id, node_name, and execution_id (all nullable)
-    let (issue_id, node_name, execution_id): (Option<String>, Option<String>, Option<String>) =
-        jobs::table
-            .find(job_id)
-            .select((jobs::issue_id, jobs::node_name, jobs::execution_id))
-            .first(&mut *conn)
-            .ok()?;
+    // Get job's issue_id, recipe node id, node_name, and execution_id (all nullable)
+    let (issue_id, recipe_node_id, node_name, execution_id): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = jobs::table
+        .find(job_id)
+        .select((
+            jobs::issue_id,
+            jobs::recipe_node_id,
+            jobs::node_name,
+            jobs::execution_id,
+        ))
+        .first(&mut *conn)
+        .ok()?;
 
     let issue_id = issue_id?; // Skip if no issue
-    let node_name = node_name.unwrap_or_else(|| "Agent".to_string());
+    let node_name = node_name.unwrap_or_else(|| "unknown".to_string());
 
     // Resolve issue UUID to KEY/NUMBER format
     let (project_key, issue_number): (String, i32) = issues::table
@@ -102,7 +112,13 @@ fn lookup_job_context(orch: &Orchestrator, job_id: &str) -> Option<JobContext> {
     let issue_key = format!("{}/{}", project_key, issue_number);
 
     // Build cairn:// URI for identification
-    let uri = build_node_uri(&mut conn, &issue_id, execution_id.as_deref(), &node_name);
+    let uri = build_node_uri(
+        &mut conn,
+        &issue_id,
+        execution_id.as_deref(),
+        recipe_node_id.as_deref(),
+        &node_name,
+    );
 
     Some(JobContext {
         issue_key,
@@ -116,6 +132,7 @@ fn build_node_uri(
     conn: &mut diesel::SqliteConnection,
     issue_id: &str,
     execution_id: Option<&str>,
+    recipe_node_id: Option<&str>,
     node_name: &str,
 ) -> Option<String> {
     let (project_key, issue_number): (String, i32) = issues::table
@@ -134,13 +151,59 @@ fn build_node_uri(
             .flatten()
     });
 
+    let visible_node = visible_node_segment_or_name(recipe_node_id, node_name);
+
     Some(format!(
         "cairn://{}/{}/{}/{}",
         project_key,
         issue_number,
         exec_seq.unwrap_or(1),
-        node_name
+        visible_node
     ))
+}
+
+/// Emit a system message when a user creates a terminal for a job.
+/// Tells the agent about the terminal's URI so it can read output.
+pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, title: &str) {
+    let ctx = match lookup_job_context(orch, job_id) {
+        Some(ctx) => ctx,
+        None => return, // No issue context — standalone job, skip
+    };
+
+    // Build terminal URI from node URI
+    let terminal_uri = match &ctx.uri {
+        Some(node_uri) => format!("{}/terminal/{}", node_uri, slug),
+        None => return,
+    };
+
+    let content = format!(
+        "User opened terminal \"{}\" — read output with: {}",
+        title, terminal_uri
+    );
+
+    let mut conn = match orch.db.conn.lock() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let msg = super::db::insert_message(
+        &mut conn,
+        &ChannelType::Issue,
+        Some(&ctx.issue_key),
+        None, // No sender_run_id — user-initiated, all agents should see it
+        "system",
+        None,
+        &content,
+    );
+
+    if let Ok(msg) = msg {
+        drop(conn);
+        super::delivery::deliver(orch, &msg);
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "messages", "action": "insert"}),
+        );
+    }
 }
 
 /// Emit a system message for a run being continued (follow-up message sent).

@@ -1,14 +1,11 @@
-//! TOTP-style rolling passcode authentication for MCP callbacks.
+//! Shared secret bearer token authentication for MCP callbacks.
 //!
-//! Instead of per-session tokens with lifecycle management, we use a shared
-//! secret with time-based passcodes:
-//! - Secret is generated once and stored in `~/.cairn/mcp_auth_secret`
-//! - Both Tauri backend and MCP binary compute passcodes independently
-//! - Passcodes are valid for 60-second windows, accepting current + previous
-//!
-//! This eliminates token lifecycle issues with warm processes.
+//! The shared secret is stored in `~/.cairn/mcp_auth_secret` and passed to
+//! the MCP binary as a base64-encoded env var. The binary sends it directly
+//! as a static bearer token; the callback server compares it against the
+//! locally-stored secret.
 
-use cairn_common::auth::{current_time_step, generate_passcode_for_step, SECRET_LEN};
+use cairn_common::auth::SECRET_LEN;
 use rand::Rng;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -50,25 +47,18 @@ impl McpAuthState {
         Ok(base64_encode(&secret))
     }
 
-    /// Validate a passcode from an MCP callback request.
+    /// Validate a bearer token from an MCP callback request.
     ///
-    /// Accepts passcodes from current or previous time window (2-minute effective validity).
-    pub fn validate_passcode(&self, passcode: &str) -> Result<(), String> {
+    /// Compares the token directly against the base64-encoded shared secret.
+    pub fn validate_token(&self, token: &str) -> Result<(), String> {
         let secret = self.get_secret()?;
+        let expected = base64_encode(&secret);
 
-        // Check current window
-        let current = generate_passcode_for_step(&secret, current_time_step());
-        if passcode == current {
-            return Ok(());
+        if token == expected {
+            Ok(())
+        } else {
+            Err("Invalid token".to_string())
         }
-
-        // Check previous window (handles clock edge cases)
-        let prev = generate_passcode_for_step(&secret, current_time_step().saturating_sub(1));
-        if passcode == prev {
-            return Ok(());
-        }
-
-        Err("Invalid passcode".to_string())
     }
 }
 
@@ -126,61 +116,44 @@ fn get_or_create_secret(config_dir: &std::path::Path) -> Result<[u8; SECRET_LEN]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_common::auth::{decode_secret, generate_passcode};
+    use cairn_common::auth::decode_secret;
 
     #[test]
-    fn test_validate_passcode_current() {
+    fn test_validate_token_correct() {
         let secret: [u8; 32] = [0x42; 32];
         let auth_state = McpAuthState {
             secret: Mutex::new(Some(secret)),
             config_dir: PathBuf::from("/tmp"),
         };
 
-        let passcode = generate_passcode(&secret);
-        assert!(auth_state.validate_passcode(&passcode).is_ok());
+        let token = base64_encode(&secret);
+        assert!(auth_state.validate_token(&token).is_ok());
     }
 
     #[test]
-    fn test_validate_passcode_previous_window() {
+    fn test_validate_token_invalid() {
         let secret: [u8; 32] = [0x42; 32];
         let auth_state = McpAuthState {
             secret: Mutex::new(Some(secret)),
             config_dir: PathBuf::from("/tmp"),
         };
 
-        // Generate passcode for previous window
-        let prev_step = current_time_step().saturating_sub(1);
-        let passcode = generate_passcode_for_step(&secret, prev_step);
-
-        assert!(auth_state.validate_passcode(&passcode).is_ok());
+        assert!(auth_state.validate_token("invalid").is_err());
+        assert!(auth_state.validate_token("").is_err());
+        assert!(auth_state.validate_token("0000000000000000").is_err());
     }
 
     #[test]
-    fn test_validate_passcode_old_window() {
-        let secret: [u8; 32] = [0x42; 32];
+    fn test_validate_token_wrong_secret() {
+        let secret1: [u8; 32] = [0x42; 32];
+        let secret2: [u8; 32] = [0xab; 32];
         let auth_state = McpAuthState {
-            secret: Mutex::new(Some(secret)),
+            secret: Mutex::new(Some(secret1)),
             config_dir: PathBuf::from("/tmp"),
         };
 
-        // Generate passcode for two windows ago (should fail)
-        let old_step = current_time_step().saturating_sub(2);
-        let passcode = generate_passcode_for_step(&secret, old_step);
-
-        assert!(auth_state.validate_passcode(&passcode).is_err());
-    }
-
-    #[test]
-    fn test_validate_passcode_invalid() {
-        let secret: [u8; 32] = [0x42; 32];
-        let auth_state = McpAuthState {
-            secret: Mutex::new(Some(secret)),
-            config_dir: PathBuf::from("/tmp"),
-        };
-
-        assert!(auth_state.validate_passcode("invalid").is_err());
-        assert!(auth_state.validate_passcode("").is_err());
-        assert!(auth_state.validate_passcode("0000000000000000").is_err());
+        let wrong_token = base64_encode(&secret2);
+        assert!(auth_state.validate_token(&wrong_token).is_err());
     }
 
     #[test]

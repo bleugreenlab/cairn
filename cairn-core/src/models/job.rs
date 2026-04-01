@@ -2,23 +2,32 @@
 //!
 //! Jobs replace timeline_nodes as the core execution unit. A job owns:
 //! - Worktree and branch (execution environment)
-//! - Claude session (conversation state)
+//! - backend session (conversation state)
 //! - Artifacts (outputs)
 //! - Runs (execution attempts)
 
 use serde::{Deserialize, Serialize};
 
-/// Job status in the execution lifecycle
+/// Job status in the execution lifecycle.
+///
+/// Transitions are validated by `transitions::transition_job`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     #[default]
-    Pending, // Created, dependencies not satisfied
-    Ready,    // All dependencies satisfied, can start
-    Running,  // Agent actively working
+    Pending, // Waiting on upstream control edges
+    Ready,    // Dependencies satisfied, waiting for process spawn
+    Running,  // Has an active run
     Complete, // Finished with artifacts
-    Failed,   // Error occurred
+    Failed,   // Error occurred or cascaded from upstream
     Blocked,  // Checkpoint awaiting approval
+}
+
+impl JobStatus {
+    /// Whether the job is in a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, JobStatus::Complete | JobStatus::Failed)
+    }
 }
 
 impl std::fmt::Display for JobStatus {
@@ -63,7 +72,7 @@ pub struct Job {
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
     pub base_commit: Option<String>,
-    pub claude_session_id: Option<String>,
+    pub current_session_id: Option<String>,
 
     pub status: JobStatus,
 
@@ -95,6 +104,8 @@ pub struct Job {
     pub node_name: Option<String>,
     /// Execution sequence number (1-indexed) for URI routing
     pub exec_seq: Option<i32>,
+    /// Base branch for worktree creation and PR targeting (None = use HEAD / repo default)
+    pub base_branch: Option<String>,
 }
 
 fn default_available_tabs() -> Vec<String> {
@@ -115,12 +126,7 @@ impl TryFrom<crate::diesel_models::DbJob> for Job {
             .parse()
             .map_err(|e: String| format!("Invalid job status: {}", e))?;
 
-        let model = db
-            .model
-            .as_ref()
-            .map(|m| m.parse::<crate::models::Model>())
-            .transpose()
-            .map_err(|e: String| format!("Invalid model: {}", e))?;
+        let model = db.model.as_ref().map(crate::models::Model::new);
 
         Ok(Job {
             id: db.id,
@@ -130,7 +136,7 @@ impl TryFrom<crate::diesel_models::DbJob> for Job {
             worktree_path: db.worktree_path,
             branch: db.branch,
             base_commit: db.base_commit,
-            claude_session_id: db.claude_session_id,
+            current_session_id: db.current_session_id,
             status,
             agent_config_id: db.agent_config_id,
             issue_id: db.issue_id,
@@ -147,6 +153,7 @@ impl TryFrom<crate::diesel_models::DbJob> for Job {
             task_index: db.task_index,
             node_name: db.node_name,
             exec_seq: None, // Populated by query functions via execution join
+            base_branch: db.base_branch,
         })
     }
 }

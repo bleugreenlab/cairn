@@ -20,6 +20,9 @@ fn create_and_load_memory() {
         "tentative",
         None,
         &triggers,
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -34,6 +37,8 @@ fn create_and_load_memory() {
     assert!(memory.active);
     assert_eq!(memory.surfaced_count, 0);
     assert!(memory.last_surfaced_at.is_none());
+    assert_eq!(memory.scope, "project");
+    assert!(memory.keywords.is_empty());
 
     // Reload and verify
     let loaded = db::load_memory(&mut conn, "memory-1").unwrap();
@@ -58,6 +63,9 @@ fn create_memory_with_triggers() {
         "established",
         Some("CAIRN-42"),
         &triggers,
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -97,6 +105,9 @@ fn load_active_filters_inactive() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
     db::create_memory(
@@ -107,9 +118,12 @@ fn load_active_filters_inactive() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
-    db::update_memory(&mut conn, "inactive-1", None, None, Some(false)).unwrap();
+    db::update_memory(&mut conn, "inactive-1", None, None, Some(false), None, None).unwrap();
 
     let active = db::load_active_memories(&mut conn, None).unwrap();
     assert_eq!(active.len(), 1);
@@ -130,6 +144,9 @@ fn load_active_project_scoping() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -142,6 +159,9 @@ fn load_active_project_scoping() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -155,6 +175,9 @@ fn load_active_project_scoping() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -176,9 +199,33 @@ fn load_active_project_scoping() {
 fn load_all_includes_inactive() {
     let mut conn = common::test_conn();
 
-    db::create_memory(&mut conn, "a-1", "Active", None, "tentative", None, &[]).unwrap();
-    db::create_memory(&mut conn, "i-1", "Inactive", None, "tentative", None, &[]).unwrap();
-    db::update_memory(&mut conn, "i-1", None, None, Some(false)).unwrap();
+    db::create_memory(
+        &mut conn,
+        "a-1",
+        "Active",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        None,
+        None,
+    )
+    .unwrap();
+    db::create_memory(
+        &mut conn,
+        "i-1",
+        "Inactive",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        None,
+        None,
+    )
+    .unwrap();
+    db::update_memory(&mut conn, "i-1", None, None, Some(false), None, None).unwrap();
 
     let all = db::load_all_memories(&mut conn, None).unwrap();
     assert_eq!(all.len(), 2);
@@ -192,12 +239,33 @@ fn load_all_includes_inactive() {
 fn load_all_ordered_by_created_at() {
     let mut conn = common::test_conn();
 
-    // Create memories with slight delay to ensure different timestamps
-    // Since timestamps are second-precision, insert directly with controlled timestamps
-    db::create_memory(&mut conn, "old", "Old memory", None, "tentative", None, &[]).unwrap();
+    db::create_memory(
+        &mut conn,
+        "old",
+        "Old memory",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        None,
+        None,
+    )
+    .unwrap();
 
-    // Manually bump the created_at of the second memory to be newer
-    db::create_memory(&mut conn, "new", "New memory", None, "tentative", None, &[]).unwrap();
+    db::create_memory(
+        &mut conn,
+        "new",
+        "New memory",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        None,
+        None,
+    )
+    .unwrap();
     diesel::sql_query("UPDATE memories SET created_at = created_at + 10 WHERE id = 'new'")
         .execute(&mut conn)
         .unwrap();
@@ -221,6 +289,9 @@ fn update_content() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -229,8 +300,16 @@ fn update_content() {
         .execute(&mut conn)
         .unwrap();
 
-    let updated =
-        db::update_memory(&mut conn, "upd-1", Some("Updated content"), None, None).unwrap();
+    let updated = db::update_memory(
+        &mut conn,
+        "upd-1",
+        Some("Updated content"),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(updated.content, "Updated content");
     assert!(updated.updated_at >= original.updated_at);
@@ -248,10 +327,22 @@ fn update_confidence() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
-    let updated = db::update_memory(&mut conn, "conf-1", None, Some("established"), None).unwrap();
+    let updated = db::update_memory(
+        &mut conn,
+        "conf-1",
+        None,
+        Some("established"),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         updated.confidence,
@@ -271,10 +362,14 @@ fn update_deactivate() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
-    let updated = db::update_memory(&mut conn, "deact-1", None, None, Some(false)).unwrap();
+    let updated =
+        db::update_memory(&mut conn, "deact-1", None, None, Some(false), None, None).unwrap();
     assert!(!updated.active);
 
     // Should no longer appear in active memories
@@ -294,10 +389,13 @@ fn update_no_fields_errors() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
-    let result = db::update_memory(&mut conn, "noop-1", None, None, None);
+    let result = db::update_memory(&mut conn, "noop-1", None, None, None, None, None);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("No fields to update"));
 }
@@ -315,6 +413,9 @@ fn delete_cascades_triggers() {
         "tentative",
         None,
         &triggers,
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -357,6 +458,9 @@ fn record_surfacing() {
         "tentative",
         None,
         &[],
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -394,6 +498,9 @@ fn replace_triggers() {
         "tentative",
         None,
         &original_triggers,
+        "project",
+        None,
+        None,
     )
     .unwrap();
 
@@ -411,6 +518,176 @@ fn replace_triggers() {
     assert!(patterns.contains(&"Edit"));
     assert!(patterns.contains(&"main\\.rs$"));
     assert!(!patterns.contains(&"Write"));
+}
+
+#[test]
+fn create_with_scope_and_keywords() {
+    let mut conn = common::test_conn();
+
+    let memory = db::create_memory(
+        &mut conn,
+        "sk-1",
+        "Branch-scoped with keywords",
+        None,
+        "tentative",
+        None,
+        &[],
+        "branch:feature/dom",
+        Some(r#"["DOM","CSP"]"#),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(memory.scope, "branch:feature/dom");
+    assert_eq!(memory.keywords, vec!["DOM", "CSP"]);
+
+    // Reload and verify
+    let loaded = db::load_memory(&mut conn, "sk-1").unwrap();
+    assert_eq!(loaded.scope, "branch:feature/dom");
+    assert_eq!(loaded.keywords, vec!["DOM", "CSP"]);
+}
+
+#[test]
+fn update_scope_and_keywords() {
+    let mut conn = common::test_conn();
+
+    db::create_memory(
+        &mut conn,
+        "sk-upd",
+        "Will update scope",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        None,
+        None,
+    )
+    .unwrap();
+
+    let updated = db::update_memory(
+        &mut conn,
+        "sk-upd",
+        None,
+        None,
+        None,
+        Some("branch:main"),
+        Some(Some(r#"["test","CI"]"#)),
+    )
+    .unwrap();
+
+    assert_eq!(updated.scope, "branch:main");
+    assert_eq!(updated.keywords, vec!["test", "CI"]);
+}
+
+#[test]
+fn update_keywords_to_null_clears_them() {
+    let mut conn = common::test_conn();
+
+    db::create_memory(
+        &mut conn,
+        "kw-clear",
+        "Has keywords",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        Some(r#"["test","CI"]"#),
+        None,
+    )
+    .unwrap();
+
+    // Clear keywords by setting to null
+    let updated = db::update_memory(
+        &mut conn,
+        "kw-clear",
+        None,
+        None,
+        None,
+        None,
+        Some(None), // keywords = Some(None) → set column to NULL
+    )
+    .unwrap();
+
+    assert!(updated.keywords.is_empty());
+
+    // Reload to verify persistence
+    let loaded = db::load_memory(&mut conn, "kw-clear").unwrap();
+    assert!(loaded.keywords.is_empty());
+}
+
+#[test]
+fn malformed_keywords_json_defaults_to_empty() {
+    let mut conn = common::test_conn();
+
+    // Insert with malformed JSON directly
+    db::create_memory(
+        &mut conn,
+        "bad-json",
+        "Bad keywords",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        Some("not valid json"),
+        None,
+    )
+    .unwrap();
+
+    let loaded = db::load_memory(&mut conn, "bad-json").unwrap();
+    // to_memory uses serde_json::from_str(...).ok().unwrap_or_default()
+    assert!(loaded.keywords.is_empty());
+}
+
+#[test]
+fn create_memory_with_source_run_id() {
+    let mut conn = common::test_conn();
+
+    let memory = db::create_memory(
+        &mut conn,
+        "run-src-1",
+        "Memory with provenance",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        None,
+        Some("run-abc-12345678"),
+    )
+    .unwrap();
+
+    assert_eq!(memory.source_run_id, Some("run-abc-12345678".to_string()));
+
+    // Reload and verify persistence
+    let loaded = db::load_memory(&mut conn, "run-src-1").unwrap();
+    assert_eq!(loaded.source_run_id, Some("run-abc-12345678".to_string()));
+}
+
+#[test]
+fn create_memory_without_source_run_id() {
+    let mut conn = common::test_conn();
+
+    let memory = db::create_memory(
+        &mut conn,
+        "no-run-1",
+        "Memory without provenance",
+        None,
+        "tentative",
+        None,
+        &[],
+        "project",
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert!(memory.source_run_id.is_none());
+
+    let loaded = db::load_memory(&mut conn, "no-run-1").unwrap();
+    assert!(loaded.source_run_id.is_none());
 }
 
 use diesel::RunQueryDsl;

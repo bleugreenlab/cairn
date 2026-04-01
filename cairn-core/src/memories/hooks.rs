@@ -1,7 +1,7 @@
-//! Hook settings file generation for memory surfacing.
+//! Hook settings file generation for memory surfacing and slash commands.
 //!
 //! Writes a standalone settings JSON file that gets passed to Claude CLI
-//! via `--settings`, keeping memory hooks scoped to Cairn runs only.
+//! via `--settings`, keeping hooks scoped to Cairn runs only.
 
 use std::path::PathBuf;
 
@@ -17,7 +17,7 @@ pub fn write_hook_settings_file(mcp_callback_port: u16) -> Result<PathBuf, Strin
     let settings_path = cairn_dir.join("hook-settings.json");
 
     let hook_command = format!(
-        "curl -sf -X POST http://127.0.0.1:{}/api/memories/match -H 'Content-Type: application/json' -d @- 2>/dev/null || true",
+        "curl -sf -X POST http://127.0.0.1:{}/api/hooks -H 'Content-Type: application/json' -d @- 2>/dev/null || true",
         mcp_callback_port
     );
 

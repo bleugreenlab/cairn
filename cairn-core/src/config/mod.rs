@@ -35,9 +35,11 @@
 pub mod agents;
 pub mod keybinds;
 pub mod mcp_setup;
+pub mod presets;
 pub mod project_settings;
 pub mod recipes;
 pub mod settings;
+pub mod skill_fetch;
 pub mod skills;
 pub mod tools;
 
@@ -278,7 +280,6 @@ pub fn get_recipe_as_snapshot(
     config_dir: &Path,
     recipe_id: &str,
     project_id: &str,
-    default_model: &crate::models::Model,
 ) -> Result<
     (
         crate::models::RecipeSnapshot,
@@ -301,7 +302,6 @@ pub fn get_recipe_as_snapshot(
         name: recipe.name,
         description: recipe.description,
         trigger: recipe.trigger,
-        context: recipe.context,
         nodes: recipe.nodes.clone(),
         edges: recipe.edges,
     };
@@ -318,6 +318,9 @@ pub fn get_recipe_as_snapshot(
         })
         .collect();
 
+    // Load presets for agent resolution
+    let presets_config = presets::load_effective_presets(config_dir, Some(&project_path));
+
     // Load agents
     let mut agents: HashMap<String, AgentSnapshot> = HashMap::new();
     for agent_id in agent_ids {
@@ -327,25 +330,8 @@ pub fn get_recipe_as_snapshot(
 
         if let Ok(Some(file_agent)) = agents::get_agent(config_dir, &agent_id, Some(&project_path))
         {
-            let resolved_model = file_agent
-                .model
-                .clone()
-                .unwrap_or_else(|| default_model.clone());
-
-            agents.insert(
-                agent_id.clone(),
-                AgentSnapshot {
-                    id: file_agent.id,
-                    name: file_agent.name,
-                    description: file_agent.description,
-                    prompt: file_agent.prompt,
-                    tools: file_agent.tools,
-                    model: Some(resolved_model),
-                    disallowed_tools: file_agent.disallowed_tools,
-                    skills: file_agent.skills,
-                    permission_mode: file_agent.permission_mode,
-                },
-            );
+            let snapshot = presets::resolve_agent_snapshot(&file_agent, None, &presets_config)?;
+            agents.insert(agent_id.clone(), snapshot);
         }
     }
 

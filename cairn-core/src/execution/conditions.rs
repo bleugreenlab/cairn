@@ -161,6 +161,7 @@ pub(crate) fn gather_condition_context(
 
 /// Evaluate a condition node and return the result port.
 pub(crate) fn evaluate_condition_node(
+    completion: &dyn crate::services::CompletionService,
     node: &DbRecipeNode,
     context: &serde_json::Value,
 ) -> Result<(String, Option<String>), String> {
@@ -185,6 +186,7 @@ pub(crate) fn evaluate_condition_node(
                 .ok_or("AI condition requires question")?;
             let context_str = crate::condition::serialize_context_for_ai(context);
             crate::condition::evaluate_ai_condition(
+                completion,
                 question,
                 &config.ports,
                 &context_str,
@@ -252,28 +254,6 @@ pub(crate) fn store_condition_evaluation(
     );
 
     Ok(())
-}
-
-/// Count condition nodes that haven't been evaluated yet.
-pub(crate) fn count_pending_condition_nodes(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    execution_id: &str,
-) -> Result<i64, String> {
-    use crate::execution::dag::load_nodes_from_execution;
-
-    let all_nodes = load_nodes_from_execution(conn, execution_id)?;
-    let total_condition_nodes = all_nodes
-        .iter()
-        .filter(|n| n.node_type == "condition")
-        .count() as i64;
-
-    let evaluated_count: i64 = condition_evaluations::table
-        .filter(condition_evaluations::execution_id.eq(execution_id))
-        .count()
-        .get_result(conn)
-        .unwrap_or(0);
-
-    Ok(total_condition_nodes - evaluated_count)
 }
 
 /// Check if an edge from a condition node is satisfied (matches the evaluated port).

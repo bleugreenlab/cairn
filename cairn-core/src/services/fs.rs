@@ -40,6 +40,13 @@ pub trait FileSystem: Send + Sync {
     /// Copy a file from one location to another.
     /// Creates parent directories of the destination if they don't exist.
     fn copy_file(&self, from: &Path, to: &Path) -> Result<(), String>;
+
+    /// Create a symbolic link at `link` pointing to `target`.
+    /// On Windows, uses a directory junction for directories.
+    fn symlink(&self, target: &Path, link: &Path) -> Result<(), String>;
+
+    /// Check if a path is a symbolic link (or junction on Windows).
+    fn is_symlink(&self, path: &Path) -> bool;
 }
 
 /// Production filesystem implementation using std::fs.
@@ -86,6 +93,50 @@ impl FileSystem for RealFileSystem {
         }
         std::fs::copy(from, to).map_err(|e| format!("Failed to copy file: {}", e))?;
         Ok(())
+    }
+
+    fn symlink(&self, target: &Path, link: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+                .map_err(|e| format!("Failed to create symlink: {}", e))
+        }
+        #[cfg(windows)]
+        {
+            // Use junction for directories (no admin required), symlink for files
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link)
+                    .or_else(|_| {
+                        // Fall back to junction if symlink fails (requires privileges)
+                        std::process::Command::new("cmd")
+                            .args(["/c", "mklink", "/J"])
+                            .arg(link.as_os_str())
+                            .arg(target.as_os_str())
+                            .output()
+                            .map_err(|e| format!("Failed to create junction: {}", e))
+                            .and_then(|o| {
+                                if o.status.success() {
+                                    Ok(())
+                                } else {
+                                    Err(format!(
+                                        "mklink /J failed: {}",
+                                        String::from_utf8_lossy(&o.stderr)
+                                    ))
+                                }
+                            })
+                    })
+                    .map_err(|e| format!("Failed to create directory link: {}", e))
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+                    .map_err(|e| format!("Failed to create file symlink: {}", e))
+            }
+        }
+    }
+
+    fn is_symlink(&self, path: &Path) -> bool {
+        path.symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
     }
 }
 
@@ -206,6 +257,47 @@ mod tests {
         assert!(fs.exists(&dst));
         let contents = fs.read_to_string(&dst).unwrap();
         assert_eq!(contents, "content");
+    }
+
+    #[test]
+    fn real_fs_symlink_and_is_symlink() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        // Create a target directory
+        let target = temp.path().join("target_dir");
+        fs.create_dir_all(&target).unwrap();
+        fs.write_str(&target.join("file.txt"), "hello").unwrap();
+
+        // Create symlink
+        let link = temp.path().join("link_dir");
+        fs.symlink(&target, &link).unwrap();
+
+        // Verify it's a symlink
+        assert!(fs.is_symlink(&link));
+        assert!(fs.exists(&link));
+
+        // Verify content is accessible through symlink
+        let content = fs.read_to_string(&link.join("file.txt")).unwrap();
+        assert_eq!(content, "hello");
+
+        // Non-symlink path should return false
+        assert!(!fs.is_symlink(&target));
+    }
+
+    #[test]
+    fn real_fs_symlink_file() {
+        let temp = TempDir::new().unwrap();
+        let fs = RealFileSystem;
+
+        let target = temp.path().join("target.txt");
+        fs.write_str(&target, "content").unwrap();
+
+        let link = temp.path().join("link.txt");
+        fs.symlink(&target, &link).unwrap();
+
+        assert!(fs.is_symlink(&link));
+        assert_eq!(fs.read_to_string(&link).unwrap(), "content");
     }
 
     #[test]

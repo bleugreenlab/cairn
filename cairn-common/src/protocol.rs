@@ -26,4 +26,8 @@ pub struct CallbackRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallbackResponse {
     pub result: String,
+    /// Cairn artifact URI for this task's output, if available.
+    /// Set by the task handler so batch_tasks can surface it in truncation messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_uri: Option<String>,
 }

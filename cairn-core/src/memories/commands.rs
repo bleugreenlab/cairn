@@ -29,6 +29,12 @@ pub fn create(conn: &mut SqliteConnection, input: CreateMemory) -> Result<Memory
         .unwrap_or_else(|| "tentative".to_string());
 
     let triggers = trigger_tuples(&input.triggers);
+    let scope = input.scope.as_deref().unwrap_or("project");
+    let keywords_json = input
+        .keywords
+        .as_ref()
+        .filter(|k| !k.is_empty())
+        .map(|k| serde_json::to_string(k).unwrap_or_default());
 
     memory_db::create_memory(
         conn,
@@ -38,6 +44,9 @@ pub fn create(conn: &mut SqliteConnection, input: CreateMemory) -> Result<Memory
         &confidence,
         input.source_issue.as_deref(),
         &triggers,
+        scope,
+        keywords_json.as_deref(),
+        input.source_run_id.as_deref(),
     )
 }
 
@@ -46,13 +55,26 @@ pub fn create(conn: &mut SqliteConnection, input: CreateMemory) -> Result<Memory
 /// Only updates fields that are provided (Some). Returns the updated memory.
 pub fn update(conn: &mut SqliteConnection, input: UpdateMemory) -> Result<Memory, String> {
     // Update scalar fields if any provided
-    if input.content.is_some() || input.confidence.is_some() || input.active.is_some() {
+    let has_scalar_update = input.content.is_some()
+        || input.confidence.is_some()
+        || input.active.is_some()
+        || input.scope.is_some()
+        || input.keywords.is_some();
+
+    if has_scalar_update {
+        let keywords_json = input
+            .keywords
+            .as_ref()
+            .map(|k| serde_json::to_string(k).unwrap_or_default());
+
         memory_db::update_memory(
             conn,
             &input.id,
             input.content.as_deref(),
             input.confidence.as_ref().map(|c| c.to_string()).as_deref(),
             input.active,
+            input.scope.as_deref(),
+            keywords_json.as_ref().map(|k| Some(k.as_str())).or(None),
         )?;
     }
 

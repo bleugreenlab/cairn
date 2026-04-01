@@ -27,6 +27,7 @@ pub struct Artifact {
     pub output_name: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    pub seen_at: Option<i64>,
 }
 
 /// Convert DbArtifact to Artifact
@@ -48,6 +49,7 @@ impl TryFrom<crate::diesel_models::DbArtifact> for Artifact {
             output_name: db.output_name,
             created_at: db.created_at as i64,
             updated_at: db.updated_at as i64,
+            seen_at: db.seen_at.map(|t| t as i64),
         })
     }
 }

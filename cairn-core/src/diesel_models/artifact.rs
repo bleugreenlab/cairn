@@ -22,6 +22,7 @@ pub struct DbArtifact {
     pub output_name: Option<String>,
     pub created_at: i32,
     pub updated_at: i32,
+    pub seen_at: Option<i32>,
 }
 
 #[derive(Debug, Insertable)]

@@ -25,14 +25,16 @@ fn file_agent_to_config(
         description: agent.description,
         prompt: agent.prompt,
         tools: agent.tools,
-        model: agent.model,
+        tier: agent.tier,
         workspace_id,
         project_id,
         created_at: now,
         updated_at: now,
         disallowed_tools: agent.disallowed_tools,
         skills: agent.skills,
-        permission_mode: agent.permission_mode,
+        approval_policy: agent.approval_policy,
+        filesystem_scope: agent.filesystem_scope,
+        backend_preference: agent.backend_preference,
     }
 }
 
@@ -193,8 +195,10 @@ impl Orchestrator {
             description: input.description.clone(),
             prompt: input.prompt.clone(),
             tools: input.tools.clone(),
-            model: input.model.clone(),
-            permission_mode: input.permission_mode.clone(),
+            tier: input.tier.clone(),
+            approval_policy: input.approval_policy,
+            filesystem_scope: input.filesystem_scope,
+            backend_preference: input.backend_preference.clone(),
             disallowed_tools: input.disallowed_tools.clone(),
             skills: input.skills.clone(),
             hooks: None,
@@ -220,14 +224,16 @@ impl Orchestrator {
             description: input.description,
             prompt: input.prompt,
             tools: input.tools,
-            model: input.model,
+            tier: input.tier,
             workspace_id: input.workspace_id,
             project_id: input.project_id,
             created_at: now,
             updated_at: now,
             disallowed_tools: input.disallowed_tools,
             skills: input.skills,
-            permission_mode: input.permission_mode,
+            approval_policy: input.approval_policy,
+            filesystem_scope: input.filesystem_scope,
+            backend_preference: input.backend_preference,
         })
     }
 
@@ -236,10 +242,15 @@ impl Orchestrator {
         &self,
         id: &str,
         input: UpdateAgentConfig,
+        target_project_id: Option<&str>,
     ) -> Result<AgentConfig, String> {
-        // Find existing agent
+        // Find existing agent in the targeted scope
         let existing = {
-            if let Some(agent) = config_agents::get_agent(&self.config_dir, id, None)? {
+            if let Some(pid) = target_project_id {
+                let project_path = self.project_path(pid)?;
+                config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
+                    .ok_or_else(|| format!("Agent not found: {}", id))?
+            } else if let Some(agent) = config_agents::get_agent(&self.config_dir, id, None)? {
                 agent
             } else {
                 let projects = self.all_project_paths()?;
@@ -261,10 +272,15 @@ impl Orchestrator {
         let description = input.description.unwrap_or(existing.description);
         let prompt = input.prompt.unwrap_or(existing.prompt);
         let tools = input.tools.unwrap_or(existing.tools);
-        let model = match input.model {
-            None => existing.model,
+        let tier = match input.tier {
+            None => existing.tier,
             Some(None) => None,
             Some(Some(m)) => Some(m),
+        };
+        let backend_preference = match input.backend_preference {
+            None => existing.backend_preference,
+            Some(None) => None,
+            Some(Some(value)) => Some(value),
         };
         let disallowed_tools = match input.disallowed_tools {
             None => existing.disallowed_tools,
@@ -276,10 +292,15 @@ impl Orchestrator {
             Some(None) => None,
             Some(Some(v)) => Some(v),
         };
-        let permission_mode = match input.permission_mode {
-            None => existing.permission_mode.clone(),
+        let approval_policy = match input.approval_policy {
+            None => existing.approval_policy,
             Some(None) => None,
-            Some(Some(m)) => Some(m),
+            Some(Some(ap)) => Some(ap),
+        };
+        let filesystem_scope = match input.filesystem_scope {
+            None => existing.filesystem_scope,
+            Some(None) => None,
+            Some(Some(fm)) => Some(fm),
         };
 
         // Determine new scope
@@ -315,8 +336,10 @@ impl Orchestrator {
             description: description.clone(),
             prompt: prompt.clone(),
             tools: tools.clone(),
-            model: model.clone(),
-            permission_mode: permission_mode.clone(),
+            tier: tier.clone(),
+            approval_policy,
+            filesystem_scope,
+            backend_preference: backend_preference.clone(),
             disallowed_tools: disallowed_tools.clone(),
             skills: skills.clone(),
             hooks: existing.hooks.clone(),
@@ -357,7 +380,7 @@ impl Orchestrator {
             description,
             prompt,
             tools,
-            model,
+            tier,
             workspace_id: if !new_is_project_scoped {
                 Some("default".to_string())
             } else {
@@ -368,7 +391,9 @@ impl Orchestrator {
             updated_at: now,
             disallowed_tools,
             skills,
-            permission_mode,
+            approval_policy,
+            filesystem_scope,
+            backend_preference,
         })
     }
 
@@ -394,16 +419,17 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Fork a workspace agent to a project scope.
-    pub fn fork_agent_config(&self, id: &str, project_id: &str) -> Result<AgentConfig, String> {
+    /// Create a project override of an agent (from any scope).
+    ///
+    /// Resolves the agent with project context, then copies it to the target project.
+    /// Errors if the target project already has an override with the same ID.
+    pub fn create_agent_override(&self, id: &str, project_id: &str) -> Result<AgentConfig, String> {
         let project_path = self.project_path(project_id)?;
 
-        let source = config_agents::get_agent(&self.config_dir, id, None)?
-            .ok_or_else(|| format!("Agent not found in workspace: {}", id))?;
-
-        if source.is_project_scoped {
-            return Err("Cannot fork a project-scoped agent".to_string());
-        }
+        // Resolve agent: try project context first (which gives project > workspace),
+        // then fall back to workspace-only lookup
+        let source = config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
+            .ok_or_else(|| format!("Agent not found: {}", id))?;
 
         let target_path = project_path
             .join(".cairn")
@@ -413,14 +439,16 @@ impl Orchestrator {
             return Err(format!("Agent '{}' already exists in this project", id));
         }
 
-        let forked = config_agents::FileAgent {
+        let override_agent = config_agents::FileAgent {
             id: id.to_string(),
             name: source.name.clone(),
             description: source.description.clone(),
             prompt: source.prompt.clone(),
             tools: source.tools.clone(),
-            model: source.model.clone(),
-            permission_mode: source.permission_mode.clone(),
+            tier: source.tier.clone(),
+            approval_policy: source.approval_policy,
+            filesystem_scope: source.filesystem_scope,
+            backend_preference: source.backend_preference.clone(),
             disallowed_tools: source.disallowed_tools.clone(),
             skills: source.skills.clone(),
             hooks: source.hooks.clone(),
@@ -428,7 +456,7 @@ impl Orchestrator {
             file_path: PathBuf::new(),
         };
 
-        config_agents::save_agent(&self.config_dir, &forked, Some(&project_path))?;
+        config_agents::save_agent(&self.config_dir, &override_agent, Some(&project_path))?;
 
         let _ = self.services.emitter.emit(
             "config-changed",
@@ -446,14 +474,91 @@ impl Orchestrator {
             description: source.description,
             prompt: source.prompt,
             tools: source.tools,
-            model: source.model,
+            tier: source.tier,
             workspace_id: None,
             project_id: Some(project_id.to_string()),
             created_at: now,
             updated_at: now,
             disallowed_tools: source.disallowed_tools,
             skills: source.skills,
-            permission_mode: source.permission_mode,
+            approval_policy: source.approval_policy,
+            filesystem_scope: source.filesystem_scope,
+            backend_preference: source.backend_preference,
+        })
+    }
+
+    /// Promote a project-only agent to workspace scope.
+    ///
+    /// Copies the project file to `~/.cairn/agents/{id}.md`.
+    /// Errors if a workspace version already exists.
+    /// The original project file remains as an override.
+    pub fn promote_agent_to_workspace(
+        &self,
+        id: &str,
+        source_project_id: &str,
+    ) -> Result<AgentConfig, String> {
+        let project_path = self.project_path(source_project_id)?;
+
+        // Load the project-scoped agent
+        let source = config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
+            .ok_or_else(|| format!("Agent not found in project: {}", id))?;
+
+        if !source.is_project_scoped {
+            return Err("Agent is not project-scoped".to_string());
+        }
+
+        // Check workspace version doesn't already exist
+        let ws_path = self.config_dir.join("agents").join(format!("{}.md", id));
+        if ws_path.exists() {
+            return Err(format!("Agent '{}' already exists at workspace scope", id));
+        }
+
+        // Copy to workspace
+        let ws_agent = config_agents::FileAgent {
+            id: id.to_string(),
+            name: source.name.clone(),
+            description: source.description.clone(),
+            prompt: source.prompt.clone(),
+            tools: source.tools.clone(),
+            tier: source.tier.clone(),
+            approval_policy: source.approval_policy,
+            filesystem_scope: source.filesystem_scope,
+            backend_preference: source.backend_preference.clone(),
+            disallowed_tools: source.disallowed_tools.clone(),
+            skills: source.skills.clone(),
+            hooks: source.hooks.clone(),
+            is_project_scoped: false,
+            file_path: PathBuf::new(),
+        };
+
+        config_agents::save_agent(&self.config_dir, &ws_agent, None)?;
+
+        let _ = self.services.emitter.emit(
+            "config-changed",
+            serde_json::json!({"entity_type": "agent", "action": "created", "id": id}),
+        );
+        let _ = self.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "agent_configs", "action": "insert"}),
+        );
+
+        let now = chrono::Utc::now().timestamp() as i32;
+        Ok(AgentConfig {
+            id: id.to_string(),
+            name: source.name,
+            description: source.description,
+            prompt: source.prompt,
+            tools: source.tools,
+            tier: source.tier,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+            disallowed_tools: source.disallowed_tools,
+            skills: source.skills,
+            approval_policy: source.approval_policy,
+            filesystem_scope: source.filesystem_scope,
+            backend_preference: source.backend_preference,
         })
     }
 

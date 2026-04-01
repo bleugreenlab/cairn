@@ -5,6 +5,7 @@
 //! Both Tauri and cairn-server dispatch to handlers in this module.
 
 pub mod auth;
+pub mod diff;
 pub mod git;
 pub mod handlers;
 pub mod types;

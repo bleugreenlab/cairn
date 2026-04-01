@@ -17,6 +17,9 @@ pub struct Memory {
     pub last_surfaced_at: Option<i64>,
     pub active: bool,
     pub triggers: Vec<MemoryTrigger>,
+    pub scope: String,
+    pub keywords: Vec<String>,
+    pub source_run_id: Option<String>,
 }
 
 /// A trigger condition for surfacing a memory.
@@ -70,6 +73,9 @@ pub struct CreateMemory {
     pub confidence: Option<MemoryConfidence>,
     pub source_issue: Option<String>,
     pub triggers: Vec<CreateMemoryTrigger>,
+    pub scope: Option<String>,
+    pub keywords: Option<Vec<String>>,
+    pub source_run_id: Option<String>,
 }
 
 /// Input for creating a trigger condition.
@@ -90,4 +96,6 @@ pub struct UpdateMemory {
     pub confidence: Option<MemoryConfidence>,
     pub active: Option<bool>,
     pub triggers: Option<Vec<CreateMemoryTrigger>>,
+    pub scope: Option<String>,
+    pub keywords: Option<Vec<String>>,
 }

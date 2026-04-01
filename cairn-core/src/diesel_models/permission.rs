@@ -17,6 +17,7 @@ pub struct DbPermissionRequest {
     pub response: Option<String>,
     pub created_at: i32,
     pub responded_at: Option<i32>,
+    pub turn_id: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -29,6 +30,7 @@ pub struct NewPermissionRequest<'a> {
     pub tool_input: &'a str,
     pub status: &'a str,
     pub created_at: i32,
+    pub turn_id: Option<&'a str>,
 }
 
 #[derive(Debug, AsChangeset, Default)]

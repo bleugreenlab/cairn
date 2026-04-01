@@ -9,15 +9,15 @@ use diesel::SqliteConnection;
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::config::settings::load_settings;
+use crate::config::presets::{load_effective_presets, resolve_agent_snapshot_with_seed_backend};
 use crate::config::{
     self, agents as config_agents, skills as config_skills, tools as config_tools, ConfigResult,
 };
 use crate::models::{
-    AgentSnapshot, ExecutionSnapshot, Model, RecipeNodeType, RecipeSnapshot, SkillSnapshot,
-    ToolSnapshot, TriggerContext, TriggerType,
+    ExecutionSnapshot, RecipeNodeType, RecipeSnapshot, SkillSnapshot, ToolSnapshot, TriggerContext,
+    TriggerType,
 };
-use crate::schema::{issues, projects};
+use crate::schema::projects;
 
 /// Build an execution snapshot from the current file-based config state.
 ///
@@ -28,6 +28,7 @@ use crate::schema::{issues, projects};
 ///
 /// The snapshot is self-contained and doesn't depend on the original
 /// recipe/agent/skill records existing.
+#[allow(clippy::too_many_arguments)]
 pub fn build_execution_snapshot(
     conn: &mut SqliteConnection,
     config_dir: &Path,
@@ -35,6 +36,8 @@ pub fn build_execution_snapshot(
     issue_id: Option<&str>,
     project_id: &str,
     trigger_type: TriggerType,
+    event_payload: Option<serde_json::Value>,
+    backend_seed: Option<&str>,
 ) -> Result<ExecutionSnapshot, String> {
     // Get project path for file-based config lookup
     let project_path: Option<std::path::PathBuf> = projects::table
@@ -60,7 +63,6 @@ pub fn build_execution_snapshot(
         name: recipe.name,
         description: recipe.description,
         trigger: recipe.trigger,
-        context: recipe.context,
         nodes: recipe.nodes.clone(),
         edges: recipe.edges,
     };
@@ -82,33 +84,11 @@ pub fn build_execution_snapshot(
         })
         .collect();
 
-    // Get issue model and skills if this execution is for an issue
-    let (issue_model, issue_skills): (Option<Model>, Vec<String>) = issue_id
-        .map(|iid| {
-            let result: Option<(Option<String>, Option<String>)> = issues::table
-                .find(iid)
-                .select((issues::model, issues::skills))
-                .first(conn)
-                .ok();
-
-            match result {
-                Some((model_str, skills_str)) => {
-                    let model = model_str.and_then(|s| s.parse().ok());
-                    let skills: Vec<String> = skills_str
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_default();
-                    (model, skills)
-                }
-                None => (None, vec![]),
-            }
-        })
-        .unwrap_or((None, vec![]));
-
-    // Get workspace default model as fallback
-    let workspace_default_model = load_settings(config_dir).default_model;
+    // Load presets config (workspace + project merged)
+    let presets = load_effective_presets(config_dir, project_path.as_deref());
 
     // Load agents and skills from files
-    let mut agents: HashMap<String, AgentSnapshot> = HashMap::new();
+    let mut agents: HashMap<String, crate::models::AgentSnapshot> = HashMap::new();
     let mut skills: HashMap<String, SkillSnapshot> = HashMap::new();
 
     // Pre-load all skills and tools into maps for quick lookup
@@ -133,35 +113,14 @@ pub fn build_execution_snapshot(
                 }
             }
 
-            // Resolve model: issue model → agent file model → workspace default
-            let resolved_model = issue_model
-                .clone()
-                .or(file_agent.model.clone())
-                .unwrap_or_else(|| workspace_default_model.clone());
+            let snapshot = resolve_agent_snapshot_with_seed_backend(
+                &file_agent,
+                None,
+                backend_seed,
+                &presets,
+            )?;
 
-            agents.insert(
-                agent_id.clone(),
-                AgentSnapshot {
-                    id: file_agent.id,
-                    name: file_agent.name,
-                    description: file_agent.description,
-                    prompt: file_agent.prompt,
-                    tools: file_agent.tools,
-                    model: Some(resolved_model),
-                    disallowed_tools: file_agent.disallowed_tools,
-                    skills: file_agent.skills,
-                    permission_mode: file_agent.permission_mode,
-                },
-            );
-        }
-    }
-
-    // Load issue skills into the snapshot's skills map
-    for skill_id in &issue_skills {
-        if !skills.contains_key(skill_id) {
-            if let Some(skill) = all_skills.get(skill_id) {
-                skills.insert(skill_id.clone(), skill.clone());
-            }
+            agents.insert(agent_id.clone(), snapshot);
         }
     }
 
@@ -170,17 +129,15 @@ pub fn build_execution_snapshot(
         issue_id: issue_id.map(|s| s.to_string()),
         project_id: project_id.to_string(),
         trigger_type,
-        issue_skills,
+        event_payload,
     };
 
     // Create the snapshot
-    Ok(ExecutionSnapshot::new(
-        recipe_snapshot,
-        agents,
-        skills,
-        all_tools,
-        trigger_context,
-    ))
+    let mut snapshot =
+        ExecutionSnapshot::new(recipe_snapshot, agents, skills, all_tools, trigger_context);
+    snapshot.presets = Some((&presets).into());
+
+    Ok(snapshot)
 }
 
 /// Load all skills from files into a map
@@ -201,7 +158,6 @@ fn load_all_skills(
                         description: skill.description,
                         prompt: skill.prompt,
                         allowed_tools: skill.allowed_tools,
-                        model: skill.model,
                     },
                 );
             }

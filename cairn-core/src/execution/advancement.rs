@@ -1,34 +1,29 @@
 //! DAG advancement logic for recipe execution.
 //!
 //! Core execution engine that advances the recipe DAG, resolves inputs from artifacts,
-//! determines which jobs are ready to run, and executes action/condition nodes inline.
+//! and determines which jobs are ready to run.
 //!
 //! ## Architecture
 //!
-//! Action node execution is handled via the event system: cairn-core creates the
-//! `action_run` record and emits a `"dag-execute-action"` event. The host layer
-//! (Tauri, cairn-server) listens for this event, performs the actual execution, and
-//! then re-triggers advancement via `"dag-advance"`.
-//!
-//! This mirrors the existing `"dag-advance"` event pattern already in the Tauri layer.
+//! `advance_execution_with_actions` is the canonical async entry point. It calls
+//! `reduce_dag` (synchronous DB advancement → typed effects) then processes effects
+//! through `execute_effects` with the `LegacyExecutor`. All callers — event listeners,
+//! direct async calls, scheduler — go through this function, ensuring `reduce_dag` is
+//! the single source of truth for DAG advancement.
 
 use crate::diesel_models::{
     DbActionRun, DbArtifact, DbJob, DbRecipeEdge, DbRecipeNode, NewActionRun,
-    UpdateActionRunChangeset, UpdateExecutionChangeset, UpdateJobChangeset,
+    UpdateActionRunChangeset,
 };
-use crate::models::Job;
+use crate::models::{Job, JobStatus};
 use crate::orchestrator::Orchestrator;
 use crate::schema::{action_runs, artifacts, events, executions, issues, jobs, projects, runs};
 use crate::services::EventEmitter;
 use diesel::prelude::*;
 use uuid::Uuid;
 
-use super::checkpoints::{approve_job_inner, format_annotations, reject_job_inner};
-use super::conditions::{
-    check_checkpoint_cache, count_pending_condition_nodes, evaluate_condition_node,
-    find_checkpoint_worktree, find_ready_condition_nodes, gather_condition_context,
-    is_condition_edge_satisfied, store_condition_evaluation,
-};
+use super::checkpoints::format_annotations;
+use super::conditions::is_condition_edge_satisfied;
 
 /// Resolved input from an upstream job's artifact.
 #[derive(Debug, Clone)]
@@ -136,9 +131,11 @@ fn resolve_node_job_inputs(
                 .first::<String>(conn)
                 .ok()
                 .and_then(|data_json| {
-                    serde_json::from_str::<crate::claude::stream::TranscriptEvent>(&data_json)
-                        .ok()
-                        .and_then(|t| t.content)
+                    serde_json::from_str::<crate::agent_process::stream::TranscriptEvent>(
+                        &data_json,
+                    )
+                    .ok()
+                    .and_then(|t| t.content)
                 });
 
             if let Some(content) = last_msg {
@@ -160,23 +157,83 @@ fn build_trigger_context(
     conn: &mut diesel::sqlite::SqliteConnection,
     job: &DbJob,
 ) -> Result<ResolvedInput, String> {
-    let issue_id = job.issue_id.as_ref().ok_or("Job has no issue_id")?;
+    let mut data = serde_json::json!({});
 
-    let (title, description): (String, Option<String>) = issues::table
-        .find(issue_id)
-        .select((issues::title, issues::description))
-        .first(conn)
-        .map_err(|e| format!("Failed to get issue: {}", e))?;
+    // Include event payload if this is an event-triggered execution
+    let mut event_payload = None;
+    if let Some(ref execution_id) = job.execution_id {
+        if let Ok(snapshot) = crate::jobs::queries::load_execution_snapshot(conn, execution_id) {
+            if let Some(ref payload) = snapshot.trigger_context.event_payload {
+                data["event"] = payload.clone();
+                event_payload = Some(payload.clone());
+            }
+        }
+    }
 
-    Ok(ResolvedInput {
-        artifact_type: "trigger_context".to_string(),
-        data: serde_json::json!({
-            "issue": {
+    // For accumulated events, look up all source issues from the events array.
+    // For single events, use the job's issue_id as before.
+    let is_accumulated = event_payload
+        .as_ref()
+        .and_then(|p| p.get("accumulated"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if is_accumulated {
+        if let Some(events) = event_payload
+            .as_ref()
+            .and_then(|p| p.get("events"))
+            .and_then(|v| v.as_array())
+        {
+            let mut issues = Vec::new();
+            let mut seen_issues = std::collections::HashSet::new();
+            for event in events {
+                let issue_number = event.get("issueNumber").and_then(|v| v.as_i64());
+                let project_key = event
+                    .get("projectKey")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if let Some(num) = issue_number {
+                    let key = format!("{}:{}", project_key, num);
+                    if seen_issues.insert(key) {
+                        // Look up issue by project key + number
+                        if let Ok((id, title, description)) = issues::table
+                            .inner_join(projects::table.on(projects::id.eq(issues::project_id)))
+                            .filter(projects::key.eq(project_key))
+                            .filter(issues::number.eq(num as i32))
+                            .select((issues::id, issues::title, issues::description))
+                            .first::<(String, String, Option<String>)>(conn)
+                        {
+                            issues.push(serde_json::json!({
+                                "id": id,
+                                "key": format!("{}-{}", project_key, num),
+                                "title": title,
+                                "description": description,
+                            }));
+                        }
+                    }
+                }
+            }
+            if !issues.is_empty() {
+                data["issues"] = serde_json::json!(issues);
+            }
+        }
+    } else if let Some(issue_id) = &job.issue_id {
+        if let Ok((title, description)) = issues::table
+            .find(issue_id)
+            .select((issues::title, issues::description))
+            .first::<(String, Option<String>)>(conn)
+        {
+            data["issue"] = serde_json::json!({
                 "id": issue_id,
                 "title": title,
                 "description": description,
-            }
-        }),
+            });
+        }
+    }
+
+    Ok(ResolvedInput {
+        artifact_type: "trigger_context".to_string(),
+        data,
     })
 }
 
@@ -233,7 +290,30 @@ pub fn format_resolved_inputs(inputs: &[ResolvedInput]) -> String {
 
         let mut section = match input.artifact_type.as_str() {
             "trigger_context" => {
-                if let Some(issue) = input.data.get("issue") {
+                let has_event = input.data.get("event").is_some();
+                let mut parts = Vec::new();
+
+                // Accumulated triggers: multiple source issues
+                if let Some(issues_arr) = input.data.get("issues").and_then(|v| v.as_array()) {
+                    let mut section = "## Source Issues\n\nThe following issues' jobs contributed to this batch:\n".to_string();
+                    for issue in issues_arr {
+                        let key = issue.get("key").and_then(|v| v.as_str()).unwrap_or("???");
+                        let title = issue
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Untitled");
+                        let description = issue
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        section.push_str(&format!("\n### {} — {}", key, title));
+                        if !description.is_empty() {
+                            section.push_str(&format!("\n\n{}", description));
+                        }
+                    }
+                    parts.push(section);
+                } else if let Some(issue) = input.data.get("issue") {
+                    // Single event trigger: one source issue
                     let title = issue
                         .get("title")
                         .and_then(|v| v.as_str())
@@ -242,13 +322,34 @@ pub fn format_resolved_inputs(inputs: &[ResolvedInput]) -> String {
                         .get("description")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if description.is_empty() {
-                        format!("# {}", title)
+
+                    if has_event {
+                        let mut section = format!(
+                            "## Source Issue\n\nThe following issue's job has ended. This is the issue that was worked on:\n\n**{}**",
+                            title
+                        );
+                        if !description.is_empty() {
+                            section.push_str(&format!("\n\n{}", description));
+                        }
+                        parts.push(section);
+                    } else if description.is_empty() {
+                        parts.push(format!("# {}", title));
                     } else {
-                        format!("# {}\n\n{}", title, description)
+                        parts.push(format!("# {}\n\n{}", title, description));
                     }
-                } else {
+                }
+
+                if let Some(event) = input.data.get("event") {
+                    parts.push(format!(
+                        "## Trigger Event\n\n```json\n{}\n```",
+                        serde_json::to_string_pretty(event).unwrap_or_default()
+                    ));
+                }
+
+                if parts.is_empty() {
                     serde_json::to_string_pretty(&input.data).unwrap_or_default()
+                } else {
+                    parts.join("\n\n")
                 }
             }
             "context" => {
@@ -431,25 +532,7 @@ fn is_node_job_ready(
     Ok(true)
 }
 
-fn count_pending_action_nodes(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    execution_id: &str,
-) -> Result<i64, String> {
-    use super::dag::load_nodes_from_execution;
-
-    let all_nodes = load_nodes_from_execution(conn, execution_id)?;
-    let total_action_nodes = all_nodes.iter().filter(|n| n.node_type == "action").count() as i64;
-
-    let executed_action_runs: i64 = action_runs::table
-        .filter(action_runs::execution_id.eq(execution_id))
-        .count()
-        .get_result(conn)
-        .unwrap_or(0);
-
-    Ok(total_action_nodes - executed_action_runs)
-}
-
-fn find_ready_action_nodes(
+pub fn find_ready_action_nodes(
     conn: &mut diesel::sqlite::SqliteConnection,
     execution_id: &str,
 ) -> Result<Vec<DbRecipeNode>, String> {
@@ -507,9 +590,8 @@ pub fn advance_execution_impl(
     conn: &mut diesel::sqlite::SqliteConnection,
     execution_id: &str,
     emitter: &dyn EventEmitter,
+    trigger_tx: &tokio::sync::broadcast::Sender<crate::models::TriggerEvent>,
 ) -> Result<Vec<Job>, String> {
-    let now = chrono::Utc::now().timestamp() as i32;
-
     let pending_jobs: Vec<DbJob> = jobs::table
         .filter(jobs::execution_id.eq(execution_id))
         .filter(jobs::status.eq("pending"))
@@ -520,16 +602,15 @@ pub fn advance_execution_impl(
 
     for job in pending_jobs {
         if is_job_ready(conn, &job)? {
-            let changeset = UpdateJobChangeset {
-                status: Some("ready"),
-                updated_at: Some(now),
-                ..Default::default()
-            };
-
-            diesel::update(jobs::table.find(&job.id))
-                .set(&changeset)
-                .execute(conn)
-                .map_err(|e| format!("Failed to update job to ready: {}", e))?;
+            // Use transition_job for validated Pending→Ready transition
+            crate::transitions::transition_job(
+                conn,
+                emitter,
+                &job.id,
+                JobStatus::Ready,
+                trigger_tx,
+            )
+            .map_err(|e| format!("Failed to transition job to ready: {}", e))?;
 
             let updated_job: DbJob = jobs::table
                 .find(&job.id)
@@ -540,425 +621,57 @@ pub fn advance_execution_impl(
         }
     }
 
-    // Transition issue from backlog → active when jobs become ready
-    if !newly_ready.is_empty() {
-        let issue_id: Option<String> = executions::table
-            .find(execution_id)
-            .select(executions::issue_id)
-            .first(conn)
-            .ok()
-            .flatten();
-
-        if let Some(ref iid) = issue_id {
-            let current_status: Option<String> = issues::table
-                .find(iid)
-                .select(issues::status)
-                .first(conn)
-                .ok();
-
-            if current_status.as_deref() == Some("backlog") {
-                let _ = diesel::update(issues::table.find(iid))
-                    .set((issues::status.eq("active"), issues::updated_at.eq(now)))
-                    .execute(conn);
-
-                log::info!("Issue {} transitioned from backlog to active", iid);
-                let _ = emitter.emit(
-                    "db-change",
-                    serde_json::json!({"table": "issues", "action": "update"}),
-                );
-            }
-        }
-    }
-
-    // Check if all jobs and action_runs are complete → mark execution complete
-    let incomplete_jobs: i64 = jobs::table
-        .filter(jobs::execution_id.eq(execution_id))
-        .filter(jobs::status.ne("complete"))
-        .filter(jobs::status.ne("failed"))
-        .count()
-        .get_result(conn)
-        .unwrap_or(1);
-
-    let incomplete_action_runs: i64 = action_runs::table
-        .filter(action_runs::execution_id.eq(execution_id))
-        .filter(action_runs::status.ne("complete"))
-        .filter(action_runs::status.ne("failed"))
-        .count()
-        .get_result(conn)
-        .unwrap_or(0);
-
-    let pending_action_nodes = count_pending_action_nodes(conn, execution_id)?;
-    let pending_condition_nodes = count_pending_condition_nodes(conn, execution_id)?;
-
-    if incomplete_jobs == 0
-        && incomplete_action_runs == 0
-        && pending_action_nodes == 0
-        && pending_condition_nodes == 0
-    {
-        let exec_changeset = UpdateExecutionChangeset {
-            status: Some("complete".to_string()),
-            completed_at: Some(Some(now)),
-            snapshot: None,
-        };
-
-        diesel::update(executions::table.find(execution_id))
-            .set(&exec_changeset)
-            .execute(conn)
-            .map_err(|e| format!("Failed to update execution: {}", e))?;
-
-        log::info!(
-            "Execution {} completed - all jobs, actions, and conditions done",
-            execution_id
-        );
-    }
-
     Ok(newly_ready)
 }
 
-/// Advance execution DAG and handle action/condition/checkpoint nodes inline.
+/// Advance execution DAG and handle action/condition/checkpoint nodes.
 ///
-/// Returns agent jobs that are ready to start. Checkpoint jobs are handled
-/// internally (blocked for approval or auto-approved for programmatic checkpoints).
-/// Action nodes are dispatched via the event system for host-layer execution.
+/// Returns agent jobs that are ready to start. All operations flow through
+/// the typed effects system: `reduce_dag` produces effects, `execute_effects`
+/// processes them through the core effect loop. Actions, checkpoints,
+/// conditions, and worktree creation are all handled inline by the loop.
+///
+/// This is the canonical entry point for DAG advancement. All callers —
+/// event listeners, direct async calls, scheduler — go through this function,
+/// which means all paths use `reduce_dag` as the single source of truth.
 pub async fn advance_execution_with_actions(
     orch: &Orchestrator,
     execution_id: &str,
 ) -> Result<Vec<Job>, String> {
-    // Advance the DAG to find ready jobs
-    let ready_jobs = {
-        let mut conn = orch
-            .db
-            .conn
-            .lock()
-            .map_err(|e| format!("Failed to lock database: {}", e))?;
-        advance_execution_impl(&mut conn, execution_id, &*orch.services.emitter)?
-    };
+    use crate::effects::dag::reduce_dag;
+    use crate::effects::run::execute_effects;
+    use crate::effects::types::WorkflowEffect;
 
-    // Categorize jobs by their node type
-    let mut agent_jobs = Vec::new();
-    let mut node_jobs: Vec<(DbJob, DbRecipeNode)> = Vec::new();
+    // Step 1: Synchronous DAG reduction — produces typed effects
+    let (mut agent_jobs, effects) = reduce_dag(orch, execution_id)?;
 
-    {
-        use super::dag::load_nodes_from_execution;
-        use std::collections::HashMap;
-
-        let mut conn = orch
-            .db
-            .conn
-            .lock()
-            .map_err(|e| format!("Failed to lock database: {}", e))?;
-
-        let mut node_map: HashMap<String, DbRecipeNode> = HashMap::new();
-        if let Some(first_job) = ready_jobs.first() {
-            if let Some(exec_id) = &first_job.execution_id {
-                if let Ok(nodes) = load_nodes_from_execution(&mut conn, exec_id) {
-                    for node in nodes {
-                        node_map.insert(node.id.clone(), node);
-                    }
-                }
+    // Step 2: Separate StartAgentJobs from other effects (we accumulate them)
+    let mut remaining_effects = Vec::new();
+    for effect in effects {
+        match effect {
+            WorkflowEffect::StartAgentJobs(jobs) => {
+                agent_jobs.extend(jobs);
             }
-        }
-
-        for job in ready_jobs {
-            if let Some(node_id) = &job.recipe_node_id {
-                if let Some(node) = node_map.get(node_id) {
-                    let db_job: DbJob = jobs::table
-                        .find(&job.id)
-                        .first(&mut *conn)
-                        .map_err(|e| format!("Failed to load job: {}", e))?;
-                    node_jobs.push((db_job, node.clone()));
-                    continue;
-                }
-            }
-            agent_jobs.push(job);
+            other => remaining_effects.push(other),
         }
     }
 
-    // Handle node-based jobs
-    for (db_job, node) in node_jobs {
-        match node.node_type.as_str() {
-            "checkpoint" => {
-                let checkpoint_config: Option<crate::models::CheckpointNodeConfig> = node
-                    .config
-                    .as_ref()
-                    .and_then(|c| serde_json::from_str(c).ok());
+    // Step 3: Execute remaining effects through the core effect loop.
+    // Cascading StartAgentJobs are handled by the executor directly.
+    if !remaining_effects.is_empty() {
+        let report = execute_effects(orch, remaining_effects).await?;
 
-                let is_programmatic = checkpoint_config
-                    .as_ref()
-                    .map(|c| {
-                        matches!(
-                            c.checkpoint_type,
-                            crate::models::CheckpointType::Programmatic
-                        )
-                    })
-                    .unwrap_or(false);
-
-                if is_programmatic {
-                    let command = checkpoint_config
-                        .as_ref()
-                        .and_then(|c| c.command.clone())
-                        .unwrap_or_else(|| "exit 0".to_string());
-
-                    let worktree_path = {
-                        let mut conn = orch
-                            .db
-                            .conn
-                            .lock()
-                            .map_err(|e| format!("Failed to lock database: {}", e))?;
-                        find_checkpoint_worktree(&mut conn, &db_job, &node)?
-                    };
-
-                    let cached_result = {
-                        let mut conn = orch
-                            .db
-                            .conn
-                            .lock()
-                            .map_err(|e| format!("Failed to lock database: {}", e))?;
-                        check_checkpoint_cache(&mut conn, &db_job, &command, &worktree_path)
-                    };
-
-                    let use_cached = matches!(&cached_result, Some((0, _, true)));
-
-                    if use_cached {
-                        if let Some((_, sha, _)) = cached_result {
-                            log::info!(
-                                "Using cached checkpoint result: passed at commit {}",
-                                &sha[..7.min(sha.len())]
-                            );
-                        }
-                        log::info!(
-                            "Programmatic checkpoint '{}' using cached pass, auto-approving",
-                            node.name
-                        );
-                        let ready = Box::pin(approve_job_inner(orch, &db_job.id, None)).await?;
-                        agent_jobs.extend(ready);
-                    } else {
-                        match super::conditions::execute_programmatic_checkpoint(
-                            &worktree_path,
-                            &command,
-                        )
-                        .await
-                        {
-                            Ok(true) => {
-                                log::info!(
-                                    "Programmatic checkpoint '{}' passed, auto-approving",
-                                    node.name
-                                );
-                                let ready =
-                                    Box::pin(approve_job_inner(orch, &db_job.id, None)).await?;
-                                agent_jobs.extend(ready);
-                            }
-                            Ok(false) => {
-                                log::info!(
-                                    "Programmatic checkpoint '{}' failed, auto-rejecting",
-                                    node.name
-                                );
-                                let _ = Box::pin(reject_job_inner(
-                                    orch,
-                                    &db_job.id,
-                                    Some(format!("Programmatic check failed: {}", command)),
-                                    None,
-                                ))
-                                .await?;
-                            }
-                            Err(e) => {
-                                log::error!("Programmatic checkpoint '{}' error: {}", node.name, e);
-                                mark_job_failed(orch, &db_job.id, &e)?;
-                            }
-                        }
-                    }
-                } else {
-                    // Approval checkpoint: block for user action
-                    let mut conn = orch
-                        .db
-                        .conn
-                        .lock()
-                        .map_err(|e| format!("Failed to lock database: {}", e))?;
-
-                    let now = chrono::Utc::now().timestamp() as i32;
-                    let changeset = UpdateJobChangeset {
-                        status: Some("blocked"),
-                        updated_at: Some(now),
-                        ..Default::default()
-                    };
-
-                    diesel::update(jobs::table.find(&db_job.id))
-                        .set(&changeset)
-                        .execute(&mut *conn)
-                        .map_err(|e| format!("Failed to update job: {}", e))?;
-
-                    let _ = orch.services.emitter.emit(
-                        "db-change",
-                        serde_json::json!({"table": "jobs", "action": "update"}),
-                    );
-                }
-            }
-
-            "action" => {
-                log::warn!(
-                    "Found job for action node - this shouldn't happen with new architecture"
-                );
-            }
-
-            "executor" => {
-                // Expand TaskList artifact into task nodes, mark executor job complete
-                log::info!("Expanding executor node '{}'", node.name);
-
-                // Resolve project path for agent config loading
-                let project_path: Option<std::path::PathBuf> = {
-                    let mut conn = orch
-                        .db
-                        .conn
-                        .lock()
-                        .map_err(|e| format!("Failed to lock database: {}", e))?;
-                    projects::table
-                        .find(&db_job.project_id)
-                        .select(projects::repo_path)
-                        .first::<String>(&mut *conn)
-                        .ok()
-                        .map(std::path::PathBuf::from)
-                };
-
-                let expand_result = super::executor::expand_executor_node(
-                    &mut *orch
-                        .db
-                        .conn
-                        .lock()
-                        .map_err(|e| format!("Failed to lock database: {}", e))?,
-                    execution_id,
-                    &node,
-                    &db_job.id,
-                    &orch.config_dir,
-                    project_path.as_deref(),
-                    &*orch.services.emitter,
-                );
-
-                match expand_result {
-                    Ok(_) => {
-                        // Cascade: pick up newly ready task jobs
-                        let cascade_jobs =
-                            Box::pin(advance_execution_with_actions(orch, execution_id)).await?;
-                        agent_jobs.extend(cascade_jobs);
-                    }
-                    Err(e) => {
-                        log::error!("Failed to expand executor node '{}': {}", node.name, e);
-                        mark_job_failed(orch, &db_job.id, &e)?;
-                    }
-                }
-            }
-
-            "agent" => {
-                agent_jobs.push(Job::try_from(db_job)?);
-            }
-
-            _ => {
-                log::warn!("Unknown node type '{}', skipping", node.node_type);
-            }
-        }
-    }
-
-    // Dispatch ready action nodes via the event system.
-    //
-    // cairn-core creates the action_run record and emits "dag-execute-action".
-    // The host layer (Tauri, cairn-server) listens for this event, executes the action,
-    // marks it complete, then re-triggers advancement via "dag-advance".
-    let ready_action_nodes = {
-        let mut conn = orch
-            .db
-            .conn
-            .lock()
-            .map_err(|e| format!("Failed to lock database: {}", e))?;
-        find_ready_action_nodes(&mut conn, execution_id)?
-    };
-
-    for node in ready_action_nodes {
-        let action_run_id = create_action_run(orch, execution_id, &node)?;
-
-        // Emit event for host layer to execute and advance afterward
-        let _ = orch.services.emitter.emit(
-            "dag-execute-action",
-            serde_json::json!({
-                "action_run_id": action_run_id,
-                "execution_id": execution_id,
-                "node_id": node.id,
-            }),
+        log::debug!(
+            "Effect loop completed: {} effects executed for execution {}",
+            report.effects_executed,
+            &execution_id[..execution_id.len().min(8)]
         );
     }
-
-    // Evaluate ready condition nodes
-    let ready_condition_nodes = {
-        let mut conn = orch
-            .db
-            .conn
-            .lock()
-            .map_err(|e| format!("Failed to lock database: {}", e))?;
-        find_ready_condition_nodes(&mut conn, execution_id)?
-    };
-
-    for node in ready_condition_nodes {
-        let recipe_id = {
-            let mut conn = orch
-                .db
-                .conn
-                .lock()
-                .map_err(|e| format!("Failed to lock database: {}", e))?;
-            executions::table
-                .find(execution_id)
-                .select(executions::recipe_id)
-                .first::<String>(&mut *conn)
-                .map_err(|e| format!("Failed to get execution: {}", e))?
-        };
-
-        let context = {
-            let mut conn = orch
-                .db
-                .conn
-                .lock()
-                .map_err(|e| format!("Failed to lock database: {}", e))?;
-            gather_condition_context(&mut conn, execution_id, &node.id, &recipe_id)?
-        };
-
-        match evaluate_condition_node(&node, &context) {
-            Ok((port, error_msg)) => {
-                log::info!(
-                    "Condition node '{}' evaluated to port '{}'",
-                    node.name,
-                    port
-                );
-
-                {
-                    let mut conn = orch
-                        .db
-                        .conn
-                        .lock()
-                        .map_err(|e| format!("Failed to lock database: {}", e))?;
-                    store_condition_evaluation(
-                        &mut conn,
-                        execution_id,
-                        &node.id,
-                        &port,
-                        error_msg.as_deref(),
-                        &*orch.services.emitter,
-                    )?;
-                }
-
-                let cascade_jobs =
-                    Box::pin(advance_execution_with_actions(orch, execution_id)).await?;
-                agent_jobs.extend(cascade_jobs);
-            }
-            Err(e) => {
-                log::error!("Condition node '{}' failed: {}", node.name, e);
-            }
-        }
-    }
-
-    // Clean up worktrees for non-issue executions that have completed
-    cleanup_non_issue_worktrees_if_complete(orch, execution_id)?;
 
     Ok(agent_jobs)
 }
 
-fn cleanup_non_issue_worktrees_if_complete(
+pub fn cleanup_non_issue_worktrees_if_complete(
     orch: &Orchestrator,
     execution_id: &str,
 ) -> Result<(), String> {
@@ -1029,27 +742,89 @@ fn cleanup_non_issue_worktrees_if_complete(
     Ok(())
 }
 
-fn mark_job_failed(orch: &Orchestrator, job_id: &str, error: &str) -> Result<(), String> {
+/// Create a dedicated worktree for the executor job.
+///
+/// Tasks and the collector inherit this worktree via `WorktreeMode::Inherit`.
+/// The branch is named `agent/{PROJECT}-{ISSUE}-executor-{SEQ}`.
+pub fn create_executor_worktree(orch: &Orchestrator, db_job: &DbJob) -> Result<(), String> {
     let mut conn = orch
         .db
         .conn
         .lock()
         .map_err(|e| format!("Failed to lock database: {}", e))?;
 
-    let now = chrono::Utc::now().timestamp() as i32;
-    let changeset = UpdateJobChangeset {
-        status: Some("failed"),
-        updated_at: Some(now),
-        completed_at: Some(Some(now)),
-        ..Default::default()
+    // Load project info
+    let (repo_path, project_key): (String, String) = projects::table
+        .find(&db_job.project_id)
+        .select((projects::repo_path, projects::key))
+        .first(&mut *conn)
+        .map_err(|e| format!("Project not found: {}", e))?;
+
+    // Display ID (issue number)
+    let display_id: String = if let Some(ref iid) = db_job.issue_id {
+        let num: i32 = issues::table
+            .find(iid)
+            .select(issues::number)
+            .first(&mut *conn)
+            .unwrap_or(0);
+        num.to_string()
+    } else {
+        "0".to_string()
     };
 
-    diesel::update(jobs::table.find(job_id))
-        .set(&changeset)
-        .execute(&mut *conn)
-        .map_err(|e| format!("Failed to update job: {}", e))?;
+    // Compute unique sequence number
+    let seq: i64 = if let Some(ref iid) = db_job.issue_id {
+        jobs::table
+            .filter(jobs::issue_id.eq(iid))
+            .filter(jobs::branch.is_not_null())
+            .count()
+            .get_result(&mut *conn)
+            .unwrap_or(0)
+    } else if let Some(ref exec_id) = db_job.execution_id {
+        jobs::table
+            .filter(jobs::execution_id.eq(exec_id))
+            .filter(jobs::branch.is_not_null())
+            .count()
+            .get_result(&mut *conn)
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
-    log::error!("Job {} failed: {}", job_id, error);
+    let branch = format!("agent/{}-{}-executor-{}", project_key, display_id, seq);
+    let wt_path = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".cairn")
+        .join("worktrees")
+        .join(format!("{}-{}-executor-{}", project_key, display_id, seq));
+
+    drop(conn);
+
+    super::jobs::prepare_worktree_for_job(orch, &repo_path, &wt_path, &branch, "HEAD")?;
+
+    let wt_path_str = wt_path.to_string_lossy().to_string();
+    let now = chrono::Utc::now().timestamp() as i32;
+    {
+        let mut conn = orch
+            .db
+            .conn
+            .lock()
+            .map_err(|e| format!("Failed to lock database: {}", e))?;
+        diesel::update(jobs::table.find(&db_job.id))
+            .set((
+                jobs::worktree_path.eq(Some(&wt_path_str)),
+                jobs::branch.eq(Some(&branch)),
+                jobs::updated_at.eq(now),
+            ))
+            .execute(&mut *conn)
+            .map_err(|e| format!("Failed to update executor job worktree: {}", e))?;
+    }
+
+    log::info!(
+        "Executor worktree created: {} (branch: {})",
+        wt_path_str,
+        branch
+    );
 
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -1059,7 +834,42 @@ fn mark_job_failed(orch: &Orchestrator, job_id: &str, error: &str) -> Result<(),
     Ok(())
 }
 
-fn create_action_run(
+pub fn mark_job_failed(orch: &Orchestrator, job_id: &str, error: &str) -> Result<(), String> {
+    let run_id: Option<String> = {
+        let mut conn = orch
+            .db
+            .conn
+            .lock()
+            .map_err(|e| format!("Failed to lock database: {}", e))?;
+
+        crate::transitions::transition_job(
+            &mut conn,
+            &*orch.services.emitter,
+            job_id,
+            crate::models::JobStatus::Failed,
+            &orch.trigger_events,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Find the latest run for this job to attach the error event
+        runs::table
+            .filter(runs::job_id.eq(job_id))
+            .order(runs::created_at.desc())
+            .select(runs::id)
+            .first::<String>(&mut *conn)
+            .ok()
+    };
+
+    log::error!("Job {} failed: {}", job_id, error);
+
+    if let Some(run_id) = run_id {
+        crate::orchestrator::session::insert_error_event(orch, &run_id, None, error);
+    }
+
+    Ok(())
+}
+
+pub fn create_action_run(
     orch: &Orchestrator,
     execution_id: &str,
     node: &DbRecipeNode,
@@ -1192,4 +1002,390 @@ pub fn mark_action_run_failed(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::diesel_models::{DbEvent, NewJob, NewRun};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::test_utils::{create_test_project, test_diesel_conn};
+    use std::sync::{Arc, Mutex};
+
+    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection) -> Orchestrator {
+        let db = Arc::new(DbState {
+            conn: Mutex::new(conn),
+        });
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
+            db.clone(),
+            services.emitter.clone(),
+        ));
+        let sync_tx = Arc::new(Mutex::new(None));
+        Orchestrator {
+            db,
+            services: services.clone(),
+            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
+            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
+                "/tmp",
+            ))),
+            warm_gc: None,
+            pty_state: Arc::new(crate::services::PtyState::default()),
+            permission_responses: tokio::sync::broadcast::channel(16).0,
+            run_completions: tokio::sync::broadcast::channel(64).0,
+            prompt_responses: tokio::sync::broadcast::channel(16).0,
+            trigger_events: tokio::sync::broadcast::channel(256).0,
+            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            identity_store: Arc::new(Mutex::new(None)),
+            mcp_binary_path: "cairn-mcp".to_string(),
+            config_dir: std::path::PathBuf::from("/tmp"),
+            schema_dir: None,
+            mcp_callback_port: 3847,
+            embedding_engine: None,
+            vibe_state: None,
+            account_manager,
+            sync_tx: sync_tx.clone(),
+            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
+            api_config: crate::api::ApiConfig::default(),
+            effect_tx: None,
+            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            provider_usage_snapshots: Default::default(),
+            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    fn create_job(conn: &mut diesel::sqlite::SqliteConnection, project_id: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+        let new_job = NewJob {
+            id: &id,
+            execution_id: None,
+            manager_id: None,
+            recipe_node_id: None,
+            parent_job_id: None,
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            current_session_id: None,
+            resume_session_id: None,
+            status: "running",
+            agent_config_id: None,
+            issue_id: None,
+            project_id,
+            task_description: Some("Test job"),
+            created_at: now,
+            updated_at: now,
+            completed_at: None,
+            parent_tool_use_id: None,
+            task_index: None,
+            started_at: Some(now),
+            model: None,
+            node_name: None,
+            base_branch: None,
+            current_turn_id: None,
+        };
+        diesel::insert_into(jobs::table)
+            .values(&new_job)
+            .execute(conn)
+            .expect("Failed to create test job");
+        id
+    }
+
+    fn create_run(conn: &mut diesel::sqlite::SqliteConnection, job_id: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+        let new_run = NewRun {
+            id: &id,
+            issue_id: None,
+            project_id: None,
+            job_id: Some(job_id),
+            status: Some("live"),
+            session_id: None,
+            error_message: None,
+            started_at: Some(now),
+            exited_at: None,
+            created_at: now,
+            updated_at: now,
+            backend: None,
+            exit_reason: None,
+            start_mode: None,
+            chat_id: None,
+        };
+        diesel::insert_into(runs::table)
+            .values(&new_run)
+            .execute(conn)
+            .expect("Failed to create test run");
+        id
+    }
+
+    #[test]
+    fn mark_job_failed_inserts_error_event_when_run_exists() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let orch = test_orchestrator(conn);
+
+        let (job_id, run_id) = {
+            let mut conn = orch.db.conn.lock().unwrap();
+            let job_id = create_job(&mut conn, &project_id);
+            let run_id = create_run(&mut conn, &job_id);
+            (job_id, run_id)
+        };
+
+        let result = mark_job_failed(&orch, &job_id, "Worktree creation failed");
+        assert!(result.is_ok());
+
+        // Verify the job was marked failed
+        let mut conn = orch.db.conn.lock().unwrap();
+        let status: String = jobs::table
+            .find(&job_id)
+            .select(jobs::status)
+            .first(&mut *conn)
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        // Verify an error event was inserted for the run
+        let error_events: Vec<DbEvent> = events::table
+            .filter(events::run_id.eq(&run_id))
+            .filter(events::event_type.eq("system:error"))
+            .load(&mut *conn)
+            .unwrap();
+
+        assert_eq!(error_events.len(), 1);
+        let data: serde_json::Value = serde_json::from_str(&error_events[0].data).unwrap();
+        assert_eq!(data["content"], "Worktree creation failed");
+        assert_eq!(data["isError"], true);
+    }
+
+    #[test]
+    fn mark_job_failed_succeeds_without_run() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let orch = test_orchestrator(conn);
+
+        let job_id = {
+            let mut conn = orch.db.conn.lock().unwrap();
+            create_job(&mut conn, &project_id)
+        };
+
+        // No run created — mark_job_failed should still succeed
+        let result = mark_job_failed(&orch, &job_id, "No run available");
+        assert!(result.is_ok());
+
+        // Job should be failed
+        let mut conn = orch.db.conn.lock().unwrap();
+        let status: String = jobs::table
+            .find(&job_id)
+            .select(jobs::status)
+            .first(&mut *conn)
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        // No error events should exist (no run to attach them to)
+        let event_count: i64 = events::table.count().get_result(&mut *conn).unwrap();
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn mark_job_failed_uses_latest_run() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let orch = test_orchestrator(conn);
+
+        let (job_id, _old_run_id, new_run_id) = {
+            let mut conn = orch.db.conn.lock().unwrap();
+            let job_id = create_job(&mut conn, &project_id);
+
+            // Create an older run
+            let old_id = Uuid::new_v4().to_string();
+            let old_time = chrono::Utc::now().timestamp() as i32 - 100;
+            diesel::insert_into(runs::table)
+                .values(&NewRun {
+                    id: &old_id,
+                    issue_id: None,
+                    project_id: None,
+                    job_id: Some(&job_id),
+                    status: Some("completed"),
+                    session_id: None,
+                    error_message: None,
+                    started_at: Some(old_time),
+                    exited_at: Some(old_time + 50),
+                    created_at: old_time,
+                    updated_at: old_time,
+                    backend: None,
+                    exit_reason: None,
+                    start_mode: None,
+                    chat_id: None,
+                })
+                .execute(&mut *conn)
+                .unwrap();
+
+            // Create a newer run
+            let new_id = Uuid::new_v4().to_string();
+            let new_time = chrono::Utc::now().timestamp() as i32;
+            diesel::insert_into(runs::table)
+                .values(&NewRun {
+                    id: &new_id,
+                    issue_id: None,
+                    project_id: None,
+                    job_id: Some(&job_id),
+                    status: Some("live"),
+                    session_id: None,
+                    error_message: None,
+                    started_at: Some(new_time),
+                    exited_at: None,
+                    created_at: new_time,
+                    updated_at: new_time,
+                    backend: None,
+                    exit_reason: None,
+                    start_mode: None,
+                    chat_id: None,
+                })
+                .execute(&mut *conn)
+                .unwrap();
+
+            (job_id, old_id, new_id)
+        };
+
+        mark_job_failed(&orch, &job_id, "DAG failure").unwrap();
+
+        // Error event should be attached to the newer run
+        let mut conn = orch.db.conn.lock().unwrap();
+        let events: Vec<DbEvent> = events::table
+            .filter(events::event_type.eq("system:error"))
+            .load(&mut *conn)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].run_id, new_run_id);
+    }
+
+    // ---- format_resolved_inputs: event trigger rendering ----
+
+    #[test]
+    fn format_trigger_context_with_issue_only() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "issue": {
+                    "id": "iss-1",
+                    "title": "Fix the bug",
+                    "description": "It crashes on startup",
+                }
+            }),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        assert!(output.contains("# Fix the bug"));
+        assert!(output.contains("It crashes on startup"));
+        assert!(!output.contains("Trigger Event"));
+    }
+
+    #[test]
+    fn format_trigger_context_with_event_only() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "event": {
+                    "jobId": "j1",
+                    "status": "complete",
+                    "projectId": "p1",
+                }
+            }),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        assert!(output.contains("## Trigger Event"));
+        assert!(output.contains("\"status\": \"complete\""));
+        // No issue heading (h1), only the event section (h2)
+        assert!(!output.starts_with("# "));
+        assert!(!output.contains("\n# "));
+    }
+
+    #[test]
+    fn format_trigger_context_with_issue_and_event() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "issue": {
+                    "id": "iss-1",
+                    "title": "Deploy monitoring",
+                    "description": null,
+                },
+                "event": {
+                    "skillId": "deploy",
+                    "skillName": "Deploy",
+                }
+            }),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        // Event-triggered: issue framed as source context, not open problem
+        assert!(output.contains("## Source Issue"));
+        assert!(output.contains("**Deploy monitoring**"));
+        assert!(output.contains("## Trigger Event"));
+        assert!(output.contains("\"skillId\": \"deploy\""));
+    }
+
+    #[test]
+    fn format_trigger_context_empty_data_falls_through() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({}),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        // Falls through to JSON pretty-print of empty object
+        assert!(output.contains("{}"));
+    }
+
+    #[test]
+    fn format_trigger_context_issue_without_description() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "issue": {
+                    "id": "iss-1",
+                    "title": "Title only",
+                    "description": null,
+                }
+            }),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        assert!(output.contains("# Title only"));
+        // Should not have a blank line after title with no description
+        assert!(!output.contains("# Title only\n\n\n"));
+    }
+
+    #[test]
+    fn format_trigger_context_accumulated_multiple_issues() {
+        let inputs = vec![ResolvedInput {
+            artifact_type: "trigger_context".to_string(),
+            data: serde_json::json!({
+                "issues": [
+                    {
+                        "id": "iss-1",
+                        "key": "PROJ-42",
+                        "title": "Fix login",
+                        "description": "Login page crashes",
+                    },
+                    {
+                        "id": "iss-2",
+                        "key": "PROJ-55",
+                        "title": "Update deps",
+                        "description": null,
+                    }
+                ],
+                "event": {
+                    "accumulated": true,
+                    "groupKey": "quickbuild",
+                    "threshold": 2,
+                    "eventCount": 2,
+                    "events": [],
+                }
+            }),
+        }];
+        let output = format_resolved_inputs(&inputs);
+        assert!(output.contains("## Source Issues"));
+        assert!(output.contains("### PROJ-42 — Fix login"));
+        assert!(output.contains("Login page crashes"));
+        assert!(output.contains("### PROJ-55 — Update deps"));
+        assert!(output.contains("## Trigger Event"));
+    }
 }

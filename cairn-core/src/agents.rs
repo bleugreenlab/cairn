@@ -3,6 +3,7 @@
 //! This module handles parsing agent markdown files for import/export.
 //! Supports Claude Code-compatible format.
 
+use crate::models::{ApprovalPolicy, FilesystemScope};
 use serde::{Deserialize, Serialize};
 
 /// Agent frontmatter from markdown files (Claude Code compatible)
@@ -17,9 +18,16 @@ pub struct AgentFrontmatter {
     #[serde(deserialize_with = "deserialize_tools")]
     pub tools: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    #[serde(alias = "model")]
+    pub tier: Option<String>,
+    /// Legacy field — kept for backward compat when reading old YAML files
+    #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filesystem_scope: Option<FilesystemScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks: Option<serde_json::Value>,
     /// Tools to disallow (added to blocked list)
@@ -28,6 +36,10 @@ pub struct AgentFrontmatter {
     /// Skills to inject into the prompt
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<String>>,
+    /// Preferred backend when multiple providers are available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "backend", alias = "backendPreference")]
+    pub backend_preference: Option<String>,
 }
 
 /// Custom deserializer that handles both comma-separated string and YAML array
@@ -77,11 +89,13 @@ pub struct ParsedAgent {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
-    pub model: Option<String>,
-    pub permission_mode: Option<String>,
+    pub tier: Option<String>,
+    pub approval_policy: Option<ApprovalPolicy>,
+    pub filesystem_scope: Option<FilesystemScope>,
     pub hooks: Option<serde_json::Value>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
+    pub backend_preference: Option<String>,
 }
 
 /// Generate a slug from a name (for ID generation)
@@ -164,6 +178,18 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         (slugify(&frontmatter.name), true)
     };
 
+    // Prefer new fields; fall back to legacy permissionMode conversion
+    let (approval_policy, filesystem_scope) =
+        if frontmatter.approval_policy.is_some() || frontmatter.filesystem_scope.is_some() {
+            (frontmatter.approval_policy, frontmatter.filesystem_scope)
+        } else if frontmatter.permission_mode.is_some() {
+            let (a, f) =
+                crate::models::split_legacy_permission_mode(frontmatter.permission_mode.as_deref());
+            (Some(a), Some(f))
+        } else {
+            (None, None)
+        };
+
     Ok(ParsedAgent {
         id,
         id_generated,
@@ -171,11 +197,13 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         description: frontmatter.description,
         prompt,
         tools,
-        model: frontmatter.model,
-        permission_mode: frontmatter.permission_mode,
+        tier: frontmatter.tier,
+        approval_policy,
+        filesystem_scope,
         hooks: frontmatter.hooks,
         disallowed_tools: frontmatter.disallowed_tools,
         skills: frontmatter.skills,
+        backend_preference: frontmatter.backend_preference,
     })
 }
 
@@ -186,12 +214,14 @@ pub struct AgentExportData<'a> {
     pub name: &'a str,
     pub description: &'a str,
     pub tools: &'a [String],
-    pub model: Option<&'a str>,
+    pub tier: Option<&'a str>,
     pub prompt: &'a str,
-    pub permission_mode: Option<&'a str>,
+    pub approval_policy: Option<ApprovalPolicy>,
+    pub filesystem_scope: Option<FilesystemScope>,
     pub disallowed_tools: Option<&'a [String]>,
     pub skills: Option<&'a [String]>,
     pub hooks: Option<&'a serde_json::Value>,
+    pub backend_preference: Option<&'a str>,
 }
 
 /// Convert agent to Claude Code-compatible markdown format for export
@@ -201,12 +231,14 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         name,
         description,
         tools,
-        model,
+        tier,
         prompt,
-        permission_mode,
+        approval_policy,
+        filesystem_scope,
         disallowed_tools,
         skills,
         hooks,
+        backend_preference,
     } = data;
 
     let mut frontmatter = format!(
@@ -216,22 +248,29 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         tools.join(", ")
     );
 
-    if let Some(m) = model {
-        frontmatter.push_str(&format!("model: {}\n", m));
+    if let Some(t) = tier {
+        frontmatter.push_str(&format!("tier: {}\n", t));
     }
 
-    // Use provided permission mode or infer from tools for Claude Code compatibility
-    let effective_permission_mode = permission_mode.unwrap_or_else(|| {
-        let has_write_or_edit = tools
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case("Write") || t.eq_ignore_ascii_case("Edit"));
-        if has_write_or_edit {
-            "acceptEdits"
-        } else {
-            "plan"
+    if let Some(b) = backend_preference {
+        frontmatter.push_str(&format!("backend: {}\n", b));
+    }
+
+    // Write approvalPolicy only when non-default (default is Ask)
+    if let Some(policy) = approval_policy {
+        if policy != ApprovalPolicy::Ask {
+            let val = serde_json::to_string(&policy).unwrap_or_default();
+            frontmatter.push_str(&format!("approvalPolicy: {}\n", val.trim_matches('"')));
         }
-    });
-    frontmatter.push_str(&format!("permissionMode: {}\n", effective_permission_mode));
+    }
+
+    // Write filesystemScope only when non-default (default is CwdOnly)
+    if let Some(mode) = filesystem_scope {
+        if mode != FilesystemScope::CwdOnly {
+            let val = serde_json::to_string(&mode).unwrap_or_default();
+            frontmatter.push_str(&format!("filesystemScope: {}\n", val.trim_matches('"')));
+        }
+    }
 
     // Export disallowedTools if present
     if let Some(disallowed) = disallowed_tools {
@@ -305,7 +344,7 @@ This is the agent's system prompt.
         assert_eq!(agent.id, "test-agent");
         assert!(agent.id_generated);
         assert_eq!(agent.tools.len(), 3);
-        assert_eq!(agent.model, Some("sonnet".to_string()));
+        assert_eq!(agent.tier, Some("sonnet".to_string()));
         assert!(agent.prompt.contains("# Test Prompt"));
     }
 
@@ -336,7 +375,7 @@ This is the agent's system prompt.
         assert!(!agent.id_generated);
         assert_eq!(agent.name, "Test Agent");
         assert_eq!(agent.tools.len(), 2);
-        assert_eq!(agent.model, Some("sonnet".to_string()));
+        assert_eq!(agent.tier, Some("sonnet".to_string()));
     }
 
     #[test]
@@ -380,18 +419,20 @@ Prompt
             name: "Test Agent",
             description: "A test agent",
             tools: &tools,
-            model: Some("sonnet"),
+            tier: Some("sonnet"),
             prompt: "# Test Prompt\n\nThis is the prompt.",
-            permission_mode: None,
+            approval_policy: None,
+            filesystem_scope: None,
             disallowed_tools: None,
             skills: None,
             hooks: None,
+            backend_preference: None,
         });
 
         assert!(markdown.contains("name: Test Agent"));
         assert!(markdown.contains("tools: Read, Grep"));
-        assert!(markdown.contains("model: sonnet"));
-        assert!(markdown.contains("permissionMode: plan")); // Inferred from tools (no Write/Edit)
+        assert!(markdown.contains("tier: sonnet"));
+        assert!(!markdown.contains("permissionMode"));
         assert!(markdown.contains("# Test Prompt"));
         assert!(!markdown.contains("id:")); // ID not exported
     }
@@ -406,12 +447,14 @@ Prompt
             name: "Planner",
             description: "Creates plans",
             tools: &tools,
-            model: None,
+            tier: None,
             prompt: "Plan stuff.",
-            permission_mode: Some("acceptEdits"),
+            approval_policy: Some(ApprovalPolicy::AcceptAll),
+            filesystem_scope: None,
             disallowed_tools: Some(&disallowed),
             skills: Some(&skills),
             hooks: None,
+            backend_preference: None,
         });
 
         assert!(markdown.contains("disallowedTools:"));
@@ -420,7 +463,7 @@ Prompt
         assert!(markdown.contains("skills:"));
         assert!(markdown.contains("  - api-conventions"));
         assert!(markdown.contains("  - error-handling"));
-        assert!(markdown.contains("permissionMode: acceptEdits"));
+        assert!(markdown.contains("approvalPolicy: acceptAll"));
     }
 
     #[test]
@@ -439,7 +482,8 @@ Prompt
         assert!(result.is_ok());
 
         let agent = result.unwrap();
-        assert_eq!(agent.permission_mode, Some("acceptEdits".to_string()));
+        assert_eq!(agent.approval_policy, Some(ApprovalPolicy::AcceptAll));
+        assert_eq!(agent.filesystem_scope, Some(FilesystemScope::CwdOnly));
     }
 
     #[test]
@@ -541,15 +585,72 @@ Build stuff.
             name: &agent.name,
             description: &agent.description,
             tools: &agent.tools,
-            model: None,
+            tier: None,
             prompt: &agent.prompt,
-            permission_mode: None,
+            approval_policy: None,
+            filesystem_scope: None,
             disallowed_tools: None,
             skills: None,
             hooks: agent.hooks.as_ref(),
+            backend_preference: None,
         });
 
         assert!(markdown.contains("hooks:"));
         assert!(markdown.contains("PreToolUse"));
+    }
+
+    #[test]
+    fn test_backend_preference_roundtrip() {
+        let content = r#"---
+name: Codex Builder
+description: Builds with Codex
+tools: Read, Write
+backend: codex
+---
+
+Build with Codex.
+"#;
+
+        let agent = parse_agent_markdown(content).unwrap();
+        assert_eq!(agent.backend_preference.as_deref(), Some("codex"));
+
+        // Export and verify backend preference is preserved
+        let markdown = agent_to_markdown(AgentExportData {
+            id: "codex-builder",
+            name: &agent.name,
+            description: &agent.description,
+            tools: &agent.tools,
+            tier: None,
+            prompt: &agent.prompt,
+            approval_policy: None,
+            filesystem_scope: None,
+            disallowed_tools: None,
+            skills: None,
+            hooks: None,
+            backend_preference: agent.backend_preference.as_deref(),
+        });
+
+        assert!(markdown.contains("backend: codex"));
+    }
+
+    #[test]
+    fn test_backend_preference_omitted_when_absent() {
+        let markdown = agent_to_markdown(AgentExportData {
+            id: "plain",
+            name: "Plain",
+            description: "No backend preference",
+            tools: &["Read".to_string()],
+            tier: Some("sonnet"),
+            prompt: "Do stuff.",
+            approval_policy: None,
+            filesystem_scope: None,
+            disallowed_tools: None,
+            skills: None,
+            hooks: None,
+            backend_preference: None,
+        });
+
+        assert!(!markdown.contains("backendPreference"));
+        assert!(!markdown.contains("backend:"));
     }
 }

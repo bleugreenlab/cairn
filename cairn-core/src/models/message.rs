@@ -44,6 +44,7 @@ pub struct Message {
     pub sender_run_id: Option<String>,
     pub sender_name: String,
     pub recipient_run_id: Option<String>,
+    pub recipient_manager_id: Option<String>,
     pub content: String,
     pub created_at: i64,
 }

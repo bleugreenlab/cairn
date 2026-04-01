@@ -6,14 +6,13 @@
 
 use super::{
     get_current_head_sha, get_job_checkpoint_command, is_worktree_dirty, lookup_run,
-    lookup_run_by_cwd, normalize_command,
+    lookup_run_by_cwd, normalize_command, unwrap_shell_launcher,
 };
-use crate::services::{get_default_shell, PtySession};
+use crate::services::{get_default_shell, PtySession, SpawnConfig};
 use portable_pty::{CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -21,6 +20,7 @@ use uuid::Uuid;
 
 use crate::diesel_models::{NewCheckpointCommandCache, NewJobTerminal};
 use crate::mcp::types::McpCallbackRequest;
+use crate::node_segments::visible_node_segment;
 use crate::orchestrator::Orchestrator;
 use crate::schema::{checkpoint_command_cache, job_terminals, jobs};
 use diesel::prelude::*;
@@ -95,6 +95,47 @@ pub struct AgentTerminalCreatedPayload {
 /// Maximum output buffer size (64KB)
 const MAX_BUFFER_SIZE: usize = 64 * 1024;
 
+/// Redact common secret patterns from a command string for safe logging.
+///
+/// Replaces values matching bearer tokens, API keys, export statements with
+/// secret-like variable names, and password flags with `[REDACTED]`.
+///
+/// This is intentionally conservative — it only redacts well-known patterns
+/// to avoid false positives that would make logs unreadable.
+pub fn redact_command(command: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        vec![
+            // Bearer tokens: "Bearer sk-abc123..." or "Bearer eyJ..."
+            // [^\s'"]+ avoids eating surrounding quotes
+            Regex::new(r#"(?i)(Bearer\s+)[^\s'"]+"#).unwrap(),
+            // API key patterns: sk-..., sk_live_..., etc.
+            Regex::new(r"\bsk[-_][a-zA-Z0-9._-]{8,}\b").unwrap(),
+            // export KEY=value, export SECRET=value, export TOKEN=value, export PASSWORD=value
+            Regex::new(r"(?i)(export\s+[A-Z_]*(?:KEY|SECRET|TOKEN|PASSWORD)\s*=)\S+").unwrap(),
+            // --password=value or --password value
+            Regex::new(r"(?i)(--password[= ])\S+").unwrap(),
+        ]
+    });
+
+    let mut result = command.to_string();
+    for pattern in PATTERNS.iter() {
+        result = pattern
+            .replace_all(&result, |caps: &regex::Captures| {
+                // Preserve the prefix (e.g., "Bearer ", "export API_KEY=", "--password=")
+                if let Some(prefix) = caps.get(1) {
+                    format!("{}[REDACTED]", prefix.as_str())
+                } else {
+                    "[REDACTED]".to_string()
+                }
+            })
+            .to_string();
+    }
+    result
+}
+
 // Re-export slug utilities from shared module
 use super::slug::{build_terminal_uri, generate_terminal_slug};
 
@@ -132,14 +173,27 @@ fn is_git_commit_command(command: &str) -> bool {
 
 /// Handle bash tool call - routes to inline or background execution
 pub async fn handle_bash(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: BashPayload = match serde_json::from_value(request.payload.clone()) {
+    let mut payload: BashPayload = match serde_json::from_value(request.payload.clone()) {
         Ok(p) => p,
         Err(e) => return format!("Invalid payload: {}", e),
     };
 
+    let unwrapped_command = unwrap_shell_launcher(&payload.command);
+    if payload.command.trim() != unwrapped_command {
+        let redacted_original = redact_command(&payload.command);
+        let redacted_unwrapped = redact_command(&unwrapped_command);
+        log::info!(
+            "bash command unwrapped from launcher form: original='{}' unwrapped='{}'",
+            &redacted_original[..redacted_original.len().min(100)],
+            &redacted_unwrapped[..redacted_unwrapped.len().min(100)]
+        );
+        payload.command = unwrapped_command;
+    }
+
+    let redacted = redact_command(&payload.command);
     log::info!(
         "bash command: {} (cwd={}, bg={:?})",
-        &payload.command[..payload.command.len().min(100)],
+        &redacted[..redacted.len().min(100)],
         request.cwd,
         payload.run_in_background
     );
@@ -149,12 +203,17 @@ pub async fn handle_bash(orch: &Orchestrator, request: &McpCallbackRequest) -> S
     if run_in_background {
         handle_background_bash(orch, &request.cwd, &payload).await
     } else {
-        handle_inline_bash(orch, &request.cwd, &payload).await
+        handle_inline_bash(orch, request, &request.cwd, &payload).await
     }
 }
 
 /// Handle inline bash execution with streaming output
-async fn handle_inline_bash(orch: &Orchestrator, cwd: &str, payload: &BashPayload) -> String {
+async fn handle_inline_bash(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    cwd: &str,
+    payload: &BashPayload,
+) -> String {
     let services = &orch.services;
     let timeout_ms = payload.timeout.unwrap_or(120_000).min(600_000);
 
@@ -165,26 +224,6 @@ async fn handle_inline_bash(orch: &Orchestrator, cwd: &str, payload: &BashPayloa
         ("bash", "-c")
     };
 
-    // Spawn the process
-    let mut child = match crate::env::command(shell)
-        .arg(flag)
-        .arg(&payload.command)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return format!("Failed to spawn command: {}", e),
-    };
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    // Collect output (we'll stream it if we have a run context)
-    let stdout_content = Arc::new(Mutex::new(String::new()));
-    let stderr_content = Arc::new(Mutex::new(String::new()));
-
     // Try to get run context for streaming (optional - works even without it)
     let run_context = {
         let mut conn = orch.db.conn.lock();
@@ -194,8 +233,43 @@ async fn handle_inline_bash(orch: &Orchestrator, cwd: &str, payload: &BashPayloa
         }
     };
 
-    // Generate a tool_use_id for correlating stream events
-    let tool_use_id = Uuid::new_v4().to_string();
+    // Reuse the transcript tool_use_id when available so chat can correlate
+    // bash-output / bash-complete events with the visible tool card.
+    let tool_use_id = request
+        .tool_use_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let inline_command_id = Uuid::new_v4().to_string();
+
+    let child = match services.process.spawn(
+        SpawnConfig::new(shell)
+            .arg(flag)
+            .arg(&payload.command)
+            .cwd(cwd),
+    ) {
+        Ok(child) => Arc::new(Mutex::new(child)),
+        Err(e) => return format!("Failed to spawn command: {}", e),
+    };
+
+    let (stdout, stderr) = {
+        let mut guard = match child.lock() {
+            Ok(guard) => guard,
+            Err(e) => return format!("Failed to access command process: {}", e),
+        };
+        (guard.take_stdout(), guard.take_stderr())
+    };
+
+    if let Some(ref ctx) = run_context {
+        orch.pty_state.register_inline_command(
+            ctx.run_id.clone(),
+            inline_command_id.clone(),
+            child.clone(),
+        );
+    }
+
+    // Collect output (we'll stream it if we have a run context)
+    let stdout_content = Arc::new(Mutex::new(String::new()));
+    let stderr_content = Arc::new(Mutex::new(String::new()));
 
     // Read stdout in a thread
     let stdout_handle = {
@@ -278,7 +352,15 @@ async fn handle_inline_bash(orch: &Orchestrator, cwd: &str, payload: &BashPayloa
     let mut exit_code = None;
 
     loop {
-        match child.try_wait() {
+        let wait_result = {
+            let mut guard = match child.lock() {
+                Ok(guard) => guard,
+                Err(e) => return format!("Failed to access command process: {}", e),
+            };
+            guard.try_wait()
+        };
+
+        match wait_result {
             Ok(Some(status)) => {
                 exit_code = status.code();
                 break;
@@ -286,15 +368,20 @@ async fn handle_inline_bash(orch: &Orchestrator, cwd: &str, payload: &BashPayloa
             Ok(None) => {
                 if start.elapsed() > timeout {
                     timed_out = true;
-                    let _ = child.kill();
+                    if let Ok(mut guard) = child.lock() {
+                        let _ = guard.kill();
+                    }
                     break;
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => {
-                return format!("Error waiting for process: {}", e);
-            }
+            Err(e) => return format!("Error waiting for process: {}", e),
         }
+    }
+
+    if let Some(ref ctx) = run_context {
+        orch.pty_state
+            .unregister_inline_command(&ctx.run_id, &inline_command_id);
     }
 
     // Wait for output threads to finish
@@ -498,7 +585,7 @@ async fn handle_background_bash(orch: &Orchestrator, cwd: &str, payload: &BashPa
     }
 
     // Generate slug and store in job_terminals table
-    let slug = {
+    let (slug, node_segment) = {
         let mut conn = match orch.db.conn.lock() {
             Ok(c) => c,
             Err(e) => return format!("Database error: {}", e),
@@ -512,6 +599,17 @@ async fn handle_background_bash(orch: &Orchestrator, cwd: &str, payload: &BashPa
             payload.description.as_deref(),
             &payload.command,
         );
+        let node_segment = if run_context.issue_number.is_some() {
+            let recipe_node_id = jobs::table
+                .find(&run_context.job_id)
+                .select(jobs::recipe_node_id)
+                .first::<Option<String>>(&mut *conn)
+                .ok()
+                .flatten();
+            visible_node_segment(recipe_node_id.as_deref(), run_context.job_name.as_deref())
+        } else {
+            None
+        };
 
         let now = chrono::Utc::now().timestamp() as i32;
         let id = Uuid::new_v4().to_string();
@@ -541,14 +639,13 @@ async fn handle_background_bash(orch: &Orchestrator, cwd: &str, payload: &BashPa
             serde_json::json!({"table": "job_terminals", "action": "update"}),
         );
 
-        slug
+        (slug, node_segment)
     };
-
-    // Build the terminal URI using cairn:// scheme
     let uri = build_terminal_uri(
         &run_context.project_key,
         run_context.issue_number,
-        run_context.job_name.as_deref(),
+        run_context.exec_seq,
+        node_segment.as_deref(),
         &slug,
     );
 
@@ -590,16 +687,16 @@ async fn handle_background_bash(orch: &Orchestrator, cwd: &str, payload: &BashPa
                                 serde_json::json!({"table": "job_terminals", "action": "delete"}),
                             );
 
-                            // If non-zero exit, get claude_session_id for injection
+                            // If non-zero exit, get current_session_id for injection
                             if let Some(code) = exit_code {
                                 if code != 0 {
-                                    let claude_session_id: Option<String> = jobs::table
+                                    let job_session_id: Option<String> = jobs::table
                                         .find(&job_id)
-                                        .select(jobs::claude_session_id)
+                                        .select(jobs::current_session_id)
                                         .first::<Option<String>>(&mut *conn)
                                         .ok()
                                         .flatten();
-                                    claude_session_id.map(|s| (s, code as i32))
+                                    job_session_id.map(|s| (s, code as i32))
                                 } else {
                                     None
                                 }
@@ -612,10 +709,10 @@ async fn handle_background_bash(orch: &Orchestrator, cwd: &str, payload: &BashPa
                     };
 
                     // Send terminal context OUTSIDE db lock to avoid deadlock
-                    if let Some((claude_session_id, code)) = injection_info {
+                    if let Some((session_id, code)) = injection_info {
                         send_terminal_exit_context(
                             &orch_t,
-                            &claude_session_id,
+                            &session_id,
                             &sid,
                             code,
                             &buffer,
@@ -725,7 +822,7 @@ fn get_exit_code_from_session(
 /// Send terminal context to Claude via stdin when a background process exits with error.
 fn send_terminal_exit_context(
     orch: &Orchestrator,
-    claude_session_id: &str,
+    session_id: &str,
     _terminal_session_id: &str,
     exit_code: i32,
     buffer: &Arc<Mutex<VecDeque<u8>>>,
@@ -750,50 +847,35 @@ fn send_terminal_exit_context(
     // Find the process and send via stdin
     let process_state = orch.process_state.clone();
 
-    let run_id = match process_state.find_process_by_session(claude_session_id) {
+    let run_id = match process_state.find_process_by_session(session_id) {
         Some(rid) => rid,
         None => {
             log::info!(
                 "No active process for session {}, skipping terminal context",
-                &claude_session_id[..8.min(claude_session_id.len())]
+                &session_id[..8.min(session_id.len())]
             );
             return;
         }
     };
 
-    let stdin_handle = match process_state.get_stdin_handle(&run_id) {
-        Some(h) => h,
-        None => {
-            log::warn!("No stdin handle for run {}", &run_id[..8.min(run_id.len())]);
-            return;
+    match crate::backends::stdin::send_user_message(
+        &process_state,
+        &run_id,
+        &content,
+        session_id,
+        None,
+        None,
+    ) {
+        Ok(()) => {
+            log::info!(
+                "Sent terminal context to session {}: command='{}' exit_code={}",
+                &session_id[..8.min(session_id.len())],
+                cmd_display,
+                exit_code
+            );
         }
-    };
-
-    let Ok(mut stdin_guard) = stdin_handle.lock() else {
-        return;
-    };
-
-    if let Some(ref mut stdin) = *stdin_guard {
-        // No image cache available in cairn-core context (Tauri-specific)
-        match crate::claude::stdin::send_user_message_with_images(
-            stdin,
-            claude_session_id,
-            &content,
-            None,
-            None,
-            None,
-        ) {
-            Ok(()) => {
-                log::info!(
-                    "Sent terminal context to session {}: command='{}' exit_code={}",
-                    &claude_session_id[..8.min(claude_session_id.len())],
-                    cmd_display,
-                    exit_code
-                );
-            }
-            Err(e) => {
-                log::warn!("Failed to send terminal context: {}", e);
-            }
+        Err(e) => {
+            log::warn!("Failed to send terminal context: {}", e);
         }
     }
 }
@@ -980,6 +1062,109 @@ pub async fn handle_kill_shell(orch: &Orchestrator, request: &McpCallbackRequest
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── redact_command tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_redact_bearer_token() {
+        assert_eq!(
+            redact_command(r#"curl -H "Authorization: Bearer sk-abc123xyz""#),
+            r#"curl -H "Authorization: Bearer [REDACTED]""#
+        );
+    }
+
+    #[test]
+    fn test_redact_bearer_case_insensitive() {
+        assert_eq!(
+            redact_command("curl -H 'bearer eyJhbGciOiJI.long.token'"),
+            "curl -H 'bearer [REDACTED]'"
+        );
+    }
+
+    #[test]
+    fn test_redact_api_key_pattern() {
+        assert_eq!(
+            redact_command("echo sk-proj-abcdefghij123456"),
+            "echo [REDACTED]"
+        );
+        assert_eq!(
+            redact_command("echo sk_live_abcdefghij123456"),
+            "echo [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_redact_export_secret_vars() {
+        assert_eq!(
+            redact_command("export API_KEY=supersecret123"),
+            "export API_KEY=[REDACTED]"
+        );
+        assert_eq!(
+            redact_command("export OPENAI_SECRET=sk-abc123456789"),
+            "export OPENAI_SECRET=[REDACTED]"
+        );
+        assert_eq!(
+            redact_command("export AUTH_TOKEN=eyJhbGciOiJI"),
+            "export AUTH_TOKEN=[REDACTED]"
+        );
+        assert_eq!(
+            redact_command("export DB_PASSWORD=hunter2"),
+            "export DB_PASSWORD=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_redact_password_flag() {
+        assert_eq!(
+            redact_command("mysql --password=secret123 -u root"),
+            "mysql --password=[REDACTED] -u root"
+        );
+        assert_eq!(
+            redact_command("mysql --password secret123 -u root"),
+            "mysql --password [REDACTED] -u root"
+        );
+    }
+
+    #[test]
+    fn test_redact_normal_commands_unchanged() {
+        let normal = "git status --short";
+        assert_eq!(redact_command(normal), normal);
+
+        let normal2 = "ls -la /tmp";
+        assert_eq!(redact_command(normal2), normal2);
+
+        let normal3 = "cargo build --release";
+        assert_eq!(redact_command(normal3), normal3);
+    }
+
+    #[test]
+    fn test_redact_multiple_secrets_in_one_command() {
+        let cmd = "export API_KEY=secret1 && curl -H 'Bearer sk-abc123456789'";
+        let redacted = redact_command(cmd);
+        assert!(!redacted.contains("secret1"));
+        assert!(!redacted.contains("sk-abc123456789"));
+        assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_redact_short_sk_not_matched() {
+        // Short sk- patterns (less than 8 chars after prefix) should NOT be redacted
+        assert_eq!(redact_command("echo sk-short"), "echo sk-short");
+    }
+
+    // ── existing tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_handle_bash_command_unwrap_uses_semantic_inner_command() {
+        assert_eq!(
+            unwrap_shell_launcher(r#"/bin/zsh -lc "sed -n '120,520p' src/app.tsx""#),
+            "sed -n '120,520p' src/app.tsx"
+        );
+        assert_eq!(
+            unwrap_shell_launcher("bash -lc 'git status --short'"),
+            "git status --short"
+        );
+    }
 
     #[test]
     fn test_is_git_commit_command() {

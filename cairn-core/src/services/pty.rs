@@ -3,10 +3,13 @@
 //! Provides testable pure functions for PTY operations and buffer management,
 //! plus a factory trait for creating PTY pairs in a testable way.
 
+use super::process::ChildProcess;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+
+pub type SharedInlineChild = Arc<Mutex<Box<dyn ChildProcess>>>;
 
 // ============================================================================
 // PtyState — Runtime PTY session tracking (shared by Tauri + cairn-server)
@@ -28,13 +31,53 @@ pub struct PtySession {
 /// Manages all active PTY sessions
 pub struct PtyState {
     pub sessions: Mutex<HashMap<String, Arc<Mutex<PtySession>>>>,
+    pub inline_commands: Mutex<HashMap<String, HashMap<String, SharedInlineChild>>>,
 }
 
 impl Default for PtyState {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            inline_commands: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl PtyState {
+    pub fn register_inline_command(
+        &self,
+        run_id: String,
+        command_id: String,
+        child: SharedInlineChild,
+    ) {
+        if let Ok(mut commands) = self.inline_commands.lock() {
+            commands
+                .entry(run_id)
+                .or_default()
+                .insert(command_id, child);
+        }
+    }
+
+    pub fn unregister_inline_command(&self, run_id: &str, command_id: &str) {
+        if let Ok(mut commands) = self.inline_commands.lock() {
+            if let Some(run_commands) = commands.get_mut(run_id) {
+                run_commands.remove(command_id);
+                if run_commands.is_empty() {
+                    commands.remove(run_id);
+                }
+            }
+        }
+    }
+
+    pub fn take_inline_commands(&self, run_id: &str) -> Vec<SharedInlineChild> {
+        if let Ok(mut commands) = self.inline_commands.lock() {
+            return commands
+                .remove(run_id)
+                .map(|run_commands| run_commands.into_values().collect())
+                .unwrap_or_default();
+        }
+
+        Vec::new()
     }
 }
 

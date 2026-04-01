@@ -107,8 +107,8 @@ mod tests {
                 project_id: project_id.to_string(),
                 title: "Test Issue".to_string(),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
+                manager_id: None,
             },
         )
         .unwrap()

@@ -90,6 +90,17 @@ pub trait GitClient: Send + Sync {
 
     /// Delete a local branch.
     fn delete_branch(&self, repo: &Path, branch_name: &str, force: bool) -> Result<(), String>;
+
+    /// Check if a branch exists on the remote (origin).
+    fn remote_branch_exists(&self, repo: &Path, branch_name: &str) -> Result<bool, String>;
+
+    /// Add a worktree tracking a remote branch (creates local branch from origin/<branch>).
+    fn worktree_add_tracking_branch(
+        &self,
+        repo: &Path,
+        worktree_path: &Path,
+        branch_name: &str,
+    ) -> Result<(), String>;
 }
 
 /// Production git client using the git CLI.
@@ -324,6 +335,49 @@ impl GitClient for RealGitClient {
             Ok(())
         } else {
             Err(format!("git branch {} failed: {}", flag, output.stderr))
+        }
+    }
+
+    fn remote_branch_exists(&self, repo: &Path, branch_name: &str) -> Result<bool, String> {
+        let output = self.run_git_strs(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/remotes/origin/{}", branch_name),
+            ],
+        )?;
+        Ok(output.success)
+    }
+
+    fn worktree_add_tracking_branch(
+        &self,
+        repo: &Path,
+        worktree_path: &Path,
+        branch_name: &str,
+    ) -> Result<(), String> {
+        let wt_path = worktree_path.to_string_lossy();
+        let remote_ref = format!("origin/{}", branch_name);
+        let output = self.run_git_strs(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "--track",
+                "-b",
+                branch_name,
+                &wt_path,
+                &remote_ref,
+            ],
+        )?;
+
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!(
+                "git worktree add --track failed: {}",
+                output.stderr
+            ))
         }
     }
 }

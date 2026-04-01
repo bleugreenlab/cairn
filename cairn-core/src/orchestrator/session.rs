@@ -1,32 +1,27 @@
-//! Claude session management (spawning, event streaming, process lifecycle).
+//! Session management (configuration resolution, agent dispatch).
 //!
-//! This module handles starting Claude sessions, resolving configuration,
-//! managing event streams, and storing session state.
+//! This module handles resolving session configuration (tools, model, prompt,
+//! MCP config) from agent configs and database state, then delegates to an
+//! `AgentBackend` for process spawning and event streaming.
 //!
 //! All functions take `&Orchestrator` instead of framework-specific handles.
 
-use crate::claude::args::{build_claude_args, ClaudeArgsConfig};
-use crate::claude::stream::{
-    parse_event, ClaudeEvent, DeltaContent, StreamEventInner, TranscriptEvent,
-};
-use crate::claude::turn_boundary::TurnBoundaryChecker;
-use crate::debug::debug_log;
+use crate::agent_process::stream::{ClaudeEvent, TranscriptEvent};
+use crate::backends::{self, SessionConfig, SessionStart};
+use crate::config::presets::{load_effective_presets, resolve_runtime_selection, PresetsConfig};
 use crate::diesel_models::*;
-use crate::models::{Model, RunStatus};
+use crate::models::Model;
+use crate::node_segments::visible_node_segment;
 use crate::schema::*;
-use crate::services::SpawnConfig;
 use diesel::prelude::*;
 use std::fs;
-use std::io::{BufRead, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::thread;
 use uuid::Uuid;
 
 use super::Orchestrator;
 
 /// Insert a synthetic system:error event for display in the transcript
-fn insert_error_event(
+pub fn insert_error_event(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
@@ -80,11 +75,27 @@ fn insert_error_event(
         cache_read_tokens: None,
         cache_create_tokens: None,
         output_tokens: None,
+        turn_id: None,
     };
 
     let _ = diesel::insert_into(events::table)
         .values(&new_event)
         .execute(&mut *conn);
+
+    // Sync event to cloud
+    orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
+        id: event_id.clone(),
+        run_id: run_id.to_string(),
+        session_id: session_id.map(|s| s.to_string()),
+        sequence: Some(sequence),
+        event_type: "system:error".to_string(),
+        data: Some(data.clone()),
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        created_at: Some(now as i64),
+        turn_id: None,
+    }));
 
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -92,100 +103,32 @@ fn insert_error_event(
     );
 }
 
-/// Finalize an `assistant:streaming` placeholder to `assistant` using accumulated content/thinking.
-/// Acquires its own DB lock — only call when no lock is held.
-fn finalize_streaming_placeholder(
-    orch: &Orchestrator,
-    streaming_state: &mut Option<StreamingState>,
-    session_id: Option<&str>,
-) {
-    let Some(state) = streaming_state.take() else {
-        return;
-    };
-    let Ok(mut conn) = orch.db.conn.lock() else {
-        return;
-    };
-
-    let final_event = TranscriptEvent {
-        event_type: "assistant".to_string(),
-        session_id: session_id.map(|s| s.to_string()),
-        parent_tool_use_id: None,
-        content: if state.content.is_empty() {
-            None
-        } else {
-            Some(state.content)
-        },
-        thinking: if state.thinking.is_empty() {
-            None
-        } else {
-            Some(state.thinking)
-        },
-        tool_name: None,
-        tool_input: None,
-        tool_uses: None,
-        tool_use_id: None,
-        tool_result: None,
-        is_error: false,
-        usage: None,
-        raw: None,
-    };
-    let data = serde_json::to_string(&final_event).unwrap_or_default();
-    let _ = diesel::update(events::table.find(&state.event_id))
-        .set((events::event_type.eq("assistant"), events::data.eq(data)))
-        .execute(&mut *conn);
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "events", "action": "update"}),
-    );
-}
-
-/// State for tracking a streaming message being accumulated
-#[derive(Debug)]
-struct StreamingState {
-    /// Database event ID for the placeholder
-    event_id: String,
-    /// Accumulated text content
-    content: String,
-    /// Accumulated thinking content
-    thinking: String,
-}
-
-impl StreamingState {
-    fn new(event_id: String) -> Self {
-        Self {
-            event_id,
-            content: String::new(),
-            thinking: String::new(),
-        }
-    }
-}
-
 /// Find the claude binary path, caching the result
 pub fn get_claude_path(
-    state: &crate::claude::process::ClaudeProcessState,
+    state: &crate::agent_process::process::AgentProcessState,
 ) -> Result<String, String> {
-    debug_log("get_claude_path: starting");
+    log::debug!("get_claude_path: starting");
 
     // Check cache first
     {
-        let cached = state.claude_path.lock().map_err(|e| e.to_string())?;
+        let cached = state.cli_binary_path.lock().map_err(|e| e.to_string())?;
         if let Some(path) = cached.as_ref() {
-            debug_log(&format!("get_claude_path: using cached path: {}", path));
+            log::debug!("get_claude_path: using cached path: {}", path);
             return Ok(path.clone());
         }
     }
 
-    debug_log("get_claude_path: no cache, resolving...");
+    log::debug!("get_claude_path: no cache, resolving...");
     let path = crate::env::find_binary("claude").map_err(|e| {
-        debug_log(&format!("get_claude_path: {}", e));
+        log::debug!("get_claude_path: {}", e);
         e
     })?;
 
-    debug_log(&format!("get_claude_path: found claude at: {}", path));
+    log::debug!("get_claude_path: found claude at: {}", path);
 
     // Cache and return
     {
-        let mut cached = state.claude_path.lock().map_err(|e| e.to_string())?;
+        let mut cached = state.cli_binary_path.lock().map_err(|e| e.to_string())?;
         *cached = Some(path.clone());
     }
 
@@ -227,9 +170,13 @@ pub fn write_system_prompt_file(
 
     // Combine bundled system prompt with agent-specific content
     let content = if let Some(agent_content) = agent_prompt {
-        format!("{}\n\n{}", crate::claude::SYSTEM_PROMPT, agent_content)
+        format!(
+            "{}\n\n{}",
+            crate::system_prompt::CAIRN_SYSTEM_PROMPT,
+            agent_content
+        )
     } else {
-        crate::claude::SYSTEM_PROMPT.to_string()
+        crate::system_prompt::CAIRN_SYSTEM_PROMPT.to_string()
     };
 
     fs::write(&file_path, &content)
@@ -301,36 +248,33 @@ pub fn cleanup_stale_prompt_files() {
     }
 }
 
-/// Start a Claude CLI session with stream-json output
+/// Start an agent session (Claude or Codex).
 ///
 /// Session ID handling:
-/// - For new sessions: caller provides `session_id` (pre-generated UUID)
-/// - For resume sessions: caller provides `resume_session_id` (existing session to continue)
+/// - `session_id`: Cairn's internal session ID (always set). Used for event storage.
+/// - `backend_id`: Backend conversation ID for resume. Claude session ID or Codex thread ID.
+///   None on first run; set from Session.backend_id on subsequent runs.
 ///
 /// Callers are responsible for creating run/job/chat/event records with the correct
-/// session_id BEFORE calling this function. This function only spawns Claude and
-/// passes the session_id via CLI flags.
+/// session_id BEFORE calling this function.
 #[allow(clippy::too_many_arguments)]
-pub fn start_claude_session(
+pub fn start_agent_session(
     orch: &Orchestrator,
     run_id: &str,
     prompt: &str,
     working_dir: &str,
-    session_id: Option<&str>,
-    resume_session_id: Option<&str>,
+    session_start: SessionStart,
     model: Option<Model>,
-    initial_user_message: Option<&str>,
+    _initial_user_message: Option<&str>,
     agent_config: Option<&crate::models::AgentConfig>,
     output_schema: Option<&crate::models::OutputSchemaInfo>,
     _is_job_level: bool,
     execution_id: Option<&str>,
+    identity_override: Option<crate::identity::UserIdentity>,
 ) -> Result<(), String> {
-    debug_log("start_claude_session: entered");
+    log::debug!("start_agent_session: entered");
     let start_time = std::time::Instant::now();
-    log::info!("[PROFILE] start_claude_session begin");
-
-    // Session ID for the reader thread (either new or resume)
-    let effective_session_id = session_id.or(resume_session_id).map(|s| s.to_string());
+    log::info!("[PROFILE] start_agent_session begin");
 
     // Resolve output schema from provided info (if any)
     let (schema_temp_path, resolved_tool_name, resolved_tool_description) = {
@@ -344,16 +288,15 @@ pub fn start_claude_session(
             .and_then(|info| info.description.clone());
 
         let temp_path = if let Some(ref info) = resolved_info {
-            debug_log("start_claude_session: resolving output schema");
-            let schema_value =
-                crate::schemas::resolve_output_schema(orch.schema_dir.as_deref(), &info.schema)
-                    .map_err(|e| format!("Failed to resolve output schema: {}", e))?;
-            let temp_path = crate::schemas::write_schema_to_temp_file(&schema_value)
+            log::debug!("start_agent_session: resolving output schema");
+            let schema_value = crate::output_schemas::resolve_output_schema(
+                orch.schema_dir.as_deref(),
+                &info.schema,
+            )
+            .map_err(|e| format!("Failed to resolve output schema: {}", e))?;
+            let temp_path = crate::output_schemas::write_schema_to_temp_file(&schema_value)
                 .map_err(|e| format!("Failed to write schema to temp file: {}", e))?;
-            debug_log(&format!(
-                "start_claude_session: schema written to {:?}",
-                temp_path
-            ));
+            log::debug!("start_agent_session: schema written to {:?}", temp_path);
             Some(temp_path)
         } else {
             None
@@ -363,13 +306,13 @@ pub fn start_claude_session(
     };
 
     // Ensure MCP config file exists and get its path
-    debug_log("start_claude_session: ensuring MCP config");
+    log::debug!("start_agent_session: ensuring MCP config");
     let schema_path_str = schema_temp_path
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
 
     // Serialize available agents, skills, and tools for MCP config
-    let (agents_json, skills_json, tools_json) = {
+    let (agents_json, skills_json, tools_json, _session_project_path, session_project_id) = {
         let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
 
         // Get project_id from run
@@ -498,7 +441,7 @@ pub fn start_claude_session(
             }
         };
 
-        (agents, skills, tools)
+        (agents, skills, tools, project_path, project_id)
     };
 
     let mcp_config_path = match crate::config::mcp_setup::ensure_mcp_config(
@@ -513,37 +456,34 @@ pub fn start_claude_session(
         tools_json.as_deref(),
     ) {
         Ok(path) => {
-            debug_log(&format!(
-                "start_claude_session: MCP config done, path={:?}",
-                path
-            ));
+            log::debug!("start_agent_session: MCP config done, path={:?}", path);
             path
         }
         Err(e) => {
-            debug_log(&format!("start_claude_session: MCP config FAILED: {}", e));
+            log::debug!("start_agent_session: MCP config FAILED: {}", e);
             return Err(e);
         }
     };
     log::info!("[PROFILE] MCP config done: {:?}", start_time.elapsed());
 
-    // Get cached claude path (resolves once on first use)
-    debug_log("start_claude_session: getting claude path");
-    let claude_path = get_claude_path(&orch.process_state)?;
-    debug_log(&format!(
-        "start_claude_session: claude path = {}",
-        claude_path
-    ));
-    log::info!("[PROFILE] Claude path resolved: {:?}", start_time.elapsed());
-
-    // Get max_thinking_tokens from settings
-    let max_thinking_tokens =
-        crate::config::settings::load_settings(&orch.config_dir).max_thinking_tokens;
+    let workspace_settings = crate::config::settings::load_settings(&orch.config_dir);
 
     // Use provided agent config (agents are now always explicitly passed)
     let agent_config = agent_config.cloned();
 
-    // Resolve tools from agent config with provider preferences
-    let (allowed_tools, disallowed_tools, effective_model, final_prompt, system_prompt_content) = {
+    // Resolve tools, model, prompt, permissions, and select backend.
+    // All operations that need agent_config + DB access are grouped here.
+    let (
+        allowed_tools,
+        disallowed_tools,
+        effective_model,
+        final_prompt,
+        system_prompt_content,
+        backend,
+        permissions,
+        max_thinking_tokens,
+        reasoning_effort,
+    ) = {
         use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
         use crate::diesel_models::DbRun;
         use crate::schema::{issues, jobs, runs};
@@ -591,19 +531,61 @@ pub fn start_claude_session(
                     .ok()
             });
 
-            let node_name = run.job_id.as_ref().and_then(|jid| {
-                jobs::table
-                    .find(jid)
-                    .select(jobs::node_name)
-                    .first::<Option<String>>(diesel_conn)
+            // Get node identifiers, execution_id, and parent context from job
+            let (recipe_node_id, node_name, job_exec_id, parent_job_id) = run
+                .job_id
+                .as_ref()
+                .and_then(|jid| {
+                    jobs::table
+                        .find(jid)
+                        .select((
+                            jobs::recipe_node_id,
+                            jobs::node_name,
+                            jobs::execution_id,
+                            jobs::parent_job_id,
+                        ))
+                        .first::<(
+                            Option<String>,
+                            Option<String>,
+                            Option<String>,
+                            Option<String>,
+                        )>(diesel_conn)
+                        .ok()
+                })
+                .unwrap_or((None, None, None, None));
+
+            // Get exec_seq from the execution
+            let exec_seq = job_exec_id.as_deref().and_then(|eid| {
+                executions::table
+                    .find(eid)
+                    .select(executions::seq)
+                    .first::<Option<i32>>(diesel_conn)
                     .ok()
                     .flatten()
             });
 
-            let uri = project_key.map(|proj| match (issue_number, node_name) {
-                (Some(num), Some(node)) => format!("cairn://{}/{}/{}", proj, num, node),
-                (Some(num), None) => format!("cairn://{}/{}", proj, num),
-                _ => format!("cairn://{}", proj),
+            // If this is a task (has parent_job_id), get parent's identifiers
+            let (parent_recipe_node_id, parent_node_name) = parent_job_id
+                .as_deref()
+                .and_then(|pid| {
+                    jobs::table
+                        .find(pid)
+                        .select((jobs::recipe_node_id, jobs::node_name))
+                        .first::<(Option<String>, Option<String>)>(diesel_conn)
+                        .ok()
+                })
+                .unwrap_or((None, None));
+
+            let uri = project_key.map(|proj| {
+                build_current_location_uri(
+                    &proj,
+                    issue_number,
+                    exec_seq,
+                    parent_recipe_node_id.as_deref(),
+                    parent_node_name.as_deref(),
+                    recipe_node_id.as_deref(),
+                    node_name.as_deref(),
+                )
             });
 
             (uri, issue_id_clone)
@@ -641,6 +623,45 @@ pub fn start_claude_session(
                     .map(std::path::PathBuf::from)
             });
 
+        let (max_thinking_tokens, reasoning_effort) = {
+            let presets = execution_id
+                .and_then(|eid| {
+                    executions::table
+                        .find(eid)
+                        .select(executions::snapshot)
+                        .first::<Option<String>>(&mut *conn)
+                        .ok()
+                        .flatten()
+                        .and_then(|json| {
+                            serde_json::from_str::<crate::models::ExecutionSnapshot>(&json)
+                                .ok()
+                                .and_then(|snapshot| {
+                                    snapshot.presets.as_ref().map(PresetsConfig::from)
+                                })
+                        })
+                })
+                .unwrap_or_else(|| {
+                    load_effective_presets(&orch.config_dir, project_path_for_prompt.as_deref())
+                });
+            let authored_tier = agent_config
+                .as_ref()
+                .and_then(|ac| ac.tier.as_ref())
+                .or(model.as_ref())
+                .map(Model::as_str);
+            let authored_backend = agent_config
+                .as_ref()
+                .and_then(|ac| ac.backend_preference.as_deref());
+            let extras = resolve_runtime_selection(authored_tier, authored_backend, &presets)
+                .map(|(_, _, extras)| extras)
+                .unwrap_or_default();
+            (
+                extras
+                    .max_thinking_tokens
+                    .or(workspace_settings.max_thinking_tokens),
+                extras.reasoning_effort.clone(),
+            )
+        };
+
         // Get list of available agents from files
         let available_agents: Vec<(String, String, String)> = {
             let agents =
@@ -673,16 +694,65 @@ pub fn start_claude_session(
             result
         };
 
-        // Get agent tools (empty if no agent config)
+        // ================================================================
+        // Backend selection (moved before tool resolution so the backend
+        // can control which tools are allowed/disallowed).
+        // ================================================================
+
+        let agent_backend_name = agent_config
+            .as_ref()
+            .and_then(|ac| ac.backend_preference.clone());
+
+        // Runtime model should already be resolved before session start.
+        let resolved_model = model.clone();
+
+        let effective_backend_name = agent_backend_name.clone().or_else(|| {
+            resolved_model
+                .as_ref()
+                .and_then(|m| backends::backend_for_model(m.as_str()))
+                .map(|s| s.to_string())
+        });
+
+        let backend = backends::backend_for_name(effective_backend_name.as_deref());
+
+        // Build canonical permissions from agent config fields
+        let permissions = {
+            let (ap, fs) = agent_config
+                .as_ref()
+                .map(|ac| (ac.approval_policy, ac.filesystem_scope))
+                .unwrap_or_default();
+            backends::AgentPermissions::new(ap.unwrap_or_default(), fs.unwrap_or_default())
+        };
+
+        // ================================================================
+        // Tool resolution via backend adapter
+        // ================================================================
+
         let agent_tools: Vec<String> = agent_config
             .as_ref()
             .map(|a| a.tools.clone())
             .unwrap_or_default();
 
-        // Resolve tools: map overlapping tools to Cairn equivalents
-        let (mut allowed, force_disallowed) = crate::claude::toolkits::resolve_tools(&agent_tools);
+        let agent_disallowed: Vec<String> = agent_config
+            .as_ref()
+            .and_then(|a| a.disallowed_tools.clone())
+            .unwrap_or_default();
 
-        // Add submission tool (custom name or default "return")
+        let resolved = backend.resolve_tools(&agent_tools, &agent_disallowed);
+        let mut allowed = resolved.allowed;
+        let disallowed = resolved.disallowed;
+
+        // Strip file mutation tools when filesystem scope is ReadOnly
+        if permissions.filesystem == crate::models::FilesystemScope::ReadOnly {
+            allowed.retain(|t| {
+                !matches!(
+                    t.as_str(),
+                    "mcp__cairn__write" | "mcp__cairn__edit" | "mcp__cairn__filechange"
+                )
+            });
+        }
+
+        // Add custom submission tool name if an output schema defines one
         let submission_tool = resolved_tool_name
             .as_ref()
             .map(|n| format!("mcp__cairn__{}", n))
@@ -691,54 +761,6 @@ pub fn start_claude_session(
         if !allowed.contains(&submission_tool) {
             allowed.push(submission_tool.clone());
         }
-
-        // Auto-add skill tool when skills are available
-        if !available_skills_for_prompt.is_empty()
-            && !allowed.contains(&"mcp__cairn__skill".to_string())
-        {
-            allowed.push("mcp__cairn__skill".to_string());
-        }
-
-        // Build disallowed: everything not allowed
-        let allowed_set: std::collections::HashSet<_> = allowed.iter().cloned().collect();
-        let all_known = crate::claude::toolkits::get_all_known_tools();
-
-        let mut disallowed: Vec<String> = all_known
-            .into_iter()
-            .filter(|t| !allowed_set.contains(t))
-            .collect();
-
-        // Add unchosen provider versions
-        disallowed.extend(force_disallowed);
-
-        // Always disallow planning mode tools (managed by Cairn)
-        for tool in crate::models::ALWAYS_DISALLOWED_TOOLS {
-            if !disallowed.contains(&tool.to_string()) {
-                disallowed.push(tool.to_string());
-            }
-        }
-
-        // Add agent-specific disallowed tools
-        if let Some(ref agent) = agent_config {
-            if let Some(ref agent_disallowed) = agent.disallowed_tools {
-                for tool in agent_disallowed {
-                    if !disallowed.contains(tool) {
-                        disallowed.push(tool.clone());
-                    }
-                }
-            }
-        }
-
-        // Remove any always-disallowed tools from allowed (in case agent config has them)
-        allowed.retain(|t| !crate::models::ALWAYS_DISALLOWED_TOOLS.contains(&t.as_str()));
-
-        disallowed.sort();
-        disallowed.dedup();
-
-        // Resolve model: job.model (passed as model param) > agent_config.model > workspace default
-        let resolved_model = model
-            .clone()
-            .or_else(|| agent_config.as_ref().and_then(|a| a.model.clone()));
 
         // Build system prompt content from agent prompt + context
         let system_prompt_content = {
@@ -773,60 +795,19 @@ pub fn start_claude_session(
                 }
             }
 
-            // Inject skill content for agent-configured skills
-            let mut injected_skill_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            if let Some(ref agent) = agent_config {
-                if let Some(ref skill_ids) = agent.skills {
-                    // Load from snapshot if available, otherwise from files
-                    if let Some(exec_id) = execution_id {
-                        use crate::jobs::queries::load_execution_snapshot;
-
-                        if let Ok(snapshot) = load_execution_snapshot(&mut conn, exec_id) {
-                            for skill_id in skill_ids {
-                                if let Some(skill) = snapshot.skills.get(skill_id) {
-                                    if !content.is_empty() {
-                                        content.push_str("\n\n");
-                                    }
-                                    content.push_str(&skill.prompt);
-                                    injected_skill_ids.insert(skill_id.clone());
-                                }
-                            }
-                        }
-                    } else {
-                        // Fallback to files (non-execution runs)
-                        for skill_id in skill_ids {
-                            if let Ok(Some(skill)) = config_skills::get_skill(
-                                &orch.config_dir,
-                                skill_id,
-                                project_path_for_prompt.as_deref(),
-                            ) {
-                                if !content.is_empty() {
-                                    content.push_str("\n\n");
-                                }
-                                content.push_str(&skill.prompt);
-                                injected_skill_ids.insert(skill_id.clone());
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Inject issue-level skills (skip if already injected via agent)
-            if let Some(exec_id) = execution_id {
-                use crate::jobs::queries::load_execution_snapshot;
-
-                if let Ok(snapshot) = load_execution_snapshot(&mut conn, exec_id) {
-                    for skill_id in &snapshot.trigger_context.issue_skills {
-                        if injected_skill_ids.contains(skill_id) {
-                            continue;
-                        }
-                        if let Some(skill) = snapshot.skills.get(skill_id) {
+            // Inject project resources section
+            if let Some(ref project_path) = project_path_for_prompt {
+                let proj_config =
+                    crate::config::project_settings::load_project_settings(project_path);
+                if let Some(ref resources) = proj_config.resources {
+                    if !resources.is_empty() {
+                        let resources_section =
+                            crate::resources::build_resources_prompt(&orch.config_dir, resources);
+                        if !resources_section.is_empty() {
                             if !content.is_empty() {
                                 content.push_str("\n\n");
                             }
-                            content.push_str(&skill.prompt);
+                            content.push_str(&resources_section);
                         }
                     }
                 }
@@ -881,714 +862,76 @@ pub fn start_claude_session(
             resolved_model,
             resolved_prompt,
             system_prompt_content,
+            backend,
+            permissions,
+            max_thinking_tokens,
+            reasoning_effort,
         )
     };
 
-    // Build Claude arguments using the pure function
-    let agent_permission_mode = agent_config.and_then(|ac| ac.permission_mode.clone());
-    let (use_skip_permissions, permission_prompt_tool) = match agent_permission_mode.as_deref() {
-        Some("bypassPermissions") => (true, None),
-        _ => (false, Some("mcp__cairn__permission_prompt".to_string())),
-    };
-
-    // Write combined system prompt (bundled + agent) to temp file
-    let prompt_file_path = write_system_prompt_file(run_id, system_prompt_content.as_deref())?;
-
-    // Write hook settings file for memory surfacing (passed via --settings)
-    let hook_settings_path =
-        crate::memories::hooks::write_hook_settings_file(orch.mcp_callback_port).ok();
-
-    let args_config = ClaudeArgsConfig {
-        mcp_config_path: mcp_config_path.to_string_lossy().to_string(),
-        skip_permissions: use_skip_permissions,
-        permission_prompt_tool,
-        model: effective_model,
-        session_id: session_id.map(|s| s.to_string()),
-        resume_session_id: resume_session_id.map(|s| s.to_string()),
-        prompt: final_prompt.clone(),
-        max_thinking_tokens,
-        allowed_tools,
-        disallowed_tools,
-        append_system_prompt_file: Some(prompt_file_path),
-        settings_path: hook_settings_path,
-        bidirectional: true,
-    };
-    let claude_args = build_claude_args(&args_config);
-
-    debug_log(&format!(
-        "start_claude_session: command built, claude_path={}",
-        claude_path
-    ));
-    debug_log(&format!("start_claude_session: args={:?}", claude_args));
-    debug_log(&format!(
-        "start_claude_session: working_dir={}",
-        working_dir
-    ));
-
-    log::info!("[PROFILE] Command built: {:?}", start_time.elapsed());
-    log::info!("Spawning claude: {} {:?}", claude_path, claude_args);
-
-    // Get MCP authentication secret (shared secret for TOTP-style passcodes)
-    let mcp_secret = orch
-        .mcp_auth
-        .get_secret_for_mcp()
-        .map_err(|e| format!("Failed to get MCP auth secret: {}", e))?;
-    log::info!("Using MCP auth secret for run {}", run_id);
-
-    // Build spawn config and spawn using ProcessSpawner service
-    let spawn_config = SpawnConfig::new(&claude_path)
-        .args(&claude_args)
-        .cwd(working_dir)
-        .env("CAIRN_RUN_ID", run_id)
-        .env("CAIRN_MCP_SECRET", &mcp_secret)
-        .env("ENABLE_TOOL_SEARCH", "false")
-        .stdin(true);
-
-    // Check if we need to evict a warm process to make room
-    orch.collect_warm_if_needed();
-
-    debug_log("start_claude_session: about to spawn");
-    let mut child = orch.services.process.spawn(spawn_config).map_err(|e| {
-        debug_log(&format!("start_claude_session: spawn failed: {}", e));
-        insert_error_event(
-            orch,
-            run_id,
-            effective_session_id.as_deref(),
-            &format!("Failed to start Claude: {}", e),
-        );
-        e
-    })?;
-    debug_log(&format!(
-        "start_claude_session: spawned, pid={}",
-        child.id()
-    ));
-    log::info!("[PROFILE] Process spawned: {:?}", start_time.elapsed());
-
-    // Update run and node status to running AFTER successful spawn
-    debug_log("start_claude_session: updating status to running");
-    let now = chrono::Utc::now().timestamp() as i32;
-    {
-        let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
-        diesel::update(runs::table.find(&run_id))
-            .set((
-                runs::status.eq("running"),
-                runs::started_at.eq(Some(now)),
-                runs::updated_at.eq(now),
-            ))
-            .execute(&mut *conn)
-            .map_err(|e| e.to_string())?;
-
-        if let Ok(Some(job_id)) = runs::table
-            .find(&run_id)
-            .select(runs::job_id)
-            .first::<Option<String>>(&mut *conn)
-        {
-            let _ = diesel::update(jobs::table.find(&job_id))
-                .set((jobs::status.eq("running"), jobs::updated_at.eq(now)))
-                .execute(&mut *conn);
-        }
-    }
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "runs", "action": "update"}),
-    );
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "jobs", "action": "update"}),
-    );
-    debug_log("start_claude_session: status updated to running");
-
-    let stdout = child.take_stdout().ok_or("Failed to capture stdout")?;
-    let stderr = child.take_stderr();
-    let stdin = child.take_stdin();
-
-    // Spawn thread to log stderr
-    if let Some(stderr) = stderr {
-        thread::spawn(move || {
-            debug_log("stderr_thread: started");
-            for line in stderr.lines().map_while(Result::ok) {
-                debug_log(&format!("claude stderr: {}", line));
-                log::error!("claude stderr: {}", line);
-            }
-            debug_log("stderr_thread: ended");
+    // Resolve identity: explicit override (server) > ambient identity store (desktop)
+    let resolved_identity = identity_override.or_else(|| {
+        let project_overrides = session_project_id.as_ref().and_then(|pid| {
+            orch.get_identity_store()
+                .and_then(|store| store.project_overrides.get(pid).cloned())
         });
-    }
-
-    // Store the process handle with stdin for bidirectional communication
-    let child_arc = Arc::new(Mutex::new(Some(child)));
-    let stdin_arc = Arc::new(Mutex::new(stdin));
-
-    // Get job_id for warm process tracking
-    let process_job_id: Option<String> = {
-        let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
-        runs::table
-            .find(&run_id)
-            .select(runs::job_id)
-            .first::<Option<String>>(&mut *conn)
-            .ok()
-            .flatten()
-    };
-
-    {
-        let mut processes = orch
-            .process_state
-            .processes
-            .lock()
-            .map_err(|e| e.to_string())?;
-        let active_process = crate::claude::process::ActiveProcess::new(
-            child_arc.clone(),
-            stdin_arc.clone(),
-            effective_session_id.clone(),
-            process_job_id,
-        );
-        processes.insert(run_id.to_string(), active_process);
-    }
-
-    // In bidirectional mode, send the initial prompt via stdin
-    if args_config.bidirectional {
-        let mut stdin_guard = stdin_arc.lock().map_err(|e| e.to_string())?;
-        if let Some(ref mut stdin_writer) = *stdin_guard {
-            let content =
-                crate::claude::stdin::build_message_content(&final_prompt, Some(working_dir), None);
-
-            let initial_message = serde_json::json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": content
-                }
-            });
-            writeln!(stdin_writer, "{}", initial_message)
-                .map_err(|e| format!("Failed to send initial prompt via stdin: {}", e))?;
-            stdin_writer
-                .flush()
-                .map_err(|e| format!("Failed to flush stdin: {}", e))?;
-            log::info!(
-                "Sent initial prompt via stdin ({} chars)",
-                final_prompt.len()
-            );
-        }
-    }
-
-    // Clone what we need for the thread
-    let run_id = run_id.to_string();
-    let orch = orch.clone();
-    let emitter = orch.services.emitter.clone();
-    let _initial_user_message = initial_user_message;
-
-    let thread_session_id = effective_session_id;
-
-    // Spawn thread to read stdout and emit events
-    thread::spawn(move || {
-        debug_log("reader_thread: started");
-        let thread_start = std::time::Instant::now();
-        log::info!("[PROFILE] Reader thread started");
-        let mut sequence = 0;
-        let session_id: Option<String> = thread_session_id;
-        let mut first_event_logged = false;
-        let mut boundary_checker = TurnBoundaryChecker::new();
-        let mut streaming_state: Option<StreamingState> = None;
-
-        debug_log("reader_thread: about to read lines");
-        for line_result in stdout.lines() {
-            let line = match line_result {
-                Ok(l) => {
-                    if !l.contains("\"type\":\"stream_event\"") {
-                        debug_log(&format!(
-                            "reader_thread: line {}: {}",
-                            sequence,
-                            &l[..l.len().min(100)]
-                        ));
-                    }
-                    l
-                }
-                Err(e) => {
-                    debug_log(&format!("reader_thread: error reading line: {}", e));
-                    log::error!("Error reading line: {}", e);
-                    continue;
-                }
-            };
-
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            match parse_event(&line) {
-                Ok((event, raw)) => {
-                    // Handle control responses
-                    if let ClaudeEvent::ControlResponse {
-                        request_id,
-                        response,
-                    } = &event
-                    {
-                        use crate::claude::stream::ControlResponseInner;
-                        match response {
-                            ControlResponseInner::Success { .. } => {
-                                log::info!(
-                                    "Control request {} succeeded for run {}",
-                                    &request_id[..request_id.len().min(8)],
-                                    &run_id[..run_id.len().min(8)]
-                                );
-                            }
-                            ControlResponseInner::Error { message } => {
-                                log::warn!(
-                                    "Control request {} failed for run {}: {:?}",
-                                    &request_id[..request_id.len().min(8)],
-                                    &run_id[..run_id.len().min(8)],
-                                    message
-                                );
-                            }
-                        }
-                        continue;
-                    }
-
-                    if !first_event_logged {
-                        log::info!(
-                            "[PROFILE] First event received: {:?}",
-                            thread_start.elapsed()
-                        );
-                        first_event_logged = true;
-                    }
-
-                    // Handle streaming events
-                    if let ClaudeEvent::StreamEvent { inner, .. } = &event {
-                        if let Ok(mut conn) = orch.db.conn.lock() {
-                            match inner {
-                                StreamEventInner::MessageStart { .. } => {
-                                    // Defensive: finalize any orphaned streaming placeholder
-                                    if let Some(orphan) = streaming_state.take() {
-                                        log::warn!(
-                                            "New MessageStart while streaming_state active for event {}",
-                                            &orphan.event_id[..orphan.event_id.len().min(8)]
-                                        );
-                                        let orphan_event = TranscriptEvent {
-                                            event_type: "assistant".to_string(),
-                                            session_id: session_id.clone(),
-                                            parent_tool_use_id: None,
-                                            content: if orphan.content.is_empty() {
-                                                None
-                                            } else {
-                                                Some(orphan.content)
-                                            },
-                                            thinking: if orphan.thinking.is_empty() {
-                                                None
-                                            } else {
-                                                Some(orphan.thinking)
-                                            },
-                                            tool_name: None,
-                                            tool_input: None,
-                                            tool_uses: None,
-                                            tool_use_id: None,
-                                            tool_result: None,
-                                            is_error: false,
-                                            usage: None,
-                                            raw: None,
-                                        };
-                                        let orphan_data = serde_json::to_string(&orphan_event)
-                                            .unwrap_or_default();
-                                        let _ =
-                                            diesel::update(events::table.find(&orphan.event_id))
-                                                .set((
-                                                    events::event_type.eq("assistant"),
-                                                    events::data.eq(orphan_data),
-                                                ))
-                                                .execute(&mut *conn);
-                                        let _ = emitter.emit(
-                                            "db-change",
-                                            serde_json::json!({"table": "events", "action": "update"}),
-                                        );
-                                        sequence += 1;
-                                    }
-                                    // Create a placeholder event for streaming
-                                    let event_id = Uuid::new_v4().to_string();
-                                    let now = chrono::Utc::now().timestamp() as i32;
-                                    let placeholder = TranscriptEvent {
-                                        event_type: "assistant:streaming".to_string(),
-                                        session_id: session_id.clone(),
-                                        parent_tool_use_id: None,
-                                        content: Some(String::new()),
-                                        thinking: None,
-                                        tool_name: None,
-                                        tool_input: None,
-                                        tool_uses: None,
-                                        tool_use_id: None,
-                                        tool_result: None,
-                                        is_error: false,
-                                        usage: None,
-                                        raw: None,
-                                    };
-                                    let data =
-                                        serde_json::to_string(&placeholder).unwrap_or_default();
-                                    let new_event = NewEvent {
-                                        id: &event_id,
-                                        run_id: &run_id,
-                                        session_id: session_id.as_deref(),
-                                        sequence,
-                                        timestamp: now,
-                                        event_type: "assistant:streaming",
-                                        data: &data,
-                                        parent_tool_use_id: None,
-                                        created_at: now,
-                                        input_tokens: None,
-                                        cache_read_tokens: None,
-                                        cache_create_tokens: None,
-                                        output_tokens: None,
-                                    };
-                                    let _ = diesel::insert_into(events::table)
-                                        .values(&new_event)
-                                        .execute(&mut *conn);
-                                    streaming_state = Some(StreamingState::new(event_id));
-                                    let _ = emitter.emit(
-                                        "db-change",
-                                        serde_json::json!({"table": "events", "action": "insert"}),
-                                    );
-                                }
-                                StreamEventInner::ContentBlockDelta { delta, .. } => {
-                                    if let Some(ref mut state) = streaming_state {
-                                        match delta {
-                                            DeltaContent::TextDelta { text } => {
-                                                state.content.push_str(text);
-                                            }
-                                            DeltaContent::ThinkingDelta { thinking } => {
-                                                state.thinking.push_str(thinking);
-                                            }
-                                            DeltaContent::Unknown => {}
-                                        }
-                                        let updated = TranscriptEvent {
-                                            event_type: "assistant:streaming".to_string(),
-                                            session_id: session_id.clone(),
-                                            parent_tool_use_id: None,
-                                            content: if state.content.is_empty() {
-                                                None
-                                            } else {
-                                                Some(state.content.clone())
-                                            },
-                                            thinking: if state.thinking.is_empty() {
-                                                None
-                                            } else {
-                                                Some(state.thinking.clone())
-                                            },
-                                            tool_name: None,
-                                            tool_input: None,
-                                            tool_uses: None,
-                                            tool_use_id: None,
-                                            tool_result: None,
-                                            is_error: false,
-                                            usage: None,
-                                            raw: None,
-                                        };
-                                        let data =
-                                            serde_json::to_string(&updated).unwrap_or_default();
-                                        let _ = diesel::update(events::table.find(&state.event_id))
-                                            .set(events::data.eq(&data))
-                                            .execute(&mut *conn);
-                                        let _ = emitter.emit(
-                                            "streaming-update",
-                                            serde_json::json!({
-                                                "run_id": run_id,
-                                                "event_id": state.event_id,
-                                                "content": state.content,
-                                                "thinking": state.thinking,
-                                            }),
-                                        );
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Finalize streaming placeholder before Result event
-                    if matches!(&event, ClaudeEvent::Result { .. }) && streaming_state.is_some() {
-                        finalize_streaming_placeholder(
-                            &orch,
-                            &mut streaming_state,
-                            session_id.as_deref(),
-                        );
-                        sequence += 1;
-                    }
-
-                    let transcript_event = TranscriptEvent::from_claude_event(&event, raw.clone());
-
-                    // Handle Assistant events during streaming
-                    let is_assistant = matches!(&event, ClaudeEvent::Assistant { .. });
-                    let has_content =
-                        transcript_event.content.is_some() || transcript_event.tool_uses.is_some();
-                    let has_thinking = transcript_event.thinking.is_some();
-
-                    // Partial Assistant event (thinking complete, no content yet)
-                    if streaming_state.is_some() && is_assistant && has_thinking && !has_content {
-                        if let Ok(mut conn) = orch.db.conn.lock() {
-                            if let Some(ref mut state) = streaming_state {
-                                state.thinking =
-                                    transcript_event.thinking.clone().unwrap_or_default();
-                                let updated = TranscriptEvent {
-                                    event_type: "assistant:streaming".to_string(),
-                                    session_id: session_id.clone(),
-                                    parent_tool_use_id: None,
-                                    content: if state.content.is_empty() {
-                                        None
-                                    } else {
-                                        Some(state.content.clone())
-                                    },
-                                    thinking: Some(state.thinking.clone()),
-                                    tool_name: None,
-                                    tool_input: None,
-                                    tool_uses: None,
-                                    tool_use_id: None,
-                                    tool_result: None,
-                                    is_error: false,
-                                    usage: None,
-                                    raw: None,
-                                };
-                                let data = serde_json::to_string(&updated).unwrap_or_default();
-                                let _ = diesel::update(events::table.find(&state.event_id))
-                                    .set(events::data.eq(&data))
-                                    .execute(&mut *conn);
-                                let _ = emitter.emit(
-                                    "db-change",
-                                    serde_json::json!({"table": "events", "action": "update"}),
-                                );
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Complete Assistant event (has content or tool_uses) - finalize placeholder
-                    if streaming_state.is_some() && is_assistant && has_content {
-                        if let Ok(mut conn) = orch.db.conn.lock() {
-                            let state = streaming_state.take().unwrap();
-                            let mut final_event = transcript_event.clone();
-                            if final_event.thinking.is_none() && !state.thinking.is_empty() {
-                                final_event.thinking = Some(state.thinking);
-                            }
-                            let data = serde_json::to_string(&final_event).unwrap_or_default();
-                            let _ = diesel::update(events::table.find(&state.event_id))
-                                .set((
-                                    events::event_type.eq(&final_event.event_type),
-                                    events::data.eq(&data),
-                                ))
-                                .execute(&mut *conn);
-                            let _ = emitter.emit(
-                                "db-change",
-                                serde_json::json!({"table": "events", "action": "update"}),
-                            );
-                        }
-                        sequence += 1;
-                        continue;
-                    }
-
-                    // Store event in database
-                    if let Ok(mut conn) = orch.db.conn.lock() {
-                        let now = chrono::Utc::now().timestamp() as i32;
-                        let event_id = Uuid::new_v4().to_string();
-                        let event_type = &transcript_event.event_type;
-                        let parent_tool_use_id = &transcript_event.parent_tool_use_id;
-                        let data = serde_json::to_string(&transcript_event).unwrap_or_default();
-
-                        let (input_tokens, cache_read_tokens, cache_create_tokens, output_tokens) =
-                            if let Some(ref usage) = transcript_event.usage {
-                                (
-                                    Some(usage.input_tokens as i32),
-                                    usage.cache_read_input_tokens.map(|t| t as i32),
-                                    usage.cache_creation_input_tokens.map(|t| t as i32),
-                                    Some(usage.output_tokens as i32),
-                                )
-                            } else {
-                                (None, None, None, None)
-                            };
-
-                        let new_event = NewEvent {
-                            id: &event_id,
-                            run_id: &run_id,
-                            session_id: session_id.as_deref(),
-                            sequence,
-                            timestamp: now,
-                            event_type,
-                            data: &data,
-                            parent_tool_use_id: parent_tool_use_id.as_deref(),
-                            created_at: now,
-                            input_tokens,
-                            cache_read_tokens,
-                            cache_create_tokens,
-                            output_tokens,
-                        };
-
-                        let _ = diesel::insert_into(events::table)
-                            .values(&new_event)
-                            .execute(&mut *conn);
-
-                        let _ = emitter.emit(
-                            "db-change",
-                            serde_json::json!({"table": "events", "action": "insert"}),
-                        );
-
-                        // If this is a TodoWrite event, update run's todos column
-                        if let Some(tool_uses) = &transcript_event.tool_uses {
-                            for tool_use in tool_uses {
-                                if tool_use.name == "TodoWrite" {
-                                    if let Some(todos_val) = tool_use.input.get("todos") {
-                                        let todos_json =
-                                            serde_json::to_string(todos_val).unwrap_or_default();
-                                        let _ = diesel::update(runs::table.find(&run_id))
-                                            .set(runs::todos.eq(Some(&todos_json)))
-                                            .execute(&mut *conn);
-                                        let _ = emitter.emit(
-                                            "db-change",
-                                            serde_json::json!({"table": "runs", "action": "update"}),
-                                        );
-                                    }
-                                }
-                            }
-                        } else if transcript_event.tool_name.as_deref() == Some("TodoWrite") {
-                            if let Some(input) = &transcript_event.tool_input {
-                                if let Some(todos_val) = input.get("todos") {
-                                    let todos_json =
-                                        serde_json::to_string(todos_val).unwrap_or_default();
-                                    let _ = diesel::update(runs::table.find(&run_id))
-                                        .set(runs::todos.eq(Some(&todos_json)))
-                                        .execute(&mut *conn);
-                                    let _ = emitter.emit(
-                                        "db-change",
-                                        serde_json::json!({"table": "runs", "action": "update"}),
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Check for turn completion
-                    if let ClaudeEvent::Result { is_error, .. } = &event {
-                        if *is_error {
-                            super::lifecycle::finalize_run(&orch, &run_id, RunStatus::Failed);
-                        } else {
-                            // Check if this is a task-spawned run (has parent_job_id)
-                            let is_task_spawned = if let Ok(mut conn) = orch.db.conn.lock() {
-                                runs::table
-                                    .find(&run_id)
-                                    .select(runs::job_id)
-                                    .first::<Option<String>>(&mut *conn)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|job_id| {
-                                        jobs::table
-                                            .find(&job_id)
-                                            .select(jobs::parent_job_id)
-                                            .first::<Option<String>>(&mut *conn)
-                                            .ok()
-                                            .flatten()
-                                    })
-                                    .is_some()
-                            } else {
-                                false
-                            };
-
-                            if is_task_spawned {
-                                super::lifecycle::finalize_run(
-                                    &orch,
-                                    &run_id,
-                                    RunStatus::Completed,
-                                );
-                                orch.process_state.transition_to_warm(&run_id);
-                                log::info!(
-                                    "Task-spawned run {} completed and finalized",
-                                    &run_id[..run_id.len().min(8)]
-                                );
-                            } else {
-                                super::lifecycle::transition_to_warm_state(&orch, &run_id);
-
-                                let _ = emitter.emit(
-                                    "run-turn-completed",
-                                    serde_json::json!({
-                                        "run_id": run_id,
-                                        "is_warm": true,
-                                    }),
-                                );
-
-                                log::info!(
-                                    "Turn completed for run {}, process now warm",
-                                    &run_id[..run_id.len().min(8)]
-                                );
-                            }
-                        }
-                    }
-
-                    boundary_checker.update(&transcript_event);
-
-                    sequence += 1;
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse event: {} - line: {}", e, line);
-                }
-            }
-        }
-
-        // Finalize any remaining streaming placeholder on EOF
-        finalize_streaming_placeholder(&orch, &mut streaming_state, session_id.as_deref());
-
-        debug_log(&format!(
-            "reader_thread: loop ended after {} lines",
-            sequence
-        ));
-
-        // Stdout closed - process has terminated
-        let was_warm = orch
-            .process_state
-            .get_process_state(&run_id)
-            .is_some_and(|s| s == crate::claude::process::ProcessState::Warm);
-
-        if was_warm {
-            log::info!(
-                "Warm process {} terminated, finalizing as completed",
-                &run_id[..run_id.len().min(8)]
-            );
-            super::lifecycle::finalize_run(&orch, &run_id, RunStatus::Completed);
-        } else if let Ok(mut conn) = orch.db.conn.lock() {
-            let status: Option<Option<String>> = runs::table
-                .find(&run_id)
-                .select(runs::status)
-                .first(&mut *conn)
-                .ok();
-            if status.flatten() == Some("running".to_string()) {
-                log::warn!(
-                    "Process {} terminated without result event, marking as failed",
-                    &run_id[..run_id.len().min(8)]
-                );
-
-                drop(conn);
-                insert_error_event(
-                    &orch,
-                    &run_id,
-                    session_id.as_deref(),
-                    "Process terminated unexpectedly without completing",
-                );
-
-                super::lifecycle::finalize_run(&orch, &run_id, RunStatus::Failed);
-            }
-        }
-
-        // Cleanup process handle
-        if let Ok(mut processes) = orch.process_state.processes.lock() {
-            processes.remove(&run_id);
-            log::debug!(
-                "Removed process {} from process map",
-                &run_id[..run_id.len().min(8)]
-            );
-        }
+        orch.resolve_identity_for_project(project_overrides.as_ref())
     });
 
-    log::info!(
-        "[PROFILE] start_claude_session returning: {:?}",
-        start_time.elapsed()
-    );
-    Ok(())
+    let session_config = SessionConfig {
+        run_id: run_id.to_string(),
+        working_dir: working_dir.to_string(),
+        prompt: final_prompt,
+        system_prompt_content,
+        model: effective_model,
+        session_start,
+        allowed_tools,
+        disallowed_tools,
+        mcp_config_path,
+        max_thinking_tokens,
+        reasoning_effort,
+        permissions,
+        bidirectional: true,
+        identity: resolved_identity,
+    };
+
+    backend.start_session(session_config, orch)
+}
+
+/// Build the `current_location_uri` for an agent session.
+///
+/// Produces URIs matching the cairn:// scheme:
+/// - Job node: `cairn://PROJECT/NUMBER/EXEC/NODE`
+/// - Issue fallback: `cairn://PROJECT/NUMBER`
+/// - Project fallback: `cairn://PROJECT`
+pub(crate) fn build_current_location_uri(
+    project_key: &str,
+    issue_number: Option<i32>,
+    exec_seq: Option<i32>,
+    parent_recipe_node_id: Option<&str>,
+    parent_node_name: Option<&str>,
+    recipe_node_id: Option<&str>,
+    node_name: Option<&str>,
+) -> String {
+    let _ = (parent_recipe_node_id, parent_node_name);
+    match (issue_number, exec_seq) {
+        (Some(num), Some(seq)) => {
+            if let Some(node_segment) = visible_node_segment(recipe_node_id, node_name) {
+                return format!("cairn://{}/{}/{}/{}", project_key, num, seq, node_segment);
+            }
+
+            format!("cairn://{}/{}", project_key, num)
+        }
+        // Fallbacks
+        (Some(num), _) => format!("cairn://{}/{}", project_key, num),
+        _ => format!("cairn://{}", project_key),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::stream::{MessageContent, MessageContentInner};
+    use crate::agent_process::stream::{MessageContent, MessageContentInner};
     use crate::services::SpawnConfig;
 
     fn make_system_event(session_id: &str) -> ClaudeEvent {
@@ -1667,16 +1010,18 @@ mod tests {
 
     #[test]
     fn test_spawn_config_from_claude_args() {
-        use crate::claude::args::{build_claude_args, ClaudeArgsConfig};
+        use crate::agent_process::args::{build_claude_args, ClaudeArgsConfig};
+        use crate::backends::SessionStart;
         use crate::models::Model;
 
         let args_config = ClaudeArgsConfig {
             mcp_config_path: "/path/to/mcp.json".to_string(),
             skip_permissions: false,
             permission_prompt_tool: None,
-            model: Some(Model::Opus),
-            session_id: None,
-            resume_session_id: None,
+            model: Some(Model::new(Model::OPUS)),
+            session_start: SessionStart::New {
+                session_id: "session-1".to_string(),
+            },
             prompt: "Test prompt".to_string(),
             max_thinking_tokens: Some(31999),
             allowed_tools: vec!["Read".to_string()],
@@ -1696,8 +1041,286 @@ mod tests {
         assert_eq!(spawn_config.program, "claude");
         assert_eq!(spawn_config.cwd, Some("/some/path".to_string()));
         assert!(spawn_config.args.contains(&"--model".to_string()));
-        assert!(spawn_config.args.contains(&"opus".to_string()));
+        assert!(spawn_config.args.contains(&"opus[1m]".to_string()));
         assert!(spawn_config.args.contains(&"--input-format".to_string()));
         assert!(spawn_config.capture_stdin);
+    }
+
+    // =========================================================================
+    // build_current_location_uri
+    // =========================================================================
+
+    #[test]
+    fn uri_for_task_agent() {
+        let uri = build_current_location_uri(
+            "CAIRN",
+            Some(831),
+            Some(1),
+            None,
+            Some("Builder"),
+            None,
+            Some("Explore"),
+        );
+        assert_eq!(uri, "cairn://CAIRN/831/1/explore");
+    }
+
+    #[test]
+    fn uri_for_task_agent_with_suffix() {
+        let uri = build_current_location_uri(
+            "CAIRN",
+            Some(831),
+            Some(1),
+            None,
+            Some("Builder"),
+            None,
+            Some("Explore-2"),
+        );
+        assert_eq!(uri, "cairn://CAIRN/831/1/explore-2");
+    }
+
+    #[test]
+    fn uri_for_recipe_node() {
+        let uri = build_current_location_uri(
+            "CAIRN",
+            Some(831),
+            Some(1),
+            None,
+            None,
+            None,
+            Some("builder-1"),
+        );
+        assert_eq!(uri, "cairn://CAIRN/831/1/builder-1");
+    }
+
+    #[test]
+    fn uri_prefers_slugified_node_name_over_recipe_node_id() {
+        let uri = build_current_location_uri(
+            "CAIRN",
+            Some(831),
+            Some(1),
+            None,
+            None,
+            Some("54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67"),
+            Some("Builder"),
+        );
+        assert_eq!(uri, "cairn://CAIRN/831/1/builder");
+    }
+
+    #[test]
+    fn uri_falls_back_to_recipe_node_id_when_name_missing() {
+        let uri = build_current_location_uri(
+            "CAIRN",
+            Some(831),
+            Some(1),
+            None,
+            None,
+            Some("54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67"),
+            None,
+        );
+        assert_eq!(
+            uri,
+            "cairn://CAIRN/831/1/54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67"
+        );
+    }
+
+    #[test]
+    fn uri_fallback_issue_only() {
+        // No exec_seq — can't build full path
+        let uri =
+            build_current_location_uri("CAIRN", Some(831), None, None, None, None, Some("Builder"));
+        assert_eq!(uri, "cairn://CAIRN/831");
+    }
+
+    #[test]
+    fn uri_fallback_issue_no_node() {
+        let uri = build_current_location_uri("CAIRN", Some(831), Some(1), None, None, None, None);
+        assert_eq!(uri, "cairn://CAIRN/831");
+    }
+
+    #[test]
+    fn uri_fallback_project_only() {
+        let uri = build_current_location_uri("CAIRN", None, None, None, None, None, None);
+        assert_eq!(uri, "cairn://CAIRN");
+    }
+
+    #[test]
+    fn uri_task_requires_all_four_components() {
+        // Has parent but no node_name — falls back to issue
+        let uri = build_current_location_uri(
+            "CAIRN",
+            Some(831),
+            Some(1),
+            None,
+            Some("Builder"),
+            None,
+            None,
+        );
+        assert_eq!(uri, "cairn://CAIRN/831");
+    }
+
+    // =========================================================================
+    // insert_error_event
+    // =========================================================================
+
+    use crate::db::DbState;
+    use crate::diesel_models::{DbEvent, NewRun};
+    use crate::orchestrator::Orchestrator;
+    use crate::schema::events;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::test_utils::test_diesel_conn;
+    use std::sync::{Arc, Mutex};
+
+    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection) -> Orchestrator {
+        let db = Arc::new(DbState {
+            conn: Mutex::new(conn),
+        });
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
+            db.clone(),
+            services.emitter.clone(),
+        ));
+        let sync_tx = Arc::new(Mutex::new(None));
+        Orchestrator {
+            db,
+            services: services.clone(),
+            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
+            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
+                "/tmp",
+            ))),
+            warm_gc: None,
+            pty_state: Arc::new(crate::services::PtyState::default()),
+            permission_responses: tokio::sync::broadcast::channel(16).0,
+            run_completions: tokio::sync::broadcast::channel(64).0,
+            prompt_responses: tokio::sync::broadcast::channel(16).0,
+            trigger_events: tokio::sync::broadcast::channel(256).0,
+            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            identity_store: Arc::new(Mutex::new(None)),
+            mcp_binary_path: "cairn-mcp".to_string(),
+            config_dir: std::path::PathBuf::from("/tmp"),
+            schema_dir: None,
+            mcp_callback_port: 3847,
+            embedding_engine: None,
+            vibe_state: None,
+            account_manager,
+            sync_tx: sync_tx.clone(),
+            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
+            api_config: crate::api::ApiConfig::default(),
+            effect_tx: None,
+            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            provider_usage_snapshots: Default::default(),
+            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    fn create_test_run(
+        conn: &mut diesel::sqlite::SqliteConnection,
+        run_id: &str,
+        job_id: Option<&str>,
+    ) {
+        let now = chrono::Utc::now().timestamp() as i32;
+        let new_run = NewRun {
+            id: run_id,
+            issue_id: None,
+            project_id: None,
+            job_id,
+            status: Some("live"),
+            session_id: None,
+            error_message: None,
+            started_at: Some(now),
+            exited_at: None,
+            created_at: now,
+            updated_at: now,
+            backend: None,
+            exit_reason: None,
+            start_mode: None,
+            chat_id: None,
+        };
+        diesel::insert_into(runs::table)
+            .values(&new_run)
+            .execute(conn)
+            .expect("Failed to create test run");
+    }
+
+    #[test]
+    fn insert_error_event_creates_system_error_event() {
+        let conn = test_diesel_conn();
+        let orch = test_orchestrator(conn);
+
+        // Create a run first (events have FK to runs)
+        {
+            let mut conn = orch.db.conn.lock().unwrap();
+            create_test_run(&mut conn, "run-1", None);
+        }
+
+        insert_error_event(&orch, "run-1", None, "Something went wrong");
+
+        let mut conn = orch.db.conn.lock().unwrap();
+        let events: Vec<DbEvent> = events::table
+            .filter(events::run_id.eq("run-1"))
+            .load(&mut *conn)
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.event_type, "system:error");
+        assert_eq!(event.run_id, "run-1");
+        assert_eq!(event.session_id, None);
+        assert_eq!(event.sequence, 0);
+
+        // Verify the data payload contains the error message (camelCase due to serde rename)
+        let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+        assert_eq!(data["content"], "Something went wrong");
+        assert_eq!(data["isError"], true);
+        assert_eq!(data["eventType"], "system:error");
+    }
+
+    #[test]
+    fn insert_error_event_includes_session_id() {
+        let conn = test_diesel_conn();
+        let orch = test_orchestrator(conn);
+
+        {
+            let mut conn = orch.db.conn.lock().unwrap();
+            create_test_run(&mut conn, "run-2", None);
+        }
+
+        insert_error_event(&orch, "run-2", Some("session-abc"), "Config error");
+
+        let mut conn = orch.db.conn.lock().unwrap();
+        let event: DbEvent = events::table
+            .filter(events::run_id.eq("run-2"))
+            .first(&mut *conn)
+            .unwrap();
+
+        assert_eq!(event.session_id, Some("session-abc".to_string()));
+
+        let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+        assert_eq!(data["sessionId"], "session-abc");
+    }
+
+    #[test]
+    fn insert_error_event_increments_sequence() {
+        let conn = test_diesel_conn();
+        let orch = test_orchestrator(conn);
+
+        {
+            let mut conn = orch.db.conn.lock().unwrap();
+            create_test_run(&mut conn, "run-3", None);
+        }
+
+        // Insert two error events — second should get sequence 1
+        insert_error_event(&orch, "run-3", None, "First error");
+        insert_error_event(&orch, "run-3", None, "Second error");
+
+        let mut conn = orch.db.conn.lock().unwrap();
+        let events: Vec<DbEvent> = events::table
+            .filter(events::run_id.eq("run-3"))
+            .order(events::sequence.asc())
+            .load(&mut *conn)
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 0);
+        assert_eq!(events[1].sequence, 1);
     }
 }

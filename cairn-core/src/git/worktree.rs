@@ -163,6 +163,30 @@ fn try_add_worktree(
     }
 }
 
+/// Attempt to create a worktree tracking a remote branch, with automatic recovery if stale entry is detected.
+fn try_add_worktree_tracking(
+    git: &dyn GitClient,
+    repo_path: &Path,
+    worktree_path: &Path,
+    branch_name: &str,
+) -> Result<(), String> {
+    let result = git.worktree_add_tracking_branch(repo_path, worktree_path, branch_name);
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if is_stale_worktree_error(&e) => {
+            log::warn!(
+                "Detected stale worktree entry, attempting to prune and retry: {}",
+                e
+            );
+            git.worktree_prune(repo_path)?;
+            log::info!("Pruned stale worktree entries, retrying creation");
+            git.worktree_add_tracking_branch(repo_path, worktree_path, branch_name)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Create a new worktree with a new branch based on base_branch (injectable version).
 pub fn create_worktree_with_services(
     git: &dyn GitClient,
@@ -206,6 +230,13 @@ pub fn create_worktree_with_services(
             branch_name
         );
         try_add_worktree(git, repo_path, worktree_path, branch_name, None)?;
+    } else if git.remote_branch_exists(repo_path, branch_name)? {
+        // No local branch, but exists on remote - create worktree tracking remote
+        log::info!(
+            "Branch {} exists on remote, creating worktree with tracking branch",
+            branch_name
+        );
+        try_add_worktree_tracking(git, repo_path, worktree_path, branch_name)?;
     } else {
         // Create new branch and worktree
         log::info!(
@@ -406,38 +437,190 @@ pub fn run_setup_commands_with_process(
     Ok(())
 }
 
-/// Copy files from the main repository to a worktree directory (injectable version).
-/// Files that don't exist in the source are logged as warnings and skipped.
-/// Existing files in the destination are overwritten.
-pub fn copy_files_to_worktree_with_services(
+/// Result of seeding a worktree with gitignored content.
+#[derive(Debug, Default)]
+pub struct SeedResult {
+    pub seeded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// Seed a worktree with all gitignored content from the main repo.
+///
+/// **Directories** are symlinked (instant, zero disk, shared with main repo).
+/// **Files** are copied (tiny .env-style files, instant).
+///
+/// Best-effort: individual failures are logged as warnings and don't block.
+pub fn seed_worktree_ignored(
+    git: &dyn GitClient,
     fs: &dyn FileSystem,
     repo_path: &Path,
     worktree_path: &Path,
-    files: &[String],
-) -> Result<(), String> {
-    if files.is_empty() {
-        return Ok(());
+) -> Result<SeedResult, String> {
+    // Discover all gitignored content in the main repo
+    let output = git.run(
+        repo_path,
+        vec![
+            "ls-files".to_string(),
+            "--others".to_string(),
+            "--ignored".to_string(),
+            "--exclude-standard".to_string(),
+            "--directory".to_string(),
+        ],
+    )?;
+
+    if !output.success {
+        return Err(format!("git ls-files failed: {}", output.stderr.trim()));
+    }
+
+    let entries: Vec<&str> = output
+        .stdout
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    if entries.is_empty() {
+        log::info!("No gitignored content to seed");
+        return Ok(SeedResult::default());
     }
 
     log::info!(
-        "Copying {} file(s) from {} to {}",
-        files.len(),
-        repo_path.display(),
-        worktree_path.display()
+        "Seeding worktree with {} gitignored entries from {}",
+        entries.len(),
+        repo_path.display()
     );
 
-    for file in files {
-        let src = repo_path.join(file);
-        let dst = worktree_path.join(file);
+    let mut result = SeedResult::default();
+    let mut seeded_paths: Vec<String> = Vec::new();
 
-        if !fs.exists(&src) {
-            log::warn!("Copy file not found in main repo: {}", file);
+    for entry in entries {
+        // Filter out .cairn/ directory
+        if entry == ".cairn/" || entry.starts_with(".cairn/") {
+            result.skipped += 1;
             continue;
         }
 
-        fs.copy_file(&src, &dst)?;
-        log::info!("Copied {} to worktree", file);
+        let is_dir = entry.ends_with('/');
+        let entry_path = entry.trim_end_matches('/');
+
+        let src = repo_path.join(entry_path);
+        let dst = worktree_path.join(entry_path);
+
+        // Skip if source doesn't exist
+        if !fs.exists(&src) {
+            result.skipped += 1;
+            continue;
+        }
+
+        // Skip if destination already exists (or is already a symlink)
+        if fs.exists(&dst) || fs.is_symlink(&dst) {
+            result.skipped += 1;
+            continue;
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = dst.parent() {
+            if let Err(e) = fs.create_dir_all(parent) {
+                log::warn!("Failed to create parent dir for {}: {}", entry, e);
+                result.failed += 1;
+                continue;
+            }
+        }
+
+        if is_dir {
+            // Directories: symlink to main repo's copy (instant, shared)
+            match fs.symlink(&src, &dst) {
+                Ok(()) => {
+                    result.seeded += 1;
+                    seeded_paths.push(entry_path.to_string());
+                }
+                Err(e) => {
+                    log::warn!("Symlink failed for {}: {}", entry, e);
+                    result.failed += 1;
+                }
+            }
+        } else {
+            // Files: copy (small .env-style files)
+            match fs.copy_file(&src, &dst) {
+                Ok(()) => {
+                    result.seeded += 1;
+                    seeded_paths.push(entry_path.to_string());
+                }
+                Err(e) => {
+                    log::warn!("Copy failed for {}: {}", entry, e);
+                    result.failed += 1;
+                }
+            }
+        }
     }
+
+    // Write seeded paths to the worktree's local git exclude so they can
+    // never be committed — .gitignore patterns with trailing slashes don't
+    // match symlinks, and the worktree branch may have an older .gitignore.
+    if !seeded_paths.is_empty() {
+        if let Err(e) = write_seeded_excludes(git, fs, worktree_path, &seeded_paths) {
+            log::warn!("Failed to write git excludes for seeded paths: {}", e);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Append seeded paths to the worktree's local git exclude file.
+///
+/// Uses `git rev-parse --git-dir` from the worktree to locate the correct
+/// exclude file (works for both main repos and linked worktrees).
+fn write_seeded_excludes(
+    git: &dyn GitClient,
+    fs: &dyn FileSystem,
+    worktree_path: &Path,
+    paths: &[String],
+) -> Result<(), String> {
+    let git_dir = git
+        .rev_parse(worktree_path, vec!["--git-dir".to_string()])?
+        .trim()
+        .to_string();
+
+    let git_dir_path = if Path::new(&git_dir).is_absolute() {
+        PathBuf::from(&git_dir)
+    } else {
+        worktree_path.join(&git_dir)
+    };
+
+    let exclude_path = git_dir_path.join("info").join("exclude");
+
+    // Ensure info/ directory exists
+    if let Some(parent) = exclude_path.parent() {
+        fs.create_dir_all(parent)?;
+    }
+
+    // Read existing content, append our entries under a marker
+    let existing = fs.read_to_string(&exclude_path).unwrap_or_default();
+
+    let marker = "# seeded by cairn (do not edit)";
+    if existing.contains(marker) {
+        // Already written — skip to avoid duplicates
+        return Ok(());
+    }
+
+    let mut new_content = existing;
+    if !new_content.is_empty() && !new_content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    new_content.push_str(marker);
+    new_content.push('\n');
+    for p in paths {
+        new_content.push_str(p);
+        new_content.push('\n');
+    }
+
+    fs.write_str(&exclude_path, &new_content)?;
+
+    log::info!(
+        "Wrote {} seeded paths to {}",
+        paths.len(),
+        exclude_path.display()
+    );
 
     Ok(())
 }
@@ -446,7 +629,7 @@ pub fn copy_files_to_worktree_with_services(
 mod tests {
     use super::*;
     use crate::services::testing::{MockFileSystem, MockGitClient, MockProcessSpawner};
-    use crate::services::CommandOutput;
+    use crate::services::{CommandOutput, GitOutput};
 
     // Tests for branch name generation
 
@@ -799,8 +982,10 @@ branch refs/heads/agent/CAI-42-test
         // Worktree path doesn't exist
         fs.expect_exists().returning(|_| false);
 
-        // Branch doesn't exist
+        // Branch doesn't exist locally or remotely
         git.expect_branch_exists().returning(|_, _| Ok(false));
+        git.expect_remote_branch_exists()
+            .returning(|_, _| Ok(false));
         // Create worktree with new branch
         git.expect_worktree_add_new_branch()
             .withf(|repo, wt, branch, base| {
@@ -911,8 +1096,10 @@ branch refs/heads/agent/CAI-42-test
         fs.expect_create_dir_all().returning(|_| Ok(()));
         fs.expect_exists().returning(|_| false);
 
-        // Branch doesn't exist
+        // Branch doesn't exist locally or remotely
         git.expect_branch_exists().returning(|_, _| Ok(false));
+        git.expect_remote_branch_exists()
+            .returning(|_, _| Ok(false));
 
         // First attempt fails with stale worktree error
         git.expect_worktree_add_new_branch()
@@ -991,8 +1178,10 @@ branch refs/heads/agent/CAI-42-test
         fs.expect_create_dir_all().returning(|_| Ok(()));
         fs.expect_exists().returning(|_| false);
 
-        // Branch doesn't exist
+        // Branch doesn't exist locally or remotely
         git.expect_branch_exists().returning(|_, _| Ok(false));
+        git.expect_remote_branch_exists()
+            .returning(|_, _| Ok(false));
 
         // First attempt fails with stale worktree error
         git.expect_worktree_add_new_branch()
@@ -1022,6 +1211,139 @@ branch refs/heads/agent/CAI-42-test
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("some other error"));
+    }
+
+    #[test]
+    fn test_create_worktree_tracks_remote_branch() {
+        let mut git = MockGitClient::new();
+        let mut fs = MockFileSystem::new();
+
+        fs.expect_create_dir_all().returning(|_| Ok(()));
+        fs.expect_exists().returning(|_| false);
+
+        // No local branch
+        git.expect_branch_exists().returning(|_, _| Ok(false));
+        // But exists on remote
+        git.expect_remote_branch_exists().returning(|_, _| Ok(true));
+        // Should create tracking worktree
+        git.expect_worktree_add_tracking_branch()
+            .withf(|repo, wt, branch| {
+                repo == Path::new("/repo")
+                    && wt == Path::new("/worktrees/feature-x")
+                    && branch == "feature/webview"
+            })
+            .returning(|_, _, _| Ok(()));
+
+        let result = create_worktree_with_services(
+            &git,
+            &fs,
+            Path::new("/repo"),
+            Path::new("/worktrees/feature-x"),
+            "feature/webview",
+            "main",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_worktree_no_local_no_remote_creates_new() {
+        let mut git = MockGitClient::new();
+        let mut fs = MockFileSystem::new();
+
+        fs.expect_create_dir_all().returning(|_| Ok(()));
+        fs.expect_exists().returning(|_| false);
+
+        // No local branch
+        git.expect_branch_exists().returning(|_, _| Ok(false));
+        // No remote branch either
+        git.expect_remote_branch_exists()
+            .returning(|_, _| Ok(false));
+        // Should create new branch from base
+        git.expect_worktree_add_new_branch()
+            .returning(|_, _, _, _| Ok(()));
+
+        let result = create_worktree_with_services(
+            &git,
+            &fs,
+            Path::new("/repo"),
+            Path::new("/worktrees/CAI-42"),
+            "agent/CAI-42-test",
+            "main",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_worktree_tracking_recovers_from_stale_entry() {
+        let mut git = MockGitClient::new();
+        let mut fs = MockFileSystem::new();
+
+        fs.expect_create_dir_all().returning(|_| Ok(()));
+        fs.expect_exists().returning(|_| false);
+
+        // No local branch
+        git.expect_branch_exists().returning(|_, _| Ok(false));
+        // Exists on remote
+        git.expect_remote_branch_exists().returning(|_, _| Ok(true));
+
+        // First tracking attempt fails with stale worktree error
+        git.expect_worktree_add_tracking_branch()
+            .times(1)
+            .returning(|_, _, _| {
+                Err(
+                    "fatal: '/worktrees/feature-x' is a missing but already registered worktree"
+                        .to_string(),
+                )
+            });
+
+        // Prune is called
+        git.expect_worktree_prune().times(1).returning(|_| Ok(()));
+
+        // Retry succeeds
+        git.expect_worktree_add_tracking_branch()
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let result = create_worktree_with_services(
+            &git,
+            &fs,
+            Path::new("/repo"),
+            Path::new("/worktrees/feature-x"),
+            "feature/webview",
+            "main",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_create_worktree_tracking_non_stale_error_passes_through() {
+        let mut git = MockGitClient::new();
+        let mut fs = MockFileSystem::new();
+
+        fs.expect_create_dir_all().returning(|_| Ok(()));
+        fs.expect_exists().returning(|_| false);
+
+        // No local branch
+        git.expect_branch_exists().returning(|_, _| Ok(false));
+        // Exists on remote
+        git.expect_remote_branch_exists().returning(|_, _| Ok(true));
+
+        // Tracking attempt fails with a non-stale error
+        git.expect_worktree_add_tracking_branch()
+            .returning(|_, _, _| {
+                Err("git worktree add --track failed: permission denied".to_string())
+            });
+
+        let result = create_worktree_with_services(
+            &git,
+            &fs,
+            Path::new("/repo"),
+            Path::new("/worktrees/feature-x"),
+            "feature/webview",
+            "main",
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("permission denied"));
     }
 
     // Tests for remove_worktree_with_services
@@ -1082,96 +1404,268 @@ branch refs/heads/agent/CAI-42-test
         assert!(result.is_ok());
     }
 
-    // Tests for copy_files_to_worktree_with_services
+    // Tests for seed_worktree_ignored
 
-    #[test]
-    fn test_copy_files_empty_list() {
-        let fs = MockFileSystem::new();
-
-        let result = copy_files_to_worktree_with_services(
-            &fs,
-            Path::new("/repo"),
-            Path::new("/worktree"),
-            &[],
-        );
-        assert!(result.is_ok());
+    fn git_ls_files_output(entries: &[&str]) -> GitOutput {
+        GitOutput {
+            success: true,
+            stdout: entries.join("\n"),
+            stderr: String::new(),
+        }
     }
 
     #[test]
-    fn test_copy_files_copies_existing_files() {
+    fn test_seed_worktree_no_gitignored_content() {
+        let mut git = MockGitClient::new();
+        let fs = MockFileSystem::new();
+
+        git.expect_run()
+            .returning(|_, _| Ok(git_ls_files_output(&[])));
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.seeded, 0);
+        assert_eq!(r.skipped, 0);
+        assert_eq!(r.failed, 0);
+    }
+
+    #[test]
+    fn test_seed_worktree_excludes_cairn_directory() {
+        let mut git = MockGitClient::new();
+        let fs = MockFileSystem::new();
+
+        git.expect_run()
+            .returning(|_, _| Ok(git_ls_files_output(&[".cairn/", ".cairn/config.yaml"])));
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.seeded, 0);
+        assert_eq!(r.skipped, 2);
+    }
+
+    #[test]
+    fn test_seed_worktree_symlinks_dirs_copies_files() {
+        let mut git = MockGitClient::new();
         let mut fs = MockFileSystem::new();
 
-        // First file exists
+        git.expect_run()
+            .returning(|_, _| Ok(git_ls_files_output(&[".env", "node_modules/"])));
+
+        // .env: source exists, dest doesn't exist, not a symlink
         fs.expect_exists()
             .withf(|p| p == Path::new("/repo/.env"))
             .returning(|_| true);
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/worktree/.env"))
+            .returning(|_| false);
+        fs.expect_is_symlink()
+            .withf(|p| p == Path::new("/worktree/.env"))
+            .returning(|_| false);
+
+        // node_modules: source exists, dest doesn't exist, not a symlink
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/repo/node_modules"))
+            .returning(|_| true);
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/worktree/node_modules"))
+            .returning(|_| false);
+        fs.expect_is_symlink()
+            .withf(|p| p == Path::new("/worktree/node_modules"))
+            .returning(|_| false);
+
+        // Parent dir creation
+        fs.expect_create_dir_all().returning(|_| Ok(()));
+
+        // .env should be copied (file)
         fs.expect_copy_file()
             .withf(|src, dst| src == Path::new("/repo/.env") && dst == Path::new("/worktree/.env"))
+            .times(1)
             .returning(|_, _| Ok(()));
 
-        // Second file exists
-        fs.expect_exists()
-            .withf(|p| p == Path::new("/repo/config/local.yaml"))
-            .returning(|_| true);
-        fs.expect_copy_file()
-            .withf(|src, dst| {
-                src == Path::new("/repo/config/local.yaml")
-                    && dst == Path::new("/worktree/config/local.yaml")
+        // node_modules should be symlinked (directory)
+        fs.expect_symlink()
+            .withf(|target, link| {
+                target == Path::new("/repo/node_modules")
+                    && link == Path::new("/worktree/node_modules")
             })
+            .times(1)
             .returning(|_, _| Ok(()));
 
-        let result = copy_files_to_worktree_with_services(
-            &fs,
-            Path::new("/repo"),
-            Path::new("/worktree"),
-            &[".env".to_string(), "config/local.yaml".to_string()],
-        );
+        // Exclude file writing: rev_parse returns git dir, write_str records it
+        git.expect_rev_parse()
+            .withf(|repo, args| repo == Path::new("/worktree") && args == &["--git-dir"])
+            .returning(|_, _| Ok("/repo/.git/worktrees/worktree\n".to_string()));
+        fs.expect_read_to_string().returning(|_| Ok(String::new()));
+        fs.expect_write_str()
+            .withf(|path, contents| {
+                path == Path::new("/repo/.git/worktrees/worktree/info/exclude")
+                    && contents.contains("# seeded by cairn")
+                    && contents.contains(".env")
+                    && contents.contains("node_modules")
+            })
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
         assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.seeded, 2);
+        assert_eq!(r.skipped, 0);
+        assert_eq!(r.failed, 0);
     }
 
     #[test]
-    fn test_copy_files_skips_missing_files() {
+    fn test_seed_worktree_skips_existing_destinations() {
+        let mut git = MockGitClient::new();
         let mut fs = MockFileSystem::new();
 
-        // First file doesn't exist - should be skipped
+        git.expect_run()
+            .returning(|_, _| Ok(git_ls_files_output(&[".env"])));
+
+        // Source exists, destination already exists
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/repo/.env"))
+            .returning(|_| true);
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/worktree/.env"))
+            .returning(|_| true);
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.seeded, 0);
+        assert_eq!(r.skipped, 1);
+    }
+
+    #[test]
+    fn test_seed_worktree_skips_existing_symlinks() {
+        let mut git = MockGitClient::new();
+        let mut fs = MockFileSystem::new();
+
+        git.expect_run()
+            .returning(|_, _| Ok(git_ls_files_output(&["node_modules/"])));
+
+        // Source exists, destination doesn't exist but IS a symlink (dangling)
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/repo/node_modules"))
+            .returning(|_| true);
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/worktree/node_modules"))
+            .returning(|_| false);
+        fs.expect_is_symlink()
+            .withf(|p| p == Path::new("/worktree/node_modules"))
+            .returning(|_| true);
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.seeded, 0);
+        assert_eq!(r.skipped, 1);
+    }
+
+    #[test]
+    fn test_seed_worktree_best_effort_on_failure() {
+        let mut git = MockGitClient::new();
+        let mut fs = MockFileSystem::new();
+
+        git.expect_run()
+            .returning(|_, _| Ok(git_ls_files_output(&[".env", ".env.local"])));
+
+        // Both sources exist, neither dest exists or is symlink
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/repo/.env"))
+            .returning(|_| true);
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/worktree/.env"))
+            .returning(|_| false);
+        fs.expect_is_symlink()
+            .withf(|p| p == Path::new("/worktree/.env"))
+            .returning(|_| false);
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/repo/.env.local"))
+            .returning(|_| true);
+        fs.expect_exists()
+            .withf(|p| p == Path::new("/worktree/.env.local"))
+            .returning(|_| false);
+        fs.expect_is_symlink()
+            .withf(|p| p == Path::new("/worktree/.env.local"))
+            .returning(|_| false);
+
+        fs.expect_create_dir_all().returning(|_| Ok(()));
+
+        // First copy fails, second succeeds
+        let mut call_count = 0;
+        fs.expect_copy_file().times(2).returning(move |_, _| {
+            call_count += 1;
+            if call_count == 1 {
+                Err("permission denied".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        // Exclude file writing for the one successfully seeded path
+        git.expect_rev_parse()
+            .returning(|_, _| Ok("/repo/.git/worktrees/worktree\n".to_string()));
+        fs.expect_read_to_string().returning(|_| Ok(String::new()));
+        fs.expect_write_str().returning(|_, _| Ok(()));
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
+        assert!(result.is_ok());
+        let r = result.unwrap();
+        assert_eq!(r.seeded, 1);
+        assert_eq!(r.failed, 1);
+    }
+
+    #[test]
+    fn test_seed_worktree_git_failure_is_fatal() {
+        let mut git = MockGitClient::new();
+        let fs = MockFileSystem::new();
+
+        git.expect_run()
+            .returning(|_, _| Err("git not found".to_string()));
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_seed_worktree_git_ls_files_non_zero_exit() {
+        let mut git = MockGitClient::new();
+        let fs = MockFileSystem::new();
+
+        git.expect_run().returning(|_, _| {
+            Ok(GitOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "fatal: not a git repository".to_string(),
+            })
+        });
+
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not a git repository"));
+    }
+
+    #[test]
+    fn test_seed_worktree_skips_missing_sources() {
+        let mut git = MockGitClient::new();
+        let mut fs = MockFileSystem::new();
+
+        git.expect_run()
+            .returning(|_, _| Ok(git_ls_files_output(&[".env"])));
+
+        // Source doesn't exist
         fs.expect_exists()
             .withf(|p| p == Path::new("/repo/.env"))
             .returning(|_| false);
 
-        // Second file exists and should be copied
-        fs.expect_exists()
-            .withf(|p| p == Path::new("/repo/config.yaml"))
-            .returning(|_| true);
-        fs.expect_copy_file()
-            .withf(|src, dst| {
-                src == Path::new("/repo/config.yaml") && dst == Path::new("/worktree/config.yaml")
-            })
-            .returning(|_, _| Ok(()));
-
-        let result = copy_files_to_worktree_with_services(
-            &fs,
-            Path::new("/repo"),
-            Path::new("/worktree"),
-            &[".env".to_string(), "config.yaml".to_string()],
-        );
+        let result = seed_worktree_ignored(&git, &fs, Path::new("/repo"), Path::new("/worktree"));
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_copy_files_propagates_copy_error() {
-        let mut fs = MockFileSystem::new();
-
-        fs.expect_exists().returning(|_| true);
-        fs.expect_copy_file()
-            .returning(|_, _| Err("Permission denied".to_string()));
-
-        let result = copy_files_to_worktree_with_services(
-            &fs,
-            Path::new("/repo"),
-            Path::new("/worktree"),
-            &[".env".to_string()],
-        );
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Permission denied"));
+        let r = result.unwrap();
+        assert_eq!(r.seeded, 0);
+        assert_eq!(r.skipped, 1);
     }
 }

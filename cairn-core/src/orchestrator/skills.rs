@@ -23,7 +23,6 @@ fn file_skill_to_config(
         description: skill.description,
         prompt: skill.prompt,
         allowed_tools: skill.allowed_tools,
-        model: skill.model,
         workspace_id,
         project_id,
         created_at: now,
@@ -167,12 +166,16 @@ impl Orchestrator {
             description: input.description.clone(),
             prompt: input.prompt.clone(),
             allowed_tools: input.allowed_tools.clone(),
-            model: input.model.clone(),
             is_project_scoped,
             file_path: PathBuf::new(),
+            dir_path: PathBuf::new(),
+            meta: None,
+            has_references: false,
+            has_scripts: false,
+            has_assets: false,
         };
 
-        config_skills::save_skill(&self.config_dir, &file_skill, project_path.as_deref())?;
+        config_skills::save_skill(&self.config_dir, &file_skill, project_path.as_deref(), None)?;
 
         let _ = self.services.emitter.emit(
             "config-changed",
@@ -190,7 +193,6 @@ impl Orchestrator {
             description: input.description,
             prompt: input.prompt,
             allowed_tools: input.allowed_tools,
-            model: input.model,
             workspace_id: input.workspace_id,
             project_id: input.project_id,
             created_at: now,
@@ -203,10 +205,15 @@ impl Orchestrator {
         &self,
         id: &str,
         input: UpdateSkillConfig,
+        target_project_id: Option<&str>,
     ) -> Result<SkillConfig, String> {
-        // Find existing skill
+        // Find existing skill in the targeted scope
         let existing = {
-            if let Some(skill) = config_skills::get_skill(&self.config_dir, id, None)? {
+            if let Some(pid) = target_project_id {
+                let project_path = self.project_path(pid)?;
+                config_skills::get_skill(&self.config_dir, id, Some(&project_path))?
+                    .ok_or_else(|| format!("Skill not found: {}", id))?
+            } else if let Some(skill) = config_skills::get_skill(&self.config_dir, id, None)? {
                 skill
             } else {
                 let projects = self.all_project_paths()?;
@@ -230,11 +237,6 @@ impl Orchestrator {
             None => existing.allowed_tools,
             Some(None) => None,
             Some(Some(v)) => Some(v),
-        };
-        let model = match input.model {
-            None => existing.model,
-            Some(None) => None,
-            Some(Some(m)) => Some(m),
         };
 
         let new_is_project_scoped = match (&input.workspace_id, &input.project_id) {
@@ -268,24 +270,46 @@ impl Orchestrator {
             description: description.clone(),
             prompt: prompt.clone(),
             allowed_tools: allowed_tools.clone(),
-            model: model.clone(),
             is_project_scoped: new_is_project_scoped,
             file_path: if scope_changing {
                 PathBuf::new()
             } else {
                 existing.file_path.clone()
             },
+            dir_path: if scope_changing {
+                PathBuf::new()
+            } else {
+                existing.dir_path.clone()
+            },
+            meta: existing.meta.clone(),
+            has_references: existing.has_references,
+            has_scripts: existing.has_scripts,
+            has_assets: existing.has_assets,
         };
 
-        config_skills::save_skill(&self.config_dir, &file_skill, new_project_path.as_deref())?;
+        let dest_path = config_skills::save_skill(
+            &self.config_dir,
+            &file_skill,
+            new_project_path.as_deref(),
+            None,
+        )?;
 
         if scope_changing {
-            if let Err(e) = std::fs::remove_file(&existing.file_path) {
-                log::warn!(
-                    "Failed to delete old skill file {:?}: {}",
-                    existing.file_path,
-                    e
-                );
+            // Copy package subdirectories to new location
+            if let Some(dest_dir) = dest_path.parent() {
+                if let Err(e) = config_skills::copy_skill_package(&existing.dir_path, dest_dir) {
+                    log::warn!("Failed to copy skill package contents: {}", e);
+                }
+            }
+            // Remove old skill directory
+            if existing.dir_path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&existing.dir_path) {
+                    log::warn!(
+                        "Failed to delete old skill directory {:?}: {}",
+                        existing.dir_path,
+                        e
+                    );
+                }
             }
         }
 
@@ -305,7 +329,6 @@ impl Orchestrator {
             description,
             prompt,
             allowed_tools,
-            model,
             workspace_id: if !new_is_project_scoped {
                 Some("default".to_string())
             } else {
@@ -339,37 +362,44 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Fork a workspace skill to a project scope.
-    pub fn fork_skill_config(&self, id: &str, project_id: &str) -> Result<SkillConfig, String> {
+    /// Create a project override of a skill (from any scope).
+    pub fn create_skill_override(&self, id: &str, project_id: &str) -> Result<SkillConfig, String> {
         let project_path = self.project_path(project_id)?;
 
-        let source = config_skills::get_skill(&self.config_dir, id, None)?
-            .ok_or_else(|| format!("Skill not found in workspace: {}", id))?;
+        let source = config_skills::get_skill(&self.config_dir, id, Some(&project_path))?
+            .ok_or_else(|| format!("Skill not found: {}", id))?;
 
-        if source.is_project_scoped {
-            return Err("Cannot fork a project-scoped skill".to_string());
-        }
-
-        let target_path = project_path
-            .join(".cairn")
-            .join("skills")
-            .join(format!("{}.md", id));
-        if target_path.exists() {
+        let target_dir = project_path.join(".cairn").join("skills").join(id);
+        if target_dir.join("SKILL.md").exists() {
             return Err(format!("Skill '{}' already exists in this project", id));
         }
 
-        let forked = config_skills::FileSkill {
+        let override_skill = config_skills::FileSkill {
             id: id.to_string(),
             name: source.name.clone(),
             description: source.description.clone(),
             prompt: source.prompt.clone(),
             allowed_tools: source.allowed_tools.clone(),
-            model: source.model.clone(),
             is_project_scoped: true,
             file_path: PathBuf::new(),
+            dir_path: PathBuf::new(),
+            meta: None,
+            has_references: false,
+            has_scripts: false,
+            has_assets: false,
         };
 
-        config_skills::save_skill(&self.config_dir, &forked, Some(&project_path))?;
+        let dest_path = config_skills::save_skill(
+            &self.config_dir,
+            &override_skill,
+            Some(&project_path),
+            None,
+        )?;
+
+        // Copy package subdirectories from source
+        if let Some(dest_dir) = dest_path.parent() {
+            config_skills::copy_skill_package(&source.dir_path, dest_dir)?;
+        }
 
         let _ = self.services.emitter.emit(
             "config-changed",
@@ -387,9 +417,137 @@ impl Orchestrator {
             description: source.description,
             prompt: source.prompt,
             allowed_tools: source.allowed_tools,
-            model: source.model,
             workspace_id: None,
             project_id: Some(project_id.to_string()),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// Promote a project-only skill to workspace scope.
+    pub fn promote_skill_to_workspace(
+        &self,
+        id: &str,
+        source_project_id: &str,
+    ) -> Result<SkillConfig, String> {
+        let project_path = self.project_path(source_project_id)?;
+
+        let source = config_skills::get_skill(&self.config_dir, id, Some(&project_path))?
+            .ok_or_else(|| format!("Skill not found in project: {}", id))?;
+
+        if !source.is_project_scoped {
+            return Err("Skill is not project-scoped".to_string());
+        }
+
+        let ws_dir = self.config_dir.join("skills").join(id);
+        if ws_dir.join("SKILL.md").exists() {
+            return Err(format!("Skill '{}' already exists at workspace scope", id));
+        }
+
+        let ws_skill = config_skills::FileSkill {
+            id: id.to_string(),
+            name: source.name.clone(),
+            description: source.description.clone(),
+            prompt: source.prompt.clone(),
+            allowed_tools: source.allowed_tools.clone(),
+            is_project_scoped: false,
+            file_path: PathBuf::new(),
+            dir_path: PathBuf::new(),
+            meta: None,
+            has_references: false,
+            has_scripts: false,
+            has_assets: false,
+        };
+
+        let dest_path = config_skills::save_skill(&self.config_dir, &ws_skill, None, None)?;
+
+        // Copy package subdirectories from source
+        if let Some(dest_dir) = dest_path.parent() {
+            config_skills::copy_skill_package(&source.dir_path, dest_dir)?;
+        }
+
+        let _ = self.services.emitter.emit(
+            "config-changed",
+            serde_json::json!({"entity_type": "skill", "action": "created", "id": id}),
+        );
+        let _ = self.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "skill_configs", "action": "insert"}),
+        );
+
+        let now = chrono::Utc::now().timestamp() as i32;
+        Ok(SkillConfig {
+            id: id.to_string(),
+            name: source.name,
+            description: source.description,
+            prompt: source.prompt,
+            allowed_tools: source.allowed_tools,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    /// Fetch a skill from a URL and return a preview for the UI.
+    pub fn fetch_skill_preview(
+        &self,
+        url: &str,
+    ) -> Result<crate::config::skill_fetch::FetchedSkill, String> {
+        let source = crate::config::skill_fetch::parse_skill_url(url)?;
+        crate::config::skill_fetch::fetch_skill(&source, url)
+    }
+
+    /// Install a previously fetched skill to the target scope.
+    pub fn install_skill_from_url(
+        &self,
+        url: &str,
+        project_id: Option<&str>,
+    ) -> Result<SkillConfig, String> {
+        let source = crate::config::skill_fetch::parse_skill_url(url)?;
+        let fetched = crate::config::skill_fetch::fetch_skill(&source, url)?;
+
+        let project_path: Option<std::path::PathBuf> = if let Some(pid) = project_id {
+            Some(self.project_path(pid)?)
+        } else {
+            None
+        };
+
+        let installed_dir = crate::config::skill_fetch::install_fetched_skill(
+            &fetched,
+            &self.config_dir,
+            project_path.as_deref(),
+        )?;
+
+        // Derive the final skill ID from the installed directory name
+        let final_id = installed_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&fetched.skill_id)
+            .to_string();
+
+        let _ = self.services.emitter.emit(
+            "config-changed",
+            serde_json::json!({"entity_type": "skill", "action": "created", "id": final_id}),
+        );
+        let _ = self.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "skill_configs", "action": "insert"}),
+        );
+
+        let now = chrono::Utc::now().timestamp() as i32;
+        Ok(SkillConfig {
+            id: final_id,
+            name: fetched.name,
+            description: fetched.description,
+            prompt: fetched.prompt,
+            allowed_tools: fetched.allowed_tools,
+            workspace_id: if project_id.is_none() {
+                Some("default".to_string())
+            } else {
+                None
+            },
+            project_id: project_id.map(|s| s.to_string()),
             created_at: now,
             updated_at: now,
         })

@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::diesel_models::{
     DbActionRun, DbConditionEvaluation, DbJob, DbRecipeEdge, DbRecipeNode, NewJob,
 };
-use crate::models::{ExecutionSnapshot, Job, RecipeEdge, RecipeNode};
+use crate::models::{DelegatedSessionMode, ExecutionSnapshot, Job, RecipeEdge, RecipeNode};
 use crate::schema::{action_runs, condition_evaluations, executions, jobs};
 
 /// Convert RecipeNode (from snapshot) to DbRecipeNode (for job creation).
@@ -363,7 +363,9 @@ pub fn create_jobs_for_new_nodes(
 }
 
 /// Find the parent agent's job ID for an inherit-mode agent node.
-/// Traverses backwards via control edges to find the first agent node.
+/// Traverses backwards via control edges to find the first agent or executor node.
+/// Executor nodes are included because they own worktrees that downstream
+/// inherit-mode nodes need to inherit.
 fn find_parent_agent_job_id(
     node_id: &str,
     reverse_edges: &HashMap<String, Vec<String>>,
@@ -384,8 +386,8 @@ fn find_parent_agent_job_id(
         }
 
         if let Some(parent_node) = node_map.get(&parent_id) {
-            if parent_node.node_type == "agent" {
-                // Found an agent - return its job ID if already created
+            if parent_node.node_type == "agent" || parent_node.node_type == "executor" {
+                // Found an agent or executor - return its job ID if already created
                 return node_to_job.get(&parent_id).cloned();
             }
         }
@@ -420,16 +422,45 @@ fn insert_job_for_node(
         .and_then(|a| a.model.as_ref())
         .map(|m| m.to_string());
 
-    let session_id = Uuid::new_v4().to_string(); // Pre-generate session_id
+    let delegated_packet = snapshot.delegated_packets.iter().find(|packet| {
+        packet
+            .materialized_node_ids
+            .iter()
+            .any(|materialized_node_id| materialized_node_id == node_id)
+    });
+    let requested_forked_session = delegated_packet
+        .map(|packet| packet.session.mode == DelegatedSessionMode::Fork)
+        .unwrap_or(false);
+    let parent_backend = delegated_packet
+        .and_then(|packet| {
+            jobs::table
+                .find(&packet.parent_job_id)
+                .select(jobs::model)
+                .first::<Option<String>>(conn)
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(crate::backends::backend_for_model)
+                .map(str::to_string)
+        });
+    let child_backend = backend_for_job_session(snapshot, agent_config_id);
+    let create_forked_session = requested_forked_session
+        && parent_backend
+            .as_deref()
+            .map(|backend| backend == child_backend)
+            .unwrap_or(false);
+    let session_id = (!create_forked_session).then(|| Uuid::new_v4().to_string());
     let new_job = NewJob {
         id: &job_id,
         execution_id: Some(execution_id),
+        manager_id: None,
         recipe_node_id: Some(node_id),
         parent_job_id,
         worktree_path: None,
         branch: None,
         base_commit: None,
-        claude_session_id: Some(&session_id),
+        current_session_id: session_id.as_deref(),
+        resume_session_id: None,
         status: "pending",
         agent_config_id,
         issue_id: if issue_id.is_empty() {
@@ -442,11 +473,13 @@ fn insert_job_for_node(
         created_at: now,
         updated_at: now,
         completed_at: None,
-        started_at: None,
         parent_tool_use_id: None,
         task_index: None,
+        started_at: None,
         model: model_str.as_deref(),
         node_name: Some(name),
+        base_branch: None,
+        current_turn_id: None,
     };
 
     diesel::insert_into(jobs::table)
@@ -454,12 +487,57 @@ fn insert_job_for_node(
         .execute(conn)
         .map_err(|e| format!("Failed to create job: {}", e))?;
 
+    // Create Session record (after Job exists to satisfy FK).
+    // Must succeed — Session is the durable conversation identity.
+    if create_forked_session {
+        let packet = delegated_packet.expect("delegated fork packet must exist");
+        let source_session_id: Option<String> = jobs::table
+            .find(&packet.parent_job_id)
+            .select(jobs::current_session_id)
+            .first(conn)
+            .map_err(|e| format!("Failed to load parent session for delegated fork: {}", e))?;
+        if let Some(source_session_id) = source_session_id {
+            let source_session = crate::sessions::queries::get(conn, &source_session_id)?;
+            crate::sessions::queries::fork_job_session(conn, &source_session, &job_id, true)?;
+        } else {
+            let session_id = Uuid::new_v4().to_string();
+            crate::sessions::queries::create_with_id(conn, &session_id, Some(&job_id), None, &child_backend)?;
+            diesel::update(jobs::table.find(&job_id))
+                .set(jobs::current_session_id.eq(Some(&session_id)))
+                .execute(conn)
+                .map_err(|e| format!("Failed to attach fallback session to delegated job: {}", e))?;
+        }
+    } else {
+        crate::sessions::queries::create_with_id(
+            conn,
+            session_id
+                .as_deref()
+                .ok_or_else(|| "Missing generated session id for new job".to_string())?,
+            Some(&job_id),
+            None,
+            &child_backend,
+        )?;
+    }
+
     let db_job: DbJob = jobs::table
         .find(&job_id)
         .first(conn)
         .map_err(|e| format!("Failed to load created job: {}", e))?;
 
     Job::try_from(db_job)
+}
+
+fn backend_for_job_session(snapshot: &ExecutionSnapshot, agent_config_id: Option<&str>) -> String {
+    agent_config_id
+        .and_then(|id| snapshot.agents.get(id))
+        .and_then(|agent| {
+            agent
+                .resolved_backend
+                .clone()
+                .or_else(|| agent.model.as_ref().and_then(|model| crate::backends::backend_for_model(model.as_str()).map(str::to_string)))
+                .or_else(|| agent.backend_preference.clone())
+        })
+        .unwrap_or_else(|| "claude".to_string())
 }
 
 /// Load execution snapshot from database
@@ -652,6 +730,348 @@ pub fn find_downstream_artifact_schema(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node(id: &str, node_type: &str) -> DbRecipeNode {
+        DbRecipeNode {
+            id: id.to_string(),
+            recipe_id: "r".to_string(),
+            node_type: node_type.to_string(),
+            name: id.to_string(),
+            position_x: 0.0,
+            position_y: 0.0,
+            config: None,
+            created_at: 0,
+            updated_at: 0,
+            parent_id: None,
+        }
+    }
+
+    /// Build reverse control edges: target → [sources]
+    fn reverse_edges(edges: &[(&str, &str)]) -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (src, tgt) in edges {
+            map.entry(tgt.to_string())
+                .or_default()
+                .push(src.to_string());
+        }
+        map
+    }
+
+    // ========================================================================
+    // find_parent_agent_job_id tests
+    // ========================================================================
+
+    #[test]
+    fn find_parent_matches_agent_node() {
+        // agent-a → task-b (control). task-b should find agent-a.
+        let nodes = vec![make_node("agent-a", "agent"), make_node("task-b", "agent")];
+        let node_map: HashMap<String, &DbRecipeNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let rev = reverse_edges(&[("agent-a", "task-b")]);
+        let jobs: HashMap<String, String> = [("agent-a".to_string(), "job-a".to_string())].into();
+
+        let result = find_parent_agent_job_id("task-b", &rev, &node_map, &jobs);
+        assert_eq!(result, Some("job-a".to_string()));
+    }
+
+    #[test]
+    fn find_parent_matches_executor_node() {
+        // executor → root-task (control). root-task should find executor.
+        let nodes = vec![
+            make_node("executor-1", "executor"),
+            make_node("root-task", "agent"),
+        ];
+        let node_map: HashMap<String, &DbRecipeNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let rev = reverse_edges(&[("executor-1", "root-task")]);
+        let jobs: HashMap<String, String> =
+            [("executor-1".to_string(), "exec-job".to_string())].into();
+
+        let result = find_parent_agent_job_id("root-task", &rev, &node_map, &jobs);
+        assert_eq!(result, Some("exec-job".to_string()));
+    }
+
+    #[test]
+    fn find_parent_traverses_through_non_agent_nodes() {
+        // executor → context-node → task (control chain).
+        // task should traverse past context-node and find executor.
+        let nodes = vec![
+            make_node("executor-1", "executor"),
+            make_node("ctx", "context"),
+            make_node("task-a", "agent"),
+        ];
+        let node_map: HashMap<String, &DbRecipeNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let rev = reverse_edges(&[("executor-1", "ctx"), ("ctx", "task-a")]);
+        let jobs: HashMap<String, String> =
+            [("executor-1".to_string(), "exec-job".to_string())].into();
+
+        let result = find_parent_agent_job_id("task-a", &rev, &node_map, &jobs);
+        assert_eq!(result, Some("exec-job".to_string()));
+    }
+
+    #[test]
+    fn find_parent_returns_none_when_no_agent_or_executor_upstream() {
+        // trigger → task (control). Trigger is neither agent nor executor.
+        let nodes = vec![
+            make_node("trigger-1", "trigger"),
+            make_node("task-a", "agent"),
+        ];
+        let node_map: HashMap<String, &DbRecipeNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let rev = reverse_edges(&[("trigger-1", "task-a")]);
+        let jobs: HashMap<String, String> =
+            [("trigger-1".to_string(), "trig-job".to_string())].into();
+
+        let result = find_parent_agent_job_id("task-a", &rev, &node_map, &jobs);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_parent_returns_none_when_agent_has_no_job_yet() {
+        // agent-a → task-b, but agent-a has no job in node_to_job.
+        let nodes = vec![make_node("agent-a", "agent"), make_node("task-b", "agent")];
+        let node_map: HashMap<String, &DbRecipeNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let rev = reverse_edges(&[("agent-a", "task-b")]);
+        let jobs: HashMap<String, String> = HashMap::new(); // no jobs
+
+        let result = find_parent_agent_job_id("task-b", &rev, &node_map, &jobs);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn find_parent_stops_at_first_agent_does_not_continue() {
+        // executor → agent-a → task-b. task-b should find agent-a, not executor.
+        let nodes = vec![
+            make_node("executor-1", "executor"),
+            make_node("agent-a", "agent"),
+            make_node("task-b", "agent"),
+        ];
+        let node_map: HashMap<String, &DbRecipeNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let rev = reverse_edges(&[("executor-1", "agent-a"), ("agent-a", "task-b")]);
+        let jobs: HashMap<String, String> = [
+            ("executor-1".to_string(), "exec-job".to_string()),
+            ("agent-a".to_string(), "job-a".to_string()),
+        ]
+        .into();
+
+        let result = find_parent_agent_job_id("task-b", &rev, &node_map, &jobs);
+        assert_eq!(result, Some("job-a".to_string()));
+    }
+
+    #[test]
+    fn create_jobs_for_new_nodes_forks_delegated_session_from_parent() {
+        use crate::diesel_models::{NewExecution, NewJob};
+        use crate::models::{
+            DelegatedOutputContract, DelegatedOwnershipScope, DelegatedSessionMode,
+            DelegatedSessionStrategy, DelegatedStatus, DelegatedWorkPacket, ExecutionSnapshot,
+            RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
+        };
+        use crate::schema::{executions, jobs, sessions};
+        use crate::test_utils::{create_test_project, test_diesel_conn};
+
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let parent_job_id = Uuid::new_v4().to_string();
+        let parent_session_id = Uuid::new_v4().to_string();
+        let execution_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+
+        diesel::insert_into(jobs::table)
+            .values(NewJob {
+                id: &parent_job_id,
+                execution_id: None,
+                manager_id: None,
+                recipe_node_id: None,
+                parent_job_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                current_session_id: Some(&parent_session_id),
+                resume_session_id: None,
+                status: "running",
+                agent_config_id: Some("Explore"),
+                issue_id: None,
+                project_id: &project_id,
+                task_description: Some("Parent"),
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+                parent_tool_use_id: None,
+                task_index: None,
+                started_at: Some(now),
+                model: Some("gpt-5"),
+                node_name: Some("Parent"),
+                base_branch: None,
+                current_turn_id: None,
+            })
+            .execute(&mut conn)
+            .unwrap();
+        crate::sessions::queries::create_with_id(
+            &mut conn,
+            &parent_session_id,
+            Some(&parent_job_id),
+            None,
+            "codex",
+        )
+        .unwrap();
+
+        let snapshot = ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: "recipe-1".to_string(),
+                name: "Delegation".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![RecipeNode {
+                    id: "delegated-packet-1-agent".to_string(),
+                    node_type: crate::models::RecipeNodeType::Agent,
+                    name: "Explore".to_string(),
+                    position: crate::models::NodePosition { x: 0.0, y: 0.0 },
+                    parent_id: None,
+                    trigger_config: None,
+                    agent_config: Some(crate::models::AgentNodeConfig {
+                        agent_config_id: Some("Explore".to_string()),
+                        checkpoint: None,
+                        output_schema: None,
+                        git_config: None,
+                    }),
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: None,
+                }],
+                edges: vec![],
+            },
+            agents: HashMap::from([(
+                "Explore".to_string(),
+                crate::models::AgentSnapshot {
+                    id: "Explore".to_string(),
+                    name: "Explore".to_string(),
+                    description: String::new(),
+                    prompt: String::new(),
+                    tools: vec![],
+                    tier: None,
+                    backend_preference: Some("codex".to_string()),
+                    model: Some(crate::models::Model::default()),
+                    disallowed_tools: None,
+                    skills: None,
+                    approval_policy: None,
+                    filesystem_scope: None,
+                    resolved_backend: Some("codex".to_string()),
+                    extras: None,
+                },
+            )]),
+            skills: HashMap::new(),
+            tools: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: None,
+                project_id: project_id.clone(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+            },
+            presets: None,
+            delegated_packets: vec![DelegatedWorkPacket {
+                id: "packet-1".to_string(),
+                parent_job_id: parent_job_id.clone(),
+                parent_turn_id: None,
+                parent_tool_use_id: Some("tool-1".to_string()),
+                origin: crate::models::DelegationOrigin::TaskTool,
+                title: "Explore".to_string(),
+                problem_statement: "Inspect".to_string(),
+                agent_config_id: "Explore".to_string(),
+                ownership: DelegatedOwnershipScope {
+                    cwd: "/tmp/test".to_string(),
+                    filesystem_scope: None,
+                    approval_policy: None,
+                },
+                session: DelegatedSessionStrategy {
+                    mode: DelegatedSessionMode::Fork,
+                },
+                acceptance: vec![],
+                output_contract: DelegatedOutputContract {
+                    schema_type: "return".to_string(),
+                    tool_name: None,
+                    description: None,
+                },
+                status: DelegatedStatus::Materialized,
+                materialized_node_ids: vec!["delegated-packet-1-agent".to_string()],
+                result_artifact_job_id: None,
+                task_index: Some(0),
+                tier_override: None,
+                backend_preference: Some("codex".to_string()),
+                created_at: now as i64,
+            }],
+            created_at: now as i64,
+        };
+        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
+        diesel::insert_into(executions::table)
+            .values(NewExecution {
+                id: &execution_id,
+                recipe_id: "recipe-1",
+                issue_id: None,
+                project_id: Some(&project_id),
+                status: "running",
+                started_at: now,
+                completed_at: None,
+                snapshot: Some(&snapshot_json),
+                seq: None,
+                initiator_sub: None,
+                initiator_auth_mode: None,
+                initiator_org_id: None,
+                triggered_by: "manual",
+            })
+            .execute(&mut conn)
+            .unwrap();
+
+        let child_job = insert_job_for_node(
+            &mut conn,
+            &execution_id,
+            "",
+            &project_id,
+            "delegated-packet-1-agent",
+            "Explore",
+            Some("Explore"),
+            None,
+            now,
+            &snapshot,
+        )
+        .unwrap();
+        let child_session_id: Option<String> = jobs::table
+            .find(&child_job.id)
+            .select(jobs::current_session_id)
+            .first(&mut conn)
+            .unwrap();
+        let child_session_id = child_session_id.unwrap();
+        let lineage: (Option<String>, Option<String>) = sessions::table
+            .find(&child_session_id)
+            .select((sessions::parent_session_id, sessions::replaced_by_id))
+            .first(&mut conn)
+            .unwrap();
+
+        assert_eq!(lineage.0.as_deref(), Some(parent_session_id.as_str()));
+        assert!(lineage.1.is_none());
+    }
+
+    #[test]
+    fn find_parent_returns_none_when_no_edges() {
+        // Isolated node with no incoming control edges.
+        let nodes = vec![make_node("task-a", "agent")];
+        let node_map: HashMap<String, &DbRecipeNode> =
+            nodes.iter().map(|n| (n.id.clone(), n)).collect();
+        let rev: HashMap<String, Vec<String>> = HashMap::new();
+        let jobs: HashMap<String, String> = HashMap::new();
+
+        let result = find_parent_agent_job_id("task-a", &rev, &node_map, &jobs);
+        assert_eq!(result, None);
+    }
 }
 
 // ============================================================================

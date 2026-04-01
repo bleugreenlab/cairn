@@ -158,7 +158,6 @@ impl Orchestrator {
             name: input.name.clone(),
             description: input.description.clone(),
             trigger: input.trigger.unwrap_or_default(),
-            context: input.context.unwrap_or_default(),
             workspace_id: input.workspace_id.clone(),
             project_id: input.project_id.clone(),
             is_default: false,
@@ -221,9 +220,6 @@ impl Orchestrator {
         }
         if let Some(trigger) = input.trigger {
             recipe.trigger = trigger;
-        }
-        if let Some(context) = input.context {
-            recipe.context = context;
         }
         if let Some(nodes) = input.nodes {
             recipe.nodes = nodes;
@@ -371,16 +367,16 @@ impl Orchestrator {
         Ok(new_recipe)
     }
 
-    /// Fork a workspace recipe to a project scope.
-    pub fn fork_recipe(&self, recipe_id: &str, project_id: &str) -> Result<Recipe, String> {
+    /// Create a project override of a recipe (from any scope).
+    pub fn create_recipe_override(
+        &self,
+        recipe_id: &str,
+        project_id: &str,
+    ) -> Result<Recipe, String> {
         let project_path = self.project_path(project_id)?;
 
-        let source = config_recipes::get_recipe(&self.config_dir, recipe_id, None)?
-            .ok_or_else(|| format!("Recipe not found in workspace: {}", recipe_id))?;
-
-        if source.is_project_scoped {
-            return Err("Cannot fork a project-scoped recipe".to_string());
-        }
+        let source = config_recipes::get_recipe(&self.config_dir, recipe_id, Some(&project_path))?
+            .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
 
         let target_path = project_path
             .join(".cairn")
@@ -394,17 +390,22 @@ impl Orchestrator {
         }
 
         let now = chrono::Utc::now().timestamp();
-        let mut forked_recipe = source.recipe.clone();
-        forked_recipe.workspace_id = None;
-        forked_recipe.project_id = Some(project_id.to_string());
-        forked_recipe.is_default = false;
-        forked_recipe.created_at = now;
-        forked_recipe.updated_at = now;
+        let mut override_recipe = source.recipe.clone();
+        override_recipe.workspace_id = None;
+        override_recipe.project_id = Some(project_id.to_string());
+        override_recipe.is_default = false;
+        override_recipe.created_at = now;
+        override_recipe.updated_at = now;
+
+        // Set file_path explicitly to avoid the save_recipe name-slug path
+        let recipes_dir = project_path.join(".cairn").join("recipes");
+        std::fs::create_dir_all(&recipes_dir)
+            .map_err(|e| format!("Failed to create project recipes directory: {}", e))?;
 
         let file_recipe = config_recipes::FileRecipe {
-            recipe: forked_recipe.clone(),
+            recipe: override_recipe.clone(),
             is_project_scoped: true,
-            file_path: PathBuf::new(),
+            file_path: recipes_dir.join(format!("{}.yaml", recipe_id)),
         };
 
         config_recipes::save_recipe(&self.config_dir, &file_recipe, Some(&project_path))?;
@@ -418,7 +419,64 @@ impl Orchestrator {
             serde_json::json!({"table": "recipes", "action": "insert"}),
         );
 
-        Ok(forked_recipe)
+        Ok(override_recipe)
+    }
+
+    /// Promote a project-only recipe to workspace scope.
+    pub fn promote_recipe_to_workspace(
+        &self,
+        recipe_id: &str,
+        source_project_id: &str,
+    ) -> Result<Recipe, String> {
+        let project_path = self.project_path(source_project_id)?;
+
+        let source = config_recipes::get_recipe(&self.config_dir, recipe_id, Some(&project_path))?
+            .ok_or_else(|| format!("Recipe not found in project: {}", recipe_id))?;
+
+        if !source.is_project_scoped {
+            return Err("Recipe is not project-scoped".to_string());
+        }
+
+        // Check workspace version doesn't already exist
+        let ws_dir = self.config_dir.join("recipes");
+        for ext in ["yaml", "yml"] {
+            let ws_path = ws_dir.join(format!("{}.{}", recipe_id, ext));
+            if ws_path.exists() {
+                return Err(format!(
+                    "Recipe '{}' already exists at workspace scope",
+                    recipe_id
+                ));
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let mut ws_recipe = source.recipe.clone();
+        ws_recipe.workspace_id = Some("default".to_string());
+        ws_recipe.project_id = None;
+        ws_recipe.created_at = now;
+        ws_recipe.updated_at = now;
+
+        std::fs::create_dir_all(&ws_dir)
+            .map_err(|e| format!("Failed to create recipes directory: {}", e))?;
+
+        let file_recipe = config_recipes::FileRecipe {
+            recipe: ws_recipe.clone(),
+            is_project_scoped: false,
+            file_path: ws_dir.join(format!("{}.yaml", recipe_id)),
+        };
+
+        config_recipes::save_recipe(&self.config_dir, &file_recipe, None)?;
+
+        let _ = self.services.emitter.emit(
+            "config-changed",
+            serde_json::json!({"entity_type": "recipe", "action": "created", "id": recipe_id}),
+        );
+        let _ = self.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "recipes", "action": "insert"}),
+        );
+
+        Ok(ws_recipe)
     }
 
     /// List recipes for a project context with workspace→project shadowing.
@@ -462,7 +520,7 @@ impl Orchestrator {
         for result in project_recipes {
             if let ConfigResult::Ok(file_recipe) = result {
                 if file_recipe.recipe.is_default
-                    && file_recipe.recipe.trigger == RecipeTrigger::Issue
+                    && file_recipe.recipe.trigger == RecipeTrigger::Manual
                     && file_recipe.is_project_scoped
                 {
                     return Ok(Some(file_recipe_to_model(
@@ -479,7 +537,7 @@ impl Orchestrator {
         for result in workspace_recipes {
             if let ConfigResult::Ok(file_recipe) = result {
                 if file_recipe.recipe.is_default
-                    && file_recipe.recipe.trigger == RecipeTrigger::Issue
+                    && file_recipe.recipe.trigger == RecipeTrigger::Manual
                     && !file_recipe.is_project_scoped
                 {
                     return Ok(Some(file_recipe_to_model(

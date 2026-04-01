@@ -1,6 +1,21 @@
 // @generated automatically by Diesel CLI.
 
 diesel::table! {
+    account (user_id) {
+        user_id -> Text,
+        email -> Text,
+        name -> Text,
+        device_id -> Text,
+        plan -> Text,
+        jwt_encrypted -> Nullable<Text>,
+        jwt_expires_at -> Nullable<Integer>,
+        org_memberships -> Nullable<Text>,
+        connected_at -> Integer,
+        updated_at -> Integer,
+    }
+}
+
+diesel::table! {
     action_configs (id) {
         id -> Text,
         name -> Text,
@@ -38,21 +53,18 @@ diesel::table! {
 }
 
 diesel::table! {
-    server_deployments (id) {
+    servers (id) {
         id -> Text,
         name -> Text,
-        host -> Text,
-        port -> Integer,
-        user -> Text,
-        ssh_key_path -> Nullable<Text>,
-        container_name -> Text,
-        api_key -> Text,
-        server_port -> Integer,
+        url -> Text,
+        org_id -> Nullable<Text>,
         status -> Text,
-        claude_authenticated -> Integer,
+        version -> Nullable<Text>,
         error_message -> Nullable<Text>,
-        created_at -> BigInt,
-        updated_at -> BigInt,
+        excluded_project_ids -> Nullable<Text>,
+        last_seen_at -> Nullable<Integer>,
+        created_at -> Integer,
+        updated_at -> Integer,
     }
 }
 
@@ -83,6 +95,7 @@ diesel::table! {
         output_name -> Nullable<Text>,
         created_at -> Integer,
         updated_at -> Integer,
+        seen_at -> Nullable<Integer>,
     }
 }
 
@@ -108,7 +121,7 @@ diesel::table! {
     chats (id) {
         id -> Text,
         project_id -> Text,
-        claude_session_id -> Nullable<Text>,
+        current_session_id -> Nullable<Text>,
         status -> Text,
         created_at -> Integer,
         updated_at -> Integer,
@@ -187,6 +200,9 @@ diesel::table! {
         surfaced_count -> Integer,
         last_surfaced_at -> Nullable<Integer>,
         active -> Integer,
+        scope -> Text,
+        keywords -> Nullable<Text>,
+        source_run_id -> Nullable<Text>,
     }
 }
 
@@ -197,6 +213,39 @@ diesel::table! {
         trigger_index -> Integer,
         json_path -> Text,
         pattern -> Text,
+    }
+}
+
+diesel::table! {
+    message_stream_chunks (id) {
+        id -> Text,
+        stream_id -> Text,
+        kind -> Text,
+        chunk_index -> Integer,
+        data -> Text,
+        char_count -> Integer,
+        created_at -> Integer,
+    }
+}
+
+diesel::table! {
+    message_streams (id) {
+        id -> Text,
+        run_id -> Text,
+        session_id -> Nullable<Text>,
+        turn_id -> Nullable<Text>,
+        backend -> Text,
+        sequence -> Integer,
+        status -> Text,
+        version -> Integer,
+        content_chars -> Integer,
+        thinking_chars -> Integer,
+        chunk_count -> Integer,
+        final_event_id -> Nullable<Text>,
+        abort_reason -> Nullable<Text>,
+        created_at -> Integer,
+        updated_at -> Integer,
+        finalized_at -> Nullable<Integer>,
     }
 }
 
@@ -215,6 +264,31 @@ diesel::table! {
         cache_read_tokens -> Nullable<Integer>,
         cache_create_tokens -> Nullable<Integer>,
         output_tokens -> Nullable<Integer>,
+        turn_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    effect_outbox (id) {
+        id -> Text,
+        kind -> Text,
+        dedupe_key -> Text,
+        payload_json -> Text,
+        state -> Text,
+        attempts -> Integer,
+        last_error -> Nullable<Text>,
+        created_at -> Integer,
+        updated_at -> Integer,
+    }
+}
+
+diesel::table! {
+    event_embeddings (event_id) {
+        event_id -> Text,
+        embedding -> Binary,
+        model_name -> Text,
+        dimensions -> Integer,
+        created_at -> Integer,
     }
 }
 
@@ -241,6 +315,19 @@ diesel::table! {
         completed_at -> Nullable<Integer>,
         snapshot -> Nullable<Text>,
         seq -> Nullable<Integer>,
+        initiator_sub -> Nullable<Text>,
+        initiator_auth_mode -> Nullable<Text>,
+        initiator_org_id -> Nullable<Text>,
+        triggered_by -> Text,
+    }
+}
+
+diesel::table! {
+    execution_trigger_sources (id) {
+        id -> Text,
+        source_job_id -> Text,
+        triggered_execution_id -> Text,
+        created_at -> Integer,
     }
 }
 
@@ -282,14 +369,102 @@ diesel::table! {
         title -> Text,
         description -> Nullable<Text>,
         status -> Text,
+        progress -> Text,
+        attention -> Text,
         priority -> Nullable<Integer>,
         completed_at -> Nullable<Integer>,
         dismissed_at -> Nullable<Integer>,
         created_at -> Integer,
         updated_at -> Integer,
-        wait_state -> Nullable<Text>,
         model -> Nullable<Text>,
-        skills -> Nullable<Text>,
+        merged_at -> Nullable<Integer>,
+        closed_at -> Nullable<Integer>,
+        manager_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    managers (id) {
+        id -> Text,
+        project_id -> Text,
+        home_project_id -> Nullable<Text>,
+        scope_kind -> Text,
+        name -> Text,
+        description -> Text,
+        branch -> Nullable<Text>,
+        job_id -> Nullable<Text>,
+        status -> Text,
+        current_session_id -> Nullable<Text>,
+        current_turn_id -> Nullable<Text>,
+        last_wake_at -> Nullable<Integer>,
+        last_turn_completed_at -> Nullable<Integer>,
+        last_error -> Nullable<Text>,
+        agent_config_id -> Nullable<Text>,
+        model -> Nullable<Text>,
+        parent_manager_id -> Nullable<Text>,
+        created_at -> Integer,
+        updated_at -> Integer,
+        execution_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    manager_mailbox (id) {
+        id -> Text,
+        manager_id -> Text,
+        cause_type -> Text,
+        cause_json -> Text,
+        delivery_policy -> Text,
+        dedupe_key -> Nullable<Text>,
+        priority -> Integer,
+        available_at -> Integer,
+        created_at -> Integer,
+        claimed_at -> Nullable<Integer>,
+        processed_at -> Nullable<Integer>,
+        superseded_by -> Nullable<Text>,
+        source_run_id -> Nullable<Text>,
+        source_issue_id -> Nullable<Text>,
+        source_project_id -> Nullable<Text>,
+        wake_batch_id -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    manager_scopes (id) {
+        id -> Text,
+        manager_id -> Text,
+        project_id -> Nullable<Text>,
+        scope_kind -> Text,
+        branch -> Nullable<Text>,
+        created_at -> Integer,
+    }
+}
+
+diesel::table! {
+    manager_wake_batches (id) {
+        id -> Text,
+        manager_id -> Text,
+        created_at -> Integer,
+        completed_at -> Nullable<Integer>,
+        outcome -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    sessions (id) {
+        id -> Text,
+        job_id -> Nullable<Text>,
+        chat_id -> Nullable<Text>,
+        backend -> Text,
+        status -> Text,
+        parent_session_id -> Nullable<Text>,
+        replaced_by_id -> Nullable<Text>,
+        terminal_reason -> Nullable<Text>,
+        sequence -> Integer,
+        created_at -> Integer,
+        closed_at -> Nullable<Integer>,
+        updated_at -> Integer,
+        backend_id -> Nullable<Text>,
     }
 }
 
@@ -297,12 +472,14 @@ diesel::table! {
     jobs (id) {
         id -> Text,
         execution_id -> Nullable<Text>,
+        manager_id -> Nullable<Text>,
         recipe_node_id -> Nullable<Text>,
         parent_job_id -> Nullable<Text>,
         worktree_path -> Nullable<Text>,
         branch -> Nullable<Text>,
         base_commit -> Nullable<Text>,
-        claude_session_id -> Nullable<Text>,
+        current_session_id -> Nullable<Text>,
+        resume_session_id -> Nullable<Text>,
         status -> Text,
         agent_config_id -> Nullable<Text>,
         issue_id -> Nullable<Text>,
@@ -316,6 +493,8 @@ diesel::table! {
         started_at -> Nullable<Integer>,
         model -> Nullable<Text>,
         node_name -> Nullable<Text>,
+        base_branch -> Nullable<Text>,
+        current_turn_id -> Nullable<Text>,
     }
 }
 
@@ -369,33 +548,61 @@ diesel::table! {
         response -> Nullable<Text>,
         created_at -> Integer,
         responded_at -> Nullable<Integer>,
+        turn_id -> Nullable<Text>,
     }
 }
 
 diesel::table! {
-    pr_data (id) {
+    turns (id) {
         id -> Text,
-        action_run_id -> Nullable<Text>,
-        pr_number -> Integer,
-        pr_url -> Text,
-        pr_status -> Text,
-        // GitHub API fields (formerly in pr_cache)
-        title -> Nullable<Text>,
+        session_id -> Text,
+        run_id -> Nullable<Text>,
+        job_id -> Nullable<Text>,
+        manager_id -> Nullable<Text>,
+        sequence -> Integer,
+        predecessor_id -> Nullable<Text>,
+        state -> Text,
+        yield_reason -> Nullable<Text>,
+        start_reason -> Text,
+        created_at -> Integer,
+        started_at -> Nullable<Integer>,
+        ended_at -> Nullable<Integer>,
+        updated_at -> Integer,
+    }
+}
+
+diesel::table! {
+    merge_requests (id) {
+        id -> Text,
+        job_id -> Text,
+        project_id -> Text,
+        issue_id -> Nullable<Text>,
+        manager_id -> Nullable<Text>,
+        // Authoritative state
+        title -> Text,
         body -> Nullable<Text>,
-        state -> Nullable<Text>,
-        is_draft -> Nullable<Integer>,
-        review_decision -> Nullable<Text>,
-        mergeable -> Nullable<Text>,
+        source_branch -> Text,
+        target_branch -> Text,
+        status -> Text,
+        merge_method -> Text,
         additions -> Nullable<Integer>,
         deletions -> Nullable<Integer>,
-        checks_status -> Nullable<Text>,
+        changed_files -> Nullable<Integer>,
+        commit_count -> Nullable<Integer>,
+        merged_commit -> Nullable<Text>,
         checks_json -> Nullable<Text>,
-        fetched_at -> Nullable<Integer>,
-        // Timestamps
-        opened_at -> Nullable<Integer>,
+        checks_status -> Nullable<Text>,
+        opened_at -> Integer,
         merged_at -> Nullable<Integer>,
         closed_at -> Nullable<Integer>,
         updated_at -> Integer,
+        // GitHub sync (all nullable)
+        github_pr_number -> Nullable<Integer>,
+        github_pr_url -> Nullable<Text>,
+        github_state -> Nullable<Text>,
+        github_review -> Nullable<Text>,
+        github_mergeable -> Nullable<Text>,
+        github_fetched_at -> Nullable<Integer>,
     }
 }
 
@@ -417,7 +624,9 @@ diesel::table! {
         terminal_commands -> Nullable<Text>,
         config -> Nullable<Text>,
         remote_url -> Nullable<Text>,
-        remote_api_key -> Nullable<Text>,
+
+        hidden -> Integer,
+        server_id -> Nullable<Text>,
     }
 }
 
@@ -429,6 +638,7 @@ diesel::table! {
         response -> Nullable<Text>,
         created_at -> Integer,
         answered_at -> Nullable<Integer>,
+        turn_id -> Nullable<Text>,
     }
 }
 
@@ -439,14 +649,46 @@ diesel::table! {
         project_id -> Nullable<Text>,
         job_id -> Nullable<Text>,
         status -> Nullable<Text>,
-        claude_session_id -> Nullable<Text>,
+        session_id -> Nullable<Text>,
         error_message -> Nullable<Text>,
         started_at -> Nullable<Integer>,
-        completed_at -> Nullable<Integer>,
+        exited_at -> Nullable<Integer>,
         created_at -> Integer,
         updated_at -> Integer,
-        todos -> Nullable<Text>,
         chat_id -> Nullable<Text>,
+        backend -> Nullable<Text>,
+        exit_reason -> Nullable<Text>,
+        start_mode -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    trigger_accumulator_state (id) {
+        id -> Text,
+        recipe_id -> Text,
+        group_key -> Text,
+        scope_key -> Text,
+        events -> Text,
+        event_count -> Integer,
+        seen_event_ids -> Text,
+        first_event_at -> Integer,
+        last_event_at -> Integer,
+        created_at -> Integer,
+    }
+}
+
+diesel::table! {
+    todos (id) {
+        id -> Text,
+        job_id -> Text,
+        todo_id -> Text,
+        content -> Text,
+        status -> Text,
+        priority -> Nullable<Text>,
+        active_form -> Nullable<Text>,
+        position -> Integer,
+        created_at -> Integer,
+        updated_at -> Integer,
     }
 }
 
@@ -470,8 +712,21 @@ diesel::table! {
         sender_run_id -> Nullable<Text>,
         sender_name -> Text,
         recipient_run_id -> Nullable<Text>,
+        recipient_manager_id -> Nullable<Text>,
         content -> Text,
         created_at -> Integer,
+    }
+}
+
+diesel::table! {
+    issue_workspaces (issue_id, execution_id) {
+        issue_id -> Text,
+        execution_id -> Text,
+        surface -> Text,
+        layout_json -> Text,
+        schema_version -> Integer,
+        updated_at -> Integer,
+        revision -> Integer,
     }
 }
 
@@ -495,6 +750,17 @@ diesel::table! {
 
 // Foreign key relationships
 diesel::joinable!(memory_triggers -> memories (memory_id));
+diesel::joinable!(message_stream_chunks -> message_streams (stream_id));
+diesel::joinable!(message_streams -> events (final_event_id));
+diesel::joinable!(message_streams -> runs (run_id));
+diesel::joinable!(managers -> executions (execution_id));
+diesel::joinable!(managers -> jobs (job_id));
+diesel::joinable!(managers -> projects (project_id));
+diesel::joinable!(manager_mailbox -> managers (manager_id));
+diesel::joinable!(manager_mailbox -> manager_wake_batches (wake_batch_id));
+diesel::joinable!(manager_scopes -> managers (manager_id));
+diesel::joinable!(manager_scopes -> projects (project_id));
+diesel::joinable!(manager_wake_batches -> managers (manager_id));
 diesel::joinable!(memories -> projects (project_id));
 diesel::joinable!(checkpoint_command_cache -> jobs (job_id));
 diesel::joinable!(artifacts -> jobs (job_id));
@@ -504,17 +770,25 @@ diesel::joinable!(job_terminals -> projects (project_id));
 diesel::joinable!(job_terminals -> runs (run_id));
 diesel::joinable!(comments -> issues (issue_id));
 diesel::joinable!(doc_references -> issues (issue_id));
+diesel::joinable!(event_embeddings -> events (event_id));
 diesel::joinable!(events -> runs (run_id));
 diesel::joinable!(file_changes -> jobs (job_id));
 
+diesel::joinable!(execution_trigger_sources -> executions (triggered_execution_id));
+diesel::joinable!(execution_trigger_sources -> jobs (source_job_id));
 diesel::joinable!(executions -> issues (issue_id));
 diesel::joinable!(executions -> projects (project_id));
+diesel::joinable!(issue_workspaces -> issues (issue_id));
+diesel::joinable!(issues -> managers (manager_id));
 diesel::joinable!(issues -> projects (project_id));
 diesel::joinable!(jobs -> executions (execution_id));
 
 diesel::joinable!(jobs -> issues (issue_id));
 diesel::joinable!(jobs -> projects (project_id));
-diesel::joinable!(pr_data -> action_runs (action_run_id));
+diesel::joinable!(merge_requests -> jobs (job_id));
+diesel::joinable!(merge_requests -> projects (project_id));
+diesel::joinable!(merge_requests -> issues (issue_id));
+diesel::joinable!(merge_requests -> managers (manager_id));
 // New joinable relationships for eliminated polymorphic scope pattern
 diesel::joinable!(action_configs -> workspaces (workspace_id));
 diesel::joinable!(action_configs -> projects (project_id));
@@ -525,10 +799,15 @@ diesel::joinable!(custom_mcp_servers -> projects (project_id));
 diesel::joinable!(projects -> workspaces (workspace_id));
 diesel::joinable!(permission_requests -> runs (run_id));
 diesel::joinable!(prompts -> runs (run_id));
+diesel::joinable!(turns -> managers (manager_id));
+diesel::joinable!(turns -> runs (run_id));
+diesel::joinable!(sessions -> jobs (job_id));
+diesel::joinable!(sessions -> chats (chat_id));
 diesel::joinable!(runs -> chats (chat_id));
 diesel::joinable!(runs -> jobs (job_id));
 diesel::joinable!(runs -> issues (issue_id));
 diesel::joinable!(runs -> projects (project_id));
+diesel::joinable!(todos -> jobs (job_id));
 
 diesel::joinable!(artifact_content -> executions (execution_id));
 diesel::joinable!(artifact_content -> jobs (job_id));
@@ -539,9 +818,11 @@ diesel::joinable!(action_runs -> projects (project_id));
 diesel::joinable!(condition_evaluations -> executions (execution_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
+    account,
     action_configs,
     action_runs,
     artifact_content,
+    effect_outbox,
     artifacts,
     chats,
     checkpoint_command_cache,
@@ -551,24 +832,37 @@ diesel::allow_tables_to_appear_in_same_query!(
     comments,
     custom_mcp_servers,
     doc_references,
+    event_embeddings,
     events,
-    file_changes,
+    execution_trigger_sources,
     executions,
+    file_changes,
     github_app,
     github_installations,
+    issue_workspaces,
     issues,
     jobs,
+    manager_mailbox,
+    manager_scopes,
+    manager_wake_batches,
+    managers,
     memories,
+    message_stream_chunks,
+    message_streams,
     memory_triggers,
     messages,
     pending_injections,
     permission_requests,
-    pr_data,
+    merge_requests,
     projects,
     prompts,
     runs,
-    server_deployments,
+    sessions,
+    servers,
     skill_configs,
+    todos,
+    trigger_accumulator_state,
+    turns,
     webhook_events,
     workspaces,
 );

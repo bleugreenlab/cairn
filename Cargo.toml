@@ -1,0 +1,3 @@
+[workspace]
+members = ["cairn-core", "cairn-common", "cairn-mcp"]
+resolver = "2"

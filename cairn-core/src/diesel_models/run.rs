@@ -17,14 +17,16 @@ pub struct DbRun {
     pub project_id: Option<String>,
     pub job_id: Option<String>,
     pub status: Option<String>,
-    pub claude_session_id: Option<String>,
+    pub session_id: Option<String>,
     pub error_message: Option<String>,
     pub started_at: Option<i32>,
-    pub completed_at: Option<i32>,
+    pub exited_at: Option<i32>,
     pub created_at: i32,
     pub updated_at: i32,
-    pub todos: Option<String>,
     pub chat_id: Option<String>,
+    pub backend: Option<String>,
+    pub exit_reason: Option<String>,
+    pub start_mode: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -35,26 +37,29 @@ pub struct NewRun<'a> {
     pub project_id: Option<&'a str>,
     pub job_id: Option<&'a str>,
     pub status: Option<&'a str>,
-    pub claude_session_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
     pub error_message: Option<&'a str>,
     pub started_at: Option<i32>,
-    pub completed_at: Option<i32>,
+    pub exited_at: Option<i32>,
     pub created_at: i32,
     pub updated_at: i32,
-    pub todos: Option<&'a str>,
     pub chat_id: Option<&'a str>,
+    pub backend: Option<&'a str>,
+    pub exit_reason: Option<&'a str>,
+    pub start_mode: Option<&'a str>,
 }
 
 #[derive(Debug, AsChangeset, Default)]
 #[diesel(table_name = runs)]
 pub struct UpdateRunChangeset<'a> {
     pub status: Option<&'a str>,
-    pub claude_session_id: Option<Option<&'a str>>,
+    pub session_id: Option<Option<&'a str>>,
     pub error_message: Option<Option<&'a str>>,
     pub started_at: Option<Option<i32>>,
-    pub completed_at: Option<Option<i32>>,
+    pub exited_at: Option<Option<i32>>,
     pub updated_at: Option<i32>,
-    pub todos: Option<Option<&'a str>>,
+    pub backend: Option<Option<&'a str>>,
+    pub exit_reason: Option<Option<&'a str>>,
 }
 
 // ============================================================================
@@ -78,6 +83,7 @@ pub struct DbEvent {
     pub cache_read_tokens: Option<i32>,
     pub cache_create_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    pub turn_id: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -96,4 +102,5 @@ pub struct NewEvent<'a> {
     pub cache_read_tokens: Option<i32>,
     pub cache_create_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    pub turn_id: Option<&'a str>,
 }

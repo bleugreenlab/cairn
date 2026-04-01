@@ -96,9 +96,15 @@ const CALLBACK_SERVER_TOOLS: &[&str] = &[
     "edit",
     "bash",
     "kill_shell",
+    "glob",
+    "grep",
     "task",
     "batch_tasks",
     "skill",
+    "list_skills",
+    "create_skill",
+    "update_skill",
+    "delete_skill",
     "search",
     "create_issue",
     "update_issue",
@@ -383,14 +389,16 @@ pub(crate) fn get_allowed_tools_for_run(
                 description: fa.description,
                 prompt: fa.prompt,
                 tools: fa.tools,
-                model: fa.model,
+                tier: fa.tier,
                 workspace_id: None,
                 project_id: None,
                 created_at: 0,
                 updated_at: 0,
                 disallowed_tools: fa.disallowed_tools,
                 skills: fa.skills,
-                permission_mode: fa.permission_mode,
+                approval_policy: fa.approval_policy,
+                filesystem_scope: fa.filesystem_scope,
+                backend_preference: fa.backend_preference,
             })
     });
 
@@ -441,14 +449,19 @@ fn load_agent_from_snapshot(
                 description: agent.description.clone(),
                 prompt: agent.prompt.clone(),
                 tools: agent.tools.clone(),
-                model: agent.model.clone(),
+                tier: agent.tier.clone().or(agent.model.clone()),
                 workspace_id: None,
                 project_id: None,
                 created_at: snapshot.created_at as i32,
                 updated_at: snapshot.created_at as i32,
                 disallowed_tools: agent.disallowed_tools.clone(),
                 skills: agent.skills.clone(),
-                permission_mode: agent.permission_mode.clone(),
+                approval_policy: agent.approval_policy,
+                filesystem_scope: agent.filesystem_scope,
+                backend_preference: agent
+                    .backend_preference
+                    .clone()
+                    .or(agent.resolved_backend.clone()),
             })
         })
         .transpose()

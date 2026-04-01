@@ -5,13 +5,15 @@
 use diesel::prelude::*;
 use serde::Deserialize;
 
+use crate::config::slugify;
 use crate::diesel_models::{DbArtifact, DbJob};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::ExecutionSnapshot;
+use crate::node_segments::visible_node_segment;
 use crate::orchestrator::Orchestrator;
 use crate::schema::{
-    action_runs, artifacts, comments, events, executions, file_changes, issues, job_terminals,
-    jobs, pr_data, runs,
+    artifacts, comments, events, executions, file_changes, issues, job_terminals, jobs,
+    merge_requests, runs, turns,
 };
 use cairn_common::uri::{parse_uri, CairnResource};
 
@@ -68,6 +70,13 @@ pub async fn handle_read_issue_resource(
             exec_seq,
             node_id,
         } => read_node_chat_full(&mut conn, &project, number, exec_seq, &node_id),
+        CairnResource::NodeChatTurn {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            turn_seq,
+        } => read_node_chat_turn(&mut conn, &project, number, exec_seq, &node_id, turn_seq),
         CairnResource::NodeChatEvent {
             project,
             number,
@@ -98,6 +107,16 @@ pub async fn handle_read_issue_resource(
             node_id,
             task_name,
         } => read_task_chat_full(&mut conn, &project, number, exec_seq, &node_id, &task_name),
+        CairnResource::TaskChatTurn {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            turn_seq,
+        } => read_task_chat_turn(
+            &mut conn, &project, number, exec_seq, &node_id, &task_name, turn_seq,
+        ),
         CairnResource::TaskChatEvent {
             project,
             number,
@@ -143,6 +162,21 @@ pub async fn handle_read_issue_resource(
 // Resource Readers
 // ============================================================================
 
+fn visible_job_node_segment(conn: &mut SqliteConnection, job: &DbJob) -> String {
+    let resolved_node_name = job.node_name.clone().or_else(|| {
+        job.recipe_node_id.as_ref().and_then(|rid| {
+            job.execution_id
+                .as_deref()
+                .and_then(|eid| get_node_name_from_execution(conn, eid, rid))
+        })
+    });
+
+    visible_node_segment(job.recipe_node_id.as_deref(), resolved_node_name.as_deref())
+        .or(resolved_node_name)
+        .or_else(|| job.agent_config_id.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn read_issue(conn: &mut SqliteConnection, project_key: &str, number: i32) -> String {
     // Get project
     let project_ctx = match lookup_project_by_key(conn, project_key) {
@@ -178,16 +212,19 @@ fn read_issue(conn: &mut SqliteConnection, project_key: &str, number: i32) -> St
     let mut output = format!("# {}-{}: {}\n\n", project_key, number, title);
     output.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
 
-    // Get PR data for this issue (via action_runs)
-    #[allow(clippy::type_complexity)]
-    let pr: Option<(i32, String, String)> = pr_data::table
-        .inner_join(action_runs::table.on(pr_data::action_run_id.eq(action_runs::id.nullable())))
-        .filter(action_runs::issue_id.eq(&issue_id))
-        .select((pr_data::pr_number, pr_data::pr_url, pr_data::pr_status))
+    // Get PR data for this issue (via merge_requests)
+    let pr: Option<(Option<i32>, Option<String>, String)> = merge_requests::table
+        .filter(merge_requests::issue_id.eq(&issue_id))
+        .select((
+            merge_requests::github_pr_number,
+            merge_requests::github_pr_url,
+            merge_requests::status,
+        ))
+        .order(merge_requests::opened_at.desc())
         .first(conn)
         .ok();
 
-    if let Some((pr_number, pr_url, pr_status)) = pr {
+    if let Some((Some(pr_number), Some(pr_url), pr_status)) = pr {
         output.push_str(&format!("PR: #{} ({}) {}\n", pr_number, pr_status, pr_url));
     }
     output.push('\n');
@@ -270,21 +307,7 @@ fn read_issue(conn: &mut SqliteConnection, project_key: &str, number: i32) -> St
                 "│  │  "
             };
 
-            // Resolve node name: UUID → human-readable via execution snapshot
-            let node_id = job
-                .recipe_node_id
-                .as_ref()
-                .and_then(|rid| get_node_name_from_execution(conn, exec_id, rid))
-                .or_else(|| job.agent_config_id.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            // Guard against UUIDs leaking into display (e.g. missing snapshot)
-            let node_id = if looks_like_uuid(&node_id) {
-                job.agent_config_id
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string())
-            } else {
-                node_id
-            };
+            let node_segment = visible_job_node_segment(conn, job);
 
             // Status icon
             let status = match job.status.as_str() {
@@ -313,31 +336,23 @@ fn read_issue(conn: &mut SqliteConnection, project_key: &str, number: i32) -> St
 
             output.push_str(&format!(
                 "{} `cairn://{}/{}/{}/{}`[{}]{}{}\n",
-                prefix, project_key, number, exec_num, node_id, status, todo, indicators
+                prefix, project_key, number, exec_num, node_segment, status, todo, indicators
             ));
 
-            // Child tasks — disambiguate duplicate names with -N suffix
+            // Child tasks — use canonical node_name from DB (already disambiguated at creation)
             let child_tasks: Vec<&&DbJob> = tasks
                 .iter()
                 .filter(|t| t.parent_job_id.as_ref() == Some(&job.id))
                 .collect();
-            let mut task_name_counts: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
             for (tidx, task) in child_tasks.iter().enumerate() {
                 let is_last_task = tidx == child_tasks.len() - 1;
                 let task_prefix = if is_last_task { "└─" } else { "├─" };
 
-                let base_name = task
-                    .agent_config_id
+                let display_name = task
+                    .node_name
                     .clone()
+                    .or_else(|| task.agent_config_id.clone())
                     .unwrap_or_else(|| "task".to_string());
-                let count = task_name_counts.entry(base_name.clone()).or_insert(0);
-                *count += 1;
-                let display_name = if *count == 1 {
-                    base_name
-                } else {
-                    format!("{}-{}", base_name, count)
-                };
                 let task_status = match task.status.as_str() {
                     "complete" => "✓",
                     "running" => "◐",
@@ -360,26 +375,7 @@ fn read_issue(conn: &mut SqliteConnection, project_key: &str, number: i32) -> St
 
 /// Get todo progress string like "3/5 todos"
 fn get_todo_progress(conn: &mut SqliteConnection, job_id: &str) -> Option<String> {
-    // Todos are stored as JSON in runs.todos column
-    let todos_json: Option<String> = runs::table
-        .filter(runs::job_id.eq(job_id))
-        .order(runs::created_at.desc())
-        .select(runs::todos)
-        .first::<Option<String>>(conn)
-        .ok()
-        .flatten();
-
-    todos_json.and_then(|json| {
-        let todos: Vec<serde_json::Value> = serde_json::from_str(&json).ok()?;
-        if todos.is_empty() {
-            return None;
-        }
-        let completed = todos
-            .iter()
-            .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
-            .count();
-        Some(format!("{}/{} todos", completed, todos.len()))
-    })
+    crate::todos::get_todo_progress(conn, job_id)
 }
 
 fn read_node(
@@ -417,6 +413,8 @@ fn read_node(
         }
     };
 
+    let visible_node_segment = visible_job_node_segment(conn, &job);
+
     // Format header
     let status_icon = match job.status.as_str() {
         "complete" => "✓",
@@ -446,7 +444,7 @@ fn read_node(
     // Build resource URIs for available sub-resources
     let base_uri = format!(
         "cairn://{}/{}/{}/{}",
-        project_key, number, exec_seq, node_name
+        project_key, number, exec_seq, visible_node_segment
     );
     output.push_str("## Resources\n\n");
     output.push_str(&format!("- Chat: `{}/chat`\n", base_uri));
@@ -457,29 +455,28 @@ fn read_node(
         output.push_str(&format!("- Artifact: `{}/artifact`\n", base_uri));
     }
 
-    // Check for PR data via action_runs
+    // Check for PR data via merge_requests
     #[allow(clippy::type_complexity)]
     let pr: Option<(
-        i32,
-        String,
+        Option<i32>,
+        Option<String>,
         String,
         Option<String>,
         Option<String>,
         Option<String>,
         Option<i32>,
         Option<i32>,
-    )> = pr_data::table
-        .inner_join(action_runs::table.on(pr_data::action_run_id.eq(action_runs::id.nullable())))
-        .filter(action_runs::parent_job_id.eq(&job.id))
+    )> = merge_requests::table
+        .filter(merge_requests::job_id.eq(&job.id))
         .select((
-            pr_data::pr_number,
-            pr_data::pr_url,
-            pr_data::pr_status,
-            pr_data::review_decision,
-            pr_data::mergeable,
-            pr_data::checks_status,
-            pr_data::additions,
-            pr_data::deletions,
+            merge_requests::github_pr_number,
+            merge_requests::github_pr_url,
+            merge_requests::status,
+            merge_requests::github_review,
+            merge_requests::github_mergeable,
+            merge_requests::checks_status,
+            merge_requests::additions,
+            merge_requests::deletions,
         ))
         .first(conn)
         .ok();
@@ -495,27 +492,126 @@ fn read_node(
         deletions,
     )) = pr
     {
-        output.push_str("\n## Pull Request\n\n");
-        output.push_str(&format!("PR #{}: {}\n", pr_number, pr_url));
-        output.push_str(&format!("Status: {}\n", pr_status));
+        if let (Some(pr_num), Some(url)) = (pr_number, pr_url) {
+            output.push_str("\n## Pull Request\n\n");
+            output.push_str(&format!("PR #{}: {}\n", pr_num, url));
+            output.push_str(&format!("Status: {}\n", pr_status));
 
-        if let Some(review) = review_decision {
-            output.push_str(&format!("Review: {}\n", review));
+            if let Some(review) = review_decision {
+                output.push_str(&format!("Review: {}\n", review));
+            }
+            if let Some(merge) = mergeable {
+                output.push_str(&format!("Mergeable: {}\n", merge));
+            }
+            if let Some(checks) = checks_status {
+                output.push_str(&format!("Checks: {}\n", checks));
+            }
+            if additions.is_some() || deletions.is_some() {
+                let adds = additions.unwrap_or(0);
+                let dels = deletions.unwrap_or(0);
+                output.push_str(&format!("Changes: +{} -{}\n", adds, dels));
+            }
         }
-        if let Some(merge) = mergeable {
-            output.push_str(&format!("Mergeable: {}\n", merge));
-        }
-        if let Some(checks) = checks_status {
-            output.push_str(&format!("Checks: {}\n", checks));
-        }
-        if additions.is_some() || deletions.is_some() {
-            let adds = additions.unwrap_or(0);
-            let dels = deletions.unwrap_or(0);
-            output.push_str(&format!("Changes: +{} -{}\n", adds, dels));
+    }
+
+    // Todos section
+    if let Ok(todos) = crate::todos::get_todos_for_job(conn, &job.id) {
+        if !todos.is_empty() {
+            let completed = todos.iter().filter(|t| t.status == "completed").count();
+            output.push_str(&format!(
+                "\n## Todos ({}/{} completed)\n\n",
+                completed,
+                todos.len()
+            ));
+            for todo in &todos {
+                let icon = match todo.status.as_str() {
+                    "completed" => "[✓]",
+                    "in_progress" => "[→]",
+                    _ => "[ ]",
+                };
+                let active = if todo.status == "in_progress" {
+                    todo.active_form
+                        .as_ref()
+                        .map(|f| format!(" ({})", f))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                output.push_str(&format!("- {} {}{}\n", icon, todo.content, active));
+            }
         }
     }
 
     output
+}
+
+/// Load events for a job in correct temporal order.
+///
+/// Uses two-query strategy: loads run ordering from `runs.created_at`,
+/// then sorts events by `(run_position, created_at, rowid)`.
+///
+/// - `run_position` fixes cross-run ordering (UUID v4 alphabetical != temporal)
+/// - `created_at` separates events across seconds
+/// - `rowid` (via insertion-order index) is the stable intra-second tiebreaker,
+///   because `sequence` is unreliable on cold resume
+fn load_job_events_ordered(
+    conn: &mut SqliteConnection,
+    job_id: &str,
+) -> Vec<(String, i32, String, String)> {
+    // 1. Load run_ids ordered by creation time
+    let ordered_run_ids: Vec<String> = runs::table
+        .filter(runs::job_id.eq(job_id))
+        .order(runs::created_at.asc())
+        .select(runs::id)
+        .load(conn)
+        .unwrap_or_default();
+
+    if ordered_run_ids.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Build run_id -> position map
+    let run_position: std::collections::HashMap<&str, usize> = ordered_run_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+
+    // 3. Load all events in rowid order (insertion order) with created_at for sort
+    let event_rows: Vec<(String, i32, i32, String, String)> = events::table
+        .filter(events::run_id.eq_any(&ordered_run_ids))
+        .order(diesel::dsl::sql::<diesel::sql_types::BigInt>("rowid"))
+        .select((
+            events::run_id,
+            events::sequence,
+            events::created_at,
+            events::event_type,
+            events::data,
+        ))
+        .load(conn)
+        .unwrap_or_default();
+
+    // 4. Build insertion-order index, sort by (run_position, created_at, insertion_index)
+    let mut indexed: Vec<(usize, (String, i32, i32, String, String))> =
+        event_rows.into_iter().enumerate().collect();
+
+    indexed.sort_by(|(idx_a, a), (idx_b, b)| {
+        let pos_a = run_position
+            .get(a.0.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        let pos_b = run_position
+            .get(b.0.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        pos_a.cmp(&pos_b).then(a.2.cmp(&b.2)).then(idx_a.cmp(idx_b))
+    });
+
+    // Strip created_at and index from output
+    indexed
+        .into_iter()
+        .map(|(_, (run_id, seq, _created_at, event_type, data))| (run_id, seq, event_type, data))
+        .collect()
 }
 
 fn read_node_chat(
@@ -553,37 +649,18 @@ fn read_node_chat(
         }
     };
 
-    let job_id = job.id;
-
-    // Get all runs for this job
-    let run_ids: Vec<String> = runs::table
-        .filter(runs::job_id.eq(&job_id))
-        .order(runs::created_at.asc())
-        .select(runs::id)
-        .load(conn)
-        .unwrap_or_default();
-
-    if run_ids.is_empty() {
+    let event_rows = load_job_events_ordered(conn, &job.id);
+    if event_rows.is_empty() {
         return "No runs found for this node.".to_string();
     }
-
-    // Get all events for these runs, ordered by sequence
-    let event_rows: Vec<(String, i32, String, String)> = events::table
-        .filter(events::run_id.eq_any(&run_ids))
-        .order((events::run_id.asc(), events::sequence.asc()))
-        .select((
-            events::run_id,
-            events::sequence,
-            events::event_type,
-            events::data,
-        ))
-        .load(conn)
-        .unwrap_or_default();
 
     // Format as markdown transcript with event URIs
     let base_uri = format!(
         "cairn://{}/{}/{}/{}/chat",
-        project_key, number, exec_seq, node_name
+        project_key,
+        number,
+        exec_seq,
+        visible_job_node_segment(conn, &job)
     );
     format_transcript_with_context(&event_rows, &base_uri)
 }
@@ -623,24 +700,92 @@ fn read_node_chat_full(
         }
     };
 
-    let job_id = job.id;
-
-    // Get all runs for this job
-    let run_ids: Vec<String> = runs::table
-        .filter(runs::job_id.eq(&job_id))
-        .order(runs::created_at.asc())
-        .select(runs::id)
-        .load(conn)
-        .unwrap_or_default();
-
-    if run_ids.is_empty() {
+    let event_rows = load_job_events_ordered(conn, &job.id);
+    if event_rows.is_empty() {
         return "No runs found for this node.".to_string();
     }
 
-    // Get all events for these runs, ordered by sequence
+    // Format as full markdown transcript (no truncation)
+    crate::transcripts::format_transcript_full(&event_rows)
+}
+
+/// Read a turn-scoped transcript slice.
+///
+/// Resolves the turn via the job's first run's session_id. Known limitation:
+/// if the job's session was rotated (due to failure), turns from successor
+/// sessions are not addressable by this URI — only the initial session's
+/// turn namespace is reachable.
+fn read_node_chat_turn(
+    conn: &mut SqliteConnection,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    turn_seq: i32,
+) -> String {
+    // Get project and issue
+    let project_ctx = match lookup_project_by_key(conn, project_key) {
+        Ok(ctx) => ctx,
+        Err(e) => return e,
+    };
+
+    let issue_id: Result<String, _> = issues::table
+        .filter(issues::project_id.eq(&project_ctx.project_id))
+        .filter(issues::number.eq(number))
+        .select(issues::id)
+        .first(conn);
+
+    let issue_id = match issue_id {
+        Ok(id) => id,
+        Err(_) => return format!("Issue {}-{} not found", project_key, number),
+    };
+
+    // Find job by node name
+    let job = match find_job_by_node_name(conn, &issue_id, node_name, exec_seq) {
+        Some(j) => j,
+        None => {
+            return format!(
+                "Node '{}' not found for issue {}-{}",
+                node_name, project_key, number
+            )
+        }
+    };
+
+    // Get session_id from the job's first run
+    let session_id: Option<String> = runs::table
+        .filter(runs::job_id.eq(&job.id))
+        .order(runs::created_at.asc())
+        .select(runs::session_id)
+        .first::<Option<String>>(conn)
+        .ok()
+        .flatten();
+
+    let session_id = match session_id {
+        Some(id) => id,
+        None => return "No session found for this node.".to_string(),
+    };
+
+    // Find turn by (session_id, sequence = turn_seq)
+    let turn_id: Result<String, _> = turns::table
+        .filter(turns::session_id.eq(&session_id))
+        .filter(turns::sequence.eq(turn_seq))
+        .select(turns::id)
+        .first(conn);
+
+    let turn_id = match turn_id {
+        Ok(id) => id,
+        Err(_) => {
+            return format!(
+                "Turn {} not found for node '{}' in issue {}-{}",
+                turn_seq, node_name, project_key, number
+            )
+        }
+    };
+
+    // Load events for this turn
     let event_rows: Vec<(String, i32, String, String)> = events::table
-        .filter(events::run_id.eq_any(&run_ids))
-        .order((events::run_id.asc(), events::sequence.asc()))
+        .filter(events::turn_id.eq(&turn_id))
+        .order(events::sequence.asc())
         .select((
             events::run_id,
             events::sequence,
@@ -650,8 +795,15 @@ fn read_node_chat_full(
         .load(conn)
         .unwrap_or_default();
 
-    // Format as full markdown transcript (no truncation)
-    format_transcript_full(&event_rows)
+    if event_rows.is_empty() {
+        return format!(
+            "No events found for turn {} in node '{}' of issue {}-{}",
+            turn_seq, node_name, project_key, number
+        );
+    }
+
+    // Format as full transcript (no truncation for focused turn slices)
+    crate::transcripts::format_transcript_full(&event_rows)
 }
 
 fn read_node_artifact(
@@ -741,35 +893,19 @@ fn read_task_chat(
         Err(e) => return e,
     };
 
-    // Get all runs for this task job
-    let run_ids: Vec<String> = runs::table
-        .filter(runs::job_id.eq(&task_job.id))
-        .order(runs::created_at.asc())
-        .select(runs::id)
-        .load(conn)
-        .unwrap_or_default();
-
-    if run_ids.is_empty() {
+    let event_rows = load_job_events_ordered(conn, &task_job.id);
+    if event_rows.is_empty() {
         return "No runs found for this task.".to_string();
     }
-
-    // Get all events for these runs
-    let event_rows: Vec<(String, i32, String, String)> = events::table
-        .filter(events::run_id.eq_any(&run_ids))
-        .order((events::run_id.asc(), events::sequence.asc()))
-        .select((
-            events::run_id,
-            events::sequence,
-            events::event_type,
-            events::data,
-        ))
-        .load(conn)
-        .unwrap_or_default();
 
     // Format as markdown transcript with event URIs
     let base_uri = format!(
         "cairn://{}/{}/{}/{}/task/{}/chat",
-        project_key, number, exec_seq, node_name, task_name
+        project_key,
+        number,
+        exec_seq,
+        visible_job_node_segment(conn, &parent_job),
+        task_name
     );
     format_transcript_with_context(&event_rows, &base_uri)
 }
@@ -816,22 +952,100 @@ fn read_task_chat_full(
         Err(e) => return e,
     };
 
-    // Get all runs for this task job
-    let run_ids: Vec<String> = runs::table
-        .filter(runs::job_id.eq(&task_job.id))
-        .order(runs::created_at.asc())
-        .select(runs::id)
-        .load(conn)
-        .unwrap_or_default();
-
-    if run_ids.is_empty() {
+    let event_rows = load_job_events_ordered(conn, &task_job.id);
+    if event_rows.is_empty() {
         return "No runs found for this task.".to_string();
     }
 
-    // Get all events for these runs
+    // Format as full markdown transcript (no truncation)
+    crate::transcripts::format_transcript_full(&event_rows)
+}
+
+fn read_task_chat_turn(
+    conn: &mut SqliteConnection,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+    turn_seq: i32,
+) -> String {
+    // Get project and issue
+    let project_ctx = match lookup_project_by_key(conn, project_key) {
+        Ok(ctx) => ctx,
+        Err(e) => return e,
+    };
+
+    let issue_id: Result<String, _> = issues::table
+        .filter(issues::project_id.eq(&project_ctx.project_id))
+        .filter(issues::number.eq(number))
+        .select(issues::id)
+        .first(conn);
+
+    let issue_id = match issue_id {
+        Ok(id) => id,
+        Err(_) => return format!("Issue {}-{} not found", project_key, number),
+    };
+
+    // Find the parent job by node name
+    let parent_job = match find_job_by_node_name(conn, &issue_id, node_name, exec_seq) {
+        Some(j) => j,
+        None => {
+            return format!(
+                "Node '{}' not found for issue {}-{}",
+                node_name, project_key, number
+            )
+        }
+    };
+
+    // Find the task job by name (with potential -N suffix disambiguation)
+    let task_job = match find_task_by_name(conn, &parent_job.id, task_name) {
+        Ok(j) => j,
+        Err(e) => return e,
+    };
+
+    // Task turn URIs are only unambiguous when all runs share one session.
+    let run_session_ids: Vec<Option<String>> = runs::table
+        .filter(runs::job_id.eq(&task_job.id))
+        .order(runs::created_at.asc())
+        .select(runs::session_id)
+        .load(conn)
+        .unwrap_or_default();
+
+    let mut session_ids = run_session_ids.into_iter().flatten();
+    let session_id = match session_ids.next() {
+        Some(id) => id,
+        None => return "No session found for this task.".to_string(),
+    };
+
+    if session_ids.any(|id| id != session_id) {
+        return format!(
+            "Task turn URI is ambiguous for task '{}' in node '{}' of issue {}-{} because runs span multiple sessions",
+            task_name, node_name, project_key, number
+        );
+    }
+
+    // Find turn by (session_id, sequence = turn_seq)
+    let turn_id: Result<String, _> = turns::table
+        .filter(turns::session_id.eq(&session_id))
+        .filter(turns::sequence.eq(turn_seq))
+        .select(turns::id)
+        .first(conn);
+
+    let turn_id = match turn_id {
+        Ok(id) => id,
+        Err(_) => {
+            return format!(
+                "Turn {} not found for task '{}' in node '{}' of issue {}-{}",
+                turn_seq, task_name, node_name, project_key, number
+            )
+        }
+    };
+
+    // Load events for this turn
     let event_rows: Vec<(String, i32, String, String)> = events::table
-        .filter(events::run_id.eq_any(&run_ids))
-        .order((events::run_id.asc(), events::sequence.asc()))
+        .filter(events::turn_id.eq(&turn_id))
+        .order(events::sequence.asc())
         .select((
             events::run_id,
             events::sequence,
@@ -841,8 +1055,14 @@ fn read_task_chat_full(
         .load(conn)
         .unwrap_or_default();
 
-    // Format as full markdown transcript (no truncation)
-    format_transcript_full(&event_rows)
+    if event_rows.is_empty() {
+        return format!(
+            "No events found for turn {} in task '{}' of node '{}' for issue {}-{}",
+            turn_seq, task_name, node_name, project_key, number
+        );
+    }
+
+    crate::transcripts::format_transcript_full(&event_rows)
 }
 
 fn read_task_artifact(
@@ -1091,7 +1311,7 @@ fn format_single_event(event_type: &str, data: &str) -> String {
                 }
             }
         }
-        "result" => {
+        "result" | "tool_result" => {
             if let Some(tool_name) = event_data.get("toolName").and_then(|t| t.as_str()) {
                 if let Some(result) = event_data.get("toolResult").and_then(|r| r.as_str()) {
                     output.push_str(&format!("**Tool Result ({}):**\n", tool_name));
@@ -1121,7 +1341,7 @@ fn format_single_event(event_type: &str, data: &str) -> String {
 // ============================================================================
 
 /// Get node name from execution snapshot (node_id is the UUID)
-fn get_node_name_from_execution(
+pub(crate) fn get_node_name_from_execution(
     conn: &mut SqliteConnection,
     execution_id: &str,
     node_id: &str,
@@ -1141,13 +1361,6 @@ fn get_node_name_from_execution(
         .iter()
         .find(|n| n.id == node_id)
         .map(|n| n.name.clone())
-}
-
-/// Check if a string looks like a UUID (8-4-4-4-12 hex pattern)
-fn looks_like_uuid(s: &str) -> bool {
-    s.len() == 36
-        && s.chars().filter(|c| *c == '-').count() == 4
-        && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
 /// Check if a job or any of its child jobs have an artifact
@@ -1226,50 +1439,26 @@ fn find_task_by_name(
     parent_job_id: &str,
     task_name: &str,
 ) -> Result<DbJob, String> {
-    // Parse task name to extract base name and optional index
-    // e.g., "Explore-2" → ("Explore", 2), "Explore" → ("Explore", 1)
-    let (base_name, target_index) = parse_task_name_with_index(task_name);
-
-    // Get all child jobs with this base agent_config_id, ordered by creation
     let matching_jobs: Vec<DbJob> = jobs::table
         .filter(jobs::parent_job_id.eq(parent_job_id))
-        .filter(jobs::agent_config_id.eq(&base_name))
         .order(jobs::created_at.asc())
         .load(conn)
         .unwrap_or_default();
 
-    if matching_jobs.is_empty() {
-        return Err(format!("Task '{}' not found", task_name));
-    }
-
-    // Get the Nth occurrence (1-indexed)
     matching_jobs
         .into_iter()
-        .nth(target_index - 1)
-        .ok_or_else(|| {
-            format!(
-                "Task '{}' not found (only {} tasks with name '{}')",
-                task_name,
-                target_index - 1,
-                base_name
-            )
+        .find(|job| {
+            job.node_name
+                .as_ref()
+                .map(|name| name == task_name || slugify(name) == task_name)
+                .unwrap_or(false)
+                || job
+                    .agent_config_id
+                    .as_ref()
+                    .map(|name| name == task_name || slugify(name) == task_name)
+                    .unwrap_or(false)
         })
-}
-
-/// Parse a task name that may have a disambiguation suffix
-/// e.g., "Explore-2" → ("Explore", 2), "Explore" → ("Explore", 1)
-fn parse_task_name_with_index(task_name: &str) -> (String, usize) {
-    // Try to find a -N suffix where N is a number
-    if let Some(dash_pos) = task_name.rfind('-') {
-        let suffix = &task_name[dash_pos + 1..];
-        if let Ok(index) = suffix.parse::<usize>() {
-            if index > 0 {
-                return (task_name[..dash_pos].to_string(), index);
-            }
-        }
-    }
-    // No valid suffix, treat as first occurrence
-    (task_name.to_string(), 1)
+        .ok_or_else(|| format!("Task '{}' not found", task_name))
 }
 
 /// Get the execution_id for a given exec_seq (1-based index stored in seq column)
@@ -1286,7 +1475,7 @@ fn get_execution_id_for_seq(
         .ok()
 }
 
-/// Find a job by node name (looking up name in execution snapshot)
+/// Find a job by node name (looking up name in execution snapshot, then node_name column)
 /// exec_seq is required and identifies the specific execution to search
 fn find_job_by_node_name(
     conn: &mut SqliteConnection,
@@ -1297,36 +1486,47 @@ fn find_job_by_node_name(
     // Resolve exec_seq to an execution_id
     let exec_id = get_execution_id_for_seq(conn, issue_id, exec_seq)?;
 
-    // Get all jobs for this execution
-    let job_rows: Vec<DbJob> = jobs::table
+    // 1. Try recipe nodes (resolve name via execution snapshot)
+    let recipe_jobs: Vec<DbJob> = jobs::table
         .filter(jobs::issue_id.eq(issue_id))
         .filter(jobs::execution_id.eq(&exec_id))
         .filter(jobs::recipe_node_id.is_not_null())
-        .order(jobs::created_at.desc()) // Most recent first
+        .order(jobs::created_at.desc())
         .load(conn)
         .ok()?;
 
-    // Find the job whose node name matches
-    for job in job_rows {
+    for job in recipe_jobs {
         if let Some(ref recipe_node_id) = &job.recipe_node_id {
+            if recipe_node_id == node_name {
+                return Some(job);
+            }
             if let Some(name) = get_node_name_from_execution(conn, &exec_id, recipe_node_id) {
-                if name == node_name {
+                if name == node_name || slugify(&name) == node_name {
                     return Some(job);
                 }
             }
         }
     }
 
-    None
+    // 2. Try node_name column (task agents + any job with stored name)
+    let candidate_jobs: Vec<DbJob> = jobs::table
+        .filter(jobs::issue_id.eq(issue_id))
+        .filter(jobs::execution_id.eq(&exec_id))
+        .load(conn)
+        .ok()?;
+
+    candidate_jobs.into_iter().find(|job| {
+        job.node_name
+            .as_ref()
+            .map(|name| name == node_name || slugify(name) == node_name)
+            .unwrap_or(false)
+    })
 }
 
 // Truncation thresholds
-const TOOL_INPUT_THRESHOLD: usize = 500;
-const TOOL_INPUT_PREVIEW: usize = 200;
-const TOOL_RESULT_THRESHOLD: usize = 500;
-const TOOL_RESULT_PREVIEW: usize = 200;
 const ASSISTANT_CONTENT_THRESHOLD: usize = 2000;
 const ASSISTANT_CONTENT_PREVIEW: usize = 500;
+const TOOL_SUMMARY_PREVIEW: usize = 80;
 
 /// Truncate text and return (display_text, was_truncated, original_len)
 fn truncate_with_info(text: &str, threshold: usize, preview_len: usize) -> (String, bool, usize) {
@@ -1343,6 +1543,176 @@ fn truncate_with_info(text: &str, threshold: usize, preview_len: usize) -> (Stri
             .unwrap_or(0);
         (format!("{}...", &text[..safe_len]), true, original_len)
     }
+}
+
+fn cleaned_tool_name(tool_name: &str) -> &str {
+    if tool_name.starts_with("mcp__") {
+        tool_name.rsplit("__").next().unwrap_or(tool_name)
+    } else {
+        tool_name
+    }
+}
+
+fn single_line_preview(text: &str, max_len: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let safe_len = trimmed
+        .char_indices()
+        .take_while(|(i, _)| *i < max_len)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(trimmed.len());
+
+    if trimmed.len() > safe_len {
+        format!("{}...", &trimmed[..safe_len])
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn summarize_scalar(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let preview = single_line_preview(text, TOOL_SUMMARY_PREVIEW);
+            if preview.is_empty() {
+                None
+            } else {
+                Some(preview)
+            }
+        }
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(boolean) => Some(boolean.to_string()),
+        _ => None,
+    }
+}
+
+fn summarize_tool_input(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+    let obj = input.as_object()?;
+    let cleaned = cleaned_tool_name(tool_name);
+
+    match cleaned {
+        "Bash" | "bash" => obj
+            .get("description")
+            .or_else(|| obj.get("command"))
+            .and_then(summarize_scalar),
+        "Read" | "read" => obj
+            .get("file_path")
+            .or_else(|| obj.get("path"))
+            .and_then(summarize_scalar),
+        "Edit" | "edit" | "filechange" => {
+            if let Some(changes) = obj.get("changes").and_then(|v| v.as_array()) {
+                let count = changes.len();
+                Some(format!(
+                    "{} file{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ))
+            } else {
+                obj.get("file_path").and_then(summarize_scalar)
+            }
+        }
+        "Write" | "write" => obj.get("file_path").and_then(summarize_scalar),
+        "Grep" | "grep" => obj
+            .get("pattern")
+            .and_then(summarize_scalar)
+            .map(|pattern| format!("\"{}\"", pattern)),
+        "Glob" | "glob" => obj.get("pattern").and_then(summarize_scalar),
+        "task" | "Task" => obj.get("description").and_then(summarize_scalar),
+        "execute" => obj.get("code").and_then(|value| {
+            value.as_str().and_then(|code| {
+                code.lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(|line| single_line_preview(line, TOOL_SUMMARY_PREVIEW))
+                    .filter(|line| !line.is_empty())
+            })
+        }),
+        "message" => obj.get("content").and_then(|value| {
+            summarize_scalar(value).map(|content| match obj.get("to").and_then(|v| v.as_str()) {
+                Some(target) if !target.is_empty() => format!("→ {} {}", target, content),
+                _ => format!("→ project {}", content),
+            })
+        }),
+        _ => obj
+            .get("command")
+            .or_else(|| obj.get("file_path"))
+            .or_else(|| obj.get("path"))
+            .or_else(|| obj.get("pattern"))
+            .or_else(|| obj.get("query"))
+            .or_else(|| obj.get("url"))
+            .or_else(|| obj.get("title"))
+            .or_else(|| obj.get("description"))
+            .and_then(summarize_scalar),
+    }
+}
+
+fn summarize_tool_result_payload(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+
+    if obj.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        if let Some(message) = obj
+            .get("error")
+            .or_else(|| obj.get("message"))
+            .or_else(|| obj.get("output"))
+            .and_then(summarize_scalar)
+        {
+            return Some(format!("error: {}", message));
+        }
+        return Some("error".to_string());
+    }
+
+    obj.get("message")
+        .or_else(|| obj.get("output"))
+        .or_else(|| obj.get("status"))
+        .or_else(|| obj.get("decision"))
+        .or_else(|| obj.get("slug"))
+        .or_else(|| obj.get("uri"))
+        .or_else(|| obj.get("id"))
+        .and_then(summarize_scalar)
+}
+
+fn summarize_tool_result(event_data: &serde_json::Value) -> Option<String> {
+    if event_data.get("isError").and_then(|v| v.as_bool()) == Some(true) {
+        return Some("error".to_string());
+    }
+
+    let raw_result = event_data.get("toolResult")?;
+
+    if !raw_result.is_string() {
+        return summarize_tool_result_payload(raw_result);
+    }
+
+    let result = raw_result.as_str().unwrap_or_default().trim();
+    if result.is_empty() {
+        return None;
+    }
+
+    serde_json::from_str::<serde_json::Value>(result)
+        .ok()
+        .and_then(|value| summarize_tool_result_payload(&value))
+}
+
+fn push_compact_tool_entry(
+    transcript: &mut String,
+    label: &str,
+    tool_name: Option<&str>,
+    summary: Option<String>,
+    event_uri: &str,
+) {
+    transcript.push_str(&format!("**{}", label));
+    if let Some(tool_name) = tool_name.filter(|tool_name| !tool_name.is_empty()) {
+        transcript.push_str(&format!(" ({})", tool_name));
+    }
+    transcript.push_str(":**");
+    if let Some(summary) = summary.filter(|summary| !summary.is_empty()) {
+        transcript.push(' ');
+        transcript.push_str(&summary);
+    }
+    transcript.push_str(&format!(" → {}\n\n", event_uri));
 }
 
 /// Context for generating event URIs during transcript formatting
@@ -1428,31 +1798,17 @@ fn format_transcript_with_context(
                             .get("name")
                             .and_then(|n| n.as_str())
                             .unwrap_or("unknown");
-                        let input = tool
+                        let summary = tool
                             .get("input")
-                            .map(|i| {
-                                if i.is_string() {
-                                    i.as_str().unwrap_or("").to_string()
-                                } else {
-                                    serde_json::to_string(i).unwrap_or_default()
-                                }
-                            })
-                            .unwrap_or_default();
+                            .and_then(|input| summarize_tool_input(name, input));
 
-                        let (display, truncated, original_len) =
-                            truncate_with_info(&input, TOOL_INPUT_THRESHOLD, TOOL_INPUT_PREVIEW);
-
-                        transcript.push_str(&format!("**Tool Call ({}):** ", name));
-                        transcript.push_str(&display);
-                        if truncated {
-                            transcript.push_str(&format!(
-                                "\n[Input truncated - {} chars] → {}\n\n",
-                                original_len,
-                                ctx.event_uri(run_id, *seq)
-                            ));
-                        } else {
-                            transcript.push_str("\n\n");
-                        }
+                        push_compact_tool_entry(
+                            &mut transcript,
+                            "Tool Call",
+                            Some(name),
+                            summary,
+                            &ctx.event_uri(run_id, *seq),
+                        );
                     }
                 }
             }
@@ -1466,105 +1822,16 @@ fn format_transcript_with_context(
                     }
                 }
             }
-            "result" => {
-                // Tool result
-                if let Some(tool_name) = event_data.get("toolName").and_then(|t| t.as_str()) {
-                    if let Some(result) = event_data.get("toolResult").and_then(|r| r.as_str()) {
-                        let (display, truncated, original_len) =
-                            truncate_with_info(result, TOOL_RESULT_THRESHOLD, TOOL_RESULT_PREVIEW);
-
-                        transcript.push_str(&format!("**Tool Result ({}):** ", tool_name));
-                        transcript.push_str(&display);
-                        if truncated {
-                            transcript.push_str(&format!(
-                                "\n[Truncated - {} chars] → {}\n\n",
-                                original_len,
-                                ctx.event_uri(run_id, *seq)
-                            ));
-                        } else {
-                            transcript.push_str("\n\n");
-                        }
-                    }
-                }
-            }
-            _ => {
-                // Skip other event types for now
-            }
-        }
-    }
-
-    if transcript.is_empty() {
-        "No conversation content found.".to_string()
-    } else {
-        transcript
-    }
-}
-
-/// Format events into a full markdown transcript without truncation
-fn format_transcript_full(events: &[(String, i32, String, String)]) -> String {
-    let mut transcript = String::new();
-
-    for (_run_id, _seq, event_type, data) in events {
-        // Parse the event data as JSON
-        let event_data: serde_json::Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        match event_type.as_str() {
-            "assistant" => {
-                // Assistant message - content is directly in the event
-                if let Some(content) = event_data.get("content").and_then(|c| c.as_str()) {
-                    if !content.is_empty() {
-                        transcript.push_str("**Assistant:** ");
-                        transcript.push_str(content);
-                        transcript.push_str("\n\n");
-                    }
-                }
-
-                // Handle tool_uses (tool calls) - full input
-                if let Some(tool_uses) = event_data.get("toolUses").and_then(|t| t.as_array()) {
-                    for tool in tool_uses {
-                        let name = tool
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("unknown");
-                        let input = tool
-                            .get("input")
-                            .map(|i| {
-                                if i.is_string() {
-                                    i.as_str().unwrap_or("").to_string()
-                                } else {
-                                    serde_json::to_string_pretty(i).unwrap_or_default()
-                                }
-                            })
-                            .unwrap_or_default();
-
-                        transcript.push_str(&format!("**Tool Call ({}):**\n", name));
-                        transcript.push_str(&input);
-                        transcript.push_str("\n\n");
-                    }
-                }
-            }
-            "user" => {
-                // User message - content is directly in the event
-                if let Some(content) = event_data.get("content").and_then(|c| c.as_str()) {
-                    if !content.is_empty() {
-                        transcript.push_str("**User:** ");
-                        transcript.push_str(content);
-                        transcript.push_str("\n\n");
-                    }
-                }
-            }
-            "result" => {
-                // Tool result - full content
-                if let Some(tool_name) = event_data.get("toolName").and_then(|t| t.as_str()) {
-                    if let Some(result) = event_data.get("toolResult").and_then(|r| r.as_str()) {
-                        transcript.push_str(&format!("**Tool Result ({}):**\n", tool_name));
-                        transcript.push_str(result);
-                        transcript.push_str("\n\n");
-                    }
-                }
+            "result" | "tool_result" => {
+                let tool_name = event_data.get("toolName").and_then(|t| t.as_str());
+                let summary = summarize_tool_result(&event_data);
+                push_compact_tool_entry(
+                    &mut transcript,
+                    "Tool Result",
+                    tool_name,
+                    summary,
+                    &ctx.event_uri(run_id, *seq),
+                );
             }
             _ => {
                 // Skip other event types for now
@@ -2139,25 +2406,585 @@ mod tests {
 
     #[test]
     fn test_format_single_event_with_tool_uses() {
-        let data = r#"{"content": "Let me read that file.", "toolUses": [{"name": "read", "input": {"file": "test.txt"}}]}"#;
+        let data = r#"{"content": "Let me read that file.", "toolUses": [{"name": "read", "input": {"file": "test.txt", "body": "complete payload"}}]}"#;
         let result = format_single_event("assistant", data);
         assert!(result.contains("**Assistant:**"));
         assert!(result.contains("**Tool Call (read):**"));
+        assert!(result.contains("\"file\": \"test.txt\""));
+        assert!(result.contains("\"body\": \"complete payload\""));
+    }
+
+    #[test]
+    fn test_format_single_event_tool_result_alias_preserves_full_payload() {
+        let data = serde_json::json!({
+            "toolName": "read",
+            "toolResult": serde_json::json!({
+                "message": "detailed result",
+                "body": "complete payload"
+            })
+            .to_string()
+        })
+        .to_string();
+
+        let result = format_single_event("tool_result", &data);
+
+        assert!(result.contains("**Tool Result (read):**"));
+        assert!(result.contains("detailed result"));
+        assert!(result.contains("complete payload"));
+    }
+
+    #[test]
+    fn test_format_transcript_with_context_compacts_tool_calls() {
+        let events = vec![(
+            "run-1".to_string(),
+            3,
+            "assistant".to_string(),
+            serde_json::json!({
+                "content": "Let me read that file.",
+                "toolUses": [{
+                    "name": "read",
+                    "input": {
+                        "path": "/tmp/test.txt",
+                        "unused": {"raw": "json body"}
+                    }
+                }]
+            })
+            .to_string(),
+        )];
+
+        let result = format_transcript_with_context(&events, "cairn://CAIRN/1062/1/builder/chat");
+
+        assert!(result.contains("**Tool Call (read):** /tmp/test.txt"));
+        assert!(result.contains("cairn://CAIRN/1062/1/builder/chat/1/3"));
+        assert!(!result.contains("\"unused\""));
+        assert!(!result.contains("raw"));
+    }
+
+    #[test]
+    fn test_format_transcript_with_context_compacts_tool_results() {
+        let events = vec![
+            (
+                "run-1".to_string(),
+                4,
+                "result".to_string(),
+                serde_json::json!({
+                    "toolName": "read",
+                    "toolResult": "file contents here"
+                })
+                .to_string(),
+            ),
+            (
+                "run-1".to_string(),
+                5,
+                "result".to_string(),
+                serde_json::json!({
+                    "toolName": "bash",
+                    "toolResult": serde_json::json!({
+                        "message": "Background terminal started: dev-server",
+                        "uri": "cairn://CAIRN/1062/terminal/dev-server"
+                    }).to_string()
+                })
+                .to_string(),
+            ),
+            (
+                "run-1".to_string(),
+                6,
+                "tool_result".to_string(),
+                serde_json::json!({
+                    "toolName": null,
+                    "toolResult": serde_json::json!({
+                        "message": "Updated 5 todos"
+                    }).to_string()
+                })
+                .to_string(),
+            ),
+        ];
+
+        let result = format_transcript_with_context(&events, "cairn://CAIRN/1062/1/builder/chat");
+
+        assert!(result.contains("**Tool Result (read):** → cairn://CAIRN/1062/1/builder/chat/1/4"));
+        assert!(result.contains("**Tool Result (bash):** Background terminal started: dev-server → cairn://CAIRN/1062/1/builder/chat/1/5"));
+        assert!(result
+            .contains("**Tool Result:** Updated 5 todos → cairn://CAIRN/1062/1/builder/chat/1/6"));
+        assert!(!result.contains("file contents here"));
+        assert!(!result.contains("**Tool Result (tool):**"));
     }
 
     #[test]
     fn test_format_transcript_full_no_truncation() {
         // Create a long message that would be truncated in regular transcript
         let long_content = "a".repeat(3000);
-        let events = vec![(
-            "run-1".to_string(),
-            1,
-            "assistant".to_string(),
-            format!(r#"{{"content": "{}"}}"#, long_content),
-        )];
-        let result = format_transcript_full(&events);
+        let tool_input = serde_json::json!({"path": "/tmp/full.txt", "body": "complete payload"});
+        let tool_result =
+            serde_json::json!({"message": "detailed result", "body": "complete payload"})
+                .to_string();
+        let events = vec![
+            (
+                "run-1".to_string(),
+                1,
+                "assistant".to_string(),
+                format!(
+                    r#"{{"content": "{}", "toolUses": [{{"name": "read", "input": {}}}]}}"#,
+                    long_content, tool_input
+                ),
+            ),
+            (
+                "run-1".to_string(),
+                2,
+                "tool_result".to_string(),
+                serde_json::json!({"toolName": "read", "toolResult": tool_result}).to_string(),
+            ),
+        ];
+        let result = crate::transcripts::format_transcript_full(&events);
         // Should contain the full content without truncation
         assert!(result.contains(&long_content));
+        assert!(result.contains("\"body\": \"complete payload\""));
+        assert!(result.contains("detailed result"));
         assert!(!result.contains("[Truncated"));
+    }
+
+    // --- find_job_by_node_name tests ---
+
+    use crate::diesel_models::{NewExecution, NewJob};
+    use crate::models::{
+        ExecutionSnapshot, NodePosition, RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger,
+        TriggerContext, TriggerType,
+    };
+    use crate::test_utils::{create_test_issue, create_test_project, test_diesel_conn};
+
+    fn setup_execution_with_snapshot(
+        conn: &mut SqliteConnection,
+        issue_id: &str,
+        project_id: &str,
+        nodes: Vec<RecipeNode>,
+    ) -> String {
+        let recipe_id = uuid::Uuid::new_v4().to_string();
+        let execution_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+
+        let snapshot = ExecutionSnapshot::new(
+            RecipeSnapshot {
+                id: recipe_id.clone(),
+                name: "Test".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes,
+                edges: vec![],
+            },
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            TriggerContext {
+                issue_id: None,
+                project_id: project_id.to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+            },
+        );
+        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
+
+        diesel::insert_into(executions::table)
+            .values(&NewExecution {
+                id: &execution_id,
+                recipe_id: &recipe_id,
+                issue_id: Some(issue_id),
+                project_id: Some(project_id),
+                status: "running",
+                started_at: now,
+                completed_at: None,
+                snapshot: Some(&snapshot_json),
+                seq: Some(1),
+                initiator_sub: None,
+                initiator_auth_mode: None,
+                initiator_org_id: None,
+                triggered_by: "manual",
+            })
+            .execute(conn)
+            .unwrap();
+
+        execution_id
+    }
+
+    fn make_node(id: &str, name: &str) -> RecipeNode {
+        RecipeNode {
+            id: id.to_string(),
+            node_type: RecipeNodeType::Agent,
+            name: name.to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        }
+    }
+
+    fn insert_job(
+        conn: &mut SqliteConnection,
+        issue_id: &str,
+        project_id: &str,
+        execution_id: &str,
+        recipe_node_id: Option<&str>,
+        node_name: Option<&str>,
+        parent_job_id: Option<&str>,
+    ) -> String {
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+        diesel::insert_into(jobs::table)
+            .values(&NewJob {
+                id: &id,
+                execution_id: Some(execution_id),
+                manager_id: None,
+                recipe_node_id,
+                parent_job_id,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                current_session_id: None,
+                resume_session_id: None,
+                status: "running",
+                agent_config_id: None,
+                issue_id: Some(issue_id),
+                project_id,
+                task_description: None,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+                parent_tool_use_id: None,
+                task_index: None,
+                started_at: Some(now),
+                model: None,
+                node_name,
+                base_branch: None,
+                current_turn_id: None,
+            })
+            .execute(conn)
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn read_node_resource_by_slugified_name() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+        let exec_id = setup_execution_with_snapshot(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            vec![make_node("node-1", "Builder")],
+        );
+
+        insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            Some("54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67"),
+            Some("Builder"),
+            None,
+        );
+
+        let output = read_node(&mut conn, "TST", 1, 1, "builder");
+        assert!(output.contains("## Resources"));
+        assert!(output.contains("cairn://TST/1/1/builder/chat"));
+    }
+
+    #[test]
+    fn read_node_resource_accepts_legacy_recipe_node_id() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+        let recipe_node_id = "54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67";
+        let exec_id = setup_execution_with_snapshot(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            vec![make_node("node-1", "Builder")],
+        );
+
+        insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            Some(recipe_node_id),
+            Some("Builder"),
+            None,
+        );
+
+        let output = read_node(&mut conn, "TST", 1, 1, recipe_node_id);
+        assert!(output.contains("## Resources"));
+        assert!(output.contains("cairn://TST/1/1/builder/chat"));
+    }
+
+    #[test]
+    fn find_job_by_node_name_recipe_node() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+
+        let node_id = "node-1";
+        let exec_id = setup_execution_with_snapshot(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            vec![make_node(node_id, "Builder")],
+        );
+
+        insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            Some(node_id),
+            Some("Builder"),
+            None,
+        );
+
+        let found = find_job_by_node_name(&mut conn, &issue_id, "Builder", 1);
+        assert!(found.is_some(), "should find job via recipe node snapshot");
+        assert_eq!(found.unwrap().recipe_node_id.as_deref(), Some(node_id));
+    }
+
+    #[test]
+    fn find_job_by_node_name_falls_back_to_node_name_column() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+
+        // Create execution with one recipe node (the parent)
+        let parent_node_id = "parent-node";
+        let exec_id = setup_execution_with_snapshot(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            vec![make_node(parent_node_id, "Builder")],
+        );
+
+        let parent_job_id = insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            Some(parent_node_id),
+            Some("Builder"),
+            None,
+        );
+
+        // Task-spawned job: no recipe_node_id, but has node_name
+        insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            None,
+            Some("Explore"),
+            Some(&parent_job_id),
+        );
+
+        // Should find the task via node_name fallback
+        let found = find_job_by_node_name(&mut conn, &issue_id, "Explore", 1);
+        assert!(found.is_some(), "should find task job via node_name column");
+        assert_eq!(found.unwrap().node_name.as_deref(), Some("Explore"));
+    }
+
+    #[test]
+    fn find_job_by_node_name_disambiguated_task() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+
+        let exec_id = setup_execution_with_snapshot(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            vec![make_node("n1", "Builder")],
+        );
+
+        let parent_id = insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            Some("n1"),
+            Some("Builder"),
+            None,
+        );
+
+        // Two Explore tasks with disambiguated names (set at creation time)
+        insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            None,
+            Some("Explore"),
+            Some(&parent_id),
+        );
+        insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            None,
+            Some("Explore-2"),
+            Some(&parent_id),
+        );
+
+        let found1 = find_job_by_node_name(&mut conn, &issue_id, "Explore", 1);
+        assert!(found1.is_some());
+        assert_eq!(found1.unwrap().node_name.as_deref(), Some("Explore"));
+
+        let found2 = find_job_by_node_name(&mut conn, &issue_id, "Explore-2", 1);
+        assert!(found2.is_some());
+        assert_eq!(found2.unwrap().node_name.as_deref(), Some("Explore-2"));
+    }
+
+    #[test]
+    fn find_job_by_node_name_no_match() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+
+        let exec_id = setup_execution_with_snapshot(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            vec![make_node("n1", "Builder")],
+        );
+
+        insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            Some("n1"),
+            Some("Builder"),
+            None,
+        );
+
+        let found = find_job_by_node_name(&mut conn, &issue_id, "NonExistent", 1);
+        assert!(found.is_none(), "should return None for unknown node name");
+    }
+
+    // --- load_job_events_ordered tests ---
+
+    use crate::diesel_models::{NewEvent, NewRun};
+
+    fn insert_run_for_job(conn: &mut SqliteConnection, id: &str, job_id: &str, created_at: i32) {
+        let now = chrono::Utc::now().timestamp() as i32;
+        diesel::insert_into(runs::table)
+            .values(&NewRun {
+                id,
+                issue_id: None,
+                project_id: None,
+                job_id: Some(job_id),
+                chat_id: None,
+                status: Some("exited"),
+                session_id: None,
+                error_message: None,
+                started_at: None,
+                exited_at: None,
+                created_at,
+                updated_at: now,
+                backend: None,
+                exit_reason: None,
+                start_mode: None,
+            })
+            .execute(conn)
+            .unwrap();
+    }
+
+    fn insert_event_for_run(
+        conn: &mut SqliteConnection,
+        id: &str,
+        run_id: &str,
+        sequence: i32,
+        event_type: &str,
+        data: &str,
+    ) {
+        let now = chrono::Utc::now().timestamp() as i32;
+        diesel::insert_into(events::table)
+            .values(&NewEvent {
+                id,
+                run_id,
+                session_id: None,
+                sequence,
+                timestamp: now,
+                event_type,
+                data,
+                parent_tool_use_id: None,
+                created_at: now,
+                input_tokens: None,
+                cache_read_tokens: None,
+                cache_create_tokens: None,
+                output_tokens: None,
+                turn_id: None,
+            })
+            .execute(conn)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_load_job_events_ordered_sorts_by_run_creation_time() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "TST");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+        let exec_id = setup_execution_with_snapshot(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            vec![make_node("n1", "Builder")],
+        );
+        let job_id = insert_job(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &exec_id,
+            Some("n1"),
+            Some("Builder"),
+            None,
+        );
+
+        // Create two runs with the SAME created_at timestamp.
+        // UUIDs are alphabetically ordered: run-a < run-b.
+        // But run-b was created first (lower created_at wins tiebreak).
+        // The old code sorted by run_id.asc() which would put run-a first — wrong.
+        let same_time = chrono::Utc::now().timestamp() as i32;
+        insert_run_for_job(&mut conn, "run-b", &job_id, same_time);
+        insert_run_for_job(&mut conn, "run-a", &job_id, same_time + 1);
+
+        // Events in run-b (first run)
+        insert_event_for_run(&mut conn, "e1", "run-b", 1, "user", "{}");
+        insert_event_for_run(&mut conn, "e2", "run-b", 2, "assistant", "{}");
+
+        // Events in run-a (second run)
+        insert_event_for_run(&mut conn, "e3", "run-a", 1, "user", "{}");
+        insert_event_for_run(&mut conn, "e4", "run-a", 2, "assistant", "{}");
+
+        let events = load_job_events_ordered(&mut conn, &job_id);
+        assert_eq!(events.len(), 4);
+
+        // Should be ordered by run creation time, not alphabetical run_id.
+        // run-b (created first) events come before run-a events.
+        assert_eq!(events[0].0, "run-b"); // run_id
+        assert_eq!(events[0].1, 1); // sequence
+        assert_eq!(events[1].0, "run-b");
+        assert_eq!(events[1].1, 2);
+        assert_eq!(events[2].0, "run-a");
+        assert_eq!(events[2].1, 1);
+        assert_eq!(events[3].0, "run-a");
+        assert_eq!(events[3].1, 2);
+    }
+
+    #[test]
+    fn test_load_job_events_ordered_no_runs() {
+        let mut conn = test_diesel_conn();
+        let events = load_job_events_ordered(&mut conn, "nonexistent-job");
+        assert!(events.is_empty());
     }
 }

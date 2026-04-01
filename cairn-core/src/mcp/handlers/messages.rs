@@ -9,8 +9,9 @@ use crate::execution::jobs::continue_job_impl;
 use crate::mcp::types::McpCallbackRequest;
 use crate::messages::{db as msg_db, delivery};
 use crate::models::ChannelType;
+use crate::node_segments::{matches_node_uri_segment, visible_node_segment_or_name};
 use crate::orchestrator::Orchestrator;
-use crate::schema::{executions, issues, jobs, projects, runs};
+use crate::schema::{issues, jobs, projects, runs};
 
 use super::lookup_run;
 
@@ -40,7 +41,7 @@ enum MessageTarget {
     Direct {
         project_key: String,
         issue_number: i32,
-        _exec_seq: String,
+        exec_seq: i32,
         node_name: String,
     },
 }
@@ -73,22 +74,30 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
 
     // Build sender URI: cairn://PROJECT/NUMBER/SEQ/NODE for issue agents,
     // or just the node name for project-level agents
-    let node_name = run_ctx.job_name.as_deref().unwrap_or("agent");
+    let node_name = match run_ctx.job_name.as_deref() {
+        Some(name) => name,
+        None => {
+            log::warn!(
+                "No job_name for run_id={}, job_id={} — sender URI will use 'unknown'",
+                run_ctx.run_id,
+                run_ctx.job_id
+            );
+            "unknown"
+        }
+    };
     let sender_name = if let Some(issue_number) = run_ctx.issue_number {
-        let exec_seq = run_ctx.execution_id.as_deref().and_then(|eid| {
-            executions::table
-                .find(eid)
-                .select(executions::seq)
-                .first::<Option<i32>>(&mut *conn)
-                .ok()
-                .flatten()
-        });
+        let recipe_node_id = jobs::table
+            .find(&run_ctx.job_id)
+            .select(jobs::recipe_node_id)
+            .first::<Option<String>>(&mut *conn)
+            .ok()
+            .flatten();
         format!(
             "cairn://{}/{}/{}/{}",
             run_ctx.project_key,
             issue_number,
-            exec_seq.unwrap_or(1),
-            node_name
+            run_ctx.exec_seq.unwrap_or(1),
+            visible_node_segment_or_name(recipe_node_id.as_deref(), node_name)
         )
     } else {
         node_name.to_string()
@@ -163,20 +172,25 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
         MessageTarget::Direct {
             project_key,
             issue_number,
+            exec_seq,
             node_name,
-            ..
         } => {
             // Look up job + latest run for the recipient
-            let (job_id, recipient_run_id) =
-                match find_recipient_job(&mut conn, &project_key, issue_number, &node_name) {
-                    Some(ids) => ids,
-                    None => {
-                        return format!(
-                            "No agent found: {}/{}/{}",
-                            project_key, issue_number, node_name
-                        )
-                    }
-                };
+            let (job_id, recipient_run_id) = match find_recipient_job(
+                &mut *conn,
+                &project_key,
+                issue_number,
+                exec_seq,
+                &node_name,
+            ) {
+                Some(ids) => ids,
+                None => {
+                    return format!(
+                        "No agent found: {}/{}/{}",
+                        project_key, issue_number, node_name
+                    );
+                }
+            };
 
             let msg = match msg_db::insert_message(
                 &mut conn,
@@ -205,7 +219,7 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
                 "[Direct message from {}]\n{}\n\nTo reply, use the message tool with to: \"{}\"",
                 msg.sender_name, msg.content, msg.sender_name
             );
-            match continue_job_impl(orch, &job_id, Some(&formatted)) {
+            match continue_job_impl(orch, &job_id, Some(&formatted), None) {
                 Ok(_run) => format!("Sent direct message to {}", node_name),
                 Err(e) => {
                     log::warn!("Direct message stored but resume failed: {}", e);
@@ -213,6 +227,172 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_target;
+    use crate::diesel_models::{NewExecution, NewJob, NewRun};
+    use crate::mcp::handlers::messages::find_recipient_job;
+    use crate::models::ChannelType;
+    use crate::schema::{executions, jobs, runs};
+    use crate::test_utils::{create_test_issue, create_test_project, test_diesel_conn};
+    use diesel::prelude::*;
+    use uuid::Uuid;
+
+    fn insert_execution(conn: &mut diesel::sqlite::SqliteConnection, issue_id: &str) -> String {
+        let execution_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+        diesel::insert_into(executions::table)
+            .values(&NewExecution {
+                id: &execution_id,
+                recipe_id: "recipe-1",
+                issue_id: Some(issue_id),
+                project_id: None,
+                status: "running",
+                started_at: now,
+                completed_at: None,
+                snapshot: None,
+                seq: Some(1),
+                initiator_sub: None,
+                initiator_auth_mode: None,
+                initiator_org_id: None,
+                triggered_by: "manual",
+            })
+            .execute(conn)
+            .unwrap();
+        execution_id
+    }
+
+    fn insert_job_and_run(
+        conn: &mut diesel::sqlite::SqliteConnection,
+        issue_id: &str,
+        project_id: &str,
+        execution_id: &str,
+        recipe_node_id: &str,
+        node_name: &str,
+    ) -> (String, String) {
+        let job_id = Uuid::new_v4().to_string();
+        let run_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+
+        diesel::insert_into(jobs::table)
+            .values(&NewJob {
+                id: &job_id,
+                execution_id: Some(execution_id),
+                manager_id: None,
+                recipe_node_id: Some(recipe_node_id),
+                parent_job_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                current_session_id: None,
+                resume_session_id: None,
+                status: "running",
+                agent_config_id: Some("Build"),
+                issue_id: Some(issue_id),
+                project_id,
+                task_description: None,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+                parent_tool_use_id: None,
+                task_index: None,
+                started_at: Some(now),
+                model: None,
+                node_name: Some(node_name),
+                base_branch: None,
+                current_turn_id: None,
+            })
+            .execute(conn)
+            .unwrap();
+
+        diesel::insert_into(runs::table)
+            .values(&NewRun {
+                id: &run_id,
+                issue_id: Some(issue_id),
+                project_id: None,
+                job_id: Some(&job_id),
+                status: Some("live"),
+                session_id: None,
+                error_message: None,
+                started_at: Some(now),
+                exited_at: None,
+                created_at: now,
+                updated_at: now,
+                chat_id: None,
+                backend: None,
+                exit_reason: None,
+                start_mode: None,
+            })
+            .execute(conn)
+            .unwrap();
+
+        (job_id, run_id)
+    }
+
+    #[test]
+    fn resolve_target_accepts_slugified_node_uri() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "CAIRN");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+        let execution_id = insert_execution(&mut conn, &issue_id);
+        let (_job_id, run_id) = insert_job_and_run(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &execution_id,
+            "54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67",
+            "Builder",
+        );
+
+        let resolved = resolve_target(&mut conn, "cairn://CAIRN/1/1/builder").unwrap();
+        assert_eq!(resolved.0, ChannelType::Direct);
+        assert_eq!(resolved.2.as_deref(), Some(run_id.as_str()));
+    }
+
+    #[test]
+    fn resolve_target_accepts_exact_stored_node_name() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "CAIRN");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+        let execution_id = insert_execution(&mut conn, &issue_id);
+        let (_job_id, run_id) = insert_job_and_run(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &execution_id,
+            "54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67",
+            "Builder",
+        );
+
+        let resolved = resolve_target(&mut conn, "cairn://CAIRN/1/1/Builder").unwrap();
+        assert_eq!(resolved.2.as_deref(), Some(run_id.as_str()));
+    }
+
+    #[test]
+    fn resolve_target_accepts_legacy_recipe_node_id_uri() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "CAIRN");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+        let execution_id = insert_execution(&mut conn, &issue_id);
+        let recipe_node_id = "54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67";
+        let (_job_id, run_id) = insert_job_and_run(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            &execution_id,
+            recipe_node_id,
+            "Builder",
+        );
+
+        let slug_result = find_recipient_job(&mut conn, "CAIRN", 1, 1, "builder").unwrap();
+        let legacy_result = find_recipient_job(&mut conn, "CAIRN", 1, 1, recipe_node_id).unwrap();
+
+        assert_eq!(slug_result.1, run_id);
+        assert_eq!(legacy_result.1, run_id);
+        assert_eq!(slug_result, legacy_result);
     }
 }
 
@@ -249,10 +429,13 @@ fn parse_message_target(uri: &str) -> Result<MessageTarget, String> {
             let issue_number: i32 = number
                 .parse()
                 .map_err(|_| format!("Invalid issue number: {}", number))?;
+            let exec_seq: i32 = exec_seq
+                .parse()
+                .map_err(|_| format!("Invalid execution sequence: {}", exec_seq))?;
             Ok(MessageTarget::Direct {
                 project_key: project_key.to_string(),
                 issue_number,
-                _exec_seq: exec_seq.to_string(),
+                exec_seq,
                 node_name: node_name.to_string(),
             })
         }
@@ -266,6 +449,7 @@ fn find_recipient_job(
     conn: &mut diesel::sqlite::SqliteConnection,
     project_key: &str,
     issue_number: i32,
+    exec_seq: i32,
     node_name: &str,
 ) -> Option<(String, String)> {
     // Find issue_id
@@ -277,17 +461,36 @@ fn find_recipient_job(
         .first(conn)
         .ok()?;
 
-    // Find the job by issue + node_name, get its latest run
-    let (job_id, run_id): (String, String) = runs::table
-        .inner_join(jobs::table.on(runs::job_id.eq(jobs::id.nullable())))
-        .filter(jobs::issue_id.eq(&issue_id))
-        .filter(jobs::node_name.eq(node_name))
-        .order(runs::created_at.desc())
-        .select((jobs::id, runs::id))
+    let execution_id: String = crate::schema::executions::table
+        .filter(crate::schema::executions::issue_id.eq(&issue_id))
+        .filter(crate::schema::executions::seq.eq(exec_seq))
+        .select(crate::schema::executions::id)
         .first(conn)
         .ok()?;
 
-    Some((job_id, run_id))
+    let candidates: Vec<(String, Option<String>, Option<String>, String)> = runs::table
+        .inner_join(jobs::table.on(runs::job_id.eq(jobs::id.nullable())))
+        .filter(jobs::issue_id.eq(&issue_id))
+        .filter(jobs::execution_id.eq(&execution_id))
+        .order(runs::created_at.desc())
+        .select((jobs::id, jobs::node_name, jobs::recipe_node_id, runs::id))
+        .load(conn)
+        .ok()?;
+
+    candidates
+        .into_iter()
+        .find_map(|(job_id, stored_node_name, recipe_node_id, run_id)| {
+            let stored_node_name = stored_node_name?;
+            if matches_node_uri_segment(
+                node_name,
+                recipe_node_id.as_deref(),
+                Some(&stored_node_name),
+            ) {
+                Some((job_id, run_id))
+            } else {
+                None
+            }
+        })
 }
 
 /// Public helper: resolve a "to" URI into (channel_type, channel_id, recipient_run_id).
@@ -308,11 +511,12 @@ pub fn resolve_target(
         MessageTarget::Direct {
             project_key,
             issue_number,
+            exec_seq,
             node_name,
             ..
         } => {
             let (_job_id, run_id) =
-                find_recipient_job(conn, &project_key, issue_number, &node_name)
+                find_recipient_job(conn, &project_key, issue_number, exec_seq, &node_name)
                     .ok_or_else(|| format!("No agent found: {}", node_name))?;
             Ok((ChannelType::Direct, None, Some(run_id)))
         }

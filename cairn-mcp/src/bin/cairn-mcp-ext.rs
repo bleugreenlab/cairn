@@ -3,19 +3,26 @@
 //! A lightweight MCP server with only the tools that work outside the Cairn app:
 //! - Issue management (create_issue, update_issue, add_comment)
 //! - Reading issues via cairn:// URIs
+//! - Resource discovery (list_resources, list_resource_templates, read_resource)
 
 use anyhow::Result;
 use rmcp::{
     handler::server::tool::{Parameters, ToolRouter},
     model::{
-        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+        Annotated, CallToolResult, Content, Implementation, ListResourceTemplatesResult,
+        ListResourcesResult, PaginatedRequestParam, ProtocolVersion, RawResource,
+        RawResourceTemplate, ReadResourceRequestParam, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerInfo,
     },
-    tool, tool_handler, tool_router, ServerHandler, ServiceExt,
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::future::Future;
 use std::sync::Arc;
+
+use cairn_common::uri::{parse_uri, CairnResource};
 
 /// Cairn MCP External Server
 #[derive(Clone)]
@@ -33,6 +40,8 @@ struct AddCommentInput {
     issue_number: String,
     /// The comment content (supports markdown)
     content: String,
+    /// Project key, or prefix the issue number (e.g. "CAIRN-37"). Use list_resources to see available projects.
+    project: Option<String>,
 }
 
 /// Input for create_issue tool
@@ -42,6 +51,8 @@ struct CreateIssueInput {
     title: String,
     /// Issue description (markdown)
     description: Option<String>,
+    /// Project key. Use list_resources to see available projects.
+    project: Option<String>,
 }
 
 /// Input for update_issue tool
@@ -54,6 +65,8 @@ struct UpdateIssueInput {
     title: Option<String>,
     /// New description (optional)
     description: Option<String>,
+    /// Project key, or prefix the issue number (e.g. "CAIRN-37"). Use list_resources to see available projects.
+    project: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -66,6 +79,14 @@ struct CallbackRequest {
 #[derive(Debug, Serialize, Deserialize)]
 struct CallbackResponse {
     result: String,
+}
+
+/// Resource info returned from Tauri callback
+#[derive(Debug, Clone, Deserialize)]
+struct ResourceInfo {
+    uri: String,
+    name: String,
+    description: Option<String>,
 }
 
 #[tool_router]
@@ -171,12 +192,108 @@ impl CairnMcpExt {
             Err(e) => format!("Error calling Tauri: {}", e),
         }
     }
+
+    /// Build static resource templates for the cairn:// URI space.
+    /// These describe the URI patterns available — no callback needed.
+    fn resource_templates() -> Vec<Annotated<RawResourceTemplate>> {
+        let templates = vec![
+            (
+                "cairn://{project}",
+                "Project overview",
+                "Project overview with recent issues and status",
+            ),
+            (
+                "cairn://{project}/{number}",
+                "Issue details",
+                "Issue overview with comments, PR data, and execution history",
+            ),
+            (
+                "cairn://{project}/{number}/files",
+                "Issue files",
+                "All files changed across executions for an issue",
+            ),
+            (
+                "cairn://{project}/{number}/messages",
+                "Issue messages",
+                "Messages between agents working on an issue",
+            ),
+            (
+                "cairn://{project}/messages",
+                "Project messages",
+                "Project-wide messages between agents",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}",
+                "Node summary",
+                "Execution node summary with status and metadata",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}/chat",
+                "Node transcript",
+                "Agent conversation transcript (truncated)",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}/chat/full",
+                "Full transcript",
+                "Complete agent conversation transcript",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}/artifact",
+                "Node artifact",
+                "Agent output artifact (plan, PR, etc.)",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}/files",
+                "Node files",
+                "Files changed by a specific execution node",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}/task/{name}/chat",
+                "Task transcript",
+                "Sub-task conversation transcript",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}/task/{name}/chat/full",
+                "Full task transcript",
+                "Complete sub-task conversation transcript",
+            ),
+            (
+                "cairn://{project}/{number}/{exec}/{node}/task/{name}/artifact",
+                "Task artifact",
+                "Sub-task output artifact",
+            ),
+            (
+                "cairn://{project}/chat/{name}",
+                "Project chat",
+                "Project-level chat session transcript",
+            ),
+        ];
+
+        templates
+            .into_iter()
+            .map(|(uri_template, name, description)| {
+                Annotated::new(
+                    RawResourceTemplate {
+                        uri_template: uri_template.to_string(),
+                        name: name.to_string(),
+                        description: Some(description.to_string()),
+                        mime_type: Some("text/plain".to_string()),
+                    },
+                    None,
+                )
+            })
+            .collect()
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for CairnMcpExt {
     fn get_info(&self) -> ServerInfo {
         let instructions = "Cairn MCP server (external mode).\n\n\
+             Resources:\n\
+             - List resources to see recent issues for the current project\n\
+             - List resource templates for cairn:// URI patterns\n\
+             - Read resources to access issue details, transcripts, artifacts\n\n\
              Issue tools:\n\
              - create_issue: Create a new issue in the backlog\n\
              - update_issue: Update an existing issue\n\
@@ -184,7 +301,10 @@ impl ServerHandler for CairnMcpExt {
 
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
             server_info: Implementation {
                 name: "cairn-mcp-ext".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -192,18 +312,121 @@ impl ServerHandler for CairnMcpExt {
             instructions: Some(instructions.to_string()),
         }
     }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, rmcp::ErrorData>> + Send + '_
+    {
+        async move {
+            tracing::info!("list_resource_templates called");
+            let templates = Self::resource_templates();
+            Ok(ListResourceTemplatesResult::with_all_items(templates))
+        }
+    }
+
+    fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourcesResult, rmcp::ErrorData>> + Send + '_ {
+        async move {
+            tracing::info!("list_resources called");
+
+            let request = CallbackRequest {
+                cwd: self.cwd.to_string(),
+                tool: "list_resources".to_string(),
+                payload: serde_json::json!({}),
+            };
+
+            let result = self.call_tauri(&request).await;
+
+            match serde_json::from_str::<Vec<ResourceInfo>>(&result) {
+                Ok(infos) => {
+                    let resources = infos
+                        .into_iter()
+                        .map(|info| {
+                            Annotated::new(
+                                RawResource {
+                                    uri: info.uri,
+                                    name: info.name,
+                                    description: info.description,
+                                    mime_type: Some("text/plain".to_string()),
+                                    size: None,
+                                },
+                                None,
+                            )
+                        })
+                        .collect();
+                    Ok(ListResourcesResult::with_all_items(resources))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse resources: {} - response: {}", e, result);
+                    Ok(ListResourcesResult::default())
+                }
+            }
+        }
+    }
+
+    fn read_resource(
+        &self,
+        request: ReadResourceRequestParam,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
+        async move {
+            let uri = &request.uri;
+            tracing::info!("read_resource called: uri={}", uri);
+
+            // Validate it's a cairn:// URI
+            if !uri.starts_with("cairn://") {
+                return Err(rmcp::ErrorData::invalid_request(
+                    format!("Unknown resource scheme: {}", uri),
+                    None,
+                ));
+            }
+
+            // Parse and reject terminal URIs (not meaningful in external mode)
+            match parse_uri(uri) {
+                Some(CairnResource::NodeTerminal { .. })
+                | Some(CairnResource::ProjectTerminal { .. }) => {
+                    return Err(rmcp::ErrorData::invalid_request(
+                        "Terminal resources are not available in external mode",
+                        None,
+                    ));
+                }
+                None => {
+                    return Err(rmcp::ErrorData::invalid_request(
+                        format!("Invalid cairn resource URI: {}", uri),
+                        None,
+                    ));
+                }
+                Some(_) => {} // Valid non-terminal resource, proceed
+            }
+
+            // Call Tauri to read the resource
+            let callback_request = CallbackRequest {
+                cwd: self.cwd.to_string(),
+                tool: "read_issue_resource".to_string(),
+                payload: serde_json::json!({ "uri": uri }),
+            };
+
+            let result = self.call_tauri(&callback_request).await;
+            let contents = vec![ResourceContents::text(result, uri.as_str())];
+            Ok(ReadResourceResult { contents })
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing to stderr (stdout is used for MCP protocol)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    // Initialize unified logging (file + stderr; stdout reserved for MCP protocol)
+    let _log_guard = cairn_common::logging::init(cairn_common::logging::LogConfig {
+        process: cairn_common::logging::ProcessTag::Mcp,
+        log_dir: None,
+        stderr: true,
+    })
+    .expect("Failed to initialize logging");
 
     // Callback URL - external mode uses /api/mcp/external endpoint
     // Port differs between debug (3857) and release (3847) builds
@@ -229,4 +452,63 @@ async fn main() -> Result<()> {
     server.waiting().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resource_templates_are_valid() {
+        let templates = CairnMcpExt::resource_templates();
+
+        // Should have templates for all non-terminal resource types
+        assert!(
+            templates.len() >= 14,
+            "Expected at least 14 templates, got {}",
+            templates.len()
+        );
+
+        // All templates should use RFC 6570 URI template syntax with {param}
+        for template in &templates {
+            let uri = &template.raw.uri_template;
+            assert!(
+                uri.starts_with("cairn://"),
+                "Template should start with cairn://: {}",
+                uri
+            );
+            assert!(
+                uri.contains('{'),
+                "Template should contain {{param}} syntax: {}",
+                uri
+            );
+        }
+    }
+
+    #[test]
+    fn test_resource_templates_no_terminal_uris() {
+        let templates = CairnMcpExt::resource_templates();
+
+        for template in &templates {
+            let uri = &template.raw.uri_template;
+            assert!(
+                !uri.contains("/terminal/"),
+                "Templates should not include terminal URIs: {}",
+                uri
+            );
+        }
+    }
+
+    #[test]
+    fn test_resource_templates_have_descriptions() {
+        let templates = CairnMcpExt::resource_templates();
+
+        for template in &templates {
+            assert!(
+                template.raw.description.is_some(),
+                "Template '{}' should have a description",
+                template.raw.name
+            );
+        }
+    }
 }

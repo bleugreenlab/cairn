@@ -40,7 +40,7 @@ pub fn create_test_project(conn: &mut SqliteConnection, name: &str, key: &str) -
         created_at: now,
         updated_at: now,
         remote_url: None,
-        remote_api_key: None,
+        server_id: None,
     };
 
     diesel::insert_into(projects::table)
@@ -70,11 +70,13 @@ pub fn create_test_issue(conn: &mut SqliteConnection, project_id: &str, title: &
         title,
         description: Some(""),
         status: "backlog",
+        progress: "backlog",
+        attention: "none",
         priority: Some(0),
         created_at: now,
         updated_at: now,
         model: None,
-        skills: None,
+        manager_id: None,
     };
 
     diesel::insert_into(issues::table)
@@ -105,12 +107,14 @@ pub fn create_test_job(
     let new_job = NewJob {
         id: &id,
         execution_id: None,
+        manager_id: None,
         recipe_node_id: None,
         parent_job_id,
         worktree_path: None,
         branch: None,
         base_commit: None,
-        claude_session_id: None,
+        current_session_id: None,
+        resume_session_id: None,
         status,
         agent_config_id: None,
         issue_id: Some(issue_id),
@@ -124,6 +128,8 @@ pub fn create_test_job(
         started_at: if status == "running" { Some(now) } else { None },
         model: None,
         node_name: None,
+        base_branch: None,
+        current_turn_id: None,
     };
 
     diesel::insert_into(jobs::table)

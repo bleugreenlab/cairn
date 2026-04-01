@@ -24,7 +24,8 @@ pub struct DbProject {
     pub terminal_commands: Option<String>,
     pub config: Option<String>,
     pub remote_url: Option<String>,
-    pub remote_api_key: Option<String>,
+    pub hidden: i32,
+    pub server_id: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -42,7 +43,7 @@ pub struct NewProject<'a> {
     pub created_at: i32,
     pub updated_at: i32,
     pub remote_url: Option<&'a str>,
-    pub remote_api_key: Option<&'a str>,
+    pub server_id: Option<&'a str>,
 }
 
 #[derive(Debug, AsChangeset, Default)]

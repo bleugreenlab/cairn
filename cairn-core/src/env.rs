@@ -80,21 +80,28 @@ pub fn get_user_path() -> &'static str {
         {
             // Unix common paths where CLI tools are installed
             let common_paths = format!(
-                "{}/.bun/bin:{}/.local/bin:{}/.npm/bin:{}/.yarn/bin:{}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin",
-                home, home, home, home, home
+                "{}/.claude/local/bin:{}/.bun/bin:{}/.local/bin:{}/.npm/bin:{}/.yarn/bin:{}/.cargo/bin:/usr/local/bin:/opt/homebrew/bin",
+                home, home, home, home, home, home
             );
 
-            // Try to get PATH from login shell
+            // Start with the process's actual PATH (includes Docker ENV, etc.)
+            let env_path = std::env::var("PATH").unwrap_or_default();
+
+            // Try to get PATH from login shell (picks up .bashrc/.zshrc additions)
             if let Ok(output) = Command::new("sh").args(["-lc", "echo $PATH"]).output() {
                 if output.status.success() {
                     let shell_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !shell_path.is_empty() {
-                        return format!("{}:{}", common_paths, shell_path);
+                        return format!("{}:{}:{}", common_paths, shell_path, env_path);
                     }
                 }
             }
 
-            format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", common_paths)
+            if env_path.is_empty() {
+                format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", common_paths)
+            } else {
+                format!("{}:{}", common_paths, env_path)
+            }
         }
     })
 }

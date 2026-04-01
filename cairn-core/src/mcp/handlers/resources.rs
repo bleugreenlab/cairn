@@ -10,8 +10,9 @@ use std::sync::Mutex;
 use super::lookup_run;
 use super::slug::build_terminal_uri;
 use crate::mcp::types::McpCallbackRequest;
+use crate::node_segments::{matches_node_uri_segment, visible_node_segment};
 use crate::orchestrator::Orchestrator;
-use crate::schema::{issues, job_terminals, projects};
+use crate::schema::{executions, issues, job_terminals, jobs, projects};
 
 /// Type alias for read cursor state: session_id -> bytes_read
 /// Uses per-terminal cursor so reads "consume" output regardless of which run is reading.
@@ -50,6 +51,65 @@ pub struct ResourceInfo {
 }
 
 /// Handle list_resources request - returns terminal resources for current job + recent issues
+fn visible_terminal_node_segment(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    job_id: &str,
+    node_name: Option<&str>,
+) -> Option<String> {
+    let recipe_node_id = jobs::table
+        .find(job_id)
+        .select(jobs::recipe_node_id)
+        .first::<Option<String>>(conn)
+        .ok()
+        .flatten();
+
+    visible_node_segment(recipe_node_id.as_deref(), node_name)
+}
+
+fn find_terminal_target_job_id(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    project_key: &str,
+    issue_number: i32,
+    exec_seq: i32,
+    node_id: &str,
+) -> Option<String> {
+    let issue_id: String = issues::table
+        .inner_join(projects::table)
+        .filter(projects::key.eq(project_key))
+        .filter(issues::number.eq(issue_number))
+        .select(issues::id)
+        .first(conn)
+        .ok()?;
+
+    let exec_id: String = executions::table
+        .filter(executions::issue_id.eq(&issue_id))
+        .filter(executions::seq.eq(exec_seq))
+        .select(executions::id)
+        .first(conn)
+        .ok()?;
+
+    let candidates: Vec<(String, Option<String>, Option<String>)> = jobs::table
+        .filter(jobs::issue_id.eq(&issue_id))
+        .filter(jobs::execution_id.eq(&exec_id))
+        .select((jobs::id, jobs::node_name, jobs::recipe_node_id))
+        .load(conn)
+        .ok()?;
+
+    candidates
+        .into_iter()
+        .find_map(|(job_id, stored_node_name, recipe_node_id)| {
+            if matches_node_uri_segment(
+                node_id,
+                recipe_node_id.as_deref(),
+                stored_node_name.as_deref(),
+            ) {
+                Some(job_id)
+            } else {
+                None
+            }
+        })
+}
+
 pub async fn handle_list_resources(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     let mut conn = match orch.db.conn.lock() {
         Ok(c) => c,
@@ -77,10 +137,13 @@ pub async fn handle_list_resources(orch: &Orchestrator, request: &McpCallbackReq
 
         for (slug, command, description, status) in terminals {
             if let Some(slug) = slug {
+                let node_segment =
+                    visible_terminal_node_segment(&mut *conn, &ctx.job_id, ctx.job_name.as_deref());
                 let uri = build_terminal_uri(
                     &ctx.project_key,
                     ctx.issue_number,
-                    ctx.job_name.as_deref(),
+                    ctx.exec_seq,
+                    node_segment.as_deref(),
                     &slug,
                 );
                 let name = description.clone().unwrap_or_else(|| {
@@ -216,31 +279,35 @@ pub async fn handle_read_resource(
                 None => None,
             }
         } else {
-            // Node-level terminal: look up by job_id from run context
-            let run_context = match lookup_run(&mut conn, request) {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    return serde_json::to_string(&TerminalReadResult {
-                        output: format!("No run context: {}", e),
-                        status: "error".to_string(),
-                        exit_code: None,
-                        new_bytes: 0,
-                        total_bytes: 0,
-                    })
-                    .unwrap_or_else(|_| "{}".to_string())
-                }
-            };
+            // Node-level terminal: resolve target job from parsed URI components
+            // (not the caller's run context — any agent can read any terminal by URI)
+            let target_job_id = (|| -> Option<String> {
+                let issue_number = parsed.issue_number?;
+                let exec_seq = parsed.exec_seq?;
+                let node_id = parsed.node_id.as_deref()?;
 
-            job_terminals::table
-                .filter(job_terminals::job_id.eq(&run_context.job_id))
-                .filter(job_terminals::slug.eq(&parsed.slug))
-                .select((
-                    job_terminals::session_id,
-                    job_terminals::status,
-                    job_terminals::exit_code,
-                ))
-                .first::<(String, String, Option<i32>)>(&mut *conn)
-                .ok()
+                find_terminal_target_job_id(
+                    &mut *conn,
+                    &parsed.project_key,
+                    issue_number,
+                    exec_seq,
+                    node_id,
+                )
+            })();
+
+            match target_job_id {
+                Some(job_id) => job_terminals::table
+                    .filter(job_terminals::job_id.eq(&job_id))
+                    .filter(job_terminals::slug.eq(&parsed.slug))
+                    .select((
+                        job_terminals::session_id,
+                        job_terminals::status,
+                        job_terminals::exit_code,
+                    ))
+                    .first::<(String, String, Option<i32>)>(&mut *conn)
+                    .ok(),
+                None => None,
+            }
         }
     };
 
@@ -274,10 +341,10 @@ pub async fn handle_read_resource(
 }
 
 /// Parsed terminal URI components
-#[allow(dead_code)] // project_key, issue_number, node_id reserved for future validation
 struct ParsedTerminalUri {
     project_key: String,
     issue_number: Option<i32>,
+    exec_seq: Option<i32>,
     node_id: Option<String>,
     slug: String,
     full: bool,
@@ -285,8 +352,8 @@ struct ParsedTerminalUri {
 
 /// Parse a terminal URI into components.
 ///
-/// Supports both formats:
-/// - `cairn://PROJECT/NUMBER/NODE/terminal/SLUG` (node-level terminal)
+/// Supports formats:
+/// - `cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG` (node-level terminal, canonical)
 /// - `cairn://PROJECT/terminal/SLUG` (project-level terminal)
 ///
 /// Query param: `?full=true` for complete history
@@ -307,18 +374,24 @@ fn parse_terminal_uri(uri: &str) -> Option<ParsedTerminalUri> {
         .unwrap_or(false);
 
     match parts.as_slice() {
-        // cairn://PROJECT/NUMBER/NODE/terminal/SLUG
-        [project_key, number, node_id, "terminal", slug] => Some(ParsedTerminalUri {
-            project_key: project_key.to_string(),
-            issue_number: number.parse().ok(),
-            node_id: Some(node_id.to_string()),
-            slug: slug.to_string(),
-            full,
-        }),
-        // cairn://PROJECT/terminal/SLUG
+        // cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG (canonical format with exec_seq)
+        [project_key, number, exec_seq_str, node_id, "terminal", slug]
+            if exec_seq_str.parse::<i32>().is_ok() =>
+        {
+            Some(ParsedTerminalUri {
+                project_key: project_key.to_string(),
+                issue_number: number.parse().ok(),
+                exec_seq: exec_seq_str.parse().ok(),
+                node_id: Some(node_id.to_string()),
+                slug: slug.to_string(),
+                full,
+            })
+        }
+        // cairn://PROJECT/terminal/SLUG (project-level)
         [project_key, "terminal", slug] => Some(ParsedTerminalUri {
             project_key: project_key.to_string(),
             issue_number: None,
+            exec_seq: None,
             node_id: None,
             slug: slug.to_string(),
             full,
@@ -401,89 +474,322 @@ fn get_buffer_content_from_cursor(
 
 /// Strip ANSI escape sequences from terminal output for cleaner agent consumption.
 /// Removes color codes, cursor movement, and other control sequences.
+/// Process raw PTY output into clean text by emulating basic terminal semantics.
+///
+/// Handles: ANSI escape sequences, carriage return (line overwrite),
+/// backspace, and other control characters. Produces the "screen content"
+/// an interactive terminal would display, not the raw byte stream.
 fn strip_ansi_sequences(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
+    // We emulate a simple terminal: a list of completed lines plus a current line buffer.
+    let mut lines: Vec<String> = Vec::new();
+    let mut line: Vec<char> = Vec::new();
+    let mut cursor: usize = 0; // cursor position within current line
     let mut chars = input.chars().peekable();
 
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // ESC character - start of escape sequence
-            if let Some(&next) = chars.peek() {
-                match next {
-                    '[' => {
-                        // CSI sequence: ESC [ ... final_byte
-                        chars.next(); // consume '['
-                                      // Skip until we hit a letter (final byte of CSI)
-                        while let Some(&ch) = chars.peek() {
-                            chars.next();
-                            if ch.is_ascii_alphabetic() || ch == '@' || ch == '`' {
-                                break;
-                            }
-                        }
-                    }
-                    ']' => {
-                        // OSC sequence: ESC ] ... (ST or BEL)
-                        chars.next(); // consume ']'
-                                      // Skip until ST (ESC \) or BEL (\x07)
-                        while let Some(ch) = chars.next() {
-                            if ch == '\x07' {
-                                break;
-                            }
-                            if ch == '\x1b' && chars.peek() == Some(&'\\') {
+        match c {
+            '\x1b' => {
+                // ESC - start of escape sequence
+                if let Some(&next) = chars.peek() {
+                    match next {
+                        '[' => {
+                            // CSI sequence: ESC [ (params) final_byte
+                            chars.next(); // consume '['
+                                          // Collect parameter bytes
+                            let mut params = String::new();
+                            while let Some(&ch) = chars.peek() {
+                                if ch.is_ascii_alphabetic() || ch == '@' || ch == '`' {
+                                    break;
+                                }
+                                params.push(ch);
                                 chars.next();
-                                break;
+                            }
+                            // Consume final byte
+                            let final_byte = chars.next();
+                            // Handle cursor movement CSI sequences
+                            match final_byte {
+                                Some('K') => {
+                                    // Erase in Line
+                                    let n: usize = params.parse().unwrap_or(0);
+                                    match n {
+                                        0 => line.truncate(cursor), // erase to end
+                                        1 => {
+                                            // erase to start
+                                            for i in 0..cursor.min(line.len()) {
+                                                line[i] = ' ';
+                                            }
+                                        }
+                                        2 => {
+                                            line.clear();
+                                            cursor = 0;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Some('C') => {
+                                    // Cursor Forward
+                                    let n: usize = params.parse().unwrap_or(1).max(1);
+                                    cursor = (cursor + n).min(line.len());
+                                }
+                                Some('D') => {
+                                    // Cursor Back
+                                    let n: usize = params.parse().unwrap_or(1).max(1);
+                                    cursor = cursor.saturating_sub(n);
+                                }
+                                _ => {
+                                    // Other CSI sequences (colors, etc.) — skip
+                                }
                             }
                         }
-                    }
-                    '(' | ')' | '*' | '+' => {
-                        // Character set designation - skip next 2 chars
-                        chars.next();
-                        chars.next();
-                    }
-                    _ => {
-                        // Other escape - skip just the next char
-                        chars.next();
+                        ']' => {
+                            // OSC sequence: ESC ] ... (ST or BEL)
+                            chars.next();
+                            while let Some(ch) = chars.next() {
+                                if ch == '\x07' {
+                                    break;
+                                }
+                                if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                    break;
+                                }
+                            }
+                        }
+                        '(' | ')' | '*' | '+' => {
+                            chars.next();
+                            chars.next();
+                        }
+                        _ => {
+                            chars.next();
+                        }
                     }
                 }
             }
-        } else if c == '\r' {
-            // Carriage return - skip (we'll keep newlines only)
-            continue;
-        } else if c.is_control() && c != '\n' && c != '\t' {
-            // Skip other control characters except newline and tab
-            continue;
-        } else {
-            result.push(c);
-        }
-    }
-
-    // Clean up multiple consecutive newlines
-    let mut cleaned = String::new();
-    let mut prev_newline = false;
-    for c in result.chars() {
-        if c == '\n' {
-            if !prev_newline {
-                cleaned.push(c);
+            '\n' => {
+                // Newline — commit current line and start fresh
+                lines.push(line.iter().collect());
+                line.clear();
+                cursor = 0;
             }
-            prev_newline = true;
-        } else {
-            prev_newline = false;
-            cleaned.push(c);
+            '\r' => {
+                // Carriage return: if followed by \n it's a line ending (cursor to 0,
+                // \n will commit). Otherwise it's a line rewrite — clear the old content
+                // so only the new text remains (matches user intent for progress bars,
+                // prompt rewrites, etc.)
+                if chars.peek() == Some(&'\n') {
+                    cursor = 0;
+                } else {
+                    line.clear();
+                    cursor = 0;
+                }
+            }
+            '\x08' => {
+                // Backspace — move cursor back one position
+                cursor = cursor.saturating_sub(1);
+            }
+            '\x7f' => {
+                // DEL — backspace + delete character
+                if cursor > 0 {
+                    cursor -= 1;
+                    if cursor < line.len() {
+                        line.remove(cursor);
+                    }
+                }
+            }
+            _ if c.is_control() && c != '\t' => {
+                // Skip other control characters (except tab)
+            }
+            _ => {
+                // Printable character — write at cursor position
+                if cursor < line.len() {
+                    line[cursor] = c;
+                } else {
+                    // Extend line to cursor position if needed
+                    while line.len() < cursor {
+                        line.push(' ');
+                    }
+                    line.push(c);
+                }
+                cursor += 1;
+            }
         }
     }
 
-    cleaned.trim().to_string()
+    // Don't forget the last line if non-empty
+    if !line.is_empty() {
+        lines.push(line.iter().collect());
+    }
+
+    // Clean up: trim trailing whitespace per line, collapse consecutive blank lines
+    let cleaned: Vec<&str> = lines.iter().map(|l| l.trim_end()).collect();
+
+    // Collapse runs of blank lines into a single blank line
+    let mut result = String::new();
+    let mut prev_blank = false;
+    for line in &cleaned {
+        if line.is_empty() {
+            if !prev_blank && !result.is_empty() {
+                result.push('\n');
+            }
+            prev_blank = true;
+        } else {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(line);
+            prev_blank = false;
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DbState;
+    use crate::diesel_models::{NewExecution, NewJob, NewJobTerminal};
+    use crate::orchestrator::Orchestrator;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::test_utils::{create_test_issue, create_test_project, test_diesel_conn};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection) -> Orchestrator {
+        let db = Arc::new(DbState {
+            conn: Mutex::new(conn),
+        });
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
+            db.clone(),
+            services.emitter.clone(),
+        ));
+        let sync_tx = Arc::new(Mutex::new(None));
+
+        Orchestrator {
+            db,
+            services: services.clone(),
+            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
+            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
+                "/tmp",
+            ))),
+            warm_gc: None,
+            pty_state: Arc::new(crate::services::PtyState::default()),
+            permission_responses: tokio::sync::broadcast::channel(16).0,
+            run_completions: tokio::sync::broadcast::channel(64).0,
+            prompt_responses: tokio::sync::broadcast::channel(16).0,
+            trigger_events: tokio::sync::broadcast::channel(256).0,
+            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            identity_store: Arc::new(Mutex::new(None)),
+            mcp_binary_path: "cairn-mcp".to_string(),
+            config_dir: std::path::PathBuf::from("/tmp"),
+            schema_dir: None,
+            mcp_callback_port: 3847,
+            embedding_engine: None,
+            vibe_state: None,
+            account_manager,
+            sync_tx: sync_tx.clone(),
+            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
+            api_config: crate::api::ApiConfig::default(),
+            effect_tx: None,
+            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            provider_usage_snapshots: Default::default(),
+            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    fn insert_issue_job_with_terminal(
+        conn: &mut diesel::sqlite::SqliteConnection,
+        issue_id: &str,
+        project_id: &str,
+        recipe_node_id: &str,
+        node_name: Option<&str>,
+        slug: &str,
+    ) -> String {
+        let execution_id = Uuid::new_v4().to_string();
+        let job_id = Uuid::new_v4().to_string();
+        let terminal_id = Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().timestamp() as i32;
+
+        diesel::insert_into(executions::table)
+            .values(&NewExecution {
+                id: &execution_id,
+                recipe_id: "recipe-1",
+                issue_id: Some(issue_id),
+                project_id: None,
+                status: "running",
+                started_at: now,
+                completed_at: None,
+                snapshot: None,
+                seq: Some(1),
+                initiator_sub: None,
+                initiator_auth_mode: None,
+                initiator_org_id: None,
+                triggered_by: "manual",
+            })
+            .execute(conn)
+            .unwrap();
+
+        diesel::insert_into(jobs::table)
+            .values(&NewJob {
+                id: &job_id,
+                execution_id: Some(&execution_id),
+                manager_id: None,
+                recipe_node_id: Some(recipe_node_id),
+                parent_job_id: None,
+                worktree_path: None,
+                branch: None,
+                base_commit: None,
+                current_session_id: None,
+                resume_session_id: None,
+                status: "running",
+                agent_config_id: Some("Build"),
+                issue_id: Some(issue_id),
+                project_id,
+                task_description: None,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+                parent_tool_use_id: None,
+                task_index: None,
+                started_at: Some(now),
+                model: None,
+                node_name,
+                base_branch: None,
+                current_turn_id: None,
+            })
+            .execute(conn)
+            .unwrap();
+
+        diesel::insert_into(job_terminals::table)
+            .values(&NewJobTerminal {
+                id: &terminal_id,
+                job_id: Some(&job_id),
+                project_id: None,
+                run_id: None,
+                session_id: "session-1",
+                command: "cargo test",
+                title: None,
+                description: Some("Test terminal"),
+                status: "running",
+                exit_code: None,
+                created_at: now,
+                exited_at: None,
+                slug: Some(slug),
+            })
+            .execute(conn)
+            .unwrap();
+
+        job_id
+    }
 
     #[test]
     fn test_parse_terminal_uri_node_level() {
-        let result = parse_terminal_uri("cairn://CAIRN/123/builder-1/terminal/dev-server").unwrap();
+        // Canonical 6-segment format: PROJECT/NUMBER/EXEC/NODE/terminal/SLUG
+        let result =
+            parse_terminal_uri("cairn://CAIRN/123/1/builder-1/terminal/dev-server").unwrap();
         assert_eq!(result.project_key, "CAIRN");
         assert_eq!(result.issue_number, Some(123));
+        assert_eq!(result.exec_seq, Some(1));
         assert_eq!(result.node_id, Some("builder-1".to_string()));
         assert_eq!(result.slug, "dev-server");
         assert!(!result.full);
@@ -502,7 +808,7 @@ mod tests {
     #[test]
     fn test_parse_terminal_uri_with_full_flag() {
         let result =
-            parse_terminal_uri("cairn://CAIRN/123/builder-1/terminal/dev-server?full=true")
+            parse_terminal_uri("cairn://CAIRN/123/1/builder-1/terminal/dev-server?full=true")
                 .unwrap();
         assert_eq!(result.slug, "dev-server");
         assert!(result.full);
@@ -518,17 +824,129 @@ mod tests {
         assert!(parse_terminal_uri("invalid").is_none());
         // Old terminal:// scheme no longer supported
         assert!(parse_terminal_uri("terminal://CAIRN/main/build").is_none());
+        // 5-segment format without exec_seq is not valid
+        assert!(parse_terminal_uri("cairn://CAIRN/123/builder-1/terminal/dev-server").is_none());
+        // 6-segment with non-numeric exec_seq is not valid
+        assert!(
+            parse_terminal_uri("cairn://CAIRN/123/abc/builder-1/terminal/dev-server").is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_read_resource_accepts_legacy_recipe_node_id_terminal_uri() {
+        let mut conn = test_diesel_conn();
+        let project_id = create_test_project(&mut conn, "Test", "CAIRN");
+        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
+        let recipe_node_id = "54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67";
+        insert_issue_job_with_terminal(
+            &mut conn,
+            &issue_id,
+            &project_id,
+            recipe_node_id,
+            None,
+            "dev-server",
+        );
+
+        let orch = test_orchestrator(conn);
+        let read_cursors = ReadCursorState::default();
+        let request = crate::mcp::types::McpCallbackRequest {
+            cwd: "/tmp/test-repo".to_string(),
+            run_id: None,
+            tool: "read_resource".to_string(),
+            payload: serde_json::json!({
+                "uri": format!(
+                    "cairn://CAIRN/1/1/{}/terminal/dev-server",
+                    recipe_node_id
+                )
+            }),
+            tool_use_id: None,
+        };
+
+        let response = handle_read_resource(&orch, &request, &read_cursors).await;
+        let parsed: TerminalReadResult = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.status, "running");
+        assert_ne!(parsed.output, "Terminal not found: dev-server");
     }
 
     #[test]
     fn test_build_terminal_uri_node_level() {
-        let uri = build_terminal_uri("CAIRN", Some(123), Some("builder-1"), "dev-server");
-        assert_eq!(uri, "cairn://CAIRN/123/builder-1/terminal/dev-server");
+        let uri = build_terminal_uri("CAIRN", Some(123), Some(1), Some("builder-1"), "dev-server");
+        assert_eq!(uri, "cairn://CAIRN/123/1/builder-1/terminal/dev-server");
     }
 
     #[test]
     fn test_build_terminal_uri_project_level() {
-        let uri = build_terminal_uri("CAIRN", None, None, "build");
+        let uri = build_terminal_uri("CAIRN", None, None, None, "build");
         assert_eq!(uri, "cairn://CAIRN/terminal/build");
+    }
+
+    #[test]
+    fn test_build_terminal_uri_missing_exec_seq_falls_back_to_project() {
+        // When issue_number exists but exec_seq is None, URI drops to project-level
+        let uri = build_terminal_uri("CAIRN", Some(123), None, Some("builder-1"), "dev-server");
+        assert_eq!(uri, "cairn://CAIRN/terminal/dev-server");
+    }
+
+    #[test]
+    fn test_build_terminal_uri_missing_node_falls_back_to_project() {
+        // When issue_number and exec_seq exist but node_id is None
+        let uri = build_terminal_uri("CAIRN", Some(123), Some(1), None, "dev-server");
+        assert_eq!(uri, "cairn://CAIRN/terminal/dev-server");
+    }
+
+    #[test]
+    fn test_strip_ansi_plain_text() {
+        assert_eq!(strip_ansi_sequences("hello world"), "hello world");
+    }
+
+    #[test]
+    fn test_strip_ansi_color_codes() {
+        assert_eq!(
+            strip_ansi_sequences("\x1b[32mgreen\x1b[0m text"),
+            "green text"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_carriage_return_overwrite() {
+        // Bare \r (not followed by \n) clears the line — only new content remains
+        assert_eq!(strip_ansi_sequences("loading...\rdone!"), "done!");
+        // Multiple rewrites — only final version kept
+        assert_eq!(strip_ansi_sequences("10%\r50%\r100%"), "100%");
+    }
+
+    #[test]
+    fn test_strip_ansi_cr_lf_sequence() {
+        // Normal \r\n line endings should produce clean lines
+        assert_eq!(strip_ansi_sequences("line1\r\nline2\r\n"), "line1\nline2");
+    }
+
+    #[test]
+    fn test_strip_ansi_backspace() {
+        // "abc" then 2 backspaces then "xy" → "axy"
+        assert_eq!(strip_ansi_sequences("abc\x08\x08xy"), "axy");
+    }
+
+    #[test]
+    fn test_strip_ansi_autocomplete_simulation() {
+        // Simulates: user types "ca", autocomplete overwrites with "cargo build"
+        // PTY output: "ca" then \r to go back, then full "cargo build" overwrites
+        assert_eq!(
+            strip_ansi_sequences("$ ca\r$ cargo build\n"),
+            "$ cargo build"
+        );
+    }
+
+    #[test]
+    fn test_strip_ansi_erase_line() {
+        // ESC[K erases from cursor to end of line
+        assert_eq!(strip_ansi_sequences("hello world\r$ cmd\x1b[K\n"), "$ cmd");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_sequences() {
+        // OSC title-setting sequences should be stripped
+        assert_eq!(strip_ansi_sequences("\x1b]0;my-title\x07$ ls\n"), "$ ls");
     }
 }

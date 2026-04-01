@@ -7,7 +7,6 @@
 use evalexpr::ContextWithMutableVariables;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::process::Command;
 
 /// Evaluate a programmatic condition expression against artifact data.
 ///
@@ -152,10 +151,12 @@ fn json_to_evalexpr_value(value: &Value) -> evalexpr::Value {
     }
 }
 
-/// Evaluate an AI condition by asking Claude a question.
+/// Evaluate an AI condition by asking a model a question.
 ///
-/// Uses a one-shot prompt to get Claude to answer with exactly one of the port names.
+/// Uses a one-shot completion to get the model to answer with exactly one of the port names.
+/// Dispatches to the appropriate backend (Claude/Codex) based on the model.
 pub fn evaluate_ai_condition(
+    completion: &dyn crate::services::CompletionService,
     question: &str,
     ports: &[String],
     context: &str,
@@ -170,22 +171,14 @@ pub fn evaluate_ai_condition(
         port_list, context, question
     );
 
-    let model = model.unwrap_or("haiku");
+    let response = completion.complete(crate::services::CompletionRequest {
+        prompt,
+        model: Some(model.unwrap_or("haiku").to_string()),
+        backend: None,
+        output_format: crate::services::OutputFormat::Text,
+    })?;
 
-    // Run claude CLI
-    let output = Command::new("claude")
-        .args(["--model", model, "-p", &prompt])
-        .output()
-        .map_err(|e| format!("Failed to run claude: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Claude command failed: {}", stderr));
-    }
-
-    let response = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_lowercase();
+    let response = response.text.trim().to_lowercase();
 
     // Match response to port (case-insensitive, partial match)
     for port in ports {
@@ -274,5 +267,86 @@ mod tests {
         let context = serialize_context_for_ai(&data);
         assert!(context.contains("Add feature"));
         assert!(context.contains("risk"));
+    }
+
+    #[test]
+    fn test_ai_condition_matches_port() {
+        use crate::services::completion::{CompletionResponse, MockCompletionService};
+
+        let mut mock = MockCompletionService::new();
+        mock.expect_complete().returning(|_req| {
+            Ok(CompletionResponse {
+                text: "high_risk".to_string(),
+            })
+        });
+
+        let ports = vec!["high_risk".to_string(), "low_risk".to_string()];
+        let result = evaluate_ai_condition(&mock, "Is this risky?", &ports, "some context", None);
+        assert_eq!(result, Ok("high_risk".to_string()));
+    }
+
+    #[test]
+    fn test_ai_condition_case_insensitive_match() {
+        use crate::services::completion::{CompletionResponse, MockCompletionService};
+
+        let mut mock = MockCompletionService::new();
+        mock.expect_complete().returning(|_req| {
+            Ok(CompletionResponse {
+                text: "LOW_RISK".to_string(),
+            })
+        });
+
+        let ports = vec!["high_risk".to_string(), "low_risk".to_string()];
+        let result = evaluate_ai_condition(&mock, "Is this risky?", &ports, "context", None);
+        assert_eq!(result, Ok("low_risk".to_string()));
+    }
+
+    #[test]
+    fn test_ai_condition_no_match() {
+        use crate::services::completion::{CompletionResponse, MockCompletionService};
+
+        let mut mock = MockCompletionService::new();
+        mock.expect_complete().returning(|_req| {
+            Ok(CompletionResponse {
+                text: "maybe".to_string(),
+            })
+        });
+
+        let ports = vec!["approve".to_string(), "reject".to_string()];
+        let result = evaluate_ai_condition(&mock, "Should we?", &ports, "ctx", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("didn't match any port"));
+    }
+
+    #[test]
+    fn test_ai_condition_service_error() {
+        use crate::services::completion::MockCompletionService;
+
+        let mut mock = MockCompletionService::new();
+        mock.expect_complete()
+            .returning(|_req| Err("connection refused".to_string()));
+
+        let ports = vec!["yes".to_string(), "no".to_string()];
+        let result = evaluate_ai_condition(&mock, "Question?", &ports, "ctx", None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("connection refused"));
+    }
+
+    #[test]
+    fn test_ai_condition_passes_model() {
+        use crate::services::completion::{CompletionResponse, MockCompletionService};
+
+        let mut mock = MockCompletionService::new();
+        mock.expect_complete().returning(|req| {
+            // Verify the model was passed through
+            assert_eq!(req.model, Some("gpt-5.4-mini".to_string()));
+            Ok(CompletionResponse {
+                text: "yes".to_string(),
+            })
+        });
+
+        let ports = vec!["yes".to_string(), "no".to_string()];
+        let result = evaluate_ai_condition(&mock, "Question?", &ports, "ctx", Some("gpt-5.4-mini"));
+        assert_eq!(result, Ok("yes".to_string()));
     }
 }

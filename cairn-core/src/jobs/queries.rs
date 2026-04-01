@@ -42,7 +42,7 @@ pub fn get_implementation_for_pr_by_cwd(
         .inner_join(issues::table.on(jobs::issue_id.assume_not_null().eq(issues::id)))
         .inner_join(projects::table.on(issues::project_id.eq(projects::id)))
         .filter(jobs::worktree_path.eq(cwd))
-        .filter(runs::status.eq("running"))
+        .filter(runs::status.eq_any(&["starting", "live"]))
         .order(runs::created_at.desc())
         .select((
             jobs::id,

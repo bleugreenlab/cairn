@@ -6,8 +6,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::common::Model;
-
 /// Skill configuration for API responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,7 +15,6 @@ pub struct SkillConfig {
     pub description: String,
     pub prompt: String,
     pub allowed_tools: Option<Vec<String>>,
-    pub model: Option<Model>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
     pub created_at: i32,
@@ -33,7 +30,6 @@ pub struct CreateSkillConfig {
     pub description: String,
     pub prompt: String,
     pub allowed_tools: Option<Vec<String>>,
-    pub model: Option<Model>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
 }
@@ -46,7 +42,6 @@ pub struct UpdateSkillConfig {
     pub description: Option<String>,
     pub prompt: Option<String>,
     pub allowed_tools: Option<Option<Vec<String>>>,
-    pub model: Option<Option<Model>>,
     pub workspace_id: Option<Option<String>>,
     pub project_id: Option<Option<String>>,
 }

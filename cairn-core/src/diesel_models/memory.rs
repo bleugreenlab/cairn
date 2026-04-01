@@ -18,6 +18,9 @@ pub struct DbMemory {
     pub surfaced_count: i32,
     pub last_surfaced_at: Option<i32>,
     pub active: i32,
+    pub scope: String,
+    pub keywords: Option<String>,
+    pub source_run_id: Option<String>,
 }
 
 #[derive(Debug, Insertable)]
@@ -33,6 +36,9 @@ pub struct NewMemory<'a> {
     pub surfaced_count: i32,
     pub last_surfaced_at: Option<i32>,
     pub active: i32,
+    pub scope: &'a str,
+    pub keywords: Option<&'a str>,
+    pub source_run_id: Option<&'a str>,
 }
 
 #[derive(Debug, Queryable, Selectable)]

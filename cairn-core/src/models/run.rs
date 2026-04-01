@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A run - a single execution attempt within a job or chat
+/// A run — one process attachment lifetime.
+///
+/// Created when a process spawns, finalized when it exits.
+/// A warm process that serves multiple turns is one Run with multiple Turns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
@@ -12,33 +15,83 @@ pub struct Run {
     pub job_id: Option<String>,
     pub chat_id: Option<String>,
     pub status: RunStatus,
-    pub claude_session_id: Option<String>,
+    pub session_id: Option<String>,
+    pub backend: Option<String>,
+    pub exit_reason: Option<String>,
     pub error_message: Option<String>,
     pub started_at: Option<i64>,
-    pub completed_at: Option<i64>,
+    pub exited_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub todos: Option<serde_json::Value>,
+    pub start_mode: Option<RunStartMode>,
 }
 
+/// How the run was started — fresh session or resuming existing.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStartMode {
+    /// Started with --session-id (new conversation)
+    Fresh,
+    /// Started with --resume (continuing existing conversation)
+    Resume,
+    /// Started by forking an existing session into a new child session
+    Fork,
+}
+
+impl std::fmt::Display for RunStartMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunStartMode::Fresh => write!(f, "fresh"),
+            RunStartMode::Resume => write!(f, "resume"),
+            RunStartMode::Fork => write!(f, "fork"),
+        }
+    }
+}
+
+impl std::str::FromStr for RunStartMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "fresh" => Ok(RunStartMode::Fresh),
+            "resume" => Ok(RunStartMode::Resume),
+            "fork" => Ok(RunStartMode::Fork),
+            other => Err(format!("unknown start mode: {}", other)),
+        }
+    }
+}
+
+/// Run lifecycle status (stored).
+///
+/// Tracks the process lifecycle only — semantic work outcome is on Turn.
+/// Transitions are validated by `transitions::transition_run`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
-    Pending,
-    Running,
-    Paused,
-    Completed,
-    Failed,
+    /// Process spawned, not yet producing events.
+    Starting,
+    /// Process connected and responsive.
+    Live,
+    /// Process exited cleanly.
+    Exited,
+    /// Process died unexpectedly.
+    Crashed,
+}
+
+impl RunStatus {
+    /// Whether the run is in a terminal state (process no longer alive).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, RunStatus::Exited | RunStatus::Crashed)
+    }
 }
 
 impl std::fmt::Display for RunStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RunStatus::Pending => write!(f, "pending"),
-            RunStatus::Running => write!(f, "running"),
-            RunStatus::Paused => write!(f, "paused"),
-            RunStatus::Completed => write!(f, "completed"),
-            RunStatus::Failed => write!(f, "failed"),
+            RunStatus::Starting => write!(f, "starting"),
+            RunStatus::Live => write!(f, "live"),
+            RunStatus::Exited => write!(f, "exited"),
+            RunStatus::Crashed => write!(f, "crashed"),
         }
     }
 }
@@ -48,11 +101,16 @@ impl std::str::FromStr for RunStatus {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "pending" => Ok(RunStatus::Pending),
-            "running" => Ok(RunStatus::Running),
-            "paused" => Ok(RunStatus::Paused),
-            "completed" => Ok(RunStatus::Completed),
-            "failed" => Ok(RunStatus::Failed),
+            "starting" => Ok(RunStatus::Starting),
+            "live" => Ok(RunStatus::Live),
+            "exited" => Ok(RunStatus::Exited),
+            "crashed" => Ok(RunStatus::Crashed),
+            // Backwards compat for pre-migration data
+            "pending" => Ok(RunStatus::Starting),
+            "running" | "idle" => Ok(RunStatus::Live),
+            "complete" | "completed" => Ok(RunStatus::Exited),
+            "failed" => Ok(RunStatus::Crashed),
+            "paused" => Ok(RunStatus::Live),
             _ => Err(format!("Unknown status: {}", s)),
         }
     }
@@ -75,6 +133,7 @@ pub struct Event {
     pub cache_read_tokens: Option<i32>,
     pub cache_create_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
+    pub turn_id: Option<String>,
 }
 
 /// A prompt awaiting user response
@@ -188,13 +247,143 @@ impl std::str::FromStr for CiStatus {
     }
 }
 
-/// Todo item extracted from TodoWrite tool calls
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_terminal() {
+        assert!(!RunStatus::Starting.is_terminal());
+        assert!(!RunStatus::Live.is_terminal());
+        assert!(RunStatus::Exited.is_terminal());
+        assert!(RunStatus::Crashed.is_terminal());
+    }
+
+    #[test]
+    fn test_display() {
+        assert_eq!(RunStatus::Starting.to_string(), "starting");
+        assert_eq!(RunStatus::Live.to_string(), "live");
+        assert_eq!(RunStatus::Exited.to_string(), "exited");
+        assert_eq!(RunStatus::Crashed.to_string(), "crashed");
+    }
+
+    #[test]
+    fn test_from_str_canonical() {
+        assert_eq!(
+            "starting".parse::<RunStatus>().unwrap(),
+            RunStatus::Starting
+        );
+        assert_eq!("live".parse::<RunStatus>().unwrap(), RunStatus::Live);
+        assert_eq!("exited".parse::<RunStatus>().unwrap(), RunStatus::Exited);
+        assert_eq!("crashed".parse::<RunStatus>().unwrap(), RunStatus::Crashed);
+    }
+
+    #[test]
+    fn test_from_str_case_insensitive() {
+        assert_eq!(
+            "STARTING".parse::<RunStatus>().unwrap(),
+            RunStatus::Starting
+        );
+        assert_eq!("Live".parse::<RunStatus>().unwrap(), RunStatus::Live);
+    }
+
+    #[test]
+    fn test_from_str_backwards_compat() {
+        // pending → Starting
+        assert_eq!("pending".parse::<RunStatus>().unwrap(), RunStatus::Starting);
+        // running, idle → Live
+        assert_eq!("running".parse::<RunStatus>().unwrap(), RunStatus::Live);
+        assert_eq!("idle".parse::<RunStatus>().unwrap(), RunStatus::Live);
+        // complete, completed → Exited
+        assert_eq!("complete".parse::<RunStatus>().unwrap(), RunStatus::Exited);
+        assert_eq!("completed".parse::<RunStatus>().unwrap(), RunStatus::Exited);
+        // failed → Crashed
+        assert_eq!("failed".parse::<RunStatus>().unwrap(), RunStatus::Crashed);
+        // paused → Live
+        assert_eq!("paused".parse::<RunStatus>().unwrap(), RunStatus::Live);
+    }
+
+    #[test]
+    fn test_from_str_unknown_returns_error() {
+        let result = "bogus".parse::<RunStatus>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown status"));
+    }
+
+    #[test]
+    fn test_display_roundtrip() {
+        for status in [
+            RunStatus::Starting,
+            RunStatus::Live,
+            RunStatus::Exited,
+            RunStatus::Crashed,
+        ] {
+            let s = status.to_string();
+            let parsed: RunStatus = s.parse().unwrap();
+            assert_eq!(parsed, status);
+        }
+    }
+
+    #[test]
+    fn test_run_start_mode_display() {
+        assert_eq!(RunStartMode::Fresh.to_string(), "fresh");
+        assert_eq!(RunStartMode::Resume.to_string(), "resume");
+        assert_eq!(RunStartMode::Fork.to_string(), "fork");
+    }
+
+    #[test]
+    fn test_run_start_mode_from_str() {
+        assert_eq!(
+            "fresh".parse::<RunStartMode>().unwrap(),
+            RunStartMode::Fresh
+        );
+        assert_eq!(
+            "resume".parse::<RunStartMode>().unwrap(),
+            RunStartMode::Resume
+        );
+        assert_eq!("fork".parse::<RunStartMode>().unwrap(), RunStartMode::Fork);
+    }
+
+    #[test]
+    fn test_run_start_mode_from_str_unknown() {
+        let result = "warm".parse::<RunStartMode>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown start mode"));
+    }
+
+    #[test]
+    fn test_run_start_mode_roundtrip() {
+        for mode in [RunStartMode::Fresh, RunStartMode::Resume, RunStartMode::Fork] {
+            let s = mode.to_string();
+            let parsed: RunStartMode = s.parse().unwrap();
+            assert_eq!(parsed, mode);
+        }
+    }
+}
+
+/// Todo item stored in the todos table
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TodoItem {
+    pub id: String,
     pub content: String,
     pub status: String, // "pending" | "in_progress" | "completed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>, // "high" | "medium" | "low"
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub active_form: Option<String>,
+}
+
+impl From<crate::diesel_models::DbTodo> for TodoItem {
+    fn from(db: crate::diesel_models::DbTodo) -> Self {
+        TodoItem {
+            id: db.todo_id,
+            content: db.content,
+            status: db.status,
+            priority: db.priority,
+            active_form: db.active_form,
+        }
+    }
 }
 
 /// Todos grouped by run, for showing accumulated todos across multiple runs

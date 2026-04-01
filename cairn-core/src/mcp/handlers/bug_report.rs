@@ -8,8 +8,6 @@ use crate::orchestrator::Orchestrator;
 
 use super::lookup_run;
 
-const BUG_REPORT_API_URL: &str = "https://bug.cairn.md/api/reports";
-
 // ============================================================================
 // Payload Types
 // ============================================================================
@@ -90,7 +88,8 @@ pub async fn handle_bug_report(orch: &Orchestrator, request: &McpCallbackRequest
             }
         };
 
-        match client.post(BUG_REPORT_API_URL).json(&report).send().await {
+        let bug_report_url = crate::api::ApiConfig::default().bug_report_url();
+        match client.post(&bug_report_url).json(&report).send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     log::warn!("bug_report: API returned status {}", resp.status());

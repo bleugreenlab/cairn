@@ -17,7 +17,7 @@ pub struct StepBehavior {
 /// Resolve behavior for a recipe node (DAG-based execution).
 pub fn resolve_node_behavior(node: &DbRecipeNode) -> StepBehavior {
     match node.node_type.as_str() {
-        // Agent nodes run Claude sessions - worktree behavior depends on git_config
+        // Agent nodes run backend sessions - worktree behavior depends on git_config
         "agent" => {
             let worktree_mode = parse_worktree_mode(node);
 

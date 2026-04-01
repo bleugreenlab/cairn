@@ -1,7 +1,7 @@
 //! Issue CRUD operations.
 
 use crate::diesel_models::{DbIssue, NewIssue, UpdateIssueChangeset};
-use crate::models::{CreateIssue, Issue, IssueStatus, UpdateIssue, WaitState};
+use crate::models::{CreateIssue, Issue, IssueAttention, IssueProgress, IssueStatus, UpdateIssue};
 use crate::schema::{issues, projects};
 use crate::services::Clock;
 use diesel::prelude::*;
@@ -17,21 +17,17 @@ pub fn db_issue_to_issue(db: DbIssue) -> Issue {
         title: db.title,
         description: db.description.unwrap_or_default(),
         status: db.status.parse().unwrap_or(IssueStatus::Backlog),
+        progress: db.progress.parse().unwrap_or(IssueProgress::Backlog),
+        attention: db.attention.parse().unwrap_or(IssueAttention::None),
         priority: db.priority.unwrap_or(0),
-        wait_state: db
-            .wait_state
-            .as_ref()
-            .and_then(|s| s.parse::<WaitState>().ok()),
         completed_at: db.completed_at.map(|t| t as i64),
         dismissed_at: db.dismissed_at.map(|t| t as i64),
         created_at: db.created_at as i64,
         updated_at: db.updated_at as i64,
-        model: db.model.as_ref().and_then(|s| s.parse().ok()),
-        skills: db
-            .skills
-            .as_ref()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default(),
+        backend_override: db.model,
+        merged_at: db.merged_at.map(|t| t as i64),
+        closed_at: db.closed_at.map(|t| t as i64),
+        manager_id: db.manager_id,
     }
 }
 
@@ -62,13 +58,6 @@ pub fn create(
         .map_err(|e| e.to_string())?;
 
     let description = input.description.as_deref();
-    let model_str = input.model.as_ref().map(|m| m.to_string());
-    let skills_json = input
-        .skills
-        .as_ref()
-        .filter(|s| !s.is_empty())
-        .map(|s| serde_json::to_string(s).unwrap());
-
     let new_issue = NewIssue {
         id: &id,
         project_id: &input.project_id,
@@ -76,11 +65,13 @@ pub fn create(
         title: &input.title,
         description,
         status: "backlog",
+        progress: "backlog",
+        attention: "none",
         priority: Some(0),
         created_at: now,
         updated_at: now,
-        model: model_str.as_deref(),
-        skills: skills_json.as_deref(),
+        model: None,
+        manager_id: input.manager_id.as_deref(),
     };
 
     diesel::insert_into(issues::table)
@@ -95,14 +86,17 @@ pub fn create(
         title: input.title,
         description: input.description.unwrap_or_default(),
         status: IssueStatus::Backlog,
+        progress: IssueProgress::Backlog,
+        attention: IssueAttention::None,
         priority: 0,
-        wait_state: None,
         completed_at: None,
         dismissed_at: None,
         created_at: now as i64,
         updated_at: now as i64,
-        model: input.model,
-        skills: input.skills.unwrap_or_default(),
+        backend_override: None,
+        merged_at: None,
+        closed_at: None,
+        manager_id: input.manager_id,
     })
 }
 
@@ -136,41 +130,24 @@ pub fn update(
 ) -> Result<Issue, String> {
     let now = clock.now() as i32;
 
-    let model_str: Option<String> = input
-        .model
+    let backend_override_update: Option<Option<&str>> = input
+        .backend_override
         .as_ref()
-        .and_then(|m| m.as_ref().map(|m| m.to_string()));
-    let model_update: Option<Option<&str>> = input
-        .model
-        .as_ref()
-        .map(|m| m.as_ref().map(|_| model_str.as_deref().unwrap()));
-
-    let skills_json: Option<String> = input.skills.as_ref().map(|s| {
-        if s.is_empty() {
-            String::new()
-        } else {
-            serde_json::to_string(s).unwrap()
-        }
-    });
-    let skills_update: Option<Option<&str>> = input.skills.as_ref().map(|s| {
-        if s.is_empty() {
-            None
-        } else {
-            skills_json.as_deref()
-        }
-    });
+        .map(|value| value.as_deref());
 
     let changeset = UpdateIssueChangeset {
         updated_at: Some(now),
         title: input.title.as_deref(),
         description: input.description.as_ref().map(|d| Some(d.as_str())),
         status: None,
+        progress: None,
+        attention: None,
         priority: None,
         completed_at: None,
         dismissed_at: None,
-        wait_state: None,
-        model: model_update,
-        skills: skills_update,
+        model: backend_override_update,
+        merged_at: None,
+        closed_at: None,
     };
 
     diesel::update(issues::table.find(&input.id))
@@ -211,50 +188,14 @@ pub fn restore(conn: &mut SqliteConnection, clock: &dyn Clock, id: &str) -> Resu
     Ok(())
 }
 
-/// Mark an issue as completed (merged).
+/// Mark an issue as merged (sets merged_at timestamp and recomputes status).
 pub fn complete(conn: &mut SqliteConnection, clock: &dyn Clock, id: &str) -> Result<(), String> {
-    let now = clock.now() as i32;
-
-    diesel::update(issues::table.find(id))
-        .set((
-            issues::completed_at.eq(Some(now)),
-            issues::status.eq("merged"),
-            issues::wait_state.eq(None::<String>),
-            issues::updated_at.eq(now),
-        ))
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-/// Update issue status directly in the database.
-/// Clears wait_state for terminal states (merged/closed).
-pub fn update_status_db(
-    conn: &mut SqliteConnection,
-    clock: &dyn Clock,
-    id: &str,
-    status: &str,
-) -> Result<(), String> {
-    let now = clock.now() as i32;
-    let is_terminal = status == "merged" || status == "closed";
-
-    if is_terminal {
-        diesel::update(issues::table.find(id))
-            .set((
-                issues::status.eq(status),
-                issues::wait_state.eq(None::<String>),
-                issues::updated_at.eq(now),
-            ))
-            .execute(conn)
-            .map_err(|e| e.to_string())?;
-    } else {
-        diesel::update(issues::table.find(id))
-            .set((issues::status.eq(status), issues::updated_at.eq(now)))
-            .execute(conn)
-            .map_err(|e| e.to_string())?;
-    }
-
+    crate::transitions::resolve_issue(
+        conn,
+        id,
+        crate::transitions::Resolution::Merged,
+        Some(clock),
+    )?;
     Ok(())
 }
 
@@ -289,7 +230,7 @@ pub fn delete_db(conn: &mut SqliteConnection, issue_id: &str) -> Result<(), Stri
         .execute(conn)
         .map_err(|e| e.to_string())?;
 
-    // Delete jobs (pr_data, artifacts will cascade)
+    // Delete jobs (merge_requests, artifacts will cascade)
     diesel::delete(jobs::table.filter(jobs::issue_id.eq(issue_id)))
         .execute(conn)
         .map_err(|e| e.to_string())?;
@@ -323,8 +264,8 @@ mod tests {
                 project_id: project_id.to_string(),
                 title: title.to_string(),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
+                manager_id: None,
             },
         )
         .expect("Failed to create test issue")
@@ -344,8 +285,8 @@ mod tests {
                 project_id: project_id.clone(),
                 title: "Test Issue".to_string(),
                 description: Some("A description".to_string()),
-                model: None,
-                skills: None,
+                backend_override: None,
+                manager_id: None,
             },
         )
         .unwrap();
@@ -355,6 +296,8 @@ mod tests {
         assert_eq!(issue.number, 1);
         assert_eq!(issue.project_id, project_id);
         assert_eq!(issue.status, IssueStatus::Backlog);
+        assert!(issue.merged_at.is_none());
+        assert!(issue.closed_at.is_none());
     }
 
     #[test]
@@ -370,8 +313,9 @@ mod tests {
                 project_id: project_id.clone(),
                 title: "First".to_string(),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
+
+                manager_id: None,
             },
         )
         .unwrap();
@@ -383,8 +327,9 @@ mod tests {
                 project_id: project_id.clone(),
                 title: "Second".to_string(),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
+
+                manager_id: None,
             },
         )
         .unwrap();
@@ -404,8 +349,9 @@ mod tests {
                 project_id: "nonexistent".to_string(),
                 title: "Test".to_string(),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
+
+                manager_id: None,
             },
         );
 
@@ -428,8 +374,9 @@ mod tests {
                 project_id: project_id.clone(),
                 title: "Clock Test Issue".to_string(),
                 description: Some("Testing clock injection".to_string()),
-                model: None,
-                skills: None,
+                backend_override: None,
+
+                manager_id: None,
             },
         )
         .unwrap();
@@ -457,8 +404,9 @@ mod tests {
                 project_id: project_id.clone(),
                 title: "Test".to_string(),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
+
+                manager_id: None,
             },
         )
         .unwrap();
@@ -483,8 +431,7 @@ mod tests {
                 id: issue_id.clone(),
                 title: Some("Updated Title".to_string()),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
             },
         )
         .unwrap();
@@ -509,8 +456,7 @@ mod tests {
                 id: issue_id.clone(),
                 title: None,
                 description: Some("New description".to_string()),
-                model: None,
-                skills: None,
+                backend_override: None,
             },
         )
         .unwrap();
@@ -535,8 +481,7 @@ mod tests {
                 id: issue_id,
                 title: Some("New Title".to_string()),
                 description: Some("New Description".to_string()),
-                model: None,
-                skills: None,
+                backend_override: None,
             },
         )
         .unwrap();
@@ -560,8 +505,7 @@ mod tests {
                 id: "nonexistent".to_string(),
                 title: Some("Title".to_string()),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
             },
         );
 
@@ -619,6 +563,7 @@ mod tests {
 
         let db_issue: DbIssue = issues::table.find(&issue_id).first(&mut conn).unwrap();
         assert_eq!(db_issue.status, "merged");
+        assert_eq!(db_issue.merged_at, Some(1700003000));
         assert_eq!(db_issue.completed_at, Some(1700003000));
         assert_eq!(db_issue.updated_at, 1700003000);
     }
@@ -656,8 +601,9 @@ mod tests {
                 project_id: project_id.clone(),
                 title: "Lifecycle Test".to_string(),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
+
+                manager_id: None,
             },
         )
         .unwrap();
@@ -673,8 +619,7 @@ mod tests {
                 id: issue.id.clone(),
                 title: Some("Updated".to_string()),
                 description: None,
-                model: None,
-                skills: None,
+                backend_override: None,
             },
         )
         .unwrap();
@@ -697,6 +642,7 @@ mod tests {
 
         let db_issue: DbIssue = issues::table.find(&issue.id).first(&mut conn).unwrap();
         assert_eq!(db_issue.status, "merged");
+        assert_eq!(db_issue.merged_at, Some(5000));
         assert_eq!(db_issue.completed_at, Some(5000));
         assert!(db_issue.dismissed_at.is_none());
         assert_eq!(db_issue.updated_at, 5000);

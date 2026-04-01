@@ -4,9 +4,40 @@
 //! These files can be version-controlled with the project.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::models::TerminalCommand;
+use crate::models::{Preset, TerminalCommand};
+
+/// External reference resource (git repo or local directory).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Resource {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// Worktree behavior settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSettings {
+    /// When true, seed gitignored repo content into new worktrees.
+    #[serde(default = "default_true")]
+    pub seed_ignored: bool,
+}
+
+impl Default for WorktreeSettings {
+    fn default() -> Self {
+        Self { seed_ignored: true }
+    }
+}
 
 /// Project settings as stored in YAML file.
 /// All fields are optional - missing fields use defaults.
@@ -16,11 +47,35 @@ pub struct ProjectSettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_commands: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub copy_files: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_commands: Option<Vec<TerminalCommand>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Vec<Resource>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeSettings>,
+    /// Project-level override for active backend
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_backend: Option<String>,
+    /// Project-level override for default tier
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_tier: Option<String>,
+    /// Project-level preset overrides (deep-merged with workspace)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
+}
+
+impl ProjectSettingsFile {
+    pub fn should_seed_worktree_ignored(&self) -> bool {
+        self.worktree
+            .as_ref()
+            .map(|worktree| worktree.seed_ignored)
+            .unwrap_or(true)
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Intermediate struct for loading legacy config files.
@@ -38,6 +93,17 @@ struct LegacyProjectSettingsFile {
     terminal_commands: Option<Vec<LegacyTerminalCommand>>,
     #[serde(default)]
     default_branch: Option<String>,
+    #[serde(default)]
+    resources: Option<Vec<Resource>>,
+    #[serde(default)]
+    worktree: Option<WorktreeSettings>,
+    // Preset fields — must be present so they survive the legacy parse path
+    #[serde(default)]
+    active_backend: Option<String>,
+    #[serde(default)]
+    default_tier: Option<String>,
+    #[serde(default)]
+    backends: Option<HashMap<String, HashMap<String, Preset>>>,
 }
 
 /// Legacy terminal command with persistent field
@@ -100,17 +166,24 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
 
     // Check if migration is needed
     let has_ci_commands = legacy.ci_commands.is_some();
+    let has_copy_files = legacy.copy_files.is_some();
+    if let Some(ref files) = legacy.copy_files {
+        log::warn!(
+            "Removing deprecated copyFiles from project config: {:?}. \
+             Gitignored content is now auto-seeded into worktrees via symlinks.",
+            files
+        );
+    }
     let has_persistent = legacy
         .terminal_commands
         .as_ref()
         .map(|cmds| cmds.iter().any(|c| c.persistent))
         .unwrap_or(false);
-    let needs_migration = has_ci_commands || has_persistent;
+    let needs_migration = has_ci_commands || has_copy_files || has_persistent;
 
     // Convert to current format (dropping deprecated fields)
     let settings = ProjectSettingsFile {
         setup_commands: legacy.setup_commands,
-        copy_files: legacy.copy_files,
         terminal_commands: legacy.terminal_commands.map(|cmds| {
             cmds.into_iter()
                 .map(|c| TerminalCommand {
@@ -120,6 +193,11 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
                 .collect()
         }),
         default_branch: legacy.default_branch,
+        resources: legacy.resources,
+        worktree: legacy.worktree,
+        active_backend: legacy.active_backend,
+        default_tier: legacy.default_tier,
+        backends: legacy.backends,
     };
 
     Ok((settings, needs_migration))
@@ -166,15 +244,18 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 #
 # This file configures how Cairn works with this project.
 # It can be committed to version control to share settings with your team.
+#
+# Worktrees can be seeded with gitignored content from the main repo
+# (node_modules, target/, .env files, etc.).
+# Directories are symlinked (instant, shared), files are copied.
+#
+# Toggle seeding on or off per project (default: true)
+# worktree:
+#   seedIgnored: true
 
 # Commands to run when setting up a new worktree
 # setupCommands:
 #   - npm install
-
-# Files to copy from main repo to worktrees (e.g., .env files)
-# copyFiles:
-#   - .env
-#   - config/local.yaml
 
 # Quick-access terminal commands
 # terminalCommands:
@@ -185,6 +266,15 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 
 # Default branch for the project (defaults to 'main')
 # defaultBranch: main
+
+# External reference repositories and directories
+# resources:
+#   - name: docs
+#     git: https://github.com/org/docs.git
+#     description: Project documentation
+#   - name: specs
+#     path: ~/Documents/specs
+#     description: Hardware specifications
 "#;
 
     std::fs::write(&path, template)
@@ -200,28 +290,27 @@ mod tests {
     fn test_project_settings_defaults() {
         let settings = ProjectSettingsFile::default();
         assert!(settings.setup_commands.is_none());
-        assert!(settings.copy_files.is_none());
         assert!(settings.terminal_commands.is_none());
         assert!(settings.default_branch.is_none());
+        assert!(settings.should_seed_worktree_ignored());
     }
 
     #[test]
     fn test_project_settings_roundtrip() {
         let settings = ProjectSettingsFile {
             setup_commands: Some(vec!["npm install".to_string()]),
-            copy_files: Some(vec![".env".to_string(), "config/local.yaml".to_string()]),
             terminal_commands: Some(vec![TerminalCommand {
                 name: "Dev Server".to_string(),
                 command: "npm run dev".to_string(),
             }]),
             default_branch: Some("develop".to_string()),
+            ..Default::default()
         };
 
         let yaml = serde_yaml::to_string(&settings).unwrap();
         let parsed: ProjectSettingsFile = serde_yaml::from_str(&yaml).unwrap();
 
         assert_eq!(parsed.setup_commands, settings.setup_commands);
-        assert_eq!(parsed.copy_files, settings.copy_files);
         assert_eq!(parsed.default_branch, settings.default_branch);
         assert_eq!(parsed.terminal_commands.as_ref().map(|v| v.len()), Some(1));
     }
@@ -240,29 +329,48 @@ defaultBranch: main
             Some(vec!["npm install".to_string()])
         );
         assert_eq!(settings.default_branch, Some("main".to_string()));
-        assert!(settings.copy_files.is_none());
         assert!(settings.terminal_commands.is_none());
+        assert!(settings.should_seed_worktree_ignored());
     }
 
     #[test]
-    fn test_yaml_deserialization_with_copy_files() {
+    fn test_worktree_seed_ignored_can_be_disabled() {
         let yaml = r#"
-setupCommands:
+worktree:
+  seedIgnored: false
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+
+        assert_eq!(
+            settings.worktree.as_ref().map(|w| w.seed_ignored),
+            Some(false)
+        );
+        assert!(!settings.should_seed_worktree_ignored());
+    }
+
+    #[test]
+    fn test_legacy_copy_files_triggers_migration() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+
+        // Write a legacy config with copyFiles
+        let legacy_content = r#"setupCommands:
   - npm install
 copyFiles:
   - .env
   - config/secrets.yaml
 "#;
-        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, legacy_content).unwrap();
 
-        assert_eq!(
-            settings.setup_commands,
-            Some(vec!["npm install".to_string()])
-        );
-        assert_eq!(
-            settings.copy_files,
-            Some(vec![".env".to_string(), "config/secrets.yaml".to_string()])
-        );
+        // Load should trigger migration and strip copyFiles
+        let loaded = load_project_settings(project_path);
+        assert_eq!(loaded.setup_commands, Some(vec!["npm install".to_string()]));
+
+        // Verify file was migrated (no copyFiles)
+        let migrated_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!migrated_content.contains("copyFiles"));
     }
 
     #[test]
@@ -272,9 +380,8 @@ copyFiles:
 
         let settings = ProjectSettingsFile {
             setup_commands: Some(vec!["cargo build".to_string()]),
-            copy_files: None,
-            terminal_commands: None,
             default_branch: Some("main".to_string()),
+            ..Default::default()
         };
 
         save_project_settings(project_path, &settings).unwrap();
@@ -307,9 +414,7 @@ copyFiles:
         // Create a custom config first
         let settings = ProjectSettingsFile {
             setup_commands: Some(vec!["custom".to_string()]),
-            copy_files: None,
-            terminal_commands: None,
-            default_branch: None,
+            ..Default::default()
         };
         save_project_settings(project_path, &settings).unwrap();
 
@@ -324,6 +429,70 @@ copyFiles:
     fn test_get_project_config_path() {
         let path = get_project_config_path(Path::new("/home/user/project"));
         assert_eq!(path, PathBuf::from("/home/user/project/.cairn/config.yaml"));
+    }
+
+    #[test]
+    fn test_resource_serde_git() {
+        let yaml = r#"
+resources:
+  - name: openpnp
+    git: https://github.com/openpnp/openpnp.git
+    description: OpenPnP source code
+    branch: develop
+  - name: local-specs
+    path: ~/Documents/specs
+    description: Hardware specifications
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let resources = settings.resources.unwrap();
+        assert_eq!(resources.len(), 2);
+
+        assert_eq!(resources[0].name, "openpnp");
+        assert_eq!(
+            resources[0].git.as_deref(),
+            Some("https://github.com/openpnp/openpnp.git")
+        );
+        assert!(resources[0].path.is_none());
+        assert_eq!(resources[0].branch.as_deref(), Some("develop"));
+
+        assert_eq!(resources[1].name, "local-specs");
+        assert!(resources[1].git.is_none());
+        assert_eq!(resources[1].path.as_deref(), Some("~/Documents/specs"));
+        assert!(resources[1].branch.is_none());
+    }
+
+    #[test]
+    fn test_resource_roundtrip() {
+        let settings = ProjectSettingsFile {
+            resources: Some(vec![Resource {
+                name: "docs".to_string(),
+                git: Some("https://github.com/org/docs.git".to_string()),
+                path: None,
+                description: Some("Project docs".to_string()),
+                branch: None,
+            }]),
+            ..Default::default()
+        };
+
+        let yaml = serde_yaml::to_string(&settings).unwrap();
+        let parsed: ProjectSettingsFile = serde_yaml::from_str(&yaml).unwrap();
+        let resources = parsed.resources.unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].name, "docs");
+        assert_eq!(
+            resources[0].git.as_deref(),
+            Some("https://github.com/org/docs.git")
+        );
+    }
+
+    #[test]
+    fn test_settings_without_resources() {
+        let yaml = r#"
+setupCommands:
+  - npm install
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        assert!(settings.resources.is_none());
     }
 
     #[test]
@@ -364,5 +533,73 @@ defaultBranch: main
         let migrated_content = std::fs::read_to_string(&config_path).unwrap();
         assert!(!migrated_content.contains("ciCommands"));
         assert!(!migrated_content.contains("persistent"));
+    }
+
+    #[test]
+    fn test_preset_fields_survive_legacy_parse() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+
+        // Write a config with both legacy fields and preset overrides
+        let content = r#"
+setupCommands:
+  - npm install
+activeBackend: codex
+defaultTier: lg
+backends:
+  codex:
+    lg:
+      model: gpt-5.4
+      reasoningEffort: high
+"#;
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+
+        let loaded = load_project_settings(project_path);
+
+        // Preset fields must survive the legacy parse path
+        assert_eq!(loaded.active_backend.as_deref(), Some("codex"));
+        assert_eq!(loaded.default_tier.as_deref(), Some("lg"));
+        assert!(loaded.backends.is_some());
+        let backends = loaded.backends.unwrap();
+        assert!(backends.contains_key("codex"));
+        assert_eq!(backends["codex"]["lg"].model.as_str(), "gpt-5.4");
+    }
+
+    #[test]
+    fn test_preset_fields_survive_migration_rewrite() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+
+        // Legacy config with ciCommands (triggers migration) AND preset overrides
+        let content = r#"
+ciCommands:
+  - npm test
+setupCommands:
+  - npm install
+worktree:
+  seedIgnored: false
+activeBackend: codex
+defaultTier: sm
+"#;
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+
+        // Load triggers migration (rewrites file without ciCommands)
+        let loaded = load_project_settings(project_path);
+
+        // Preset fields must survive the migration rewrite
+        assert_eq!(loaded.active_backend.as_deref(), Some("codex"));
+        assert_eq!(loaded.default_tier.as_deref(), Some("sm"));
+        assert!(!loaded.should_seed_worktree_ignored());
+
+        // Verify rewritten file still has preset fields
+        let rewritten = std::fs::read_to_string(&config_path).unwrap();
+        assert!(rewritten.contains("activeBackend"));
+        assert!(rewritten.contains("codex"));
+        assert!(rewritten.contains("seedIgnored: false"));
+        assert!(!rewritten.contains("ciCommands"));
     }
 }
