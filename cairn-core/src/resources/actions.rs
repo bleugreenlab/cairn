@@ -48,22 +48,34 @@ pub(crate) async fn read_actions_collection(
         },
     };
 
-    let mut actions: Vec<ActionConfig> =
-        match action_queries::list_action_configs(&orch.db.local, Some(WORKSPACE_ID), None, false)
+    // Agent-facing effective set: workspace actions inherited, project actions
+    // shadowing by name, per-project disabled names removed. Without a project
+    // context, only workspace actions are visible.
+    let actions: Vec<ActionConfig> = match project_id.as_deref() {
+        Some(project_id) => {
+            match action_queries::list_action_configs_for_context(
+                &orch.db.local,
+                project_id,
+                false,
+            )
             .await
+            {
+                Ok(list) => list,
+                Err(e) => return format!("Error listing actions: {e}"),
+            }
+        }
+        None => match action_queries::list_action_configs(
+            &orch.db.local,
+            Some(WORKSPACE_ID),
+            None,
+            false,
+        )
+        .await
         {
             Ok(list) => list,
             Err(e) => return format!("Error listing actions: {e}"),
-        };
-
-    if let Some(project_id) = project_id.as_deref() {
-        match action_queries::list_action_configs(&orch.db.local, None, Some(project_id), false)
-            .await
-        {
-            Ok(project_actions) => actions.extend(project_actions),
-            Err(e) => return format!("Error listing project actions: {e}"),
-        }
-    }
+        },
+    };
 
     let header = match project_key.as_deref() {
         Some(key) => format!("# Actions — {key} context\n\n"),

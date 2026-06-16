@@ -32,7 +32,6 @@ use super::project::{
     produce_project_issues, read_project, read_project_issues, read_project_search,
     read_project_settings, read_projects,
 };
-use super::prs::read_project_prs;
 use super::recipes::{read_recipe, read_recipes_collection};
 use super::settings::read_settings;
 
@@ -1580,13 +1579,6 @@ async fn render_resource_body(
                 error
             } else {
                 read_project_settings(orch, &project).await
-            }
-        }
-        CairnResource::ProjectPrs { project } => {
-            if let Some(error) = reject_query_params("project prs", &params) {
-                error
-            } else {
-                read_project_prs(&orch.db.local, &project).await
             }
         }
         // Terminal URIs are routed to read_resource by the MCP binary and should never reach here

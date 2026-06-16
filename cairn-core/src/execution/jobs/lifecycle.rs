@@ -860,40 +860,34 @@ pub fn continue_job_impl(
             &side_channel_notices,
         )?;
     }
-    let prompt = {
-        let mut parts: Vec<String> = Vec::new();
-        if !base_prompt.is_empty() {
-            parts.push(base_prompt);
-        }
-        if !side_channel_notices.is_empty() {
-            parts.push(
-                crate::messages::transcript::render_side_channel_prompt_block(
-                    &side_channel_notices,
-                ),
-            );
-        }
-        // CAIRN-1647: the briefing (claimed above) is rendered from CURRENT
-        // ledger state; an empty set (all handled since the wake) yields None
-        // — the stale-wake drop. The agent gets the full resolved markdown here;
-        // the UI gets the compact structured event stored below.
-        if let Some(b) = &briefing {
-            parts.push(b.prompt.clone());
-        }
-        if has_queued {
-            parts.push(
-                queued_messages
-                    .iter()
-                    .map(|m| m.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            );
-        }
-        if parts.is_empty() {
-            "Continue where you left off.".to_string()
-        } else {
-            parts.join("\n\n")
-        }
+    // CAIRN-1647: the briefing (claimed above) is rendered from CURRENT ledger
+    // state; an empty set (all handled since the wake) yields None — the
+    // stale-wake drop. The agent gets the full resolved markdown here; the UI
+    // gets the compact structured event stored below.
+    let queued_block = if has_queued {
+        Some(
+            queued_messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+    } else {
+        None
     };
+    let side_channel_block = if side_channel_notices.is_empty() {
+        None
+    } else {
+        Some(crate::messages::transcript::render_side_channel_prompt_block(
+            &side_channel_notices,
+        ))
+    };
+    let prompt = assemble_resume_prompt(
+        queued_block,
+        &base_prompt,
+        side_channel_block,
+        briefing.as_ref().map(|b| b.prompt.as_str()),
+    );
 
     let job_model = job.model.as_ref().map(Model::new);
 
@@ -929,22 +923,10 @@ pub fn continue_job_impl(
             )?;
         }
     }
-    let store_default_user_event =
-        !(suppress_user_event || (message.is_none() && (has_queued || briefing.is_some())));
-    if store_default_user_event {
-        let display_message = user_message.clone();
-        store_user_event_with_turn(
-            orch,
-            &run_id,
-            &session_id,
-            &display_message,
-            now,
-            -1,
-            Some(&turn_id),
-        )?;
-    }
-    // Each delivered queued follow-up shows as its own "You" block and drops out
-    // of the pending strip.
+    // Queued follow-ups — including passive "quiet" notes that rode along without
+    // waking the agent — were authored before the immediate resume message, so
+    // they render first, matching the prompt order assembled above. Each shows as
+    // its own "You" block and drops out of the pending strip.
     if has_queued {
         for queued in &queued_messages {
             let display_message = queued.content.clone();
@@ -962,6 +944,20 @@ pub fn continue_job_impl(
             "db-change",
             serde_json::json!({"table": "queued_messages", "action": "update"}),
         );
+    }
+    let store_default_user_event =
+        !(suppress_user_event || (message.is_none() && (has_queued || briefing.is_some())));
+    if store_default_user_event {
+        let display_message = user_message.clone();
+        store_user_event_with_turn(
+            orch,
+            &run_id,
+            &session_id,
+            &display_message,
+            now,
+            -1,
+            Some(&turn_id),
+        )?;
     }
 
     // ---- Warm process or new session ------------------------------------
@@ -1007,6 +1003,49 @@ pub fn continue_job_impl(
         "Run not found after creation",
     ))?;
     Ok(run)
+}
+
+/// Assemble a resume prompt so notes that accumulated before this wake lead and
+/// the immediate resume message follows them.
+///
+/// Queued user follow-ups — including `passive` "quiet" notes that rode along
+/// without waking the agent — were authored before the message that triggers
+/// this resume, so they precede `base_prompt`. A quiet note "A" sent before a
+/// waking message "B" is therefore delivered as "A\n\nB", matching the order the
+/// user sent them rather than reversing it. Side-channel notices and the
+/// attention briefing keep their established position after the immediate
+/// message. Falls back to the generic continue placeholder when every part is
+/// empty.
+fn assemble_resume_prompt(
+    queued_block: Option<String>,
+    base_prompt: &str,
+    side_channel_block: Option<String>,
+    briefing_prompt: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(q) = queued_block {
+        if !q.is_empty() {
+            parts.push(q);
+        }
+    }
+    if !base_prompt.is_empty() {
+        parts.push(base_prompt.to_string());
+    }
+    if let Some(s) = side_channel_block {
+        if !s.is_empty() {
+            parts.push(s);
+        }
+    }
+    if let Some(b) = briefing_prompt {
+        if !b.is_empty() {
+            parts.push(b.to_string());
+        }
+    }
+    if parts.is_empty() {
+        "Continue where you left off.".to_string()
+    } else {
+        parts.join("\n\n")
+    }
 }
 
 /// Outcome of reconciling a reusable process against the job's requested model.
@@ -1227,9 +1266,54 @@ pub fn reconcile_stale_active_turn_for_continue_for_test(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_reused_process_model, ReuseDecision};
+    use super::{assemble_resume_prompt, ensure_reused_process_model, ReuseDecision};
     use crate::agent_process::process::{wrap_plain_stdin, AgentProcessState, RunHandle};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn passive_note_precedes_immediate_resume_message() {
+        // A quiet note "A" queued before a waking message "B" must deliver as
+        // "A then B", matching send order — not reversed.
+        let prompt = assemble_resume_prompt(Some("A".to_string()), "B", None, None);
+        assert_eq!(prompt, "A\n\nB");
+    }
+
+    #[test]
+    fn multiple_queued_notes_keep_order_before_message() {
+        let prompt = assemble_resume_prompt(Some("A1\n\nA2".to_string()), "B", None, None);
+        assert_eq!(prompt, "A1\n\nA2\n\nB");
+    }
+
+    #[test]
+    fn resume_prompt_without_queued_is_just_the_message() {
+        let prompt = assemble_resume_prompt(None, "B", None, None);
+        assert_eq!(prompt, "B");
+    }
+
+    #[test]
+    fn queued_only_resume_has_no_placeholder() {
+        let prompt = assemble_resume_prompt(Some("A".to_string()), "", None, None);
+        assert_eq!(prompt, "A");
+    }
+
+    #[test]
+    fn empty_resume_falls_back_to_placeholder() {
+        let prompt = assemble_resume_prompt(None, "", None, None);
+        assert_eq!(prompt, "Continue where you left off.");
+    }
+
+    #[test]
+    fn side_channel_and_briefing_follow_the_immediate_message() {
+        // Queued notes lead; the immediate message, then side-channel and
+        // briefing context, follow — the established position for those blocks.
+        let prompt = assemble_resume_prompt(
+            Some("A".to_string()),
+            "B",
+            Some("side".to_string()),
+            Some("brief"),
+        );
+        assert_eq!(prompt, "A\n\nB\n\nside\n\nbrief");
+    }
 
     /// Register a warm process with a recorded model and backend. The stdin is an
     /// in-memory writer so a live `send_set_model` (Claude) succeeds in tests.

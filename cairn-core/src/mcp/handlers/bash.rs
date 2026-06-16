@@ -474,6 +474,13 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             serde_json::json!({"worktree_path": cwd}),
         );
     }
+    // A successful commit may be the worktree's first divergence from main, which
+    // flips later LSP queries onto a per-worktree-keyed server that was never
+    // warmed. Warm it now, in the background, so indexing overlaps the agent's
+    // other work instead of blocking its first query. Idempotent once warm.
+    if barrier.committed {
+        orch.lsp_prewarm_detached(worktree_path.to_path_buf());
+    }
     if !barrier.message.is_empty() {
         if !result.is_empty() {
             result.push_str("\n\n");
@@ -495,6 +502,10 @@ pub(super) struct CommitBarrierOutcome {
     /// Whether the worktree was mutated (committed or restored) so the caller
     /// should emit a `worktree-changed` event.
     pub worktree_changed: bool,
+    /// Whether a real commit (or amend) landed. True only when `git_commit_all`
+    /// succeeded; gates the divergence LSP prewarm so it never fires on a
+    /// NO_COMMIT, a restore, a clean no-op, or a missing commit_msg.
+    pub committed: bool,
 }
 
 /// Enforce the worktree==HEAD invariant after a `run` batch.
@@ -520,6 +531,7 @@ pub(super) fn run_commit_barrier(
     let cwd = worktree_path.to_string_lossy();
     let mut message = String::new();
     let mut worktree_changed = false;
+    let mut committed = false;
 
     match commit_msg {
         Some("NO_COMMIT") => {
@@ -547,6 +559,7 @@ pub(super) fn run_commit_barrier(
                 match crate::mcp::git::git_commit_all(worktree_path, commit_msg, author) {
                     Ok(commit_result) => {
                         worktree_changed = true;
+                        committed = true;
                         let pr_suffix = commit_result
                             .pr_number
                             .map(|pr| format!(" updated PR#{}", pr))
@@ -607,6 +620,7 @@ pub(super) fn run_commit_barrier(
     CommitBarrierOutcome {
         message,
         worktree_changed,
+        committed,
     }
 }
 
@@ -4454,6 +4468,7 @@ mod commit_barrier_tests {
         let out = run_commit_barrier(wt, Some("add file"), false, None, None);
 
         assert!(out.worktree_changed);
+        assert!(out.committed, "a real commit must set committed");
         assert!(out.message.contains("Committed"), "got: {}", out.message);
         assert!(
             porcelain(wt).is_empty(),
@@ -4472,6 +4487,7 @@ mod commit_barrier_tests {
         let out = run_commit_barrier(wt, Some("nothing"), true, None, None);
 
         assert!(!out.worktree_changed);
+        assert!(!out.committed, "a clean no-op must not set committed");
         assert!(out.message.is_empty());
         assert_eq!(head_sha(wt), before);
         assert!(porcelain(wt).is_empty());
@@ -4496,6 +4512,7 @@ mod commit_barrier_tests {
 
         let out = run_commit_barrier(wt, Some("will fail"), true, None, None);
 
+        assert!(!out.committed, "a failed commit must not set committed");
         assert!(
             out.message.contains("Failed to commit"),
             "got: {}",
@@ -4524,6 +4541,7 @@ mod commit_barrier_tests {
         let out = run_commit_barrier(wt, Some("NO_COMMIT"), true, None, None);
 
         assert!(out.worktree_changed);
+        assert!(!out.committed, "NO_COMMIT must not set committed");
         assert!(out.message.contains("NO_COMMIT"), "got: {}", out.message);
         assert!(
             porcelain(wt).is_empty(),
@@ -4562,6 +4580,10 @@ mod commit_barrier_tests {
         let out = run_commit_barrier(wt, Some("NO_COMMIT"), true, None, None);
 
         assert!(
+            !out.committed,
+            "NO_COMMIT mid-merge must not set committed"
+        );
+        assert!(
             out.message.is_empty(),
             "NO_COMMIT should be accepted mid-merge; got: {}",
             out.message
@@ -4583,6 +4605,7 @@ mod commit_barrier_tests {
         let out = run_commit_barrier(wt, None, true, Some(&status_before), None);
 
         assert!(out.worktree_changed);
+        assert!(!out.committed, "a restore (no commit_msg) must not set committed");
         assert!(out.message.contains("reverted"), "got: {}", out.message);
         assert!(
             out.message

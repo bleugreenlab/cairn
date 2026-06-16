@@ -248,8 +248,35 @@ pub async fn handle_pr_node(
     let (worktree_path, branch_name, base_branch) =
         find_implementation_context(orch, action_run).await?;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
-
     let has_remote = crate::mcp::git::has_remote(std::path::Path::new(&worktree_path));
+
+    // Seed the merge_requests row with the create-pr title/body before the slow
+    // push + GitHub open below. The PR facet appears as soon as this action run
+    // exists, so without the row the tab shows an empty "no data" state for the
+    // several seconds the open takes. `is_local` is recorded now from has_remote
+    // so the row is never mistaken for local just because its GitHub number
+    // hasn't arrived. `upsert_merge_request_for_pr` is idempotent by job id, so
+    // the post-open call updates this same row with the GitHub url/number/state;
+    // the backend refresh fills in live mergeability/checks.
+    upsert_merge_request_for_pr(
+        &orch.db.local,
+        &action_run.id,
+        &action_run.project_id,
+        action_run.issue_id.as_deref(),
+        &title,
+        body.as_deref(),
+        &branch_name,
+        base_branch.as_deref(),
+        None,
+        !has_remote,
+        chrono::Utc::now().timestamp() as i32,
+    )
+    .await?;
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "merge_requests", "action": "insert"}),
+    );
+
     let github = if has_remote {
         let pr_url = open_or_update_github_pr(
             &worktree_path,
@@ -280,6 +307,7 @@ pub async fn handle_pr_node(
         &branch_name,
         base_branch.as_deref(),
         github.as_ref().map(|(url, number)| (url.as_str(), *number)),
+        !has_remote,
         now,
     )
     .await?;
@@ -509,6 +537,7 @@ async fn handle_create_pr(
         &branch_name,
         base_branch.as_deref(),
         github.as_ref().map(|(url, number)| (url.as_str(), *number)),
+        !has_remote,
         now,
     )
     .await?;
@@ -1342,6 +1371,7 @@ async fn upsert_merge_request_for_pr(
     source_branch: &str,
     base_branch: Option<&str>,
     github: Option<(&str, i32)>,
+    is_local: bool,
     now: i32,
 ) -> Result<(), String> {
     let parent_job_id = parent_job_id.to_string();
@@ -1394,8 +1424,9 @@ async fn upsert_merge_request_for_pr(
                          github_pr_number = ?5,
                          github_pr_url = ?6,
                          github_state = ?7,
-                         updated_at = ?8
-                     WHERE id = ?9",
+                         is_local = ?8,
+                         updated_at = ?9
+                     WHERE id = ?10",
                     params![
                         title.as_str(),
                         body.as_deref(),
@@ -1404,6 +1435,7 @@ async fn upsert_merge_request_for_pr(
                         github_pr_number,
                         github_pr_url.as_deref(),
                         github_state.as_deref(),
+                        i64::from(is_local),
                         now,
                         existing_id.as_str()
                     ],
@@ -1439,10 +1471,10 @@ async fn upsert_merge_request_for_pr(
                 "INSERT INTO merge_requests(
                     id, job_id, project_id, issue_id, title, body,
                     source_branch, target_branch, status, merge_method, opened_at,
-                    updated_at, github_pr_number, github_pr_url, github_state
+                    updated_at, github_pr_number, github_pr_url, github_state, is_local
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open',
-                         'squash', ?9, ?10, ?11, ?12, ?13)",
+                         'squash', ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     mr_id.as_str(),
                     parent_job_id.as_str(),
@@ -1457,6 +1489,7 @@ async fn upsert_merge_request_for_pr(
                     github_pr_number,
                     github_pr_url.as_deref(),
                     github_state.as_deref(),
+                    i64::from(is_local),
                 ],
             )
             .await?;

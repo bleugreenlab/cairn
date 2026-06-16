@@ -331,6 +331,16 @@ pub const TURSO_MIGRATIONS: &[Migration] = &[
             "../../../../turso_migrations/0064_clear_skyline_cache_for_system_event_filter.sql"
         ),
     ),
+    Migration::new(
+        "0065",
+        "merge_request_is_local",
+        include_str!("../../../../turso_migrations/0065_merge_request_is_local.sql"),
+    ),
+    Migration::new(
+        "0066",
+        "config_disables",
+        include_str!("../../../../turso_migrations/0066_config_disables.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -413,7 +423,9 @@ mod tests {
                 "0061_attention_escalate_at".to_string(),
                 "0062_attention_fingerprint".to_string(),
                 "0063_comment_seq".to_string(),
-                "0064_clear_skyline_cache_for_system_event_filter".to_string()
+                "0064_clear_skyline_cache_for_system_event_filter".to_string(),
+                "0065_merge_request_is_local".to_string(),
+                "0066_config_disables".to_string()
             ]
         );
         Ok(db)

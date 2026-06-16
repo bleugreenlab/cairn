@@ -104,7 +104,7 @@ pub use artifact::Artifact;
 // PR types
 pub use pr::{
     Check, CheckFailureDetails, CheckState, ChecksStatus, MergeableState, PrCache, PrDataSummary,
-    PrState, ProjectPrEntry, ReviewDecision,
+    PrState, ReviewDecision,
 };
 
 // Agent types

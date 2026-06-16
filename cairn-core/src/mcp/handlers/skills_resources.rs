@@ -171,17 +171,29 @@ pub(crate) async fn read_skills_collection(
     request: &McpCallbackRequest,
     explicit_project: Option<&str>,
 ) -> String {
-    // Resolve project context: explicit project key + path, or current run project.
-    let (project_key, project_path): (Option<String>, Option<PathBuf>) =
+    // Resolve project context: explicit project key + id + path, or current run.
+    let (project_id, project_key, project_path): (Option<String>, Option<String>, Option<PathBuf>) =
         if let Some(project) = explicit_project {
             match project_path_by_key(orch, project).await {
-                Ok(path) => (Some(project.to_uppercase()), Some(path)),
+                Ok(path) => {
+                    let id = super::run_context::project_id_by_key(&orch.db.local, project)
+                        .await
+                        .ok();
+                    (id, Some(project.to_uppercase()), Some(path))
+                }
                 Err(e) => return e,
             }
         } else {
-            match current_run_project(orch, request).await {
-                Some((key, path)) => (Some(key), path),
-                None => (None, None),
+            match super::run_context::lookup_run(&orch.db.local, request).await {
+                Ok(ctx) => {
+                    let path = super::run_context::project_path(&orch.db.local, &ctx.project_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(PathBuf::from);
+                    (Some(ctx.project_id), Some(ctx.project_key), path)
+                }
+                Err(_) => (None, None, None),
             }
         };
 
@@ -198,6 +210,19 @@ pub(crate) async fn read_skills_collection(
             // config_root_subdirs yields project first, so keep the first
             // occurrence for each id to let project skills shadow workspace.
             by_id.entry(skill.id.clone()).or_insert(skill);
+        }
+    }
+
+    // Drop inherited workspace skills the project has disabled. A project-scoped
+    // skill of the same id has already shadowed it above, so only an inherited
+    // (workspace) skill remains to hide.
+    if let Some(pid) = project_id.as_deref() {
+        if let Ok(disabled) =
+            crate::config_disables::list_disabled_keys(&orch.db.local, pid, "skill").await
+        {
+            by_id.retain(|_, skill| {
+                skill.is_project_scoped || !disabled.contains(&skill.id)
+            });
         }
     }
 
@@ -242,16 +267,30 @@ pub(crate) async fn read_skill(
     path: &[String],
     explicit_project: Option<&str>,
 ) -> String {
-    let project_path: Option<PathBuf> = if let Some(project) = explicit_project {
-        match project_path_by_key(orch, project).await {
-            Ok(path) => Some(path),
-            Err(e) => return e,
-        }
-    } else {
-        current_run_project(orch, request)
-            .await
-            .and_then(|(_, path)| path)
-    };
+    let (project_id, project_path): (Option<String>, Option<PathBuf>) =
+        if let Some(project) = explicit_project {
+            match project_path_by_key(orch, project).await {
+                Ok(path) => {
+                    let id = super::run_context::project_id_by_key(&orch.db.local, project)
+                        .await
+                        .ok();
+                    (id, Some(path))
+                }
+                Err(e) => return e,
+            }
+        } else {
+            match super::run_context::lookup_run(&orch.db.local, request).await {
+                Ok(ctx) => {
+                    let path = super::run_context::project_path(&orch.db.local, &ctx.project_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(PathBuf::from);
+                    (Some(ctx.project_id), path)
+                }
+                Err(_) => (None, None),
+            }
+        };
 
     let skill = match resolve_skill_for_scope(
         &orch.config_dir,
@@ -273,6 +312,26 @@ pub(crate) async fn read_skill(
         }
         Err(e) => return format!("Error loading skill: {e}"),
     };
+
+    // An inherited workspace skill disabled for this project reads as not-found.
+    // A project-scoped skill is the project's own and is never hidden.
+    if !skill.is_project_scoped {
+        if let Some(pid) = project_id.as_deref() {
+            if let Ok(disabled) =
+                crate::config_disables::list_disabled_keys(&orch.db.local, pid, "skill").await
+            {
+                if disabled.contains(&skill.id) {
+                    return match explicit_project {
+                        Some(project) => format!(
+                            "Skill not found in project {}: {skill_id}",
+                            project.to_uppercase()
+                        ),
+                        None => format!("Skill not found: {skill_id}"),
+                    };
+                }
+            }
+        }
+    }
 
     let scope = match explicit_project {
         Some(project) => SkillScopeUri::Project(project.to_uppercase()),

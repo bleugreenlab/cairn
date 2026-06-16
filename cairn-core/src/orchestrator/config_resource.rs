@@ -1,6 +1,6 @@
 //! Shared orchestration for workspace/project-scoped config resources.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::ConfigResult;
@@ -507,39 +507,6 @@ pub(crate) fn delete_config<R: ConfigResource>(
     Ok(())
 }
 
-pub(crate) fn create_override<R: ConfigResource>(
-    orch: &Orchestrator,
-    id: &str,
-    project_id: &str,
-) -> Result<R::Config, String> {
-    copy_to_scope::<R>(orch, id, Some(project_id), "this project")
-}
-
-pub(crate) fn promote_to_workspace<R: ConfigResource>(
-    orch: &Orchestrator,
-    id: &str,
-    source_project_id: &str,
-) -> Result<R::Config, String> {
-    let source_project_path = orch.project_path(source_project_id)?;
-    let source =
-        R::get_file(&orch.config_dir, id, Some(&source_project_path))?.ok_or_else(|| {
-            format!(
-                "{} not found in project: {}",
-                title_case(R::ENTITY_TYPE),
-                id
-            )
-        })?;
-
-    if !R::file_is_project_scoped(&source) {
-        return Err(format!(
-            "{} is not project-scoped",
-            title_case(R::ENTITY_TYPE)
-        ));
-    }
-
-    copy_source_to_scope::<R>(orch, source, id, None, "workspace scope")
-}
-
 pub(crate) fn list_for_context<R: ConfigResource>(
     orch: &Orchestrator,
     project_id: &str,
@@ -588,9 +555,31 @@ pub(crate) fn list_for_context<R: ConfigResource>(
         }
     }
 
-    let mut configs: Vec<R::Config> = configs_map.into_values().collect();
+    // Per-project disabled inherited artifacts drop out of the effective set.
+    // This is the agent-facing/editor-dropdown view; the settings UI renders
+    // disabled inherited items separately via `list_disabled_configs`.
+    let disabled = disabled_keys_blocking(orch, project_id, R::ENTITY_TYPE)?;
+    let mut configs: Vec<R::Config> = configs_map
+        .into_values()
+        .filter(|config| !disabled.contains(&R::config_id(config)))
+        .collect();
     sort_configs::<R>(&mut configs);
     Ok(configs)
+}
+
+/// Blocking fetch of the disabled shadow-key set for a (project, entity_type),
+/// for the synchronous file-type resolution paths.
+pub(crate) fn disabled_keys_blocking(
+    orch: &Orchestrator,
+    project_id: &str,
+    entity_type: &str,
+) -> Result<HashSet<String>, String> {
+    let db = orch.db.local.clone();
+    let project_id = project_id.to_string();
+    let entity_type = entity_type.to_string();
+    run_db_blocking(move || async move {
+        crate::config_disables::list_disabled_keys(&db, &project_id, &entity_type).await
+    })
 }
 
 fn find_for_update<R: ConfigResource>(
@@ -619,26 +608,30 @@ fn find_for_update<R: ConfigResource>(
     Err(format!("{} not found: {}", title_case(R::ENTITY_TYPE), id))
 }
 
-fn copy_to_scope<R: ConfigResource>(
+/// Copy any source artifact (from any scope) into a target scope under a chosen
+/// id. Same id as an inherited workspace artifact + project target shadows it;
+/// a new id is additive. Hard copy: no parent link, no propagation.
+///
+/// This is the single canonical scope-mutation primitive: a same-id copy into a
+/// project shadows the inherited workspace artifact, a same-id copy into the
+/// workspace promotes a project-only artifact, and a new id is an additive copy.
+pub(crate) fn copy_config<R: ConfigResource>(
     orch: &Orchestrator,
-    id: &str,
-    project_id: Option<&str>,
-    duplicate_scope_label: &str,
+    source_id: &str,
+    source_project_id: Option<&str>,
+    target_id: &str,
+    target_project_id: Option<&str>,
 ) -> Result<R::Config, String> {
-    let source_project_path = project_id.map(|pid| orch.project_path(pid)).transpose()?;
-    let source = R::get_file(&orch.config_dir, id, source_project_path.as_deref())?
-        .ok_or_else(|| format!("{} not found: {}", title_case(R::ENTITY_TYPE), id))?;
-    copy_source_to_scope::<R>(orch, source, id, project_id, duplicate_scope_label)
-}
+    let source_project_path: Option<PathBuf> = source_project_id
+        .map(|pid| orch.project_path(pid))
+        .transpose()?;
+    // get_file resolves project-first-then-workspace, so an inherited workspace
+    // source is found when the source project hasn't redefined it.
+    let source = R::get_file(&orch.config_dir, source_id, source_project_path.as_deref())?
+        .ok_or_else(|| format!("{} not found: {}", title_case(R::ENTITY_TYPE), source_id))?;
 
-fn copy_source_to_scope<R: ConfigResource>(
-    orch: &Orchestrator,
-    source: R::File,
-    id: &str,
-    project_id: Option<&str>,
-    duplicate_scope_label: &str,
-) -> Result<R::Config, String> {
-    let (target_root, workspace_id, project_id_string, is_project_scoped) = match project_id {
+    let (target_root, workspace_id, project_id_string, is_project_scoped) = match target_project_id
+    {
         Some(pid) => (orch.project_path(pid)?, None, Some(pid.to_string()), true),
         None => (
             orch.config_dir.clone(),
@@ -648,19 +641,23 @@ fn copy_source_to_scope<R: ConfigResource>(
         ),
     };
 
-    if R::target_exists(&target_root, id, is_project_scoped) {
+    if R::target_exists(&target_root, target_id, is_project_scoped) {
         return Err(format!(
             "{} '{}' already exists at {}",
             title_case(R::ENTITY_TYPE),
-            id,
-            duplicate_scope_label
+            target_id,
+            if is_project_scoped {
+                "this project"
+            } else {
+                "workspace scope"
+            }
         ));
     }
 
     let now = now_timestamp();
     let file = R::build_scoped_copy(
         &source,
-        id,
+        target_id,
         is_project_scoped,
         workspace_id.clone(),
         project_id_string.clone(),
@@ -671,10 +668,10 @@ fn copy_source_to_scope<R: ConfigResource>(
     R::post_save_copy(&source, &dest_path)?;
     crate::config::commit_config_paths(
         &R::stage_paths(&dest_path),
-        &config_commit_message::<R>("create", id),
+        &config_commit_message::<R>("create", target_id),
     );
 
-    emit_config_change::<R>(orch, "created", id);
+    emit_config_change::<R>(orch, "created", target_id);
     emit_db_change::<R>(orch, "insert");
 
     Ok(R::to_config(file, workspace_id, project_id_string, now))

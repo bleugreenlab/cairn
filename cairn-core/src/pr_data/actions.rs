@@ -40,6 +40,10 @@ pub struct MrContext {
     pub github_pr_number: Option<i32>,
     pub repo_path: String,
     pub job_id: String,
+    /// Creation-time fact: the PR was opened without a GitHub remote. Stored, not
+    /// inferred from a missing `github_pr_number` (which a remote PR also lacks
+    /// during the window between opening it and GitHub returning its number).
+    pub is_local: bool,
 }
 
 /// `MrContext` plus the issue/branch/project fields a merge needs.
@@ -84,7 +88,7 @@ pub async fn query_mr_context_for_job(
 ) -> DbResult<Option<MrContext>> {
     let mut rows = conn
         .query(
-            "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id
+            "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local
              FROM merge_requests mr
              JOIN projects p ON mr.project_id = p.id
              WHERE mr.job_id = ?1
@@ -102,6 +106,7 @@ pub async fn query_mr_context_for_job(
                 github_pr_number: row.opt_i64(2)?.map(|value| value as i32),
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
+                is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
             })
         })
         .transpose()
@@ -174,7 +179,7 @@ async fn query_pr_node_mr_context_for_artifact_job(
     for target_node_id in pr_target_nodes {
         let mut rows = conn
             .query(
-                "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id
+                "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local
                  FROM action_runs ar
                  JOIN merge_requests mr ON mr.job_id = ar.id
                  JOIN projects p ON mr.project_id = p.id
@@ -192,6 +197,7 @@ async fn query_pr_node_mr_context_for_artifact_job(
                 github_pr_number: row.opt_i64(2)?.map(|value| value as i32),
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
+                is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
             }));
         }
     }
@@ -953,7 +959,7 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
         checks: checks.clone(),
         fetched_at: now,
         updated_at: now,
-        is_local: false,
+        is_local: mr_context.is_local,
         source_branch: None,
         target_branch: None,
     };
@@ -1080,7 +1086,7 @@ async fn refresh_local_pr_for_job(
         checks: Vec::new(),
         fetched_at: now,
         updated_at,
-        is_local: true,
+        is_local: mr_context.is_local,
         source_branch: Some(source_branch),
         target_branch: Some(target_branch),
     })
@@ -1592,6 +1598,7 @@ mod tests {
                 github_pr_number: None,
                 repo_path: "/tmp/repo".to_string(),
                 job_id: "job".to_string(),
+                is_local: false,
             },
             issue_id: Some("issue".to_string()),
             default_branch: "main".to_string(),

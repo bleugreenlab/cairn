@@ -282,20 +282,6 @@ impl Orchestrator {
         config_resource::delete_config::<SkillResource>(self, id, project_id)
     }
 
-    /// Create a project override of a skill (from any scope).
-    pub fn create_skill_override(&self, id: &str, project_id: &str) -> Result<SkillConfig, String> {
-        config_resource::create_override::<SkillResource>(self, id, project_id)
-    }
-
-    /// Promote a project-only skill to workspace scope.
-    pub fn promote_skill_to_workspace(
-        &self,
-        id: &str,
-        source_project_id: &str,
-    ) -> Result<SkillConfig, String> {
-        config_resource::promote_to_workspace::<SkillResource>(self, id, source_project_id)
-    }
-
     /// Fetch a skill from a URL and return a preview for the UI.
     pub fn fetch_skill_preview(
         &self,
@@ -361,6 +347,23 @@ impl Orchestrator {
     }
 
     /// List skills for a project context with workspace→project shadowing.
+    /// Copy a skill from any scope into a target scope under a chosen id.
+    pub fn copy_skill_config(
+        &self,
+        source_id: &str,
+        source_project_id: Option<&str>,
+        target_id: &str,
+        target_project_id: Option<&str>,
+    ) -> Result<SkillConfig, String> {
+        config_resource::copy_config::<SkillResource>(
+            self,
+            source_id,
+            source_project_id,
+            target_id,
+            target_project_id,
+        )
+    }
+
     pub fn list_skills_for_context(&self, project_id: &str) -> Result<Vec<SkillConfig>, String> {
         config_resource::list_for_context::<SkillResource>(self, project_id)
     }

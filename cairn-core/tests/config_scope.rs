@@ -1,4 +1,5 @@
-//! Tests for entity override and promote operations.
+//! Tests for config scope mutation: copying agents, skills, and recipes
+//! between workspace and project scope through the canonical copy primitive.
 
 mod common;
 
@@ -129,43 +130,33 @@ impl ConfigKind {
         self.write(ctx, ConfigScope::Workspace, id, name);
     }
 
-    fn write_project(self, ctx: &TestOrchestrator, id: &str, name: &str) {
-        self.write(ctx, ConfigScope::Project, id, name);
-    }
-
-    fn create_override(
+    fn copy(
         self,
         ctx: &TestOrchestrator,
-        id: &str,
+        source_id: &str,
+        source_project_id: Option<&str>,
+        target_id: &str,
+        target_project_id: Option<&str>,
     ) -> Result<ConfigResourceResult, String> {
         match self {
-            ConfigKind::Agent => {
-                normalize_config_result(ctx.orch.create_agent_override(id, &ctx.project_id))
-            }
-            ConfigKind::Skill => {
-                normalize_config_result(ctx.orch.create_skill_override(id, &ctx.project_id))
-            }
-            ConfigKind::Recipe => {
-                normalize_config_result(ctx.orch.create_recipe_override(id, &ctx.project_id))
-            }
-        }
-    }
-
-    fn promote_to_workspace(
-        self,
-        ctx: &TestOrchestrator,
-        id: &str,
-    ) -> Result<ConfigResourceResult, String> {
-        match self {
-            ConfigKind::Agent => {
-                normalize_config_result(ctx.orch.promote_agent_to_workspace(id, &ctx.project_id))
-            }
-            ConfigKind::Skill => {
-                normalize_config_result(ctx.orch.promote_skill_to_workspace(id, &ctx.project_id))
-            }
-            ConfigKind::Recipe => {
-                normalize_config_result(ctx.orch.promote_recipe_to_workspace(id, &ctx.project_id))
-            }
+            ConfigKind::Agent => normalize_config_result(ctx.orch.copy_agent_config(
+                source_id,
+                source_project_id,
+                target_id,
+                target_project_id,
+            )),
+            ConfigKind::Skill => normalize_config_result(ctx.orch.copy_skill_config(
+                source_id,
+                source_project_id,
+                target_id,
+                target_project_id,
+            )),
+            ConfigKind::Recipe => normalize_config_result(ctx.orch.copy_recipe_config(
+                source_id,
+                source_project_id,
+                target_id,
+                target_project_id,
+            )),
         }
     }
 
@@ -229,176 +220,70 @@ impl ConfigKind {
     }
 }
 
-async fn assert_create_override_from_workspace(
-    kind: ConfigKind,
-    id: &str,
-    workspace_name: &str,
-    expected_result_name: Option<&str>,
-) {
+/// copy-from-existing (behavior #3): a workspace source copies into the project
+/// under a NEW id as an independent additive artifact, and under the SAME id as
+/// a project shadow. The source stays put in both cases (hard copy, no move).
+async fn assert_copy_from_workspace_source(kind: ConfigKind) {
     let ctx = test_config_orchestrator().await;
+    kind.write_workspace(&ctx, "src", "Source");
 
-    kind.write_workspace(&ctx, id, workspace_name);
-
-    let result = kind.create_override(&ctx, id).unwrap();
-    assert_eq!(result.id, id, "{kind:?}");
-    if let Some(expected_name) = expected_result_name {
-        assert_eq!(result.name, expected_name, "{kind:?}");
-    }
-    assert_eq!(result.project_id, Some(ctx.project_id.clone()), "{kind:?}");
-    assert!(kind.project_path(&ctx, id).exists(), "{kind:?}");
-}
-
-async fn assert_create_override_rejects_duplicate(
-    kind: ConfigKind,
-    id: &str,
-    workspace_name: &str,
-) {
-    let ctx = test_config_orchestrator().await;
-
-    kind.write_workspace(&ctx, id, workspace_name);
-    kind.write_project(&ctx, id, "Already There");
-
-    assert_err_contains(kind.create_override(&ctx, id), "already exists");
-}
-
-async fn assert_promote_to_workspace_success(
-    kind: ConfigKind,
-    id: &str,
-    project_name: &str,
-    expect_project_file: bool,
-) {
-    let ctx = test_config_orchestrator().await;
-
-    kind.write_project(&ctx, id, project_name);
-
-    let result = kind.promote_to_workspace(&ctx, id).unwrap();
-    assert_eq!(result.id, id, "{kind:?}");
-    assert_eq!(result.workspace_id, Some("default".to_string()), "{kind:?}");
-    assert!(kind.workspace_path(&ctx, id).exists(), "{kind:?}");
-    if expect_project_file {
-        assert!(kind.project_path(&ctx, id).exists(), "{kind:?}");
-    }
-}
-
-async fn assert_promote_rejects_non_project_scoped(
-    kind: ConfigKind,
-    id: &str,
-    workspace_name: &str,
-) {
-    let ctx = test_config_orchestrator().await;
-
-    kind.write_workspace(&ctx, id, workspace_name);
-
-    assert_err_contains(kind.promote_to_workspace(&ctx, id), "not project-scoped");
-}
-
-async fn assert_promote_rejects_if_workspace_exists(
-    kind: ConfigKind,
-    id: &str,
-    workspace_name: &str,
-) {
-    let ctx = test_config_orchestrator().await;
-
-    kind.write_workspace(&ctx, id, workspace_name);
-    kind.write_project(&ctx, id, "Project Version");
-
-    assert_err_contains(
-        kind.promote_to_workspace(&ctx, id),
-        "already exists at workspace",
+    let additive = kind
+        .copy(&ctx, "src", None, "src-copy", Some(&ctx.project_id))
+        .unwrap();
+    assert_eq!(additive.id, "src-copy", "{kind:?}");
+    assert_eq!(additive.name, "Source", "{kind:?}");
+    assert!(additive.workspace_id.is_none(), "{kind:?}");
+    assert_eq!(additive.project_id, Some(ctx.project_id.clone()), "{kind:?}");
+    assert!(kind.project_path(&ctx, "src-copy").exists(), "{kind:?}");
+    assert!(
+        kind.workspace_path(&ctx, "src").exists(),
+        "source remains after copy {kind:?}"
     );
+
+    let shadow = kind
+        .copy(&ctx, "src", None, "src", Some(&ctx.project_id))
+        .unwrap();
+    assert_eq!(shadow.id, "src", "{kind:?}");
+    assert_eq!(shadow.project_id, Some(ctx.project_id.clone()), "{kind:?}");
+    assert!(kind.project_path(&ctx, "src").exists(), "{kind:?}");
 }
 
-#[tokio::test]
-async fn create_agent_override_from_workspace() {
-    assert_create_override_from_workspace(
-        ConfigKind::Agent,
-        "my-agent",
-        "My Agent",
-        Some("My Agent"),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn create_agent_override_rejects_duplicate() {
-    assert_create_override_rejects_duplicate(ConfigKind::Agent, "my-agent", "My Agent").await;
-}
-
-#[tokio::test]
-async fn create_agent_override_from_project_scope_rejects_duplicate() {
+/// The target_exists guard: copying onto an id that already exists at the target
+/// scope errors rather than clobbering it.
+async fn assert_copy_rejects_existing_target(kind: ConfigKind) {
     let ctx = test_config_orchestrator().await;
+    kind.write_workspace(&ctx, "src", "Source");
+    kind.write_workspace(&ctx, "taken", "Taken");
 
-    ConfigKind::Agent.write_project(&ctx, "proj-only", "Project Only Agent");
-
-    let result = ctx.orch.create_agent_override("proj-only", &ctx.project_id);
-    assert_err_contains(result, "already exists");
+    assert_err_contains(kind.copy(&ctx, "src", None, "taken", None), "already exists");
 }
 
 #[tokio::test]
-async fn promote_agent_to_workspace_success() {
-    assert_promote_to_workspace_success(ConfigKind::Agent, "proj-agent", "Project Agent", true)
-        .await;
+async fn copy_agent_from_workspace_additive_and_shadow() {
+    assert_copy_from_workspace_source(ConfigKind::Agent).await;
 }
 
 #[tokio::test]
-async fn promote_agent_rejects_non_project_scoped() {
-    assert_promote_rejects_non_project_scoped(ConfigKind::Agent, "ws-agent", "WS Agent").await;
+async fn copy_skill_from_workspace_additive_and_shadow() {
+    assert_copy_from_workspace_source(ConfigKind::Skill).await;
 }
 
 #[tokio::test]
-async fn promote_agent_rejects_if_workspace_exists() {
-    assert_promote_rejects_if_workspace_exists(ConfigKind::Agent, "dual-agent", "WS Version").await;
+async fn copy_recipe_from_workspace_additive_and_shadow() {
+    assert_copy_from_workspace_source(ConfigKind::Recipe).await;
 }
 
 #[tokio::test]
-async fn create_skill_override_from_workspace() {
-    assert_create_override_from_workspace(ConfigKind::Skill, "my-skill", "My Skill", None).await;
+async fn copy_agent_rejects_existing_target() {
+    assert_copy_rejects_existing_target(ConfigKind::Agent).await;
 }
 
 #[tokio::test]
-async fn create_skill_override_rejects_duplicate() {
-    assert_create_override_rejects_duplicate(ConfigKind::Skill, "my-skill", "My Skill").await;
+async fn copy_skill_rejects_existing_target() {
+    assert_copy_rejects_existing_target(ConfigKind::Skill).await;
 }
 
 #[tokio::test]
-async fn promote_skill_to_workspace_success() {
-    assert_promote_to_workspace_success(ConfigKind::Skill, "proj-skill", "Project Skill", false)
-        .await;
-}
-
-#[tokio::test]
-async fn promote_skill_rejects_non_project_scoped() {
-    assert_promote_rejects_non_project_scoped(ConfigKind::Skill, "ws-skill", "WS Skill").await;
-}
-
-#[tokio::test]
-async fn promote_skill_rejects_if_workspace_exists() {
-    assert_promote_rejects_if_workspace_exists(ConfigKind::Skill, "dual-skill", "WS Version").await;
-}
-
-#[tokio::test]
-async fn create_recipe_override_from_workspace() {
-    assert_create_override_from_workspace(ConfigKind::Recipe, "my-recipe", "My Recipe", None).await;
-}
-
-#[tokio::test]
-async fn create_recipe_override_rejects_duplicate() {
-    assert_create_override_rejects_duplicate(ConfigKind::Recipe, "my-recipe", "My Recipe").await;
-}
-
-#[tokio::test]
-async fn promote_recipe_to_workspace_success() {
-    assert_promote_to_workspace_success(ConfigKind::Recipe, "proj-recipe", "Project Recipe", false)
-        .await;
-}
-
-#[tokio::test]
-async fn promote_recipe_rejects_non_project_scoped() {
-    assert_promote_rejects_non_project_scoped(ConfigKind::Recipe, "ws-recipe", "WS Recipe").await;
-}
-
-#[tokio::test]
-async fn promote_recipe_rejects_if_workspace_exists() {
-    assert_promote_rejects_if_workspace_exists(ConfigKind::Recipe, "dual-recipe", "WS Version")
-        .await;
+async fn copy_recipe_rejects_existing_target() {
+    assert_copy_rejects_existing_target(ConfigKind::Recipe).await;
 }

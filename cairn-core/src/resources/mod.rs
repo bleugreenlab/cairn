@@ -15,7 +15,6 @@ mod messages;
 pub(crate) mod mutations;
 mod node;
 mod project;
-mod prs;
 mod read;
 mod recipes;
 mod settings;

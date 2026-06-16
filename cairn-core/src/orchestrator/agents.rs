@@ -283,30 +283,26 @@ impl Orchestrator {
         config_resource::delete_config::<AgentResource>(self, id, project_id)
     }
 
-    /// Create a project override of an agent (from any scope).
-    ///
-    /// Resolves the agent with project context, then copies it to the target project.
-    /// Errors if the target project already has an override with the same ID.
-    pub fn create_agent_override(&self, id: &str, project_id: &str) -> Result<AgentConfig, String> {
-        config_resource::create_override::<AgentResource>(self, id, project_id)
-    }
-
-    /// Promote a project-only agent to workspace scope.
-    ///
-    /// Copies the project file to `~/.cairn/agents/{id}.md`.
-    /// Errors if a workspace version already exists.
-    /// The original project file remains as an override.
-    pub fn promote_agent_to_workspace(
-        &self,
-        id: &str,
-        source_project_id: &str,
-    ) -> Result<AgentConfig, String> {
-        config_resource::promote_to_workspace::<AgentResource>(self, id, source_project_id)
-    }
-
     /// List agents for a project context with workspace→project shadowing.
     pub fn list_agents_for_context(&self, project_id: &str) -> Result<Vec<AgentConfig>, String> {
         config_resource::list_for_context::<AgentResource>(self, project_id)
+    }
+
+    /// Copy an agent from any scope into a target scope under a chosen id.
+    pub fn copy_agent_config(
+        &self,
+        source_id: &str,
+        source_project_id: Option<&str>,
+        target_id: &str,
+        target_project_id: Option<&str>,
+    ) -> Result<AgentConfig, String> {
+        config_resource::copy_config::<AgentResource>(
+            self,
+            source_id,
+            source_project_id,
+            target_id,
+            target_project_id,
+        )
     }
 }
 
@@ -399,5 +395,65 @@ mod tests {
 
         let invalid = orch.list_invalid_configs(None, None).unwrap();
         assert!(invalid.is_empty(), "UI-created agent must not be invalid");
+    }
+
+    /// An inherited workspace agent disabled for one project drops out of that
+    /// project's effective set without redefinition, and re-enabling restores it.
+    #[tokio::test]
+    async fn disabled_inherited_agent_drops_from_context_and_returns_on_enable() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let agents_dir = config_dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("planner.md"),
+            "---\nname: Planner\ndescription: plans\ntools: Read\n---\n\nprompt",
+        )
+        .unwrap();
+
+        let orch = build_orch(config_dir.path().to_path_buf()).await;
+
+        // A non-workspace project whose repo path resolves for list_for_context.
+        let project_dir = tempfile::tempdir().unwrap();
+        let repo_path = project_dir.path().to_string_lossy().to_string();
+        orch.db
+            .local
+            .write(|conn| {
+                let repo_path = repo_path.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
+                         VALUES ('p1', 'default', 'Proj', 'PROJ', ?1, 1, 1, 0)",
+                        turso::params![repo_path.as_str()],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        assert!(orch
+            .list_agents_for_context("p1")
+            .unwrap()
+            .iter()
+            .any(|a| a.id == "planner"));
+
+        crate::config_disables::disable_config(&orch.db.local, "p1", "agent", "planner")
+            .await
+            .unwrap();
+        assert!(!orch
+            .list_agents_for_context("p1")
+            .unwrap()
+            .iter()
+            .any(|a| a.id == "planner"));
+
+        crate::config_disables::enable_config(&orch.db.local, "p1", "agent", "planner")
+            .await
+            .unwrap();
+        assert!(orch
+            .list_agents_for_context("p1")
+            .unwrap()
+            .iter()
+            .any(|a| a.id == "planner"));
     }
 }

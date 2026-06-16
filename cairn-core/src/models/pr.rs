@@ -222,27 +222,3 @@ pub struct PrDataSummary {
     pub pr_url: String,
     pub pr_status: String,
 }
-
-/// PR entry with provenance info for project-level PR listing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectPrEntry {
-    pub id: String,
-    pub action_run_id: String,
-    pub pr_number: i32,
-    pub pr_url: String,
-    pub pr_status: String,
-    pub title: Option<String>,
-    pub is_draft: bool,
-    pub additions: Option<i32>,
-    pub deletions: Option<i32>,
-    pub checks_status: Option<String>,
-    pub review_decision: Option<String>,
-    pub opened_at: Option<i64>,
-    pub updated_at: i64,
-    // Provenance
-    pub issue_id: Option<String>,
-    pub issue_number: Option<i32>,
-    pub issue_title: Option<String>,
-    pub execution_id: String,
-}

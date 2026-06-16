@@ -27,6 +27,11 @@ use super::Orchestrator;
 /// in a JS-rooted repo).
 const MARKER_SCAN_DEPTH: usize = 4;
 
+/// How deep to scan for a representative source file to open before a
+/// `workspace/symbol` query. Breadth-first, so shallow files are found first
+/// and this only bounds the worst case on a tree with no nearby source.
+const REPR_SCAN_DEPTH: usize = 6;
+
 /// A language server selected for a query, carrying both the worktree-relative
 /// indexing root and the *effective* root the pooled instance is actually keyed
 /// and confined on. When a worktree subroot is byte-identical to the project's
@@ -437,6 +442,11 @@ impl Orchestrator {
         for routed in &servers {
             match self.ready_instance(routed) {
                 Ok(instance) => {
+                    // workspace/symbol needs an open document to establish a
+                    // project-based server's project (tsserver throws "No Project"
+                    // cold). Prewarm usually did this already; this is the backstop
+                    // for an un-prewarmed or raced instance — guarded no-op otherwise.
+                    self.ensure_project_open(&instance, routed, worktree, in_hint);
                     match queries::search_symbols(&instance.client, &routed.effective_root, query) {
                         Ok(QueryOutcome::Candidates(found)) => candidates.extend(found),
                         Ok(_) => {}
@@ -775,7 +785,90 @@ impl Orchestrator {
     /// recognized language markers spawns nothing.
     pub fn lsp_prewarm(&self, worktree: &Path) {
         for routed in self.lsp_route_servers(worktree, None) {
-            let _ = self.spawn_instance(&routed);
+            if let Ok(instance) = self.spawn_instance(&routed) {
+                self.ensure_project_open(&instance, &routed, worktree, None);
+            }
+        }
+    }
+
+    /// Open a representative document on `instance` so a project-based server
+    /// (tsserver) has an established project before `workspace/symbol`. A guarded
+    /// no-op once the instance has any open document — from prewarm, a prior
+    /// file-anchored read, or a prior search — so it neither rescans nor disturbs
+    /// an eager server (rust-analyzer). Prefer the caller's `in` hint when it is a
+    /// file the routed server handles; otherwise the shallowest matching source
+    /// file under the effective root. Best-effort: a missing file is a silent skip.
+    fn ensure_project_open(
+        &self,
+        instance: &LspInstance,
+        routed: &RoutedServer,
+        worktree: &Path,
+        in_hint: Option<&Path>,
+    ) {
+        if instance.client.has_open_documents() {
+            return;
+        }
+        let file = self.hint_source_file(routed, worktree, in_hint).or_else(|| {
+            routing::first_source_file(
+                &routed.effective_root,
+                &routed.cfg.extensions,
+                REPR_SCAN_DEPTH,
+            )
+        });
+        if let Some(file) = file {
+            let _ = instance.client.ensure_open(&file);
+        }
+    }
+
+    /// The `in` hint resolved to an absolute, server-confined path when it names a
+    /// file the routed server handles and that file exists; else `None`.
+    fn hint_source_file(
+        &self,
+        routed: &RoutedServer,
+        worktree: &Path,
+        in_hint: Option<&Path>,
+    ) -> Option<PathBuf> {
+        let hint = in_hint?;
+        let ext = hint.extension().and_then(|e| e.to_str())?;
+        if !routed.cfg.extensions.iter().any(|e| e == ext) {
+            return None;
+        }
+        let abs = if hint.is_absolute() {
+            hint.to_path_buf()
+        } else {
+            worktree.join(hint)
+        };
+        let translated = routed.translate_file(&abs);
+        translated.is_file().then_some(translated)
+    }
+
+    /// Background-prewarm `worktree`'s routed servers on a detached thread so
+    /// indexing overlaps the agent's other work and never blocks a tool call.
+    /// Idempotent via the pool (`get_or_spawn` reuses a live instance).
+    pub fn lsp_prewarm_detached(&self, worktree: PathBuf) {
+        let orch = self.clone();
+        std::thread::spawn(move || orch.lsp_prewarm(&worktree));
+    }
+
+    /// Background-prewarm every project's main checkout so the shared
+    /// main-keyed server is warm at boot. Best-effort. Canonicalize the repo
+    /// path so the InstanceKey matches the root equivalent worktrees reroute
+    /// onto (`base_checkout` canonicalizes its result).
+    pub async fn lsp_prewarm_main_checkouts(&self) {
+        let projects = match crate::projects::crud::list_db(&self.db.local).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("lsp boot prewarm: list projects failed: {e}");
+                return;
+            }
+        };
+        for project in projects {
+            if project.repo_path.is_empty() {
+                continue;
+            }
+            let path = std::path::Path::new(&project.repo_path);
+            let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            self.lsp_prewarm_detached(canon);
         }
     }
 

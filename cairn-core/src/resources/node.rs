@@ -90,6 +90,110 @@ fn render_job_summary_header(
     output
 }
 
+/// `"{n} {noun}"` with a plural `s` for any count other than one.
+fn count_phrase(n: i64, noun: &str) -> String {
+    format!("{} {}{}", n, noun, if n == 1 { "" } else { "s" })
+}
+
+/// Collapse text to its first non-empty line, capped to one readable line. Used
+/// for the node-summary "Latest" preview so a long assistant message becomes a
+/// single scannable line.
+fn activity_preview(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    const MAX_CHARS: usize = 160;
+    if line.chars().count() > MAX_CHARS {
+        let head: String = line.chars().take(MAX_CHARS).collect();
+        format!("{}\u{2026}", head.trim_end())
+    } else {
+        line.to_string()
+    }
+}
+
+/// The freshest assistant prose line for a node, drawn only from live (`full`)
+/// rows. Archived assistant events store their body at git coordinates, not in
+/// `data`, so they are excluded rather than reconstructed — a summary read must
+/// stay cheap, and a completed/archived node has its artifact to read instead.
+async fn latest_assistant_preview(conn: &turso::Connection, job_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT e.data
+            FROM events e
+            JOIN runs r ON e.run_id = r.id
+            WHERE r.job_id = ?1
+              AND e.event_type = 'assistant'
+              AND (e.storage_mode IS NULL OR e.storage_mode = 'full')
+            ORDER BY e.created_at DESC, e.rowid DESC
+            LIMIT 30
+            ",
+            (job_id,),
+        )
+        .await
+        .ok()?;
+    while let Ok(Some(row)) = rows.next().await {
+        let Ok(data) = row.text(0) else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        if let Some(content) = value.get("content").and_then(|c| c.as_str()) {
+            let preview = activity_preview(content);
+            if !preview.is_empty() {
+                return Some(preview);
+            }
+        }
+    }
+    None
+}
+
+/// Render the node summary's `## Activity` section: turn/run/event counts, the
+/// last-activity timestamp, and the latest assistant line. Returns `None` when
+/// the node has no events yet (nothing to summarize beyond the header), so a
+/// just-started node stays terse. Counts and timing come from one cheap
+/// aggregate that needs no event-body reconstruction.
+async fn render_node_activity(conn: &turso::Connection, job_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT COUNT(DISTINCT e.run_id), COUNT(DISTINCT e.turn_id),
+                   COUNT(*), MAX(e.created_at)
+            FROM events e
+            JOIN runs r ON e.run_id = r.id
+            WHERE r.job_id = ?1
+            ",
+            (job_id,),
+        )
+        .await
+        .ok()?;
+    let row = rows.next().await.ok().flatten()?;
+    let runs = row.opt_i64(0).ok().flatten().unwrap_or(0);
+    let turns = row.opt_i64(1).ok().flatten().unwrap_or(0);
+    let events = row.opt_i64(2).ok().flatten().unwrap_or(0);
+    let last_activity = row.opt_i64(3).ok().flatten();
+    if events == 0 {
+        return None;
+    }
+
+    let mut summary = format!(
+        "{} \u{b7} {} \u{b7} {}",
+        count_phrase(turns, "turn"),
+        count_phrase(runs, "run"),
+        count_phrase(events, "event"),
+    );
+    if let Some(ts) = last_activity {
+        summary.push_str(&format!(" \u{b7} last active {}", format_node_timestamp(ts)));
+    }
+
+    let mut output = format!("## Activity\n\n{}\n", summary);
+    if let Some(preview) = latest_assistant_preview(conn, job_id).await {
+        output.push_str(&format!("\nLatest: {}\n", preview));
+    }
+    Some(output)
+}
+
 fn format_job_todos(
     project_key: &str,
     number: i32,
@@ -658,6 +762,14 @@ pub(super) async fn read_node(
         job.started_at.map(i64::from),
         job.completed_at.map(i64::from),
     );
+
+    // Activity gives the summary something to decide on before an artifact
+    // exists: how much has happened (turns/runs/events), when it last moved, and
+    // the latest assistant line. Skipped entirely for a node with no events yet.
+    if let Some(activity) = render_node_activity(&conn, &job.id).await {
+        output.push_str(&activity);
+        output.push('\n');
+    }
 
     // Build resource URIs for available sub-resources
     let base_uri = build_node_uri(project_key, number, exec_seq, &visible_node_segment);
@@ -1493,6 +1605,35 @@ mod artifact_render_tests {
     #[test]
     fn non_object_payload_is_verbatim() {
         assert_eq!(render_artifact_markdown("plain text"), "plain text");
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::{activity_preview, count_phrase};
+
+    #[test]
+    fn count_phrase_pluralizes_around_one() {
+        assert_eq!(count_phrase(1, "turn"), "1 turn");
+        assert_eq!(count_phrase(0, "turn"), "0 turns");
+        assert_eq!(count_phrase(3, "run"), "3 runs");
+    }
+
+    #[test]
+    fn activity_preview_takes_first_nonempty_line() {
+        assert_eq!(
+            activity_preview("\n  \nFirst real line\nsecond line"),
+            "First real line"
+        );
+    }
+
+    #[test]
+    fn activity_preview_truncates_long_lines_with_ellipsis() {
+        let long = "x".repeat(400);
+        let preview = activity_preview(&long);
+        assert!(preview.ends_with('\u{2026}'));
+        // 160 retained chars plus the ellipsis.
+        assert_eq!(preview.chars().count(), 161);
     }
 }
 

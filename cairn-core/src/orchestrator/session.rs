@@ -1219,6 +1219,22 @@ pub fn start_agent_session(
             )
         };
 
+        // Inherited workspace agents/skills a project has disabled drop out of the
+        // prompt surfaces entirely. Skills auto-surface into the prompt, so this is
+        // the real per-project disable lever for an inherited skill.
+        let (disabled_agents, disabled_skills) = match session_project_id.as_deref() {
+            Some(pid) => (
+                super::config_resource::disabled_keys_blocking(orch, pid, "agent")
+                    .unwrap_or_default(),
+                super::config_resource::disabled_keys_blocking(orch, pid, "skill")
+                    .unwrap_or_default(),
+            ),
+            None => (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            ),
+        };
+
         // Get list of available agents from files
         let available_agents: Vec<(String, String, String)> = {
             let agents =
@@ -1234,6 +1250,7 @@ pub fn start_agent_session(
                         .or_insert((agent.name, agent.description));
                 }
             }
+            by_id.retain(|id, _| !disabled_agents.contains(id));
             let mut result: Vec<(String, String, String)> = by_id
                 .into_iter()
                 .map(|(id, (name, description))| (id, name, description))
@@ -1257,6 +1274,7 @@ pub fn start_agent_session(
                         .or_insert((skill.name, skill.description));
                 }
             }
+            by_id.retain(|id, _| !disabled_skills.contains(id));
             let mut result: Vec<(String, String, String)> = by_id
                 .into_iter()
                 .map(|(id, (name, description))| (id, name, description))

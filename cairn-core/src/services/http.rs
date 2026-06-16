@@ -245,6 +245,13 @@ impl HttpClient for RealHttpClient {
 #[cfg(any(test, feature = "test-utils"))]
 pub struct MockHttpClient {
     responses: std::sync::Mutex<Vec<(String, HttpResponse)>>,
+    /// Sequenced responses keyed by URL pattern. Each matching request consumes
+    /// the next entry; once a sequence is down to its last entry that entry is
+    /// returned for every subsequent request (mirroring an upstream value that
+    /// has settled). Used to model GitHub's async mergeability window, where the
+    /// first GET returns `mergeable: null` and a later GET returns the computed
+    /// value.
+    sequences: std::sync::Mutex<Vec<(String, std::collections::VecDeque<HttpResponse>)>>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -252,6 +259,7 @@ impl MockHttpClient {
     pub fn new() -> Self {
         Self {
             responses: std::sync::Mutex::new(Vec::new()),
+            sequences: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -264,11 +272,40 @@ impl MockHttpClient {
         self
     }
 
+    /// Add an ordered sequence of responses for URLs containing the pattern.
+    ///
+    /// Successive matching requests consume successive entries; the final entry
+    /// is then repeated for any further requests. Fixed `respond_to` responses
+    /// take precedence, so a more specific pattern (e.g. `"reviews"`) still
+    /// resolves before a broader sequenced one (e.g. `"/pulls/7"`).
+    pub fn respond_to_sequence(self, url_contains: &str, responses: Vec<HttpResponse>) -> Self {
+        self.sequences
+            .lock()
+            .unwrap()
+            .push((url_contains.to_string(), responses.into()));
+        self
+    }
+
     fn find_response(&self, url: &str) -> Result<HttpResponse, String> {
-        let responses = self.responses.lock().unwrap();
-        for (pattern, response) in responses.iter() {
-            if url.contains(pattern) {
-                return Ok(response.clone());
+        // Fixed responses win over sequences so a specific pattern resolves
+        // ahead of a broader sequenced one matching the same URL.
+        {
+            let responses = self.responses.lock().unwrap();
+            for (pattern, response) in responses.iter() {
+                if url.contains(pattern) {
+                    return Ok(response.clone());
+                }
+            }
+        }
+        let mut sequences = self.sequences.lock().unwrap();
+        for (pattern, queue) in sequences.iter_mut() {
+            if url.contains(pattern.as_str()) {
+                if queue.len() > 1 {
+                    return Ok(queue.pop_front().unwrap());
+                }
+                if let Some(last) = queue.front() {
+                    return Ok(last.clone());
+                }
             }
         }
         Err(format!("No mock response configured for URL: {}", url))

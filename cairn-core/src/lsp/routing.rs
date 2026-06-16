@@ -121,6 +121,55 @@ pub fn find_marker_roots(worktree: &Path, markers: &[String], max_depth: usize) 
     roots
 }
 
+/// Find a representative source file under `root` whose extension the server
+/// handles — the document opened to establish a project-based server's project
+/// before a `workspace/symbol` query (tsserver throws "No Project" until one
+/// file is open). Breadth-first so a shallow file (e.g. `src/App.tsx`) is found
+/// fast, skipping build/vendor/VCS dirs and symlinks, bounded to `max_depth`
+/// levels below `root`. Entries are sorted so the result is deterministic.
+pub fn first_source_file(root: &Path, extensions: &[String], max_depth: usize) -> Option<PathBuf> {
+    if extensions.is_empty() {
+        return None;
+    }
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back((root.to_path_buf(), 0usize));
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            // file_type from read_dir does not follow symlinks, so symlinked
+            // dirs report as symlinks and are skipped — no cycle risk.
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if !is_ignored_scan_dir(&name.to_string_lossy()) {
+                    subdirs.push(entry.path());
+                }
+            } else if ft.is_file() {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        for file in &files {
+            if let Some(ext) = file.extension().and_then(|e| e.to_str()) {
+                if extensions.iter().any(|e| e == ext) {
+                    return Some(file.clone());
+                }
+            }
+        }
+        if depth < max_depth {
+            subdirs.sort();
+            for sub in subdirs {
+                queue.push_back((sub, depth + 1));
+            }
+        }
+    }
+    None
+}
+
 /// The git tree SHA naming the content of `relpath` under `rev` in `repo`. A
 /// subtree's tree SHA is its content identity: two checkouts whose subroots
 /// resolve to the same tree SHA hold byte-identical trees there. `relpath` is
@@ -238,6 +287,72 @@ mod tests {
         assert_eq!(
             find_marker_roots(root, &["go.mod".to_string()], 4),
             vec![deep]
+        );
+    }
+
+    #[test]
+    fn first_source_file_skips_ignored_dirs() {
+        let wt = tempdir().unwrap();
+        let root = wt.path();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("node_modules")).unwrap();
+        fs::write(root.join("node_modules/foo.ts"), "").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/app.ts"), "").unwrap();
+
+        assert_eq!(
+            first_source_file(root, &["ts".to_string()], 6),
+            Some(root.join("src/app.ts")),
+            "never the node_modules file"
+        );
+    }
+
+    #[test]
+    fn first_source_file_prefers_shallowest() {
+        let wt = tempdir().unwrap();
+        let root = wt.path();
+        let deep = root.join("src/lib");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("util.ts"), "").unwrap();
+        fs::write(root.join("index.ts"), "").unwrap();
+
+        assert_eq!(
+            first_source_file(root, &["ts".to_string()], 6),
+            Some(root.join("index.ts")),
+            "breadth-first returns the root-level file"
+        );
+    }
+
+    #[test]
+    fn first_source_file_none_when_no_match() {
+        let wt = tempdir().unwrap();
+        let root = wt.path();
+        fs::write(root.join("readme.md"), "").unwrap();
+
+        assert_eq!(first_source_file(root, &[], 6), None, "empty extensions");
+        assert_eq!(
+            first_source_file(root, &["ts".to_string()], 6),
+            None,
+            "no file matches the extension"
+        );
+    }
+
+    #[test]
+    fn first_source_file_respects_max_depth() {
+        let wt = tempdir().unwrap();
+        let root = wt.path();
+        let deep = root.join("a/b/c");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("x.ts"), "").unwrap();
+
+        assert_eq!(
+            first_source_file(root, &["ts".to_string()], 2),
+            None,
+            "deeper than max_depth is not found"
+        );
+        assert_eq!(
+            first_source_file(root, &["ts".to_string()], 3),
+            Some(deep.join("x.ts"))
         );
     }
 

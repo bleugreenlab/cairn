@@ -331,6 +331,14 @@ impl LspClient {
         Ok(uri)
     }
 
+    /// Whether any document has been opened on this client. A `workspace/symbol`
+    /// query needs at least one open document to establish a project-based
+    /// server's project (tsserver); once true, the project is established and an
+    /// extra representative open is redundant.
+    pub fn has_open_documents(&self) -> bool {
+        !self.opened.lock().unwrap().is_empty()
+    }
+
     /// Send a request and block for its result (the inner `result` value, with
     /// `error` mapped to [`LspError::Transport`]).
     pub fn request(
@@ -963,6 +971,22 @@ mod tests {
         assert!(
             saw_initialized,
             "server should observe the initialized notification"
+        );
+    }
+
+    #[test]
+    fn has_open_documents_flips_on_ensure_open() {
+        let (client, _) = scripted_client(with_init(HashMap::new()), false);
+        assert!(
+            !client.has_open_documents(),
+            "a fresh client has no open documents"
+        );
+        client
+            .ensure_open(Path::new("/tmp/cairn-test-open.ts"))
+            .expect("ensure_open should send didOpen");
+        assert!(
+            client.has_open_documents(),
+            "ensure_open establishes an open document"
         );
     }
 

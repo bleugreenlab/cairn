@@ -316,27 +316,26 @@ impl Orchestrator {
         config_resource::delete_config::<RecipeResource>(self, recipe_id, project_id)
     }
 
-    /// Create a project override of a recipe (from any scope).
-    pub fn create_recipe_override(
-        &self,
-        recipe_id: &str,
-        project_id: &str,
-    ) -> Result<Recipe, String> {
-        config_resource::create_override::<RecipeResource>(self, recipe_id, project_id)
-    }
-
-    /// Promote a project-only recipe to workspace scope.
-    pub fn promote_recipe_to_workspace(
-        &self,
-        recipe_id: &str,
-        source_project_id: &str,
-    ) -> Result<Recipe, String> {
-        config_resource::promote_to_workspace::<RecipeResource>(self, recipe_id, source_project_id)
-    }
-
     /// List recipes for a project context with workspace→project shadowing.
     pub fn list_recipes_for_context(&self, project_id: &str) -> Result<Vec<Recipe>, String> {
         config_resource::list_for_context::<RecipeResource>(self, project_id)
+    }
+
+    /// Copy a recipe from any scope into a target scope under a chosen id.
+    pub fn copy_recipe_config(
+        &self,
+        source_id: &str,
+        source_project_id: Option<&str>,
+        target_id: &str,
+        target_project_id: Option<&str>,
+    ) -> Result<Recipe, String> {
+        config_resource::copy_config::<RecipeResource>(
+            self,
+            source_id,
+            source_project_id,
+            target_id,
+            target_project_id,
+        )
     }
 
     /// Archive a recipe (in file-only mode, same as delete).

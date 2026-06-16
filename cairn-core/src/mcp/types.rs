@@ -32,6 +32,7 @@ pub struct Question {
     pub question: String,
     pub header: Option<String>,
     pub options: Vec<QuestionOption>,
+    #[serde(default)]
     pub multi_select: bool,
 }
 
@@ -260,6 +261,20 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn ask_user_payload_defaults_missing_multi_select_to_false() {
+        let json = serde_json::json!({
+            "questions": [{
+                "question": "Continue?",
+                "header": "Confirm",
+                "options": [{"label": "Yes", "description": "Proceed"}]
+            }]
+        });
+
+        let payload: AskUserPayload = serde_json::from_value(json).unwrap();
+        assert!(!payload.questions[0].multi_select);
     }
 
     #[test]

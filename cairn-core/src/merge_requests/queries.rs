@@ -4,7 +4,7 @@ use turso::params;
 
 const PR_COLUMNS: &str = "id, job_id, github_pr_number, github_pr_url, title, body, github_state,
     status, github_review, github_mergeable, additions, deletions, checks_status, checks_json,
-    github_fetched_at, updated_at, source_branch, target_branch";
+    github_fetched_at, updated_at, source_branch, target_branch, is_local";
 
 fn pr_cache_from_row(row: &turso::Row) -> DbResult<PrCache> {
     let checks: Vec<Check> = row
@@ -40,7 +40,7 @@ fn pr_cache_from_row(row: &turso::Row) -> DbResult<PrCache> {
         checks,
         fetched_at: row.opt_i64(14)?.unwrap_or(0),
         updated_at: row.i64(15)?,
-        is_local: row.opt_i64(2)?.is_none(),
+        is_local: row.opt_i64(18)?.unwrap_or(0) != 0,
         source_branch: row.opt_text(16)?,
         target_branch: row.opt_text(17)?,
     })
@@ -180,48 +180,6 @@ async fn pr_summary_for_job(
     )
     .await
     .map_err(|e| format!("Failed to load PR summary: {e}"))
-}
-
-pub async fn get_project_merge_requests(
-    db: &LocalDb,
-    project_id: &str,
-) -> Result<Vec<crate::models::ProjectPrEntry>, String> {
-    let project_id = project_id.to_string();
-    db.query_all(
-        "SELECT mr.id, mr.job_id, mr.status, mr.title, mr.additions, mr.deletions,
-                mr.checks_status, mr.github_review, mr.github_pr_number,
-                mr.github_pr_url, mr.opened_at, mr.updated_at, mr.issue_id,
-                i.number, i.title, j.execution_id
-         FROM merge_requests mr
-         LEFT JOIN issues i ON mr.issue_id = i.id
-         LEFT JOIN jobs j ON j.id = mr.job_id
-         WHERE mr.project_id = ?1
-         ORDER BY mr.updated_at DESC",
-        params![project_id.as_str()],
-        |row| {
-            Ok(crate::models::ProjectPrEntry {
-                id: row.text(0)?,
-                action_run_id: row.text(1)?,
-                pr_status: row.text(2)?,
-                title: row.opt_text(3)?,
-                additions: row.opt_i64(4)?.map(|value| value as i32),
-                deletions: row.opt_i64(5)?.map(|value| value as i32),
-                checks_status: row.opt_text(6)?,
-                review_decision: row.opt_text(7)?,
-                pr_number: row.opt_i64(8)?.unwrap_or(0) as i32,
-                pr_url: row.opt_text(9)?.unwrap_or_default(),
-                opened_at: Some(row.i64(10)?),
-                updated_at: row.i64(11)?,
-                issue_id: row.opt_text(12)?,
-                issue_number: row.opt_i64(13)?.map(|value| value as i32),
-                issue_title: row.opt_text(14)?,
-                execution_id: row.opt_text(15)?.unwrap_or_default(),
-                is_draft: false,
-            })
-        },
-    )
-    .await
-    .map_err(|e| format!("Failed to load project PRs: {e}"))
 }
 
 pub async fn get_webhook_events(db: &LocalDb, pr_number: i64) -> Result<Vec<WebhookEvent>, String> {

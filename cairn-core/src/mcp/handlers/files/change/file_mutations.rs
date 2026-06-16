@@ -1306,6 +1306,11 @@ pub(super) async fn finalize_file_commit(
             // File changes were already recorded above (on apply); committing
             // does not re-record them.
             emit_worktree_changed(orch, &request.cwd);
+            // A successful commit/amend changes the tree SHA, which may be the
+            // worktree's first divergence from main; warm the per-worktree LSP
+            // server in the background so it is ready before the agent's first
+            // query rather than spawned cold mid-query. Idempotent once warm.
+            orch.lsp_prewarm_detached(std::path::PathBuf::from(&request.cwd));
 
             Ok(Some(CommitReport {
                 status: if commit_msg == "^" {

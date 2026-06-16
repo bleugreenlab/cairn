@@ -392,12 +392,6 @@ pub enum CairnResource {
         project: String,
         action_id: String,
     },
-    /// Project-wide pull-request (merge request) collection — a read-only list
-    /// of the project's PRs. Per-PR actions (merge/close/refresh) live on the
-    /// `pr` action node; each row links to that canonical URI.
-    ProjectPrs {
-        project: String,
-    },
     /// Workspace-global settings document. One resource with every section:
     /// app prefs, backends (+ read-only catalog/usage), git identities, provider
     /// accounts, keybinds, build services, and read-only GitHub status. Patch
@@ -872,10 +866,6 @@ pub fn build_project_action_uri(project: &str, action_id: &str) -> String {
     format!("{}/actions/{}", build_project_uri(project), action_id)
 }
 
-pub fn build_project_prs_uri(project: &str) -> String {
-    format!("{}/prs", build_project_uri(project))
-}
-
 pub fn build_settings_uri() -> String {
     "cairn://settings".to_string()
 }
@@ -1175,7 +1165,6 @@ impl CairnResource {
             Self::ProjectAction { project, action_id } => {
                 build_project_action_uri(project, action_id)
             }
-            Self::ProjectPrs { project } => build_project_prs_uri(project),
             Self::Settings => build_settings_uri(),
             Self::Projects => build_projects_uri(),
             Self::ProjectSettings { project } => build_project_settings_uri(project),
@@ -1323,7 +1312,6 @@ impl CairnResource {
             | Self::Action { .. }
             | Self::ProjectActions { .. }
             | Self::ProjectAction { .. }
-            | Self::ProjectPrs { .. }
             | Self::NodeLsp { .. }
             | Self::ProjectLsp { .. }
             | Self::Db
@@ -1384,8 +1372,7 @@ impl CairnResource {
             | Self::ProjectActions { project }
             | Self::ProjectAction { project, .. }
             | Self::NodeLsp { project, .. }
-            | Self::ProjectLsp { project, .. }
-            | Self::ProjectPrs { project } => Some(project),
+            | Self::ProjectLsp { project, .. } => Some(project),
             Self::Skills
             | Self::Skill { .. }
             | Self::Labels
@@ -1463,7 +1450,6 @@ impl CairnResource {
             | Self::Action { .. }
             | Self::ProjectActions { .. }
             | Self::ProjectAction { .. }
-            | Self::ProjectPrs { .. }
             | Self::ProjectLsp { .. }
             | Self::Db
             | Self::Logs
@@ -1572,7 +1558,6 @@ impl CairnResource {
             Self::Action { .. } => ResourceKind::Action,
             Self::ProjectActions { .. } => ResourceKind::ProjectActions,
             Self::ProjectAction { .. } => ResourceKind::ProjectAction,
-            Self::ProjectPrs { .. } => ResourceKind::ProjectPrs,
             Self::NodeLsp { .. } => ResourceKind::NodeLsp,
             Self::ProjectLsp { .. } => ResourceKind::ProjectLsp,
         }
@@ -1705,11 +1690,6 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "actions", action_id] => Some(CairnResource::ProjectAction {
             project: canonical_project(project),
             action_id: (*action_id).to_string(),
-        }),
-        // Read-only project-wide PR list. Literal `prs` segment; must precede the
-        // numeric `[PROJECT_SCOPE, project, number]` issue arm below.
-        [PROJECT_SCOPE, project, "prs"] => Some(CairnResource::ProjectPrs {
-            project: canonical_project(project),
         }),
         // Literal `lsp` segment(s); must precede the numeric issue arm below so a
         // project-scoped lsp URI is never misread as an issue id.
@@ -3129,23 +3109,6 @@ mod tests {
         );
         assert_eq!(CairnResource::Recipes.to_route(), None);
         assert_eq!(CairnResource::Recipes.kind(), ResourceKind::Recipes);
-    }
-
-    #[test]
-    fn parses_and_round_trips_project_prs() {
-        let prs = CairnResource::ProjectPrs {
-            project: "CAIRN".to_string(),
-        };
-        assert_eq!(parse_uri("cairn://p/CAIRN/prs"), Some(prs.clone()));
-        assert_eq!(prs.to_uri(), "cairn://p/CAIRN/prs");
-        // Project key is canonicalized (uppercased) on parse.
-        assert_eq!(parse_uri("cairn://p/cairn/prs"), Some(prs.clone()));
-        // Accessors: project-scoped collection with no issue number and no route.
-        assert_eq!(prs.kind(), ResourceKind::ProjectPrs);
-        assert_eq!(prs.project(), Some("CAIRN"));
-        assert_eq!(prs.issue_number(), None);
-        assert_eq!(prs.node_id(), None);
-        assert_eq!(prs.to_route(), None);
     }
 
     #[test]

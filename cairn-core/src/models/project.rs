@@ -69,4 +69,5 @@ pub struct UpdateProject {
     pub setup_commands: Option<Vec<String>>,
     pub terminal_commands: Option<Vec<TerminalCommand>>,
     pub worktree_populate: Option<crate::config::project_settings::PopulateConfig>,
+    pub default_branch: Option<String>,
 }

@@ -281,6 +281,86 @@ async fn node_and_task_resources_resolve_by_stored_uri_segment() {
 }
 
 #[tokio::test]
+async fn node_summary_surfaces_activity_and_latest_assistant_line() {
+    let fixture = issue_project_fixture("MCP").await;
+    let issue_id = fixture
+        .insert_issue_with_status_and_time(1, "Activity issue", "active", 1)
+        .await;
+
+    let project_id = fixture.project_id.clone();
+    fixture
+        .db
+        .write(|conn| {
+            let project_id = project_id.clone();
+            let issue_id = issue_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-act', 'recipe', ?1, ?2, 'running', 1, 1)",
+                    params![issue_id.as_str(), project_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, status, created_at, updated_at, started_at, uri_segment)
+                     VALUES ('node-act', 'exec-act', 'planner', ?1, ?2, 'planner', 'running', 1, 1, 1, 'planner')",
+                    params![issue_id.as_str(), project_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs(id, job_id, status, created_at, updated_at)
+                     VALUES ('run-act', 'node-act', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO turns(id, session_id, run_id, sequence, created_at, updated_at)
+                     VALUES ('turn-a', 'sess-act', 'run-act', 1, 1, 1), ('turn-b', 'sess-act', 'run-act', 2, 2, 2)",
+                    (),
+                )
+                .await?;
+                // Two assistant turns (earlier + later) and a tool result in
+                // between; the later assistant line is the expected "Latest".
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id)
+                     VALUES ('ev-1', 'run-act', 1, 10, 'assistant', '{\"content\":\"Mapping the parser flow.\"}', 10, 'turn-a')",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id)
+                     VALUES ('ev-2', 'run-act', 2, 20, 'tool_result', '{\"toolResult\":\"ok\"}', 20, 'turn-a')",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id)
+                     VALUES ('ev-3', 'run-act', 3, 30, 'assistant', '{\"content\":\"Drafting the plan now.\"}', 30, 'turn-b')",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    let summary = read_resource(&fixture.orch, "cairn://p/MCP/1/1/planner".to_string()).await;
+    assert_contains_all(
+        &summary,
+        &[
+            "## Activity",
+            "2 turns",
+            "1 run",
+            "3 events",
+            "last active",
+            "Latest: Drafting the plan now.",
+        ],
+    );
+    // The earlier assistant line is superseded, not surfaced.
+    assert_not_contains_any(&summary, &["Mapping the parser flow."]);
+}
+
+#[tokio::test]
 async fn project_root_is_overview_and_project_issues_is_collection() {
     let fixture = issue_project_fixture("MCP").await;
     set_project_context(

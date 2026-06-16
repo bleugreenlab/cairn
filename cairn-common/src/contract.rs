@@ -121,7 +121,6 @@ pub enum ResourceKind {
     Action,
     ProjectActions,
     ProjectAction,
-    ProjectPrs,
     NodeLsp,
     ProjectLsp,
     Help,
@@ -192,7 +191,6 @@ impl ResourceKind {
         ResourceKind::Action,
         ResourceKind::ProjectActions,
         ResourceKind::ProjectAction,
-        ResourceKind::ProjectPrs,
         ResourceKind::NodeLsp,
         ResourceKind::ProjectLsp,
         ResourceKind::Help,
@@ -2350,16 +2348,6 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
                 example: "write({changes:[{target:\"cairn://p/PROJECT/actions/ID\",mode:\"delete\"}]})",
             },
         ],
-    },
-    ResourceContract {
-        kind: ResourceKind::ProjectPrs,
-        uri_template: "cairn://p/{project}/prs",
-        name: "Project pull requests",
-        description: "Read-only list of the project's pull requests (merge requests), newest-first. Each row links to the per-PR `pr` action node (cairn://p/PROJECT/N/EXEC/pr), where merge/close/refresh live.",
-        read_projections: NO_PROJECTIONS,
-        related: NO_RELATED,
-        cross_actions: NO_CROSS_ACTIONS,
-        mutations: NO_MUTATIONS,
     },
 ];
 

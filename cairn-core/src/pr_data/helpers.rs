@@ -8,6 +8,7 @@ use crate::github::credentials::GitHubAppCredentials;
 use crate::models::{Check, CheckState, ChecksStatus, MergeableState, PrState, ReviewDecision};
 use crate::services::{GitClient, HttpClient};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // ── Parsed PR Details ──────────────────────────────────────────
 
@@ -117,7 +118,23 @@ pub fn extract_run_id(url: &str) -> Result<i64, String> {
 
 // ── HTTP-Composed Helpers ──────────────────────────────────────
 
+/// Number of times to re-poll GitHub for a PR's mergeability after the first
+/// fetch returns a still-computing `null`.
+///
+/// GitHub computes a PR's `mergeable` boolean asynchronously: a freshly opened
+/// or just-pushed PR's first GET returns `mergeable: null` until the background
+/// merge check finishes. Polling past that window keeps a null-window `UNKNOWN`
+/// out of the cache. Bounded so a genuinely indeterminate PR still resolves.
+const MERGEABILITY_POLL_ATTEMPTS: usize = 4;
+
+/// Delay between mergeability re-polls (~2.4s worst case across all attempts).
+const MERGEABILITY_POLL_BACKOFF: Duration = Duration::from_millis(600);
+
 /// Fetch and parse PR details from GitHub, including reviews.
+///
+/// Polls past GitHub's asynchronous mergeability-compute window (see
+/// [`MERGEABILITY_POLL_ATTEMPTS`]) so an open PR never resolves to a
+/// null-window `UNKNOWN` that would otherwise stick in the cache.
 pub async fn fetch_pr_via_api(
     http: &dyn HttpClient,
     creds: &GitHubAppCredentials,
@@ -125,7 +142,37 @@ pub async fn fetch_pr_via_api(
     repo: &str,
     pr_number: i32,
 ) -> Result<ParsedPrDetails, String> {
-    let pr = api::fetch_pr(http, creds, owner, repo, pr_number).await?;
+    fetch_pr_via_api_with_backoff(
+        http,
+        creds,
+        owner,
+        repo,
+        pr_number,
+        MERGEABILITY_POLL_BACKOFF,
+    )
+    .await
+}
+
+async fn fetch_pr_via_api_with_backoff(
+    http: &dyn HttpClient,
+    creds: &GitHubAppCredentials,
+    owner: &str,
+    repo: &str,
+    pr_number: i32,
+    backoff: Duration,
+) -> Result<ParsedPrDetails, String> {
+    let mut pr = api::fetch_pr(http, creds, owner, repo, pr_number).await?;
+
+    // GitHub returns `mergeable: null` for an open PR while it computes the merge
+    // check in the background. Re-poll until it settles or the attempt budget is
+    // exhausted; a still-null result then falls through to `Unknown` gracefully.
+    for _ in 0..MERGEABILITY_POLL_ATTEMPTS {
+        if pr.mergeable.is_some() || compute_pr_state(pr.merged, &pr.state) != PrState::Open {
+            break;
+        }
+        tokio::time::sleep(backoff).await;
+        pr = api::fetch_pr(http, creds, owner, repo, pr_number).await?;
+    }
 
     let state = compute_pr_state(pr.merged, &pr.state);
     let mergeable = compute_mergeable_state(pr.mergeable, pr.mergeable_state.as_deref());
@@ -1133,6 +1180,13 @@ mod tests {
             MergeableState::Mergeable
         );
         assert_eq!(compute_mergeable_state(None, None), MergeableState::Unknown);
+        // The boolean wins over `mergeable_state`: a settled `Some(true)` is
+        // MERGEABLE even when the state is "unstable" (e.g. checks failing). The
+        // webhook path now shares this fn, so both paths agree on this case.
+        assert_eq!(
+            compute_mergeable_state(Some(true), Some("unstable")),
+            MergeableState::Mergeable
+        );
     }
 
     #[test]
@@ -1377,6 +1431,105 @@ mod tests {
         assert_eq!(checks[3].state, CheckState::Cancelled);
         assert_eq!(checks[4].state, CheckState::Failure); // unknown conclusion → Failure
         assert_eq!(checks[5].state, CheckState::Pending); // in_progress → Pending
+    }
+
+    // ── fetch_pr_via_api: mergeability poll ─────────────────────
+
+    fn mergeability_poll_creds() -> crate::github::credentials::GitHubAppCredentials {
+        crate::github::credentials::GitHubAppCredentials {
+            app_id: 12345,
+            private_key: include_str!("../../tests/fixtures/test_rsa_key.pem").to_string(),
+            installation_id: 99999,
+        }
+    }
+
+    fn pr_response(
+        mergeable: serde_json::Value,
+        mergeable_state: serde_json::Value,
+    ) -> crate::services::HttpResponse {
+        let body = serde_json::json!({
+            "title": "Poll PR",
+            "body": null,
+            "state": "open",
+            "draft": false,
+            "mergeable": mergeable,
+            "mergeable_state": mergeable_state,
+            "additions": 3,
+            "deletions": 1,
+            "merged": false,
+            "head": { "sha": "headsha" }
+        });
+        crate::services::HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&body).unwrap(),
+        }
+    }
+
+    fn token_response() -> crate::services::HttpResponse {
+        let token_body = serde_json::json!({
+            "token": "ghs_test",
+            "expires_at": "2099-01-01T00:00:00Z"
+        });
+        crate::services::HttpResponse {
+            status: 201,
+            body: serde_json::to_vec(&token_body).unwrap(),
+        }
+    }
+
+    fn empty_reviews_response() -> crate::services::HttpResponse {
+        crate::services::HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&serde_json::json!([])).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_via_api_polls_past_null_mergeable_window() {
+        use crate::services::testing::MockHttpClient;
+
+        // First GET lands inside GitHub's compute window (`mergeable: null`);
+        // the next resolves to a real value. The poll must surface MERGEABLE.
+        let http = MockHttpClient::new()
+            .respond_to("access_tokens", token_response())
+            .respond_to("reviews", empty_reviews_response())
+            .respond_to_sequence(
+                "/pulls/7",
+                vec![
+                    pr_response(serde_json::Value::Null, serde_json::json!("unknown")),
+                    pr_response(serde_json::json!(true), serde_json::json!("clean")),
+                ],
+            );
+
+        let creds = mergeability_poll_creds();
+        let parsed =
+            fetch_pr_via_api_with_backoff(&http, &creds, "owner", "repo", 7, Duration::ZERO)
+                .await
+                .unwrap();
+
+        assert_eq!(parsed.mergeable, MergeableState::Mergeable);
+    }
+
+    #[tokio::test]
+    async fn fetch_pr_via_api_returns_unknown_when_mergeable_never_settles() {
+        use crate::services::testing::MockHttpClient;
+
+        // GitHub never finishes computing within the budget: every GET returns
+        // `mergeable: null`. The poll must give up and return UNKNOWN, not hang.
+        let http = MockHttpClient::new()
+            .respond_to("access_tokens", token_response())
+            .respond_to("reviews", empty_reviews_response())
+            .respond_to(
+                "/pulls/9",
+                pr_response(serde_json::Value::Null, serde_json::json!("unknown")),
+            );
+
+        let creds = mergeability_poll_creds();
+        let parsed =
+            fetch_pr_via_api_with_backoff(&http, &creds, "owner", "repo", 9, Duration::ZERO)
+                .await
+                .unwrap();
+
+        assert_eq!(parsed.mergeable, MergeableState::Unknown);
     }
 
     // ── update_main_repo_after_merge ────────────────────────────

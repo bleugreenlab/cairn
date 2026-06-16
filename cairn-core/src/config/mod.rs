@@ -387,6 +387,66 @@ pub fn bundled_resource_ids(resource_dir: &Path, dir_name: &str) -> Result<Vec<S
     Ok(ids)
 }
 
+/// Restore one bundled config artifact (agent | recipe | skill) over its
+/// workspace copy and commit the change. The per-artifact analog of
+/// [`mirror_bundle_resources`], for resetting a single diverged workspace
+/// artifact back to its shipped default. Errors if the id has no bundled
+/// counterpart (a user-created artifact has no default to restore).
+///
+/// `entity_type` is the singular form used across the config commands
+/// (`agent` | `recipe` | `skill`). `resource_dir` is the app bundle's resource
+/// directory; `target_dir` is the workspace config dir (`~/.cairn`).
+pub fn restore_bundled_config_entry(
+    resource_dir: &Path,
+    target_dir: &Path,
+    entity_type: &str,
+    id: &str,
+) -> Result<(), String> {
+    let subdir = match entity_type {
+        "agent" => "agents",
+        "recipe" => "recipes",
+        "skill" => "skills",
+        other => return Err(format!("No bundled defaults for entity type '{other}'")),
+    };
+
+    let dest = if subdir == "skills" {
+        let source = resource_dir.join(subdir).join(id);
+        if !source.join("SKILL.md").exists() {
+            return Err(format!("No bundled default for skill '{id}'"));
+        }
+        let dest = target_dir.join(subdir).join(id);
+        let fs = crate::services::RealFileSystem;
+        mirror_dir_with_fs(&fs, &source, &dest)?;
+        dest
+    } else {
+        let extensions: &[&str] = if subdir == "agents" {
+            &["md"]
+        } else {
+            &["yaml", "yml"]
+        };
+        let source = extensions
+            .iter()
+            .map(|ext| resource_dir.join(subdir).join(format!("{id}.{ext}")))
+            .find(|path| path.exists())
+            .ok_or_else(|| format!("No bundled default for {entity_type} '{id}'"))?;
+        let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let dest = target_dir.join(subdir).join(format!("{id}.{ext}"));
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {subdir} directory: {e}"))?;
+        }
+        std::fs::copy(&source, &dest)
+            .map_err(|e| format!("Failed to copy bundled {entity_type} '{id}': {e}"))?;
+        dest
+    };
+
+    commit_config_paths(
+        std::slice::from_ref(&dest),
+        &format!("cairn: reset {entity_type} {id}"),
+    );
+    Ok(())
+}
+
 /// Result type for config file loading - includes both successful loads and parse errors
 #[derive(Debug, Clone)]
 pub enum ConfigResult<T> {
