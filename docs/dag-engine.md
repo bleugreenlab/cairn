@@ -6,9 +6,9 @@ The execution engine turns recipe definitions into running multi-agent workflows
 
 **Recipe** — a static workflow template. Defines nodes (what to do) and edges (in what order, with what data). Stored as YAML configuration.
 
-**Execution** — a runtime instance of a recipe, tied to a specific issue. Contains a frozen snapshot of the recipe and all referenced configuration (agents, skills, tools, trigger context). The snapshot is the execution's own copy — it can be modified during execution (executor expansion adds nodes) without affecting the recipe definition.
+**Execution** — a runtime instance of a recipe, tied to a specific issue. Contains a frozen snapshot of the recipe and all referenced configuration (agents, skills, tools, trigger context). The snapshot is the execution's own copy — it can be extended during execution when delegated task packets materialize into ordinary nodes without affecting the recipe definition.
 
-**Job** — a unit of work within an execution. Created for agent and executor nodes. Tracks status, worktree assignment, and links to runs.
+**Job** — a unit of work within an execution. Created for agent nodes. Tracks status, worktree assignment, and links to runs.
 
 **Run** — a single Claude process invocation within a job. A job may have multiple runs (resume, follow-up messages). Each run produces a sequence of events stored in the database.
 
@@ -59,7 +59,7 @@ ExecutionSnapshot
 └── created_at: timestamp
 ```
 
-The snapshot is serialized as JSON and stored in the execution record. All subsequent operations — job creation, dependency checking, input resolution, executor expansion — read from the snapshot, not from config files. This makes executions reproducible and immune to config changes mid-flight.
+The snapshot is serialized as JSON and stored in the execution record. All subsequent operations — job creation, dependency checking, input resolution, and delegated task materialization — read from the snapshot, not from config files. This makes executions reproducible and immune to config changes mid-flight.
 
 `SnapshotOverrides` allows editing the recipe or agents before execution starts, supporting per-execution customization.
 
@@ -102,7 +102,6 @@ Jobs that pass all checks transition from `pending` to `ready`.
 | **Checkpoint (Programmatic)** | Shell command executed; exit 0 → approved, else rejected. Results cached by commit hash |
 | **Action** | Action run record created, executed inline by the effect loop, advancement re-triggered |
 | **Condition** | Upstream artifacts loaded, expression evaluated (or AI called), selected port stored, advancement re-triggered |
-| **Executor** | `expand_executor_node()` called (see below), advancement re-triggered |
 
 Agent jobs are the only type returned to the caller — everything else resolves inline and re-enters the advancement loop.
 
@@ -121,19 +120,17 @@ Before an agent runs, `resolve_job_inputs()` gathers data from upstream context 
 
 Resolved inputs are formatted as markdown sections and injected into the agent's prompt, giving it the context produced by earlier stages of the workflow.
 
-## Executor Expansion
+## TaskList Delegation
 
-Executor nodes enable dynamic workflows. An upstream agent produces a `TaskList` artifact — a structured list of tasks with dependencies. When the executor node becomes ready:
+TaskList workflows use a normal Agent node configured with the `executor` agent. An upstream agent produces a `TaskList` artifact — a structured list of tasks with dependencies. The executor agent:
 
-1. **Load the TaskList** from the upstream artifact (via context edge)
-2. **Validate the dependency graph** — topological sort to detect cycles, verify all dependency references are valid
-3. **Create an overview context node** with the objective, requirements, and task list
-4. **For each task**: create a Context node (task prompt) + Agent node pair
-5. **Wire dependencies**: control edges between tasks based on declared dependencies, context edges from upstream output and the overview node
-6. **Connect leaf tasks** to the executor's downstream nodes (replacing the executor in the DAG)
-7. **Update the snapshot** with new nodes and edges
-8. **Create jobs** for the new agent nodes
-9. **Mark the executor job complete** and re-trigger advancement
+1. **Loads the TaskList** from upstream context
+2. **Validates and groups dependencies** — topological waves detect cycles and invalid dependency references
+3. **Delegates a wave** with one blocking `cairn:~/tasks` batch append containing one task packet per task
+4. **Materializes packets** through DAG advancement into ordinary trigger/context/agent nodes
+5. **Runs child jobs** under the executor job; delegated children inherit the executor worktree path
+6. **Integrates between waves** before delegating the next dependency tier
+7. **Writes the PR artifact** after all waves are complete and verification passes
 
 The TaskList structure:
 ```
@@ -166,4 +163,4 @@ pending → ready → running → complete
 
 **Job preparation** (`prepare_job()`) handles the transition from ready to running: sets up the worktree (if needed), loads the agent config, resolves the output schema, creates a run record, and returns a `PreparedJob` with everything the host needs to spawn Claude.
 
-**Job completion** (`on_job_complete_impl()`) triggers DAG advancement, which may make downstream jobs ready, evaluate conditions, or expand executors — continuing the workflow.
+**Job completion** (`on_job_complete_impl()`) triggers DAG advancement, which may make downstream jobs ready, evaluate conditions, or materialize delegated task packets — continuing the workflow.

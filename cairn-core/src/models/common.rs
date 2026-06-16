@@ -1,6 +1,7 @@
 //! Common types used across the application.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Model identifier for any agent backend.
 ///
@@ -16,6 +17,7 @@ impl Model {
     pub const SONNET: &str = "sonnet";
     pub const OPUS: &str = "opus";
     pub const HAIKU: &str = "haiku";
+    pub const FABLE: &str = "fable";
     pub const GPT_5_4_MINI: &str = "gpt-5.4-mini";
 
     pub fn new(s: impl Into<String>) -> Self {
@@ -57,6 +59,30 @@ impl From<&str> for Model {
 impl From<String> for Model {
     fn from(s: String) -> Self {
         Self(s)
+    }
+}
+
+/// One option of the single model dropdown: a concrete model bound to the
+/// backend that serves it.
+///
+/// Model and backend are not independent axes — every option a user picks fully
+/// determines its backend, so a resolved choice travels as one atomic value
+/// everywhere it appears. `RuntimeExtras` stays separate, being genuinely
+/// orthogonal. No code path holds a free-floating model next to a separate
+/// backend; the pair is always this struct.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelSelection {
+    pub backend: String,
+    pub model: Model,
+}
+
+impl ModelSelection {
+    pub fn new(backend: impl Into<String>, model: Model) -> Self {
+        Self {
+            backend: backend.into(),
+            model,
+        }
     }
 }
 
@@ -149,6 +175,7 @@ mod tests {
         assert_eq!(Model::SONNET, "sonnet");
         assert_eq!(Model::OPUS, "opus");
         assert_eq!(Model::HAIKU, "haiku");
+        assert_eq!(Model::FABLE, "fable");
     }
 
     #[test]
@@ -245,11 +272,13 @@ mod tests {
     fn preset_to_extras_maps_all_fields() {
         let preset = Preset {
             model: Model::new("sonnet"),
-            max_thinking_tokens: Some(31999),
-            reasoning_effort: Some("high".to_string()),
+            options: HashMap::from([(
+                "reasoningEffort".to_string(),
+                PresetOptionValue::Str("high".to_string()),
+            )]),
         };
         let extras = preset.to_extras();
-        assert_eq!(extras.max_thinking_tokens, Some(31999));
+        assert_eq!(extras.max_thinking_tokens, None);
         assert_eq!(extras.reasoning_effort, Some("high".to_string()));
     }
 
@@ -257,8 +286,7 @@ mod tests {
     fn preset_to_extras_none_fields() {
         let preset = Preset {
             model: Model::new("haiku"),
-            max_thinking_tokens: None,
-            reasoning_effort: None,
+            options: HashMap::new(),
         };
         let extras = preset.to_extras();
         assert_eq!(extras.max_thinking_tokens, None);
@@ -269,37 +297,106 @@ mod tests {
     fn preset_serde_roundtrip() {
         let preset = Preset {
             model: Model::new("sonnet"),
-            max_thinking_tokens: Some(31999),
-            reasoning_effort: None,
+            options: HashMap::new(),
         };
         let json = serde_json::to_string(&preset).unwrap();
         let parsed: Preset = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, preset);
-        // reasoning_effort should be absent from JSON when None
-        assert!(!json.contains("reasoningEffort"));
+        // options should be absent from JSON when empty
+        assert!(!json.contains("options"));
+    }
+
+    #[test]
+    fn preset_legacy_fields_migrate_to_options_and_drop_budget() {
+        let json = r#"{
+            "model": "sonnet",
+            "reasoningEffort": "high",
+            "maxThinkingTokens": 31999
+        }"#;
+
+        let preset: Preset = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            preset
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str),
+            Some("high")
+        );
+        assert_eq!(preset.to_extras().max_thinking_tokens, None);
+
+        let serialized = serde_json::to_string(&preset).unwrap();
+        assert!(!serialized.contains("maxThinkingTokens"));
+        assert!(serialized.contains("options"));
     }
 }
 
-/// A single preset: concrete model + backend-specific runtime parameters.
+/// A single preset: concrete model + backend-specific options.
 ///
 /// Presets are configured per-backend per-tier in workspace settings.
-/// Example: `claude/md` → `{ model: "sonnet", max_thinking_tokens: Some(31999) }`
+/// Example: `codex/md` → `{ model: "gpt-5.3-codex", options: { reasoningEffort: "medium" } }`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "PresetFile")]
 pub struct Preset {
     pub model: Model,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_thinking_tokens: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub options: HashMap<String, PresetOptionValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum PresetOptionValue {
+    Str(String),
+    Bool(bool),
+    Int(i64),
+}
+
+impl PresetOptionValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PresetOptionValue::Str(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresetFile {
+    model: Model,
+    #[serde(default)]
+    options: Option<HashMap<String, PresetOptionValue>>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    max_thinking_tokens: Option<i32>,
+}
+
+impl From<PresetFile> for Preset {
+    fn from(file: PresetFile) -> Self {
+        let mut options = file.options.unwrap_or_default();
+        if let Some(effort) = file.reasoning_effort {
+            options
+                .entry("reasoningEffort".to_string())
+                .or_insert(PresetOptionValue::Str(effort));
+        }
+        let _ = file.max_thinking_tokens; // Intentionally discarded.
+        Preset {
+            model: file.model,
+            options,
+        }
+    }
 }
 
 impl Preset {
-    /// Convert this preset's extras into a RuntimeExtras.
+    /// Convert this preset's options into backend runtime extras.
     pub fn to_extras(&self) -> RuntimeExtras {
         RuntimeExtras {
-            max_thinking_tokens: self.max_thinking_tokens,
-            reasoning_effort: self.reasoning_effort.clone(),
+            max_thinking_tokens: None,
+            reasoning_effort: self
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
         }
     }
 }
@@ -307,15 +404,17 @@ impl Preset {
 /// Backend-specific runtime parameters.
 ///
 /// These can be set at the agent level and override workspace defaults.
-/// Each backend uses the fields relevant to it (e.g. Claude uses
-/// `max_thinking_tokens`, Codex uses `reasoning_effort`).
+/// Both Claude and Codex now select reasoning via `reasoning_effort`
+/// (Claude's CLI replaced `--max-thinking-tokens` with `--effort`).
+/// `max_thinking_tokens` is retained only for backward-compatible
+/// deserialization of older Claude presets; it is no longer sent to the CLI.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeExtras {
-    /// Claude: max thinking tokens (None = inherit from workspace)
+    /// Legacy Claude budget — deserialized for compat, mapped to effort "high".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_thinking_tokens: Option<i32>,
-    /// Codex: reasoning effort ("low", "medium", "high"; None = inherit/default)
+    /// Reasoning effort ("low", "medium", "high", "xhigh", "max"; None = backend default)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }

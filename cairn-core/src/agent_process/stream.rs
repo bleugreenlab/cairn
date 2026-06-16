@@ -52,6 +52,12 @@ pub enum ClaudeEvent {
     #[serde(rename = "stream_event")]
     StreamEvent {
         session_id: String,
+        /// Set to the Task tool_use id when the partial message belongs to a
+        /// subagent; `None`/absent for the primary session. Lets the live
+        /// context gauge skip subagent inferences so they don't overwrite the
+        /// primary session's figure.
+        #[serde(default)]
+        parent_tool_use_id: Option<String>,
         #[serde(rename = "event")]
         inner: StreamEventInner,
     },
@@ -60,6 +66,43 @@ pub enum ClaudeEvent {
         request_id: String,
         response: ControlResponseInner,
     },
+    /// Account rate-limit state pushed by the CLI mid-session. Reports status +
+    /// reset windows (not a precise usage percent); surfaced to the live usage
+    /// panel and used to classify an exhausted-limit EOF as recoverable.
+    RateLimitEvent { rate_limit_info: RateLimitInfo },
+    /// Any event `type` we don't model. A unit `#[serde(other)]` arm keeps the
+    /// parser forward-compatible: a future event kind is ignored cleanly instead
+    /// of failing to parse (which used to spam warnings, e.g. `rate_limit_event`).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Payload of a `rate_limit_event`. Field shape is the CLI's: `status` is
+/// lowercase, the rest are camelCase, so each carries an explicit rename. The
+/// flattened `extra` tolerates fields the CLI adds later without a parse error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitInfo {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, rename = "rateLimitType")]
+    pub rate_limit_type: Option<String>,
+    #[serde(default, rename = "resetsAt")]
+    pub resets_at: Option<i64>,
+    #[serde(default, rename = "overageResetsAt")]
+    pub overage_resets_at: Option<i64>,
+    #[serde(flatten, default)]
+    pub extra: Value,
+}
+
+impl RateLimitInfo {
+    /// Whether the reported status means the request was blocked by an exhausted
+    /// limit, as opposed to allowed or a soft warning. Conservative on purpose:
+    /// only an explicit reject counts, because a blocking-status EOF is finalized
+    /// as recoverable (warm/resumable) rather than a hard crash.
+    pub fn is_blocking(&self) -> bool {
+        let status = self.status.to_ascii_lowercase();
+        matches!(status.as_str(), "rejected" | "blocked" | "exhausted")
+    }
 }
 
 /// Inner response for control requests
@@ -161,7 +204,7 @@ pub enum ContentBlock {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     #[serde(default)]
     pub input_tokens: u32,
@@ -171,6 +214,45 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub output_tokens_details: Option<OutputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutputTokensDetails {
+    #[serde(default)]
+    pub thinking_tokens: Option<u32>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TokenCounts {
+    pub input: Option<i32>,
+    pub output: Option<i32>,
+    pub cache_read: Option<i32>,
+    pub cache_create: Option<i32>,
+    pub thinking: Option<i32>,
+}
+
+impl TokenCounts {
+    pub fn from_usage(usage: &Usage) -> Self {
+        Self {
+            input: Some(usage.input_tokens as i32),
+            output: Some(usage.output_tokens as i32),
+            cache_read: usage.cache_read_input_tokens.map(|tokens| tokens as i32),
+            cache_create: usage
+                .cache_creation_input_tokens
+                .map(|tokens| tokens as i32),
+            thinking: usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.thinking_tokens)
+                .map(|tokens| tokens as i32),
+        }
+    }
+
+    pub fn from_optional_usage(usage: Option<&Usage>) -> Self {
+        usage.map(Self::from_usage).unwrap_or_default()
+    }
 }
 
 /// A single tool use extracted from an assistant message
@@ -197,7 +279,11 @@ pub struct TranscriptEvent {
     pub tool_use_id: Option<String>,         // For tool_result: which tool this is for
     pub tool_result: Option<String>,
     pub is_error: bool,
-    pub usage: Option<Usage>,
+    /// Wall-clock duration from stream open to the finalized thinking-token
+    /// count, in milliseconds. Set only on finalized assistant events that
+    /// carried reasoning; `None` (and omitted from JSON) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_ms: Option<i64>,
     /// Remainder of raw JSON after stripping extracted fields.
     /// None if only boilerplate fields remain.
     pub raw: Option<Value>,
@@ -261,7 +347,7 @@ impl TranscriptEvent {
                     tool_use_id: None,
                     tool_result: None,
                     is_error: false,
-                    usage: None,
+                    thinking_ms: None,
                     raw: strip_extracted_fields(raw, &event_type),
                 }
             }
@@ -286,7 +372,7 @@ impl TranscriptEvent {
                     tool_use_id,
                     tool_result,
                     is_error,
-                    usage: None,
+                    thinking_ms: None,
                     raw: strip_extracted_fields(raw, &event_type),
                 }
             }
@@ -307,11 +393,6 @@ impl TranscriptEvent {
                 } else {
                     (None, None)
                 };
-                // Extract per-turn usage from message.usage (before raw is moved)
-                let usage = raw
-                    .get("message")
-                    .and_then(|m| m.get("usage"))
-                    .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok());
                 TranscriptEvent {
                     event_type: "assistant".to_string(),
                     session_id: Some(session_id.clone()),
@@ -324,7 +405,7 @@ impl TranscriptEvent {
                     tool_use_id: None,
                     tool_result: None,
                     is_error: false,
-                    usage,
+                    thinking_ms: None,
                     raw: strip_extracted_fields(raw, "assistant"),
                 }
             }
@@ -332,7 +413,6 @@ impl TranscriptEvent {
                 subtype,
                 session_id,
                 is_error,
-                usage,
                 result,
                 ..
             } => {
@@ -349,15 +429,19 @@ impl TranscriptEvent {
                     tool_use_id: None,
                     tool_result: None,
                     is_error: *is_error,
-                    usage: usage.clone(),
+                    thinking_ms: None,
                     raw: strip_extracted_fields(raw, &event_type),
                 }
             }
             // StreamEvent is handled specially in session.rs - this should not be called
-            ClaudeEvent::StreamEvent { session_id, .. } => TranscriptEvent {
+            ClaudeEvent::StreamEvent {
+                session_id,
+                parent_tool_use_id,
+                ..
+            } => TranscriptEvent {
                 event_type: "stream_event".to_string(),
                 session_id: Some(session_id.clone()),
-                parent_tool_use_id: None,
+                parent_tool_use_id: parent_tool_use_id.clone(),
                 content: None,
                 thinking: None,
                 tool_name: None,
@@ -366,7 +450,7 @@ impl TranscriptEvent {
                 tool_use_id: None,
                 tool_result: None,
                 is_error: false,
-                usage: None,
+                thinking_ms: None,
                 raw: strip_extracted_fields(raw, "stream_event"),
             },
             // ControlResponse is handled specially in session.rs - this should not be called
@@ -384,8 +468,32 @@ impl TranscriptEvent {
                     tool_use_id: None,
                     tool_result: None,
                     is_error: false,
-                    usage: None,
+                    thinking_ms: None,
                     raw: strip_extracted_fields(raw, &event_type),
+                }
+            }
+            // RateLimitEvent and Unknown are intercepted in the backend reader
+            // loop (logged / converted to a usage snapshot / ignored) and never
+            // reach this conversion. These arms exist only for exhaustiveness.
+            ClaudeEvent::RateLimitEvent { .. } | ClaudeEvent::Unknown => {
+                let event_type = match event {
+                    ClaudeEvent::RateLimitEvent { .. } => "rate_limit_event",
+                    _ => "unknown",
+                };
+                TranscriptEvent {
+                    event_type: event_type.to_string(),
+                    session_id: None,
+                    parent_tool_use_id: None,
+                    content: None,
+                    thinking: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_uses: None,
+                    tool_use_id: None,
+                    tool_result: None,
+                    is_error: false,
+                    thinking_ms: None,
+                    raw: strip_extracted_fields(raw, event_type),
                 }
             }
         }
@@ -655,6 +763,23 @@ mod tests {
     }
 
     #[test]
+    fn test_token_counts_parse_message_delta_thinking_tokens() {
+        let usage: Usage = serde_json::from_str(r#"{"input_tokens":2979,"cache_creation_input_tokens":22522,"cache_read_input_tokens":0,"output_tokens":4147,"output_tokens_details":{"thinking_tokens":176}}"#).unwrap();
+        let counts = TokenCounts::from_usage(&usage);
+
+        assert_eq!(counts.input, Some(2979));
+        assert_eq!(counts.cache_create, Some(22522));
+        assert_eq!(counts.cache_read, Some(0));
+        assert_eq!(counts.output, Some(4147));
+        assert_eq!(counts.thinking, Some(176));
+        let used = usage.input_tokens as i64
+            + usage.cache_creation_input_tokens.unwrap_or(0) as i64
+            + usage.cache_read_input_tokens.unwrap_or(0) as i64
+            + usage.output_tokens as i64;
+        assert_eq!(used, 29_648);
+    }
+
+    #[test]
     fn test_parse_control_response_with_nested_request_id() {
         let json = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-1234"}}"#;
         let (event, _raw) = parse_event(json).unwrap();
@@ -741,5 +866,88 @@ mod tests {
             transcript.parent_tool_use_id,
             Some("toolu_abc123".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_rate_limit_event() {
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1717000000,"overageResetsAt":1717100000}}"#;
+        let (event, _raw) = parse_event(json).unwrap();
+
+        match event {
+            ClaudeEvent::RateLimitEvent { rate_limit_info } => {
+                assert_eq!(rate_limit_info.status, "allowed");
+                assert_eq!(
+                    rate_limit_info.rate_limit_type.as_deref(),
+                    Some("five_hour")
+                );
+                assert_eq!(rate_limit_info.resets_at, Some(1717000000));
+                assert_eq!(rate_limit_info.overage_resets_at, Some(1717100000));
+                assert!(!rate_limit_info.is_blocking());
+            }
+            _ => panic!("Expected RateLimitEvent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rate_limit_event_blocking_status() {
+        let json = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#;
+        let (event, _raw) = parse_event(json).unwrap();
+        match event {
+            ClaudeEvent::RateLimitEvent { rate_limit_info } => {
+                assert!(rate_limit_info.is_blocking());
+                // Absent camelCase fields tolerate gracefully.
+                assert_eq!(rate_limit_info.resets_at, None);
+            }
+            _ => panic!("Expected RateLimitEvent"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unknown_event_type_is_ok() {
+        // A future/unmodeled event type must parse cleanly to Unknown, not error.
+        let json = r#"{"type":"some_future_event","foo":42}"#;
+        let (event, _raw) = parse_event(json).expect("unknown type should parse, not error");
+        assert!(matches!(event, ClaudeEvent::Unknown));
+    }
+
+    fn empty_transcript_event() -> super::TranscriptEvent {
+        super::TranscriptEvent {
+            event_type: "assistant".to_string(),
+            session_id: None,
+            parent_tool_use_id: None,
+            content: None,
+            thinking: None,
+            tool_name: None,
+            tool_input: None,
+            tool_uses: None,
+            tool_use_id: None,
+            tool_result: None,
+            is_error: false,
+            thinking_ms: None,
+            raw: None,
+        }
+    }
+
+    #[test]
+    fn thinking_ms_is_omitted_from_json_when_none() {
+        let json = serde_json::to_string(&empty_transcript_event()).unwrap();
+        assert!(!json.contains("thinkingMs"));
+    }
+
+    #[test]
+    fn thinking_ms_round_trips_when_present() {
+        let mut event = empty_transcript_event();
+        event.thinking_ms = Some(4200);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"thinkingMs\":4200"));
+        let parsed: super::TranscriptEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.thinking_ms, Some(4200));
+    }
+
+    #[test]
+    fn thinking_ms_defaults_to_none_when_absent_in_json() {
+        let json = r#"{"eventType":"assistant","sessionId":null,"parentToolUseId":null,"content":null,"thinking":null,"toolName":null,"toolInput":null,"toolUses":null,"toolUseId":null,"toolResult":null,"isError":false,"raw":null}"#;
+        let parsed: super::TranscriptEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.thinking_ms, None);
     }
 }

@@ -47,6 +47,10 @@ pub trait FileSystem: Send + Sync {
 
     /// Check if a path is a symbolic link (or junction on Windows).
     fn is_symlink(&self, path: &Path) -> bool;
+
+    /// Recursively copy a directory from one location to another.
+    /// Creates the destination directory and copies all contents.
+    fn copy_dir_recursive(&self, from: &Path, to: &Path) -> Result<(), String>;
 }
 
 /// Production filesystem implementation using std::fs.
@@ -138,6 +142,26 @@ impl FileSystem for RealFileSystem {
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
     }
+
+    fn copy_dir_recursive(&self, from: &Path, to: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(to)
+            .map_err(|e| format!("Failed to create directory {:?}: {}", to, e))?;
+        let entries = std::fs::read_dir(from)
+            .map_err(|e| format!("Failed to read directory {:?}: {}", from, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+            let src_path = entry.path();
+            let dst_path = to.join(entry.file_name());
+            if src_path.is_dir() {
+                self.copy_dir_recursive(&src_path, &dst_path)?;
+            } else {
+                std::fs::copy(&src_path, &dst_path).map_err(|e| {
+                    format!("Failed to copy {:?} to {:?}: {}", src_path, dst_path, e)
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -145,10 +169,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn real_fs_fixture() -> (TempDir, RealFileSystem) {
+        (TempDir::new().unwrap(), RealFileSystem)
+    }
+
     #[test]
     fn real_fs_create_and_check_exists() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         let new_dir = temp.path().join("subdir");
         assert!(!fs.exists(&new_dir));
@@ -159,8 +186,7 @@ mod tests {
 
     #[test]
     fn real_fs_write_and_read() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         let file = temp.path().join("test.txt");
         fs.write(&file, b"hello").unwrap();
@@ -171,8 +197,7 @@ mod tests {
 
     #[test]
     fn real_fs_write_str_and_read_to_string() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         let file = temp.path().join("test.txt");
         fs.write_str(&file, "hello world").unwrap();
@@ -183,8 +208,7 @@ mod tests {
 
     #[test]
     fn real_fs_remove_file() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         let file = temp.path().join("test.txt");
         fs.write_str(&file, "content").unwrap();
@@ -196,8 +220,7 @@ mod tests {
 
     #[test]
     fn real_fs_remove_dir_all() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         let dir = temp.path().join("mydir");
         fs.create_dir_all(&dir.join("subdir")).unwrap();
@@ -224,8 +247,7 @@ mod tests {
 
     #[test]
     fn real_fs_copy_file() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         // Create source file
         let src = temp.path().join("source.txt");
@@ -242,8 +264,7 @@ mod tests {
 
     #[test]
     fn real_fs_copy_file_creates_parent_dirs() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         // Create source file
         let src = temp.path().join("source.txt");
@@ -261,8 +282,7 @@ mod tests {
 
     #[test]
     fn real_fs_symlink_and_is_symlink() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         // Create a target directory
         let target = temp.path().join("target_dir");
@@ -287,8 +307,7 @@ mod tests {
 
     #[test]
     fn real_fs_symlink_file() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         let target = temp.path().join("target.txt");
         fs.write_str(&target, "content").unwrap();
@@ -302,8 +321,7 @@ mod tests {
 
     #[test]
     fn real_fs_copy_file_overwrites_existing() {
-        let temp = TempDir::new().unwrap();
-        let fs = RealFileSystem;
+        let (temp, fs) = real_fs_fixture();
 
         // Create source and existing destination
         let src = temp.path().join("source.txt");
@@ -317,5 +335,45 @@ mod tests {
 
         let contents = fs.read_to_string(&dst).unwrap();
         assert_eq!(contents, "new content");
+    }
+
+    #[test]
+    fn real_fs_copy_dir_recursive() {
+        let (temp, fs) = real_fs_fixture();
+
+        // Create a source directory with nested structure
+        let src = temp.path().join("source_dir");
+        fs.create_dir_all(&src.join("sub")).unwrap();
+        fs.write_str(&src.join("root.txt"), "root file").unwrap();
+        fs.write_str(&src.join("sub").join("nested.txt"), "nested file")
+            .unwrap();
+
+        // Copy to destination
+        let dst = temp.path().join("dest_dir");
+        fs.copy_dir_recursive(&src, &dst).unwrap();
+
+        // Verify structure was reproduced
+        assert!(fs.exists(&dst));
+        assert!(fs.exists(&dst.join("sub")));
+        assert_eq!(
+            fs.read_to_string(&dst.join("root.txt")).unwrap(),
+            "root file"
+        );
+        assert_eq!(
+            fs.read_to_string(&dst.join("sub").join("nested.txt"))
+                .unwrap(),
+            "nested file"
+        );
+    }
+
+    #[test]
+    fn real_fs_copy_dir_recursive_nonexistent_source() {
+        let (temp, fs) = real_fs_fixture();
+
+        let src = temp.path().join("does_not_exist");
+        let dst = temp.path().join("dest");
+
+        let result = fs.copy_dir_recursive(&src, &dst);
+        assert!(result.is_err());
     }
 }

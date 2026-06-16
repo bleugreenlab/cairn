@@ -1,4 +1,9 @@
 pub mod auth;
+pub mod change_validation;
+pub mod contract;
 pub mod logging;
+pub mod paths;
 pub mod protocol;
+pub mod query;
+pub mod read;
 pub mod uri;

@@ -32,6 +32,12 @@ impl ApiConfig {
         format!("{}/tokens/device/{}", self.base_url, device_id)
     }
 
+    /// Anonymous (account-less) device registration endpoint.
+    /// Returns a long-lived, user-less device JWT usable only on `/embed`.
+    pub fn anon_device_url(&self) -> String {
+        format!("{}/tokens/device/anonymous", self.base_url)
+    }
+
     /// Org-scoped token issuance endpoint.
     pub fn org_token_url(&self) -> String {
         format!("{}/tokens/issue", self.base_url)
@@ -55,6 +61,11 @@ impl ApiConfig {
     pub fn bug_report_url(&self) -> String {
         format!("{}/bugs/reports", self.base_url)
     }
+
+    /// Embedding gateway endpoint (Bedrock Cohere Embed v4).
+    pub fn embed_url(&self) -> String {
+        format!("{}/embed", self.base_url)
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +84,10 @@ mod tests {
         assert_eq!(
             config.device_url("dev-123"),
             "https://api.cairn.computer/tokens/device/dev-123"
+        );
+        assert_eq!(
+            config.anon_device_url(),
+            "https://api.cairn.computer/tokens/device/anonymous"
         );
         assert_eq!(
             config.org_token_url(),

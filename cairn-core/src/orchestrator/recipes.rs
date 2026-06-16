@@ -1,10 +1,9 @@
-//! Orchestrator recipe configuration operations.
+//! Orchestrator recipe operations.
 //!
 //! File-based recipe management: workspace-scoped (`~/.cairn/recipes/`) vs
 //! project-scoped (`[project]/.cairn/recipes/`).
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{recipes as config_recipes, slugify, ConfigResult};
 use crate::models::{
@@ -12,6 +11,7 @@ use crate::models::{
     UpdateRecipe,
 };
 
+use super::config_resource::{self, merge_optional, ConfigResource};
 use super::Orchestrator;
 
 /// Convert a file recipe to the API model.
@@ -19,6 +19,7 @@ fn file_recipe_to_model(
     file_recipe: config_recipes::FileRecipe,
     workspace_id: Option<String>,
     project_id: Option<String>,
+    _now: i64,
 ) -> Recipe {
     let mut recipe = file_recipe.recipe;
     recipe.workspace_id = workspace_id;
@@ -26,140 +27,89 @@ fn file_recipe_to_model(
     recipe
 }
 
-impl Orchestrator {
-    /// List recipe configurations with optional scope filters.
-    pub fn list_recipes(
-        &self,
-        workspace_id: Option<&str>,
-        project_id: Option<&str>,
-    ) -> Result<Vec<Recipe>, String> {
-        let mut all_recipes = Vec::new();
+pub(crate) struct RecipeResource;
 
-        if workspace_id.is_none() && project_id.is_none() {
-            // Load workspace recipes
-            let ws_results = config_recipes::list_recipes(&self.config_dir, None)?;
-            for result in ws_results {
-                if let ConfigResult::Ok(file_recipe) = result {
-                    if !file_recipe.is_project_scoped {
-                        all_recipes.push(file_recipe_to_model(
-                            file_recipe,
-                            Some("default".to_string()),
-                            None,
-                        ));
-                    }
-                }
-            }
+impl ConfigResource for RecipeResource {
+    type Config = Recipe;
+    type File = config_recipes::FileRecipe;
+    type CreateInput = CreateRecipe;
+    type UpdateInput = UpdateRecipe;
 
-            // Load recipes from all projects
-            let projects = self.all_project_paths()?;
-            for (pid, project_path) in projects {
-                let proj_results =
-                    config_recipes::list_recipes(&self.config_dir, Some(&project_path))?;
-                for result in proj_results {
-                    if let ConfigResult::Ok(file_recipe) = result {
-                        if file_recipe.is_project_scoped {
-                            all_recipes.push(file_recipe_to_model(
-                                file_recipe,
-                                None,
-                                Some(pid.clone()),
-                            ));
-                        }
-                    }
-                }
-            }
-        } else {
-            let project_path: Option<PathBuf> = if let Some(pid) = project_id {
-                Some(self.project_path(pid)?)
-            } else {
-                None
-            };
+    const ENTITY_TYPE: &'static str = "recipe";
+    const TABLE: &'static str = "recipes";
+    const SUBDIR: &'static str = "recipes";
+    const GET_SEARCHES_ALL_PROJECTS: bool = false;
+    const UPDATE_SEARCHES_ALL_PROJECTS: bool = false;
 
-            let results = config_recipes::list_recipes(&self.config_dir, project_path.as_deref())?;
-
-            for result in results {
-                if let ConfigResult::Ok(file_recipe) = result {
-                    let include = match (workspace_id, project_id) {
-                        (Some(_), None) => !file_recipe.is_project_scoped,
-                        (None, Some(_)) => file_recipe.is_project_scoped,
-                        _ => true,
-                    };
-
-                    if include {
-                        let (ws_id, proj_id) = if file_recipe.is_project_scoped {
-                            (None, project_id.map(|s| s.to_string()))
-                        } else {
-                            (workspace_id.map(|s| s.to_string()), None)
-                        };
-                        all_recipes.push(file_recipe_to_model(file_recipe, ws_id, proj_id));
-                    }
-                }
-            }
-        }
-
-        all_recipes.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(all_recipes)
+    fn list_files(
+        config_dir: &Path,
+        project_path: Option<&Path>,
+    ) -> Result<Vec<ConfigResult<Self::File>>, String> {
+        config_recipes::list_recipes(config_dir, project_path)
     }
 
-    /// Get a single recipe by ID.
-    pub fn get_recipe(
-        &self,
-        recipe_id: &str,
-        project_id: Option<&str>,
-    ) -> Result<Option<Recipe>, String> {
-        let project_path: Option<PathBuf> = if let Some(pid) = project_id {
-            Some(self.project_path(pid)?)
-        } else {
-            None
-        };
-
-        let file_recipe =
-            config_recipes::get_recipe(&self.config_dir, recipe_id, project_path.as_deref())?;
-
-        Ok(file_recipe.map(|fr| {
-            let (ws_id, proj_id) = if fr.is_project_scoped {
-                (None, project_id.map(|s| s.to_string()))
-            } else {
-                (Some("default".to_string()), None)
-            };
-            file_recipe_to_model(fr, ws_id, proj_id)
-        }))
+    fn get_file(
+        config_dir: &Path,
+        id: &str,
+        project_path: Option<&Path>,
+    ) -> Result<Option<Self::File>, String> {
+        config_recipes::get_recipe(config_dir, id, project_path)
     }
 
-    /// Create a new recipe.
-    pub fn create_recipe(&self, input: CreateRecipe) -> Result<Recipe, String> {
-        if input.workspace_id.is_none() == input.project_id.is_none() {
-            return Err("Exactly one of workspace_id or project_id must be set".to_string());
-        }
+    fn save_file(
+        config_dir: &Path,
+        file: &Self::File,
+        project_path: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        config_recipes::save_recipe(config_dir, file, project_path)
+    }
 
-        let project_path: Option<PathBuf> = if let Some(ref pid) = input.project_id {
-            Some(self.project_path(pid)?)
-        } else {
-            None
-        };
+    fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String> {
+        config_recipes::delete_recipe(config_dir, id, project_path)
+    }
 
-        let is_project_scoped = project_path.is_some();
-        let id = slugify(&input.name);
+    fn file_is_project_scoped(file: &Self::File) -> bool {
+        file.is_project_scoped
+    }
 
-        let file_path = if let Some(ref proj_path) = project_path {
-            let recipes_dir = proj_path.join(".cairn").join("recipes");
-            std::fs::create_dir_all(&recipes_dir)
-                .map_err(|e| format!("Failed to create project recipes directory: {}", e))?;
-            recipes_dir.join(format!("{}.yaml", id))
-        } else {
-            let recipes_dir = self.config_dir.join("recipes");
-            std::fs::create_dir_all(&recipes_dir)
-                .map_err(|e| format!("Failed to create recipes directory: {}", e))?;
-            recipes_dir.join(format!("{}.yaml", id))
-        };
+    fn to_config(
+        file: Self::File,
+        workspace_id: Option<String>,
+        project_id: Option<String>,
+        now: i64,
+    ) -> Self::Config {
+        file_recipe_to_model(file, workspace_id, project_id, now)
+    }
 
-        let now = chrono::Utc::now().timestamp();
+    fn config_name(cfg: &Self::Config) -> &str {
+        &cfg.name
+    }
+
+    fn config_id(cfg: &Self::Config) -> String {
+        cfg.id.clone()
+    }
+
+    fn create_id(input: &Self::CreateInput) -> String {
+        slugify(&input.name)
+    }
+
+    fn create_input_scopes(input: &Self::CreateInput) -> (Option<String>, Option<String>) {
+        (input.workspace_id.clone(), input.project_id.clone())
+    }
+
+    fn build_create_file(
+        input: Self::CreateInput,
+        id: String,
+        is_project_scoped: bool,
+        now: i64,
+    ) -> Self::File {
         let recipe = Recipe {
-            id: id.clone(),
-            name: input.name.clone(),
-            description: input.description.clone(),
+            id,
+            name: input.name,
+            description: input.description,
             trigger: input.trigger.unwrap_or_default(),
-            workspace_id: input.workspace_id.clone(),
-            project_id: input.project_id.clone(),
+            workspace_id: input.workspace_id,
+            project_id: input.project_id,
             is_default: false,
             version: 1,
             parent_recipe_id: None,
@@ -169,55 +119,40 @@ impl Orchestrator {
             created_at: now,
             updated_at: now,
         };
-
-        let file_recipe = config_recipes::FileRecipe {
-            recipe: recipe.clone(),
+        config_recipes::FileRecipe {
+            recipe,
             is_project_scoped,
-            file_path,
-        };
-
-        config_recipes::save_recipe(&self.config_dir, &file_recipe, project_path.as_deref())?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "created", "id": id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "insert"}),
-        );
-
-        Ok(recipe)
+            file_path: PathBuf::new(),
+        }
     }
 
-    /// Update an existing recipe.
-    pub fn update_recipe(
-        &self,
-        recipe_id: &str,
-        input: UpdateRecipe,
-        project_id: Option<&str>,
-    ) -> Result<Recipe, String> {
-        let original_project_path: Option<PathBuf> = if let Some(pid) = project_id {
-            Some(self.project_path(pid)?)
+    fn update_scope(
+        _existing: &Self::File,
+        input: &Self::UpdateInput,
+        target_project_id: Option<&str>,
+    ) -> (bool, Option<String>) {
+        let project_id = input.project_id.as_ref().and_then(Clone::clone);
+        let scope_is_changing = project_id != target_project_id.map(|s| s.to_string());
+        if scope_is_changing {
+            (project_id.is_some(), project_id)
         } else {
-            None
-        };
+            (target_project_id.is_some(), project_id)
+        }
+    }
 
-        let existing = config_recipes::get_recipe(
-            &self.config_dir,
-            recipe_id,
-            original_project_path.as_deref(),
-        )?
-        .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
-
+    fn build_update_file(
+        existing: &Self::File,
+        input: Self::UpdateInput,
+        _id: &str,
+        new_is_project_scoped: bool,
+        scope_changing: bool,
+        now: i64,
+    ) -> Self::File {
         let mut recipe = existing.recipe.clone();
-
         if let Some(name) = input.name {
             recipe.name = name;
         }
-        if let Some(description) = input.description {
-            recipe.description = description;
-        }
+        recipe.description = merge_optional(&recipe.description, &input.description);
         if let Some(trigger) = input.trigger {
             recipe.trigger = trigger;
         }
@@ -227,84 +162,181 @@ impl Orchestrator {
         if let Some(edges) = input.edges {
             recipe.edges = edges;
         }
-
-        let input_project_id = input.project_id.as_ref().and_then(|p| p.clone());
-        let scope_is_changing = input_project_id != project_id.map(|s| s.to_string());
-
-        if scope_is_changing {
-            let new_is_project_scoped = input_project_id.is_some();
-
-            recipe.workspace_id = if new_is_project_scoped {
-                None
-            } else {
-                Some("default".to_string())
-            };
-            recipe.project_id = input_project_id.clone();
-
-            let new_project_path: Option<PathBuf> = if let Some(ref pid) = input_project_id {
-                Some(self.project_path(pid)?)
-            } else {
-                None
-            };
-
-            config_recipes::delete_recipe(
-                &self.config_dir,
-                recipe_id,
-                original_project_path.as_deref(),
-            )?;
-
-            let file_recipe = config_recipes::FileRecipe {
-                recipe: recipe.clone(),
-                is_project_scoped: new_is_project_scoped,
-                file_path: PathBuf::new(),
-            };
-            recipe.updated_at = chrono::Utc::now().timestamp();
-            config_recipes::save_recipe(
-                &self.config_dir,
-                &file_recipe,
-                new_project_path.as_deref(),
-            )?;
+        recipe.workspace_id = if new_is_project_scoped {
+            None
         } else {
-            recipe.updated_at = chrono::Utc::now().timestamp();
+            Some("default".to_string())
+        };
+        recipe.project_id = input.project_id.and_then(|p| p);
+        recipe.updated_at = now;
 
-            let recipe_file: RecipeFile = recipe.clone().into();
-            let yaml = recipe_file.to_yaml()?;
-            std::fs::write(&existing.file_path, yaml)
-                .map_err(|e| format!("Failed to write recipe file: {}", e))?;
+        config_recipes::FileRecipe {
+            recipe,
+            is_project_scoped: new_is_project_scoped,
+            file_path: if scope_changing {
+                PathBuf::new()
+            } else {
+                existing.file_path.clone()
+            },
         }
+    }
 
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "modified", "id": recipe_id}),
+    fn cleanup_after_scope_change(existing: &Self::File, _dest_path: &Path) {
+        if let Err(e) = std::fs::remove_file(&existing.file_path) {
+            log::warn!(
+                "Failed to delete old recipe file {:?}: {}",
+                existing.file_path,
+                e
+            );
+        }
+    }
+
+    fn target_exists(scope_root: &Path, id: &str, is_project_scoped: bool) -> bool {
+        let root = if is_project_scoped {
+            scope_root.join(".cairn")
+        } else {
+            scope_root.to_path_buf()
+        };
+        let dir = root.join(Self::SUBDIR);
+        ["yaml", "yml"]
+            .into_iter()
+            .any(|ext| dir.join(format!("{}.{}", id, ext)).exists())
+    }
+
+    fn build_scoped_copy(
+        source: &Self::File,
+        id: &str,
+        is_project_scoped: bool,
+        workspace_id: Option<String>,
+        project_id: Option<String>,
+        now: i64,
+    ) -> Self::File {
+        let mut recipe = source.recipe.clone();
+        recipe.id = id.to_string();
+        recipe.workspace_id = workspace_id;
+        recipe.project_id = project_id;
+        if is_project_scoped {
+            recipe.is_default = false;
+        }
+        recipe.created_at = now;
+        recipe.updated_at = now;
+
+        config_recipes::FileRecipe {
+            recipe,
+            is_project_scoped,
+            file_path: PathBuf::new(),
+        }
+    }
+
+    fn primary_path(file: &Self::File) -> PathBuf {
+        file.file_path.clone()
+    }
+
+    fn post_save_copy(_source: &Self::File, _dest_path: &Path) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct RecipeChangeEvent<'a> {
+    event_id: &'a str,
+    config_action: &'a str,
+    db_action: &'a str,
+}
+
+impl Orchestrator {
+    fn save_recipe_change(
+        &self,
+        recipe: Recipe,
+        is_project_scoped: bool,
+        file_path: PathBuf,
+        project_path: Option<&Path>,
+        event: RecipeChangeEvent<'_>,
+    ) -> Result<Recipe, String> {
+        let file_recipe = config_recipes::FileRecipe {
+            recipe: recipe.clone(),
+            is_project_scoped,
+            file_path,
+        };
+        let saved_path = config_recipes::save_recipe(&self.config_dir, &file_recipe, project_path)?;
+        let action = if event.config_action == "created" {
+            "create"
+        } else {
+            "update"
+        };
+        crate::config::commit_config_paths(
+            std::slice::from_ref(&saved_path),
+            &format!("cairn: {action} recipe {}", event.event_id),
         );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "update"}),
+
+        config_resource::emit_config_change::<RecipeResource>(
+            self,
+            event.config_action,
+            event.event_id,
         );
+        config_resource::emit_db_change::<RecipeResource>(self, event.db_action);
 
         Ok(recipe)
     }
 
+    /// List recipe configurations with optional scope filters.
+    pub fn list_recipes(
+        &self,
+        workspace_id: Option<&str>,
+        project_id: Option<&str>,
+    ) -> Result<Vec<Recipe>, String> {
+        config_resource::list_configs::<RecipeResource>(self, workspace_id, project_id)
+    }
+
+    /// Get a single recipe by ID.
+    pub fn get_recipe(
+        &self,
+        recipe_id: &str,
+        project_id: Option<&str>,
+    ) -> Result<Option<Recipe>, String> {
+        config_resource::get_config::<RecipeResource>(self, recipe_id, project_id)
+    }
+
+    /// Create a new recipe.
+    pub fn create_recipe(&self, input: CreateRecipe) -> Result<Recipe, String> {
+        config_resource::create_config::<RecipeResource>(self, input)
+    }
+
+    /// Update an existing recipe.
+    pub fn update_recipe(
+        &self,
+        recipe_id: &str,
+        input: UpdateRecipe,
+        project_id: Option<&str>,
+    ) -> Result<Recipe, String> {
+        config_resource::update_config::<RecipeResource>(self, recipe_id, input, project_id)
+    }
+
     /// Delete a recipe.
     pub fn delete_recipe(&self, recipe_id: &str, project_id: Option<&str>) -> Result<(), String> {
-        let project_path: Option<PathBuf> = if let Some(pid) = project_id {
-            Some(self.project_path(pid)?)
-        } else {
-            None
-        };
+        config_resource::delete_config::<RecipeResource>(self, recipe_id, project_id)
+    }
 
-        config_recipes::delete_recipe(&self.config_dir, recipe_id, project_path.as_deref())?;
+    /// Create a project override of a recipe (from any scope).
+    pub fn create_recipe_override(
+        &self,
+        recipe_id: &str,
+        project_id: &str,
+    ) -> Result<Recipe, String> {
+        config_resource::create_override::<RecipeResource>(self, recipe_id, project_id)
+    }
 
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "removed", "id": recipe_id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "delete"}),
-        );
+    /// Promote a project-only recipe to workspace scope.
+    pub fn promote_recipe_to_workspace(
+        &self,
+        recipe_id: &str,
+        source_project_id: &str,
+    ) -> Result<Recipe, String> {
+        config_resource::promote_to_workspace::<RecipeResource>(self, recipe_id, source_project_id)
+    }
 
-        Ok(())
+    /// List recipes for a project context with workspace→project shadowing.
+    pub fn list_recipes_for_context(&self, project_id: &str) -> Result<Vec<Recipe>, String> {
+        config_resource::list_for_context::<RecipeResource>(self, project_id)
     }
 
     /// Archive a recipe (in file-only mode, same as delete).
@@ -348,167 +380,17 @@ impl Orchestrator {
             .map(|p| p.join(format!("{}.yaml", new_id)))
             .ok_or_else(|| "Invalid source recipe path".to_string())?;
 
-        let file_recipe = config_recipes::FileRecipe {
-            recipe: new_recipe.clone(),
-            is_project_scoped: existing.is_project_scoped,
+        self.save_recipe_change(
+            new_recipe,
+            existing.is_project_scoped,
             file_path,
-        };
-        config_recipes::save_recipe(&self.config_dir, &file_recipe, project_path.as_deref())?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "created", "id": new_id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "insert"}),
-        );
-
-        Ok(new_recipe)
-    }
-
-    /// Create a project override of a recipe (from any scope).
-    pub fn create_recipe_override(
-        &self,
-        recipe_id: &str,
-        project_id: &str,
-    ) -> Result<Recipe, String> {
-        let project_path = self.project_path(project_id)?;
-
-        let source = config_recipes::get_recipe(&self.config_dir, recipe_id, Some(&project_path))?
-            .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
-
-        let target_path = project_path
-            .join(".cairn")
-            .join("recipes")
-            .join(format!("{}.yaml", recipe_id));
-        if target_path.exists() {
-            return Err(format!(
-                "Recipe '{}' already exists in this project",
-                recipe_id
-            ));
-        }
-
-        let now = chrono::Utc::now().timestamp();
-        let mut override_recipe = source.recipe.clone();
-        override_recipe.workspace_id = None;
-        override_recipe.project_id = Some(project_id.to_string());
-        override_recipe.is_default = false;
-        override_recipe.created_at = now;
-        override_recipe.updated_at = now;
-
-        // Set file_path explicitly to avoid the save_recipe name-slug path
-        let recipes_dir = project_path.join(".cairn").join("recipes");
-        std::fs::create_dir_all(&recipes_dir)
-            .map_err(|e| format!("Failed to create project recipes directory: {}", e))?;
-
-        let file_recipe = config_recipes::FileRecipe {
-            recipe: override_recipe.clone(),
-            is_project_scoped: true,
-            file_path: recipes_dir.join(format!("{}.yaml", recipe_id)),
-        };
-
-        config_recipes::save_recipe(&self.config_dir, &file_recipe, Some(&project_path))?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "created", "id": recipe_id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "insert"}),
-        );
-
-        Ok(override_recipe)
-    }
-
-    /// Promote a project-only recipe to workspace scope.
-    pub fn promote_recipe_to_workspace(
-        &self,
-        recipe_id: &str,
-        source_project_id: &str,
-    ) -> Result<Recipe, String> {
-        let project_path = self.project_path(source_project_id)?;
-
-        let source = config_recipes::get_recipe(&self.config_dir, recipe_id, Some(&project_path))?
-            .ok_or_else(|| format!("Recipe not found in project: {}", recipe_id))?;
-
-        if !source.is_project_scoped {
-            return Err("Recipe is not project-scoped".to_string());
-        }
-
-        // Check workspace version doesn't already exist
-        let ws_dir = self.config_dir.join("recipes");
-        for ext in ["yaml", "yml"] {
-            let ws_path = ws_dir.join(format!("{}.{}", recipe_id, ext));
-            if ws_path.exists() {
-                return Err(format!(
-                    "Recipe '{}' already exists at workspace scope",
-                    recipe_id
-                ));
-            }
-        }
-
-        let now = chrono::Utc::now().timestamp();
-        let mut ws_recipe = source.recipe.clone();
-        ws_recipe.workspace_id = Some("default".to_string());
-        ws_recipe.project_id = None;
-        ws_recipe.created_at = now;
-        ws_recipe.updated_at = now;
-
-        std::fs::create_dir_all(&ws_dir)
-            .map_err(|e| format!("Failed to create recipes directory: {}", e))?;
-
-        let file_recipe = config_recipes::FileRecipe {
-            recipe: ws_recipe.clone(),
-            is_project_scoped: false,
-            file_path: ws_dir.join(format!("{}.yaml", recipe_id)),
-        };
-
-        config_recipes::save_recipe(&self.config_dir, &file_recipe, None)?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "created", "id": recipe_id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "insert"}),
-        );
-
-        Ok(ws_recipe)
-    }
-
-    /// List recipes for a project context with workspace→project shadowing.
-    pub fn list_recipes_for_context(&self, project_id: &str) -> Result<Vec<Recipe>, String> {
-        let project_path = self.project_path(project_id)?;
-        let mut recipes_map: HashMap<String, Recipe> = HashMap::new();
-
-        let ws_results = config_recipes::list_recipes(&self.config_dir, None)?;
-        for result in ws_results {
-            if let ConfigResult::Ok(file_recipe) = result {
-                if !file_recipe.is_project_scoped {
-                    let recipe =
-                        file_recipe_to_model(file_recipe, Some("default".to_string()), None);
-                    recipes_map.insert(recipe.id.clone(), recipe);
-                }
-            }
-        }
-
-        let proj_results = config_recipes::list_recipes(&self.config_dir, Some(&project_path))?;
-        for result in proj_results {
-            if let ConfigResult::Ok(file_recipe) = result {
-                if file_recipe.is_project_scoped {
-                    let recipe =
-                        file_recipe_to_model(file_recipe, None, Some(project_id.to_string()));
-                    recipes_map.insert(recipe.id.clone(), recipe);
-                }
-            }
-        }
-
-        let mut recipes: Vec<Recipe> = recipes_map.into_values().collect();
-        recipes.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(recipes)
+            project_path.as_deref(),
+            RecipeChangeEvent {
+                event_id: &new_id,
+                config_action: "created",
+                db_action: "insert",
+            },
+        )
     }
 
     /// Get the default recipe for an issue (project first, then workspace).
@@ -527,6 +409,7 @@ impl Orchestrator {
                         file_recipe,
                         None,
                         Some(project_id.to_string()),
+                        chrono::Utc::now().timestamp(),
                     )));
                 }
             }
@@ -544,6 +427,7 @@ impl Orchestrator {
                         file_recipe,
                         Some("default".to_string()),
                         None,
+                        chrono::Utc::now().timestamp(),
                     )));
                 }
             }
@@ -601,23 +485,17 @@ impl Orchestrator {
         recipe.is_default = true;
         recipe.updated_at = chrono::Utc::now().timestamp();
 
-        let file_recipe = config_recipes::FileRecipe {
-            recipe: recipe.clone(),
-            is_project_scoped: existing.is_project_scoped,
-            file_path: existing.file_path,
-        };
-        config_recipes::save_recipe(&self.config_dir, &file_recipe, project_path.as_deref())?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "modified", "id": recipe_id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "update"}),
-        );
-
-        Ok(recipe)
+        self.save_recipe_change(
+            recipe,
+            existing.is_project_scoped,
+            existing.file_path,
+            project_path.as_deref(),
+            RecipeChangeEvent {
+                event_id: recipe_id,
+                config_action: "modified",
+                db_action: "update",
+            },
+        )
     }
 
     /// Unset a recipe as the default.
@@ -640,23 +518,17 @@ impl Orchestrator {
         recipe.is_default = false;
         recipe.updated_at = chrono::Utc::now().timestamp();
 
-        let file_recipe = config_recipes::FileRecipe {
-            recipe: recipe.clone(),
-            is_project_scoped: existing.is_project_scoped,
-            file_path: existing.file_path,
-        };
-        config_recipes::save_recipe(&self.config_dir, &file_recipe, project_path.as_deref())?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "modified", "id": recipe_id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "update"}),
-        );
-
-        Ok(recipe)
+        self.save_recipe_change(
+            recipe,
+            existing.is_project_scoped,
+            existing.file_path,
+            project_path.as_deref(),
+            RecipeChangeEvent {
+                event_id: recipe_id,
+                config_action: "modified",
+                db_action: "update",
+            },
+        )
     }
 
     /// Get recipe version history (stub — file-based recipes have no version history).
@@ -724,23 +596,17 @@ impl Orchestrator {
             recipes_dir.join(format!("{}.yaml", id))
         };
 
-        let file_recipe = config_recipes::FileRecipe {
-            recipe: recipe.clone(),
+        self.save_recipe_change(
+            recipe,
             is_project_scoped,
             file_path,
-        };
-        config_recipes::save_recipe(&self.config_dir, &file_recipe, project_path.as_deref())?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "recipe", "action": "created", "id": id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "recipes", "action": "insert"}),
-        );
-
-        Ok(recipe)
+            project_path.as_deref(),
+            RecipeChangeEvent {
+                event_id: &id,
+                config_action: "created",
+                db_action: "insert",
+            },
+        )
     }
 
     /// Validate recipe file content without saving.

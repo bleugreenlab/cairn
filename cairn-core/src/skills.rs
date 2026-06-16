@@ -42,7 +42,7 @@ pub struct SkillFrontmatter {
 }
 
 /// Wrapper for allowed tools that handles multiple input formats.
-/// Normalizes to a Vec<String> internally.
+/// Normalizes to a `Vec<String>` internally.
 /// Serializes as a space-delimited string (spec format).
 #[derive(Debug, Clone)]
 pub struct AllowedToolsValue(pub Vec<String>);

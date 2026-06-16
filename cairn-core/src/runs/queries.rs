@@ -1,80 +1,46 @@
-use crate::diesel_models::{DbEvent, DbPrompt, DbRun};
+use crate::agent_process::stream::TranscriptEvent as StoredTranscriptEvent;
+use crate::error::CairnError;
 use crate::models::{Event, Prompt, Run, RunStatus};
 use crate::models::{RunTodos, TodoItem};
-use crate::schema::{events, prompts, runs};
+use crate::runs::read_tokens::ReadSegmentTokens;
+use crate::storage::{DbResult, LocalDb, RowExt};
+use crate::transcripts::stream_store::ActiveMessageStream;
 use crate::transcripts::stream_store::{
-    find_active_stream_for_run, find_active_stream_for_session, ActiveMessageStream,
+    find_active_stream_for_run, find_active_stream_for_session, read_active_stream,
 };
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::future::Future;
+use std::sync::Arc;
+use turso::{params, Row};
 
-/// Paginated response for events
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastEventDigest {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub is_pending: bool,
+}
+
+/// Incremental session-event delta. Durable events insert monotonically per
+/// session (runs execute sequentially; once a new run starts, older runs never
+/// insert), so `WHERE session_id = ? AND rowid > ?` is a sound append-only
+/// delta even across run boundaries.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PaginatedEvents {
-    /// Events in chronological order (oldest first within this page)
+pub struct SessionEventsDelta {
+    /// New durable events. On the initial load (no cursor) these are
+    /// run-ordered; on a delta they are in insertion (rowid) order.
     pub events: Vec<Event>,
-    /// Whether there are more (older) events to load
-    pub has_more: bool,
-    /// Cursor for loading older events (created_at of oldest event in full result set)
-    pub next_cursor: Option<i64>,
-}
-
-/// Token usage summary for a session
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionTokenUsage {
-    /// Current context size: input + cache_read + cache_create from latest event
-    pub current: i64,
-    /// Total output tokens generated across all events in session
-    pub total_output: i64,
-    /// Number of times the session has been compacted
-    pub compaction_count: i64,
-}
-
-/// Convert DbRun to Run model
-pub fn db_run_to_run(db: DbRun) -> Run {
-    Run {
-        id: db.id,
-        issue_id: db.issue_id,
-        project_id: db.project_id,
-        job_id: db.job_id,
-        chat_id: db.chat_id,
-        status: db
-            .status
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(RunStatus::Starting),
-        session_id: db.session_id,
-        backend: db.backend,
-        exit_reason: db.exit_reason,
-        error_message: db.error_message,
-        started_at: db.started_at.map(|t| t as i64),
-        exited_at: db.exited_at.map(|t| t as i64),
-        created_at: db.created_at as i64,
-        updated_at: db.updated_at as i64,
-        start_mode: db.start_mode.and_then(|s| s.parse().ok()),
-    }
-}
-
-/// Convert DbEvent to Event model
-pub fn db_event_to_event(db: DbEvent) -> Event {
-    Event {
-        id: db.id,
-        run_id: db.run_id,
-        session_id: db.session_id,
-        sequence: db.sequence,
-        timestamp: db.timestamp as i64,
-        event_type: db.event_type,
-        data: db.data,
-        parent_tool_use_id: db.parent_tool_use_id,
-        created_at: db.created_at as i64,
-        input_tokens: db.input_tokens,
-        cache_read_tokens: db.cache_read_tokens,
-        cache_create_tokens: db.cache_create_tokens,
-        output_tokens: db.output_tokens,
-        turn_id: db.turn_id,
-    }
+    /// Max rowid of all durable events returned; echoes the cursor when the
+    /// delta is empty so the caller can keep its position. `None` only when the
+    /// session has no durable events yet.
+    pub last_rowid: Option<i64>,
+    /// Active-stream placeholder, returned separately rather than spliced into
+    /// `events` so the frontend merge stays append-only.
+    pub streaming: Option<Event>,
 }
 
 fn active_stream_to_event(active: ActiveMessageStream) -> Event {
@@ -93,6 +59,13 @@ fn active_stream_to_event(active: ActiveMessageStream) -> Event {
         cache_create_tokens: None,
         output_tokens: None,
         turn_id: active.stream.turn_id.clone(),
+        thinking_tokens: None,
+        storage_mode: None,
+        content_commit: None,
+        content_render_sha: None,
+        data_blob: None,
+        codec: None,
+        read_segments: None,
     }
 }
 
@@ -132,415 +105,198 @@ fn insert_active_stream_by_created_at(events: &mut Vec<Event>, active: ActiveMes
     events.insert(insert_at, active_event);
 }
 
-/// Convert DbPrompt to Prompt model
-pub fn db_prompt_to_prompt(db: DbPrompt) -> Prompt {
-    Prompt {
-        id: db.id,
-        run_id: db.run_id,
-        questions: db.questions,
-        response: db.response,
-        created_at: db.created_at as i64,
-        answered_at: db.answered_at.map(|t| t as i64),
-    }
+const RUN_COLUMNS: &str = "id, issue_id, project_id, job_id, status, session_id, error_message,
+    started_at, exited_at, created_at, updated_at, chat_id, backend, exit_reason, start_mode";
+
+pub(crate) const EVENT_COLUMNS: &str =
+    "id, run_id, session_id, sequence, timestamp, event_type, data,
+    parent_tool_use_id, created_at, input_tokens, cache_read_tokens, cache_create_tokens,
+    output_tokens, turn_id, thinking_tokens, storage_mode, content_commit, content_render_sha,
+    data_blob, codec";
+
+/// Number of columns `EVENT_COLUMNS` projects, and therefore the zero-based
+/// index of any extra column appended after it (e.g. `SELECT {EVENT_COLUMNS},
+/// rowid` puts `rowid` here). Keep in lockstep with `EVENT_COLUMNS`: adding a
+/// column there without bumping this read a trailing column at the wrong index.
+pub(crate) const EVENT_COLUMN_COUNT: usize = 20;
+
+const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id";
+
+#[derive(Debug, Default)]
+struct ReconcileResult {
+    stale_run_count: usize,
+    turn_count: usize,
 }
 
-/// List runs for an issue.
-pub fn list_runs(conn: &mut SqliteConnection, issue_id: &str) -> Result<Vec<Run>, String> {
-    let db_runs: Vec<DbRun> = runs::table
-        .filter(runs::issue_id.eq(issue_id))
-        .order(runs::created_at.desc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(db_runs.into_iter().map(db_run_to_run).collect())
+pub fn list_runs(db: Arc<LocalDb>, issue_id: &str) -> Result<Vec<Run>, CairnError> {
+    let issue_id = issue_id.to_string();
+    run_query_db(async move {
+        load_runs_by_sql(
+            &db,
+            "SELECT id, issue_id, project_id, job_id, status, session_id, error_message,
+                    started_at, exited_at, created_at, updated_at, chat_id, backend, exit_reason,
+                    start_mode
+             FROM runs
+             WHERE issue_id = ?1
+             ORDER BY created_at DESC",
+            issue_id,
+        )
+        .await
+    })
 }
 
-/// List runs for a job.
-pub fn list_runs_for_job(conn: &mut SqliteConnection, job_id: &str) -> Result<Vec<Run>, String> {
-    let db_runs: Vec<DbRun> = runs::table
-        .filter(runs::job_id.eq(job_id))
-        .order(runs::created_at.desc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(db_runs.into_iter().map(db_run_to_run).collect())
+pub fn list_runs_for_job(db: Arc<LocalDb>, job_id: &str) -> Result<Vec<Run>, CairnError> {
+    let job_id = job_id.to_string();
+    run_query_db(async move {
+        load_runs_by_sql(
+            &db,
+            "SELECT id, issue_id, project_id, job_id, status, session_id, error_message,
+                    started_at, exited_at, created_at, updated_at, chat_id, backend, exit_reason,
+                    start_mode
+             FROM runs
+             WHERE job_id = ?1
+             ORDER BY created_at DESC",
+            job_id,
+        )
+        .await
+    })
 }
 
-/// List runs for a chat.
-pub fn list_runs_for_chat(conn: &mut SqliteConnection, chat_id: &str) -> Result<Vec<Run>, String> {
-    let db_runs: Vec<DbRun> = runs::table
-        .filter(runs::chat_id.eq(chat_id))
-        .order(runs::created_at.desc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(db_runs.into_iter().map(db_run_to_run).collect())
+pub fn get_run(db: Arc<LocalDb>, id: &str) -> Result<Option<Run>, CairnError> {
+    let id = id.to_string();
+    run_query_db(async move { load_run(&db, id).await })
 }
 
-/// Get a single run by ID.
-pub fn get_run(conn: &mut SqliteConnection, id: &str) -> Result<Option<Run>, String> {
-    let db_run: Option<DbRun> = runs::table
-        .find(id)
-        .first(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
+pub fn list_events(db: Arc<LocalDb>, run_id: &str) -> Result<Vec<Event>, CairnError> {
+    let run_id = run_id.to_string();
+    let query_db = db.clone();
+    let query_run_id = run_id.clone();
+    let mut events = run_query_db(async move {
+        let events = load_events_for_run(&query_db, query_run_id).await?;
+        let mut events = crate::archival::reconstruct_events(&query_db, events).await;
+        apply_lean_read_projection(&query_db, &mut events).await?;
+        Ok(events)
+    })?;
 
-    Ok(db_run.map(db_run_to_run))
-}
-
-/// List events for a run.
-pub fn list_events(conn: &mut SqliteConnection, run_id: &str) -> Result<Vec<Event>, String> {
-    let db_events: Vec<DbEvent> = events::table
-        .filter(events::run_id.eq(run_id))
-        .order(events::sequence.asc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    let mut events: Vec<Event> = db_events.into_iter().map(db_event_to_event).collect();
-    if let Some(active) = find_active_stream_for_run(conn, run_id)? {
+    if let Some(active) = find_active_stream_for_run(db, &run_id).map_err(CairnError::Internal)? {
         events.push(active_stream_to_event(active));
         events.sort_by_key(|event| (event.sequence, event.created_at));
     }
     Ok(events)
 }
 
-/// List events for a run with limit/offset.
 pub fn list_events_limited(
-    conn: &mut SqliteConnection,
+    db: Arc<LocalDb>,
     run_id: &str,
     limit: i64,
     offset: i64,
-) -> Result<Vec<Event>, String> {
-    let db_events: Vec<DbEvent> = events::table
-        .filter(events::run_id.eq(run_id))
-        .order(events::sequence.asc())
-        .limit(limit)
-        .offset(offset)
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(db_events.into_iter().map(db_event_to_event).collect())
+) -> Result<Vec<Event>, CairnError> {
+    let run_id = run_id.to_string();
+    run_query_db(async move {
+        let events = load_events_limited(&db, run_id, limit, offset).await?;
+        Ok(crate::archival::reconstruct_events(&db, events).await)
+    })
 }
 
-/// List events for a session (spanning multiple runs).
-///
-/// Uses two-query strategy: load run ordering from `runs.created_at`,
-/// then sort events by `(run_position, created_at, rowid)` for stable
-/// ordering at turn boundaries.
-///
-/// - `run_position` fixes cross-run ordering when `created_at` ties (same second)
-/// - `created_at` separates events across seconds
-/// - `rowid` (via insertion-order index) is the stable intra-second tiebreaker,
-///   because `sequence` is unreliable: on cold resume the user event gets
-///   `max_session_seq + 1` while the backend process resets to 0
 pub fn list_events_for_session(
-    conn: &mut SqliteConnection,
+    db: Arc<LocalDb>,
     session_id: &str,
-) -> Result<Vec<Event>, String> {
-    // 1. Load run_ids ordered by creation time
-    let ordered_run_ids: Vec<String> = runs::table
-        .filter(runs::session_id.eq(session_id))
-        .order(runs::created_at.asc())
-        .select(runs::id)
-        .load(conn)
-        .map_err(|e| e.to_string())?;
+) -> Result<Vec<Event>, CairnError> {
+    let session_id = session_id.to_string();
+    let query_db = db.clone();
+    let query_session_id = session_id.clone();
+    let (mut events, run_position) = run_query_db(async move {
+        let (events, run_position) = load_events_for_session(&query_db, query_session_id).await?;
+        let events = crate::archival::reconstruct_events(&query_db, events).await;
+        Ok((events, run_position))
+    })?;
 
-    // 2. Build run_id -> position map for O(1) lookup
-    let run_position: std::collections::HashMap<String, usize> = ordered_run_ids
-        .iter()
-        .enumerate()
-        .map(|(i, id)| (id.clone(), i))
-        .collect();
-
-    // 3. Load all session events in rowid order (insertion order)
-    let db_events: Vec<DbEvent> = events::table
-        .filter(events::session_id.eq(session_id))
-        .order(diesel::dsl::sql::<diesel::sql_types::BigInt>("rowid"))
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    // 4. Build insertion-order index from rowid-ordered load
-    let mut indexed: Vec<(usize, DbEvent)> = db_events.into_iter().enumerate().collect();
-
-    // 5. Sort by (run_position, created_at, insertion_index)
-    indexed.sort_by(|(idx_a, a), (idx_b, b)| {
-        let pos_a = run_position.get(&a.run_id).copied().unwrap_or(usize::MAX);
-        let pos_b = run_position.get(&b.run_id).copied().unwrap_or(usize::MAX);
-        pos_a
-            .cmp(&pos_b)
-            .then(a.created_at.cmp(&b.created_at))
-            .then(idx_a.cmp(idx_b))
-    });
-
-    let mut events: Vec<Event> = indexed
-        .into_iter()
-        .map(|(_, e)| db_event_to_event(e))
-        .collect();
-
-    if let Some(active) = find_active_stream_for_session(conn, session_id)? {
+    if let Some(active) =
+        find_active_stream_for_session(db, &session_id).map_err(CairnError::Internal)?
+    {
         insert_active_stream_for_session(&mut events, active, &run_position);
     }
 
     Ok(events)
 }
 
-/// List events for a specific turn.
-///
-/// Orders by `(created_at, rowid)`. On cold resume, the user event
-/// (global session sequence) and backend events (process-local seq 0)
-/// can share the same `created_at` second; `rowid` preserves insertion
-/// order as a stable tiebreaker.
-pub fn list_events_for_turn(
-    conn: &mut SqliteConnection,
-    turn_id: &str,
-) -> Result<Vec<Event>, String> {
-    let db_events: Vec<DbEvent> = events::table
-        .filter(events::turn_id.eq(turn_id))
-        .order((
-            events::created_at.asc(),
-            diesel::dsl::sql::<diesel::sql_types::BigInt>("rowid"),
-        ))
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    let mut events: Vec<Event> = db_events.into_iter().map(db_event_to_event).collect();
-    if let Some(active) = message_streams_for_turn(conn, turn_id)? {
+pub fn list_events_for_turn(db: Arc<LocalDb>, turn_id: &str) -> Result<Vec<Event>, CairnError> {
+    let turn_id = turn_id.to_string();
+    let query_db = db.clone();
+    let query_turn_id = turn_id.clone();
+    let mut events = run_query_db(async move {
+        let events = load_events_for_turn(&query_db, query_turn_id).await?;
+        Ok(crate::archival::reconstruct_events(&query_db, events).await)
+    })?;
+    if let Some(active) = message_streams_for_turn(db, &turn_id)? {
         insert_active_stream_by_created_at(&mut events, active);
     }
     Ok(events)
 }
 
-/// List events for a session with pagination.
-/// Returns events in chronological order (oldest first), loading from newest.
-/// - limit: max events to return
-/// - before: optional cursor (created_at timestamp) - load events older than this
-pub fn list_events_paginated(
-    conn: &mut SqliteConnection,
+/// Incremental session-event loader. `after_rowid = None` returns the full
+/// run-ordered history plus a cursor; `after_rowid = Some(r)` returns only
+/// events inserted after the cursor, in append order. The active-stream
+/// placeholder is returned in its own field rather than spliced into `events`.
+pub fn list_events_for_session_delta(
+    db: Arc<LocalDb>,
     session_id: &str,
-    limit: i64,
-    before: Option<i64>,
-) -> Result<PaginatedEvents, String> {
-    let mut query = events::table
-        .filter(events::session_id.eq(session_id))
-        .into_boxed();
+    after_rowid: Option<i64>,
+) -> Result<SessionEventsDelta, CairnError> {
+    let session_id = session_id.to_string();
+    let query_db = db.clone();
+    let query_session_id = session_id.clone();
+    let (events, last_rowid) = run_query_db(async move {
+        let (events, last_rowid) =
+            load_session_events_delta(&query_db, query_session_id, after_rowid).await?;
+        let mut events = crate::archival::reconstruct_events(&query_db, events).await;
+        apply_lean_read_projection(&query_db, &mut events).await?;
+        Ok((events, last_rowid))
+    })?;
 
-    if let Some(cursor) = before {
-        query = query.filter(events::created_at.lt(cursor as i32));
-    }
+    let streaming = find_active_stream_for_session(db, &session_id)
+        .map_err(CairnError::Internal)?
+        .map(active_stream_to_event);
 
-    let db_events: Vec<DbEvent> = query
-        .order((events::created_at.desc(), events::sequence.desc()))
-        .limit(limit + 1)
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    let has_more = db_events.len() > limit as usize;
-    let events_to_return: Vec<DbEvent> = db_events.into_iter().take(limit as usize).collect();
-
-    let next_cursor = events_to_return.last().map(|e| e.created_at as i64);
-
-    let mut events: Vec<Event> = events_to_return
-        .into_iter()
-        .rev()
-        .map(db_event_to_event)
-        .collect();
-
-    if before.is_none() {
-        if let Some(active) = find_active_stream_for_session(conn, session_id)? {
-            insert_active_stream_by_created_at(&mut events, active);
-        }
-    }
-
-    Ok(PaginatedEvents {
+    Ok(SessionEventsDelta {
         events,
-        has_more,
-        next_cursor,
+        last_rowid,
+        streaming,
     })
 }
 
-/// List events for a run with pagination.
-/// Used for initial events before session_id is known.
-pub fn list_events_for_run_paginated(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-    limit: i64,
-    before: Option<i64>,
-) -> Result<PaginatedEvents, String> {
-    let mut query = events::table.filter(events::run_id.eq(run_id)).into_boxed();
-
-    if let Some(cursor) = before {
-        query = query.filter(events::created_at.lt(cursor as i32));
-    }
-
-    let db_events: Vec<DbEvent> = query
-        .order((events::created_at.desc(), events::sequence.desc()))
-        .limit(limit + 1)
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    let has_more = db_events.len() > limit as usize;
-    let events_to_return: Vec<DbEvent> = db_events.into_iter().take(limit as usize).collect();
-
-    let next_cursor = events_to_return.last().map(|e| e.created_at as i64);
-
-    let mut events: Vec<Event> = events_to_return
-        .into_iter()
-        .rev()
-        .map(db_event_to_event)
-        .collect();
-
-    if before.is_none() {
-        if let Some(active) = find_active_stream_for_run(conn, run_id)? {
-            insert_active_stream_by_created_at(&mut events, active);
-        }
-    }
-
-    Ok(PaginatedEvents {
-        events,
-        has_more,
-        next_cursor,
-    })
+pub fn last_event_for_session(
+    db: Arc<LocalDb>,
+    session_id: &str,
+) -> Result<Option<LastEventDigest>, CairnError> {
+    let session_id = session_id.to_string();
+    run_query_db(async move { load_last_event_for_session(&db, &session_id).await })
 }
 
-fn message_streams_for_turn(
-    conn: &mut SqliteConnection,
-    turn_id: &str,
-) -> Result<Option<ActiveMessageStream>, String> {
-    use crate::schema::message_streams;
-
-    let stream_id = message_streams::table
-        .filter(message_streams::turn_id.eq(turn_id))
-        .filter(message_streams::status.eq_any(["open", "finalizing"]))
-        .order(message_streams::created_at.asc())
-        .select(message_streams::id)
-        .first::<String>(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    match stream_id {
-        Some(stream_id) => crate::transcripts::stream_store::read_active_stream(conn, &stream_id),
-        None => Ok(None),
-    }
+pub fn get_pending_prompt(db: Arc<LocalDb>, run_id: &str) -> Result<Option<Prompt>, CairnError> {
+    let run_id = run_id.to_string();
+    run_query_db(async move { load_pending_prompt(&db, run_id).await })
 }
 
-/// Get the pending prompt for a run (if any).
-pub fn get_pending_prompt(
-    conn: &mut SqliteConnection,
-    run_id: &str,
-) -> Result<Option<Prompt>, String> {
-    let db_prompt: Option<DbPrompt> = prompts::table
-        .filter(prompts::run_id.eq(run_id))
-        .filter(prompts::response.is_null())
-        .order(prompts::created_at.desc())
-        .first(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    Ok(db_prompt.map(db_prompt_to_prompt))
-}
-
-/// Get the pending prompt for a job (finds via yielded turn).
-/// This is the primary lookup path — prompts anchor to turns, jobs own turns.
 pub fn get_pending_prompt_for_job(
-    conn: &mut SqliteConnection,
+    db: Arc<LocalDb>,
     job_id: &str,
-) -> Result<Option<Prompt>, String> {
-    use crate::schema::jobs;
-
-    // Get current_turn_id from the job
-    let current_turn_id: Option<String> = jobs::table
-        .find(job_id)
-        .select(jobs::current_turn_id)
-        .first::<Option<String>>(conn)
-        .ok()
-        .flatten();
-
-    let Some(turn_id) = current_turn_id else {
-        return Ok(None);
-    };
-
-    // Look for pending prompt on the current turn
-    let db_prompt: Option<DbPrompt> = prompts::table
-        .filter(prompts::turn_id.eq(&turn_id))
-        .filter(prompts::response.is_null())
-        .order(prompts::created_at.desc())
-        .first(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    Ok(db_prompt.map(db_prompt_to_prompt))
+) -> Result<Option<Prompt>, CairnError> {
+    let job_id = job_id.to_string();
+    run_query_db(async move { load_pending_prompt_for_job(&db, job_id).await })
 }
 
-/// Get token usage statistics for a session
-pub fn get_session_token_usage(
-    conn: &mut SqliteConnection,
-    session_id: &str,
-) -> Result<SessionTokenUsage, String> {
-    // Get the latest assistant event with token data for current context size
-    // Filter to main agent only (exclude sub-agent events)
-    let latest_tokens: Option<(Option<i32>, Option<i32>, Option<i32>)> = events::table
-        .filter(events::session_id.eq(session_id))
-        .filter(events::event_type.eq("assistant"))
-        .filter(events::parent_tool_use_id.is_null())
-        .filter(events::input_tokens.is_not_null())
-        .order((events::created_at.desc(), events::sequence.desc()))
-        .select((
-            events::input_tokens,
-            events::cache_read_tokens,
-            events::cache_create_tokens,
-        ))
-        .first(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    let current = if let Some((input, cache_read, cache_create)) = latest_tokens {
-        let input_val = input.unwrap_or(0) as i64;
-        let cache_read_val = cache_read.unwrap_or(0) as i64;
-        let cache_create_val = cache_create.unwrap_or(0) as i64;
-        input_val + cache_read_val + cache_create_val
-    } else {
-        0
-    };
-
-    // Sum all output tokens for the session (main agent only)
-    let total_output: i64 = events::table
-        .filter(events::session_id.eq(session_id))
-        .filter(events::parent_tool_use_id.is_null())
-        .filter(events::output_tokens.is_not_null())
-        .select(diesel::dsl::sum(events::output_tokens))
-        .first::<Option<i64>>(conn)
-        .map_err(|e| e.to_string())?
-        .unwrap_or(0);
-
-    // Count compaction events (main agent only)
-    let compaction_count: i64 = events::table
-        .filter(events::session_id.eq(session_id))
-        .filter(events::parent_tool_use_id.is_null())
-        .filter(events::event_type.eq("system:compact_boundary"))
-        .count()
-        .get_result(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(SessionTokenUsage {
-        current,
-        total_output,
-        compaction_count,
+pub fn get_job_todos(db: Arc<LocalDb>, job_id: &str) -> Result<Vec<TodoItem>, CairnError> {
+    let job_id = job_id.to_string();
+    run_query_db(async move {
+        crate::todos::get_todos_for_job(&db, &job_id)
+            .await
+            .map_err(CairnError::Internal)
     })
 }
 
-/// Get the current todo list for a job.
-/// Queries the todos table directly.
-pub fn get_job_todos(conn: &mut SqliteConnection, job_id: &str) -> Result<Vec<TodoItem>, String> {
-    crate::todos::get_todos_for_job(conn, job_id)
-}
-
-/// Get todos for a job (single list — no longer grouped by run).
-/// Kept for backward compatibility; returns the current todos as a single RunTodos entry.
-pub fn get_job_todos_by_run(
-    conn: &mut SqliteConnection,
-    job_id: &str,
-) -> Result<Vec<RunTodos>, String> {
-    let todos = crate::todos::get_todos_for_job(conn, job_id)?;
+pub fn get_job_todos_by_run(db: Arc<LocalDb>, job_id: &str) -> Result<Vec<RunTodos>, CairnError> {
+    let todos = get_job_todos(db, job_id)?;
     if todos.is_empty() {
         return Ok(vec![]);
     }
@@ -551,1178 +307,1197 @@ pub fn get_job_todos_by_run(
     }])
 }
 
-/// Reconcile stale runs on startup.
-///
-/// Any run marked starting/live in the DB has no live process after restart.
-/// Mark them as crashed with exit_reason "crash" and interrupt orphaned turns.
-pub fn reconcile_stale_runs(
-    conn: &mut SqliteConnection,
-    emitter: &dyn crate::services::EventEmitter,
-) {
-    use crate::schema::turns;
+pub fn reconcile_stale_runs(db: Arc<LocalDb>, emitter: &dyn crate::services::EventEmitter) {
+    match run_query_db(reconcile_stale_runs_db(db)) {
+        Ok(result) if result.stale_run_count == 0 => {}
+        Ok(result) => {
+            log::info!(
+                "Reconciled {} stale runs on startup",
+                result.stale_run_count
+            );
+            // Intentionally bare: this startup sweep reconciles many stale runs
+            // at once and carries no ids, so the frontend broad-invalidates
+            // ["runs"]. (See `crate::notify::run_db_change_ids`.)
+            let _ = emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "runs", "action": "update"}),
+            );
+            if result.turn_count > 0 {
+                let _ = emitter.emit(
+                    "db-change",
+                    serde_json::json!({"table": "turns", "action": "update"}),
+                );
+            }
+        }
+        Err(err) => {
+            log::warn!("Failed to reconcile stale runs on startup: {}", err);
+        }
+    }
+}
 
-    let now = chrono::Utc::now().timestamp() as i32;
+fn run_query_db<T, Fut>(future: Fut) -> Result<T, CairnError>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, CairnError>> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                CairnError::Internal(format!("Failed to start run database runtime: {e}"))
+            })?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| CairnError::Internal("Run database task panicked".to_string()))?
+}
 
-    let stale_runs: Vec<String> = runs::table
-        .filter(runs::status.eq_any(&["starting", "live"]))
-        .select(runs::id)
-        .load(conn)
-        .unwrap_or_default();
+async fn load_runs_by_sql(
+    db: &LocalDb,
+    sql: &'static str,
+    value: String,
+) -> Result<Vec<Run>, CairnError> {
+    db.query_all(sql, params![value.as_str()], run_from_row)
+        .await
+        .map_err(CairnError::from)
+}
 
-    if stale_runs.is_empty() {
-        return;
+async fn load_run(db: &LocalDb, id: String) -> Result<Option<Run>, CairnError> {
+    db.query_opt(
+        format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1"),
+        params![id.as_str()],
+        run_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+async fn load_events_for_run(db: &LocalDb, run_id: String) -> Result<Vec<Event>, CairnError> {
+    db.query_all(
+        format!(
+            "SELECT {EVENT_COLUMNS}
+             FROM events
+             WHERE run_id = ?1
+             ORDER BY sequence ASC"
+        ),
+        params![run_id.as_str()],
+        event_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+async fn load_events_limited(
+    db: &LocalDb,
+    run_id: String,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Event>, CairnError> {
+    db.query_all(
+        format!(
+            "SELECT {EVENT_COLUMNS}
+             FROM events
+             WHERE run_id = ?1
+             ORDER BY sequence ASC
+             LIMIT ?2 OFFSET ?3"
+        ),
+        params![run_id.as_str(), limit, offset],
+        event_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+async fn load_last_event_for_session(
+    db: &LocalDb,
+    session_id: &str,
+) -> Result<Option<LastEventDigest>, CairnError> {
+    let mut events = db
+        .query_all(
+            format!(
+                "SELECT {EVENT_COLUMNS}
+                 FROM events
+                 WHERE session_id = ?1
+                 ORDER BY rowid DESC
+                 LIMIT 64"
+            ),
+            params![session_id],
+            event_from_row,
+        )
+        .await
+        .map_err(CairnError::from)?;
+
+    if events.is_empty() {
+        return Ok(None);
     }
 
-    for run_id in &stale_runs {
-        // Mark as crashed (unclean shutdown)
-        let _ = diesel::update(runs::table.find(run_id))
-            .set((
-                runs::status.eq("crashed"),
-                runs::exit_reason.eq(Some("crash")),
-                runs::exited_at.eq(Some(now)),
-                runs::updated_at.eq(now),
-            ))
-            .execute(conn);
+    events.reverse();
 
-        // Interrupt any running/pending turns attached to this run
-        let orphaned_turns: Vec<(String, String)> = turns::table
-            .filter(turns::run_id.eq(run_id))
-            .filter(turns::state.eq_any(&["running", "pending"]))
-            .select((turns::id, turns::state))
-            .load(conn)
-            .unwrap_or_default();
+    let parsed_events: Vec<StoredTranscriptEvent> = events
+        .iter()
+        .filter_map(|event| serde_json::from_str::<StoredTranscriptEvent>(&event.data).ok())
+        .collect();
 
-        for (turn_id, turn_state) in &orphaned_turns {
-            let result = match turn_state.as_str() {
-                "running" => crate::transitions::interrupt_turn(conn, turn_id, emitter),
-                "pending" => crate::transitions::apply_turn_outcome(
-                    conn,
-                    turn_id,
-                    crate::models::TurnState::Failed,
-                    emitter,
-                ),
-                _ => continue,
-            };
-            if let Err(err) = result {
-                log::warn!(
-                    "Failed to reconcile orphaned turn {} for run {}: {}",
-                    turn_id,
-                    run_id,
-                    err.reason
-                );
+    if parsed_events.is_empty() {
+        return Ok(None);
+    }
+
+    let completed_tool_ids: HashSet<String> = parsed_events
+        .iter()
+        .filter(|event| event.event_type == "tool_result")
+        .filter_map(|event| event.tool_use_id.clone())
+        .collect();
+
+    for event in parsed_events.iter().rev() {
+        if event.event_type == "assistant" || event.event_type == "assistant:streaming" {
+            if let Some(tool_uses) = event.tool_uses.as_ref() {
+                for tool in tool_uses.iter().rev() {
+                    if !completed_tool_ids.contains(&tool.id) {
+                        return Ok(Some(LastEventDigest {
+                            kind: "tool".to_string(),
+                            content: truncate_digest(clean_tool_name(&tool.name), 200),
+                            tool_name: Some(tool.name.clone()),
+                            is_pending: true,
+                        }));
+                    }
+                }
+            }
+
+            if let Some(thinking) = event.thinking.as_deref().filter(|value| !value.is_empty()) {
+                return Ok(Some(LastEventDigest {
+                    kind: "thinking".to_string(),
+                    content: truncate_digest(thinking, 200),
+                    tool_name: None,
+                    is_pending: true,
+                }));
+            }
+
+            if let Some(content) = event.content.as_deref().filter(|value| !value.is_empty()) {
+                return Ok(Some(LastEventDigest {
+                    kind: "message".to_string(),
+                    content: truncate_digest(content, 200),
+                    tool_name: None,
+                    is_pending: false,
+                }));
             }
         }
     }
 
-    log::info!("Reconciled {} stale runs on startup", stale_runs.len());
+    Ok(Some(LastEventDigest {
+        kind: "thinking".to_string(),
+        content: String::new(),
+        tool_name: None,
+        is_pending: true,
+    }))
+}
 
-    let _ = emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "runs", "action": "update"}),
-    );
+fn clean_tool_name(name: &str) -> &str {
+    name.rsplit_once("__").map(|(_, tail)| tail).unwrap_or(name)
+}
+
+fn truncate_digest(text: impl AsRef<str>, len: usize) -> String {
+    let text = text.as_ref();
+    if text.chars().count() <= len {
+        return text.to_string();
+    }
+    text.chars().take(len).collect::<String>() + "…"
+}
+
+async fn load_events_for_session(
+    db: &LocalDb,
+    session_id: String,
+) -> Result<(Vec<Event>, std::collections::HashMap<String, usize>), CairnError> {
+    let ordered_run_ids = db
+        .query_all(
+            "SELECT id
+             FROM runs
+             WHERE session_id = ?1
+             ORDER BY created_at ASC",
+            params![session_id.as_str()],
+            |row| row.text(0),
+        )
+        .await
+        .map_err(CairnError::from)?;
+
+    let run_position: std::collections::HashMap<String, usize> = ordered_run_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i))
+        .collect();
+
+    let db_events = db
+        .query_all(
+            format!(
+                "SELECT {EVENT_COLUMNS}
+                 FROM events
+                 WHERE session_id = ?1
+                 ORDER BY rowid"
+            ),
+            params![session_id.as_str()],
+            event_from_row,
+        )
+        .await
+        .map_err(CairnError::from)?;
+    let mut indexed: Vec<(usize, Event)> = db_events.into_iter().enumerate().collect();
+
+    indexed.sort_by(|(idx_a, a), (idx_b, b)| {
+        let pos_a = run_position.get(&a.run_id).copied().unwrap_or(usize::MAX);
+        let pos_b = run_position.get(&b.run_id).copied().unwrap_or(usize::MAX);
+        pos_a
+            .cmp(&pos_b)
+            .then(a.created_at.cmp(&b.created_at))
+            .then(idx_a.cmp(idx_b))
+    });
+
+    Ok((
+        indexed.into_iter().map(|(_, event)| event).collect(),
+        run_position,
+    ))
+}
+
+async fn load_events_for_turn(db: &LocalDb, turn_id: String) -> Result<Vec<Event>, CairnError> {
+    db.query_all(
+        format!(
+            "SELECT {EVENT_COLUMNS}
+             FROM events
+             WHERE turn_id = ?1
+             ORDER BY created_at ASC, rowid"
+        ),
+        params![turn_id.as_str()],
+        event_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+/// Fetch a single event with its full, unstripped `data` for on-demand detail /
+/// raw rendering (CAIRN-1593). Reconstructs archival storage like the list
+/// loaders, but never applies the lean read projection.
+pub fn load_event_by_id(db: Arc<LocalDb>, event_id: &str) -> Result<Option<Event>, CairnError> {
+    let event_id = event_id.to_string();
+    let query_db = db.clone();
+    run_query_db(async move {
+        let event = query_db
+            .query_opt(
+                format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = ?1"),
+                params![event_id.as_str()],
+                event_from_row,
+            )
+            .await
+            .map_err(CairnError::from)?;
+        match event {
+            Some(event) => {
+                let mut events = crate::archival::reconstruct_events(&query_db, vec![event]).await;
+                Ok(events.pop())
+            }
+            None => Ok(None),
+        }
+    })
+}
+
+/// Strip cached read tool-result bodies from `events` and attach per-segment
+/// token counts (CAIRN-1593). A row in `event_read_tokens` both carries the
+/// counts and signals "this event is a read result", so any event with a cache
+/// row gets its `tool_result` blanked and `read_segments` set.
+///
+/// When the originating read tool call is present in this same batch (full
+/// session and per-run loads carry the assistant event), missing cache rows are
+/// backfilled first so historical reads gain counts uniformly. Deltas that do
+/// not include the assistant event rely on the ingest-time cache populated when
+/// the result was recorded.
+///
+/// Kept strictly out of the skyline event-load path, which needs real bodies to
+/// compute bar line counts.
+pub(crate) async fn apply_lean_read_projection(
+    db: &LocalDb,
+    events: &mut [Event],
+) -> Result<(), CairnError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    // Correlate tool_use_id -> input paths for read tool calls visible here.
+    let mut read_tool_paths: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for event in events.iter() {
+        let Ok(parsed) = serde_json::from_str::<StoredTranscriptEvent>(&event.data) else {
+            continue;
+        };
+        if let Some(tool_uses) = parsed.tool_uses {
+            for tool in tool_uses {
+                if crate::runs::read_tokens::is_read_tool(&tool.name) {
+                    read_tool_paths.insert(
+                        tool.id,
+                        crate::runs::read_tokens::extract_paths(&tool.input),
+                    );
+                }
+            }
+        }
+    }
+
+    // Candidate tool_result events: every one is checked against the cache;
+    // read-correlated ones can be backfilled on a miss.
+    #[derive(Clone)]
+    struct Candidate {
+        event_id: String,
+        body: Option<String>,
+        expected: Vec<String>,
+        is_read: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for event in events.iter() {
+        if event.event_type != "tool_result" {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<StoredTranscriptEvent>(&event.data) else {
+            continue;
+        };
+        let (is_read, expected) = match parsed.tool_use_id.as_deref() {
+            Some(id) => match read_tool_paths.get(id) {
+                Some(paths) => (true, paths.clone()),
+                None => (false, Vec::new()),
+            },
+            None => (false, Vec::new()),
+        };
+        candidates.push(Candidate {
+            event_id: event.id.clone(),
+            body: parsed.tool_result,
+            expected,
+            is_read,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    // Phase 1 (hot path): read existing cache rows. The common live case — a
+    // freshly-streamed read whose row ingest already wrote — stays read-only.
+    let candidate_ids: Vec<String> = candidates.iter().map(|c| c.event_id.clone()).collect();
+    let mut segments_by_event: std::collections::HashMap<String, Vec<ReadSegmentTokens>> = db
+        .read(move |conn| {
+            let candidate_ids = candidate_ids.clone();
+            Box::pin(async move {
+                let mut found: std::collections::HashMap<String, Vec<ReadSegmentTokens>> =
+                    std::collections::HashMap::new();
+                for id in candidate_ids {
+                    let mut rows = conn
+                        .query(
+                            "SELECT segments_json FROM event_read_tokens WHERE event_id = ?1",
+                            params![id.as_str()],
+                        )
+                        .await?;
+                    if let Some(row) = rows.next().await? {
+                        let json = row.text(0)?;
+                        let segs: Vec<ReadSegmentTokens> =
+                            serde_json::from_str(&json).unwrap_or_default();
+                        found.insert(id, segs);
+                    }
+                }
+                Ok(found)
+            })
+        })
+        .await
+        .map_err(CairnError::from)?;
+
+    // Phase 2 (backfill): only when a correlated read result has no cache row
+    // (historical events from before ingest, or a delta missing its assistant).
+    // This is the one path that takes a write lock.
+    let backfill: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| c.is_read && c.body.is_some() && !segments_by_event.contains_key(&c.event_id))
+        .collect();
+    if !backfill.is_empty() {
+        let now = chrono::Utc::now().timestamp();
+        let computed: std::collections::HashMap<String, Vec<ReadSegmentTokens>> = db
+            .write(move |conn| {
+                let backfill = backfill.clone();
+                Box::pin(async move {
+                    let mut computed: std::collections::HashMap<String, Vec<ReadSegmentTokens>> =
+                        std::collections::HashMap::new();
+                    for cand in backfill {
+                        let body = cand.body.unwrap_or_default();
+                        let segs =
+                            crate::runs::read_tokens::read_segment_tokens(&body, &cand.expected);
+                        let total: i64 = segs.iter().map(|s| s.tokens).sum();
+                        let json = serde_json::to_string(&segs).unwrap_or_default();
+                        conn.execute(
+                            "INSERT OR REPLACE INTO event_read_tokens
+                                (event_id, segments_json, total_tokens, created_at)
+                             VALUES (?1, ?2, ?3, ?4)",
+                            params![cand.event_id.as_str(), json.as_str(), total, now],
+                        )
+                        .await?;
+                        computed.insert(cand.event_id, segs);
+                    }
+                    Ok(computed)
+                })
+            })
+            .await
+            .map_err(CairnError::from)?;
+        segments_by_event.extend(computed);
+    }
+
+    if segments_by_event.is_empty() {
+        return Ok(());
+    }
+
+    for event in events.iter_mut() {
+        if let Some(segs) = segments_by_event.get(&event.id) {
+            event.data = strip_read_body(&event.data);
+            event.read_segments = Some(segs.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Blank the `tool_result` body of a serialized tool-result event, leaving every
+/// other field (including `isError`) intact. On a read result the body is the
+/// only large payload — `raw` already had its content stripped at ingest — so
+/// nulling it removes the read text from the list payload while keeping the
+/// event renderable (the detail/raw surfaces re-fetch the full body on demand).
+fn strip_read_body(data: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(mut value) => {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("toolResult".to_string(), serde_json::Value::Null);
+            }
+            serde_json::to_string(&value).unwrap_or_else(|_| data.to_string())
+        }
+        Err(_) => data.to_string(),
+    }
+}
+
+async fn load_session_events_delta(
+    db: &LocalDb,
+    session_id: String,
+    after_rowid: Option<i64>,
+) -> Result<(Vec<Event>, Option<i64>), CairnError> {
+    match after_rowid {
+        // Initial load: reuse the run-ordered sort, and take the session-wide
+        // MAX(rowid) as the cursor (all durable rows are returned here).
+        None => {
+            let (events, _run_position) = load_events_for_session(db, session_id.clone()).await?;
+            let last_rowid = db
+                .query_one(
+                    "SELECT MAX(rowid) FROM events WHERE session_id = ?1",
+                    params![session_id.as_str()],
+                    |row| row.opt_i64(0),
+                )
+                .await
+                .map_err(CairnError::from)?;
+            Ok((events, last_rowid))
+        }
+        // Delta: rows insert monotonically, so rowid order is the append order
+        // and no Rust re-sort is needed. Uses idx_events_session_id.
+        Some(cursor) => {
+            let rows = db
+                .query_all(
+                    format!(
+                        "SELECT {EVENT_COLUMNS}, rowid
+                         FROM events
+                         WHERE session_id = ?1 AND rowid > ?2
+                         ORDER BY rowid ASC"
+                    ),
+                    params![session_id.as_str(), cursor],
+                    |row| {
+                        let event = event_from_row(row)?;
+                        // `rowid` is appended right after EVENT_COLUMNS.
+                        let rowid = row.i64(EVENT_COLUMN_COUNT)?;
+                        Ok((event, rowid))
+                    },
+                )
+                .await
+                .map_err(CairnError::from)?;
+            // Echo the cursor when the delta is empty so the caller holds position.
+            let last_rowid = rows.last().map(|(_, rowid)| *rowid).or(Some(cursor));
+            let events = rows.into_iter().map(|(event, _)| event).collect();
+            Ok((events, last_rowid))
+        }
+    }
+}
+
+fn message_streams_for_turn(
+    db: Arc<LocalDb>,
+    turn_id: &str,
+) -> Result<Option<ActiveMessageStream>, CairnError> {
+    let turn_id = turn_id.to_string();
+    let query_db = db.clone();
+    let stream_id =
+        run_query_db(async move { active_stream_id_for_turn(&query_db, turn_id).await })?;
+
+    match stream_id {
+        Some(stream_id) => read_active_stream(db, &stream_id).map_err(CairnError::Internal),
+        None => Ok(None),
+    }
+}
+
+async fn active_stream_id_for_turn(
+    db: &LocalDb,
+    turn_id: String,
+) -> Result<Option<String>, CairnError> {
+    db.query_opt(
+        "SELECT id
+         FROM message_streams
+         WHERE turn_id = ?1
+           AND status IN ('open', 'finalizing')
+         ORDER BY created_at ASC
+         LIMIT 1",
+        params![turn_id.as_str()],
+        |row| row.text(0),
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+async fn load_pending_prompt(db: &LocalDb, run_id: String) -> Result<Option<Prompt>, CairnError> {
+    db.query_opt(
+        format!(
+            "SELECT {PROMPT_COLUMNS}
+             FROM prompts
+             WHERE run_id = ?1
+               AND response IS NULL
+             ORDER BY created_at DESC
+             LIMIT 1"
+        ),
+        params![run_id.as_str()],
+        prompt_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+async fn load_pending_prompt_for_job(
+    db: &LocalDb,
+    job_id: String,
+) -> Result<Option<Prompt>, CairnError> {
+    let Some(turn_id) = db
+        .query_opt(
+            "SELECT current_turn_id
+             FROM jobs
+             WHERE id = ?1",
+            params![job_id.as_str()],
+            |row| row.opt_text(0),
+        )
+        .await
+        .map_err(CairnError::from)?
+        .flatten()
+    else {
+        return Ok(None);
+    };
+
+    db.query_opt(
+        format!(
+            "SELECT {PROMPT_COLUMNS}
+             FROM prompts
+             WHERE turn_id = ?1
+               AND response IS NULL
+             ORDER BY created_at DESC
+             LIMIT 1"
+        ),
+        params![turn_id.as_str()],
+        prompt_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+async fn reconcile_stale_runs_db(db: Arc<LocalDb>) -> Result<ReconcileResult, CairnError> {
+    db.write(|conn| {
+        Box::pin(async move {
+            let now = chrono::Utc::now().timestamp();
+
+            let mut stale_rows = conn
+                .query(
+                    "SELECT id
+                     FROM runs
+                     WHERE status IN ('starting', 'live')",
+                    (),
+                )
+                .await?;
+            let mut stale_runs = Vec::new();
+            while let Some(row) = stale_rows.next().await? {
+                stale_runs.push(row.text(0)?);
+            }
+
+            let mut turn_count = 0usize;
+            for run_id in &stale_runs {
+                conn.execute(
+                    "UPDATE runs
+                     SET status = 'crashed',
+                         exit_reason = 'crash',
+                         exited_at = ?1,
+                         updated_at = ?2
+                     WHERE id = ?3",
+                    params![now, now, run_id.as_str()],
+                )
+                .await?;
+
+                let mut turn_rows = conn
+                    .query(
+                        "SELECT id, state
+                         FROM turns
+                         WHERE run_id = ?1
+                           AND state IN ('running', 'pending')",
+                        params![run_id.as_str()],
+                    )
+                    .await?;
+                let mut orphaned_turns = Vec::new();
+                while let Some(row) = turn_rows.next().await? {
+                    orphaned_turns.push((row.text(0)?, row.text(1)?));
+                }
+
+                for (turn_id, turn_state) in orphaned_turns {
+                    let target_state = match turn_state.as_str() {
+                        "running" => "interrupted",
+                        "pending" => "failed",
+                        _ => continue,
+                    };
+                    conn.execute(
+                        "UPDATE turns
+                         SET state = ?1,
+                             ended_at = ?2,
+                             updated_at = ?3
+                         WHERE id = ?4",
+                        params![target_state, now, now, turn_id.as_str()],
+                    )
+                    .await?;
+                    turn_count += 1;
+                }
+            }
+
+            Ok(ReconcileResult {
+                stale_run_count: stale_runs.len(),
+                turn_count,
+            })
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+fn run_from_row(row: &Row) -> DbResult<Run> {
+    Ok(Run {
+        id: row.text(0)?,
+        issue_id: row.opt_text(1)?,
+        project_id: row.opt_text(2)?,
+        job_id: row.opt_text(3)?,
+        status: row
+            .opt_text(4)?
+            .and_then(|status| status.parse().ok())
+            .unwrap_or(RunStatus::Starting),
+        session_id: row.opt_text(5)?,
+        chat_id: row.opt_text(11)?,
+        backend: row.opt_text(12)?,
+        exit_reason: row.opt_text(13)?,
+        error_message: row.opt_text(6)?,
+        started_at: row.opt_i64(7)?,
+        exited_at: row.opt_i64(8)?,
+        created_at: row.i64(9)?,
+        updated_at: row.i64(10)?,
+        start_mode: row.opt_text(14)?.and_then(|mode| mode.parse().ok()),
+    })
+}
+
+pub(crate) fn event_from_row(row: &Row) -> DbResult<Event> {
+    Ok(Event {
+        id: row.text(0)?,
+        run_id: row.text(1)?,
+        session_id: row.opt_text(2)?,
+        sequence: row.i64(3)? as i32,
+        timestamp: row.i64(4)?,
+        event_type: row.text(5)?,
+        data: row.text(6)?,
+        parent_tool_use_id: row.opt_text(7)?,
+        created_at: row.i64(8)?,
+        input_tokens: row.opt_i64(9)?.map(|value| value as i32),
+        cache_read_tokens: row.opt_i64(10)?.map(|value| value as i32),
+        cache_create_tokens: row.opt_i64(11)?.map(|value| value as i32),
+        output_tokens: row.opt_i64(12)?.map(|value| value as i32),
+        turn_id: row.opt_text(13)?,
+        thinking_tokens: row.opt_i64(14)?.map(|value| value as i32),
+        storage_mode: row.opt_text(15)?,
+        content_commit: row.opt_text(16)?,
+        content_render_sha: row.opt_text(17)?,
+        data_blob: row.opt_blob(18)?,
+        codec: row.opt_text(19)?,
+        read_segments: None,
+    })
+}
+
+fn prompt_from_row(row: &Row) -> DbResult<Prompt> {
+    Ok(Prompt {
+        id: row.text(0)?,
+        run_id: row.text(1)?,
+        questions: row.text(2)?,
+        response: row.opt_text(3)?,
+        created_at: row.i64(4)?,
+        answered_at: row.opt_i64(5)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diesel_models::{NewMessageStream, NewMessageStreamChunk, NewRun, NewTurn};
-    use crate::schema::{message_stream_chunks, message_streams, turns};
-    use crate::services::testing::CapturingEmitter;
-    use crate::test_utils::test_diesel_conn;
+    use crate::agent_process::stream::ToolUseInfo;
+    use serde_json::json;
 
-    fn insert_run(conn: &mut SqliteConnection, id: &str, status: &str) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_run = NewRun {
-            id,
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some(status),
-            session_id: None,
-            error_message: None,
-            started_at: None,
-            exited_at: None,
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: None,
-        };
-        diesel::insert_into(runs::table)
-            .values(&new_run)
-            .execute(conn)
-            .unwrap();
+    async fn seed_run(db: &LocalDb, session_id: &str) {
+        db.write(|conn| {
+            let session_id = session_id.to_string();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO runs(id, status, session_id, created_at, updated_at)
+                     VALUES ('run-1', 'live', ?1, 1, 1)",
+                    params![session_id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 
-    fn insert_run_with_fields(
-        conn: &mut SqliteConnection,
-        id: &str,
-        status: &str,
-        backend: Option<&str>,
-        exit_reason: Option<&str>,
-    ) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_run = NewRun {
-            id,
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some(status),
-            session_id: None,
-            error_message: None,
-            started_at: Some(now),
-            exited_at: if status == "exited" || status == "crashed" {
-                Some(now)
-            } else {
-                None
-            },
-            created_at: now,
-            updated_at: now,
-            backend,
-            exit_reason,
-            start_mode: None,
-        };
-        diesel::insert_into(runs::table)
-            .values(&new_run)
-            .execute(conn)
-            .unwrap();
-    }
-
-    // ========================================================================
-    // db_run_to_run tests
-    // ========================================================================
-
-    #[test]
-    fn test_db_run_to_run_maps_new_fields() {
-        let mut conn = test_diesel_conn();
-        insert_run_with_fields(
-            &mut conn,
-            "run-1",
-            "exited",
-            Some("codex"),
-            Some("user_stop"),
-        );
-
-        let db_run: crate::diesel_models::DbRun =
-            runs::table.find("run-1").first(&mut conn).unwrap();
-        let run = db_run_to_run(db_run);
-
-        assert_eq!(run.status, RunStatus::Exited);
-        assert_eq!(run.backend.as_deref(), Some("codex"));
-        assert_eq!(run.exit_reason.as_deref(), Some("user_stop"));
-        assert!(run.exited_at.is_some());
-    }
-
-    #[test]
-    fn test_db_run_to_run_defaults_to_starting_when_status_none() {
-        let mut conn = test_diesel_conn();
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_run = NewRun {
-            id: "run-null",
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: None,
-            session_id: None,
-            error_message: None,
-            started_at: None,
-            exited_at: None,
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: None,
-        };
-        diesel::insert_into(runs::table)
-            .values(&new_run)
-            .execute(&mut conn)
-            .unwrap();
-
-        let db_run: crate::diesel_models::DbRun =
-            runs::table.find("run-null").first(&mut conn).unwrap();
-        let run = db_run_to_run(db_run);
-
-        assert_eq!(run.status, RunStatus::Starting);
-    }
-
-    #[test]
-    fn test_db_run_to_run_parses_legacy_status() {
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-legacy", "running");
-
-        let db_run: crate::diesel_models::DbRun =
-            runs::table.find("run-legacy").first(&mut conn).unwrap();
-        let run = db_run_to_run(db_run);
-
-        assert_eq!(run.status, RunStatus::Live);
-    }
-
-    // ========================================================================
-    // reconcile_stale_runs tests
-    // ========================================================================
-
-    #[test]
-    fn test_reconcile_marks_starting_as_crashed() {
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-1", "starting");
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        let status: String = runs::table
-            .find("run-1")
-            .select(runs::status.assume_not_null())
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(status, "crashed");
-
-        let reason: Option<String> = runs::table
-            .find("run-1")
-            .select(runs::exit_reason)
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(reason.as_deref(), Some("crash"));
-
-        let exited_at: Option<i32> = runs::table
-            .find("run-1")
-            .select(runs::exited_at)
-            .first(&mut conn)
-            .unwrap();
-        assert!(exited_at.is_some());
-    }
-
-    #[test]
-    fn test_reconcile_marks_live_as_crashed() {
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-1", "live");
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        let status: String = runs::table
-            .find("run-1")
-            .select(runs::status.assume_not_null())
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(status, "crashed");
-    }
-
-    #[test]
-    fn test_reconcile_leaves_terminal_runs_alone() {
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-exited", "exited");
-        insert_run(&mut conn, "run-crashed", "crashed");
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        let exited_status: String = runs::table
-            .find("run-exited")
-            .select(runs::status.assume_not_null())
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(exited_status, "exited");
-
-        let crashed_status: String = runs::table
-            .find("run-crashed")
-            .select(runs::status.assume_not_null())
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(crashed_status, "crashed");
-    }
-
-    #[test]
-    fn test_reconcile_no_stale_runs_is_noop() {
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-1", "exited");
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        // Should not emit db-change when nothing to reconcile
-        let db_changes = emitter.events_named("db-change");
-        assert!(db_changes.is_empty());
-    }
-
-    #[test]
-    fn test_reconcile_emits_db_change() {
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-1", "live");
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        let db_changes = emitter.events_named("db-change");
-        assert!(
-            !db_changes.is_empty(),
-            "should emit db-change for reconciled runs"
-        );
-    }
-
-    #[test]
-    fn test_reconcile_interrupts_orphaned_turns() {
-        use crate::diesel_models::NewTurn;
-        use crate::schema::turns;
-
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-1", "live");
-
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_turn = NewTurn {
-            id: "turn-1",
-            session_id: "session-1",
-            run_id: Some("run-1"),
-            job_id: None,
-            manager_id: None,
-            sequence: 1,
-            predecessor_id: None,
-            state: "running",
-            yield_reason: None,
-            start_reason: "user",
-            created_at: now,
-            started_at: Some(now),
-            ended_at: None,
-            updated_at: now,
-        };
-        diesel::insert_into(turns::table)
-            .values(&new_turn)
-            .execute(&mut conn)
-            .unwrap();
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        let turn_state: String = turns::table
-            .find("turn-1")
-            .select(turns::state)
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(turn_state, "interrupted");
-    }
-
-    #[test]
-    fn test_reconcile_fails_pending_orphaned_turns() {
-        use crate::diesel_models::NewTurn;
-        use crate::schema::turns;
-
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-1", "live");
-
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_turn = NewTurn {
-            id: "turn-1",
-            session_id: "session-1",
-            run_id: Some("run-1"),
-            job_id: None,
-            manager_id: None,
-            sequence: 1,
-            predecessor_id: None,
-            state: "pending",
-            yield_reason: None,
-            start_reason: "initial",
-            created_at: now,
-            started_at: None,
-            ended_at: None,
-            updated_at: now,
-        };
-        diesel::insert_into(turns::table)
-            .values(&new_turn)
-            .execute(&mut conn)
-            .unwrap();
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        let turn_state: String = turns::table
-            .find("turn-1")
-            .select(turns::state)
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(turn_state, "failed");
-    }
-
-    #[test]
-    fn test_reconcile_multiple_stale_runs() {
-        let mut conn = test_diesel_conn();
-        insert_run(&mut conn, "run-1", "starting");
-        insert_run(&mut conn, "run-2", "live");
-        insert_run(&mut conn, "run-3", "exited"); // should not be touched
-
-        let emitter = CapturingEmitter::new();
-        reconcile_stale_runs(&mut conn, &emitter);
-
-        for run_id in &["run-1", "run-2"] {
-            let status: String = runs::table
-                .find(run_id)
-                .select(runs::status.assume_not_null())
-                .first(&mut conn)
-                .unwrap();
-            assert_eq!(status, "crashed", "run {} should be crashed", run_id);
-        }
-
-        let status_3: String = runs::table
-            .find("run-3")
-            .select(runs::status.assume_not_null())
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(status_3, "exited", "run-3 should remain exited");
-    }
-
-    #[test]
-    fn test_db_run_to_run_maps_start_mode() {
-        use crate::diesel_models::DbRun;
-        use crate::models::RunStartMode;
-
-        let now = chrono::Utc::now().timestamp() as i32;
-
-        // start_mode = "fresh"
-        let db_run = DbRun {
-            id: "run-1".to_string(),
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some("live".to_string()),
-            session_id: Some("sess-1".to_string()),
-            error_message: None,
-            started_at: Some(now),
-            exited_at: None,
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: Some("fresh".to_string()),
-        };
-        let run = super::db_run_to_run(db_run);
-        assert_eq!(run.start_mode, Some(RunStartMode::Fresh));
-
-        // start_mode = "resume"
-        let db_run_resume = DbRun {
-            id: "run-2".to_string(),
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some("live".to_string()),
-            session_id: None,
-            error_message: None,
-            started_at: Some(now),
-            exited_at: None,
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: Some("resume".to_string()),
-        };
-        let run = super::db_run_to_run(db_run_resume);
-        assert_eq!(run.start_mode, Some(RunStartMode::Resume));
-
-        let db_run_fork = DbRun {
-            id: "run-5".to_string(),
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some("live".to_string()),
-            session_id: None,
-            error_message: None,
-            started_at: Some(now),
-            exited_at: None,
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: Some("fork".to_string()),
-        };
-        let run = super::db_run_to_run(db_run_fork);
-        assert_eq!(run.start_mode, Some(RunStartMode::Fork));
-
-        // start_mode = None (legacy run)
-        let db_run_none = DbRun {
-            id: "run-3".to_string(),
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some("exited".to_string()),
-            session_id: None,
-            error_message: None,
-            started_at: Some(now),
-            exited_at: Some(now + 10),
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: None,
-        };
-        let run = super::db_run_to_run(db_run_none);
-        assert_eq!(run.start_mode, None);
-
-        // start_mode = unknown string (silently ignored)
-        let db_run_unknown = DbRun {
-            id: "run-4".to_string(),
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some("live".to_string()),
-            session_id: None,
-            error_message: None,
-            started_at: Some(now),
-            exited_at: None,
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: Some("warm".to_string()),
-        };
-        let run = super::db_run_to_run(db_run_unknown);
-        assert_eq!(run.start_mode, None); // unknown parses to None via .ok()
-    }
-
-    // ========================================================================
-    // list_events_for_turn tests
-    // ========================================================================
-
-    fn insert_turn(conn: &mut SqliteConnection, id: &str, session_id: &str, sequence: i32) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_turn = NewTurn {
-            id,
-            session_id,
-            run_id: None,
-            job_id: None,
-            manager_id: None,
-            sequence,
-            predecessor_id: None,
-            state: "complete",
-            yield_reason: None,
-            start_reason: "initial",
-            created_at: now,
-            started_at: Some(now),
-            ended_at: Some(now),
-            updated_at: now,
-        };
-        diesel::insert_into(turns::table)
-            .values(&new_turn)
-            .execute(conn)
-            .unwrap();
-    }
-
-    fn insert_event(
-        conn: &mut SqliteConnection,
-        id: &str,
-        run_id: &str,
-        session_id: Option<&str>,
-        sequence: i32,
-        event_type: &str,
-        turn_id: Option<&str>,
-    ) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_event = crate::diesel_models::NewEvent {
-            id,
-            run_id,
-            session_id,
-            sequence,
-            timestamp: now,
-            event_type,
-            data: "{}",
-            parent_tool_use_id: None,
-            created_at: now,
-            input_tokens: None,
-            cache_read_tokens: None,
-            cache_create_tokens: None,
-            output_tokens: None,
-            turn_id,
-        };
-        diesel::insert_into(events::table)
-            .values(&new_event)
-            .execute(conn)
-            .unwrap();
-    }
-
-    fn insert_run_for_session(
-        conn: &mut SqliteConnection,
+    async fn insert_event(
+        db: &LocalDb,
         id: &str,
         session_id: &str,
-        created_at: i32,
-    ) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_run = NewRun {
-            id,
-            issue_id: None,
-            project_id: None,
-            job_id: None,
-            chat_id: None,
-            status: Some("exited"),
-            session_id: Some(session_id),
-            error_message: None,
-            started_at: None,
-            exited_at: None,
-            created_at,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: None,
-        };
-        diesel::insert_into(runs::table)
-            .values(&new_run)
-            .execute(conn)
-            .unwrap();
-    }
-
-    fn insert_active_stream_at(
-        conn: &mut SqliteConnection,
-        id: &str,
-        run_id: &str,
-        session_id: Option<&str>,
-        turn_id: Option<&str>,
         sequence: i32,
-        created_at: i32,
-        content: &str,
+        parent_tool_use_id: Option<&str>,
+        event: StoredTranscriptEvent,
     ) {
-        diesel::insert_into(message_streams::table)
-            .values(&NewMessageStream {
-                id,
-                run_id,
-                session_id,
-                turn_id,
-                backend: "claude",
-                sequence,
-                status: "open",
-                version: 1,
-                content_chars: content.chars().count() as i32,
-                thinking_chars: 0,
-                chunk_count: 1,
-                final_event_id: None,
-                abort_reason: None,
-                created_at,
-                updated_at: created_at,
-                finalized_at: None,
+        let data = serde_json::to_string(&event).unwrap();
+        let event_type = event.event_type.clone();
+        db.write(|conn| {
+            let id = id.to_string();
+            let session_id = session_id.to_string();
+            let parent_tool_use_id = parent_tool_use_id.map(ToString::to_string);
+            let data = data.clone();
+            let event_type = event_type.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO events(
+                        id, run_id, session_id, sequence, timestamp, event_type, data,
+                        parent_tool_use_id, created_at, thinking_tokens
+                     ) VALUES (?1, 'run-1', ?2, ?3, ?3, ?4, ?5, ?6, ?3, NULL)",
+                    params![
+                        id.as_str(),
+                        session_id.as_str(),
+                        i64::from(sequence),
+                        event_type.as_str(),
+                        data.as_str(),
+                        parent_tool_use_id.as_deref()
+                    ],
+                )
+                .await?;
+                Ok(())
             })
-            .execute(conn)
-            .unwrap();
-
-        diesel::insert_into(message_stream_chunks::table)
-            .values(&NewMessageStreamChunk {
-                id: &format!("{id}-chunk"),
-                stream_id: id,
-                kind: "content",
-                chunk_index: 0,
-                data: content,
-                char_count: content.chars().count() as i32,
-                created_at,
-            })
-            .execute(conn)
-            .unwrap();
+        })
+        .await
+        .unwrap();
     }
 
-    #[test]
-    fn test_list_events_for_turn() {
-        let mut conn = test_diesel_conn();
-
-        insert_run(&mut conn, "run-1", "exited");
-        insert_turn(&mut conn, "turn-a", "sess-1", 1);
-        insert_turn(&mut conn, "turn-b", "sess-1", 2);
-        insert_event(
-            &mut conn,
-            "e1",
-            "run-1",
-            None,
-            1,
-            "assistant",
-            Some("turn-a"),
-        );
-        insert_event(&mut conn, "e2", "run-1", None, 2, "tool", Some("turn-a"));
-        insert_event(
-            &mut conn,
-            "e3",
-            "run-1",
-            None,
-            3,
-            "assistant",
-            Some("turn-b"),
-        );
-        insert_event(&mut conn, "e4", "run-1", None, 4, "tool", None); // no turn
-
-        let events = list_events_for_turn(&mut conn, "turn-a").unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].id, "e1");
-        assert_eq!(events[1].id, "e2");
-
-        let events = list_events_for_turn(&mut conn, "turn-b").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].id, "e3");
-
-        // Nonexistent turn returns empty
-        let events = list_events_for_turn(&mut conn, "turn-nope").unwrap();
-        assert!(events.is_empty());
-    }
-
-    // ========================================================================
-    // list_events_for_session stable ordering tests
-    // ========================================================================
-
-    #[test]
-    fn test_list_events_for_session_orders_by_run_position() {
-        let mut conn = test_diesel_conn();
-        let session = "session-1";
-
-        // Create runs with same created_at (simulating same-second events)
-        // but insert in alphabetical order that differs from temporal order.
-        // run-b was created first, run-a second.
-        let same_time = chrono::Utc::now().timestamp() as i32;
-        insert_run_for_session(&mut conn, "run-b", session, same_time);
-        insert_run_for_session(&mut conn, "run-a", session, same_time + 1);
-
-        // Events in run-b (first run)
-        insert_event(&mut conn, "e1", "run-b", Some(session), 1, "user", None);
-        insert_event(
-            &mut conn,
-            "e2",
-            "run-b",
-            Some(session),
-            2,
-            "assistant",
-            None,
-        );
-
-        // Events in run-a (second run)
-        insert_event(&mut conn, "e3", "run-a", Some(session), 1, "user", None);
-        insert_event(
-            &mut conn,
-            "e4",
-            "run-a",
-            Some(session),
-            2,
-            "assistant",
-            None,
-        );
-
-        let events = list_events_for_session(&mut conn, session).unwrap();
-        assert_eq!(events.len(), 4);
-
-        // Should be ordered by run creation time, not alphabetical run_id
-        // run-b (created first) events come before run-a events
-        assert_eq!(events[0].id, "e1"); // run-b, seq 1
-        assert_eq!(events[1].id, "e2"); // run-b, seq 2
-        assert_eq!(events[2].id, "e3"); // run-a, seq 1
-        assert_eq!(events[3].id, "e4"); // run-a, seq 2
-    }
-
-    /// Insert an event with explicit created_at for testing same-second scenarios.
-    fn insert_event_at(
-        conn: &mut SqliteConnection,
-        id: &str,
-        run_id: &str,
-        session_id: Option<&str>,
-        sequence: i32,
-        event_type: &str,
-        turn_id: Option<&str>,
-        created_at: i32,
-    ) {
-        let new_event = crate::diesel_models::NewEvent {
-            id,
-            run_id,
-            session_id,
-            sequence,
-            timestamp: created_at,
-            event_type,
-            data: "{}",
+    fn assistant_event(
+        content: Option<&str>,
+        thinking: Option<&str>,
+        tool_uses: Option<Vec<ToolUseInfo>>,
+    ) -> StoredTranscriptEvent {
+        StoredTranscriptEvent {
+            event_type: "assistant".to_string(),
+            session_id: Some("sess-1".to_string()),
             parent_tool_use_id: None,
-            created_at,
-            input_tokens: None,
-            cache_read_tokens: None,
-            cache_create_tokens: None,
-            output_tokens: None,
-            turn_id,
-        };
-        diesel::insert_into(events::table)
-            .values(&new_event)
-            .execute(conn)
+            content: content.map(ToString::to_string),
+            thinking: thinking.map(ToString::to_string),
+            tool_name: None,
+            tool_input: None,
+            tool_uses,
+            tool_use_id: None,
+            tool_result: None,
+            is_error: false,
+            thinking_ms: None,
+            raw: None,
+        }
+    }
+
+    fn tool_result(tool_use_id: &str) -> StoredTranscriptEvent {
+        StoredTranscriptEvent {
+            event_type: "tool_result".to_string(),
+            session_id: Some("sess-1".to_string()),
+            parent_tool_use_id: None,
+            content: None,
+            thinking: None,
+            tool_name: None,
+            tool_input: None,
+            tool_uses: None,
+            tool_use_id: Some(tool_use_id.to_string()),
+            tool_result: Some("done".to_string()),
+            is_error: false,
+            thinking_ms: None,
+            raw: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn last_event_for_session_returns_pending_tool() {
+        let db = crate::storage::migrated_test_db("last-event-pending-tool.db").await;
+        seed_run(&db, "sess-1").await;
+        insert_event(
+            &db,
+            "event-1",
+            "sess-1",
+            1,
+            None,
+            assistant_event(
+                None,
+                None,
+                Some(vec![ToolUseInfo {
+                    id: "tool-1".to_string(),
+                    name: "mcp__cairn__read".to_string(),
+                    input: json!({"paths": ["file:src/lib.rs"]}),
+                }]),
+            ),
+        )
+        .await;
+
+        let digest = load_last_event_for_session(&db, "sess-1")
+            .await
+            .unwrap()
+            .expect("digest");
+        assert_eq!(digest.kind, "tool");
+        assert_eq!(digest.content, "read");
+        assert_eq!(digest.tool_name.as_deref(), Some("mcp__cairn__read"));
+        assert!(digest.is_pending);
+    }
+
+    #[tokio::test]
+    async fn last_event_for_session_prefers_message_after_completed_tool() {
+        let db = crate::storage::migrated_test_db("last-event-message.db").await;
+        seed_run(&db, "sess-1").await;
+        insert_event(
+            &db,
+            "event-1",
+            "sess-1",
+            1,
+            None,
+            assistant_event(
+                None,
+                None,
+                Some(vec![ToolUseInfo {
+                    id: "tool-1".to_string(),
+                    name: "read".to_string(),
+                    input: json!({}),
+                }]),
+            ),
+        )
+        .await;
+        insert_event(&db, "event-2", "sess-1", 2, None, tool_result("tool-1")).await;
+        insert_event(
+            &db,
+            "event-3",
+            "sess-1",
+            3,
+            None,
+            assistant_event(Some("all done"), None, None),
+        )
+        .await;
+
+        let digest = load_last_event_for_session(&db, "sess-1")
+            .await
+            .unwrap()
+            .expect("digest");
+        assert_eq!(digest.kind, "message");
+        assert_eq!(digest.content, "all done");
+        assert!(!digest.is_pending);
+    }
+
+    #[tokio::test]
+    async fn last_event_for_session_handles_empty_and_parent_tagged_task_events() {
+        let db = crate::storage::migrated_test_db("last-event-empty.db").await;
+        seed_run(&db, "sess-1").await;
+        assert!(load_last_event_for_session(&db, "sess-1")
+            .await
+            .unwrap()
+            .is_none());
+
+        insert_event(
+            &db,
+            "event-1",
+            "sess-1",
+            1,
+            Some("parent-tool"),
+            assistant_event(Some("child task work"), None, None),
+        )
+        .await;
+        let digest = load_last_event_for_session(&db, "sess-1")
+            .await
+            .unwrap()
+            .expect("parent-tagged task event should count within its own session");
+        assert_eq!(digest.kind, "message");
+        assert_eq!(digest.content, "child task work");
+    }
+
+    /// Rewrite an event to the zstd archival shape the teardown writer produces:
+    /// a valid-but-empty stub in `data`, the compressed original in `data_blob`.
+    async fn archive_event_zstd(db: &LocalDb, id: &str, original: &str) {
+        let blob = crate::archival::compress(original.as_bytes()).unwrap();
+        let id = id.to_string();
+        db.write(move |conn| {
+            let id = id.clone();
+            let blob = blob.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE events SET storage_mode = 'zstd',
+                         data = '{\"eventType\":\"assistant\",\"archived\":\"zstd\"}',
+                         data_blob = ?1, codec = 'zstd_v1'
+                     WHERE id = ?2",
+                    params![blob, id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Initial load (no cursor): archived assistant events must come back with
+    /// their original `data` reconstructed, not the empty zstd stub. The stub
+    /// parses as valid JSON, so the chat UI silently renders it as an empty
+    /// (invisible) assistant turn — exactly the "assistant events vanished"
+    /// symptom — when reconstruction is skipped.
+    #[tokio::test]
+    async fn session_delta_initial_reconstructs_archived_events() {
+        let db = crate::storage::migrated_test_db("session-delta-archived.db").await;
+        seed_run(&db, "sess-1").await;
+        let original =
+            serde_json::to_string(&assistant_event(Some("hello world"), None, None)).unwrap();
+        insert_event(
+            &db,
+            "event-1",
+            "sess-1",
+            1,
+            None,
+            assistant_event(Some("hello world"), None, None),
+        )
+        .await;
+        archive_event_zstd(&db, "event-1", &original).await;
+
+        let (events, _) = load_session_events_delta(&db, "sess-1".to_string(), None)
+            .await
             .unwrap();
-    }
-
-    #[test]
-    fn test_list_events_for_session_cold_resume_same_second() {
-        let mut conn = test_diesel_conn();
-        let session = "session-cr";
-        let t = 1700000000;
-
-        // Single resumed run — user event and backend events share the same second
-        insert_run_for_session(&mut conn, "run-resumed", session, t);
-        insert_turn(&mut conn, "turn-cr", session, 1);
-
-        // User event inserted first with high global sequence (simulating max_session_seq + 1)
-        insert_event_at(
-            &mut conn,
-            "user-ev",
-            "run-resumed",
-            Some(session),
-            50,
-            "user",
-            Some("turn-cr"),
-            t,
-        );
-        // Backend events inserted after with process-local seq starting at 0, same second
-        insert_event_at(
-            &mut conn,
-            "asst-0",
-            "run-resumed",
-            Some(session),
-            0,
-            "assistant",
-            Some("turn-cr"),
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-1",
-            "run-resumed",
-            Some(session),
-            1,
-            "tool",
-            Some("turn-cr"),
-            t,
-        );
-
-        // Session query: user event must come first despite lower sequence
-        let events = list_events_for_session(&mut conn, session).unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(
-            events[0].id, "user-ev",
-            "user event must precede backend events"
-        );
-        assert_eq!(events[1].id, "asst-0");
-        assert_eq!(events[2].id, "asst-1");
-
-        // Turn query: same correctness requirement
-        let turn_events = list_events_for_turn(&mut conn, "turn-cr").unwrap();
-        assert_eq!(turn_events.len(), 3);
-        assert_eq!(
-            turn_events[0].id, "user-ev",
-            "user event must precede backend events in turn"
-        );
-        assert_eq!(turn_events[1].id, "asst-0");
-        assert_eq!(turn_events[2].id, "asst-1");
-    }
-
-    #[test]
-    fn test_list_events_for_session_active_stream_preserves_cold_resume_order() {
-        let mut conn = test_diesel_conn();
-        let session = "session-cr-stream";
-        let t = 1700000000;
-
-        insert_run_for_session(&mut conn, "run-resumed", session, t);
-        insert_turn(&mut conn, "turn-cr", session, 1);
-        insert_event_at(
-            &mut conn,
-            "user-ev",
-            "run-resumed",
-            Some(session),
-            50,
-            "user",
-            Some("turn-cr"),
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-0",
-            "run-resumed",
-            Some(session),
-            0,
-            "assistant",
-            Some("turn-cr"),
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-1",
-            "run-resumed",
-            Some(session),
-            1,
-            "tool",
-            Some("turn-cr"),
-            t,
-        );
-        insert_active_stream_at(
-            &mut conn,
-            "stream-1",
-            "run-resumed",
-            Some(session),
-            Some("turn-cr"),
-            2,
-            t,
-            "partial",
-        );
-
-        let events = list_events_for_session(&mut conn, session).unwrap();
-        assert_eq!(
-            events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-            vec!["user-ev", "asst-0", "asst-1", "stream-1"]
-        );
-    }
-
-    #[test]
-    fn test_list_events_for_turn_active_stream_preserves_cold_resume_order() {
-        let mut conn = test_diesel_conn();
-        let session = "session-turn-stream";
-        let t = 1700000000;
-
-        insert_run_for_session(&mut conn, "run-resumed", session, t);
-        insert_turn(&mut conn, "turn-cr", session, 1);
-        insert_event_at(
-            &mut conn,
-            "user-ev",
-            "run-resumed",
-            Some(session),
-            50,
-            "user",
-            Some("turn-cr"),
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-0",
-            "run-resumed",
-            Some(session),
-            0,
-            "assistant",
-            Some("turn-cr"),
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-1",
-            "run-resumed",
-            Some(session),
-            1,
-            "tool",
-            Some("turn-cr"),
-            t,
-        );
-        insert_active_stream_at(
-            &mut conn,
-            "stream-1",
-            "run-resumed",
-            Some(session),
-            Some("turn-cr"),
-            2,
-            t,
-            "partial",
-        );
-
-        let events = list_events_for_turn(&mut conn, "turn-cr").unwrap();
-        assert_eq!(
-            events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
-            vec!["user-ev", "asst-0", "asst-1", "stream-1"]
-        );
-    }
-
-    #[test]
-    fn test_list_events_paginated_active_stream_preserves_existing_order() {
-        let mut conn = test_diesel_conn();
-        let session = "session-page-stream";
-        let t = 1700000000;
-
-        insert_run_for_session(&mut conn, "run-resumed", session, t);
-        insert_turn(&mut conn, "turn-cr", session, 1);
-        insert_event_at(
-            &mut conn,
-            "user-ev",
-            "run-resumed",
-            Some(session),
-            50,
-            "user",
-            Some("turn-cr"),
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-0",
-            "run-resumed",
-            Some(session),
-            0,
-            "assistant",
-            Some("turn-cr"),
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-1",
-            "run-resumed",
-            Some(session),
-            1,
-            "tool",
-            Some("turn-cr"),
-            t,
-        );
-
-        let baseline = list_events_paginated(&mut conn, session, 10, None).unwrap();
-        let baseline_ids: Vec<String> = baseline
-            .events
-            .iter()
-            .map(|event| event.id.clone())
-            .collect();
-
-        insert_active_stream_at(
-            &mut conn,
-            "stream-1",
-            "run-resumed",
-            Some(session),
-            Some("turn-cr"),
-            2,
-            t,
-            "partial",
-        );
-
-        let paginated = list_events_paginated(&mut conn, session, 10, None).unwrap();
-        let ids: Vec<String> = paginated
-            .events
-            .iter()
-            .map(|event| event.id.clone())
-            .collect();
-        assert_eq!(&ids[..baseline_ids.len()], baseline_ids.as_slice());
-        assert_eq!(ids.last().map(String::as_str), Some("stream-1"));
-    }
-
-    #[test]
-    fn test_list_events_for_run_paginated_active_stream_preserves_existing_order() {
-        let mut conn = test_diesel_conn();
-        let run_id = "run-paged";
-        let t = 1700000000;
-
-        insert_run(&mut conn, run_id, "exited");
-        insert_event_at(
-            &mut conn,
-            "user-ev",
-            run_id,
-            Some("session-1"),
-            50,
-            "user",
-            None,
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-0",
-            run_id,
-            Some("session-1"),
-            0,
-            "assistant",
-            None,
-            t,
-        );
-        insert_event_at(
-            &mut conn,
-            "asst-1",
-            run_id,
-            Some("session-1"),
-            1,
-            "tool",
-            None,
-            t,
-        );
-
-        let baseline = list_events_for_run_paginated(&mut conn, run_id, 10, None).unwrap();
-        let baseline_ids: Vec<String> = baseline
-            .events
-            .iter()
-            .map(|event| event.id.clone())
-            .collect();
-
-        insert_active_stream_at(
-            &mut conn,
-            "stream-1",
-            run_id,
-            Some("session-1"),
-            None,
-            2,
-            t,
-            "partial",
-        );
-
-        let paginated = list_events_for_run_paginated(&mut conn, run_id, 10, None).unwrap();
-        let ids: Vec<String> = paginated
-            .events
-            .iter()
-            .map(|event| event.id.clone())
-            .collect();
-        assert_eq!(&ids[..baseline_ids.len()], baseline_ids.as_slice());
-        assert_eq!(ids.last().map(String::as_str), Some("stream-1"));
-    }
-
-    #[test]
-    fn test_list_events_for_turn_populates_turn_id() {
-        let mut conn = test_diesel_conn();
-
-        insert_run(&mut conn, "run-1", "exited");
-        insert_turn(&mut conn, "turn-x", "sess-1", 1);
-        insert_event(
-            &mut conn,
-            "e1",
-            "run-1",
-            None,
-            1,
-            "assistant",
-            Some("turn-x"),
-        );
-
-        let events = list_events_for_turn(&mut conn, "turn-x").unwrap();
+        let events = crate::archival::reconstruct_events(&db, events).await;
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].turn_id.as_deref(), Some("turn-x"));
+        assert_eq!(
+            events[0].data, original,
+            "archived event must reconstruct to its original data, got the stub"
+        );
+        assert!(events[0].data.contains("hello world"));
     }
 
-    #[test]
-    fn test_list_events_for_session_orphan_events_sort_last() {
-        let mut conn = test_diesel_conn();
-        let session = "session-orphan";
-
-        // Create one known run
-        let now = chrono::Utc::now().timestamp() as i32;
-        insert_run_for_session(&mut conn, "run-known", session, now);
-
-        // Insert an "orphan" run that shares the session but has no runs table entry
-        // (simulated by inserting events with a run_id that doesn't exist in runs)
-        // We need a real run for the orphan events to reference, but we won't
-        // include it in the session's runs query. Actually, the events just need
-        // a run_id — there's no FK constraint enforced in SQLite by default.
-        // But the function filters events by session_id, not by run_id.
-        // So events with session_id=session but run_id not in the session's runs
-        // should sort to the end (usize::MAX).
-
-        // Events with known run
-        insert_event(&mut conn, "e1", "run-known", Some(session), 1, "user", None);
+    /// Follow-up delta (cursor set): the loader appends `rowid` to EVENT_COLUMNS
+    /// and must read it at the correct trailing index. The archival columns
+    /// pushed the real index out, so a stale index read a TEXT column as i64 and
+    /// failed the whole delta query — freezing the transcript at its last
+    /// successful load.
+    #[tokio::test]
+    async fn session_delta_followup_succeeds_with_archival_columns() {
+        let db = crate::storage::migrated_test_db("session-delta-followup.db").await;
+        seed_run(&db, "sess-1").await;
         insert_event(
-            &mut conn,
-            "e2",
-            "run-known",
-            Some(session),
-            2,
-            "assistant",
-            None,
-        );
-
-        // Events with unknown run_id (orphan — run exists but not for this session)
-        insert_run_for_session(&mut conn, "run-orphan", "other-session", now);
-        insert_event(
-            &mut conn,
-            "e3",
-            "run-orphan",
-            Some(session),
+            &db,
+            "event-1",
+            "sess-1",
             1,
-            "user",
             None,
+            assistant_event(Some("first"), None, None),
+        )
+        .await;
+        let (_initial, cursor) = load_session_events_delta(&db, "sess-1".to_string(), None)
+            .await
+            .unwrap();
+        let cursor = cursor.expect("initial load yields a cursor");
+
+        insert_event(
+            &db,
+            "event-2",
+            "sess-1",
+            2,
+            None,
+            assistant_event(Some("second"), None, None),
+        )
+        .await;
+
+        let (delta, next) = load_session_events_delta(&db, "sess-1".to_string(), Some(cursor))
+            .await
+            .expect("delta query must not error on archival columns");
+        assert_eq!(delta.len(), 1, "delta returns only the new event");
+        assert_eq!(delta[0].id, "event-2");
+        assert!(next.unwrap() > cursor, "cursor advances past the new event");
+    }
+
+    #[tokio::test]
+    async fn last_event_for_session_reads_bounded_tail() {
+        let db = crate::storage::migrated_test_db("last-event-tail.db").await;
+        seed_run(&db, "sess-1").await;
+        for sequence in 1..=70 {
+            insert_event(
+                &db,
+                &format!("event-{sequence}"),
+                "sess-1",
+                sequence,
+                None,
+                assistant_event(Some(&format!("message {sequence}")), None, None),
+            )
+            .await;
+        }
+
+        let digest = load_last_event_for_session(&db, "sess-1")
+            .await
+            .unwrap()
+            .expect("digest");
+        assert_eq!(digest.kind, "message");
+        assert_eq!(digest.content, "message 70");
+    }
+
+    fn read_assistant(tool_use_id: &str, path: &str) -> StoredTranscriptEvent {
+        assistant_event(
+            None,
+            None,
+            Some(vec![ToolUseInfo {
+                id: tool_use_id.to_string(),
+                name: "mcp__cairn__read".to_string(),
+                input: json!({ "paths": [path] }),
+            }]),
+        )
+    }
+
+    fn result_with_body(tool_use_id: &str, body: &str) -> StoredTranscriptEvent {
+        let mut event = tool_result(tool_use_id);
+        event.tool_result = Some(body.to_string());
+        event
+    }
+
+    #[tokio::test]
+    async fn lean_projection_strips_read_body_and_attaches_segments() {
+        let db = crate::storage::migrated_test_db("lean-projection-strip.db").await;
+        seed_run(&db, "sess-1").await;
+        insert_event(
+            &db,
+            "a1",
+            "sess-1",
+            1,
+            None,
+            read_assistant("t1", "file:a.rs"),
+        )
+        .await;
+        insert_event(
+            &db,
+            "r1",
+            "sess-1",
+            2,
+            None,
+            result_with_body("t1", "=== file:a.rs ===\nfn main() { println!(\"hi\"); }"),
+        )
+        .await;
+        // A non-read result must be left untouched.
+        insert_event(
+            &db,
+            "a2",
+            "sess-1",
+            3,
+            None,
+            assistant_event(
+                None,
+                None,
+                Some(vec![ToolUseInfo {
+                    id: "t2".to_string(),
+                    name: "mcp__cairn__run".to_string(),
+                    input: json!({}),
+                }]),
+            ),
+        )
+        .await;
+        insert_event(
+            &db,
+            "r2",
+            "sess-1",
+            4,
+            None,
+            result_with_body("t2", "ran ok"),
+        )
+        .await;
+
+        let (mut events, _) = load_events_for_session(&db, "sess-1".to_string())
+            .await
+            .unwrap();
+        apply_lean_read_projection(&db, &mut events).await.unwrap();
+
+        let read_event = events.iter().find(|e| e.id == "r1").expect("read result");
+        let segments = read_event
+            .read_segments
+            .as_ref()
+            .expect("read result carries segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].target, "file:a.rs");
+        assert!(segments[0].tokens > 0);
+        let read_data: serde_json::Value = serde_json::from_str(&read_event.data).unwrap();
+        assert!(
+            read_data
+                .get("toolResult")
+                .map(|v| v.is_null())
+                .unwrap_or(true),
+            "read body must be stripped from the projected data"
         );
 
-        let events = list_events_for_session(&mut conn, session).unwrap();
-        assert_eq!(events.len(), 3);
+        let run_event = events.iter().find(|e| e.id == "r2").expect("run result");
+        assert!(run_event.read_segments.is_none());
+        let run_data: serde_json::Value = serde_json::from_str(&run_event.data).unwrap();
+        assert_eq!(
+            run_data.get("toolResult").and_then(|v| v.as_str()),
+            Some("ran ok"),
+            "non-read result bodies must flow through untouched"
+        );
+    }
 
-        // Known run events come first, orphan sorts last
-        assert_eq!(events[0].id, "e1");
-        assert_eq!(events[1].id, "e2");
-        assert_eq!(events[2].id, "e3");
+    #[tokio::test]
+    async fn load_event_by_id_returns_full_unstripped_body() {
+        let db = Arc::new(crate::storage::migrated_test_db("lean-projection-by-id.db").await);
+        seed_run(&db, "sess-1").await;
+        insert_event(
+            &db,
+            "a1",
+            "sess-1",
+            1,
+            None,
+            read_assistant("t1", "file:a.rs"),
+        )
+        .await;
+        let body = "=== file:a.rs ===\nfn main() {}";
+        insert_event(&db, "r1", "sess-1", 2, None, result_with_body("t1", body)).await;
+
+        // The lean list load strips the body in place.
+        let (mut events, _) = load_events_for_session(&db, "sess-1".to_string())
+            .await
+            .unwrap();
+        apply_lean_read_projection(&db, &mut events).await.unwrap();
+        let stripped = events.iter().find(|e| e.id == "r1").unwrap();
+        let stripped_data: serde_json::Value = serde_json::from_str(&stripped.data).unwrap();
+        assert!(stripped_data
+            .get("toolResult")
+            .map(|v| v.is_null())
+            .unwrap_or(true));
+
+        // The on-demand single-event fetch returns the full body.
+        let full = load_event_by_id(db.clone(), "r1")
+            .unwrap()
+            .expect("event exists");
+        let full_data: serde_json::Value = serde_json::from_str(&full.data).unwrap();
+        assert_eq!(
+            full_data.get("toolResult").and_then(|v| v.as_str()),
+            Some(body)
+        );
+        assert!(full.read_segments.is_none());
+        assert!(load_event_by_id(db, "missing").unwrap().is_none());
     }
 }

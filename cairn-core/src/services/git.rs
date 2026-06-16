@@ -73,6 +73,9 @@ pub trait GitClient: Send + Sync {
     /// Get the remote URL for origin.
     fn remote_get_url(&self, repo: &Path) -> Result<String, String>;
 
+    /// Add or update a named git remote.
+    fn set_remote(&self, repo: &Path, name: &str, url: &str) -> Result<(), String>;
+
     /// Run an arbitrary git command (for operations not covered above).
     fn run(&self, repo: &Path, args: Vec<String>) -> Result<GitOutput, String>;
 
@@ -101,6 +104,36 @@ pub trait GitClient: Send + Sync {
         worktree_path: &Path,
         branch_name: &str,
     ) -> Result<(), String>;
+
+    /// Check whether `path` is inside a git work tree.
+    fn is_repo(&self, path: &Path) -> Result<bool, String>;
+
+    /// Initialize a git repository and set HEAD to the desired initial branch.
+    fn init_repo(&self, path: &Path, initial_branch: &str) -> Result<(), String>;
+
+    /// Stage all changes in the repository.
+    fn add_all(&self, repo: &Path) -> Result<(), String>;
+
+    /// Commit staged changes with Cairn's inline identity.
+    fn commit(&self, repo: &Path, message: &str) -> Result<(), String>;
+
+    /// Create a branch at a specific start point.
+    fn create_branch_at(&self, repo: &Path, name: &str, start_point: &str) -> Result<(), String>;
+
+    /// Return the root commit for a revision.
+    fn root_commit(&self, repo: &Path, rev: &str) -> Result<String, String>;
+
+    /// Check whether `ancestor` is an ancestor of `descendant`.
+    fn is_ancestor(&self, repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String>;
+
+    /// Merge a ref with git's default merge message.
+    fn merge_no_edit(&self, repo: &Path, merge_ref: &str) -> Result<GitOutput, String>;
+
+    /// List paths currently in an unmerged/conflicted state.
+    fn list_unmerged(&self, repo: &Path) -> Result<Vec<String>, String>;
+
+    /// Resolve paths by checking out our side.
+    fn checkout_ours(&self, repo: &Path, paths: Vec<String>) -> Result<(), String>;
 }
 
 /// Production git client using the git CLI.
@@ -133,6 +166,131 @@ impl RealGitClient {
 }
 
 impl GitClient for RealGitClient {
+    fn is_repo(&self, path: &Path) -> Result<bool, String> {
+        let output = self.run_git_strs(path, &["rev-parse", "--is-inside-work-tree"])?;
+        Ok(output.success && output.stdout.trim() == "true")
+    }
+
+    fn init_repo(&self, path: &Path, initial_branch: &str) -> Result<(), String> {
+        let output = self.run_git_strs(path, &["init"])?;
+        if !output.success {
+            return Err(format!("git init failed: {}", output.stderr));
+        }
+
+        let head_ref = format!("refs/heads/{initial_branch}");
+        let output = self.run_git_strs(path, &["symbolic-ref", "HEAD", &head_ref])?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!("git symbolic-ref failed: {}", output.stderr))
+        }
+    }
+
+    fn add_all(&self, repo: &Path) -> Result<(), String> {
+        let output = self.run_git_strs(repo, &["add", "-A"])?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!("git add failed: {}", output.stderr))
+        }
+    }
+
+    fn commit(&self, repo: &Path, message: &str) -> Result<(), String> {
+        let output = self.run_git_strs(
+            repo,
+            &[
+                "-c",
+                "user.name=Cairn",
+                "-c",
+                "user.email=cairn@local.invalid",
+                "commit",
+                "-m",
+                message,
+            ],
+        )?;
+        if output.success
+            || output.stderr.contains("nothing to commit")
+            || output.stdout.contains("nothing to commit")
+        {
+            Ok(())
+        } else {
+            Err(format!("git commit failed: {}", output.stderr))
+        }
+    }
+
+    fn create_branch_at(&self, repo: &Path, name: &str, start_point: &str) -> Result<(), String> {
+        let output = self.run_git_strs(repo, &["branch", name, start_point])?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!("git branch failed: {}", output.stderr))
+        }
+    }
+
+    fn root_commit(&self, repo: &Path, rev: &str) -> Result<String, String> {
+        let output = self.run_git_strs(repo, &["rev-list", "--max-parents=0", rev])?;
+        if output.success {
+            output
+                .stdout
+                .lines()
+                .last()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .ok_or_else(|| format!("git rev-list returned no root commit for {rev}"))
+        } else {
+            Err(format!("git rev-list failed: {}", output.stderr))
+        }
+    }
+
+    fn is_ancestor(&self, repo: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+        let output =
+            self.run_git_strs(repo, &["merge-base", "--is-ancestor", ancestor, descendant])?;
+        if output.success {
+            Ok(true)
+        } else if output.stderr.trim().is_empty() {
+            Ok(false)
+        } else {
+            Err(format!("git merge-base failed: {}", output.stderr))
+        }
+    }
+
+    fn merge_no_edit(&self, repo: &Path, merge_ref: &str) -> Result<GitOutput, String> {
+        self.run_git_strs(repo, &["merge", "--no-edit", merge_ref])
+    }
+
+    fn list_unmerged(&self, repo: &Path) -> Result<Vec<String>, String> {
+        let output = self.run_git_strs(repo, &["diff", "--name-only", "--diff-filter=U"])?;
+        if output.success {
+            Ok(output
+                .stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect())
+        } else {
+            Err(format!("git diff unmerged failed: {}", output.stderr))
+        }
+    }
+
+    fn checkout_ours(&self, repo: &Path, paths: Vec<String>) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
+            "checkout".to_string(),
+            "--ours".to_string(),
+            "--".to_string(),
+        ];
+        args.extend(paths);
+        let output = self.run_git(repo, &args)?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!("git checkout --ours failed: {}", output.stderr))
+        }
+    }
+
     fn rev_parse(&self, repo: &Path, args: Vec<String>) -> Result<String, String> {
         let mut full_args = vec!["rev-parse".to_string()];
         full_args.extend(args);
@@ -277,6 +435,23 @@ impl GitClient for RealGitClient {
             Ok(output.stdout)
         } else {
             Err(format!("git remote get-url failed: {}", output.stderr))
+        }
+    }
+
+    fn set_remote(&self, repo: &Path, name: &str, url: &str) -> Result<(), String> {
+        let set_output = self.run_git_strs(repo, &["remote", "set-url", name, url])?;
+        if set_output.success {
+            return Ok(());
+        }
+
+        let add_output = self.run_git_strs(repo, &["remote", "add", name, url])?;
+        if add_output.success {
+            Ok(())
+        } else {
+            Err(format!(
+                "git remote set-url failed: {}; git remote add failed: {}",
+                set_output.stderr, add_output.stderr
+            ))
         }
     }
 
@@ -425,5 +600,21 @@ mod tests {
         assert_eq!(cloned.success, output.success);
         assert_eq!(cloned.stdout, output.stdout);
         assert_eq!(cloned.stderr, output.stderr);
+    }
+
+    #[test]
+    fn real_git_set_remote_adds_then_updates_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        let git = RealGitClient;
+        git.init_repo(temp.path(), "main").unwrap();
+
+        let one = temp.path().join("one.git").to_string_lossy().to_string();
+        let two = temp.path().join("two.git").to_string_lossy().to_string();
+
+        git.set_remote(temp.path(), "origin", &one).unwrap();
+        assert_eq!(git.remote_get_url(temp.path()).unwrap(), one);
+
+        git.set_remote(temp.path(), "origin", &two).unwrap();
+        assert_eq!(git.remote_get_url(temp.path()).unwrap(), two);
     }
 }

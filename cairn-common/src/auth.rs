@@ -22,6 +22,20 @@ pub fn decode_secret(encoded: &str) -> Option<[u8; SECRET_LEN]> {
     Some(secret)
 }
 
+/// Load the local MCP bearer token from the on-disk secret.
+pub fn load_local_mcp_token() -> Option<String> {
+    use base64::Engine;
+
+    let config_dir = crate::paths::cairn_home();
+    let secret = std::fs::read(config_dir.join("mcp_auth_secret")).ok()?;
+
+    if secret.len() != SECRET_LEN {
+        return None;
+    }
+
+    Some(base64::engine::general_purpose::STANDARD.encode(secret))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

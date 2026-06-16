@@ -1,0 +1,1513 @@
+//! Job-status recompute: the single writer of `job.status`.
+//!
+//! Job status is a projection (see [`crate::transitions::projection`]). This
+//! module gathers the facts a job's status derives from and writes the derived
+//! value as a cache, exactly as execution/issue status are recomputed beneath it.
+//!
+//! - [`recompute_job_status_conn`] gathers facts for one job and derives its
+//!   status (no write) — used by tests and the manager path.
+//! - [`recompute_execution_jobs_conn`] sweeps every job in an execution in
+//!   topological order, writes the changed caches, recomputes execution + issue
+//!   status, and returns the diffs.
+//! - [`recompute_execution_jobs`] runs the sweep in a write transaction and
+//!   emits the follow-on effects (lifecycle messages, manager wake, JobEnded,
+//!   DAG advancement) keyed by each derived edge. This is the single entry
+//!   point every former decider now calls.
+
+use super::*;
+use crate::models::{RecipeNode, RecipeNodeType, TriggerEvent, TurnState};
+use crate::transitions::outcome::{recompute_execution_status_conn, recompute_issue_status_conn};
+use crate::transitions::projection::{derive_job_status, CheckpointGate, JobFacts, Resolution};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+/// A job whose derived status differs from its cached status.
+#[derive(Debug, Clone)]
+pub struct JobStatusChange {
+    pub job_id: String,
+    pub from: JobStatus,
+    pub to: JobStatus,
+    pub issue_id: Option<String>,
+    pub project_id: String,
+    pub parent_job_id: Option<String>,
+    /// Carried so the scoped `jobs` db-change can invalidate the parent batch's
+    /// child-job query (`["child-jobs", parentToolUseId]`) without a cache scan.
+    pub parent_tool_use_id: Option<String>,
+    /// When `to == Blocked` because the node ended its turn without its declared
+    /// output, a human-readable reason naming the missing artifact. None for
+    /// other Blocked causes (approval gate) and for non-Blocked changes.
+    pub blocked_reason: Option<String>,
+}
+
+impl JobStatusChange {
+    /// JobEnded fires for a top-level job reaching a terminal status.
+    /// Delegated children stay silent because they have a parent job.
+    fn fires_job_ended(&self) -> bool {
+        matches!(self.to, JobStatus::Complete | JobStatus::Failed) && self.parent_job_id.is_none()
+    }
+
+    /// Missing required output is an internal Blocked gate, not a user-facing
+    /// lifecycle event. Other Blocked causes (approval/checkpoint gates) still
+    /// emit the normal blocked message.
+    fn emits_blocked_lifecycle_message(&self) -> bool {
+        self.to == JobStatus::Blocked && self.blocked_reason.is_none()
+    }
+}
+
+struct SweepJob {
+    id: String,
+    recipe_node_id: Option<String>,
+    parent_job_id: Option<String>,
+    status: JobStatus,
+    issue_id: Option<String>,
+    project_id: String,
+    parent_tool_use_id: Option<String>,
+}
+
+/// Classify the checkpoint gate of a recipe node.
+fn classify_gate(node: &RecipeNode) -> CheckpointGate {
+    // The producing node's human-approval gate is declared on its own output
+    // schema via `confirm_policy`: `User` blocks once the turn completes until
+    // the artifact is confirmed; `Auto` (or no declared schema) never blocks.
+    // Field inheritance from a downstream context edge is irrelevant here — the
+    // gate is the producing node's decision.
+    let confirm = |schema: Option<&crate::models::SchemaConfig>| match schema {
+        Some(s) if s.confirm_policy == crate::models::ConfirmPolicy::User => {
+            CheckpointGate::ConfirmGate
+        }
+        _ => CheckpointGate::None,
+    };
+    match node.node_type {
+        RecipeNodeType::Agent => confirm(
+            node.agent_config
+                .as_ref()
+                .and_then(|c| c.output_schema.as_ref()),
+        ),
+        RecipeNodeType::Action => confirm(
+            node.action_config
+                .as_ref()
+                .and_then(|c| c.output_schema.as_ref()),
+        ),
+        // Standalone checkpoint nodes are always a command gate now.
+        RecipeNodeType::Checkpoint => CheckpointGate::Command,
+        _ => CheckpointGate::None,
+    }
+}
+
+/// A node whose output flows (via a context edge) into a first-class `pr` node
+/// never carries a pre-PR approval gate: the PR lifecycle (open → merge/close) is
+/// the human checkpoint, and the producer's output auto-confirms straight into PR
+/// creation. See CAIRN-1219 / CAIRN-1220.
+fn node_feeds_pr(snapshot: &crate::models::ExecutionSnapshot, node_id: &str) -> bool {
+    let pr_ids: HashSet<&str> = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .filter(|n| n.node_type == RecipeNodeType::Pr)
+        .map(|n| n.id.as_str())
+        .collect();
+    snapshot.recipe.edges.iter().any(|edge| {
+        edge.edge_type.to_string() == "context"
+            && edge.source_node_id == node_id
+            && pr_ids.contains(edge.target_node_id.as_str())
+    })
+}
+
+/// The latest *work* turn state for a job, used to derive `live_turn` /
+/// The latest *work* turn state for a job, used to derive the terminal OUTCOME
+/// (`turn_complete` / `turn_failed`). The post-completion memory-review turn
+/// (`start_reason = 'memory_review'`) is excluded here so a failed review turn
+/// never fails the job, and a completed review turn never stands in for the work
+/// turn's outcome. Liveness is computed separately by [`latest_turn_is_live`],
+/// which *includes* the review turn so the job reads Running while the review
+/// agent is active. Confirmation is decoupled from run state — it keys off the
+/// unconfirmed artifact, not the job status — so a live review no longer hides
+/// the confirm affordance. CAIRN-1576.
+async fn latest_turn_state(conn: &turso::Connection, job_id: &str) -> DbResult<Option<TurnState>> {
+    let mut rows = conn
+        .query(
+            "SELECT state FROM turns
+             WHERE job_id = ?1 AND start_reason != 'memory_review'
+             ORDER BY created_at DESC, sequence DESC LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .map(|r| r.text(0))
+        .transpose()?
+        .and_then(|s| s.parse::<TurnState>().ok()))
+}
+
+/// Whether the job's absolute latest turn is live (Running/Pending/Yielded),
+/// *including* a memory-review turn. Liveness includes the review so the job
+/// stays Running while the post-completion review agent is active; the terminal
+/// outcome still derives from the work turn via [`latest_turn_state`].
+async fn latest_turn_is_live(conn: &turso::Connection, job_id: &str) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT state FROM turns WHERE job_id = ?1 ORDER BY created_at DESC, sequence DESC LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    let state = rows
+        .next()
+        .await?
+        .map(|r| r.text(0))
+        .transpose()?
+        .and_then(|s| s.parse::<TurnState>().ok());
+    Ok(matches!(
+        state,
+        Some(TurnState::Running | TurnState::Pending | TurnState::Yielded)
+    ))
+}
+
+async fn latest_artifact_confirmed(conn: &turso::Connection, job_id: &str) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .map(|r| r.i64(0))
+        .transpose()?
+        .map(|v| v != 0)
+        .unwrap_or(false))
+}
+
+/// Whether any artifact row exists for the job — i.e. the node produced its
+/// declared output. Distinct from `latest_artifact_confirmed`, which conflates
+/// "no artifact" with "artifact awaiting confirmation."
+async fn latest_artifact_present(conn: &turso::Connection, job_id: &str) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM artifacts WHERE job_id = ?1 LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
+}
+
+/// Whether the job has produced its *required* output artifact. When the output
+/// contract names a specific artifact, only that artifact counts — a stray
+/// checkpoint/other artifact for the same job must not satisfy the gate. The
+/// agent writes to `cairn:~/<name>`, which is stored as the artifact's
+/// `output_name` (see `store_artifact`), so `output_name` is the contract's
+/// `artifact_name`. Falls back to any-artifact presence only when the contract
+/// is unnamed (no resolvable `artifact_name`).
+async fn artifact_present_for(
+    conn: &turso::Connection,
+    job_id: &str,
+    required_name: Option<&str>,
+) -> DbResult<bool> {
+    match required_name {
+        Some(name) => {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM artifacts WHERE job_id = ?1 AND output_name = ?2 LIMIT 1",
+                    params![job_id, name],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        }
+        None => latest_artifact_present(conn, job_id).await,
+    }
+}
+
+/// Record a job's failure as a turn fact so the projection derives `Failed`.
+///
+/// Failure is a *turn* truth, not a job-status truth (the two-axis split). If the
+/// latest turn is still live it is failed in place; if it is already terminal
+/// (or absent), a synthetic terminal `failed` turn is appended so the projection
+/// reads `turn_failed`. Used by `mark_job_failed` and the no-recovery checkpoint
+/// rejection path — cases where the job has no recovery edge and must go terminal.
+pub(crate) async fn force_fail_job_turn_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> DbResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    let latest = {
+        let mut rows = conn
+            .query(
+                "SELECT id, state, session_id, sequence
+                 FROM turns WHERE job_id = ?1 ORDER BY created_at DESC, sequence DESC LIMIT 1",
+                (job_id,),
+            )
+            .await?;
+        rows.next()
+            .await?
+            .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?, row.text(2)?, row.i64(3)?)))
+            .transpose()?
+    };
+
+    match latest {
+        Some((turn_id, state, _session, _seq))
+            if !state
+                .parse::<TurnState>()
+                .map(|s| s.is_terminal())
+                .unwrap_or(false) =>
+        {
+            // Live turn: fail it in place.
+            conn.execute(
+                "UPDATE turns SET state = 'failed', ended_at = ?1, updated_at = ?2 WHERE id = ?3",
+                params![now, now, turn_id.as_str()],
+            )
+            .await?;
+        }
+        other => {
+            // Terminal or absent: append a synthetic failed turn so the latest
+            // turn outcome is Failed. Carries the job's session if it has one.
+            let (session_id, predecessor_id, sequence) = match other {
+                Some((turn_id, _state, session, seq)) => (session, Some(turn_id), seq + 1),
+                None => {
+                    let session = {
+                        let mut rows = conn
+                            .query(
+                                "SELECT current_session_id FROM jobs WHERE id = ?1",
+                                (job_id,),
+                            )
+                            .await?;
+                        rows.next()
+                            .await?
+                            .and_then(|row| row.opt_text(0).ok().flatten())
+                            .unwrap_or_else(|| format!("rejected-{job_id}"))
+                    };
+                    (session, None, 1)
+                }
+            };
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state,
+                                    start_reason, created_at, ended_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'failed', 'retry', ?6, ?6, ?6)",
+                params![
+                    turn_id.as_str(),
+                    session_id.as_str(),
+                    job_id,
+                    sequence,
+                    predecessor_id.as_deref(),
+                    now
+                ],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn execution_issue_id_conn(
+    conn: &turso::Connection,
+    execution_id: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT issue_id FROM executions WHERE id = ?1",
+            (execution_id,),
+        )
+        .await?;
+    crate::storage::next_opt_text(&mut rows, 0).await
+}
+
+async fn load_sweep_jobs(conn: &turso::Connection, execution_id: &str) -> DbResult<Vec<SweepJob>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, recipe_node_id, parent_job_id, status, issue_id, project_id,
+                    completed_at, parent_tool_use_id
+             FROM jobs WHERE execution_id = ?1",
+            (execution_id,),
+        )
+        .await?;
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let status: JobStatus = row
+            .text(3)?
+            .parse()
+            .map_err(|e: String| DbError::internal(e))?;
+        jobs.push(SweepJob {
+            id: row.text(0)?,
+            recipe_node_id: row.opt_text(1)?,
+            parent_job_id: row.opt_text(2)?,
+            status,
+            issue_id: row.opt_text(4)?,
+            project_id: row.text(5)?,
+            parent_tool_use_id: row.opt_text(7)?,
+        });
+    }
+    Ok(jobs)
+}
+
+async fn write_job_status(
+    conn: &turso::Connection,
+    job_id: &str,
+    from: &JobStatus,
+    to: &JobStatus,
+) -> DbResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    match to {
+        // Entering Running from Pending is a start — stamp started_at.
+        JobStatus::Running if *from == JobStatus::Pending => {
+            conn.execute(
+                "UPDATE jobs SET status = ?1, started_at = ?2, updated_at = ?3 WHERE id = ?4",
+                params![to.to_string(), now, now, job_id],
+            )
+            .await?;
+        }
+        JobStatus::Complete | JobStatus::Failed => {
+            conn.execute(
+                "UPDATE jobs SET status = ?1, completed_at = ?2, updated_at = ?3 WHERE id = ?4",
+                params![to.to_string(), now, now, job_id],
+            )
+            .await?;
+        }
+        _ => {
+            conn.execute(
+                "UPDATE jobs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![to.to_string(), now, job_id],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Soft invariant check. Derivation is truth, so a surprising edge is logged for
+/// observability rather than blocking the write. Deliberately distinct text from
+/// the legacy "Invalid job transition" assertion.
+fn check_reachable(from: &JobStatus, to: &JobStatus, job_id: &str) {
+    use JobStatus::*;
+    let reachable = matches!(
+        (from, to),
+        (Pending, Running | Blocked | Failed | Complete)
+            | (Running, Complete | Failed | Blocked | Pending)
+            | (Blocked, Complete | Failed | Pending | Running)
+            | (Complete, Running | Pending)
+            | (Failed, Running | Pending)
+    );
+    if !reachable {
+        log::warn!("job-status projection: unexpected transition {from} -> {to} for {job_id}");
+    }
+}
+
+fn topo_order(node_ids: &[&str], control: &[(String, String)]) -> Vec<String> {
+    let mut indeg: HashMap<&str, usize> = node_ids.iter().map(|id| (*id, 0usize)).collect();
+    let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (s, t) in control {
+        if indeg.contains_key(s.as_str()) && indeg.contains_key(t.as_str()) {
+            adj.entry(s.as_str()).or_default().push(t.as_str());
+            *indeg.get_mut(t.as_str()).unwrap() += 1;
+        }
+    }
+    let mut queue: VecDeque<&str> = node_ids
+        .iter()
+        .filter(|id| indeg.get(**id).copied().unwrap_or(0) == 0)
+        .copied()
+        .collect();
+    let mut order: Vec<String> = Vec::new();
+    while let Some(n) = queue.pop_front() {
+        order.push(n.to_string());
+        if let Some(ts) = adj.get(n) {
+            for t in ts.clone() {
+                let d = indeg.get_mut(t).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(t);
+                }
+            }
+        }
+    }
+    // Cycle/disconnected safety: append any node the topo walk did not emit.
+    for id in node_ids {
+        if !order.iter().any(|o| o == id) {
+            order.push((*id).to_string());
+        }
+    }
+    order
+}
+
+/// Recompute one job's status from its facts without writing. Used by tests and
+/// the manager path; the execution sweep computes the same facts in bulk.
+pub async fn recompute_job_status_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> DbResult<JobStatus> {
+    let jobs_one = {
+        let mut rows = conn
+            .query(
+                "SELECT execution_id, recipe_node_id, status
+                 FROM jobs WHERE id = ?1",
+                (job_id,),
+            )
+            .await?;
+        rows.next()
+            .await?
+            .map(|row| Ok::<_, DbError>((row.opt_text(0)?, row.opt_text(1)?, row.text(2)?)))
+            .transpose()?
+    };
+    let Some((execution_id, recipe_node_id, current_status)) = jobs_one else {
+        return Err(DbError::internal(format!("job not found: {job_id}")));
+    };
+
+    // Cancelled is an explicit, sticky override (a node removed from the snapshot),
+    // not a derived projection. Never re-derive it back to a live status.
+    if current_status == "cancelled" {
+        return Ok(JobStatus::Cancelled);
+    }
+
+    let turn = latest_turn_state(conn, job_id).await?;
+    let live_turn = latest_turn_is_live(conn, job_id).await?;
+
+    // Standalone (no execution): liveness and resolution decide. A standalone
+    // job (e.g. an approved/rejected checkpoint with no DAG) resolves from its
+    // artifact confirmation.
+    let Some(execution_id) = execution_id else {
+        let confirmed = latest_artifact_confirmed(conn, job_id).await?;
+        let facts = JobFacts {
+            dag_ready: true,
+            upstream_failed: false,
+            live_turn,
+            turn_failed: matches!(
+                turn,
+                // Interrupt/cancel is a user-initiated pause, NOT a failure: the
+                // job rests resumable (derives Pending) and never cascades to
+                // downstream. Only a genuine agent/process failure terminalizes.
+                Some(TurnState::Failed)
+            ),
+            turn_complete: matches!(turn, Some(TurnState::Complete)),
+            // A standalone (no-execution) job resolves from its artifact: a
+            // confirmed artifact completes it via the Command gate. Manager jobs
+            // have no artifact and stay turn-driven (None).
+            checkpoint: if confirmed {
+                CheckpointGate::Command
+            } else {
+                CheckpointGate::None
+            },
+            resolution: if confirmed {
+                Resolution::Confirmed
+            } else {
+                Resolution::Pending
+            },
+            // Standalone / manager jobs have no DAG output contract.
+            requires_output: false,
+            artifact_present: false,
+        };
+        let derived = derive_job_status(&facts);
+        return Ok(derived);
+    };
+
+    let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
+    let all_nodes_db = snapshot_nodes_to_db(&snapshot);
+    let all_edges_db = snapshot_edges_to_db(&snapshot);
+    let node_map_db: HashMap<&str, &DbRecipeNode> =
+        all_nodes_db.iter().map(|n| (n.id.as_str(), n)).collect();
+    let node = recipe_node_id
+        .as_deref()
+        .and_then(|nid| snapshot.recipe.nodes.iter().find(|n| n.id == nid));
+
+    let dag_ready = match recipe_node_id.as_deref() {
+        Some(node_id) => {
+            is_action_node_ready_with_snapshot_conn(
+                conn,
+                &execution_id,
+                node_id,
+                &all_edges_db,
+                &node_map_db,
+            )
+            .await?
+        }
+        None => true,
+    };
+
+    let upstream_failed = match recipe_node_id.as_deref() {
+        Some(node_id) => upstream_failed_conn(conn, &execution_id, node_id, &snapshot).await?,
+        None => false,
+    };
+
+    let confirmed = latest_artifact_confirmed(conn, job_id).await?;
+    let downstream_schema = match recipe_node_id.as_deref() {
+        Some(node_id) => {
+            crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
+                conn, &snapshot, node_id,
+            )
+            .await?
+        }
+        None => None,
+    };
+    let requires_output = downstream_schema.is_some();
+    let required_artifact_name = downstream_schema.and_then(|schema| schema.artifact_name);
+    let artifact_present =
+        artifact_present_for(conn, job_id, required_artifact_name.as_deref()).await?;
+    let facts = JobFacts {
+        dag_ready,
+        upstream_failed,
+        live_turn,
+        turn_failed: matches!(
+            turn,
+            // Interrupt/cancel is a user-initiated pause, NOT a failure: the
+            // job rests resumable (derives Pending) and never cascades to
+            // downstream. Only a genuine agent/process failure terminalizes.
+            Some(TurnState::Failed)
+        ),
+        turn_complete: matches!(turn, Some(TurnState::Complete)),
+        checkpoint: match node {
+            Some(n) if node_feeds_pr(&snapshot, &n.id) => CheckpointGate::None,
+            Some(n) => classify_gate(n),
+            None => CheckpointGate::None,
+        },
+        resolution: if confirmed {
+            Resolution::Confirmed
+        } else {
+            Resolution::Pending
+        },
+        requires_output,
+        artifact_present,
+    };
+    let derived = derive_job_status(&facts);
+    Ok(derived)
+}
+
+async fn upstream_failed_conn(
+    conn: &turso::Connection,
+    execution_id: &str,
+    node_id: &str,
+    snapshot: &crate::models::ExecutionSnapshot,
+) -> DbResult<bool> {
+    let parents: Vec<&str> = snapshot
+        .recipe
+        .edges
+        .iter()
+        .filter(|e| e.edge_type.to_string() == "control" && e.target_node_id == node_id)
+        .map(|e| e.source_node_id.as_str())
+        .collect();
+    for parent in parents {
+        let mut rows = conn
+            .query(
+                "SELECT 1 FROM jobs
+                 WHERE execution_id = ?1 AND recipe_node_id = ?2 AND status = 'failed'
+                 LIMIT 1",
+                params![execution_id, parent],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Sweep every job in an execution in topological order, writing changed caches
+/// and recomputing execution + issue status. Returns the diffs for effect emission.
+pub async fn recompute_execution_jobs_conn(
+    conn: &turso::Connection,
+    execution_id: &str,
+) -> DbResult<Vec<JobStatusChange>> {
+    let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
+    let node_by_id: HashMap<&str, &RecipeNode> = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n))
+        .collect();
+    let all_nodes_db = snapshot_nodes_to_db(&snapshot);
+    let all_edges_db = snapshot_edges_to_db(&snapshot);
+    let node_map_db: HashMap<&str, &DbRecipeNode> =
+        all_nodes_db.iter().map(|n| (n.id.as_str(), n)).collect();
+
+    let control: Vec<(String, String)> = snapshot
+        .recipe
+        .edges
+        .iter()
+        .filter(|e| e.edge_type.to_string() == "control")
+        .map(|e| (e.source_node_id.clone(), e.target_node_id.clone()))
+        .collect();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for (s, t) in &control {
+        parents.entry(t.clone()).or_default().push(s.clone());
+    }
+
+    let jobs = load_sweep_jobs(conn, execution_id).await?;
+    let mut node_jobs: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, j) in jobs.iter().enumerate() {
+        if let Some(nid) = &j.recipe_node_id {
+            node_jobs.entry(nid.clone()).or_default().push(i);
+        }
+    }
+    let mut status: HashMap<String, JobStatus> = jobs
+        .iter()
+        .map(|j| (j.id.clone(), j.status.clone()))
+        .collect();
+
+    let node_ids: Vec<&str> = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .map(|n| n.id.as_str())
+        .collect();
+    let order = topo_order(&node_ids, &control);
+
+    let mut changes = Vec::new();
+    for node_id in &order {
+        let Some(idxs) = node_jobs.get(node_id).cloned() else {
+            continue;
+        };
+        for i in idxs {
+            let j = &jobs[i];
+            // Cancelled jobs are archived (node removed from the snapshot): leave
+            // their status untouched and never let the projection re-derive them.
+            if j.status == JobStatus::Cancelled {
+                continue;
+            }
+            let upstream_failed = parents
+                .get(node_id)
+                .map(|ps| {
+                    ps.iter().any(|p| {
+                        node_jobs
+                            .get(p)
+                            .map(|js| {
+                                js.iter()
+                                    .any(|&k| status.get(&jobs[k].id) == Some(&JobStatus::Failed))
+                            })
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+
+            let node = node_by_id.get(node_id.as_str()).copied();
+            let dag_ready = is_action_node_ready_with_snapshot_conn(
+                conn,
+                execution_id,
+                node_id,
+                &all_edges_db,
+                &node_map_db,
+            )
+            .await?;
+            let turn = latest_turn_state(conn, &j.id).await?;
+            let confirmed = latest_artifact_confirmed(conn, &j.id).await?;
+            // A node "requires output" when it has an effective output contract:
+            // its own output schema, or the input schema of a downstream consumer
+            // it feeds (e.g. a builder feeding a `pr` node's create-pr). This
+            // reuses the exact resolver that tells the agent what to write, so the
+            // completion gate and the instruction never drift.
+            let downstream_schema =
+                crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
+                    conn, &snapshot, node_id,
+                )
+                .await?;
+            let requires_output = downstream_schema.is_some();
+            let required_artifact_name = downstream_schema.and_then(|schema| schema.artifact_name);
+            let artifact_present =
+                artifact_present_for(conn, &j.id, required_artifact_name.as_deref()).await?;
+
+            let facts = JobFacts {
+                dag_ready,
+                upstream_failed,
+                live_turn: latest_turn_is_live(conn, &j.id).await?,
+                turn_failed: matches!(
+                    turn,
+                    // Interrupt/cancel is a user-initiated pause, NOT a failure: the
+                    // job rests resumable (derives Pending) and never cascades to
+                    // downstream. Only a genuine agent/process failure terminalizes.
+                    Some(TurnState::Failed)
+                ),
+                turn_complete: matches!(turn, Some(TurnState::Complete)),
+                checkpoint: match node {
+                    Some(n) if node_feeds_pr(&snapshot, &n.id) => CheckpointGate::None,
+                    Some(n) => classify_gate(n),
+                    None => CheckpointGate::None,
+                },
+                resolution: if confirmed {
+                    Resolution::Confirmed
+                } else {
+                    Resolution::Pending
+                },
+                requires_output,
+                artifact_present,
+            };
+            let derived = derive_job_status(&facts);
+            let current = status
+                .get(&j.id)
+                .cloned()
+                .unwrap_or_else(|| j.status.clone());
+            // Never demote a claimed job back to Pending. Advancement claims a
+            // ready job `pending→Running` synchronously, but its turn only goes
+            // live a moment later (worktree setup, session start). A sweep landing
+            // in that start-gap derives Pending (no live turn yet) — honor the
+            // claim and leave it Running rather than un-starting and double-starting.
+            if current == JobStatus::Running && derived == JobStatus::Pending {
+                continue;
+            }
+            if derived != current {
+                // C4: distinguish Blocked-on-missing-output from Blocked-for-
+                // approval so the surfaced reason is actionable. The process is
+                // warm/idle; writing the artifact recomputes it to Complete.
+                let blocked_reason = if derived == JobStatus::Blocked
+                    && facts.turn_complete
+                    && facts.requires_output
+                    && !facts.artifact_present
+                {
+                    Some(format!(
+                        "agent ended its turn without producing required output{}",
+                        required_artifact_name
+                            .as_deref()
+                            .map(|name| format!(": `{name}`"))
+                            .unwrap_or_default()
+                    ))
+                } else {
+                    None
+                };
+                check_reachable(&current, &derived, &j.id);
+                write_job_status(conn, &j.id, &current, &derived).await?;
+                status.insert(j.id.clone(), derived.clone());
+                changes.push(JobStatusChange {
+                    job_id: j.id.clone(),
+                    from: current,
+                    to: derived,
+                    issue_id: j.issue_id.clone(),
+                    project_id: j.project_id.clone(),
+                    parent_job_id: j.parent_job_id.clone(),
+                    parent_tool_use_id: j.parent_tool_use_id.clone(),
+                    blocked_reason,
+                });
+            }
+        }
+    }
+
+    recompute_execution_status_conn(conn, execution_id).await?;
+    if let Some(issue_id) = execution_issue_id_conn(conn, execution_id).await? {
+        recompute_issue_status_conn(conn, &issue_id).await?;
+    }
+
+    Ok(changes)
+}
+
+/// Recompute a single job by id, routing to the execution sweep when the job
+/// belongs to a DAG execution, or doing a standalone single-job write otherwise
+/// (manager jobs have no execution). This is the entry point for deciders that
+/// hold a `job_id` rather than an `execution_id`.
+pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+    let db = orch.db.local.clone();
+    let job_id_owned = job_id.to_string();
+    let execution_id = run_advancement_db(async move {
+        db.query_opt_text(
+            "SELECT execution_id FROM jobs WHERE id = ?1",
+            turso::params![job_id_owned.as_str()],
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+
+    if let Some(execution_id) = execution_id {
+        return recompute_execution_jobs(orch, &execution_id);
+    }
+
+    // Standalone / manager job: derive and write in isolation. No DAG advance,
+    // no JobEnded — a manager is never terminalized by the projection.
+    let db = orch.db.local.clone();
+    let job_id_owned = job_id.to_string();
+    let changed = run_advancement_db(async move {
+        db.write(|conn| {
+            let job_id = job_id_owned.clone();
+            Box::pin(async move {
+                let current = {
+                    let mut rows = conn
+                        .query("SELECT status FROM jobs WHERE id = ?1", (job_id.as_str(),))
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => row
+                            .text(0)?
+                            .parse::<JobStatus>()
+                            .map_err(DbError::internal)?,
+                        None => return Ok(false),
+                    }
+                };
+                let derived = recompute_job_status_conn(conn, &job_id).await?;
+                if derived != current {
+                    check_reachable(&current, &derived, &job_id);
+                    write_job_status(conn, &job_id, &current, &derived).await?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+
+    if changed {
+        let job = run_advancement_db({
+            let db = orch.db.local.clone();
+            let job_id = job_id.to_string();
+            async move {
+                crate::jobs::queries::get_job(&db, &job_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })?;
+        let _ = orch
+            .services
+            .emitter
+            .emit("db-change", crate::notify::job_db_change(&job, "update"));
+    }
+    Ok(())
+}
+
+/// The single entry point every former decider calls: run the execution sweep in
+/// a write transaction, then emit the follow-on effects keyed by each derived edge.
+pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Result<(), String> {
+    let db = orch.db.local.clone();
+    let execution_id_owned = execution_id.to_string();
+    let changes = run_advancement_db(async move {
+        db.write(|conn| {
+            let execution_id = execution_id_owned.clone();
+            Box::pin(async move { recompute_execution_jobs_conn(conn, &execution_id).await })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+
+    if changes.is_empty() {
+        return Ok(());
+    }
+
+    // One scoped jobs event per changed job; the frontend's invalidation batch
+    // dedupes them into the minimal scoped set. Executions/issues stay broad.
+    for change in &changes {
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            crate::notify::job_db_change_ids(
+                "update",
+                &change.job_id,
+                change.issue_id.as_deref(),
+                Some(execution_id),
+                change.parent_job_id.as_deref(),
+                change.parent_tool_use_id.as_deref(),
+                &change.project_id,
+            ),
+        );
+    }
+    for table in ["executions", "issues"] {
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": table, "action": "update"}),
+        );
+    }
+
+    // Recompute is a pure projection-write; it no longer broadcasts a coarse
+    // "something changed" poke. The fact-driven emit sites (artifact write,
+    // turn-end, webhook PR state, manual issue close) carry their own typed
+    // events. The one thing recompute is still responsible for here is
+    // surfacing a *terminal* status flip that wasn't already signaled by the
+    // calling fact site — e.g. a cascade-failure that closes the issue. Emit
+    // one `Resolved` event for each issue this sweep moved to a terminal
+    // status; non-terminal flips stay silent.
+    let touched_issue_ids: Vec<String> = changes
+        .iter()
+        .filter_map(|change| change.issue_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    for issue_id in touched_issue_ids {
+        let db = orch.db.local.clone();
+        let issue_id_owned = issue_id.clone();
+        let lookup = run_advancement_db(async move {
+            crate::orchestrator::attention::read_issue_for_attention(&db, &issue_id_owned).await
+        });
+        if let Ok(ctx) = lookup {
+            if ctx.status.is_terminal() {
+                orch.emit_attention_event(crate::orchestrator::AttentionEvent {
+                    issue_id,
+                    issue_uri: ctx.issue_uri(),
+                    fact: crate::orchestrator::AttentionFact::Resolved {
+                        escalate: false,
+                        final_status: ctx.status.clone(),
+                    },
+                    attention: ctx.attention,
+                    status: ctx.status,
+                    updated_at: ctx.updated_at,
+                });
+            }
+        }
+    }
+
+    let mut advance = false;
+    for change in &changes {
+        match change.to {
+            JobStatus::Complete => {
+                match crate::memories::commands::confirm_drafts_for_completed_job_without_artifact_review(
+                    orch,
+                    &change.job_id,
+                ) {
+                    Ok(completion) if completion.confirmed_count > 0 => {
+                        log::info!(
+                            "Confirmed {} draft memor{} for completed no-artifact job {}",
+                            completion.confirmed_count,
+                            if completion.confirmed_count == 1 { "y" } else { "ies" },
+                            &change.job_id[..change.job_id.len().min(8)]
+                        );
+                        let triage_orch = orch.clone();
+                        let confirmed_scopes = completion.confirmed_scopes.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = crate::memories::triage::maybe_spawn_triage(
+                                triage_orch,
+                                confirmed_scopes,
+                            )
+                            .await
+                            {
+                                log::warn!("memory triage check after no-artifact confirmation failed: {error}");
+                            }
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => log::warn!(
+                        "Failed to run no-artifact draft-memory safety net for completed job {}: {error}",
+                        &change.job_id[..change.job_id.len().min(8)]
+                    ),
+                }
+                crate::messages::system::emit_job_event(
+                    orch,
+                    &change.job_id,
+                    None,
+                    crate::messages::system::JobEvent::Completed,
+                );
+                advance = true;
+            }
+            JobStatus::Failed => {
+                crate::messages::system::emit_job_event(
+                    orch,
+                    &change.job_id,
+                    None,
+                    crate::messages::system::JobEvent::Failed,
+                );
+            }
+            JobStatus::Blocked => {
+                if let Some(reason) = &change.blocked_reason {
+                    log::info!(
+                        "Job {} blocked without lifecycle message: {}",
+                        &change.job_id[..change.job_id.len().min(8)],
+                        reason
+                    );
+                }
+                if change.emits_blocked_lifecycle_message() {
+                    crate::messages::system::emit_job_event(
+                        orch,
+                        &change.job_id,
+                        None,
+                        crate::messages::system::JobEvent::Blocked { reason: None },
+                    );
+                }
+            }
+            _ => {}
+        }
+        if change.fires_job_ended() {
+            let _ = orch.trigger_events.send(TriggerEvent::JobEnded {
+                job_id: change.job_id.clone(),
+                status: change.to.to_string(),
+                execution_id: Some(execution_id.to_string()),
+                issue_id: change.issue_id.clone(),
+                project_id: change.project_id.clone(),
+            });
+        }
+    }
+
+    // Any terminal job in the sweep can unblock downstream DAG work; fire one
+    // AdvanceDag for the execution (reduce_dag is idempotent).
+    if advance {
+        match crate::effects::outbox::insert_pending_with_payload(
+            orch.db.local.clone(),
+            "advance_dag",
+            execution_id,
+            "{}",
+        ) {
+            Ok(entry_id) => {
+                if let Some(ref tx) = orch.effect_tx {
+                    let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
+                        execution_id: execution_id.to_string(),
+                        outbox_entry_id: Some(entry_id),
+                    });
+                } else {
+                    log::error!(
+                        "No effect_tx configured — cannot advance DAG for execution {}",
+                        &execution_id[..execution_id.len().min(8)]
+                    );
+                }
+            }
+            Err(e) => log::error!("Failed to enqueue advance_dag outbox entry: {e}"),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::models::{AgentNodeConfig, ConfirmPolicy, NodePosition, SchemaConfig};
+
+    fn agent_node(output_schema: Option<SchemaConfig>) -> RecipeNode {
+        RecipeNode {
+            id: "n".to_string(),
+            node_type: RecipeNodeType::Agent,
+            name: "Agent".to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: Some(AgentNodeConfig {
+                agent_config_id: Some("planner".to_string()),
+                output_schema,
+                git_config: None,
+            }),
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        }
+    }
+
+    fn schema(policy: ConfirmPolicy) -> SchemaConfig {
+        SchemaConfig {
+            name: "plan".to_string(),
+            schema: None,
+            confirm_policy: policy,
+            tool_name: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn top_level_terminal_job_fires_job_ended() {
+        let change = JobStatusChange {
+            job_id: "job-1".to_string(),
+            from: JobStatus::Running,
+            to: JobStatus::Complete,
+            issue_id: Some("issue-1".to_string()),
+            project_id: "project-1".to_string(),
+            parent_job_id: None,
+            parent_tool_use_id: None,
+            blocked_reason: None,
+        };
+
+        assert!(change.fires_job_ended());
+    }
+
+    #[test]
+    fn delegated_child_terminal_job_does_not_fire_job_ended() {
+        let change = JobStatusChange {
+            job_id: "job-1".to_string(),
+            from: JobStatus::Running,
+            to: JobStatus::Complete,
+            issue_id: Some("issue-1".to_string()),
+            project_id: "project-1".to_string(),
+            parent_job_id: Some("parent-1".to_string()),
+            parent_tool_use_id: None,
+            blocked_reason: None,
+        };
+
+        assert!(!change.fires_job_ended());
+    }
+
+    #[test]
+    fn missing_output_block_does_not_emit_lifecycle_message() {
+        let change = JobStatusChange {
+            job_id: "job-1".to_string(),
+            from: JobStatus::Running,
+            to: JobStatus::Blocked,
+            issue_id: Some("issue-1".to_string()),
+            project_id: "project-1".to_string(),
+            parent_job_id: None,
+            parent_tool_use_id: None,
+            blocked_reason: Some(
+                "agent ended its turn without producing required output: `create-pr`".to_string(),
+            ),
+        };
+
+        assert!(!change.emits_blocked_lifecycle_message());
+    }
+
+    #[test]
+    fn approval_block_still_emits_lifecycle_message() {
+        let change = JobStatusChange {
+            job_id: "job-1".to_string(),
+            from: JobStatus::Running,
+            to: JobStatus::Blocked,
+            issue_id: Some("issue-1".to_string()),
+            project_id: "project-1".to_string(),
+            parent_job_id: None,
+            parent_tool_use_id: None,
+            blocked_reason: None,
+        };
+
+        assert!(change.emits_blocked_lifecycle_message());
+    }
+
+    #[test]
+    fn user_policy_is_confirm_gate() {
+        let node = agent_node(Some(schema(ConfirmPolicy::User)));
+        assert_eq!(classify_gate(&node), CheckpointGate::ConfirmGate);
+    }
+
+    #[test]
+    fn auto_policy_is_no_gate() {
+        let node = agent_node(Some(schema(ConfirmPolicy::Auto)));
+        assert_eq!(classify_gate(&node), CheckpointGate::None);
+    }
+
+    #[test]
+    fn no_schema_is_no_gate() {
+        let node = agent_node(None);
+        assert_eq!(classify_gate(&node), CheckpointGate::None);
+    }
+
+    #[test]
+    fn checkpoint_node_is_command_gate() {
+        let node = RecipeNode {
+            id: "c".to_string(),
+            node_type: RecipeNodeType::Checkpoint,
+            name: "Check".to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: Some(crate::models::CheckpointNodeConfig {
+                command: Some("bun run ci".to_string()),
+                prompt: None,
+            }),
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        };
+        assert_eq!(classify_gate(&node), CheckpointGate::Command);
+    }
+}
+
+#[cfg(test)]
+mod artifact_present_tests {
+    use super::{artifact_present_for, recompute_job, recompute_job_status_conn};
+    use crate::db::DbState;
+    use crate::models::{
+        AgentNodeConfig, ConfirmPolicy, ExecutionSnapshot, JobStatus, NodePosition, RecipeNode,
+        RecipeNodeType, RecipeSnapshot, RecipeTrigger, SchemaConfig, TriggerContext, TriggerType,
+    };
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{
+        DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("recompute.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// Seed the minimal FK chain (workspace -> project -> issue -> execution ->
+    /// job) plus a stray `checkpoint` artifact on the job. Deliberately does NOT
+    /// write the required `create-pr` output.
+    async fn seed_job_with_stray_artifact(db: &LocalDb) {
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-1','e-1','i-1','p-1','running','builder','builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, created_at, updated_at) VALUES ('a-chk','j-1','checkpoint','{}',1,'checkpoint',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    fn review_snapshot_json() -> String {
+        let node = RecipeNode {
+            id: "builder".to_string(),
+            node_type: RecipeNodeType::Agent,
+            name: "Builder".to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: Some(AgentNodeConfig {
+                agent_config_id: Some("builder".to_string()),
+                output_schema: Some(SchemaConfig {
+                    name: "create-pr".to_string(),
+                    schema: None,
+                    confirm_policy: ConfirmPolicy::Auto,
+                    tool_name: None,
+                    description: None,
+                }),
+                git_config: None,
+            }),
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        };
+        serde_json::to_string(&ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: "recipe".to_string(),
+                name: "Recipe".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![node],
+                edges: vec![],
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: Some("i-review".to_string()),
+                project_id: "p-review".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 1,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pending_memory_review_allows_completion_and_advancement() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let snapshot = review_snapshot_json();
+        db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-review','recipe','i-review','p-review','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, memory_review_state, created_at, updated_at) VALUES ('j-review','e-review','builder','i-review','p-review','running','builder','builder','sent',1,1)", ()).await?;
+                conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-review','j-review','codex','open',1,1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-review','s-review','j-review',1,'complete','initial',1,2,2)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-review','j-review','create-pr',1,'{}',1,'create-pr',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let derived = db
+            .read(|conn| Box::pin(async move { recompute_job_status_conn(conn, "j-review").await }))
+            .await
+            .unwrap();
+        assert_eq!(derived, JobStatus::Complete);
+
+        let search_index =
+            Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let (effect_tx, _effect_rx) = tokio::sync::mpsc::unbounded_channel();
+        let orch = OrchestratorBuilder::new(db_state, services, temp.path().join("config"))
+            .effect_tx(Some(effect_tx))
+            .build();
+
+        recompute_job(&orch, "j-review").unwrap();
+
+        let status = orch
+            .db
+            .local
+            .query_one("SELECT status FROM jobs WHERE id = 'j-review'", (), |row| {
+                row.text(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "complete");
+        let outbox_count = orch
+            .db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM effect_outbox WHERE kind = 'advance_dag' AND dedupe_key = 'e-review'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outbox_count, 1);
+    }
+
+    #[tokio::test]
+    async fn live_review_turn_keeps_job_running() {
+        // A running MemoryReview turn keeps the job Running — the agent is active,
+        // so the job must not be artificially blocked. Confirmation is decoupled
+        // from run state (it keys off the unconfirmed artifact), so a live review
+        // no longer needs the job forced Blocked. The terminal outcome still
+        // derives from the work turn once the review ends (CAIRN-1576).
+        let db = test_db().await;
+        let snapshot = review_snapshot_json();
+        db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-review','recipe','i-review','p-review','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, memory_review_state, created_at, updated_at) VALUES ('j-review','e-review','builder','i-review','p-review','running','builder','builder','sent',1,1)", ()).await?;
+                conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-review','j-review','codex','open',1,1,1)", ()).await?;
+                // Work turn: completed earlier.
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-work','s-review','j-review',1,'complete','initial',1,2,2)", ()).await?;
+                // Review turn: running, created after the work turn.
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-review','s-review','j-review',2,'running','memory_review',3,NULL,3)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-review','j-review','create-pr',1,'{}',1,'create-pr',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let derived = db
+            .read(|conn| Box::pin(async move { recompute_job_status_conn(conn, "j-review").await }))
+            .await
+            .unwrap();
+        assert_eq!(derived, JobStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn failed_review_turn_does_not_fail_a_confirmed_complete_job() {
+        // A failed MemoryReview turn is excluded from the facts, so a job whose
+        // work turn completed (and whose output is confirmed) stays Complete
+        // rather than being flipped to Failed by the review turn's failure.
+        let db = test_db().await;
+        let snapshot = review_snapshot_json();
+        db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-review','recipe','i-review','p-review','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, memory_review_state, created_at, updated_at) VALUES ('j-review','e-review','builder','i-review','p-review','complete','builder','builder','done',1,1)", ()).await?;
+                conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-review','j-review','codex','open',1,1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-work','s-review','j-review',1,'complete','initial',1,2,2)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-review','s-review','j-review',2,'failed','memory_review',3,4,4)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-review','j-review','create-pr',1,'{}',1,'create-pr',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let derived = db
+            .read(|conn| Box::pin(async move { recompute_job_status_conn(conn, "j-review").await }))
+            .await
+            .unwrap();
+        assert_eq!(derived, JobStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn interrupt_and_cancel_turns_stay_resumable_for_execution_attached_job() {
+        // The execution-attached branch of `recompute_job_status_conn` must honor
+        // the `JobFacts` contract: an Interrupted/Cancelled work turn is a
+        // user-initiated pause, NOT a failure. The job rests resumable (derives
+        // Pending) so it never cascades to downstream — matching the standalone
+        // branch and the bulk sweep. Counting interrupt/cancel as failure here
+        // would report Failed while the persisted bulk value stays resumable.
+        let db = test_db().await;
+        let snapshot = review_snapshot_json();
+        db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-review','recipe','i-review','p-review','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                // Two execution-attached jobs on the same node: one paused via
+                // Interrupt, one via Cancel (turn-level cancel, not the sticky
+                // job-status override).
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-int','e-review','builder','i-review','p-review','running','builder','builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-cancel','e-review','builder','i-review','p-review','running','builder-2','builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-int','j-int','codex','open',1,1,1)", ()).await?;
+                conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-cancel','j-cancel','codex','open',1,1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-int','s-int','j-int',1,'interrupted','initial',1,2,2)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-cancel','s-cancel','j-cancel',1,'cancelled','initial',1,2,2)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let interrupted = db
+            .read(|conn| Box::pin(async move { recompute_job_status_conn(conn, "j-int").await }))
+            .await
+            .unwrap();
+        assert_eq!(
+            interrupted,
+            JobStatus::Pending,
+            "an interrupted work turn must rest resumable (Pending), not Failed"
+        );
+
+        let cancelled = db
+            .read(|conn| Box::pin(async move { recompute_job_status_conn(conn, "j-cancel").await }))
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled,
+            JobStatus::Pending,
+            "a turn-cancelled work turn must rest resumable (Pending), not Failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn stray_artifact_does_not_satisfy_missing_required_output() {
+        // The Part C guarantee: a node that declares `create-pr` but only wrote
+        // some other artifact must NOT be treated as having produced its output.
+        let db = test_db().await;
+        seed_job_with_stray_artifact(&db).await;
+
+        let required = db
+            .read(|conn| {
+                Box::pin(async move { artifact_present_for(conn, "j-1", Some("create-pr")).await })
+            })
+            .await
+            .unwrap();
+        assert!(
+            !required,
+            "a stray checkpoint artifact must not satisfy a missing create-pr output"
+        );
+
+        // The unnamed-contract fallback still sees any artifact.
+        let any = db
+            .read(|conn| Box::pin(async move { artifact_present_for(conn, "j-1", None).await }))
+            .await
+            .unwrap();
+        assert!(any, "unnamed contract falls back to any-artifact presence");
+    }
+
+    #[tokio::test]
+    async fn named_required_artifact_satisfies_gate() {
+        let db = test_db().await;
+        seed_job_with_stray_artifact(&db).await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, created_at, updated_at) VALUES ('a-pr','j-1','pull_request','{}',2,'create-pr',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let present = db
+            .read(|conn| {
+                Box::pin(async move { artifact_present_for(conn, "j-1", Some("create-pr")).await })
+            })
+            .await
+            .unwrap();
+        assert!(present, "the required create-pr artifact is present");
+    }
+}

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::agents::{agent_to_markdown, parse_agent_markdown, AgentExportData};
-use crate::models::{ApprovalPolicy, FilesystemScope, Model};
+use crate::models::{Fence, Model};
 
 use super::{id_from_path, ConfigResult};
 
@@ -23,8 +23,7 @@ pub struct FileAgent {
     pub tools: Vec<String>,
     #[serde(alias = "model")]
     pub tier: Option<Model>,
-    pub approval_policy: Option<ApprovalPolicy>,
-    pub filesystem_scope: Option<FilesystemScope>,
+    pub fence: Option<Fence>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub hooks: Option<serde_json::Value>,
@@ -48,40 +47,19 @@ pub fn list_agents(
 ) -> Result<Vec<ConfigResult<FileAgent>>, String> {
     let mut results = vec![];
 
-    // Read workspace-scoped agents
-    let ws_dir = config_dir.join("agents");
-    if ws_dir.exists() {
-        for entry in std::fs::read_dir(&ws_dir)
+    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "agents") {
+        if !dir.exists() || !dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir)
             .map_err(|e| format!("Failed to read agents directory: {}", e))?
         {
             let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
             let path = entry.path();
-
-            // Skip directories and non-.md files
             if path.is_dir() || path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-
-            results.push(load_agent_file(&path, false));
-        }
-    }
-
-    // Read project-scoped agents if project path specified
-    if let Some(proj_path) = project_path {
-        let proj_dir = proj_path.join(".cairn").join("agents");
-        if proj_dir.exists() && proj_dir.is_dir() {
-            for entry in std::fs::read_dir(&proj_dir)
-                .map_err(|e| format!("Failed to read project agents directory: {}", e))?
-            {
-                let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-                let path = entry.path();
-
-                if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                    continue;
-                }
-
-                results.push(load_agent_file(&path, true));
-            }
+            results.push(load_agent_file(&path, is_project_scoped));
         }
     }
 
@@ -96,27 +74,14 @@ pub fn get_agent(
     id: &str,
     project_path: Option<&Path>,
 ) -> Result<Option<FileAgent>, String> {
-    // Try project-scoped first if project specified
-    if let Some(proj_path) = project_path {
-        let path = proj_path
-            .join(".cairn")
-            .join("agents")
-            .join(format!("{}.md", id));
+    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "agents") {
+        let path = dir.join(format!("{}.md", id));
         if path.exists() {
-            return match load_agent_file(&path, true) {
+            return match load_agent_file(&path, is_project_scoped) {
                 ConfigResult::Ok(agent) => Ok(Some(agent)),
                 ConfigResult::Err { error, .. } => Err(error),
             };
         }
-    }
-
-    // Try workspace-scoped
-    let path = config_dir.join("agents").join(format!("{}.md", id));
-    if path.exists() {
-        return match load_agent_file(&path, false) {
-            ConfigResult::Ok(agent) => Ok(Some(agent)),
-            ConfigResult::Err { error, .. } => Err(error),
-        };
     }
 
     Ok(None)
@@ -163,8 +128,7 @@ pub fn save_agent(
         tools: &agent.tools,
         tier: agent.tier.as_ref().map(|m| m.to_string()).as_deref(),
         prompt: &agent.prompt,
-        approval_policy: agent.approval_policy,
-        filesystem_scope: agent.filesystem_scope,
+        fence: agent.fence,
         disallowed_tools: agent.disallowed_tools.as_deref(),
         skills: agent.skills.as_deref(),
         hooks: agent.hooks.as_ref(),
@@ -290,8 +254,7 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
                 prompt: parsed.prompt,
                 tools: parsed.tools,
                 tier,
-                approval_policy: parsed.approval_policy,
-                filesystem_scope: parsed.filesystem_scope,
+                fence: parsed.fence,
                 disallowed_tools: parsed.disallowed_tools,
                 skills: parsed.skills,
                 hooks: parsed.hooks,
@@ -311,6 +274,50 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn get_agent_walks_project_then_workspace() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(project_dir.join(".cairn/agents")).unwrap();
+
+        std::fs::write(
+            config_dir.join("agents/shared.md"),
+            "---\nname: Workspace\ndescription: workspace agent\ntools:
+  - Read\n---\n\nWorkspace prompt.",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join(".cairn/agents/shared.md"),
+            "---\nname: Project\ndescription: project agent\ntools:
+  - Read\n---\n\nProject prompt.",
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("agents/workspace-only.md"),
+            "---\nname: Workspace Only\ndescription: workspace only\ntools:
+  - Read\n---\n\nWorkspace only prompt.",
+        )
+        .unwrap();
+
+        let shared = get_agent(&config_dir, "shared", Some(&project_dir))
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.name, "Project");
+        assert!(shared.is_project_scoped);
+
+        let workspace = get_agent(&config_dir, "workspace-only", Some(&project_dir))
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.name, "Workspace Only");
+        assert!(!workspace.is_project_scoped);
+
+        assert!(get_agent(&config_dir, "missing", Some(&project_dir))
+            .unwrap()
+            .is_none());
+    }
 
     #[test]
     fn test_load_agent_roundtrip() {

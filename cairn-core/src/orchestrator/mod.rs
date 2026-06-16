@@ -6,35 +6,55 @@
 
 pub mod account_manager;
 pub mod agents;
-pub mod conflict_resolution;
+pub mod attention;
+pub mod attention_delivery;
+pub mod attention_ledger;
+pub mod base_advance;
+pub mod build_services;
+pub mod config_resource;
 pub mod docs;
 pub mod identity;
 pub mod lifecycle;
+pub mod lsp;
+pub mod parent_wake;
 pub mod recipes;
 pub mod session;
 pub mod settings;
 pub mod skills;
+pub mod wakes;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::broadcast;
+use tokio::sync::Mutex as TokioMutex;
 
 use crate::agent_process::process::AgentProcessState;
 use crate::api::ApiConfig;
-use crate::backends::{backend_for_name, ProviderModelCatalog};
+use crate::backends::context_window::{claude_context_window, ClaudeContextOptIn};
+use crate::backends::{backend_for_name, DiscoveredModel, ProviderModelCatalog};
 use crate::db::DbState;
 use crate::effects::executor::EffectExecutor;
 use crate::effects::types::WorkflowEffect;
-use crate::embeddings::{EmbeddingEngine, VibeState};
+use crate::embeddings::{
+    spawn_embed_worker, EmbedJob, EmbeddingClient, PositionConfig, PositionKind, PositionMeta,
+    VibeState,
+};
 use crate::identity::IdentityStore;
+use crate::mcp::gateway::McpGateway;
 use crate::mcp::McpAuthState;
-use crate::models::{ProviderUsageSnapshot, TriggerEvent};
+use crate::models::{
+    get_latest_context_token_event, ContextTokenState, ProviderUsageSnapshot, TriggerEvent,
+};
 use crate::notify::Notifier;
-use crate::services::{PtyState, Services};
+use crate::services::{ChildProcess, PtyState, Services};
 use crate::sync::SyncMessage;
 
+pub use crate::account::AnonDeviceManager;
+pub use lsp::{RenamePlan, RenameSpec};
 pub use account_manager::AccountManager;
+pub use attention::{AttentionEvent, AttentionFact, AttentionFactKey};
 
 pub struct OrchestratorBuilder {
     db: Arc<DbState>,
@@ -47,13 +67,14 @@ pub struct OrchestratorBuilder {
     run_completions: broadcast::Sender<String>,
     prompt_responses: broadcast::Sender<(String, String)>,
     trigger_events: broadcast::Sender<TriggerEvent>,
+    attention_changed: broadcast::Sender<AttentionEvent>,
     session_allowed_tools: Arc<Mutex<HashSet<String>>>,
+    session_allowed_crossings: Arc<Mutex<HashSet<String>>>,
     identity_store: Arc<Mutex<Option<IdentityStore>>>,
     mcp_binary_path: String,
     config_dir: PathBuf,
     schema_dir: Option<PathBuf>,
     mcp_callback_port: u16,
-    embedding_engine: Option<Arc<std::sync::Mutex<EmbeddingEngine>>>,
     vibe_state: Option<Arc<VibeState>>,
     account_manager: Arc<AccountManager>,
     sync_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SyncMessage>>>>,
@@ -62,6 +83,7 @@ pub struct OrchestratorBuilder {
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
+    context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
 }
 
 impl OrchestratorBuilder {
@@ -73,7 +95,9 @@ impl OrchestratorBuilder {
         let run_completions = broadcast::channel(64).0;
         let prompt_responses = broadcast::channel(16).0;
         let trigger_events = broadcast::channel(256).0;
+        let attention_changed = broadcast::channel(64).0;
         let session_allowed_tools = Arc::new(Mutex::new(HashSet::new()));
+        let session_allowed_crossings = Arc::new(Mutex::new(HashSet::new()));
         let identity_store = Arc::new(Mutex::new(None));
         let account_manager = Arc::new(AccountManager::new(db.clone(), services.emitter.clone()));
         let sync_tx = Arc::new(std::sync::Mutex::new(None));
@@ -90,13 +114,14 @@ impl OrchestratorBuilder {
             run_completions,
             prompt_responses,
             trigger_events,
+            attention_changed,
             session_allowed_tools,
+            session_allowed_crossings,
             identity_store,
-            mcp_binary_path: "cairn-mcp".to_string(),
+            mcp_binary_path: "cairn-cli".to_string(),
             config_dir,
             schema_dir: None,
             mcp_callback_port: 0,
-            embedding_engine: None,
             vibe_state: None,
             account_manager,
             sync_tx,
@@ -105,6 +130,7 @@ impl OrchestratorBuilder {
             effect_tx: None,
             model_catalog: Arc::new(RwLock::new(HashMap::new())),
             provider_usage_snapshots: Arc::new(RwLock::new(HashMap::new())),
+            context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -157,6 +183,14 @@ impl OrchestratorBuilder {
         self
     }
 
+    pub fn attention_changed(
+        mut self,
+        attention_changed: broadcast::Sender<AttentionEvent>,
+    ) -> Self {
+        self.attention_changed = attention_changed;
+        self
+    }
+
     pub fn identity_store(mut self, identity_store: Option<IdentityStore>) -> Self {
         self.identity_store = Arc::new(Mutex::new(identity_store));
         self
@@ -174,14 +208,6 @@ impl OrchestratorBuilder {
 
     pub fn mcp_callback_port(mut self, mcp_callback_port: u16) -> Self {
         self.mcp_callback_port = mcp_callback_port;
-        self
-    }
-
-    pub fn embedding_engine(
-        mut self,
-        embedding_engine: Option<Arc<std::sync::Mutex<EmbeddingEngine>>>,
-    ) -> Self {
-        self.embedding_engine = embedding_engine;
         self
     }
 
@@ -222,6 +248,10 @@ impl OrchestratorBuilder {
     }
 
     pub fn build(self) -> Orchestrator {
+        let anon_device_manager = Arc::new(AnonDeviceManager::new(
+            self.db.clone(),
+            self.api_config.clone(),
+        ));
         Orchestrator {
             db: self.db,
             services: self.services,
@@ -233,24 +263,41 @@ impl OrchestratorBuilder {
             run_completions: self.run_completions,
             prompt_responses: self.prompt_responses,
             trigger_events: self.trigger_events,
+            attention_changed: self.attention_changed,
             session_allowed_tools: self.session_allowed_tools,
+            session_allowed_crossings: self.session_allowed_crossings,
             identity_store: self.identity_store,
             mcp_binary_path: self.mcp_binary_path,
             config_dir: self.config_dir,
             schema_dir: self.schema_dir,
             mcp_callback_port: self.mcp_callback_port,
-            embedding_engine: self.embedding_engine,
             vibe_state: self.vibe_state,
+            embed_tx: Arc::new(Mutex::new(None)),
+            anon_device_manager,
             account_manager: self.account_manager,
             sync_tx: self.sync_tx,
             notifier: self.notifier,
             api_config: self.api_config,
             effect_tx: self.effect_tx,
             executor: Arc::new(OnceLock::new()),
+            mcp_gateway: Arc::new(OnceLock::new()),
             model_catalog: self.model_catalog,
             provider_usage_snapshots: self.provider_usage_snapshots,
+            context_token_snapshots: self.context_token_snapshots,
+            execution_locks: Arc::new(Mutex::new(HashMap::new())),
+            setup_registry: Arc::new(Mutex::new(HashMap::new())),
+            build_service_children: Arc::new(Mutex::new(HashMap::new())),
+            lsp_manager: Arc::new(crate::lsp::manager::LspManager::new()),
+            agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
+            blocker_escalation_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
+}
+
+/// Cancel state for an in-flight worktree/setup preparation.
+pub struct SetupHandle {
+    pub cancel: Arc<AtomicBool>,
+    pub child: Arc<Mutex<Option<Box<dyn ChildProcess>>>>,
 }
 
 /// Central runtime state for agent orchestration.
@@ -259,7 +306,7 @@ impl OrchestratorBuilder {
 /// Passed to all orchestration functions as `&Orchestrator`.
 #[derive(Clone)]
 pub struct Orchestrator {
-    /// Database connection state (SQLite + Diesel)
+    /// Database connection state.
     pub db: Arc<DbState>,
     /// Service abstractions (event emitter, process spawner, clock, filesystem)
     pub services: Arc<Services>,
@@ -288,16 +335,37 @@ pub struct Orchestrator {
     /// and dispatches through `process_trigger_event`.
     pub trigger_events: broadcast::Sender<TriggerEvent>,
 
+    /// Attention-changed broadcast: payload = typed [`AttentionEvent`].
+    ///
+    /// Each emission corresponds to a discrete actionable fact (a question is
+    /// stored, a permission requested, an artifact written, the agent's turn
+    /// terminalized with work remaining, a PR state changed, an issue
+    /// resolved). The event carries enough content for the `watch` long-poll
+    /// handler to build a response without a follow-up `read`. Emit through
+    /// [`Orchestrator::emit_attention_event`] so the dedupe cache collapses
+    /// repeated-fact bursts (e.g. an artifact patched five times in a 500ms
+    /// window emits once with the freshest content).
+    pub attention_changed: broadcast::Sender<AttentionEvent>,
+
     /// Tools auto-allowed via "Allow for Session" permission responses.
-    /// Checked in handle_permission_prompt before showing UI.
+    /// Checked in the Codex permission flow before prompting the user.
     pub session_allowed_tools: Arc<Mutex<HashSet<String>>>,
+
+    /// Worktree-fence crossings auto-allowed via an `allow` + `scope: session`
+    /// permission answer. Keyed by the crossing's canonical descriptor (the
+    /// `descriptor` field of a [`crate::mcp::handlers::fence::Crossing`]).
+    /// Session-scoped tools cannot be reused here because a fenced verb's tool
+    /// name is always `read`/`write`/`run`; the descriptor (path or command)
+    /// is what distinguishes one crossing from another. Checked in
+    /// `raise_fence` before suspending.
+    pub session_allowed_crossings: Arc<Mutex<HashSet<String>>>,
 
     /// Multi-account identity store. None = anonymous/legacy mode.
     /// Populated from local identity store (desktop) or JWT claims (server).
     pub identity_store: Arc<Mutex<Option<IdentityStore>>>,
 
     // === Host-specific paths (set by Tauri or cairn-server) ===
-    /// Path to the cairn-mcp binary
+    /// Path to the cairn-cli binary
     pub mcp_binary_path: String,
     /// Directory for writing MCP config files
     pub config_dir: PathBuf,
@@ -305,10 +373,10 @@ pub struct Orchestrator {
     pub schema_dir: Option<PathBuf>,
     /// Port for the MCP callback server
     pub mcp_callback_port: u16,
-    /// Embedding engine for inline computation (None if init failed)
-    pub embedding_engine: Option<Arc<std::sync::Mutex<EmbeddingEngine>>>,
-    /// Vibe state for embedding-based color assignment (None if embeddings unavailable)
+    /// Vibe state for embedding-based color assignment (None if centroids unavailable)
     pub vibe_state: Option<Arc<VibeState>>,
+    /// Sender into the async event-embed worker. None until the worker is started.
+    pub embed_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EmbedJob>>>>,
 
     // === Team connection state (multi-team) ===
     /// Multi-team manager: handles DB-backed team configs, JWT refresh, credential resolution
@@ -316,6 +384,10 @@ pub struct Orchestrator {
     // === Account connection (replaces teams for individual users) ===
     /// Account manager: device code auth, single-account JWT lifecycle
     pub account_manager: Arc<AccountManager>,
+
+    /// Anonymous device manager: user-less JWT for the `/embed` gateway so
+    /// embedding works logged-out. Account JWT takes precedence when connected.
+    pub anon_device_manager: Arc<AnonDeviceManager>,
 
     // === Remote sync channel ===
     /// Sync sender for dual-writing to cloud. None when not connected or no plan.
@@ -348,10 +420,59 @@ pub struct Orchestrator {
     /// which isn't available until after the Orchestrator is built.
     pub executor: Arc<OnceLock<Arc<dyn EffectExecutor>>>,
 
+    /// Host-specific gateway to external MCP servers (the `cairn://mcp/...`
+    /// family). `None` until a host sets it; `read`/`run` MCP dispatch returns a
+    /// clear error when unset. Wrapped like `executor` so it's Clone-compatible
+    /// and settable after construction via `&self`.
+    pub mcp_gateway: Arc<OnceLock<Arc<dyn McpGateway>>>,
+
     /// Cached provider model catalog loaded at startup and refreshed on demand.
     pub model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     /// Latest provider/account usage snapshots keyed by backend name.
     pub provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
+    /// Latest normalized context-token snapshots keyed by durable session id.
+    pub context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
+
+    /// Per-execution locks to serialize read-modify-write operations on snapshots.
+    /// Prevents concurrent `persist_task_packet` calls from losing packets.
+    pub execution_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+
+    /// In-flight worktree/setup preparation handles, keyed by job id.
+    pub setup_registry: Arc<Mutex<HashMap<String, SetupHandle>>>,
+
+    /// Launcher handles for supervised Managed Build Service daemons, keyed by
+    /// service name. Held so a foreground daemon can be stopped on shutdown; a
+    /// daemon that detaches (e.g. an sccache server) outlives its launcher,
+    /// which is acceptable for a shared cache. See `orchestrator::build_services`.
+    pub build_service_children: Arc<Mutex<HashMap<String, Box<dyn ChildProcess>>>>,
+
+    /// Per-worktree LSP instance pool. Lazily spawns language servers and pools
+    /// them by `(language, indexing root)`; idle instances are swept on access
+    /// and via the warm-process eviction cadence. See `crate::lsp`.
+    pub lsp_manager: Arc<crate::lsp::manager::LspManager>,
+
+    /// Wakes the blocker-escalation worker when a new pending question/permission
+    /// item arms an escalation deadline, so the worker re-computes its next sleep
+    /// instead of polling (CAIRN-1647).
+    pub blocker_escalation_notify: Arc<tokio::sync::Notify>,
+
+    /// Per-run dedupe for legacy `agent-attention` terminal toasts.
+    ///
+    /// The completion toast now fires at the turn idle boundary while the same
+    /// run may later EOF/finalize. Keying by run id suppresses cleanup-path
+    /// duplicates and repeated crash finalization attempts.
+    pub agent_completion_attention_dedupe: Arc<Mutex<HashSet<String>>>,
+}
+
+/// Resolve the `/embed` gateway token: account JWT preferred, anonymous device
+/// JWT as fallback. Single source of truth for `embed_token_provider`'s
+/// precedence so it can be unit-tested without a full Orchestrator.
+fn resolve_embed_token(account: &AccountManager, anon: &AnonDeviceManager) -> Option<String> {
+    account
+        .get_jwt()
+        .ok()
+        .flatten()
+        .or_else(|| anon.get_anon_jwt().ok().flatten())
 }
 
 impl Orchestrator {
@@ -368,6 +489,107 @@ impl Orchestrator {
         executor: Arc<dyn EffectExecutor>,
     ) -> Result<(), Arc<dyn EffectExecutor>> {
         self.executor.set(executor)
+    }
+
+    /// Set the external MCP gateway after construction (mirrors `set_executor`).
+    pub fn set_mcp_gateway(&self, gateway: Arc<dyn McpGateway>) -> Result<(), Arc<dyn McpGateway>> {
+        self.mcp_gateway.set(gateway)
+    }
+
+    /// The configured MCP gateway, if a host has set one.
+    pub fn mcp_gateway(&self) -> Option<&Arc<dyn McpGateway>> {
+        self.mcp_gateway.get()
+    }
+
+    /// Get or create a per-execution lock for serializing snapshot mutations.
+    pub fn execution_lock(&self, execution_id: &str) -> Arc<TokioMutex<()>> {
+        let mut map = self.execution_locks.lock().unwrap();
+        map.entry(execution_id.to_string())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    /// Emit a typed attention event to any in-flight `watch` long-poll.
+    ///
+    /// Consults the short-window dedupe cache: if an emit for the same
+    /// `(issue_id, fact-key)` landed within the dedupe window, the new one is
+    /// dropped (the prior emit's content is already in-flight to subscribers).
+    /// Fire-and-forget: a send error (no subscribers) is ignored.
+    ///
+    /// Also opportunistically prunes the dedupe cache on each emit: when the
+    /// cache exceeds `DEDUPE_CACHE_SWEEP_THRESHOLD` entries, drop everything
+    /// older than the dedupe window (those entries can no longer suppress
+    /// anything). Bounded growth, no background task required.
+    pub fn emit_attention_event(&self, event: AttentionEvent) {
+        let key = event.fact.key();
+        log::debug!(
+            "attention_emit: issue={} kind={} status={} attention={}",
+            event.issue_id,
+            key.kind,
+            event.status,
+            event.attention
+        );
+        // CAIRN-1647: issue-attention facts drive the durable attention ledger
+        // (open/bump/resolve + watcher evaluation), which replaces the frozen
+        // `[Child update] … Read X.` system-direct and its 1s dedupe cache —
+        // keyed-item idempotency makes the cache unnecessary. The legacy router
+        // is retained only for `ExternalMessageReply`, which targets external
+        // `cairn watch` drivers rather than a parent wake.
+        match &event.fact {
+            AttentionFact::ExternalMessageReply { .. } => {
+                let _ = crate::orchestrator::wakes::route_child_attention(
+                    self,
+                    &event.issue_id,
+                    &event.issue_uri,
+                    &event.attention.to_string(),
+                    key.kind,
+                    key.detail_uri.as_deref(),
+                    event.fact.urgency(),
+                );
+            }
+            _ => {
+                crate::orchestrator::attention_delivery::open_and_schedule_for_fact(self, &event);
+            }
+        }
+        let _ = self.attention_changed.send(event);
+    }
+
+    /// Wake any in-flight `cairn watch` for an issue whose actionable state
+    /// may have just changed. Reads the live projection and emits a typed
+    /// `Resolved` (terminal status) or `AgentIdleWithWork` (attention != None,
+    /// or attention None with an open PR work product) event. No-ops if none of
+    /// those hold: the agent isn't idle in any way the watcher needs to learn
+    /// about.
+    ///
+    /// Use this at *boundary* sites that don't correspond to a single typed
+    /// fact (manual merge resolution, execution start, permission answered,
+    /// manual issue close, prompt answered, PR just opened). Discrete
+    /// actionable facts — question stored, permission requested, artifact
+    /// written, webhook PR state — should construct the event inline so the
+    /// watch handler can render the specific content. Fact construction is
+    /// shared with the turn-end emit via [`attention::idle_fact_for_issue`].
+    pub async fn wake_for_issue(&self, issue_id: &str) {
+        let ctx = match attention::read_issue_for_attention(&self.db.local, issue_id).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                log::debug!("wake_for_issue skip ({}): {}", issue_id, e);
+                return;
+            }
+        };
+        let issue_uri = ctx.issue_uri();
+        let Some(idle) = attention::idle_fact_for_issue(&self.db.local, issue_id, &ctx, None).await
+        else {
+            // No actionable state, not terminal, no open PR — nothing for `watch`.
+            return;
+        };
+        self.emit_attention_event(AttentionEvent {
+            issue_id: issue_id.to_string(),
+            issue_uri,
+            fact: idle.fact,
+            attention: ctx.attention,
+            status: ctx.status,
+            updated_at: idle.updated_at,
+        });
     }
 
     /// Send a sync message to the cloud (no-op if sync not active).
@@ -412,13 +634,244 @@ impl Orchestrator {
         }
     }
 
+    /// Start the async embed worker. Call once at startup, on a tokio runtime.
+    /// Handles both event vibe coloring and corpus resource embedding through a
+    /// single channel. Vibe coloring is skipped when axes are unavailable;
+    /// resource embedding always runs (the gateway returns `Ok(None)` with no
+    /// account, so starting unconditionally is safe). Jobs enqueued before this
+    /// is called are dropped.
+    pub fn start_embed_worker(&self) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = EmbeddingClient::new(self.api_config.clone(), self.embed_token_provider());
+        spawn_embed_worker(
+            rx,
+            client,
+            self.db.local.clone(),
+            self.vibe_state.clone(),
+            self.services.emitter.clone(),
+        );
+        if let Ok(mut guard) = self.embed_tx.lock() {
+            *guard = Some(tx);
+        }
+    }
+
+    /// Token provider for the `/embed` gateway: prefers the connected account's
+    /// JWT, falling back to the anonymous device JWT when logged out. Returns
+    /// `None` only when neither is available (embedding then no-ops).
+    pub fn embed_token_provider(&self) -> crate::embeddings::TokenProvider {
+        let am = self.account_manager.clone();
+        let anon = self.anon_device_manager.clone();
+        Arc::new(move || resolve_embed_token(&am, &anon))
+    }
+
+    /// Spawn a background task that registers an anonymous device JWT for the
+    /// `/embed` gateway and keeps it fresh. Registers immediately, then
+    /// re-checks every ~12h (well inside the 30-day token TTL). Best-effort:
+    /// failures leave embedding neutral until the next attempt. Idempotent at
+    /// the API level (reuses the persisted device_id).
+    ///
+    /// Runs unconditionally, even when an account is connected: the account JWT
+    /// takes precedence in `embed_token_provider`, but keeping the anon token
+    /// warm means embedding keeps working immediately on logout. The anon token
+    /// is `type: "device_anon"` and is only ever accepted by `/embed`.
+    pub fn start_anon_device(&self) {
+        let anon = self.anon_device_manager.clone();
+        tokio::spawn(async move {
+            loop {
+                anon.ensure_registered().await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(12 * 3600)).await;
+            }
+        });
+    }
+
+    /// Spawn the one-time archival backfill on a background task.
+    ///
+    /// Call once at startup, on a tokio runtime. Compresses the events of
+    /// already-torn-down executions (history the teardown writer can never reach)
+    /// into their durable archival form, gated by `archival_backfill_state` so it
+    /// runs once, never on every startup; the work is detached so it never blocks
+    /// startup or the UI. This frees pages to the freelist but does NOT shrink the
+    /// database file: file-size reclamation is deferred (see the
+    /// `archival::backfill` module docs and CAIRN-1556).
+    pub fn spawn_archival_maintenance(&self) {
+        let db = self.db.local.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::archival::run_archival_maintenance(&db).await {
+                log::warn!("archival maintenance failed: {e}");
+            }
+        });
+    }
+
+    /// Spawn the pending-blocker escalation worker (CAIRN-1647).
+    ///
+    /// A question/permission attention item opens passive and arms an absolute
+    /// deadline (`attention_items.escalate_at`). This worker sleeps until the
+    /// soonest deadline — woken early via `blocker_escalation_notify` when a new
+    /// blocker arms a nearer one — then escalates any blocker still open at its
+    /// deadline to a steering wake. It is a timer, not a poll: it sleeps exactly
+    /// until the next deadline and otherwise blocks on the notify. Durable:
+    /// deadlines live in the ledger, so a restart re-arms every timer on the
+    /// first pass and fires anything already overdue immediately.
+    pub fn spawn_blocker_escalation_worker(&self) {
+        // Floor on the immediate-fire path so a transient clear failure can't
+        // spin the loop hot.
+        const IMMEDIATE_FIRE_FLOOR: std::time::Duration = std::time::Duration::from_millis(200);
+        let orch = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let next =
+                    crate::orchestrator::attention_ledger::min_pending_escalation(&orch.db.local)
+                        .await
+                        .ok()
+                        .flatten();
+                match next {
+                    None => orch.blocker_escalation_notify.notified().await,
+                    Some(due_at) => {
+                        let now = chrono::Utc::now().timestamp();
+                        if due_at <= now {
+                            crate::orchestrator::attention_delivery::fire_due_blocker_escalations(
+                                &orch,
+                            )
+                            .await;
+                            tokio::time::sleep(IMMEDIATE_FIRE_FLOOR).await;
+                        } else {
+                            let dur = std::time::Duration::from_secs((due_at - now) as u64);
+                            tokio::select! {
+                                _ = tokio::time::sleep(dur) => {
+                                    crate::orchestrator::attention_delivery::fire_due_blocker_escalations(&orch).await;
+                                }
+                                _ = orch.blocker_escalation_notify.notified() => {}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Spawn the memory-triage reconciliation sweep: once immediately at
+    /// startup, then on a periodic timer. The sweep is driven entirely by DB
+    /// state and guarantees every at-threshold pending pool has a triage issue
+    /// even when no fresh same-scope confirmation occurs (accumulated pools,
+    /// reverted/deferred batches, lowered thresholds, crashes between claim and
+    /// issue creation, drafts stranded on failed/interrupted jobs). Idempotent;
+    /// errors are logged, never fatal. Must be called from within a tokio
+    /// runtime context.
+    pub fn spawn_memory_triage_reconcile(&self) {
+        /// Cadence of the reconciliation sweep after its immediate startup pass.
+        /// Hourly: this is a safety net behind the event-driven fast path, not a
+        /// latency-sensitive path.
+        const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            loop {
+                // The first tick fires immediately, so reconciliation runs once
+                // at startup, then every RECONCILE_INTERVAL.
+                interval.tick().await;
+                if let Err(error) =
+                    crate::memories::triage::reconcile_memory_triage(orch.clone()).await
+                {
+                    log::warn!("memory triage reconcile failed: {error}");
+                }
+            }
+        });
+    }
+
+    /// Send a job to the embed worker. Non-blocking; a no-op if the worker
+    /// hasn't been started.
+    fn send_embed_job(&self, job: EmbedJob) {
+        if let Ok(guard) = self.embed_tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(job);
+            }
+        }
+    }
+
+    /// Enqueue an assistant event for async embedding + vibe coloring only
+    /// (no session position). Used by the outbox replay/recovery path, where
+    /// re-folding would double-count. Non-blocking; a no-op if the worker
+    /// hasn't been started.
+    pub fn enqueue_event_embed(&self, event_id: &str, text: String) {
+        self.send_embed_job(EmbedJob::Event {
+            event_id: event_id.to_string(),
+            text,
+            position: None,
+        });
+    }
+
+    /// Enqueue an event for async embedding that both (for agent content) colors
+    /// and folds into the session's semantic position. `kind` selects the feed
+    /// (user / agent content / change signal); `tokens` is the event's token
+    /// count when known, used to weight its contribution. Non-blocking; a no-op
+    /// if the worker hasn't been started.
+    pub fn enqueue_position_embed(
+        &self,
+        session_id: &str,
+        event_id: &str,
+        kind: PositionKind,
+        text: String,
+        tokens: Option<i32>,
+    ) {
+        let weight = PositionConfig::default().weight_for(kind, tokens, &text);
+        self.send_embed_job(EmbedJob::Event {
+            event_id: event_id.to_string(),
+            text,
+            position: Some(PositionMeta::new(session_id, kind, weight)),
+        });
+    }
+
+    /// Enqueue a corpus resource for async embedding. Empty/whitespace text
+    /// enqueues a delete instead (e.g. a description cleared to blank).
+    /// Non-blocking; a no-op if the worker hasn't been started.
+    pub fn enqueue_resource_embed(&self, uri: &str, text: String) {
+        self.send_embed_job(EmbedJob::resource(uri, text));
+    }
+
+    /// Enqueue removal of a corpus resource's embedding.
+    /// Non-blocking; a no-op if the worker hasn't been started.
+    pub fn enqueue_resource_delete(&self, uri: &str) {
+        self.send_embed_job(EmbedJob::ResourceDelete {
+            uri: uri.to_string(),
+        });
+    }
+
     /// Evict a warm process if needed to make room for a new one.
     /// Returns the run_id of the evicted process, if any.
     pub fn collect_warm_if_needed(&self) -> Option<String> {
-        let gc = self.warm_gc.as_ref()?;
+        // Eviction-cadence backstop to the LSP pool's access-time idle sweep:
+        // best-effort, never gated on warm-process state.
+        self.lsp_collect_idle();
+        let gc = self.warm_gc.as_ref()?.clone();
+        let process_state = self.process_state.clone();
+        let db = self.db.local.clone();
+
         let eviction_candidate = {
-            let mut conn = self.db.conn.lock().ok()?;
-            gc.find_eviction_candidate(&self.process_state, &mut conn)
+            fn run_lookup(
+                gc: Arc<crate::agent_process::gc::WarmProcessGC>,
+                process_state: Arc<AgentProcessState>,
+                db: Arc<crate::storage::LocalDb>,
+            ) -> Option<String> {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        log::error!("GC: failed to create database runtime: {}", error);
+                        error
+                    })
+                    .ok()?
+                    .block_on(async move { gc.find_eviction_candidate(&process_state, &db).await })
+            }
+
+            if tokio::runtime::Handle::try_current().is_ok() {
+                std::thread::spawn(move || run_lookup(gc, process_state, db))
+                    .join()
+                    .map_err(|_| log::error!("GC: database lookup thread panicked"))
+                    .ok()
+                    .flatten()
+            } else {
+                run_lookup(gc, process_state, db)
+            }
         };
 
         if let Some(ref run_id) = eviction_candidate {
@@ -443,6 +896,113 @@ impl Orchestrator {
         providers
     }
 
+    /// Store a provider/account usage snapshot and notify the frontend.
+    ///
+    /// The single store path for both backends: it writes the in-memory cache
+    /// (read by `get_provider_usage_snapshot`) **and** emits `provider-usage-updated`
+    /// so the usage panel updates live instead of only on a manual refresh. Both
+    /// Claude (`rate_limit_event`) and Codex (`account/rateLimits/updated`) route
+    /// here, as does the manual refresh command.
+    pub fn store_provider_usage_snapshot(&self, snapshot: ProviderUsageSnapshot) {
+        {
+            let Ok(mut guard) = self.provider_usage_snapshots.write() else {
+                return;
+            };
+            // Prefer the richer source. A coarse live snapshot (Claude
+            // `rate_limit_event`, a single status window) must not overwrite a
+            // richer manual-probe snapshot (`claude_usage_tui` / `codex_rate_limits`,
+            // the canonical 5-hour + weekly windows) already cached, or the panel
+            // would flip shape mid-run. Equal-or-greater rank still updates, so
+            // Codex's rich live events and every manual refresh flow through.
+            if let Some(existing) = guard.get(&snapshot.backend) {
+                if snapshot.panel_rank() < existing.panel_rank() {
+                    return;
+                }
+            }
+            guard.insert(snapshot.backend.clone(), snapshot.clone());
+        }
+        let _ = self.services.emitter.emit(
+            "provider-usage-updated",
+            serde_json::json!({
+                "backend": snapshot.backend,
+                "snapshot": snapshot,
+            }),
+        );
+    }
+
+    /// Store a normalized context-token snapshot and notify the frontend.
+    ///
+    /// Snapshots are keyed by durable session id and represent the latest turn's
+    /// full prompt plus that turn's output, not cumulative usage across turns.
+    pub fn store_context_token_snapshot(&self, state: ContextTokenState) {
+        let Some(session_id) = state.session_id.clone() else {
+            return;
+        };
+        {
+            let Ok(mut guard) = self.context_token_snapshots.write() else {
+                return;
+            };
+            guard.insert(session_id.clone(), state.clone());
+        }
+
+        let _ = self.services.emitter.emit(
+            "context-tokens-updated",
+            serde_json::json!({
+                "sessionId": session_id,
+                "state": state,
+            }),
+        );
+    }
+
+    pub async fn get_context_token_state(&self, session_id: &str) -> Option<ContextTokenState> {
+        if let Some(state) = self
+            .context_token_snapshots
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(session_id).cloned())
+        {
+            return Some(state);
+        }
+
+        let snapshot = match get_latest_context_token_event(self.db.local.clone(), session_id).await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::warn!("Failed to derive context token state from events: {error}");
+                None
+            }
+        }?;
+        let context_window =
+            self.context_window_for_context_tokens(&snapshot.backend, snapshot.model.as_deref());
+        let state = snapshot.into_state(context_window);
+
+        if let Ok(mut guard) = self.context_token_snapshots.write() {
+            guard.insert(session_id.to_string(), state.clone());
+        }
+        Some(state)
+    }
+
+    fn context_window_for_context_tokens(&self, backend: &str, model: Option<&str>) -> Option<i64> {
+        if backend.eq_ignore_ascii_case("claude") {
+            return Some(claude_context_window(
+                model.unwrap_or("unknown"),
+                ClaudeContextOptIn::default(),
+            ));
+        }
+
+        if backend.eq_ignore_ascii_case("codex") {
+            return model.and_then(|model| {
+                self.model_catalog
+                    .read()
+                    .ok()
+                    .and_then(|catalog| catalog.get("codex").cloned())
+                    .and_then(|catalog| context_window_from_catalog(&catalog.models, model))
+            });
+        }
+
+        None
+    }
+
     pub fn refresh_model_catalog(&self) {
         for backend_name in ["claude", "codex"] {
             let backend = backend_for_name(Some(backend_name));
@@ -450,12 +1010,14 @@ impl Orchestrator {
                 Ok(models) => ProviderModelCatalog {
                     backend: backend_name.to_string(),
                     models,
+                    options: backend.option_descriptors(),
                     refreshed_at: Some(chrono::Utc::now().timestamp()),
                     error: None,
                 },
                 Err(error) => ProviderModelCatalog {
                     backend: backend_name.to_string(),
                     models: Vec::new(),
+                    options: backend.option_descriptors(),
                     refreshed_at: Some(chrono::Utc::now().timestamp()),
                     error: Some(error),
                 },
@@ -474,240 +1036,285 @@ impl Orchestrator {
     }
 }
 
+fn context_window_from_catalog(models: &[DiscoveredModel], model: &str) -> Option<i64> {
+    models
+        .iter()
+        .find(|entry| entry.model == model || entry.id == model)
+        .and_then(|entry| entry.context_window)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_process::gc::WarmProcessGC;
-    use crate::agent_process::process::RunHandle;
-    use crate::diesel_models::NewRun;
-    use crate::services::testing::{MockChildProcess, TestServicesBuilder};
-    use crate::test_utils::test_diesel_conn;
-    use diesel::prelude::*;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use crate::account::jwt::encrypt_jwt_for_storage;
+    use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
+    use crate::services::EventEmitter;
+    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
 
-    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection, max_warm: usize) -> Orchestrator {
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-
-        Orchestrator::builder(db, services, std::path::PathBuf::from("/tmp"))
-            .warm_gc(Some(Arc::new(WarmProcessGC::new(max_warm))))
-            .mcp_callback_port(3847)
-            .build()
+    async fn test_db() -> Arc<DbState> {
+        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("orch.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        Arc::new(DbState::new(Arc::new(local), search))
     }
 
-    #[test]
-    fn builder_defaults_match_expected_runtime_defaults() {
-        let db = Arc::new(DbState {
-            conn: Mutex::new(test_diesel_conn()),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let orch = Orchestrator::builder(
-            db.clone(),
-            services.clone(),
-            std::path::PathBuf::from("/tmp/config"),
-        )
-        .build();
-
-        assert!(Arc::ptr_eq(&orch.db, &db));
-        assert!(Arc::ptr_eq(&orch.services, &services));
-        assert!(orch.warm_gc.is_none());
-        assert_eq!(orch.mcp_binary_path, "cairn-mcp");
-        assert_eq!(orch.config_dir, std::path::PathBuf::from("/tmp/config"));
-        assert!(orch.schema_dir.is_none());
-        assert_eq!(orch.mcp_callback_port, 0);
-        assert!(orch.embedding_engine.is_none());
-        assert!(orch.vibe_state.is_none());
-        assert!(orch.effect_tx.is_none());
-        assert!(orch.executor.get().is_none());
-        assert!(orch.sync_tx.lock().unwrap().is_none());
-        assert!(orch.identity_store.lock().unwrap().is_none());
-        assert!(orch.model_catalog.read().unwrap().is_empty());
+    async fn insert_account_jwt(db: &DbState, jwt: &str) {
+        let enc = encrypt_jwt_for_storage(jwt).unwrap();
+        db.local
+            .write(|conn| {
+                let enc = enc.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO account (user_id, email, name, device_id, plan,
+                             jwt_encrypted, jwt_expires_at, org_memberships, connected_at, updated_at)
+                         VALUES ('u1','a@b.com','A','dev','free', ?1, ?2, NULL, 0, 0)",
+                        (enc.as_str(), chrono::Utc::now().timestamp() + 3600),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
     }
 
-    #[test]
-    fn builder_applies_explicit_overrides() {
-        let db = Arc::new(DbState {
-            conn: Mutex::new(test_diesel_conn()),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let process_state = Arc::new(AgentProcessState::default());
-        let mcp_auth = Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
-            "/tmp/auth",
-        )));
-        let pty_state = Arc::new(crate::services::PtyState::default());
-        let permission_responses = tokio::sync::broadcast::channel(16).0;
-        let run_completions = tokio::sync::broadcast::channel(64).0;
-        let prompt_responses = tokio::sync::broadcast::channel(16).0;
-        let trigger_events = tokio::sync::broadcast::channel(256).0;
-        let identity_store = crate::identity::IdentityStore {
-            user_id: "user-1".to_string(),
-            accounts: vec![],
-            git_identities: vec![],
-            project_overrides: Default::default(),
-        };
-        let schema_dir = std::path::PathBuf::from("/tmp/schemas");
-        let api_config = crate::api::ApiConfig {
-            base_url: "http://localhost:9000".to_string(),
-        };
-        let (effect_tx, _effect_rx) = tokio::sync::mpsc::unbounded_channel();
+    async fn insert_anon_jwt(db: &DbState, jwt: &str) {
+        let enc = encrypt_jwt_for_storage(jwt).unwrap();
+        db.local
+            .write(|conn| {
+                let enc = enc.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO anon_device (device_id, jwt_encrypted, jwt_expires_at,
+                             created_at, updated_at)
+                         VALUES ('anon-dev', ?1, ?2, 0, 0)",
+                        (enc.as_str(), chrono::Utc::now().timestamp() + 3600),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
 
-        let mut permission_rx = permission_responses.subscribe();
-        let mut run_rx = run_completions.subscribe();
-        let mut prompt_rx = prompt_responses.subscribe();
-        let mut trigger_rx = trigger_events.subscribe();
-
-        let orch = Orchestrator::builder(
+    fn managers(db: Arc<DbState>) -> (Arc<AccountManager>, Arc<AnonDeviceManager>) {
+        let account = Arc::new(AccountManager::new(
             db.clone(),
-            services.clone(),
-            std::path::PathBuf::from("/tmp/config"),
-        )
-        .process_state(process_state.clone())
-        .mcp_auth(mcp_auth.clone())
-        .pty_state(pty_state.clone())
-        .permission_responses(permission_responses)
-        .run_completions(run_completions)
-        .prompt_responses(prompt_responses)
-        .trigger_events(trigger_events)
-        .identity_store(Some(identity_store.clone()))
-        .mcp_binary_path("custom-mcp")
-        .schema_dir(Some(schema_dir.clone()))
-        .mcp_callback_port(9123)
-        .api_config(api_config.clone())
-        .effect_tx(Some(effect_tx))
-        .build();
+            Arc::new(CapturingEmitter::new()),
+        ));
+        let anon = Arc::new(AnonDeviceManager::new(db, ApiConfig::default()));
+        (account, anon)
+    }
 
-        assert!(Arc::ptr_eq(&orch.process_state, &process_state));
-        assert!(Arc::ptr_eq(&orch.mcp_auth, &mcp_auth));
-        assert!(Arc::ptr_eq(&orch.pty_state, &pty_state));
-        assert_eq!(orch.mcp_binary_path, "custom-mcp");
-        assert_eq!(orch.schema_dir, Some(schema_dir));
-        assert_eq!(orch.mcp_callback_port, 9123);
-        assert_eq!(orch.api_config.base_url, api_config.base_url);
-        assert!(orch.effect_tx.is_some());
-        assert_eq!(
-            orch.identity_store
+    #[derive(Clone, Default)]
+    struct RecordingEmitter {
+        events: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl EventEmitter for RecordingEmitter {
+        fn emit(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            self.events
                 .lock()
                 .unwrap()
-                .as_ref()
-                .unwrap()
-                .user_id,
-            identity_store.user_id
-        );
+                .push((event.to_string(), payload));
+            Ok(())
+        }
 
-        orch.permission_responses
-            .send(("req-1".to_string(), "yes".to_string()))
-            .unwrap();
-        orch.run_completions.send("run-1".to_string()).unwrap();
-        orch.prompt_responses
-            .send(("run-1".to_string(), "reply".to_string()))
-            .unwrap();
-        orch.trigger_events
-            .send(TriggerEvent::JobEnded {
-                job_id: "job-1".to_string(),
-                status: "complete".to_string(),
-                execution_id: Some("exec-1".to_string()),
-                issue_id: Some("issue-1".to_string()),
-                project_id: "proj-1".to_string(),
-            })
-            .unwrap();
-
-        assert_eq!(
-            permission_rx.try_recv().unwrap(),
-            ("req-1".to_string(), "yes".to_string())
-        );
-        assert_eq!(run_rx.try_recv().unwrap(), "run-1".to_string());
-        assert_eq!(
-            prompt_rx.try_recv().unwrap(),
-            ("run-1".to_string(), "reply".to_string())
-        );
-        assert!(matches!(
-            trigger_rx.try_recv().unwrap(),
-            TriggerEvent::JobEnded {
-                job_id,
-                status,
-                execution_id,
-                issue_id,
-                project_id,
-            } if job_id == "job-1"
-                && status == "complete"
-                && execution_id.as_deref() == Some("exec-1")
-                && issue_id.as_deref() == Some("issue-1")
-                && project_id == "proj-1"
-        ));
+        fn emit_empty(&self, event: &str) -> Result<(), String> {
+            self.emit(event, serde_json::Value::Null)
+        }
     }
 
-    fn insert_live_run(conn: &mut diesel::sqlite::SqliteConnection, run_id: &str) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        diesel::insert_into(crate::schema::runs::table)
-            .values(&NewRun {
-                id: run_id,
-                issue_id: None,
-                project_id: None,
-                job_id: None,
-                status: Some("live"),
-                session_id: Some("session-1"),
-                error_message: None,
-                started_at: Some(now),
-                exited_at: None,
-                created_at: now,
-                updated_at: now,
-                backend: None,
-                exit_reason: None,
-                start_mode: None,
-                chat_id: None,
-            })
-            .execute(conn)
-            .unwrap();
+    #[tokio::test]
+    async fn context_token_snapshot_round_trips_and_emits() {
+        let db = test_db().await;
+        let emitter = RecordingEmitter::default();
+        let captured_events = emitter.events.clone();
+        let services = Arc::new(TestServicesBuilder::new().with_emitter(emitter).build());
+        let orch =
+            OrchestratorBuilder::new(db, services, tempfile::tempdir().unwrap().keep()).build();
+        let state = ContextTokenState {
+            run_id: "run-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            backend: "codex".to_string(),
+            model: Some("gpt-5".to_string()),
+            used_tokens: 18_676,
+            context_window: Some(258_400),
+            auto_compact_limit: None,
+            reasoning_tokens: Some(0),
+            last_output_tokens: Some(5),
+            captured_at: 123,
+        };
+
+        orch.store_context_token_snapshot(state.clone());
+
+        assert_eq!(
+            orch.get_context_token_state("session-1").await,
+            Some(state.clone())
+        );
+        let payloads: Vec<_> = captured_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(event, _)| event == "context-tokens-updated")
+            .map(|(_, payload)| payload.clone())
+            .collect();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["sessionId"], "session-1");
+        assert_eq!(payloads[0]["state"]["usedTokens"], 18_676);
     }
 
-    #[test]
-    fn collect_warm_if_needed_evicts_without_deadlocking() {
-        let mut conn = test_diesel_conn();
-        insert_live_run(&mut conn, "run-1");
-        let orch = test_orchestrator(conn, 1);
-
-        let child = Arc::new(Mutex::new(Some(Box::new(MockChildProcess::with_stdout(
-            999_999,
-            vec![],
-        ))
-            as Box<dyn crate::services::ChildProcess>)));
-        let stdin = Arc::new(Mutex::new(None));
-        let mut handle = RunHandle::new(child, stdin, Some("session-1".to_string()), None);
-        handle.transition_to_warm();
-
-        orch.process_state
-            .processes
-            .lock()
-            .unwrap()
-            .register("run-1".to_string(), handle);
-
-        let orch_for_thread = orch.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let result = orch_for_thread.collect_warm_if_needed();
-            let _ = tx.send(result);
-        });
-
-        let evicted = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("collect_warm_if_needed deadlocked during warm eviction");
-        assert_eq!(evicted.as_deref(), Some("run-1"));
-
-        assert!(!orch
-            .process_state
-            .processes
-            .lock()
-            .unwrap()
-            .contains_key("run-1"));
-
-        let run_status: Option<String> = crate::schema::runs::table
-            .find("run-1")
-            .select(crate::schema::runs::status)
-            .first(&mut *orch.db.conn.lock().unwrap())
+    #[tokio::test]
+    async fn context_token_state_falls_back_to_latest_event_tokens() {
+        let db = test_db().await;
+        db.local
+            .execute_script(
+                "
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('project-ctx', 'default', 'Context Project', 'CTX', '/tmp/ctx', 1, 1);
+                INSERT INTO jobs(id, project_id, status, model, created_at, updated_at)
+                 VALUES ('job-ctx', 'project-ctx', 'running', 'gpt-5', 1, 1);
+                INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+                 VALUES ('session-ctx', 'job-ctx', 'codex', 'open', 1, 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
+                 VALUES ('run-ctx', 'project-ctx', 'job-ctx', 'exited', 'session-ctx', 'codex', 1, 1);
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens)
+                 VALUES ('event-old', 'run-ctx', 'session-ctx', 1, 10, 'result:success', '{}',
+                    NULL, 10, 100, 999, NULL, 25, 3);
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens)
+                 VALUES ('event-latest', 'run-ctx', 'session-ctx', 2, 20, 'result:success', '{}',
+                    NULL, 20, 200, 999, NULL, 50, 7);
+                ",
+            )
+            .await
             .unwrap();
-        assert_eq!(run_status.as_deref(), Some("exited"));
+
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        orch.model_catalog.write().unwrap().insert(
+            "codex".to_string(),
+            ProviderModelCatalog {
+                backend: "codex".to_string(),
+                models: vec![DiscoveredModel {
+                    id: "gpt-5".to_string(),
+                    model: "gpt-5".to_string(),
+                    display_name: "GPT-5".to_string(),
+                    description: None,
+                    hidden: false,
+                    is_default: true,
+                    default_reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
+                    context_window: Some(258_400),
+                }],
+                options: Vec::new(),
+                refreshed_at: Some(20),
+                error: None,
+            },
+        );
+
+        let state = orch.get_context_token_state("session-ctx").await.unwrap();
+        assert_eq!(state.run_id, "run-ctx");
+        assert_eq!(state.backend, "codex");
+        assert_eq!(state.model, Some("gpt-5".to_string()));
+        assert_eq!(state.used_tokens, 250);
+        assert_eq!(state.context_window, Some(258_400));
+        assert_eq!(state.reasoning_tokens, Some(7));
+        assert_eq!(state.last_output_tokens, Some(50));
+        assert_eq!(state.captured_at, 20);
+    }
+
+    #[tokio::test]
+    async fn claude_context_token_state_ignores_cumulative_result_usage() {
+        let db = test_db().await;
+        db.local
+            .execute_script(
+                "
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('project-claude-ctx', 'default', 'Claude Context Project', 'CLCTX', '/tmp/clctx', 1, 1);
+                INSERT INTO jobs(id, project_id, status, model, created_at, updated_at)
+                 VALUES ('job-claude-ctx', 'project-claude-ctx', 'running', 'claude-sonnet-4-20250514', 1, 1);
+                INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+                 VALUES ('session-claude-ctx', 'job-claude-ctx', 'claude', 'open', 1, 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
+                 VALUES ('run-claude-ctx', 'project-claude-ctx', 'job-claude-ctx', 'exited', 'session-claude-ctx', 'claude', 1, 1);
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens)
+                 VALUES ('event-assistant-final', 'run-claude-ctx', 'session-claude-ctx', 10, 10, 'assistant', '{}',
+                    NULL, 10, 7, 31468, 6200, 38, 12);
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens)
+                 VALUES ('event-result-cumulative', 'run-claude-ctx', 'session-claude-ctx', 11, 11, 'result:success', '{}',
+                    NULL, 11, 7, 118888, 37711, 439, NULL);
+                ",
+            )
+            .await
+            .unwrap();
+
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+
+        let state = orch
+            .get_context_token_state("session-claude-ctx")
+            .await
+            .unwrap();
+        assert_eq!(state.run_id, "run-claude-ctx");
+        assert_eq!(state.backend, "claude");
+        assert_eq!(state.model, Some("claude-sonnet-4-20250514".to_string()));
+        assert_eq!(state.used_tokens, 37_713);
+        assert_ne!(state.used_tokens, 157_045);
+        assert_eq!(state.reasoning_tokens, Some(12));
+        assert_eq!(state.last_output_tokens, Some(38));
+        assert_eq!(state.captured_at, 10);
+    }
+
+    #[tokio::test]
+    async fn embed_token_prefers_account_jwt() {
+        let db = test_db().await;
+        insert_account_jwt(&db, "account-jwt").await;
+        insert_anon_jwt(&db, "anon-jwt").await;
+        let (account, anon) = managers(db);
+        assert_eq!(
+            resolve_embed_token(&account, &anon),
+            Some("account-jwt".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_token_falls_back_to_anon_when_no_account() {
+        let db = test_db().await;
+        insert_anon_jwt(&db, "anon-jwt").await;
+        let (account, anon) = managers(db);
+        assert_eq!(
+            resolve_embed_token(&account, &anon),
+            Some("anon-jwt".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_token_none_when_neither_present() {
+        let db = test_db().await;
+        let (account, anon) = managers(db);
+        assert_eq!(resolve_embed_token(&account, &anon), None);
     }
 }

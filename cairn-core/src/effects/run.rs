@@ -47,8 +47,8 @@ pub async fn execute_effects(
                     // Only root AdvanceDag effects from apply_step_outcome carry an
                     // outbox_entry_id. Follow-on effects from reduce_dag have None.
                     if let Some(ref entry_id) = outbox_entry_id {
-                        if let Ok(mut conn) = orch.db.conn.lock() {
-                            crate::effects::outbox::mark_done(&mut conn, entry_id);
+                        if let Err(error) = mark_outbox_done(orch, entry_id).await {
+                            log::warn!("Failed to mark outbox entry done: {}", error);
                         }
                     }
                 }
@@ -67,10 +67,6 @@ pub async fn execute_effects(
                     );
                 }
 
-                WorkflowEffect::WakeManager { job_id } => {
-                    crate::orchestrator::lifecycle::wake_manager_on_failure(orch, &job_id);
-                }
-
                 // ── Condition evaluation ──
                 WorkflowEffect::StoreConditionEvaluation {
                     execution_id,
@@ -78,19 +74,24 @@ pub async fn execute_effects(
                     port,
                     error_msg,
                 } => {
-                    let mut conn = orch
-                        .db
-                        .conn
-                        .lock()
-                        .map_err(|e| format!("Failed to lock database: {}", e))?;
                     crate::execution::conditions::store_condition_evaluation(
-                        &mut conn,
+                        &orch.db.local,
                         &execution_id,
                         &node_id,
                         &port,
                         error_msg.as_deref(),
                         &*orch.services.emitter,
-                    )?;
+                    )
+                    .await?;
+                    let condition_ref = format!("{execution_id}/{node_id}");
+                    if let Err(error) = crate::orchestrator::wakes::route_condition_event(
+                        orch,
+                        &condition_ref,
+                        "evaluated",
+                        None,
+                    ) {
+                        log::warn!("failed to route condition wake for {condition_ref}: {error}");
+                    }
                     effects.push(WorkflowEffect::AdvanceDag {
                         execution_id,
                         outbox_entry_id: None,
@@ -103,7 +104,8 @@ pub async fn execute_effects(
                     node_name,
                     ..
                 } => {
-                    let result = evaluate_condition(orch, &execution_id, &node_id, &node_name);
+                    let result =
+                        evaluate_condition(orch, &execution_id, &node_id, &node_name).await;
                     if let Some(effect_result) = result {
                         effects.extend(reduce_effect_result(effect_result));
                     }
@@ -115,13 +117,25 @@ pub async fn execute_effects(
                     effects.extend(new_effects);
                 }
 
-                WorkflowEffect::ApplyCheckpointRejection { job_id, reason } => {
-                    let new_effects = crate::effects::checkpoint::reject_job_pure(
-                        orch,
-                        &job_id,
-                        reason.as_deref(),
-                    )?;
-                    effects.extend(new_effects);
+                WorkflowEffect::BlockCheckpointJob { job_id } => {
+                    // Command checkpoint failed: block the job (seed unconfirmed
+                    // artifact + recompute -> Blocked). Resumable, not terminal.
+                    crate::execution::advancement::block_job(orch, &job_id)?;
+                    // Then wake the upstream agent with the captured failure so it
+                    // can fix and commit; the checkpoint re-runs automatically when
+                    // the agent goes idle. Best-effort — a failed wake leaves the
+                    // checkpoint Blocked for manual resolution.
+                    if let Err(e) =
+                        crate::execution::advancement::wake_upstream_after_checkpoint_failure(
+                            orch, &job_id,
+                        )
+                    {
+                        log::warn!(
+                            "Failed to wake upstream after checkpoint {} failed: {}",
+                            &job_id[..job_id.len().min(8)],
+                            e
+                        );
+                    }
                 }
 
                 WorkflowEffect::RunCheckpointCommand {
@@ -158,23 +172,6 @@ pub async fn execute_effects(
                         &action_run_id,
                         &error,
                     )?;
-                }
-
-                // ── Worktree management ──
-                WorkflowEffect::CleanupWorktrees { execution_id } => {
-                    let _ = crate::execution::advancement::cleanup_non_issue_worktrees_if_complete(
-                        orch,
-                        &execution_id,
-                    );
-                }
-
-                WorkflowEffect::CreateExecutorWorktree {
-                    job_id,
-                    execution_id,
-                    ..
-                } => {
-                    let result = create_worktree(orch, &job_id, &execution_id);
-                    effects.extend(reduce_effect_result(result));
                 }
 
                 // ── Agent jobs: dispatch to host executor ──
@@ -230,9 +227,11 @@ pub async fn execute_effects(
 
 // ── Helper functions for effect handling ──────────────────────────────────
 
-/// Run a programmatic checkpoint command.
+/// Run a programmatic checkpoint command. Every actual run (pass or fail) is
+/// recorded in `checkpoint_runs` — the durable history that drives the auto-fix
+/// loop (attempt count, last-run SHA, and the failure output shown on wake).
 async fn run_checkpoint(
-    _orch: &Orchestrator,
+    orch: &Orchestrator,
     job_id: &str,
     node_name: &str,
     command: &str,
@@ -252,76 +251,99 @@ async fn run_checkpoint(
     }
 
     let worktree_str = worktree_path.to_string_lossy().to_string();
-    match crate::execution::conditions::execute_programmatic_checkpoint(&worktree_str, command)
-        .await
-    {
-        Ok(passed) => {
-            if passed {
-                log::info!(
-                    "Programmatic checkpoint '{}' passed, auto-approving",
-                    node_name
-                );
-            } else {
-                log::info!(
-                    "Programmatic checkpoint '{}' failed, auto-rejecting",
-                    node_name
-                );
+    let commit_sha = crate::execution::cache::get_current_head_sha(&worktree_str).ok();
+    let output =
+        match crate::execution::conditions::execute_programmatic_checkpoint(&worktree_str, command)
+            .await
+        {
+            Ok(output) => output,
+            Err(e) => {
+                // The command could not even be spawned. Record it as a failed run
+                // (exit -1) so the loop treats it like any other failure.
+                log::error!("Programmatic checkpoint '{}' error: {}", node_name, e);
+                crate::execution::conditions::CheckpointRunOutput {
+                    passed: false,
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: e,
+                }
             }
-            EffectResult::CheckpointComplete {
-                job_id: job_id.to_string(),
-                passed,
-                error: if passed {
-                    None
-                } else {
-                    Some(format!("Programmatic check failed: {}", command))
-                },
-            }
-        }
-        Err(e) => {
-            log::error!("Programmatic checkpoint '{}' error: {}", node_name, e);
-            EffectResult::CheckpointComplete {
-                job_id: job_id.to_string(),
-                passed: false,
-                error: Some(e),
-            }
-        }
+        };
+
+    if let Err(e) = crate::execution::checkpoint_runs::record_checkpoint_run(
+        orch,
+        job_id,
+        command,
+        commit_sha.as_deref(),
+        &output,
+    ) {
+        log::warn!("Failed to record checkpoint run for '{}': {}", node_name, e);
+    }
+
+    if output.passed {
+        log::info!(
+            "Programmatic checkpoint '{}' passed, auto-approving",
+            node_name
+        );
+    } else {
+        log::info!(
+            "Programmatic checkpoint '{}' failed (exit {}), blocking",
+            node_name,
+            output.exit_code
+        );
+    }
+
+    EffectResult::CheckpointComplete {
+        job_id: job_id.to_string(),
+        passed: output.passed,
+        error: if output.passed {
+            None
+        } else {
+            Some(format!(
+                "Programmatic check failed (exit {}): {}",
+                output.exit_code, command
+            ))
+        },
     }
 }
 
 /// Evaluate a condition node.
-fn evaluate_condition(
+async fn evaluate_condition(
     orch: &Orchestrator,
     execution_id: &str,
     node_id: &str,
     node_name: &str,
 ) -> Option<EffectResult> {
-    let node = {
-        let mut conn = orch.db.conn.lock().ok()?;
-        let nodes =
-            crate::execution::dag::load_nodes_from_execution(&mut conn, execution_id).ok()?;
-        nodes.into_iter().find(|n| n.id == node_id)?
+    let node = match crate::execution::conditions::load_condition_node(
+        &orch.db.local,
+        execution_id,
+        node_id,
+    )
+    .await
+    {
+        Ok(node) => node,
+        Err(error) => {
+            log::error!("Failed to load condition node '{}': {}", node_name, error);
+            return None;
+        }
     };
 
-    let recipe_id = {
-        use crate::schema::executions;
-        use diesel::prelude::*;
-        let mut conn = orch.db.conn.lock().ok()?;
-        executions::table
-            .find(execution_id)
-            .select(executions::recipe_id)
-            .first::<String>(&mut *conn)
-            .ok()?
-    };
-
-    let context = {
-        let mut conn = orch.db.conn.lock().ok()?;
-        crate::execution::conditions::gather_condition_context(
-            &mut conn,
-            execution_id,
-            node_id,
-            &recipe_id,
-        )
-        .ok()?
+    let context = match crate::execution::conditions::gather_condition_context(
+        &orch.db.local,
+        execution_id,
+        node_id,
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => {
+            log::error!(
+                "Failed to gather context for condition node '{}': {}",
+                node_name,
+                error
+            );
+            return None;
+        }
     };
 
     match crate::execution::conditions::evaluate_condition_node(
@@ -354,54 +376,79 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
-    use crate::test_utils::test_diesel_conn;
+    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    fn test_orchestrator() -> Orchestrator {
-        let conn = test_diesel_conn();
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
-            db.clone(),
-            services.emitter.clone(),
+    async fn test_orch() -> Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.keep().join("run-checkpoint-test.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        let config = tempfile::tempdir().unwrap().keep();
+        let db_state = Arc::new(DbState::new(
+            Arc::new(db),
+            Arc::new(SearchIndex::open_or_create(config.join("idx")).unwrap()),
         ));
-        let sync_tx = Arc::new(Mutex::new(None));
-        Orchestrator {
-            db,
-            services: services.clone(),
-            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
-            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(PathBuf::from("/tmp"))),
-            warm_gc: None,
-            pty_state: Arc::new(crate::services::PtyState::default()),
-            permission_responses: tokio::sync::broadcast::channel(16).0,
-            run_completions: tokio::sync::broadcast::channel(64).0,
-            prompt_responses: tokio::sync::broadcast::channel(16).0,
-            trigger_events: tokio::sync::broadcast::channel(256).0,
-            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            identity_store: Arc::new(Mutex::new(None)),
-            mcp_binary_path: "cairn-mcp".to_string(),
-            config_dir: PathBuf::from("/tmp"),
-            schema_dir: None,
-            mcp_callback_port: 3847,
-            embedding_engine: None,
-            vibe_state: None,
-            account_manager,
-            sync_tx: sync_tx.clone(),
-            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
-            api_config: crate::api::ApiConfig::default(),
-            effect_tx: None,
-            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            provider_usage_snapshots: Default::default(),
-            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
-        }
+        let services = Arc::new(TestServicesBuilder::new().build());
+        Orchestrator::builder(db_state, services, config).build()
+    }
+
+    /// Insert a project + job so a recorded checkpoint run satisfies the
+    /// `checkpoint_runs.job_id -> jobs(id)` foreign key.
+    async fn seed_job(orch: &Orchestrator, job_id: &str) {
+        let job_id = job_id.to_string();
+        orch.db
+            .local
+            .write(|conn| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                         VALUES ('p-run', 'default', 'P', 'PRUN', '/tmp/p', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO jobs (id, project_id, status, created_at, updated_at)
+                         VALUES (?1, 'p-run', 'running', 1, 1)",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn recorded_runs(orch: &Orchestrator, job_id: &str) -> i64 {
+        let job_id = job_id.to_string();
+        orch.db
+            .local
+            .read(|conn| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM checkpoint_runs WHERE job_id = ?1",
+                            (job_id.as_str(),),
+                        )
+                        .await?;
+                    rows.next().await?.unwrap().i64(0)
+                })
+            })
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
     async fn run_checkpoint_cached_pass_returns_complete_true() {
-        let orch = test_orchestrator();
+        let orch = test_orch().await;
         let result = run_checkpoint(
             &orch,
             "job-1",
@@ -417,12 +464,15 @@ mod tests {
             EffectResult::CheckpointComplete { ref job_id, passed, ref error }
                 if job_id == "job-1" && passed && error.is_none()
         ));
+        // A cached pass does not run the command, so nothing is recorded.
+        assert_eq!(recorded_runs(&orch, "job-1").await, 0);
     }
 
     #[tokio::test]
-    async fn run_checkpoint_not_cached_runs_command() {
-        let orch = test_orchestrator();
-        // "exit 0" should pass on any system
+    async fn run_checkpoint_not_cached_runs_command_and_records() {
+        let orch = test_orch().await;
+        seed_job(&orch, "job-2").await;
+        // "exit 0" should pass on any system.
         let result = run_checkpoint(
             &orch,
             "job-2",
@@ -438,11 +488,13 @@ mod tests {
             EffectResult::CheckpointComplete { ref job_id, passed, ref error }
                 if job_id == "job-2" && passed && error.is_none()
         ));
+        assert_eq!(recorded_runs(&orch, "job-2").await, 1);
     }
 
     #[tokio::test]
-    async fn run_checkpoint_command_failure_returns_false() {
-        let orch = test_orchestrator();
+    async fn run_checkpoint_command_failure_returns_false_and_records() {
+        let orch = test_orch().await;
+        seed_job(&orch, "job-3").await;
         let result = run_checkpoint(
             &orch,
             "job-3",
@@ -458,45 +510,29 @@ mod tests {
             EffectResult::CheckpointComplete { ref job_id, passed, .. }
                 if job_id == "job-3" && !passed
         ));
+        assert_eq!(recorded_runs(&orch, "job-3").await, 1);
     }
 }
 
-/// Create a worktree for an executor node.
-fn create_worktree(orch: &Orchestrator, job_id: &str, execution_id: &str) -> EffectResult {
-    let db_job = {
-        use crate::schema::jobs;
-        use diesel::prelude::*;
-        let conn_result = orch.db.conn.lock();
-        match conn_result {
-            Ok(mut conn) => match jobs::table
-                .find(job_id)
-                .first::<crate::diesel_models::DbJob>(&mut *conn)
-            {
-                Ok(j) => j,
-                Err(e) => {
-                    return EffectResult::WorktreeFailed {
-                        job_id: job_id.to_string(),
-                        error: format!("Job not found: {}", e),
-                    };
-                }
-            },
-            Err(e) => {
-                return EffectResult::WorktreeFailed {
-                    job_id: job_id.to_string(),
-                    error: format!("DB lock failed: {}", e),
-                };
-            }
-        }
-    };
-
-    match crate::execution::advancement::create_executor_worktree(orch, &db_job) {
-        Ok(()) => EffectResult::WorktreeCreated {
-            job_id: job_id.to_string(),
-            execution_id: execution_id.to_string(),
-        },
-        Err(e) => EffectResult::WorktreeFailed {
-            job_id: job_id.to_string(),
-            error: e,
-        },
-    }
+async fn mark_outbox_done(orch: &Orchestrator, id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    let now = chrono::Utc::now().timestamp() as i32;
+    orch.db
+        .local
+        .write(|conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE effect_outbox
+                     SET state = 'done',
+                         updated_at = ?1
+                     WHERE id = ?2",
+                    (now, id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| format!("Failed to mark outbox entry done: {error}"))
 }

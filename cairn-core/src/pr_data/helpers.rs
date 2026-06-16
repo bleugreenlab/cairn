@@ -7,7 +7,7 @@ use crate::github::api;
 use crate::github::credentials::GitHubAppCredentials;
 use crate::models::{Check, CheckState, ChecksStatus, MergeableState, PrState, ReviewDecision};
 use crate::services::{GitClient, HttpClient};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ── Parsed PR Details ──────────────────────────────────────────
 
@@ -341,9 +341,748 @@ pub fn update_main_repo_after_merge(
     Ok(())
 }
 
+// ── Active Worktree Fast-Forward ───────────────────────────────
+
+/// Fast-forward an active worktree checked out on `branch` to the merged tip.
+///
+/// This is the general case of "a checkout has the merged base branch and
+/// should advance": a Coordinator's integration-branch worktree, into which
+/// child PRs merge, is left stale otherwise. (The main repo's default-branch
+/// checkout is the special case already handled by
+/// `update_main_repo_after_merge`.)
+///
+/// Safe by construction: fetch, then `merge --ff-only`. If the worktree is on a
+/// different branch, has uncommitted changes, or its branch has diverged (so a
+/// fast-forward is impossible), this warns and leaves the worktree untouched —
+/// it never force-updates or clobbers local work.
+pub fn update_worktree_after_merge(
+    git: &dyn GitClient,
+    worktree_path: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    let current = git.current_branch(worktree_path)?;
+    if current != branch {
+        log::warn!(
+            "Skipping worktree fast-forward: {} is on '{}', not '{}'",
+            worktree_path.display(),
+            current,
+            branch
+        );
+        return Ok(());
+    }
+
+    let status = git.status(worktree_path)?;
+    if !status.trim().is_empty() {
+        log::warn!(
+            "Skipping worktree fast-forward for {}: working tree has uncommitted changes",
+            worktree_path.display()
+        );
+        return Ok(());
+    }
+
+    let fetch = git.run(
+        worktree_path,
+        vec![
+            "fetch".to_string(),
+            "origin".to_string(),
+            branch.to_string(),
+        ],
+    )?;
+    if !fetch.success {
+        return Err(format!("git fetch failed: {}", fetch.stderr));
+    }
+
+    let ff = git.run(
+        worktree_path,
+        vec![
+            "merge".to_string(),
+            "--ff-only".to_string(),
+            format!("origin/{branch}"),
+        ],
+    )?;
+    if !ff.success {
+        return Err(format!(
+            "fast-forward failed (branch diverged?): {}",
+            ff.stderr
+        ));
+    }
+
+    log::info!(
+        "Fast-forwarded worktree {} to merged {}",
+        worktree_path.display(),
+        branch
+    );
+    Ok(())
+}
+
+fn run_git(
+    git: &dyn GitClient,
+    repo: &Path,
+    args: &[&str],
+) -> Result<crate::services::GitOutput, String> {
+    git.run(repo, args.iter().map(|arg| arg.to_string()).collect())
+}
+
+fn cleanup_local_merge(git: &dyn GitClient, repo_path: &Path, worktree: &Path, ephemeral: bool) {
+    let _ = run_git(git, worktree, &["merge", "--abort"]);
+    let _ = run_git(git, worktree, &["reset", "--hard"]);
+    if ephemeral {
+        let _ = git.worktree_remove(repo_path, worktree, true);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LocalMergeStash {
+    sha: String,
+    label: String,
+}
+
+fn stash_label_for_sha(git: &dyn GitClient, worktree: &Path, sha: &str) -> Result<String, String> {
+    let list = run_git(git, worktree, &["stash", "list", "--format=%gd %H"])?;
+    if !list.success {
+        return Err(format!("git stash list failed: {}", list.stderr));
+    }
+
+    for line in list.stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else {
+            continue;
+        };
+        let Some(entry_sha) = parts.next() else {
+            continue;
+        };
+        if entry_sha == sha {
+            return Ok(label.to_string());
+        }
+    }
+
+    Err(format!(
+        "could not find local merge stash {sha} in git stash list"
+    ))
+}
+
+fn stash_dirty_local_merge_target(
+    git: &dyn GitClient,
+    worktree: &Path,
+    target_branch: &str,
+) -> Result<Option<LocalMergeStash>, String> {
+    let status = git.status(worktree)?;
+    if status.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let message = format!("cairn-local-merge {target_branch}");
+    log::info!(
+        "Target branch {} has uncommitted changes in {}; stashing before local merge",
+        target_branch,
+        worktree.display()
+    );
+    let push = run_git(
+        git,
+        worktree,
+        &["stash", "push", "--include-untracked", "-m", &message],
+    )?;
+    if !push.success {
+        return Err(format!(
+            "Could not stash uncommitted changes in target branch {target_branch} at {} before local merge: {}",
+            worktree.display(),
+            if push.stderr.is_empty() { push.stdout } else { push.stderr }
+        ));
+    }
+
+    let stash_sha = git.rev_parse(worktree, vec!["refs/stash".to_string()])?;
+    let label = stash_label_for_sha(git, worktree, &stash_sha)?;
+    log::info!(
+        "Stashed target branch changes for local merge as {} ({})",
+        label,
+        stash_sha
+    );
+
+    Ok(Some(LocalMergeStash {
+        sha: stash_sha,
+        label,
+    }))
+}
+
+fn pop_local_merge_stash(
+    git: &dyn GitClient,
+    worktree: &Path,
+    stash: &LocalMergeStash,
+) -> Result<(), String> {
+    let label = stash_label_for_sha(git, worktree, &stash.sha)?;
+    let pop = run_git(git, worktree, &["stash", "pop", &label])?;
+    if pop.success {
+        log::info!("Restored local merge target changes from {label}");
+        return Ok(());
+    }
+
+    Err(format!(
+        "git stash pop {label} failed: {}",
+        if pop.stderr.is_empty() {
+            pop.stdout
+        } else {
+            pop.stderr
+        }
+    ))
+}
+
+fn restore_local_merge_stash_after_failure(
+    git: &dyn GitClient,
+    worktree: &Path,
+    stash: &Option<LocalMergeStash>,
+    failure_context: &str,
+) -> Result<(), String> {
+    let Some(stash) = stash else {
+        return Ok(());
+    };
+
+    pop_local_merge_stash(git, worktree, stash).map_err(|error| {
+        log::error!(
+            "{}; additionally failed to restore local merge stash {} ({}): {}",
+            failure_context,
+            stash.label,
+            stash.sha,
+            error
+        );
+        format!(
+            "{failure_context}; attempted to restore stashed target changes, but {error}. Your changes remain in the git stash entry originally captured as {} ({}); recover manually with `git stash apply {}` in {}.",
+            stash.label,
+            stash.sha,
+            stash.label,
+            worktree.display()
+        )
+    })
+}
+
+fn local_merge_worktree_path() -> Result<PathBuf, String> {
+    let mut base = crate::git::worktree::worktree_base_dir()?;
+    base.push(format!("local-merge-{}", uuid::Uuid::new_v4()));
+    Ok(base)
+}
+
+/// Compute local mergeability without touching the working tree.
+pub fn compute_local_mergeable(
+    git: &dyn GitClient,
+    repo_path: &Path,
+    target_branch: &str,
+    source_branch: &str,
+) -> MergeableState {
+    match run_git(
+        git,
+        repo_path,
+        &["merge-tree", "--write-tree", target_branch, source_branch],
+    ) {
+        Ok(output) if output.success => MergeableState::Mergeable,
+        Ok(_) => MergeableState::Conflicting,
+        Err(_) => MergeableState::Unknown,
+    }
+}
+
+/// Capture local changed files for a PR-equivalent using git diff --numstat.
+pub fn local_pr_files(
+    git: &dyn GitClient,
+    repo_path: &Path,
+    target_branch: &str,
+    source_branch: &str,
+) -> Result<Vec<api::PrFile>, String> {
+    // PR semantics: compare the source branch against the merge base with the
+    // target branch, excluding target-only changes that landed after fork.
+    let range = format!("{target_branch}...{source_branch}");
+    let output = run_git(git, repo_path, &["diff", "--numstat", &range])?;
+    if !output.success {
+        return Err(format!("git diff --numstat failed: {}", output.stderr));
+    }
+    let mut files = Vec::new();
+    for line in output.stdout.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let additions = parts[0].parse::<i32>().unwrap_or(0);
+        let deletions = parts[1].parse::<i32>().unwrap_or(0);
+        files.push(api::PrFile {
+            filename: parts[2].to_string(),
+            status: "modified".to_string(),
+            additions,
+            deletions,
+            changes: additions + deletions,
+            patch: None,
+            previous_filename: None,
+        });
+    }
+    Ok(files)
+}
+
+/// Merge a local PR-equivalent into its target branch.
+pub fn local_merge(
+    git: &dyn GitClient,
+    repo_path: &Path,
+    target_branch: &str,
+    source_branch: &str,
+    method: &str,
+    title: &str,
+) -> Result<String, String> {
+    log::info!(
+        "Preparing local merge: {} -> {} using {} in {}",
+        source_branch,
+        target_branch,
+        method,
+        repo_path.display()
+    );
+    let existing =
+        crate::git::worktree::get_worktree_for_branch_with_git(git, repo_path, target_branch)?;
+    let (worktree, ephemeral, stashed_target_changes) = if let Some(path) = existing {
+        let stash = stash_dirty_local_merge_target(git, &path, target_branch)?;
+        (path, false, stash)
+    } else {
+        let path = local_merge_worktree_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create local merge worktree dir: {e}"))?;
+        }
+        git.worktree_add_existing_branch(repo_path, &path, target_branch)?;
+        (path, true, None)
+    };
+
+    log::info!(
+        "Running local merge in worktree {} (ephemeral={})",
+        worktree.display(),
+        ephemeral
+    );
+
+    let merge_result = match method {
+        "merge" | "merge-commit" => run_git(
+            git,
+            &worktree,
+            &[
+                "-c",
+                "user.name=Cairn",
+                "-c",
+                "user.email=cairn@localhost",
+                "merge",
+                "--no-ff",
+                source_branch,
+                "-m",
+                title,
+            ],
+        ),
+        "squash" => {
+            let squash = run_git(git, &worktree, &["merge", "--squash", source_branch]);
+            match squash {
+                Ok(output) if output.success => run_git(
+                    git,
+                    &worktree,
+                    &[
+                        "-c",
+                        "user.name=Cairn",
+                        "-c",
+                        "user.email=cairn@localhost",
+                        "commit",
+                        "-m",
+                        title,
+                    ],
+                ),
+                other => other,
+            }
+        }
+        "rebase" => {
+            cleanup_local_merge(git, repo_path, &worktree, ephemeral);
+            restore_local_merge_stash_after_failure(
+                git,
+                &worktree,
+                &stashed_target_changes,
+                "Local rebase merge is not supported yet",
+            )?;
+            return Err("Local rebase merge is not supported yet".to_string());
+        }
+        other => {
+            let error = format!("Unsupported local merge method: {other}");
+            cleanup_local_merge(git, repo_path, &worktree, ephemeral);
+            restore_local_merge_stash_after_failure(
+                git,
+                &worktree,
+                &stashed_target_changes,
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
+
+    match merge_result {
+        Ok(output) if output.success => {}
+        Ok(output) => {
+            cleanup_local_merge(git, repo_path, &worktree, ephemeral);
+            let error = format!(
+                "local merge conflict while merging {source_branch} into {target_branch}: {}",
+                if output.stderr.is_empty() {
+                    output.stdout
+                } else {
+                    output.stderr
+                }
+            );
+            restore_local_merge_stash_after_failure(
+                git,
+                &worktree,
+                &stashed_target_changes,
+                &error,
+            )?;
+            return Err(error);
+        }
+        Err(error) => {
+            cleanup_local_merge(git, repo_path, &worktree, ephemeral);
+            let error = format!(
+                "local merge conflict while merging {source_branch} into {target_branch}: {error}"
+            );
+            restore_local_merge_stash_after_failure(
+                git,
+                &worktree,
+                &stashed_target_changes,
+                &error,
+            )?;
+            return Err(error);
+        }
+    }
+
+    let merged_commit = git.rev_parse(&worktree, vec!["HEAD".to_string()])?;
+    if let Some(stash) = &stashed_target_changes {
+        if let Err(error) = pop_local_merge_stash(git, &worktree, stash) {
+            log::error!(
+                "Local merge succeeded at {}, but restoring target changes from {} ({}) failed: {}",
+                merged_commit,
+                stash.label,
+                stash.sha,
+                error
+            );
+            return Err(format!(
+                "local merge succeeded at {merged_commit}, but restoring stashed target changes failed: {error}. The stash was preserved as {} ({}); recover manually with `git stash apply {}` in {}.",
+                stash.label,
+                stash.sha,
+                stash.label,
+                worktree.display()
+            ));
+        }
+    }
+    if ephemeral {
+        git.worktree_remove(repo_path, &worktree, false).map_err(|error| {
+            format!(
+                "local merge succeeded at {merged_commit}, but failed to remove temporary worktree {}: {error}",
+                worktree.display()
+            )
+        })?;
+    }
+    log::info!(
+        "Completed local merge: {} -> {} at {}",
+        source_branch,
+        target_branch,
+        merged_commit
+    );
+    Ok(merged_commit)
+}
+
+/// Locate an active worktree checked out on `branch` and fast-forward it.
+///
+/// Skips the main repository checkout at `repo_path` — its default-branch
+/// update is handled by `update_main_repo_after_merge`, and
+/// `git worktree list --porcelain` lists the main working tree first, so a
+/// merge into the default branch resolves here to `repo_path` and is a no-op.
+/// Non-fatal: returns `Err` on a lookup/fast-forward failure for the caller to
+/// log, but never force-updates.
+pub fn fast_forward_active_worktree(
+    git: &dyn GitClient,
+    repo_path: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    match crate::git::worktree::get_worktree_for_branch_with_git(git, repo_path, branch)? {
+        Some(worktree) if worktree.as_path() != repo_path => {
+            update_worktree_after_merge(git, &worktree, branch)
+        }
+        _ => {
+            log::debug!(
+                "No separate active worktree on '{}' to fast-forward (main repo handled by pull)",
+                branch
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(path: &std::path::Path, args: &[&str]) {
+        let output = crate::env::git()
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout(path: &std::path::Path, args: &[&str]) -> String {
+        let output = crate::env::git()
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn local_pr_files_excludes_target_only_changes_after_fork() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        git(repo, &["init"]);
+        git(repo, &["config", "user.email", "test@test.com"]);
+        git(repo, &["config", "user.name", "Test User"]);
+        git(repo, &["checkout", "-B", "main"]);
+
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-m", "base"]);
+
+        git(repo, &["checkout", "-b", "feature"]);
+        std::fs::write(repo.join("file.txt"), "base\nfeature\n").unwrap();
+        git(repo, &["commit", "-am", "feature"]);
+
+        git(repo, &["checkout", "main"]);
+        std::fs::write(repo.join("file.txt"), "base\ntarget\n").unwrap();
+        git(repo, &["commit", "-am", "target"]);
+
+        let files =
+            local_pr_files(&crate::services::RealGitClient, repo, "main", "feature").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "file.txt");
+        assert_eq!(files[0].additions, 1);
+        assert_eq!(files[0].deletions, 0);
+    }
+
+    #[test]
+    fn local_merge_squash_merges_non_remote_repo() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        git(repo, &["init"]);
+        git(repo, &["checkout", "-B", "main"]);
+
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        git(repo, &["checkout", "-b", "agent/test-local-pr"]);
+        std::fs::write(repo.join("file.txt"), "base\nfeature\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "feature",
+            ],
+        );
+        git(repo, &["checkout", "main"]);
+
+        let merged_commit = local_merge(
+            &crate::services::RealGitClient,
+            repo,
+            "main",
+            "agent/test-local-pr",
+            "squash",
+            "Local PR",
+        )
+        .unwrap();
+
+        assert!(!merged_commit.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "base\nfeature\n"
+        );
+        let status = crate::services::RealGitClient.status(repo).unwrap();
+        assert!(status.is_empty(), "local merge left dirty status: {status}");
+        let branch = crate::services::RealGitClient.current_branch(repo).unwrap();
+        assert_eq!(branch, "main");
+    }
+
+    #[test]
+    fn local_merge_stashes_dirty_target_and_restores_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        git(repo, &["init"]);
+        git(repo, &["checkout", "-B", "main"]);
+
+        std::fs::write(repo.join("file.txt"), "base\n").unwrap();
+        std::fs::write(repo.join("target.txt"), "clean\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        git(repo, &["checkout", "-b", "agent/test-local-pr"]);
+        std::fs::write(repo.join("file.txt"), "base\nfeature\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "feature",
+            ],
+        );
+        git(repo, &["checkout", "main"]);
+
+        std::fs::write(repo.join("target.txt"), "dirty target change\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "untracked target change\n").unwrap();
+
+        let merged_commit = local_merge(
+            &crate::services::RealGitClient,
+            repo,
+            "main",
+            "agent/test-local-pr",
+            "squash",
+            "Local PR",
+        )
+        .unwrap();
+
+        assert!(!merged_commit.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "base\nfeature\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("target.txt")).unwrap(),
+            "dirty target change\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("untracked.txt")).unwrap(),
+            "untracked target change\n"
+        );
+        let status = crate::services::RealGitClient.status(repo).unwrap();
+        assert!(
+            status.contains("target.txt"),
+            "missing dirty tracked file: {status}"
+        );
+        assert!(
+            status.contains("untracked.txt"),
+            "missing dirty untracked file: {status}"
+        );
+        let stash_list = git_stdout(repo, &["stash", "list"]);
+        assert!(
+            !stash_list.contains("cairn-local-merge main"),
+            "local merge stash was not dropped: {stash_list}"
+        );
+    }
+
+    #[test]
+    fn local_merge_pop_conflict_preserves_stash_and_reports_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        git(repo, &["init"]);
+        git(repo, &["checkout", "-B", "main"]);
+
+        std::fs::write(repo.join("conflict.txt"), "base\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "base",
+            ],
+        );
+
+        git(repo, &["checkout", "-b", "agent/test-local-pr"]);
+        std::fs::write(repo.join("conflict.txt"), "feature\n").unwrap();
+        git(repo, &["add", "-A"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.email=test@test.com",
+                "-c",
+                "user.name=Test User",
+                "commit",
+                "-m",
+                "feature",
+            ],
+        );
+        git(repo, &["checkout", "main"]);
+        std::fs::write(repo.join("conflict.txt"), "dirty target change\n").unwrap();
+
+        let error = local_merge(
+            &crate::services::RealGitClient,
+            repo,
+            "main",
+            "agent/test-local-pr",
+            "squash",
+            "Local PR",
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("local merge succeeded at"),
+            "missing merge-success context: {error}"
+        );
+        assert!(
+            error.contains("restoring stashed target changes failed"),
+            "missing restore-failure context: {error}"
+        );
+        assert!(
+            error.contains("stash was preserved as stash@{"),
+            "missing named stash recovery: {error}"
+        );
+        let stash_list = git_stdout(repo, &["stash", "list"]);
+        assert!(
+            stash_list.contains("cairn-local-merge main"),
+            "conflicted pop dropped the stash: {stash_list}"
+        );
+        let conflict_file = std::fs::read_to_string(repo.join("conflict.txt")).unwrap();
+        assert!(
+            conflict_file.contains("<<<<<<<"),
+            "expected pop conflict markers, got: {conflict_file}"
+        );
+    }
 
     #[test]
     fn extract_run_id_from_full_url() {
@@ -720,5 +1459,177 @@ mod tests {
         let result = update_main_repo_after_merge(&git, "/repo", "main");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Could not stash"));
+    }
+
+    // ── update_worktree_after_merge ──────────────────────────
+
+    #[test]
+    fn update_worktree_fast_forwards_clean_matching_branch() {
+        use crate::services::testing::MockGitClient;
+        use crate::services::GitOutput;
+
+        let mut git = MockGitClient::new();
+        git.expect_current_branch()
+            .returning(|_| Ok("agent/CAI-1-coordinator-0".to_string()));
+        git.expect_status().returning(|_| Ok(String::new()));
+        // Asserts both halves fire exactly once: fetch, then ff-only merge.
+        git.expect_run()
+            .withf(|_, args| args.first().map(String::as_str) == Some("fetch"))
+            .times(1)
+            .returning(|_, _| {
+                Ok(GitOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+        git.expect_run()
+            .withf(|_, args| {
+                args.first().map(String::as_str) == Some("merge")
+                    && args.iter().any(|a| a == "--ff-only")
+            })
+            .times(1)
+            .returning(|_, _| {
+                Ok(GitOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+
+        let result =
+            update_worktree_after_merge(&git, Path::new("/wt/coord"), "agent/CAI-1-coordinator-0");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_worktree_skips_dirty_tree() {
+        use crate::services::testing::MockGitClient;
+
+        let mut git = MockGitClient::new();
+        git.expect_current_branch()
+            .returning(|_| Ok("integration".to_string()));
+        git.expect_status()
+            .returning(|_| Ok(" M src/lib.rs".to_string()));
+        // A dirty tree must never trigger fetch/merge.
+        git.expect_run().never();
+
+        let result = update_worktree_after_merge(&git, Path::new("/wt/coord"), "integration");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_worktree_skips_wrong_branch() {
+        use crate::services::testing::MockGitClient;
+
+        let mut git = MockGitClient::new();
+        git.expect_current_branch()
+            .returning(|_| Ok("some-other-branch".to_string()));
+        // A branch mismatch short-circuits before status/run.
+        git.expect_status().never();
+        git.expect_run().never();
+
+        let result = update_worktree_after_merge(&git, Path::new("/wt/coord"), "integration");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_worktree_errors_when_fast_forward_impossible() {
+        use crate::services::testing::MockGitClient;
+        use crate::services::GitOutput;
+
+        let mut git = MockGitClient::new();
+        git.expect_current_branch()
+            .returning(|_| Ok("integration".to_string()));
+        git.expect_status().returning(|_| Ok(String::new()));
+        git.expect_run()
+            .withf(|_, args| args.first().map(String::as_str) == Some("fetch"))
+            .returning(|_, _| {
+                Ok(GitOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+        git.expect_run()
+            .withf(|_, args| args.first().map(String::as_str) == Some("merge"))
+            .returning(|_, _| {
+                Ok(GitOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "Not possible to fast-forward".to_string(),
+                })
+            });
+
+        let result = update_worktree_after_merge(&git, Path::new("/wt/coord"), "integration");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("fast-forward failed"));
+    }
+
+    // ── fast_forward_active_worktree: dispatch + main-repo skip ──
+
+    const PORCELAIN_TWO_WORKTREES: &str = "\
+worktree /repo
+HEAD abc
+branch refs/heads/main
+
+worktree /wt/coord
+HEAD def
+branch refs/heads/integration
+";
+
+    #[test]
+    fn fast_forward_active_worktree_advances_separate_worktree() {
+        use crate::services::testing::MockGitClient;
+        use crate::services::GitOutput;
+
+        let mut git = MockGitClient::new();
+        git.expect_worktree_list()
+            .returning(|_| Ok(PORCELAIN_TWO_WORKTREES.to_string()));
+        // The `integration` worktree is distinct from /repo → it is fast-forwarded.
+        git.expect_current_branch()
+            .returning(|_| Ok("integration".to_string()));
+        git.expect_status().returning(|_| Ok(String::new()));
+        git.expect_run().returning(|_, _| {
+            Ok(GitOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+
+        let result = fast_forward_active_worktree(&git, Path::new("/repo"), "integration");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fast_forward_active_worktree_skips_main_repo_on_default_branch() {
+        use crate::services::testing::MockGitClient;
+
+        let mut git = MockGitClient::new();
+        git.expect_worktree_list()
+            .returning(|_| Ok(PORCELAIN_TWO_WORKTREES.to_string()));
+        // `main` resolves to the main repo entry (/repo), so no fast-forward runs:
+        // the existing main-repo pull owns the default branch (no regression).
+        git.expect_current_branch().never();
+        git.expect_status().never();
+        git.expect_run().never();
+
+        let result = fast_forward_active_worktree(&git, Path::new("/repo"), "main");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn fast_forward_active_worktree_skips_when_branch_not_checked_out() {
+        use crate::services::testing::MockGitClient;
+
+        let mut git = MockGitClient::new();
+        git.expect_worktree_list()
+            .returning(|_| Ok("worktree /repo\nHEAD abc\nbranch refs/heads/main\n".to_string()));
+        git.expect_current_branch().never();
+        git.expect_run().never();
+
+        let result = fast_forward_active_worktree(&git, Path::new("/repo"), "integration");
+        assert!(result.is_ok());
     }
 }

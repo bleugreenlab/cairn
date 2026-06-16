@@ -1,27 +1,74 @@
 //! Implementation-related MCP handlers.
 //!
-//! Handles: add_comment, return
+//! Handles: add_comment, and artifact writes/patches submitted through the
+//! `write` verb (the replacement for the deleted dynamic `return` tool).
 
-use crate::diesel_models::NewComment;
-use crate::jobs::queries::{
-    find_node_in_snapshot, get_node_name_for_job, get_task_parent_info, load_execution_snapshot,
-};
 use crate::mcp::types::{AddCommentPayload, McpCallbackRequest};
+use crate::models::{ConfirmPolicy, ExecutionSnapshot};
 use crate::orchestrator::Orchestrator;
-use crate::schema::{artifacts, comments, jobs};
-use diesel::prelude::*;
-
-use super::{lookup_run, RunContext};
+use crate::storage::{DbError, DbResult, RowExt};
+use turso::params;
 
 // ============================================================================
 // Handlers
 // ============================================================================
 
+pub async fn append_issue_comment(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    project_key: &str,
+    issue_number: i32,
+    content: &str,
+) -> Result<String, String> {
+    let services = &orch.services;
+    let project_key_upper = project_key.to_uppercase();
+    let (comment_id, issue_id, now) =
+        append_issue_comment_db(orch, &project_key_upper, issue_number, content.to_string())
+            .await?;
+    let source = "agent";
+
+    orch.sync(crate::sync::SyncMessage::Comment(
+        crate::sync::SyncComment {
+            id: comment_id.clone(),
+            issue_id: issue_id.clone(),
+            content: content.to_string(),
+            source: Some(source.to_string()),
+            created_at: Some(now as i64),
+        },
+    ));
+
+    let _ = services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "comments", "action": "insert"}),
+    );
+
+    let exclude_job_id = super::run_context::lookup_run(&orch.db.local, request)
+        .await
+        .ok()
+        .map(|ctx| ctx.job_id);
+    if let Err(error) = crate::messages::side_channel::record_issue_comment_side_channel_async(
+        orch,
+        &issue_id,
+        source,
+        content,
+        exclude_job_id.as_deref(),
+    )
+    .await
+    {
+        log::warn!("Failed to record issue comment side-channel notices: {error}");
+    }
+
+    Ok(format!(
+        "Appended comment to issue {}-{}",
+        project_key_upper, issue_number
+    ))
+}
+
 /// Handle add_comment tool call - adds a comment to the issue associated with this run
 pub async fn handle_add_comment(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: AddCommentPayload = match serde_json::from_value(request.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => return format!("Invalid payload: {}", e),
+    let payload: AddCommentPayload = match super::parse_payload(request) {
+        Ok(payload) => payload,
+        Err(error) => return error,
     };
 
     log::info!(
@@ -30,430 +77,814 @@ pub async fn handle_add_comment(orch: &Orchestrator, request: &McpCallbackReques
         payload.content.len()
     );
 
-    let services = &orch.services;
-    let db_state = &orch.db;
-
-    let mut conn = match db_state.conn.lock() {
-        Ok(c) => c,
-        Err(e) => return format!("Failed to lock database: {}", e),
-    };
-
-    let diesel_conn = &mut *conn;
-
-    // Get the issue_id from the run
-    let ctx = match lookup_run(diesel_conn, request) {
+    let ctx = match super::run_context::lookup_run(&orch.db.local, request).await {
         Ok(ctx) => ctx,
         Err(e) => return e,
     };
-    let issue_id = match ctx.issue_id {
-        Some(id) => id,
+    let issue_number = match ctx.issue_number {
+        Some(number) => number,
         None => {
             return "Cannot add comment: project-level jobs don't have an associated issue"
-                .to_string()
+                .to_string();
         }
     };
-
-    // Insert the comment
-    let now = chrono::Utc::now().timestamp() as i32;
-    let comment_id = uuid::Uuid::new_v4().to_string();
-
-    let new_comment = NewComment {
-        id: &comment_id,
-        issue_id: &issue_id,
-        content: &payload.content,
-        source: "agent",
-        created_at: now,
-    };
-
-    if let Err(e) = diesel::insert_into(comments::table)
-        .values(&new_comment)
-        .execute(diesel_conn)
-    {
-        return format!("Failed to insert comment: {}", e);
+    let project_key = ctx.project_key.clone();
+    match append_issue_comment(orch, request, &project_key, issue_number, &payload.content).await {
+        Ok(result) => result,
+        Err(error) => error,
     }
-
-    orch.sync(crate::sync::SyncMessage::Comment(
-        crate::sync::SyncComment {
-            id: comment_id.clone(),
-            issue_id: issue_id.clone(),
-            content: payload.content.clone(),
-            source: Some("agent".to_string()),
-            created_at: Some(now as i64),
-        },
-    ));
-
-    // Emit db-change event so frontend can refresh comments
-    let _ = services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "comments", "action": "insert"}),
-    );
-
-    "Comment added to issue.".to_string()
 }
 
-/// Handle return tool call - submit final output and complete the job
-///
-/// ## Lifecycle Design
-///
-/// **Job status:** Deferred until after checkpoint resolution, then written via
-/// `transition_job`. This ensures:
-/// - State machine validation (Running→Complete, Running→Blocked, Running→Failed)
-/// - Failure cascade to downstream DAG jobs
-/// - Execution/issue status recomputation
-/// - `TriggerEvent::JobEnded` emission
-///
-/// **Run status:** NOT touched here. The run stays "running" until the reader
-/// thread processes the Result event and calls `transition_to_warm_state` →
-/// `transition_run(Idle)`. This makes the Running→Idle transition valid.
-pub async fn handle_return(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    use crate::diesel_models::NewArtifact;
-    use crate::models::JobStatus;
+/// Validate `payload` against a resolved JSON Schema, returning a descriptive
+/// error naming the failing fields. Now that the artifact schema is no longer a
+/// visible tool input, this is where the agent gets corrective feedback for a
+/// malformed write.
+fn validate_against_schema(
+    schema: &serde_json::Value,
+    payload: &serde_json::Value,
+) -> Result<(), String> {
+    let validator =
+        jsonschema::validator_for(schema).map_err(|e| format!("Invalid artifact schema: {e}"))?;
+    let errors: Vec<String> = validator
+        .iter_errors(payload)
+        .map(|e| {
+            let path = e.instance_path.to_string();
+            if path.is_empty() {
+                e.to_string()
+            } else {
+                format!("{e} (at {path})")
+            }
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Artifact does not match its schema:\n- {}",
+            errors.join("\n- ")
+        ))
+    }
+}
 
-    // The payload is the raw artifact output (already validated by cairn-mcp against schema)
-    let payload = &request.payload;
-
-    log::info!(
-        "return for cwd={}, payload keys: {:?}",
-        request.cwd,
-        payload.as_object().map(|o| o.keys().collect::<Vec<_>>())
-    );
-
-    let services = &orch.services;
-
-    // Phase 1: Inside db lock — store artifact, read checkpoint info, read execution context.
-    // Do NOT write job or run status here.
-    let (run_id, job_id, artifact_type, artifact_uri, checkpoint_info, worktree_path) = {
-        let db_state = &orch.db;
-
-        let mut conn = match db_state.conn.lock() {
-            Ok(c) => c,
-            Err(e) => return format!("Failed to lock database: {}", e),
-        };
-
-        let diesel_conn = &mut *conn;
-
-        // Get the run context
-        let ctx = match lookup_run(diesel_conn, request) {
-            Ok(ctx) => ctx,
-            Err(e) => return e,
-        };
-
-        // Get artifact type and output name from three sources (in priority order):
-        // 1. Source node's own outputSchema.schemaType
-        // 2. Downstream ActionNode's inputSchema.schemaType
-        // 3. Downstream ArtifactNode's artifactType
-        let (artifact_type, output_name) =
-            resolve_artifact_type_and_output(diesel_conn, &ctx.job_id, &ctx.job_type);
-
-        // Serialize the payload
-        let data_json = match serde_json::to_string(payload) {
-            Ok(json) => json,
-            Err(e) => return format!("Failed to serialize artifact data: {}", e),
-        };
-
-        // Check for existing artifact on this job (for versioning)
-        let existing: Option<(String, i32)> = artifacts::table
-            .filter(artifacts::job_id.eq(&ctx.job_id))
-            .order(artifacts::version.desc())
-            .select((artifacts::id, artifacts::version))
-            .first(diesel_conn)
-            .ok();
-
-        let (parent_version_id, version) = match existing {
-            Some((parent_id, parent_version)) => (Some(parent_id), parent_version + 1),
-            None => (None, 1),
-        };
-
-        // Create the artifact
-        let now = chrono::Utc::now().timestamp() as i32;
-        let artifact_id = uuid::Uuid::new_v4().to_string();
-
-        let new_artifact = NewArtifact {
-            id: &artifact_id,
-            job_id: Some(&ctx.job_id),
-            artifact_type: &artifact_type,
-            schema_version: 1,
-            data: &data_json,
-            version,
-            parent_version_id: parent_version_id.as_deref(),
-            output_name: output_name.as_deref(),
-            created_at: now,
-            updated_at: now,
-        };
-
-        if let Err(e) = diesel::insert_into(artifacts::table)
-            .values(&new_artifact)
-            .execute(diesel_conn)
-        {
-            return format!("Failed to store artifact: {}", e);
-        }
-
-        log::info!(
-            "Artifact stored: id={}, job_id={}, type={}, version={}",
-            artifact_id,
-            ctx.job_id,
-            artifact_type,
-            version
-        );
-
-        // Sync the new artifact to cloud
-        orch.sync(crate::sync::SyncMessage::Artifact(
-            crate::sync::SyncArtifact {
-                id: artifact_id.clone(),
-                job_id: Some(ctx.job_id.clone()),
-                data: Some(data_json.clone()),
-                version: Some(version),
-                updated_at: Some(now as i64),
-            },
-        ));
-
-        // Get checkpoint info to determine how to handle completion
-        let checkpoint_info = get_checkpoint_info(diesel_conn, &ctx.job_id);
-
-        // Get worktree for programmatic checkpoint execution
-        let worktree_path: Option<String> = jobs::table
-            .find(&ctx.job_id)
-            .select(jobs::worktree_path)
-            .first(diesel_conn)
-            .ok()
-            .flatten();
-
-        // Emit artifact event for frontend
-        let _ = services.emitter.emit(
-            "artifact-submitted",
-            serde_json::json!({
-                "artifact_id": artifact_id,
-                "run_id": ctx.run_id,
-                "job_id": ctx.job_id,
-                "artifact_type": artifact_type,
-                "version": version,
-            }),
-        );
-
-        let _ = services
-            .emitter
-            .emit("db-change", serde_json::json!({ "table": "artifacts" }));
-
-        // Build artifact URI while we have the context and db lock
-        let artifact_uri = build_artifact_uri(diesel_conn, &ctx, &ctx.job_id);
-
-        (
-            ctx.run_id,
-            ctx.job_id,
-            artifact_type,
-            artifact_uri,
-            checkpoint_info,
-            worktree_path,
-        )
-    };
-
-    // Phase 2: Determine final job status based on checkpoint type.
-    // Job stays Running during this phase — transition only when outcome is known.
-    let job_target = match &checkpoint_info {
-        Some(info) if info.checkpoint_type == "approval" || info.checkpoint_type == "prompt" => {
-            log::info!("Job {} blocked at checkpoint - awaiting approval", job_id);
-            JobStatus::Blocked
-        }
-        Some(info) if info.checkpoint_type == "programmatic" => {
-            let command = info.command.clone().unwrap_or_else(|| "exit 0".to_string());
-
-            if let Some(ref worktree) = worktree_path {
-                log::info!(
-                    "Executing programmatic checkpoint for job {}: {}",
-                    job_id,
-                    command
-                );
-
-                match crate::execution::conditions::execute_programmatic_checkpoint(
-                    worktree, &command,
+/// Resolve the artifact schema *shape* for a node (its own schema, else inherited
+/// from a downstream context-edge target). `None` means no schema to validate
+/// against.
+async fn resolve_artifact_schema(
+    orch: &Orchestrator,
+    node_id: &str,
+    execution_id: &str,
+) -> Option<crate::models::OutputSchemaInfo> {
+    let node_id = node_id.to_string();
+    let execution_id = execution_id.to_string();
+    orch.db
+        .local
+        .read(|conn| {
+            let node_id = node_id.clone();
+            let execution_id = execution_id.clone();
+            Box::pin(async move {
+                crate::execution::jobs::find_downstream_artifact_schema_conn(
+                    conn,
+                    &node_id,
+                    &execution_id,
                 )
                 .await
-                {
-                    Ok(true) => {
-                        log::info!("Programmatic checkpoint passed for job {}", job_id);
-                        JobStatus::Complete
-                    }
-                    Ok(false) | Err(_) => {
-                        log::warn!("Programmatic checkpoint failed for job {}", job_id);
-                        JobStatus::Failed
-                    }
-                }
-            } else {
-                log::warn!(
-                    "No worktree found for programmatic checkpoint on job {}",
-                    job_id
-                );
-                JobStatus::Complete
-            }
-        }
-        _ => JobStatus::Complete,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Store (or patch) a node/task artifact submitted through the `write` verb.
+///
+/// ## Lifecycle design
+///
+/// This replaces the dynamic `return` tool. The schema is resolved and validated
+/// server-side; `confirmed` is set from the producing node's declared
+/// `confirm_policy` (`auto` -> confirmed, `user` -> unconfirmed); and the job is
+/// recomputed so its status re-derives (Complete, or Blocked under `user`
+/// policy). A fresh `create` of the declared output artifact arms the producing
+/// run for a boundary interrupt after the tool result reaches native history.
+///
+/// `is_patch` merges the payload over the latest artifact (validating the full
+/// merged object); `create` stores the payload as-is.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn write_artifact_change(
+    orch: &Orchestrator,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: Option<&str>,
+    artifact_name: Option<&str>,
+    payload: &serde_json::Value,
+    is_patch: bool,
+) -> Result<String, String> {
+    let services = &orch.services;
+
+    // 1. Resolve the owning job from the URI coordinates.
+    let job_id = crate::resources::resolve_todos_job_id(
+        &orch.db.local,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+    )
+    .await?;
+
+    // 2. Resolve schema shape + confirm policy from the execution snapshot.
+    let (node_id, execution_id) = match job_node_execution(orch, &job_id).await.ok().flatten() {
+        Some((node_id, execution_id)) => (node_id, execution_id),
+        None => (None, None),
     };
 
-    // Phase 3: Apply step outcome via unified reducer (transition + system message +
-    // manager wake + DAG advance signal).
-    {
-        use crate::transitions::outcome::{
-            apply_step_outcome, emit_outcome_effects, OutcomeContext, OutcomeSource, StepOutcome,
-        };
-
-        let outcome = match job_target {
-            JobStatus::Complete => StepOutcome::Complete,
-            JobStatus::Failed => StepOutcome::Failed,
-            JobStatus::Blocked => StepOutcome::Blocked,
-            _ => unreachable!(),
-        };
-        let ctx = OutcomeContext {
-            run_id: Some(&run_id),
-            source: OutcomeSource::Return,
-        };
-
-        match apply_step_outcome(orch, &job_id, &ctx, outcome) {
-            Ok((_result, effects)) => {
-                emit_outcome_effects(orch, effects);
-            }
-            Err(e) => log::error!("Failed to apply step outcome for {}: {}", job_id, e),
+    // Resolve the confirm policy, artifact contract name, and schema to validate
+    // against. Node jobs read these from their recipe node (own schema, else
+    // inherited from a downstream context edge). Task jobs have no recipe node:
+    // they auto-confirm and validate against the `return` contract that every
+    // child/delegated task is started with (restoring the validation the dynamic
+    // return tool did).
+    let mut policy = ConfirmPolicy::Auto;
+    let mut validation_schema: Option<crate::models::OutputSchema> = None;
+    let mut required_artifact_name: Option<String> = None;
+    if let (Some(node_id), Some(execution_id)) = (node_id.as_deref(), execution_id.as_deref()) {
+        // One resolved output contract drives both the confirm policy and the
+        // validation shape: the producing node's own schema, else inherited from
+        // the downstream ctx-edge consumer's `inputSchema` (a `pr` consumer
+        // auto-confirms — the PR lifecycle is the gate, see CAIRN-1219).
+        if let Some(info) = resolve_artifact_schema(orch, node_id, execution_id).await {
+            policy = info.confirm_policy;
+            required_artifact_name = info.artifact_name;
+            validation_schema = Some(info.schema);
         }
+    } else if task_name.is_some() {
+        // Child/delegated tasks are started with the return preset under the
+        // declared `result` artifact name (see child_tasks.rs). Do not derive
+        // the required name from the URI being written: incidental task artifacts
+        // such as `notes` must validate if they use the return shape, but they
+        // must not satisfy/arm the declared task output contract.
+        required_artifact_name = Some("result".to_string());
+        validation_schema = Some(crate::models::OutputSchema::Preset("return".to_string()));
     }
+    let should_arm_terminal_interrupt = should_arm_output_artifact_interrupt(
+        is_patch,
+        artifact_name,
+        required_artifact_name.as_deref(),
+        validation_schema.is_some(),
+    );
 
-    // Flag the process so the reader thread suppresses the synthetic interrupt message
-    orch.process_state.mark_terminal_tool(&run_id);
+    // A `patch` resolves against the latest artifact's data; a `create`
+    // replaces. Validation and storage operate on the full resulting object so a
+    // partial patch (e.g. `{content}` against a plan) can't drop required fields
+    // like `title`. File-style text replacement payloads are operations over a
+    // prose field, not metadata to store on the artifact.
+    let latest = load_latest_artifact(orch, &job_id).await;
+    let prior_confirmed = latest.as_ref().map(|(_, confirmed)| *confirmed);
 
-    // Schedule interrupt after a short delay to ensure MCP response is delivered first.
-    // This stops Claude from generating more after receiving the tool result.
-    let process_state = orch.process_state.clone();
-    let run_id_clone = run_id.clone();
-    tokio::spawn(async move {
-        // Small delay to let the MCP response get through
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        if crate::backends::stdin::send_interrupt(&process_state, &run_id_clone).is_ok() {
-            log::info!(
-                "Sent interrupt after turn-ender tool for run {}",
-                &run_id_clone[..run_id_clone.len().min(8)]
+    let effective_payload = match (is_patch, &latest) {
+        (true, Some((base, _))) => apply_artifact_patch(base.clone(), payload)?,
+        (true, None) if is_text_replacement_patch(payload) => {
+            return Err(
+                "Artifact text replacement patch requires an existing artifact to edit".to_string(),
             );
         }
-    });
-
-    // Build artifact reference - prefer URI, fall back to job UUID
-    let artifact_ref = artifact_uri.unwrap_or_else(|| format!("job: {}", job_id));
-
-    format!(
-        "Output submitted successfully ({}, type: {})",
-        artifact_ref, artifact_type
-    )
-}
-
-/// Checkpoint information for a job's node.
-#[derive(Debug, Clone)]
-struct CheckpointInfo {
-    checkpoint_type: String, // "approval", "prompt", or "programmatic"
-    command: Option<String>, // For programmatic: the command to run
-}
-
-/// Get checkpoint information for a job's node.
-/// Checks for embedded checkpoint in agent/action nodes or standalone checkpoint nodes.
-fn get_checkpoint_info(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    job_id: &str,
-) -> Option<CheckpointInfo> {
-    // Get job's execution_id and recipe_node_id
-    let job_data: Option<(Option<String>, Option<String>)> = jobs::table
-        .find(job_id)
-        .select((jobs::execution_id, jobs::recipe_node_id))
-        .first(conn)
-        .ok();
-
-    let (execution_id, node_id) = match job_data {
-        Some((Some(e), Some(n))) => (e, n),
-        _ => return None,
+        // create, or field-merge patch with no prior artifact — the payload stands alone.
+        _ => payload.clone(),
     };
 
-    // Load node from execution snapshot
-    let snapshot = load_execution_snapshot(conn, &execution_id).ok()?;
-    let node = find_node_in_snapshot(&snapshot, &node_id)?;
-
-    // Check for embedded checkpoint in agent nodes
-    if let Some(ref agent_cfg) = node.agent_config {
-        if let Some(ref checkpoint) = agent_cfg.checkpoint {
-            return Some(CheckpointInfo {
-                checkpoint_type: checkpoint.checkpoint_type.to_string(),
-                command: checkpoint.command.clone(),
-            });
-        }
+    if let Some(schema) = &validation_schema {
+        let schema_value =
+            crate::output_schemas::resolve_output_schema(orch.schema_dir.as_deref(), schema)
+                .map_err(|e| format!("Failed to resolve artifact schema: {e}"))?;
+        validate_against_schema(&schema_value, &effective_payload)?;
     }
 
-    // Check for embedded checkpoint in action nodes
-    if let Some(ref action_cfg) = node.action_config {
-        if let Some(ref checkpoint) = action_cfg.checkpoint {
-            return Some(CheckpointInfo {
-                checkpoint_type: checkpoint.checkpoint_type.to_string(),
-                command: checkpoint.command.clone(),
-            });
-        }
+    // 3. Confirmation is a one-shot job-progress trigger, not a per-version gate.
+    //    A fresh create sets it from the node's policy (auto -> confirmed, user
+    //    -> awaits the human). A patch is a pure edit: it never re-arms the gate.
+    //    Once any version is confirmed, later writes keep it confirmed; a patch
+    //    before confirmation inherits the still-unconfirmed state (so the
+    //    request-changes revision stays Blocked until the human confirms).
+    let confirmed = resolve_confirmed(is_patch, prior_confirmed, policy);
+
+    let data_json = serde_json::to_string(&effective_payload)
+        .map_err(|e| format!("Failed to serialize artifact: {e}"))?;
+    let default_type = artifact_name.unwrap_or("document");
+    let stored = store_artifact(orch, &job_id, default_type, data_json, confirmed).await?;
+
+    let synced_pr_metadata = if let Some((title, body)) = create_pr_artifact_details(
+        &effective_payload,
+        artifact_name,
+        required_artifact_name.as_deref(),
+        stored.output_name.as_deref(),
+        &stored.artifact_type,
+    ) {
+        crate::pr_data::actions::sync_create_pr_artifact_for_job(
+            orch,
+            &job_id,
+            &title,
+            body.as_deref(),
+        )
+        .await?
+    } else {
+        false
+    };
+
+    log::info!(
+        "Artifact written via change: id={}, job_id={}, type={}, version={}, confirmed={}, synced_pr_metadata={}",
+        stored.artifact_id,
+        job_id,
+        stored.artifact_type,
+        stored.version,
+        confirmed,
+        synced_pr_metadata
+    );
+
+    let artifact = crate::models::Artifact {
+        id: stored.artifact_id.clone(),
+        job_id: Some(job_id.clone()),
+        artifact_type: stored.artifact_type.clone(),
+        schema_version: 1,
+        data: effective_payload.clone(),
+        version: stored.version,
+        parent_version_id: stored.parent_version_id.clone(),
+        output_name: stored.output_name.clone(),
+        created_at: stored.created_at as i64,
+        updated_at: stored.updated_at as i64,
+        seen_at: None,
+        confirmed,
+    };
+    orch.notifier.artifact(&artifact);
+
+    let _ = services.emitter.emit(
+        "artifact-submitted",
+        serde_json::json!({
+            "artifact_id": stored.artifact_id,
+            "job_id": job_id,
+            "artifact_type": stored.artifact_type,
+            "version": stored.version,
+        }),
+    );
+
+    // Build the canonical artifact URI and embed its prose for corpus recall.
+    let artifact_uri = if let Some(task_name) = task_name {
+        cairn_common::uri::build_task_artifact_uri_named(
+            project_key,
+            number,
+            exec_seq,
+            node_name,
+            task_name,
+            artifact_name,
+        )
+    } else {
+        cairn_common::uri::build_node_artifact_uri_named(
+            project_key,
+            number,
+            exec_seq,
+            node_name,
+            artifact_name,
+        )
+    };
+    let text = crate::embeddings::artifact_embed_text(&stored.artifact_type, &effective_payload)
+        .unwrap_or_default();
+    orch.enqueue_resource_embed(&artifact_uri, text);
+
+    // 4. Typed attention emit: the artifact landing IS the actionable fact, so
+    //    emit BEFORE the recompute. If recompute moves the issue to terminal
+    //    and fires its own `Resolved` event, a watcher that returns on the
+    //    first match still gets the artifact metadata first — the resolution
+    //    is the downstream consequence, not the user-facing fact. The dedupe
+    //    cache prevents the recompute's Resolved from drowning out the
+    //    artifact write for the same issue within the dedupe window.
+    if let Ok((issue_id, issue_ctx)) =
+        crate::orchestrator::attention::lookup_issue_for_attention_by_key(
+            &orch.db.local,
+            project_key,
+            number,
+        )
+        .await
+    {
+        let title = effective_payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let summary = effective_payload
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let output_name = artifact_name.unwrap_or("document").to_string();
+        orch.emit_attention_event(crate::orchestrator::AttentionEvent {
+            issue_id,
+            issue_uri: issue_ctx.issue_uri(),
+            fact: crate::orchestrator::AttentionFact::ArtifactWritten {
+                escalate: false,
+                detail_uri: artifact_uri.clone(),
+                content: crate::orchestrator::attention::ArtifactSummary {
+                    output_name,
+                    version: stored.version,
+                    confirmed,
+                    title,
+                    summary,
+                    artifact_type: stored.artifact_type.clone(),
+                },
+            },
+            attention: issue_ctx.attention,
+            status: issue_ctx.status,
+            updated_at: issue_ctx.updated_at,
+        });
     }
 
-    // Check for standalone checkpoint node
-    if node.node_type.to_string() == "checkpoint" {
-        if let Some(ref checkpoint_cfg) = node.checkpoint_config {
-            return Some(CheckpointInfo {
-                checkpoint_type: checkpoint_cfg.checkpoint_type.to_string(),
-                command: checkpoint_cfg.command.clone(),
-            });
-        }
+    // 5. Recompute the job so its status re-derives. Runs after the typed emit
+    //    so the artifact's content reaches the watcher before any downstream
+    //    Resolved. Draft memories are reviewed from the idle hook after the
+    //    terminal artifact/tool boundary warms the process.
+    if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
+        log::warn!("recompute_job after artifact write failed for {job_id}: {e}");
     }
 
-    None
+    if should_arm_terminal_interrupt {
+        arm_terminal_interrupt_for_job(orch, &job_id);
+    }
+
+    let verb = if is_patch { "patched" } else { "wrote" };
+    Ok(format!(
+        "Artifact {} ({}, type: {}, version {}){}{}",
+        verb,
+        artifact_uri,
+        stored.artifact_type,
+        stored.version,
+        if confirmed {
+            ""
+        } else {
+            " — awaiting user confirmation"
+        },
+        if synced_pr_metadata {
+            " — synced PR title/body"
+        } else {
+            ""
+        }
+    ))
 }
 
-/// Build artifact URI for the tool response.
-/// Returns format like `cairn://CAIRN/123/Planner/artifact` or `cairn://CAIRN/123/Builder/task/Explore/artifact`.
-fn build_artifact_uri(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    ctx: &RunContext,
-    job_id: &str,
-) -> Option<String> {
-    // Only issue-based jobs get URIs
-    let issue_number = ctx.issue_number?;
+struct StoredArtifact {
+    artifact_id: String,
+    artifact_type: String,
+    version: i32,
+    parent_version_id: Option<String>,
+    output_name: Option<String>,
+    created_at: i32,
+    updated_at: i32,
+}
 
-    // Check if this is a task-spawned job (has parent_job_id)
-    if let Some((parent_job_id, agent_config_id, task_index)) = get_task_parent_info(conn, job_id) {
-        // Task-spawned job: cairn://PROJECT/123/ParentNode/task/TaskName/artifact
-        let parent_node = get_node_name_for_job(conn, &parent_job_id)?;
-        let task_name = agent_config_id.unwrap_or_else(|| "Task".to_string());
-        // Handle task_index for disambiguation if > 0 (0-indexed, so first task has no suffix)
-        let task_suffix = task_index
-            .filter(|&i| i > 0)
-            .map(|i| format!("-{}", i + 1))
-            .unwrap_or_default();
-        Some(format!(
-            "cairn://{}/{}/{}/task/{}{}/artifact",
-            ctx.project_key, issue_number, parent_node, task_name, task_suffix
-        ))
+async fn append_issue_comment_db(
+    orch: &Orchestrator,
+    project_key_upper: &str,
+    issue_number: i32,
+    content: String,
+) -> Result<(String, String, i32), String> {
+    let project_key_upper = project_key_upper.to_string();
+    orch.db
+        .local
+        .write(|conn| {
+            let project_key_upper = project_key_upper.clone();
+            let content = content.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT i.id
+                        FROM issues i
+                        JOIN projects p ON i.project_id = p.id
+                        WHERE p.key = ?1 AND i.number = ?2
+                        LIMIT 1
+                        ",
+                        params![project_key_upper.as_str(), issue_number],
+                    )
+                    .await?;
+                let row = rows.next().await?.ok_or_else(|| {
+                    DbError::Row(format!(
+                        "Issue {}-{} not found",
+                        project_key_upper, issue_number
+                    ))
+                })?;
+                let issue_id = row.text(0)?;
+                let comment_id = uuid::Uuid::new_v4().to_string();
+                let now = chrono::Utc::now().timestamp() as i32;
+                let seq = crate::issues::comments::next_issue_comment_seq(conn, &issue_id).await?;
+
+                conn.execute(
+                    "
+                    INSERT INTO comments (id, issue_id, content, source, created_at, seq)
+                    VALUES (?1, ?2, ?3, 'agent', ?4, ?5)
+                    ",
+                    params![
+                        comment_id.as_str(),
+                        issue_id.as_str(),
+                        content.as_str(),
+                        now,
+                        seq
+                    ],
+                )
+                .await?;
+
+                Ok((comment_id, issue_id, now))
+            })
+        })
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("not found") {
+                e.to_string()
+            } else {
+                format!("Failed to insert comment: {e}")
+            }
+        })
+}
+
+/// Resolve a written artifact version's `confirmed` flag. Confirmation is a
+/// one-shot job-progress trigger, not a per-version gate:
+/// - once any version is confirmed, later writes keep it confirmed;
+/// - a patch before confirmation inherits the unconfirmed state (a
+///   request-changes revision stays Blocked until the human confirms);
+/// - a fresh create with no prior (or an unconfirmed prior) takes the node's
+///   policy (`auto` -> confirmed, `user` -> awaits the human).
+fn resolve_confirmed(is_patch: bool, prior_confirmed: Option<bool>, policy: ConfirmPolicy) -> bool {
+    match (is_patch, prior_confirmed) {
+        (_, Some(true)) => true,
+        (true, Some(false)) => false,
+        _ => matches!(policy, ConfirmPolicy::Auto),
+    }
+}
+
+fn output_artifact_name_matches(artifact_name: Option<&str>, required_name: Option<&str>) -> bool {
+    match required_name {
+        Some(required) => artifact_name.unwrap_or("document") == required,
+        // Mirror recompute's unnamed-contract fallback: any artifact can satisfy
+        // an output contract only when there is a schema but no required name.
+        None => true,
+    }
+}
+
+fn should_arm_output_artifact_interrupt(
+    is_patch: bool,
+    artifact_name: Option<&str>,
+    required_name: Option<&str>,
+    has_output_contract: bool,
+) -> bool {
+    has_output_contract && !is_patch && output_artifact_name_matches(artifact_name, required_name)
+}
+
+fn create_pr_artifact_details(
+    payload: &serde_json::Value,
+    artifact_name: Option<&str>,
+    required_name: Option<&str>,
+    stored_output_name: Option<&str>,
+    stored_artifact_type: &str,
+) -> Option<(String, Option<String>)> {
+    let is_create_pr = artifact_name == Some("create-pr")
+        || required_name == Some("create-pr")
+        || stored_output_name == Some("create-pr")
+        || stored_artifact_type == "create-pr";
+    if !is_create_pr {
+        return None;
+    }
+
+    let title = payload.get("title")?.as_str()?.to_string();
+    let body = payload
+        .get("body")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    Some((title, body))
+}
+
+fn active_run_id_for_job(orch: &Orchestrator, job_id: &str) -> Option<String> {
+    let Ok(processes) = orch.process_state.processes.lock() else {
+        return None;
+    };
+    let run_id = processes
+        .iter()
+        .find(|(_, process)| process.job_id.as_deref() == Some(job_id))
+        .map(|(run_id, _)| run_id.clone());
+    run_id
+}
+
+fn arm_terminal_interrupt_for_job(orch: &Orchestrator, job_id: &str) {
+    let run_id = active_run_id_for_job(orch, job_id);
+
+    if let Some(run_id) = run_id {
+        if !orch.process_state.arm_terminal_tool(&run_id) {
+            log::warn!(
+                "Failed to arm terminal interrupt for output artifact job {} run {}",
+                job_id,
+                run_id
+            );
+        }
     } else {
-        // Regular job: cairn://PROJECT/123/NodeName/artifact
-        let node_name = get_node_name_for_job(conn, job_id)?;
-        Some(format!(
-            "cairn://{}/{}/{}/artifact",
-            ctx.project_key, issue_number, node_name
+        log::warn!(
+            "No active run found to arm terminal interrupt for output artifact job {}",
+            job_id
+        );
+    }
+}
+
+/// Apply a structured artifact patch.
+///
+/// Supported patch forms:
+/// - field merge patch: shallow merge artifact fields over the prior object;
+/// - text replacement patch: `{old_string,new_string,replace_all?,field?}` edits
+///   an existing top-level string field (`field`, else `content`, else `body`).
+fn apply_artifact_patch(
+    base: serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if is_text_replacement_patch(patch) {
+        apply_artifact_text_replacement(base, patch)
+    } else {
+        Ok(merge_artifact_payload(base, patch))
+    }
+}
+
+fn is_text_replacement_patch(patch: &serde_json::Value) -> bool {
+    patch
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("old_string") || obj.contains_key("new_string"))
+}
+
+fn apply_artifact_text_replacement(
+    base: serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut base_obj = base.as_object().cloned().ok_or_else(|| {
+        "Artifact text replacement patch requires an existing object artifact".to_string()
+    })?;
+    let patch_obj = patch
+        .as_object()
+        .ok_or_else(|| "Artifact text replacement patch payload must be an object".to_string())?;
+
+    reject_mixed_artifact_text_patch_keys(patch_obj)?;
+
+    let old = patch_obj
+        .get("old_string")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Artifact text replacement patch requires string old_string".to_string())?;
+    let new = patch_obj
+        .get("new_string")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Artifact text replacement patch requires string new_string".to_string())?;
+    let replace_all = patch_obj
+        .get("replace_all")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let field = resolve_artifact_text_field(&base_obj, patch_obj)?;
+
+    let current = base_obj
+        .get(&field)
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            format!("Artifact text replacement field `{field}` is missing or not a string")
+        })?;
+
+    let updated = replace_artifact_text(current, old, new, replace_all)?;
+    base_obj.insert(field, serde_json::Value::String(updated));
+    Ok(serde_json::Value::Object(base_obj))
+}
+
+fn reject_mixed_artifact_text_patch_keys(
+    patch_obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    const HELPER_KEYS: &[&str] = &["old_string", "new_string", "replace_all", "field"];
+    let extra_keys: Vec<&str> = patch_obj
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !HELPER_KEYS.contains(key))
+        .collect();
+    if extra_keys.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Artifact text replacement patch cannot be mixed with artifact field updates ({}) because those fields would be ambiguous; submit a separate field merge patch",
+            extra_keys.join(", ")
         ))
     }
+}
+
+fn resolve_artifact_text_field(
+    base_obj: &serde_json::Map<String, serde_json::Value>,
+    patch_obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    if let Some(field) = patch_obj.get("field") {
+        let field = field.as_str().ok_or_else(|| {
+            "Artifact text replacement field selector must be a string".to_string()
+        })?;
+        if base_obj
+            .get(field)
+            .and_then(|value| value.as_str())
+            .is_none()
+        {
+            return Err(format!(
+                "Artifact text replacement field `{field}` is missing or not a string"
+            ));
+        }
+        return Ok(field.to_string());
+    }
+
+    for candidate in ["content", "body"] {
+        if base_obj
+            .get(candidate)
+            .and_then(|value| value.as_str())
+            .is_some()
+        {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err("Artifact text replacement requires `field` or a string `content`/`body` field".to_string())
+}
+
+pub(crate) fn replace_artifact_text(
+    current: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+) -> Result<String, String> {
+    if let Some(anchors) = crate::mcp::wildcard::parse_wildcard(old) {
+        return crate::mcp::wildcard::apply_wildcard_edit(current, &anchors, new)
+            .map(|(result, _)| result)
+            .map_err(|e| format!("Wildcard edit failed: {e}"));
+    }
+
+    let literal_old = crate::mcp::wildcard::unescape_literal(old);
+    if !current.contains(literal_old.as_str()) {
+        return Err(
+            crate::mcp::handlers::files::change::file_mutations::literal_not_found_diagnostic(
+                &literal_old,
+                new,
+            ),
+        );
+    }
+
+    let matches = current.matches(literal_old.as_str()).count();
+    if matches > 1 && !replace_all {
+        return Err(format!(
+            "old_string matched {matches} times; use replace_all:true or make old_string more specific"
+        ));
+    }
+
+    if replace_all {
+        Ok(current.replace(literal_old.as_str(), new))
+    } else {
+        Ok(current.replacen(literal_old.as_str(), new, 1))
+    }
+}
+
+/// Merge a `patch` payload's keys over the existing artifact object (shallow,
+/// per-key). A non-object base (or non-object patch) yields the patch as-is.
+fn merge_artifact_payload(base: serde_json::Value, patch: &serde_json::Value) -> serde_json::Value {
+    match base {
+        serde_json::Value::Object(mut base_obj) => {
+            if let Some(obj) = patch.as_object() {
+                for (key, value) in obj {
+                    base_obj.insert(key.clone(), value.clone());
+                }
+            }
+            serde_json::Value::Object(base_obj)
+        }
+        _ => patch.clone(),
+    }
+}
+
+/// Load the latest artifact version's parsed `data` and `confirmed` flag for a
+/// job. The patch path merges a partial payload over the data; the `confirmed`
+/// flag carries the one-shot confirmation across edits.
+async fn load_latest_artifact(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Option<(serde_json::Value, bool)> {
+    let job_id = job_id.to_string();
+    let row: Option<(String, i64)> = orch
+        .db
+        .local
+        .read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT data, confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                rows.next()
+                    .await?
+                    .map(|row| Ok::<_, DbError>((row.text(0)?, row.i64(1)?)))
+                    .transpose()
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+    row.and_then(|(data, confirmed)| {
+        serde_json::from_str(&data)
+            .ok()
+            .map(|value| (value, confirmed != 0))
+    })
+}
+
+async fn store_artifact(
+    orch: &Orchestrator,
+    job_id: &str,
+    default_type: &str,
+    data_json: String,
+    confirmed: bool,
+) -> Result<StoredArtifact, String> {
+    let (artifact_type, _source_handle) =
+        resolve_artifact_type_and_output(orch, job_id, default_type).await;
+    // The artifact's output/display name is its resolved schema name (e.g.
+    // "create-pr", "plan"), NOT the context-edge source handle — the handle
+    // (`_source_handle`, e.g. "context-out") is an input-mapping detail, not a
+    // name. This drives the sidebar label and the canonical artifact URI segment.
+    let output_name = Some(artifact_type.clone());
+    let job_id = job_id.to_string();
+    orch.db
+        .local
+        .write(|conn| {
+            let job_id = job_id.clone();
+            let data_json = data_json.clone();
+            let artifact_type = artifact_type.clone();
+            let output_name = output_name.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT id, version
+                        FROM artifacts
+                        WHERE job_id = ?1
+                        ORDER BY version DESC
+                        LIMIT 1
+                        ",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                let existing = rows
+                    .next()
+                    .await?
+                    .map(|row| Ok::<_, DbError>((row.text(0)?, row.i64(1)? as i32)))
+                    .transpose()?;
+
+                let (parent_version_id, version) = match existing {
+                    Some((parent_id, parent_version)) => (Some(parent_id), parent_version + 1),
+                    None => (None, 1),
+                };
+                let now = chrono::Utc::now().timestamp() as i32;
+                let artifact_id = uuid::Uuid::new_v4().to_string();
+
+                conn.execute(
+                    "
+                    INSERT INTO artifacts (
+                        id, job_id, artifact_type, schema_version, data, version,
+                        parent_version_id, output_name, confirmed, created_at, updated_at
+                    )
+                    VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                    ",
+                    params![
+                        artifact_id.as_str(),
+                        job_id.as_str(),
+                        artifact_type.as_str(),
+                        data_json.as_str(),
+                        version,
+                        parent_version_id.as_deref(),
+                        output_name.as_deref(),
+                        if confirmed { 1 } else { 0 },
+                        now
+                    ],
+                )
+                .await?;
+
+                Ok(StoredArtifact {
+                    artifact_id,
+                    artifact_type,
+                    version,
+                    parent_version_id,
+                    output_name,
+                    created_at: now,
+                    updated_at: now,
+                })
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to store artifact: {}", e))
 }
 
 /// Resolve artifact type and output name from three sources (in priority order):
-/// 1. Source node's own outputSchema.schemaType
-/// 2. Downstream ActionNode's inputSchema.schemaType
+/// 1. Source node's own outputSchema.name (when it carries an inline schema)
+/// 2. Downstream ActionNode's inputSchema.name (when it carries an inline schema)
 /// 3. Downstream ArtifactNode's artifactType
-fn resolve_artifact_type_and_output(
-    conn: &mut diesel::sqlite::SqliteConnection,
+async fn resolve_artifact_type_and_output(
+    orch: &Orchestrator,
     job_id: &str,
     default_type: &str,
 ) -> (String, Option<String>) {
     // Get job's recipe_node_id and execution_id
-    let job_data: Option<(Option<String>, Option<String>)> = jobs::table
-        .find(job_id)
-        .select((jobs::recipe_node_id, jobs::execution_id))
-        .first(conn)
-        .ok();
+    let job_data = job_node_execution(orch, job_id).await.ok().flatten();
 
     let (node_id, execution_id) = match job_data {
         Some((Some(n), Some(e))) => (n, e),
@@ -461,13 +892,13 @@ fn resolve_artifact_type_and_output(
     };
 
     // Load execution snapshot
-    let snapshot = match load_execution_snapshot(conn, &execution_id) {
+    let snapshot = match load_execution_snapshot(orch, &execution_id).await {
         Ok(s) => s,
         Err(_) => return (default_type.to_string(), None),
     };
 
     // Find source node in snapshot
-    let source_node = match find_node_in_snapshot(&snapshot, &node_id) {
+    let source_node = match snapshot.recipe.nodes.iter().find(|n| n.id == node_id) {
         Some(n) => n,
         None => return (default_type.to_string(), None),
     };
@@ -476,9 +907,10 @@ fn resolve_artifact_type_and_output(
     if source_node.node_type.to_string() == "agent" {
         if let Some(ref agent_cfg) = source_node.agent_config {
             if let Some(ref output_schema) = agent_cfg.output_schema {
-                let schema_type = &output_schema.schema_type;
-                if !schema_type.is_empty() && schema_type != "custom" {
-                    return (schema_type.clone(), None);
+                // A self-contained inline schema makes this node the type source;
+                // a name-only schema (no inline shape) inherits from downstream.
+                if output_schema.schema.is_some() {
+                    return (output_schema.name.clone(), None);
                 }
             }
         }
@@ -493,18 +925,24 @@ fn resolve_artifact_type_and_output(
         .collect();
 
     for edge in context_edges {
-        let target_node = match find_node_in_snapshot(&snapshot, &edge.target_node_id) {
+        let target_node = match snapshot
+            .recipe
+            .nodes
+            .iter()
+            .find(|n| n.id == edge.target_node_id)
+        {
             Some(n) => n,
             None => continue,
         };
 
-        // PRIORITY 2: Action node with inputSchema
-        if target_node.node_type.to_string() == "action" {
+        // PRIORITY 2: Consumer node with inputSchema (action or first-class PR)
+        if target_node.node_type.to_string() == "action"
+            || target_node.node_type.to_string() == "pr"
+        {
             if let Some(ref action_cfg) = target_node.action_config {
                 if let Some(ref input_schema) = action_cfg.input_schema {
-                    let schema_type = &input_schema.schema_type;
-                    if !schema_type.is_empty() && schema_type != "custom" {
-                        return (schema_type.clone(), Some(edge.source_handle.clone()));
+                    if input_schema.schema.is_some() {
+                        return (input_schema.name.clone(), Some(edge.source_handle.clone()));
                     }
                 }
             }
@@ -524,4 +962,301 @@ fn resolve_artifact_type_and_output(
     }
 
     (default_type.to_string(), None)
+}
+
+async fn load_execution_snapshot(
+    orch: &Orchestrator,
+    execution_id: &str,
+) -> DbResult<ExecutionSnapshot> {
+    let execution_id = execution_id.to_string();
+    let execution_id_for_query = execution_id.clone();
+    let snapshot_json = orch
+        .db
+        .local
+        .query_opt_text(
+            "SELECT snapshot FROM executions WHERE id = ?1",
+            params![execution_id_for_query.as_str()],
+        )
+        .await?;
+
+    let snapshot_json = snapshot_json
+        .ok_or_else(|| DbError::Row(format!("Execution has no snapshot: {}", execution_id)))?;
+    serde_json::from_str(&snapshot_json).map_err(|e| DbError::Row(e.to_string()))
+}
+
+async fn job_node_execution(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> DbResult<Option<(Option<String>, Option<String>)>> {
+    let job_id = job_id.to_string();
+    orch.db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT recipe_node_id, execution_id FROM jobs WHERE id = ?1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                rows.next()
+                    .await?
+                    .map(|row| Ok((row.opt_text(0)?, row.opt_text(1)?)))
+                    .transpose()
+            })
+        })
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_artifact_patch, merge_artifact_payload, resolve_confirmed,
+        should_arm_output_artifact_interrupt, validate_against_schema,
+    };
+    use crate::models::ConfirmPolicy;
+    use serde_json::json;
+
+    #[test]
+    fn create_takes_policy() {
+        assert!(!resolve_confirmed(false, None, ConfirmPolicy::User));
+        assert!(resolve_confirmed(false, None, ConfirmPolicy::Auto));
+    }
+
+    #[test]
+    fn request_changes_revision_stays_unconfirmed() {
+        // user-policy patch over the still-unconfirmed version stays Blocked.
+        assert!(!resolve_confirmed(true, Some(false), ConfirmPolicy::User));
+    }
+
+    #[test]
+    fn edit_after_confirmation_never_rearms_the_gate() {
+        // The one-shot guarantee: once confirmed, any later write keeps it
+        // confirmed regardless of policy or mode.
+        assert!(resolve_confirmed(true, Some(true), ConfirmPolicy::User));
+        assert!(resolve_confirmed(false, Some(true), ConfirmPolicy::User));
+        assert!(resolve_confirmed(true, Some(true), ConfirmPolicy::Auto));
+    }
+
+    #[test]
+    fn create_pr_artifact_details_detects_required_name() {
+        let payload = json!({"title":"Updated PR", "body":"Fresh description"});
+        let details =
+            super::create_pr_artifact_details(&payload, None, Some("create-pr"), None, "document");
+        assert_eq!(
+            details,
+            Some((
+                "Updated PR".to_string(),
+                Some("Fresh description".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn create_pr_artifact_details_ignores_non_pr_artifacts() {
+        let payload = json!({"title":"Plan", "body":"Not a PR"});
+        assert!(
+            super::create_pr_artifact_details(&payload, Some("plan"), None, None, "plan").is_none()
+        );
+    }
+
+    #[test]
+    fn output_artifact_interrupt_arms_only_matching_creates() {
+        assert!(should_arm_output_artifact_interrupt(
+            false,
+            Some("create-pr"),
+            Some("create-pr"),
+            true
+        ));
+        assert!(!should_arm_output_artifact_interrupt(
+            true,
+            Some("create-pr"),
+            Some("create-pr"),
+            true
+        ));
+        assert!(!should_arm_output_artifact_interrupt(
+            false,
+            Some("notes"),
+            Some("create-pr"),
+            true
+        ));
+        assert!(!should_arm_output_artifact_interrupt(
+            false,
+            Some("notes"),
+            Some("result"),
+            true
+        ));
+        assert!(should_arm_output_artifact_interrupt(
+            false,
+            Some("result"),
+            Some("result"),
+            true
+        ));
+        assert!(!should_arm_output_artifact_interrupt(
+            false,
+            Some("create-pr"),
+            Some("create-pr"),
+            false
+        ));
+        assert!(should_arm_output_artifact_interrupt(
+            false,
+            Some("checkpoint"),
+            None,
+            true
+        ));
+        assert!(should_arm_output_artifact_interrupt(
+            false,
+            None,
+            Some("document"),
+            true
+        ));
+    }
+
+    #[test]
+    fn patch_merges_over_base_keeping_unedited_fields() {
+        let base = json!({"title": "Original", "content": "old", "summary": "s"});
+        let merged = apply_artifact_patch(base, &json!({"content": "new"})).unwrap();
+        // Edited field updated; required + untouched fields preserved.
+        assert_eq!(merged["title"], "Original");
+        assert_eq!(merged["content"], "new");
+        assert_eq!(merged["summary"], "s");
+    }
+
+    #[test]
+    fn text_patch_updates_content_and_discards_helper_keys() {
+        let base = json!({"title": "Original", "content": "old text", "summary": "s"});
+        let patched = apply_artifact_patch(
+            base,
+            &json!({"old_string": "old", "new_string": "new", "replace_all": true}),
+        )
+        .unwrap();
+
+        assert_eq!(patched["content"], "new text");
+        assert!(patched.get("old_string").is_none());
+        assert!(patched.get("new_string").is_none());
+        assert!(patched.get("replace_all").is_none());
+        assert!(patched.get("field").is_none());
+    }
+
+    #[test]
+    fn text_patch_can_target_explicit_summary_field() {
+        let base = json!({"title": "Original", "content": "unchanged", "summary": "stale summary"});
+        let patched = apply_artifact_patch(
+            base,
+            &json!({"old_string": "stale", "new_string": "fresh", "field": "summary"}),
+        )
+        .unwrap();
+
+        assert_eq!(patched["content"], "unchanged");
+        assert_eq!(patched["summary"], "fresh summary");
+    }
+
+    #[test]
+    fn text_patch_defaults_to_content_before_body() {
+        let base = json!({"title": "Original", "content": "stale content", "body": "stale body"});
+        let patched =
+            apply_artifact_patch(base, &json!({"old_string": "stale", "new_string": "fresh"}))
+                .unwrap();
+
+        assert_eq!(patched["content"], "fresh content");
+        assert_eq!(patched["body"], "stale body");
+    }
+
+    #[test]
+    fn text_patch_rejects_missing_old_string() {
+        let base = json!({"title": "Original", "content": "current text"});
+        let error = apply_artifact_patch(
+            base,
+            &json!({"old_string": "missing", "new_string": "fresh"}),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("old_string not found"), "{error}");
+    }
+
+    #[test]
+    fn text_patch_rejects_duplicate_match_without_replace_all() {
+        let base = json!({"title": "Original", "content": "dup dup"});
+        let error = apply_artifact_patch(base, &json!({"old_string": "dup", "new_string": "new"}))
+            .unwrap_err();
+
+        assert!(error.contains("matched 2 times"), "{error}");
+        assert!(error.contains("replace_all:true"), "{error}");
+    }
+
+    #[test]
+    fn text_patch_replace_all_updates_every_match() {
+        let base = json!({"title": "Original", "content": "dup dup"});
+        let patched = apply_artifact_patch(
+            base,
+            &json!({"old_string": "dup", "new_string": "new", "replace_all": true}),
+        )
+        .unwrap();
+
+        assert_eq!(patched["content"], "new new");
+    }
+
+    #[test]
+    fn text_patch_rejects_mixed_field_updates() {
+        let base =
+            json!({"title": "Original", "content": "stale content", "summary": "old summary"});
+        let error = apply_artifact_patch(
+            base,
+            &json!({"old_string": "stale", "new_string": "fresh", "summary": "new summary"}),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cannot be mixed"), "{error}");
+        assert!(error.contains("summary"), "{error}");
+    }
+
+    #[test]
+    fn strict_plan_schema_rejects_unknown_field_merge_keys() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/schemas/plan.json"
+        )))
+        .unwrap();
+        let base = json!({"title": "Original", "content": "old", "summary": "s"});
+        let merged = apply_artifact_patch(base, &json!({"old_string": "old", "new_string": "new"}));
+        assert!(merged.is_ok());
+
+        let inert_field_merge = merge_artifact_payload(
+            json!({"title": "Original", "content": "old", "summary": "s"}),
+            &json!({"unexpected": "metadata"}),
+        );
+        let error = validate_against_schema(&schema, &inert_field_merge).unwrap_err();
+        assert!(error.contains("unexpected"), "{error}");
+    }
+
+    #[test]
+    fn transformed_text_patch_validates_against_plan_schema() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/schemas/plan.json"
+        )))
+        .unwrap();
+        let base = json!({"title": "Original", "content": "old", "summary": "s"});
+        let patched =
+            apply_artifact_patch(base, &json!({"old_string": "old", "new_string": "new"})).unwrap();
+
+        validate_against_schema(&schema, &patched).unwrap();
+        assert_eq!(
+            patched,
+            json!({"title": "Original", "content": "new", "summary": "s"})
+        );
+    }
+
+    #[test]
+    fn patch_adds_new_keys() {
+        let merged = merge_artifact_payload(json!({"title": "t"}), &json!({"content": "c"}));
+        assert_eq!(merged["title"], "t");
+        assert_eq!(merged["content"], "c");
+    }
+
+    #[test]
+    fn non_object_base_yields_patch() {
+        let merged = merge_artifact_payload(json!("scalar"), &json!({"content": "c"}));
+        assert_eq!(merged, json!({"content": "c"}));
+    }
 }

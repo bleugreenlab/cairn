@@ -1,5 +1,6 @@
 //! Account connection types.
 
+use crate::storage::{DbError, RowExt};
 use serde::{Deserialize, Serialize};
 
 /// Represents the desktop's connection to cairn.computer.
@@ -24,9 +25,7 @@ pub struct OrgMembership {
     pub role: String,
 }
 
-/// Diesel ORM model for the `account` table.
-#[derive(Debug, Clone, diesel::Queryable, diesel::Insertable)]
-#[diesel(table_name = crate::schema::account)]
+#[derive(Debug, Clone)]
 pub struct DbAccount {
     pub user_id: String,
     pub email: String,
@@ -38,6 +37,23 @@ pub struct DbAccount {
     pub org_memberships: Option<String>, // JSON
     pub connected_at: i32,
     pub updated_at: i32,
+}
+
+impl DbAccount {
+    pub(crate) fn from_row(row: &turso::Row) -> Result<Self, DbError> {
+        Ok(Self {
+            user_id: row.text(0)?,
+            email: row.text(1)?,
+            name: row.text(2)?,
+            device_id: row.text(3)?,
+            plan: row.text(4)?,
+            jwt_encrypted: row.opt_text(5)?,
+            jwt_expires_at: row.opt_i64(6)?.map(|value| value as i32),
+            org_memberships: row.opt_text(7)?,
+            connected_at: row.i64(8)? as i32,
+            updated_at: row.i64(9)? as i32,
+        })
+    }
 }
 
 impl From<DbAccount> for AccountConnection {

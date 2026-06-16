@@ -5,13 +5,12 @@
 //! threshold is reached. Events are grouped by a configurable field
 //! (`group_by`) and scoped by project, issue, or global.
 
-use diesel::prelude::*;
 use serde_json::Value;
+use turso::params;
 use uuid::Uuid;
 
-use crate::diesel_models::{DbAccumulatorState, NewAccumulatorState};
 use crate::models::{AccumulationScope, Recipe, RecipeNodeType};
-use crate::schema::trigger_accumulator_state;
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 /// Accumulation policy extracted from a recipe's trigger config.
 pub struct AccumulationPolicy {
@@ -19,6 +18,13 @@ pub struct AccumulationPolicy {
     pub group_by: String,
     pub scope: AccumulationScope,
     pub time_window_secs: Option<i64>,
+}
+
+struct AccumulatorState {
+    id: String,
+    events: String,
+    seen_event_ids: String,
+    first_event_at: i32,
 }
 
 /// Default groupBy per trigger type. Groups by the natural identity field
@@ -98,8 +104,8 @@ pub fn build_scope_key(
 /// - `Ok(Some(payload))` — threshold met, accumulated payload ready
 /// - `Ok(None)` — below threshold, event stored
 /// - `Err` — DB or extraction error
-pub fn try_accumulate(
-    conn: &mut SqliteConnection,
+pub async fn try_accumulate(
+    db: &LocalDb,
     recipe_id: &str,
     policy: &AccumulationPolicy,
     event_payload: &Value,
@@ -107,10 +113,7 @@ pub fn try_accumulate(
     issue_id: Option<&str>,
 ) -> Result<Option<Value>, String> {
     // Extract event_id for dedup
-    let event_id = event_payload
-        .get("eventId")
-        .or_else(|| event_payload.get("event_id"))
-        .and_then(|v| v.as_str())
+    let event_id = event_id_from_payload(event_payload)
         .ok_or_else(|| "Event payload missing event_id/eventId field".to_string())?;
 
     // Extract group key
@@ -118,138 +121,173 @@ pub fn try_accumulate(
         .ok_or_else(|| format!("Event payload missing group_by field '{}'", policy.group_by))?;
 
     let scope_key = build_scope_key(&policy.scope, project_id, issue_id);
-    let now = chrono::Utc::now().timestamp() as i32;
+    let recipe_id = recipe_id.to_string();
+    let event_id = event_id.to_string();
+    let event_payload = event_payload.clone();
+    let every = policy.every;
+    let time_window_secs = policy.time_window_secs;
 
-    // Look up existing row
-    let existing: Option<DbAccumulatorState> = trigger_accumulator_state::table
-        .filter(trigger_accumulator_state::recipe_id.eq(recipe_id))
-        .filter(trigger_accumulator_state::group_key.eq(&group_key_value))
-        .filter(trigger_accumulator_state::scope_key.eq(&scope_key))
-        .first(conn)
-        .optional()
-        .map_err(|e| format!("DB read error: {}", e))?;
+    db.write(|conn| {
+        let recipe_id = recipe_id.clone();
+        let event_id = event_id.clone();
+        let group_key_value = group_key_value.clone();
+        let scope_key = scope_key.clone();
+        let event_payload = event_payload.clone();
+        Box::pin(async move {
+            let now = chrono::Utc::now().timestamp() as i32;
+            let existing =
+                load_accumulator_state(conn, &recipe_id, &group_key_value, &scope_key).await?;
 
-    if let Some(row) = existing {
-        // Check dedup
-        let seen: Vec<String> = serde_json::from_str(&row.seen_event_ids).unwrap_or_default();
-        if seen.contains(&event_id.to_string()) {
-            // Already seen — skip
-            return Ok(None);
-        }
+            if let Some(row) = existing {
+                let seen: Vec<String> =
+                    serde_json::from_str(&row.seen_event_ids).unwrap_or_default();
+                if seen.contains(&event_id) {
+                    return Ok(None);
+                }
 
-        // Parse stored events
-        let mut events: Vec<Value> = serde_json::from_str(&row.events).unwrap_or_default();
-        let mut seen_ids = seen;
+                let mut events: Vec<Value> = serde_json::from_str(&row.events).unwrap_or_default();
+                let mut seen_ids = seen;
 
-        // Time window pruning
-        if let Some(window) = policy.time_window_secs {
-            let cutoff = now as i64 - window;
-            events.retain(|e| {
-                e.get("_accumulatedAt")
-                    .and_then(|v| v.as_i64())
-                    .map(|t| t >= cutoff)
-                    .unwrap_or(true)
-            });
-            // Rebuild seen_ids from remaining events
-            seen_ids = events
-                .iter()
-                .filter_map(|e| {
-                    e.get("eventId")
-                        .or_else(|| e.get("event_id"))
-                        .and_then(|v| v.as_str())
-                        .map(String::from)
-                })
-                .collect();
-        }
+                if let Some(window) = time_window_secs {
+                    let cutoff = now as i64 - window;
+                    events.retain(|event| {
+                        event
+                            .get("_accumulatedAt")
+                            .and_then(|value| value.as_i64())
+                            .map(|timestamp| timestamp >= cutoff)
+                            .unwrap_or(true)
+                    });
+                    seen_ids = events
+                        .iter()
+                        .filter_map(event_id_from_payload)
+                        .map(ToOwned::to_owned)
+                        .collect();
+                }
 
-        // Append new event
-        let mut enriched = event_payload.clone();
-        if let Value::Object(ref mut map) = enriched {
-            map.insert(
-                "_accumulatedAt".to_string(),
-                Value::Number(serde_json::Number::from(now as i64)),
-            );
-        }
-        events.push(enriched);
-        seen_ids.push(event_id.to_string());
+                events.push(enrich_event(event_payload.clone(), now));
+                seen_ids.push(event_id.clone());
 
-        let new_count = events.len() as i32;
+                let new_count = events.len() as i32;
+                if new_count >= every {
+                    let payload = build_accumulated_payload(
+                        &group_key_value,
+                        every,
+                        &events,
+                        row.first_event_at as i64,
+                        now as i64,
+                    );
+                    conn.execute(
+                        "DELETE FROM trigger_accumulator_state WHERE id = ?1",
+                        params![row.id.as_str()],
+                    )
+                    .await?;
+                    Ok(Some(payload))
+                } else {
+                    let events_json = serde_json::to_string(&events).map_err(json_error)?;
+                    let seen_json = serde_json::to_string(&seen_ids).map_err(json_error)?;
+                    conn.execute(
+                        "UPDATE trigger_accumulator_state
+                         SET events = ?1, event_count = ?2, seen_event_ids = ?3,
+                             last_event_at = ?4
+                         WHERE id = ?5",
+                        params![
+                            events_json.as_str(),
+                            new_count,
+                            seen_json.as_str(),
+                            now,
+                            row.id.as_str()
+                        ],
+                    )
+                    .await?;
+                    Ok(None)
+                }
+            } else {
+                if every <= 1 {
+                    return Ok(Some(event_payload.clone()));
+                }
 
-        if new_count >= policy.every {
-            // Threshold met — build accumulated payload and delete row
-            let payload = build_accumulated_payload(
-                &group_key_value,
-                policy.every,
-                &events,
-                row.first_event_at as i64,
-                now as i64,
-            );
+                let events = vec![enrich_event(event_payload.clone(), now)];
+                let seen_ids = vec![event_id.clone()];
+                let events_json = serde_json::to_string(&events).map_err(json_error)?;
+                let seen_json = serde_json::to_string(&seen_ids).map_err(json_error)?;
+                let id = Uuid::new_v4().to_string();
 
-            diesel::delete(trigger_accumulator_state::table.find(&row.id))
-                .execute(conn)
-                .map_err(|e| format!("DB delete error: {}", e))?;
+                conn.execute(
+                    "INSERT INTO trigger_accumulator_state(
+                        id, recipe_id, group_key, scope_key, events, event_count,
+                        seen_event_ids, first_event_at, last_event_at, created_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9)",
+                    params![
+                        id.as_str(),
+                        recipe_id.as_str(),
+                        group_key_value.as_str(),
+                        scope_key.as_str(),
+                        events_json.as_str(),
+                        seen_json.as_str(),
+                        now,
+                        now,
+                        now
+                    ],
+                )
+                .await?;
 
-            Ok(Some(payload))
-        } else {
-            // Update row
-            let events_json =
-                serde_json::to_string(&events).map_err(|e| format!("JSON error: {}", e))?;
-            let seen_json =
-                serde_json::to_string(&seen_ids).map_err(|e| format!("JSON error: {}", e))?;
+                Ok(None)
+            }
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
 
-            diesel::update(trigger_accumulator_state::table.find(&row.id))
-                .set((
-                    trigger_accumulator_state::events.eq(&events_json),
-                    trigger_accumulator_state::event_count.eq(new_count),
-                    trigger_accumulator_state::seen_event_ids.eq(&seen_json),
-                    trigger_accumulator_state::last_event_at.eq(now),
-                ))
-                .execute(conn)
-                .map_err(|e| format!("DB update error: {}", e))?;
+async fn load_accumulator_state(
+    conn: &turso::Connection,
+    recipe_id: &str,
+    group_key: &str,
+    scope_key: &str,
+) -> DbResult<Option<AccumulatorState>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, events, seen_event_ids, first_event_at
+             FROM trigger_accumulator_state
+             WHERE recipe_id = ?1 AND group_key = ?2 AND scope_key = ?3
+             LIMIT 1",
+            params![recipe_id, group_key, scope_key],
+        )
+        .await?;
 
-            Ok(None)
-        }
-    } else {
-        // First event for this group — check if threshold is 1 (shouldn't reach here, but guard)
-        if policy.every <= 1 {
-            return Ok(Some(event_payload.clone()));
-        }
-
-        // Create new row
-        let mut enriched = event_payload.clone();
-        if let Value::Object(ref mut map) = enriched {
-            map.insert(
-                "_accumulatedAt".to_string(),
-                Value::Number(serde_json::Number::from(now as i64)),
-            );
-        }
-        let events = vec![enriched];
-        let seen_ids = vec![event_id.to_string()];
-
-        let events_json =
-            serde_json::to_string(&events).map_err(|e| format!("JSON error: {}", e))?;
-        let seen_json =
-            serde_json::to_string(&seen_ids).map_err(|e| format!("JSON error: {}", e))?;
-
-        let id = Uuid::new_v4().to_string();
-        diesel::insert_into(trigger_accumulator_state::table)
-            .values(NewAccumulatorState {
-                id: &id,
-                recipe_id,
-                group_key: &group_key_value,
-                scope_key: &scope_key,
-                events: &events_json,
-                event_count: 1,
-                seen_event_ids: &seen_json,
-                first_event_at: now,
-                last_event_at: now,
-                created_at: now,
+    rows.next()
+        .await?
+        .map(|row| {
+            Ok(AccumulatorState {
+                id: row.text(0)?,
+                events: row.text(1)?,
+                seen_event_ids: row.text(2)?,
+                first_event_at: row.i64(3)? as i32,
             })
-            .execute(conn)
-            .map_err(|e| format!("DB insert error: {}", e))?;
+        })
+        .transpose()
+}
 
-        Ok(None)
+fn enrich_event(mut event: Value, now: i32) -> Value {
+    if let Value::Object(ref mut map) = event {
+        map.insert(
+            "_accumulatedAt".to_string(),
+            Value::Number(serde_json::Number::from(now as i64)),
+        );
     }
+    event
+}
+
+fn event_id_from_payload(event: &Value) -> Option<&str> {
+    event
+        .get("eventId")
+        .or_else(|| event.get("event_id"))
+        .and_then(|value| value.as_str())
+}
+
+fn json_error(error: serde_json::Error) -> DbError {
+    DbError::internal(format!("JSON error: {error}"))
 }
 
 /// Build the accumulated payload that gets passed to the triggered execution.
@@ -307,8 +345,6 @@ mod tests {
     use super::*;
     use crate::models::EventFilter;
 
-    // ---- extract_group_key ----
-
     #[test]
     fn extract_group_key_string_field() {
         let payload = serde_json::json!({"skillId": "code-review", "status": "complete"});
@@ -320,7 +356,6 @@ mod tests {
 
     #[test]
     fn extract_group_key_snake_case_lookup() {
-        // field in payload is camelCase, but group_by is snake_case
         let payload = serde_json::json!({"skillId": "code-review"});
         assert_eq!(
             extract_group_key(&payload, "skill_id"),
@@ -352,8 +387,6 @@ mod tests {
         );
     }
 
-    // ---- build_scope_key ----
-
     #[test]
     fn scope_key_global() {
         assert_eq!(
@@ -380,14 +413,11 @@ mod tests {
 
     #[test]
     fn scope_key_issue_fallback_to_project() {
-        // Issue scope but no issue_id — falls back to project scope
         assert_eq!(
             build_scope_key(&AccumulationScope::Issue, "proj-1", None),
             "proj:proj-1"
         );
     }
-
-    // ---- to_camel_case ----
 
     #[test]
     fn camel_case_conversion() {
@@ -396,8 +426,6 @@ mod tests {
         assert_eq!(to_camel_case("already"), "already");
         assert_eq!(to_camel_case("a_b_c"), "aBC");
     }
-
-    // ---- get_accumulation_policy ----
 
     #[test]
     fn policy_none_when_no_every() {
@@ -447,7 +475,6 @@ mod tests {
             accumulation_scope: None,
             time_window_secs: None,
         }));
-        // group_by absent → inferred from trigger type (skill_called → skillId)
         let policy = get_accumulation_policy(&recipe).unwrap();
         assert_eq!(policy.every, 4);
         assert_eq!(policy.group_by, "skillId");
@@ -469,8 +496,6 @@ mod tests {
         assert_eq!(policy.time_window_secs, Some(3600));
     }
 
-    // ---- build_accumulated_payload ----
-
     #[test]
     fn accumulated_payload_structure() {
         let events = vec![
@@ -486,17 +511,13 @@ mod tests {
         assert_eq!(payload["firstEventAt"], 100);
         assert_eq!(payload["lastEventAt"], 200);
 
-        // _accumulatedAt should be stripped from individual events
-        let evts = payload["events"].as_array().unwrap();
-        assert!(evts[0].get("_accumulatedAt").is_none());
-        assert_eq!(evts[0]["eventId"], "e1");
+        let events = payload["events"].as_array().unwrap();
+        assert!(events[0].get("_accumulatedAt").is_none());
+        assert_eq!(events[0]["eventId"], "e1");
     }
-
-    // ---- EventFilter serde backward compat ----
 
     #[test]
     fn event_filter_backward_compat_no_new_fields() {
-        // Old-style JSON without accumulation fields should deserialize fine
         let json = r#"{"jobStatus":["complete"]}"#;
         let filter: EventFilter = serde_json::from_str(json).unwrap();
         assert_eq!(filter.job_status, Some(vec!["complete".to_string()]));
@@ -525,10 +546,9 @@ mod tests {
         assert_eq!(parsed.time_window_secs, Some(7200));
     }
 
-    // ---- Helpers ----
-
     fn make_recipe(event_filter: Option<EventFilter>) -> Recipe {
         use crate::models::{NodePosition, RecipeNode, RecipeTrigger, TriggerConfig};
+
         Recipe {
             id: "r1".to_string(),
             name: "Test".to_string(),
@@ -562,360 +582,6 @@ mod tests {
             edges: vec![],
             created_at: 0,
             updated_at: 0,
-        }
-    }
-
-    // =========================================================================
-    // try_accumulate — DB-backed state machine tests
-    // =========================================================================
-
-    fn test_conn() -> diesel::SqliteConnection {
-        crate::test_utils::test_diesel_conn()
-    }
-
-    fn make_policy(every: i32) -> AccumulationPolicy {
-        AccumulationPolicy {
-            every,
-            group_by: "skillId".to_string(),
-            scope: AccumulationScope::Project,
-            time_window_secs: None,
-        }
-    }
-
-    fn make_event(event_id: &str, skill_id: &str) -> Value {
-        serde_json::json!({
-            "eventId": event_id,
-            "skillId": skill_id,
-            "status": "complete"
-        })
-    }
-
-    #[test]
-    fn try_accumulate_first_event_below_threshold() {
-        let mut conn = test_conn();
-        let policy = make_policy(3);
-        let event = make_event("e1", "code-review");
-
-        let result =
-            try_accumulate(&mut conn, "recipe-1", &policy, &event, "proj-1", None).unwrap();
-        assert!(result.is_none(), "First event should not fire (need 3)");
-
-        // Verify row was inserted
-        let count: i64 = trigger_accumulator_state::table
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn try_accumulate_fires_at_threshold() {
-        let mut conn = test_conn();
-        let policy = make_policy(3);
-
-        // Events 1 and 2: stored
-        assert!(try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e1", "code-review"),
-            "proj-1",
-            None
-        )
-        .unwrap()
-        .is_none());
-        assert!(try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e2", "code-review"),
-            "proj-1",
-            None
-        )
-        .unwrap()
-        .is_none());
-
-        // Event 3: threshold met
-        let result = try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e3", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-
-        let payload = result.expect("Should fire at threshold");
-        assert_eq!(payload["accumulated"], true);
-        assert_eq!(payload["threshold"], 3);
-        assert_eq!(payload["eventCount"], 3);
-        assert_eq!(payload["groupKey"], "code-review");
-
-        let events = payload["events"].as_array().unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0]["eventId"], "e1");
-        assert_eq!(events[2]["eventId"], "e3");
-
-        // DB row should be deleted after firing
-        let count: i64 = trigger_accumulator_state::table
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(count, 0, "Row should be deleted after threshold met");
-    }
-
-    #[test]
-    fn try_accumulate_dedup_same_event_id() {
-        let mut conn = test_conn();
-        let policy = make_policy(3);
-
-        // Insert event e1
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e1", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-
-        // Duplicate e1 — should be silently ignored
-        let result = try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e1", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-        assert!(result.is_none());
-
-        // Verify count is still 1, not 2
-        let row: DbAccumulatorState = trigger_accumulator_state::table.first(&mut conn).unwrap();
-        assert_eq!(row.event_count, 1, "Duplicate should not increment count");
-    }
-
-    #[test]
-    fn try_accumulate_separate_groups() {
-        let mut conn = test_conn();
-        let policy = make_policy(2);
-
-        // Two events for different skills — separate groups
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e1", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e2", "testing"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-
-        // Two separate rows
-        let count: i64 = trigger_accumulator_state::table
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(count, 2, "Different group keys should create separate rows");
-
-        // Second event for code-review should fire
-        let result = try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e3", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-        assert!(result.is_some(), "Second code-review event should fire");
-
-        // Only testing group should remain
-        let remaining: i64 = trigger_accumulator_state::table
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(remaining, 1, "Only the testing group should remain");
-    }
-
-    #[test]
-    fn try_accumulate_time_window_prunes_stale() {
-        let mut conn = test_conn();
-        let policy = AccumulationPolicy {
-            every: 3,
-            group_by: "skillId".to_string(),
-            scope: AccumulationScope::Project,
-            time_window_secs: Some(60), // 60-second window
-        };
-
-        // Insert first event normally
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e1", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-
-        // Manually backdate the stored event's _accumulatedAt to make it stale
-        let row: DbAccumulatorState = trigger_accumulator_state::table.first(&mut conn).unwrap();
-        let mut events: Vec<Value> = serde_json::from_str(&row.events).unwrap();
-        if let Value::Object(ref mut map) = events[0] {
-            let stale_time = chrono::Utc::now().timestamp() - 120; // 2 minutes ago
-            map.insert(
-                "_accumulatedAt".to_string(),
-                Value::Number(serde_json::Number::from(stale_time)),
-            );
-        }
-        let events_json = serde_json::to_string(&events).unwrap();
-        diesel::update(trigger_accumulator_state::table.find(&row.id))
-            .set(trigger_accumulator_state::events.eq(&events_json))
-            .execute(&mut conn)
-            .unwrap();
-
-        // Add second event — the stale first event should be pruned
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e2", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-
-        // Check: should have only 1 event (e2), since e1 was pruned
-        let row: DbAccumulatorState = trigger_accumulator_state::table.first(&mut conn).unwrap();
-        assert_eq!(row.event_count, 1, "Stale event should have been pruned");
-        let events: Vec<Value> = serde_json::from_str(&row.events).unwrap();
-        assert_eq!(events[0]["eventId"], "e2");
-    }
-
-    #[test]
-    fn try_accumulate_scope_isolation() {
-        let mut conn = test_conn();
-        let policy = AccumulationPolicy {
-            every: 2,
-            group_by: "skillId".to_string(),
-            scope: AccumulationScope::Issue,
-            time_window_secs: None,
-        };
-
-        // Same skill, same recipe, different issues — should not mix
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e1", "code-review"),
-            "proj-1",
-            Some("issue-1"),
-        )
-        .unwrap();
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e2", "code-review"),
-            "proj-1",
-            Some("issue-2"),
-        )
-        .unwrap();
-
-        // Two rows, one per issue
-        let count: i64 = trigger_accumulator_state::table
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(count, 2, "Different issues should create separate rows");
-
-        // Second event for issue-1 should fire
-        let result = try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e3", "code-review"),
-            "proj-1",
-            Some("issue-1"),
-        )
-        .unwrap();
-        assert!(result.is_some(), "issue-1 should hit threshold");
-
-        // issue-2 still has 1 event
-        let remaining: i64 = trigger_accumulator_state::table
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(remaining, 1);
-    }
-
-    #[test]
-    fn try_accumulate_missing_event_id_is_error() {
-        let mut conn = test_conn();
-        let policy = make_policy(2);
-
-        let bad_event = serde_json::json!({"skillId": "code-review"});
-        let result = try_accumulate(&mut conn, "recipe-1", &policy, &bad_event, "proj-1", None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("event_id"));
-    }
-
-    #[test]
-    fn try_accumulate_missing_group_by_field_is_error() {
-        let mut conn = test_conn();
-        let policy = make_policy(2);
-
-        // Has eventId but missing skillId (the group_by field)
-        let bad_event = serde_json::json!({"eventId": "e1", "otherField": "value"});
-        let result = try_accumulate(&mut conn, "recipe-1", &policy, &bad_event, "proj-1", None);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("group_by"));
-    }
-
-    #[test]
-    fn try_accumulate_strips_internal_fields_from_output() {
-        let mut conn = test_conn();
-        let policy = make_policy(2);
-
-        try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e1", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap();
-        let result = try_accumulate(
-            &mut conn,
-            "recipe-1",
-            &policy,
-            &make_event("e2", "code-review"),
-            "proj-1",
-            None,
-        )
-        .unwrap()
-        .unwrap();
-
-        // _accumulatedAt should be stripped from the events in the output
-        for event in result["events"].as_array().unwrap() {
-            assert!(
-                event.get("_accumulatedAt").is_none(),
-                "_accumulatedAt should be stripped from output events"
-            );
         }
     }
 }

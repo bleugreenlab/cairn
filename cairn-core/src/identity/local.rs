@@ -85,6 +85,8 @@ struct AccountFile {
     api_provider: ApiProvider,
     source: AccountSource,
     auth: AuthFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_id: Option<String>,
     sort_order: i32,
     created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,20 +205,8 @@ pub fn detect_local_accounts() -> Vec<ProviderAccount> {
             api_provider: ApiProvider::Anthropic,
             source: AccountSource::LocalCli,
             auth: ProviderAuth::LocalCli,
+            project_id: None,
             sort_order: 1000, // Low priority — after all configured accounts
-            created_at: 0,
-            last_used_at: None,
-        });
-    }
-
-    if crate::env::find_binary("codex").is_ok() {
-        accounts.push(ProviderAccount {
-            id: "local_cli_openai".to_string(),
-            label: "Local CLI".to_string(),
-            api_provider: ApiProvider::OpenAI,
-            source: AccountSource::LocalCli,
-            auth: ProviderAuth::LocalCli,
-            sort_order: 1000,
             created_at: 0,
             last_used_at: None,
         });
@@ -251,7 +241,7 @@ pub fn identity_store_from_git_config() -> IdentityStore {
 /// Returns the resolved `UserIdentity` from the store (v1 or v2).
 pub fn load_local_identity(config_dir: &Path) -> Result<Option<UserIdentity>, String> {
     match load_identity_store(config_dir)? {
-        Some(store) => Ok(Some(store.resolve(None))),
+        Some(store) => Ok(Some(store.resolve(None, None))),
         None => Ok(None),
     }
 }
@@ -318,7 +308,7 @@ pub fn save_local_identity(config_dir: &Path, identity: &UserIdentity) -> Result
 /// Auto-populate identity fields from git config (backward-compatible).
 pub fn identity_from_git_config() -> UserIdentity {
     let store = identity_store_from_git_config();
-    store.resolve(None)
+    store.resolve(None, None)
 }
 
 // === Internal helpers ===
@@ -349,6 +339,7 @@ fn update_account_from_auth(
                 api_provider: provider,
                 source: AccountSource::Configured,
                 auth: new_auth,
+                project_id: None,
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
@@ -378,6 +369,7 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             api_provider: ApiProvider::Anthropic,
             source: AccountSource::Configured,
             auth,
+            project_id: None,
             sort_order: 0,
             created_at: now,
             last_used_at: None,
@@ -400,6 +392,7 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             api_provider: ApiProvider::OpenAI,
             source: AccountSource::Configured,
             auth,
+            project_id: None,
             sort_order: 0,
             created_at: now,
             last_used_at: None,
@@ -415,6 +408,7 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             api_provider: ApiProvider::GitHub,
             source: AccountSource::Configured,
             auth: ProviderAuth::ApiKey { value: token },
+            project_id: None,
             sort_order: 0,
             created_at: now,
             last_used_at: None,
@@ -448,12 +442,18 @@ fn store_from_v2_file(file: IdentityStoreFile, machine_id: &str) -> Result<Ident
             },
             AuthFile::LocalCli => ProviderAuth::LocalCli,
         };
+        if acc_file.api_provider == ApiProvider::OpenAI
+            && acc_file.source == AccountSource::LocalCli
+        {
+            continue;
+        }
         accounts.push(ProviderAccount {
             id: acc_file.id,
             label: acc_file.label,
             api_provider: acc_file.api_provider,
             source: acc_file.source,
             auth,
+            project_id: acc_file.project_id,
             sort_order: acc_file.sort_order,
             created_at: acc_file.created_at,
             last_used_at: acc_file.last_used_at,
@@ -484,6 +484,11 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
     let mut accounts = Vec::new();
 
     for account in &store.accounts {
+        if account.api_provider == ApiProvider::OpenAI && account.source == AccountSource::LocalCli
+        {
+            continue;
+        }
+
         // Skip ephemeral LocalCli accounts that haven't been reordered by the user.
         // If the user reordered them (sort_order != 1000), persist so the preference sticks.
         if account.source == AccountSource::LocalCli && account.sort_order == 1000 {
@@ -506,6 +511,7 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
             api_provider: account.api_provider,
             source: account.source.clone(),
             auth,
+            project_id: account.project_id.clone(),
             sort_order: account.sort_order,
             created_at: account.created_at,
             last_used_at: account.last_used_at,
@@ -557,38 +563,178 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn roundtrip_saved<T>(
+        dir: &TempDir,
+        save: impl FnOnce(&Path) -> Result<(), String>,
+        load: impl FnOnce(&Path) -> Result<Option<T>, String>,
+    ) -> T {
+        save(dir.path()).unwrap();
+        load(dir.path()).unwrap().unwrap()
+    }
+
+    fn configured_account(
+        id: &str,
+        label: &str,
+        api_provider: ApiProvider,
+        auth: ProviderAuth,
+        sort_order: i32,
+        created_at: i64,
+        last_used_at: Option<i64>,
+    ) -> ProviderAccount {
+        ProviderAccount {
+            id: id.to_string(),
+            label: label.to_string(),
+            api_provider,
+            source: AccountSource::Configured,
+            auth,
+            project_id: None,
+            sort_order,
+            created_at,
+            last_used_at,
+        }
+    }
+
+    fn api_key_account(
+        id: &str,
+        label: &str,
+        api_provider: ApiProvider,
+        value: &str,
+        sort_order: i32,
+        created_at: i64,
+        last_used_at: Option<i64>,
+    ) -> ProviderAccount {
+        configured_account(
+            id,
+            label,
+            api_provider,
+            ProviderAuth::ApiKey {
+                value: value.to_string(),
+            },
+            sort_order,
+            created_at,
+            last_used_at,
+        )
+    }
+
+    fn oauth_account(
+        id: &str,
+        label: &str,
+        api_provider: ApiProvider,
+        value: &str,
+        sort_order: i32,
+        created_at: i64,
+        last_used_at: Option<i64>,
+    ) -> ProviderAccount {
+        configured_account(
+            id,
+            label,
+            api_provider,
+            ProviderAuth::OAuthToken {
+                value: value.to_string(),
+            },
+            sort_order,
+            created_at,
+            last_used_at,
+        )
+    }
+
+    fn local_cli_account(
+        id: &str,
+        label: &str,
+        api_provider: ApiProvider,
+        sort_order: i32,
+    ) -> ProviderAccount {
+        ProviderAccount {
+            id: id.to_string(),
+            label: label.to_string(),
+            api_provider,
+            source: AccountSource::LocalCli,
+            auth: ProviderAuth::LocalCli,
+            project_id: None,
+            sort_order,
+            created_at: 0,
+            last_used_at: None,
+        }
+    }
+
+    fn git_identity(
+        id: &str,
+        label: &str,
+        name: &str,
+        email: &str,
+        sort_order: i32,
+    ) -> GitIdentity {
+        GitIdentity {
+            id: id.to_string(),
+            label: label.to_string(),
+            name: name.to_string(),
+            email: email.to_string(),
+            sort_order,
+        }
+    }
+
+    fn identity_store(
+        user_id: &str,
+        accounts: Vec<ProviderAccount>,
+        git_identities: Vec<GitIdentity>,
+    ) -> IdentityStore {
+        IdentityStore {
+            user_id: user_id.to_string(),
+            accounts,
+            git_identities,
+            project_overrides: Default::default(),
+        }
+    }
+
+    fn user_identity(
+        user_id: &str,
+        email: &str,
+        name: &str,
+        claude_auth: Option<ClaudeAuth>,
+        codex_auth: Option<CodexAuth>,
+        github_token: Option<&str>,
+    ) -> UserIdentity {
+        UserIdentity {
+            user_id: user_id.to_string(),
+            email: email.to_string(),
+            name: name.to_string(),
+            claude_auth,
+            codex_auth,
+            github_token: github_token.map(str::to_string),
+        }
+    }
+
     // === V2 format tests ===
 
     #[test]
     fn test_v2_save_and_load_roundtrip() {
         let dir = TempDir::new().unwrap();
 
-        let store = IdentityStore {
-            user_id: "local-test-123".to_string(),
-            accounts: vec![ProviderAccount {
-                id: "acc_1".to_string(),
-                label: "Test Anthropic".to_string(),
-                api_provider: ApiProvider::Anthropic,
-                source: AccountSource::Configured,
-                auth: ProviderAuth::ApiKey {
-                    value: "sk-ant-test-key".to_string(),
-                },
-                sort_order: 0,
-                created_at: 1000,
-                last_used_at: None,
-            }],
-            git_identities: vec![GitIdentity {
-                id: "gi_1".to_string(),
-                label: "Personal".to_string(),
-                name: "Test User".to_string(),
-                email: "test@example.com".to_string(),
-                sort_order: 0,
-            }],
-            project_overrides: Default::default(),
-        };
+        let store = identity_store(
+            "local-test-123",
+            vec![api_key_account(
+                "acc_1",
+                "Test Anthropic",
+                ApiProvider::Anthropic,
+                "sk-ant-test-key",
+                0,
+                1000,
+                None,
+            )],
+            vec![git_identity(
+                "gi_1",
+                "Personal",
+                "Test User",
+                "test@example.com",
+                0,
+            )],
+        );
 
-        save_identity_store(dir.path(), &store).unwrap();
-        let loaded = load_identity_store(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
 
         assert_eq!(loaded.user_id, store.user_id);
         assert_eq!(loaded.accounts.len(), 1);
@@ -606,58 +752,51 @@ mod tests {
     fn test_v2_multiple_accounts() {
         let dir = TempDir::new().unwrap();
 
-        let store = IdentityStore {
-            user_id: "local-multi".to_string(),
-            accounts: vec![
-                ProviderAccount {
-                    id: "acc_1".to_string(),
-                    label: "Personal".to_string(),
-                    api_provider: ApiProvider::Anthropic,
-                    source: AccountSource::Configured,
-                    auth: ProviderAuth::OAuthToken {
-                        value: "oauth-token".to_string(),
-                    },
-                    sort_order: 0,
-                    created_at: 1000,
-                    last_used_at: None,
-                },
-                ProviderAccount {
-                    id: "acc_2".to_string(),
-                    label: "Work".to_string(),
-                    api_provider: ApiProvider::Anthropic,
-                    source: AccountSource::Configured,
-                    auth: ProviderAuth::ApiKey {
-                        value: "sk-work-key".to_string(),
-                    },
-                    sort_order: 1,
-                    created_at: 2000,
-                    last_used_at: Some(3000),
-                },
-                ProviderAccount {
-                    id: "acc_3".to_string(),
-                    label: "OpenAI".to_string(),
-                    api_provider: ApiProvider::OpenAI,
-                    source: AccountSource::Configured,
-                    auth: ProviderAuth::ApiKey {
-                        value: "sk-openai".to_string(),
-                    },
-                    sort_order: 0,
-                    created_at: 1000,
-                    last_used_at: None,
-                },
+        let store = identity_store(
+            "local-multi",
+            vec![
+                oauth_account(
+                    "acc_1",
+                    "Personal",
+                    ApiProvider::Anthropic,
+                    "oauth-token",
+                    0,
+                    1000,
+                    None,
+                ),
+                api_key_account(
+                    "acc_2",
+                    "Work",
+                    ApiProvider::Anthropic,
+                    "sk-work-key",
+                    1,
+                    2000,
+                    Some(3000),
+                ),
+                api_key_account(
+                    "acc_3",
+                    "OpenAI",
+                    ApiProvider::OpenAI,
+                    "sk-openai",
+                    0,
+                    1000,
+                    None,
+                ),
             ],
-            git_identities: vec![GitIdentity {
-                id: "gi_1".to_string(),
-                label: "Default".to_string(),
-                name: "User".to_string(),
-                email: "user@example.com".to_string(),
-                sort_order: 0,
-            }],
-            project_overrides: Default::default(),
-        };
+            vec![git_identity(
+                "gi_1",
+                "Default",
+                "User",
+                "user@example.com",
+                0,
+            )],
+        );
 
-        save_identity_store(dir.path(), &store).unwrap();
-        let loaded = load_identity_store(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
 
         assert_eq!(loaded.accounts.len(), 3);
         assert_eq!(loaded.accounts[0].label, "Personal");
@@ -671,23 +810,19 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let secret = "sk-ant-my-secret-token";
 
-        let store = IdentityStore {
-            user_id: "test".to_string(),
-            accounts: vec![ProviderAccount {
-                id: "acc_1".to_string(),
-                label: "Test".to_string(),
-                api_provider: ApiProvider::Anthropic,
-                source: AccountSource::Configured,
-                auth: ProviderAuth::ApiKey {
-                    value: secret.to_string(),
-                },
-                sort_order: 0,
-                created_at: 0,
-                last_used_at: None,
-            }],
-            git_identities: vec![],
-            project_overrides: Default::default(),
-        };
+        let store = identity_store(
+            "test",
+            vec![api_key_account(
+                "acc_1",
+                "Test",
+                ApiProvider::Anthropic,
+                secret,
+                0,
+                0,
+                None,
+            )],
+            vec![],
+        );
 
         save_identity_store(dir.path(), &store).unwrap();
 
@@ -700,38 +835,33 @@ mod tests {
     fn test_v2_local_cli_accounts_not_persisted() {
         let dir = TempDir::new().unwrap();
 
-        let store = IdentityStore {
-            user_id: "test".to_string(),
-            accounts: vec![
-                ProviderAccount {
-                    id: "acc_1".to_string(),
-                    label: "Configured".to_string(),
-                    api_provider: ApiProvider::Anthropic,
-                    source: AccountSource::Configured,
-                    auth: ProviderAuth::ApiKey {
-                        value: "key".to_string(),
-                    },
-                    sort_order: 0,
-                    created_at: 0,
-                    last_used_at: None,
-                },
-                ProviderAccount {
-                    id: "local_cli_anthropic".to_string(),
-                    label: "Local CLI".to_string(),
-                    api_provider: ApiProvider::Anthropic,
-                    source: AccountSource::LocalCli,
-                    auth: ProviderAuth::LocalCli,
-                    sort_order: 1000,
-                    created_at: 0,
-                    last_used_at: None,
-                },
+        let store = identity_store(
+            "test",
+            vec![
+                api_key_account(
+                    "acc_1",
+                    "Configured",
+                    ApiProvider::Anthropic,
+                    "key",
+                    0,
+                    0,
+                    None,
+                ),
+                local_cli_account(
+                    "local_cli_anthropic",
+                    "Local CLI",
+                    ApiProvider::Anthropic,
+                    1000,
+                ),
             ],
-            git_identities: vec![],
-            project_overrides: Default::default(),
-        };
+            vec![],
+        );
 
-        save_identity_store(dir.path(), &store).unwrap();
-        let loaded = load_identity_store(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
 
         // LocalCli accounts should not be persisted
         assert_eq!(loaded.accounts.len(), 1);
@@ -745,14 +875,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
 
         // Write a v1 format file by saving with the old API
-        let identity = UserIdentity {
-            user_id: "local-v1-user".to_string(),
-            email: "v1@example.com".to_string(),
-            name: "V1 User".to_string(),
-            claude_auth: Some(ClaudeAuth::ApiKey("sk-ant-v1-key".to_string())),
-            codex_auth: Some(CodexAuth::OAuthToken("codex-oauth-json".to_string())),
-            github_token: Some("ghp_test_token".to_string()),
-        };
+        let identity = user_identity(
+            "local-v1-user",
+            "v1@example.com",
+            "V1 User",
+            Some(ClaudeAuth::ApiKey("sk-ant-v1-key".to_string())),
+            Some(CodexAuth::OAuthToken("codex-oauth-json".to_string())),
+            Some("ghp_test_token"),
+        );
 
         // Write v1 format directly
         let machine_id = get_machine_id();
@@ -824,17 +954,20 @@ mod tests {
     fn test_backward_compat_save_and_load_roundtrip() {
         let dir = TempDir::new().unwrap();
 
-        let identity = UserIdentity {
-            user_id: "local-test-123".to_string(),
-            email: "test@example.com".to_string(),
-            name: "Test User".to_string(),
-            claude_auth: Some(ClaudeAuth::ApiKey("sk-ant-test-key".to_string())),
-            codex_auth: None,
-            github_token: Some("ghp_test_token".to_string()),
-        };
+        let identity = user_identity(
+            "local-test-123",
+            "test@example.com",
+            "Test User",
+            Some(ClaudeAuth::ApiKey("sk-ant-test-key".to_string())),
+            None,
+            Some("ghp_test_token"),
+        );
 
-        save_local_identity(dir.path(), &identity).unwrap();
-        let loaded = load_local_identity(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_local_identity(path, &identity),
+            load_local_identity,
+        );
 
         assert_eq!(loaded.user_id, identity.user_id);
         assert_eq!(loaded.email, identity.email);
@@ -850,17 +983,20 @@ mod tests {
     fn test_backward_compat_without_credentials() {
         let dir = TempDir::new().unwrap();
 
-        let identity = UserIdentity {
-            user_id: "local-no-creds".to_string(),
-            email: "user@example.com".to_string(),
-            name: "Plain User".to_string(),
-            claude_auth: None,
-            codex_auth: None,
-            github_token: None,
-        };
+        let identity = user_identity(
+            "local-no-creds",
+            "user@example.com",
+            "Plain User",
+            None,
+            None,
+            None,
+        );
 
-        save_local_identity(dir.path(), &identity).unwrap();
-        let loaded = load_local_identity(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_local_identity(path, &identity),
+            load_local_identity,
+        );
 
         assert_eq!(loaded.name, "Plain User");
         assert!(loaded.claude_auth.is_none());
@@ -879,14 +1015,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         assert!(!identity_exists(dir.path()));
 
-        let identity = UserIdentity {
-            user_id: "test".to_string(),
-            email: "test@test.com".to_string(),
-            name: "Test".to_string(),
-            claude_auth: None,
-            codex_auth: None,
-            github_token: None,
-        };
+        let identity = user_identity("test", "test@test.com", "Test", None, None, None);
         save_local_identity(dir.path(), &identity).unwrap();
         assert!(identity_exists(dir.path()));
     }
@@ -895,17 +1024,20 @@ mod tests {
     fn test_oauth_token_roundtrip() {
         let dir = TempDir::new().unwrap();
 
-        let identity = UserIdentity {
-            user_id: "test".to_string(),
-            email: "test@test.com".to_string(),
-            name: "Test".to_string(),
-            claude_auth: Some(ClaudeAuth::OAuthToken("oauth-token-xyz".to_string())),
-            codex_auth: None,
-            github_token: None,
-        };
+        let identity = user_identity(
+            "test",
+            "test@test.com",
+            "Test",
+            Some(ClaudeAuth::OAuthToken("oauth-token-xyz".to_string())),
+            None,
+            None,
+        );
 
-        save_local_identity(dir.path(), &identity).unwrap();
-        let loaded = load_local_identity(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_local_identity(path, &identity),
+            load_local_identity,
+        );
 
         match loaded.claude_auth {
             Some(ClaudeAuth::OAuthToken(token)) => assert_eq!(token, "oauth-token-xyz"),
@@ -918,17 +1050,20 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let auth_json = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"id","access_token":"at","refresh_token":"rt"}}"#;
 
-        let identity = UserIdentity {
-            user_id: "test".to_string(),
-            email: "test@test.com".to_string(),
-            name: "Test".to_string(),
-            claude_auth: None,
-            codex_auth: Some(CodexAuth::OAuthToken(auth_json.to_string())),
-            github_token: None,
-        };
+        let identity = user_identity(
+            "test",
+            "test@test.com",
+            "Test",
+            None,
+            Some(CodexAuth::OAuthToken(auth_json.to_string())),
+            None,
+        );
 
-        save_local_identity(dir.path(), &identity).unwrap();
-        let loaded = load_local_identity(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_local_identity(path, &identity),
+            load_local_identity,
+        );
 
         match loaded.codex_auth {
             Some(CodexAuth::OAuthToken(json)) => assert_eq!(json, auth_json),
@@ -940,17 +1075,20 @@ mod tests {
     fn test_codex_api_key_roundtrip() {
         let dir = TempDir::new().unwrap();
 
-        let identity = UserIdentity {
-            user_id: "test".to_string(),
-            email: "test@test.com".to_string(),
-            name: "Test".to_string(),
-            claude_auth: None,
-            codex_auth: Some(CodexAuth::ApiKey("sk-openai-test-key".to_string())),
-            github_token: None,
-        };
+        let identity = user_identity(
+            "test",
+            "test@test.com",
+            "Test",
+            None,
+            Some(CodexAuth::ApiKey("sk-openai-test-key".to_string())),
+            None,
+        );
 
-        save_local_identity(dir.path(), &identity).unwrap();
-        let loaded = load_local_identity(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_local_identity(path, &identity),
+            load_local_identity,
+        );
 
         match loaded.codex_auth {
             Some(CodexAuth::ApiKey(key)) => assert_eq!(key, "sk-openai-test-key"),
@@ -974,28 +1112,24 @@ mod tests {
             },
         );
 
-        let store = IdentityStore {
-            user_id: "test".to_string(),
-            accounts: vec![],
-            git_identities: vec![GitIdentity {
-                id: "gi_1".to_string(),
-                label: "Default".to_string(),
-                name: "Test".to_string(),
-                email: "test@test.com".to_string(),
-                sort_order: 0,
-            }],
-            project_overrides: overrides_map,
-        };
+        let mut store = identity_store(
+            "test",
+            vec![],
+            vec![git_identity("gi_1", "Default", "Test", "test@test.com", 0)],
+        );
+        store.project_overrides = overrides_map;
 
-        save_identity_store(dir.path(), &store).unwrap();
-        let loaded = load_identity_store(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
 
         assert_eq!(loaded.project_overrides.len(), 1);
         let ov = loaded.project_overrides.get("proj_1").unwrap();
         assert_eq!(ov.anthropic_account_id, Some("acc_work".to_string()));
         assert_eq!(ov.github_account_id, Some("gh_work".to_string()));
         assert!(ov.openai_account_id.is_none());
-        assert!(ov.google_account_id.is_none());
         assert!(ov.git_identity_id.is_none());
     }
 
@@ -1005,38 +1139,33 @@ mod tests {
         // it should be persisted so the preference sticks.
         let dir = TempDir::new().unwrap();
 
-        let store = IdentityStore {
-            user_id: "test".to_string(),
-            accounts: vec![
-                ProviderAccount {
-                    id: "local_cli_anthropic".to_string(),
-                    label: "Local CLI".to_string(),
-                    api_provider: ApiProvider::Anthropic,
-                    source: AccountSource::LocalCli,
-                    auth: ProviderAuth::LocalCli,
-                    sort_order: 0, // User moved it to top priority
-                    created_at: 0,
-                    last_used_at: None,
-                },
-                ProviderAccount {
-                    id: "acc_1".to_string(),
-                    label: "API Key".to_string(),
-                    api_provider: ApiProvider::Anthropic,
-                    source: AccountSource::Configured,
-                    auth: ProviderAuth::ApiKey {
-                        value: "sk-key".to_string(),
-                    },
-                    sort_order: 1,
-                    created_at: 0,
-                    last_used_at: None,
-                },
+        let store = identity_store(
+            "test",
+            vec![
+                local_cli_account(
+                    "local_cli_anthropic",
+                    "Local CLI",
+                    ApiProvider::Anthropic,
+                    0,
+                ),
+                api_key_account(
+                    "acc_1",
+                    "API Key",
+                    ApiProvider::Anthropic,
+                    "sk-key",
+                    1,
+                    0,
+                    None,
+                ),
             ],
-            git_identities: vec![],
-            project_overrides: Default::default(),
-        };
+            vec![],
+        );
 
-        save_identity_store(dir.path(), &store).unwrap();
-        let loaded = load_identity_store(dir.path()).unwrap().unwrap();
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
 
         // Both accounts should be persisted since LocalCli has non-1000 sort_order
         assert_eq!(loaded.accounts.len(), 2);
@@ -1063,18 +1192,15 @@ mod tests {
 
     #[test]
     fn test_update_account_from_auth_updates_existing() {
-        let mut accounts = vec![ProviderAccount {
-            id: "acc_1".to_string(),
-            label: "Anthropic".to_string(),
-            api_provider: ApiProvider::Anthropic,
-            source: AccountSource::Configured,
-            auth: ProviderAuth::ApiKey {
-                value: "old-key".to_string(),
-            },
-            sort_order: 0,
-            created_at: 0,
-            last_used_at: None,
-        }];
+        let mut accounts = vec![api_key_account(
+            "acc_1",
+            "Anthropic",
+            ApiProvider::Anthropic,
+            "old-key",
+            0,
+            0,
+            None,
+        )];
 
         update_account_from_auth(
             &mut accounts,
@@ -1090,18 +1216,15 @@ mod tests {
 
     #[test]
     fn test_update_account_from_auth_removes_when_none() {
-        let mut accounts = vec![ProviderAccount {
-            id: "acc_1".to_string(),
-            label: "Anthropic".to_string(),
-            api_provider: ApiProvider::Anthropic,
-            source: AccountSource::Configured,
-            auth: ProviderAuth::ApiKey {
-                value: "key".to_string(),
-            },
-            sort_order: 0,
-            created_at: 0,
-            last_used_at: None,
-        }];
+        let mut accounts = vec![api_key_account(
+            "acc_1",
+            "Anthropic",
+            ApiProvider::Anthropic,
+            "key",
+            0,
+            0,
+            None,
+        )];
 
         update_account_from_auth(&mut accounts, ApiProvider::Anthropic, None);
 
@@ -1134,29 +1257,60 @@ mod tests {
     }
 
     #[test]
+    fn detect_local_accounts_does_not_include_openai_local_cli() {
+        let accounts = detect_local_accounts();
+        assert!(!accounts.iter().any(|a| {
+            a.api_provider == ApiProvider::OpenAI && a.source == AccountSource::LocalCli
+        }));
+    }
+
+    #[test]
+    fn test_v2_openai_local_cli_accounts_are_ignored_on_load() {
+        let dir = TempDir::new().unwrap();
+        let content = r#"# Cairn Identity Store (v2)
+version: 2
+userId: test-user
+gitIdentities: []
+accounts:
+  - id: local_cli_openai
+    label: Local CLI
+    apiProvider: openai
+    source: local_cli
+    auth:
+      type: local_cli
+    sortOrder: 0
+    createdAt: 0
+"#;
+        std::fs::write(dir.path().join(IDENTITY_FILENAME), content).unwrap();
+
+        let store = load_identity_store(dir.path()).unwrap().unwrap();
+        assert!(store.accounts.is_empty());
+    }
+
+    #[test]
     fn test_backward_compat_save_merges_into_existing_store() {
         let dir = TempDir::new().unwrap();
 
         // First save creates a store with Claude auth
-        let identity1 = UserIdentity {
-            user_id: "user-1".to_string(),
-            email: "test@test.com".to_string(),
-            name: "Test".to_string(),
-            claude_auth: Some(ClaudeAuth::ApiKey("sk-claude".to_string())),
-            codex_auth: None,
-            github_token: None,
-        };
+        let identity1 = user_identity(
+            "user-1",
+            "test@test.com",
+            "Test",
+            Some(ClaudeAuth::ApiKey("sk-claude".to_string())),
+            None,
+            None,
+        );
         save_local_identity(dir.path(), &identity1).unwrap();
 
         // Second save adds Codex auth — should merge, not replace
-        let identity2 = UserIdentity {
-            user_id: "user-1".to_string(),
-            email: "test@test.com".to_string(),
-            name: "Test".to_string(),
-            claude_auth: Some(ClaudeAuth::ApiKey("sk-claude".to_string())),
-            codex_auth: Some(CodexAuth::ApiKey("sk-openai".to_string())),
-            github_token: None,
-        };
+        let identity2 = user_identity(
+            "user-1",
+            "test@test.com",
+            "Test",
+            Some(ClaudeAuth::ApiKey("sk-claude".to_string())),
+            Some(CodexAuth::ApiKey("sk-openai".to_string())),
+            None,
+        );
         save_local_identity(dir.path(), &identity2).unwrap();
 
         // Load the store directly to verify structure

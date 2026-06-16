@@ -134,6 +134,27 @@ pub struct Event {
     pub cache_create_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
     pub turn_id: Option<String>,
+    pub thinking_tokens: Option<i32>,
+    /// Archival storage mode (CAIRN-1538): `full` (or absent) for a live inline
+    /// event, `gitcoord`/`zstd` for one rewritten at worktree teardown. These
+    /// coordinate fields drive `archival::reconstruct_events` and are skipped
+    /// from serialization — consumers only ever see reconstructed `data`.
+    #[serde(skip, default)]
+    pub storage_mode: Option<String>,
+    #[serde(skip, default)]
+    pub content_commit: Option<String>,
+    #[serde(skip, default)]
+    pub content_render_sha: Option<String>,
+    #[serde(skip, default)]
+    pub data_blob: Option<Vec<u8>>,
+    #[serde(skip, default)]
+    pub codec: Option<String>,
+    /// Per-target read token counts (CAIRN-1593). Populated only by the lean
+    /// read projection on frontend-facing event loads, where the read body is
+    /// stripped from `data` and replaced by these counts. `None` everywhere
+    /// else (skyline path, plain row loads).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub read_segments: Option<Vec<crate::runs::read_tokens::ReadSegmentTokens>>,
 }
 
 /// A prompt awaiting user response
@@ -194,8 +215,8 @@ impl std::str::FromStr for PermissionStatus {
     }
 }
 
-impl From<crate::diesel_models::DbPermissionRequest> for PermissionRequest {
-    fn from(db: crate::diesel_models::DbPermissionRequest) -> Self {
+impl From<crate::db_records::DbPermissionRequest> for PermissionRequest {
+    fn from(db: crate::db_records::DbPermissionRequest) -> Self {
         PermissionRequest {
             id: db.id,
             run_id: db.run_id,
@@ -353,7 +374,11 @@ mod tests {
 
     #[test]
     fn test_run_start_mode_roundtrip() {
-        for mode in [RunStartMode::Fresh, RunStartMode::Resume, RunStartMode::Fork] {
+        for mode in [
+            RunStartMode::Fresh,
+            RunStartMode::Resume,
+            RunStartMode::Fork,
+        ] {
             let s = mode.to_string();
             let parsed: RunStartMode = s.parse().unwrap();
             assert_eq!(parsed, mode);
@@ -374,8 +399,8 @@ pub struct TodoItem {
     pub active_form: Option<String>,
 }
 
-impl From<crate::diesel_models::DbTodo> for TodoItem {
-    fn from(db: crate::diesel_models::DbTodo) -> Self {
+impl From<crate::db_records::DbTodo> for TodoItem {
+    fn from(db: crate::db_records::DbTodo) -> Self {
         TodoItem {
             id: db.todo_id,
             content: db.content,

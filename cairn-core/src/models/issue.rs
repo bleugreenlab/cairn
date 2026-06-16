@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::Label;
+
 /// Issue with lifecycle status derived from executions + resolution timestamps.
 ///
 /// Status is stored for query efficiency but recomputed deterministically:
@@ -29,8 +31,22 @@ pub struct Issue {
     pub merged_at: Option<i64>,
     /// Timestamp when the issue was closed (resolution)
     pub closed_at: Option<i64>,
-    /// Manager that owns this issue
-    pub manager_id: Option<String>,
+    /// Number of dependencies that have not reached Merged or Closed.
+    #[serde(default)]
+    pub unmet_dependency_count: i64,
+    /// Canonical issue URIs this issue depends on.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Canonical issue URIs of dependencies that have not yet reached Merged or
+    /// Closed — what this issue is currently blocked on.
+    #[serde(default)]
+    pub unmet_depends_on: Vec<String>,
+    /// Parent issue this issue branches from and wakes on attention.
+    #[serde(default)]
+    pub parent_issue_id: Option<String>,
+    /// Workspace labels attached to this issue.
+    #[serde(default)]
+    pub labels: Vec<Label>,
 }
 
 /// Issue lifecycle status.
@@ -99,9 +115,6 @@ pub enum IssueAttention {
     NeedsInput,
     NeedsAuthorization,
     NeedsApproval,
-    NeedsConflictResolution,
-    NeedsReview,
-    NeedsMerge,
 }
 
 impl IssueAttention {
@@ -117,9 +130,6 @@ impl std::fmt::Display for IssueAttention {
             IssueAttention::NeedsInput => write!(f, "needs_input"),
             IssueAttention::NeedsAuthorization => write!(f, "needs_authorization"),
             IssueAttention::NeedsApproval => write!(f, "needs_approval"),
-            IssueAttention::NeedsConflictResolution => write!(f, "needs_conflict_resolution"),
-            IssueAttention::NeedsReview => write!(f, "needs_review"),
-            IssueAttention::NeedsMerge => write!(f, "needs_merge"),
         }
     }
 }
@@ -133,11 +143,27 @@ impl std::str::FromStr for IssueAttention {
             "needs_input" => Ok(IssueAttention::NeedsInput),
             "needs_authorization" => Ok(IssueAttention::NeedsAuthorization),
             "needs_approval" => Ok(IssueAttention::NeedsApproval),
-            "needs_conflict_resolution" => Ok(IssueAttention::NeedsConflictResolution),
-            "needs_review" => Ok(IssueAttention::NeedsReview),
-            "needs_merge" => Ok(IssueAttention::NeedsMerge),
             _ => Err(format!("Unknown attention: {}", s)),
         }
+    }
+}
+
+impl IssueStatus {
+    /// A terminal status is a stable end-state: no further automated progress
+    /// will happen without an external action. `watch` returns on these so an
+    /// external driver stops waiting instead of long-polling forever on a done
+    /// issue. Distinct from [`crate::issues::relations::is_complete_status`]
+    /// (dependency satisfaction = Merged | Closed only): `Failed` is terminal
+    /// for a watcher's purposes too. `Complete` is intentionally *not* terminal
+    /// — it is a transient successful state that typically advances to a PR /
+    /// merge, so treating it as terminal would return early before the work is
+    /// actually done. (Interrupts never reach `Failed`, so an interrupted issue
+    /// stays watchable — see the interrupt-not-failure projection rule.)
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            IssueStatus::Merged | IssueStatus::Closed | IssueStatus::Failed
+        )
     }
 }
 
@@ -180,8 +206,8 @@ pub struct CreateIssue {
     pub description: Option<String>,
     #[serde(alias = "model")]
     pub backend_override: Option<String>,
-    /// Manager that owns this issue
-    pub manager_id: Option<String>,
+    #[serde(default)]
+    pub label_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +218,11 @@ pub struct UpdateIssue {
     pub description: Option<String>,
     #[serde(alias = "model")]
     pub backend_override: Option<Option<String>>, // Nested Option to support clearing
+    /// Full replacement dependency list when provided.
+    pub depends_on: Option<Vec<String>>,
+    /// Full replacement label list when provided.
+    #[serde(default)]
+    pub label_ids: Option<Vec<String>>,
 }
 
 // Comment types
@@ -204,6 +235,10 @@ pub struct Comment {
     pub content: String,
     pub source: CommentSource,
     pub created_at: i64,
+    /// Stable, 1-based per-issue sequence. This is the identifier surfaced in
+    /// the comment URI (`cairn://p/PROJECT/NUMBER/comments/{seq}`); the `id`
+    /// UUID stays the internal primary key.
+    pub seq: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -275,9 +310,6 @@ mod tests {
             IssueAttention::NeedsInput,
             IssueAttention::NeedsAuthorization,
             IssueAttention::NeedsApproval,
-            IssueAttention::NeedsConflictResolution,
-            IssueAttention::NeedsReview,
-            IssueAttention::NeedsMerge,
         ];
         for v in &variants {
             let s = v.to_string();
@@ -302,9 +334,6 @@ mod tests {
             IssueAttention::NeedsInput,
             IssueAttention::NeedsAuthorization,
             IssueAttention::NeedsApproval,
-            IssueAttention::NeedsConflictResolution,
-            IssueAttention::NeedsReview,
-            IssueAttention::NeedsMerge,
         ];
         for v in &blocking {
             assert!(

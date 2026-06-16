@@ -2,20 +2,17 @@
 //!
 //! Handles: search, glob, grep
 
-use super::{lookup_project_context, lookup_run};
-use crate::config::project_settings::load_project_settings;
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::{SearchContentType, SearchFilters};
 use crate::orchestrator::Orchestrator;
-use crate::resources::resolve_resource_path;
-use crate::schema::projects;
-use diesel::prelude::*;
-use serde::Deserialize;
+use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_common::query::QueryParam;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Payload for search tool
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchPayload {
     pub query: String,
@@ -28,35 +25,44 @@ pub struct SearchPayload {
 
 /// Handle search tool call - searches across issues, comments, artifacts, and events.
 pub async fn handle_search(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: SearchPayload = match serde_json::from_value(request.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => return format!("Invalid payload: {}", e),
+    let payload: SearchPayload = match super::parse_payload(request) {
+        Ok(payload) => payload,
+        Err(error) => return error,
     };
 
-    log::info!("search called: query={}", payload.query);
+    let SearchPayload {
+        query,
+        content_types,
+        project_id,
+        issue_id,
+        since,
+        limit,
+    } = payload;
 
-    let mut conn = match orch.db.conn.lock() {
-        Ok(c) => c,
-        Err(e) => return format!("Failed to lock database: {}", e),
-    };
+    log::info!("search called: query={}", query);
 
     // Get project context via run chain (internal agents), or none (external callers)
-    let ctx = lookup_project_context(&mut conn, request).ok();
+    let ctx = lookup_search_project_context(&orch.db.local, request).await;
 
     // Build filters - use provided project_id or default to current project from run chain
-    let project_id = payload
-        .project_id
-        .or_else(|| ctx.as_ref().map(|c| c.project_id.clone()));
+    let project_id = project_id.or_else(|| ctx.as_ref().map(|c| c.project_id.clone()));
 
     let filters = SearchFilters {
         project_id,
-        issue_id: payload.issue_id,
-        content_types: payload.content_types,
-        since: payload.since,
-        limit: payload.limit,
+        issue_id,
+        content_types,
+        since,
+        limit,
     };
 
-    match crate::search::search_content(&mut conn, &payload.query, Some(filters)) {
+    match crate::search::search_content(
+        &orch.db.local,
+        &orch.db.search_index,
+        &query,
+        Some(filters),
+    )
+    .await
+    {
         Ok(results) => {
             format_search_results(&results, ctx.as_ref().map(|c| c.project_key.as_str()))
         }
@@ -64,8 +70,115 @@ pub async fn handle_search(orch: &Orchestrator, request: &McpCallbackRequest) ->
     }
 }
 
+#[derive(Debug, Clone)]
+struct SearchProjectContext {
+    project_id: String,
+    project_key: String,
+}
+
+async fn lookup_search_project_context(
+    db: &LocalDb,
+    request: &McpCallbackRequest,
+) -> Option<SearchProjectContext> {
+    let result = if let Some(ref run_id) = request.run_id {
+        lookup_search_project_context_by_run_id(db, run_id).await
+    } else {
+        lookup_search_project_context_by_cwd(db, &request.cwd).await
+    };
+
+    match result {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            log::debug!("search project context lookup failed: {}", error);
+            None
+        }
+    }
+}
+
+async fn lookup_search_project_context_by_run_id(
+    db: &LocalDb,
+    run_id: &str,
+) -> DbResult<Option<SearchProjectContext>> {
+    let run_id = run_id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "
+                    SELECT p.id, p.key
+                    FROM runs r
+                    LEFT JOIN jobs j ON r.job_id = j.id
+                    JOIN projects p ON p.id = COALESCE(j.project_id, r.project_id)
+                    WHERE r.id = ?1
+                    LIMIT 1
+                    ",
+                    (run_id.as_str(),),
+                )
+                .await?;
+
+            rows.next()
+                .await?
+                .map(|row| search_project_context_from_row(&row))
+                .transpose()
+        })
+    })
+    .await
+}
+
+async fn lookup_search_project_context_by_cwd(
+    db: &LocalDb,
+    cwd: &str,
+) -> DbResult<Option<SearchProjectContext>> {
+    let cwd = cwd.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "
+                    SELECT p.id, p.key
+                    FROM runs r
+                    JOIN jobs j ON r.job_id = j.id
+                    JOIN projects p ON j.project_id = p.id
+                    WHERE r.status IN ('starting', 'live')
+                      AND (
+                        j.worktree_path = ?1
+                        OR (p.repo_path = ?1 AND j.issue_id IS NULL)
+                      )
+                    ORDER BY
+                        CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
+                        r.created_at DESC
+                    LIMIT 1
+                    ",
+                    (cwd.as_str(),),
+                )
+                .await?;
+
+            rows.next()
+                .await?
+                .map(|row| search_project_context_from_row(&row))
+                .transpose()
+        })
+    })
+    .await
+}
+
+fn search_project_context_from_row(row: &turso::Row) -> DbResult<SearchProjectContext> {
+    Ok(SearchProjectContext {
+        project_id: row.text(0)?,
+        project_key: row.text(1)?,
+    })
+}
+
+fn should_walk_entry(entry_path: &Path, walk_root: &Path, deny_read: &[PathBuf]) -> bool {
+    if entry_path == walk_root {
+        return true;
+    }
+
+    !crate::mcp::git::path_within_any(entry_path, deny_read)
+}
+
 /// Format search results as human-readable text for the agent.
-fn format_search_results(
+pub(crate) fn format_search_results(
     results: &[crate::models::SearchResult],
     project_key: Option<&str>,
 ) -> String {
@@ -87,7 +200,10 @@ fn format_search_results(
         // Use the URI from the search result directly
         let uri = if result.uri.is_empty() {
             let key = project_key.unwrap_or("PROJECT");
-            format!("cairn://{}/{}", key, result.id)
+            match result.id.parse::<i32>() {
+                Ok(number) if number > 0 => cairn_common::uri::build_issue_uri(key, number),
+                _ => cairn_common::uri::build_project_uri(key),
+            }
         } else {
             result.uri.clone()
         };
@@ -107,15 +223,15 @@ fn format_search_results(
 const WALK_TIMEOUT: Duration = Duration::from_secs(30);
 const GREP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Payload for glob tool (matches cairn-mcp GlobInput)
-#[derive(Debug, Clone, Deserialize)]
+/// Payload for glob tool (matches cairn-cli GlobInput)
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GlobPayload {
     pub pattern: String,
     pub path: Option<String>,
 }
 
-/// Payload for grep tool (matches cairn-mcp GrepInput)
-#[derive(Debug, Clone, Deserialize)]
+/// Payload for grep tool (matches cairn-cli GrepInput)
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GrepPayload {
     pub pattern: String,
     pub path: Option<String>,
@@ -139,65 +255,6 @@ pub struct GrepPayload {
     pub multiline: Option<bool>,
 }
 
-/// Build the set of directories that a search tool is allowed to access.
-///
-/// Always includes the agent's cwd. If we can look up the run's project,
-/// also includes any configured resource directories.
-fn resolve_allowed_directories(orch: &Orchestrator, request: &McpCallbackRequest) -> Vec<PathBuf> {
-    let mut allowed = vec![PathBuf::from(&request.cwd)];
-
-    let mut conn = match orch.db.conn.lock() {
-        Ok(c) => c,
-        Err(_) => return allowed,
-    };
-
-    if let Ok(ctx) = lookup_run(&mut conn, request) {
-        // Get the project repo_path so we can load project settings
-        let repo_path: Option<String> = projects::table
-            .find(&ctx.project_id)
-            .select(projects::repo_path)
-            .first(&mut *conn)
-            .ok();
-
-        if let Some(ref path) = repo_path {
-            let settings = load_project_settings(Path::new(path));
-            if let Some(resources) = settings.resources {
-                for resource in &resources {
-                    if let Some(resolved) = resolve_resource_path(&orch.config_dir, resource) {
-                        allowed.push(resolved);
-                    }
-                }
-            }
-        }
-    }
-
-    allowed
-}
-
-/// Check that `search_path` is inside one of the `allowed` directories.
-fn validate_search_path(search_path: &Path, allowed: &[PathBuf]) -> Result<(), String> {
-    let canonical = search_path
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve path '{}': {}", search_path.display(), e))?;
-
-    for dir in allowed {
-        if let Ok(allowed_canonical) = dir.canonicalize() {
-            if canonical.starts_with(&allowed_canonical) {
-                return Ok(());
-            }
-        }
-    }
-
-    Err(format!(
-        "Path '{}' is outside allowed directories. Allowed: {:?}",
-        search_path.display(),
-        allowed
-            .iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-    ))
-}
-
 /// Resolve the search directory from the payload path and the agent cwd.
 fn resolve_search_dir(cwd: &str, path: Option<&str>) -> PathBuf {
     match path {
@@ -213,12 +270,56 @@ fn resolve_search_dir(cwd: &str, path: Option<&str>) -> PathBuf {
     }
 }
 
-/// Handle glob tool call — pattern-match files with path scoping.
-pub fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: GlobPayload = match serde_json::from_value(request.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => return format!("Invalid payload: {}", e),
-    };
+/// Default grep output mode for a target. Grepping a single file should print
+/// matching lines (you already named the file — echoing it back is useless and
+/// dead-ends agents into shelling out to grep), while grepping a directory
+/// lists which files matched.
+fn default_grep_output_mode(search_path: &Path) -> &'static str {
+    if search_path.is_file() {
+        "content"
+    } else {
+        "files_with_matches"
+    }
+}
+
+/// Resolve the effective grep output mode. An explicit `output_mode` always
+/// wins. Absent one, context flags (`-C`/`-A`/`-B`/`context`) force `content`:
+/// asking for context lines around a bare filename is meaningless, so a
+/// directory grep with `-C=N` would otherwise silently drop both the context
+/// and the matched lines. With no override and no context request, fall back to
+/// the target-aware default (see `default_grep_output_mode`).
+pub fn resolve_grep_output_mode<'a>(
+    explicit: Option<&'a str>,
+    requested_context: bool,
+    search_path: &Path,
+) -> &'a str {
+    explicit.unwrap_or_else(|| {
+        if requested_context {
+            "content"
+        } else {
+            default_grep_output_mode(search_path)
+        }
+    })
+}
+
+/// Matched files for a glob, as paths relative to the resolved search dir,
+/// sorted most-recently-modified first.
+pub(crate) struct GlobMatches {
+    pub search_dir: PathBuf,
+    pub pattern: String,
+    pub paths: Vec<PathBuf>,
+    pub timed_out: bool,
+}
+
+/// Resolve a glob to its matched files. Shared by the glob tool's list output
+/// and the read-projection's `output_mode=content`/`count` modes, so both walk
+/// the tree identically (gitignore-aware, path-scoped, timeout-bounded).
+pub(crate) fn glob_matched_paths(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+) -> Result<GlobMatches, String> {
+    let payload: GlobPayload = serde_json::from_value(request.payload.clone())
+        .map_err(|e| format!("Invalid payload: {}", e))?;
 
     let search_dir = resolve_search_dir(&request.cwd, payload.path.as_deref());
     log::info!(
@@ -227,35 +328,25 @@ pub fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String 
         search_dir.display()
     );
 
-    // Path scoping
-    let allowed = resolve_allowed_directories(orch, request);
-    if let Err(e) = validate_search_path(&search_dir, &allowed) {
-        return e;
-    }
-
     // Build glob matcher
-    let glob = match globset::GlobBuilder::new(&payload.pattern)
+    let glob = globset::GlobBuilder::new(&payload.pattern)
         .literal_separator(false)
         .build()
-    {
-        Ok(g) => g,
-        Err(e) => {
-            return format!("Invalid glob pattern '{}': {}", payload.pattern, e);
-        }
-    };
-    let matcher = match globset::GlobSetBuilder::new().add(glob).build() {
-        Ok(m) => m,
-        Err(e) => {
-            return format!("Failed to build glob matcher: {}", e);
-        }
-    };
+        .map_err(|e| format!("Invalid glob pattern '{}': {}", payload.pattern, e))?;
+    let matcher = globset::GlobSetBuilder::new()
+        .add(glob)
+        .build()
+        .map_err(|e| format!("Failed to build glob matcher: {}", e))?;
 
     // Walk directory respecting .gitignore, with timeout
+    let deny_read = orch.sandbox_deny_read();
+    let filter_root = search_dir.clone();
     let walker = ignore::WalkBuilder::new(&search_dir)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
+        .filter_entry(move |entry| should_walk_entry(entry.path(), &filter_root, &deny_read))
         .build();
 
     let deadline = std::time::Instant::now() + WALK_TIMEOUT;
@@ -290,36 +381,61 @@ pub fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String 
     // Sort by modification time, most recent first
     matches.sort_by(|a, b| b.1.cmp(&a.1));
 
-    if matches.is_empty() && !timed_out {
+    Ok(GlobMatches {
+        search_dir,
+        pattern: payload.pattern,
+        paths: matches.into_iter().map(|(p, _)| p).collect(),
+        timed_out,
+    })
+}
+
+/// Append the shared "search timed out" warning to a glob result body.
+pub(crate) fn glob_timeout_warning() -> String {
+    format!(
+        "\n\n[WARNING: Search timed out after {}s — results are incomplete. \
+         Try a more specific path or pattern to narrow the search.]",
+        WALK_TIMEOUT.as_secs()
+    )
+}
+
+/// Handle glob tool call — pattern-match files with path scoping.
+pub fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+    let GlobMatches {
+        search_dir,
+        pattern,
+        paths,
+        timed_out,
+    } = match glob_matched_paths(orch, request) {
+        Ok(matches) => matches,
+        Err(error) => return error,
+    };
+
+    if paths.is_empty() && !timed_out {
         return format!(
             "No files matched pattern '{}' in {}",
-            payload.pattern,
+            pattern,
             search_dir.display()
         );
     }
 
-    let mut result: String = matches
+    let mut result: String = paths
         .iter()
-        .map(|(p, _)| p.display().to_string())
+        .map(|p| p.display().to_string())
         .collect::<Vec<_>>()
         .join("\n");
 
     if timed_out {
-        result.push_str(&format!(
-            "\n\n[WARNING: Search timed out after {}s — results are incomplete. \
-             Try a more specific path or pattern to narrow the search.]",
-            WALK_TIMEOUT.as_secs()
-        ));
+        result.push_str(&glob_timeout_warning());
     }
 
     result
 }
 
-/// Handle grep tool call — in-process ripgrep search with path scoping.
+/// Handle grep tool call — in-process ripgrep search.
 pub async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: GrepPayload = match serde_json::from_value(request.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => return format!("Invalid payload: {}", e),
+    let payload: GrepPayload = match super::parse_payload(request) {
+        Ok(payload) => payload,
+        Err(error) => return error,
     };
 
     let search_path = resolve_search_dir(&request.cwd, payload.path.as_deref());
@@ -329,17 +445,18 @@ pub async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> S
         search_path.display()
     );
 
-    // Path scoping
-    let allowed = resolve_allowed_directories(orch, request);
-    if let Err(e) = validate_search_path(&search_path, &allowed) {
-        return e;
-    }
-
-    // Validate output mode early
-    let output_mode = payload
-        .output_mode
-        .as_deref()
-        .unwrap_or("files_with_matches");
+    // Validate output mode early. An explicit `output_mode` always wins;
+    // otherwise the default is target-aware (see `default_grep_output_mode`),
+    // except that context flags (`-C`/`-A`/`-B`/`context`) force `content`.
+    let requested_context = payload.context.is_some()
+        || payload.context_alias.is_some()
+        || payload.after_context.is_some()
+        || payload.before_context.is_some();
+    let output_mode = resolve_grep_output_mode(
+        payload.output_mode.as_deref(),
+        requested_context,
+        &search_path,
+    );
     if !matches!(output_mode, "files_with_matches" | "count" | "content") {
         return format!(
             "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
@@ -351,70 +468,446 @@ pub async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> S
     let show_line_numbers = payload.line_numbers.unwrap_or(true);
     let offset = payload.offset.unwrap_or(0) as usize;
     let head_limit = payload.head_limit;
+    let pattern = payload.pattern.clone();
+    let deny_read = orch.sandbox_deny_read();
 
     let result = tokio::time::timeout(
         GREP_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            grep_search(payload, &search_path, &output_mode, show_line_numbers)
+            grep_search(
+                payload,
+                &search_path,
+                &output_mode,
+                show_line_numbers,
+                deny_read,
+            )
         }),
     )
     .await;
 
     match result {
-        Ok(Ok(Ok(output))) => {
-            if output.is_empty() {
-                return format!(
-                    "No matches found for pattern '{}'",
-                    &request.payload["pattern"].as_str().unwrap_or("?")
-                );
-            }
-
-            let lines: Vec<&str> = output.lines().collect();
-            let sliced = if offset >= lines.len() {
-                Vec::new()
-            } else {
-                match head_limit {
-                    Some(limit) => lines[offset..]
-                        .iter()
-                        .take(limit as usize)
-                        .copied()
-                        .collect(),
-                    None => lines[offset..].to_vec(),
-                }
-            };
-
-            sliced.join("\n")
-        }
+        Ok(Ok(Ok(output))) => finalize_grep_output(output, &pattern, offset, head_limit),
         Ok(Ok(Err(e))) => e,
         Ok(Err(e)) => format!("grep task failed: {}", e),
         Err(_) => format!("grep timed out after {:?}", GREP_TIMEOUT),
     }
 }
 
-/// Perform the actual in-process grep search.
-fn grep_search(
+/// A content source for a single-file grep: a filesystem path (live directory
+/// walk) or an in-memory byte slice (single-file read / archival reconstruction).
+#[derive(Clone, Copy)]
+enum GrepSource<'a> {
+    Path(&'a Path),
+    Bytes(&'a [u8]),
+}
+
+/// Run a configured searcher over one source, dispatching to `search_path` for
+/// the filesystem walk and `search_slice` for in-memory bytes.
+fn run_search<S: grep_searcher::Sink>(
+    searcher: &mut grep_searcher::Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    source: GrepSource<'_>,
+    sink: S,
+) -> Result<(), S::Error> {
+    match source {
+        GrepSource::Path(path) => searcher.search_path(matcher, path, sink),
+        GrepSource::Bytes(bytes) => searcher.search_slice(matcher, bytes, sink),
+    }
+}
+
+/// Build the regex matcher for a grep, honoring case-insensitivity and
+/// multiline. Shared by the directory walker and the single-file bytes renderer.
+fn build_grep_matcher(payload: &GrepPayload) -> Result<grep_regex::RegexMatcher, String> {
+    let mut builder = grep_regex::RegexMatcherBuilder::new();
+    if payload.case_insensitive.unwrap_or(false) {
+        builder.case_insensitive(true);
+    }
+    if payload.multiline.unwrap_or(false) {
+        builder.multi_line(true);
+        builder.dot_matches_new_line(true);
+    }
+    builder
+        .build(&payload.pattern)
+        .map_err(|e| format!("Invalid regex pattern '{}': {}", payload.pattern, e))
+}
+
+/// Build the searcher (binary detection, line numbers, context window) for a
+/// grep. Shared by the directory walker and the single-file bytes renderer.
+fn build_grep_searcher(payload: &GrepPayload) -> grep_searcher::Searcher {
+    let mut builder = grep_searcher::SearcherBuilder::new();
+    builder
+        .binary_detection(grep_searcher::BinaryDetection::quit(b'\x00'))
+        .line_number(true);
+
+    let context = payload.context_alias.or(payload.context);
+    if let Some(c) = context {
+        builder.before_context(c as usize).after_context(c as usize);
+    }
+    if let Some(a) = payload.after_context {
+        builder.after_context(a as usize);
+    }
+    if let Some(b) = payload.before_context {
+        builder.before_context(b as usize);
+    }
+    if payload.multiline.unwrap_or(false) {
+        builder.multi_line(true);
+    }
+
+    builder.build()
+}
+
+/// Format one grep content line. With a non-empty `relative` label this is the
+/// directory/single-file form `path:N:text` (match) / `path:N-text` (context);
+/// with an empty label (a materialized in-memory body — a rendered resource,
+/// web markdown, artifact, or transcript) the path prefix is dropped entirely,
+/// yielding `N:text` / `N-text`. `sep` is `':'` for a match line and `'-'` for a
+/// context line; both forms collapse to bare `text` when line numbers are off.
+fn format_grep_line(relative: &str, line_number: Option<u64>, sep: char, text: &str) -> String {
+    match (relative.is_empty(), line_number) {
+        (true, Some(n)) => format!("{}{}{}", n, sep, text),
+        (true, None) => text.to_string(),
+        (false, Some(n)) => format!("{}:{}{}{}", relative, n, sep, text),
+        (false, None) => format!("{}{}{}", relative, sep, text),
+    }
+}
+
+/// Collect grep output lines for one source under the requested output mode,
+/// appending to `output_lines`. This is the single per-file formatter shared by
+/// the directory walker (`grep_search`) and the single-file bytes renderer
+/// (`render_single_file_grep`), so both emit identical match/context/count lines.
+fn grep_collect_into(
+    searcher: &mut grep_searcher::Searcher,
+    matcher: &grep_regex::RegexMatcher,
+    relative: &str,
+    source: GrepSource<'_>,
+    output_mode: &str,
+    show_line_numbers: bool,
+    output_lines: &mut Vec<String>,
+) {
+    use grep_searcher::Searcher;
+
+    match output_mode {
+        "files_with_matches" => {
+            let mut found = false;
+            let sink = grep_searcher::sinks::UTF8(|_, _| {
+                found = true;
+                Ok(false)
+            });
+            let _ = run_search(searcher, matcher, source, sink);
+            if found {
+                output_lines.push(relative.to_string());
+            }
+        }
+        "count" => {
+            let mut count: u64 = 0;
+            let sink = grep_searcher::sinks::UTF8(|_, _| {
+                count += 1;
+                Ok(true)
+            });
+            let _ = run_search(searcher, matcher, source, sink);
+            if count > 0 {
+                output_lines.push(format!("{}:{}", relative, count));
+            }
+        }
+        "content" => {
+            struct ContentSink {
+                relative: String,
+                show_line_numbers: bool,
+                lines: Vec<String>,
+                needs_separator: bool,
+            }
+
+            impl grep_searcher::Sink for ContentSink {
+                type Error = std::io::Error;
+
+                fn matched(
+                    &mut self,
+                    _searcher: &Searcher,
+                    mat: &grep_searcher::SinkMatch<'_>,
+                ) -> Result<bool, Self::Error> {
+                    self.needs_separator = true;
+                    let text = std::str::from_utf8(mat.bytes())
+                        .unwrap_or("")
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r');
+                    let line_number = self.show_line_numbers.then(|| mat.line_number()).flatten();
+                    self.lines
+                        .push(format_grep_line(&self.relative, line_number, ':', text));
+                    Ok(true)
+                }
+
+                fn context(
+                    &mut self,
+                    _searcher: &Searcher,
+                    ctx: &grep_searcher::SinkContext<'_>,
+                ) -> Result<bool, Self::Error> {
+                    let text = std::str::from_utf8(ctx.bytes())
+                        .unwrap_or("")
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r');
+                    let line_number = self.show_line_numbers.then(|| ctx.line_number()).flatten();
+                    self.lines
+                        .push(format_grep_line(&self.relative, line_number, '-', text));
+                    Ok(true)
+                }
+
+                fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
+                    if self.needs_separator {
+                        self.lines.push("--".to_string());
+                        self.needs_separator = false;
+                    }
+                    Ok(true)
+                }
+            }
+
+            let mut sink = ContentSink {
+                relative: relative.to_string(),
+                show_line_numbers,
+                lines: Vec::new(),
+                needs_separator: false,
+            };
+            let _ = run_search(searcher, matcher, source, &mut sink);
+            if sink.lines.last().is_some_and(|l| l == "--") {
+                sink.lines.pop();
+            }
+            output_lines.extend(sink.lines);
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Apply the post-search finalization shared by the directory grep and the
+/// single-file bytes renderer: the empty-result message, then the
+/// `offset`/`head_limit` match-window slice.
+fn finalize_grep_output(
+    output: String,
+    pattern: &str,
+    offset: usize,
+    head_limit: Option<u32>,
+) -> String {
+    if output.is_empty() {
+        return format!("No matches found for pattern '{}'", pattern);
+    }
+
+    let lines: Vec<&str> = output.lines().collect();
+    let sliced = if offset >= lines.len() {
+        Vec::new()
+    } else {
+        match head_limit {
+            Some(limit) => lines[offset..]
+                .iter()
+                .take(limit as usize)
+                .copied()
+                .collect(),
+            None => lines[offset..].to_vec(),
+        }
+    };
+
+    sliced.join("\n")
+}
+
+/// Render a grep over a single file's bytes, reproducing the live single-file
+/// read-grep output without touching the filesystem. The live read feeds this
+/// from disk; archival reconstruction will feed it from a git blob. A single
+/// file always defaults to `content` mode (you already named the file), and
+/// directory/glob/file-type walks stay in `grep_search`. Both paths share this
+/// module's matcher, searcher, per-file collection, and finalization helpers, so
+/// there is no frozen second copy of the grep-rendering logic.
+pub(crate) fn render_single_file_grep(bytes: &[u8], label: &str, payload: &GrepPayload) -> String {
+    let output_mode = payload.output_mode.as_deref().unwrap_or("content");
+    if !matches!(output_mode, "files_with_matches" | "count" | "content") {
+        return format!(
+            "Invalid output_mode '{}'. Must be 'content', 'files_with_matches', or 'count'.",
+            output_mode
+        );
+    }
+
+    let show_line_numbers = payload.line_numbers.unwrap_or(true);
+    let offset = payload.offset.unwrap_or(0) as usize;
+    let head_limit = payload.head_limit;
+
+    let matcher = match build_grep_matcher(payload) {
+        Ok(matcher) => matcher,
+        Err(error) => return error,
+    };
+    let mut searcher = build_grep_searcher(payload);
+
+    let mut output_lines: Vec<String> = Vec::new();
+    grep_collect_into(
+        &mut searcher,
+        &matcher,
+        label,
+        GrepSource::Bytes(bytes),
+        output_mode,
+        show_line_numbers,
+        &mut output_lines,
+    );
+
+    finalize_grep_output(
+        output_lines.join("\n"),
+        &payload.pattern,
+        offset,
+        head_limit,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Shared grep param/payload helpers used by both the file-tree pushdown path
+// and the universal post-render grep over already-materialized bodies.
+// ---------------------------------------------------------------------------
+
+fn grep_query_value<'a>(params: &'a [QueryParam], key: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .rev()
+        .find(|param| param.key == key)
+        .map(|param| param.value.as_str())
+}
+
+fn grep_opt_u32(value: Option<&str>, key: &str) -> Result<Option<u32>, String> {
+    value
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid integer for query parameter '{key}': {value}"))
+        })
+        .transpose()
+}
+
+fn grep_opt_bool(value: Option<&str>, key: &str) -> Result<Option<bool>, String> {
+    value
+        .map(|value| match value {
+            "" | "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(format!(
+                "Invalid boolean for query parameter '{key}': {value}"
+            )),
+        })
+        .transpose()
+}
+
+/// Build a [`GrepPayload`] from the shared grep modifier params (`context`,
+/// `-A`/`-B`/`-C`, `-i`, `-n`, `head_limit`, `multiline`). The caller supplies
+/// the target-specific fields (`pattern`, `glob`, `file_type`, `output_mode`,
+/// `offset`) and an optional `head_limit_fallback` (the `limit` alias). This is
+/// the single field-mapping shared by the filesystem projection parser and the
+/// universal body-grep parser so neither carries a frozen second copy.
+pub(crate) fn build_grep_payload(
+    params: &[QueryParam],
+    pattern: String,
+    glob: Option<String>,
+    file_type: Option<String>,
+    output_mode: Option<String>,
+    offset: Option<u32>,
+    head_limit_fallback: Option<u32>,
+) -> Result<GrepPayload, String> {
+    Ok(GrepPayload {
+        pattern,
+        path: None,
+        glob,
+        file_type,
+        output_mode,
+        context: grep_opt_u32(grep_query_value(params, "context"), "context")?,
+        after_context: grep_opt_u32(grep_query_value(params, "-A"), "-A")?,
+        before_context: grep_opt_u32(grep_query_value(params, "-B"), "-B")?,
+        context_alias: grep_opt_u32(grep_query_value(params, "-C"), "-C")?,
+        case_insensitive: grep_opt_bool(grep_query_value(params, "-i"), "-i")?,
+        line_numbers: grep_opt_bool(grep_query_value(params, "-n"), "-n")?,
+        head_limit: grep_opt_u32(grep_query_value(params, "head_limit"), "head_limit")?
+            .or(head_limit_fallback),
+        offset,
+        multiline: grep_opt_bool(grep_query_value(params, "multiline"), "multiline")?,
+    })
+}
+
+/// Parse the universal body-grep payload from a target's query params. Returns
+/// `None` when no `grep` is present (the caller renders the body normally).
+///
+/// A materialized body has no file dimension, so this rejects the tree-only
+/// modes and selectors: `output_mode=files_with_matches|count` (need a
+/// directory/multi-file target), `type` (file-type walk), and `glob` unless the
+/// caller `allow_glob` (only `/changed`, which keeps `glob` as its own pushdown
+/// applied before grep). `offset` is rejected (paginate matches via
+/// `head_limit`); `limit` aliases `head_limit`. The resolved `output_mode` is
+/// always `content`.
+pub(crate) fn body_grep_payload(
+    params: &[QueryParam],
+    allow_glob: bool,
+) -> Result<Option<GrepPayload>, String> {
+    let Some(pattern) = grep_query_value(params, "grep") else {
+        return Ok(None);
+    };
+    if pattern.is_empty() {
+        return Err(
+            "Empty 'grep' pattern; omit 'grep' for a plain read or provide a search pattern"
+                .to_string(),
+        );
+    }
+    if grep_query_value(params, "offset").is_some() {
+        return Err("'offset' is a line-window and does not combine with 'grep'; use 'head_limit' or 'limit' to cap the number of matches".to_string());
+    }
+    if !allow_glob && grep_query_value(params, "glob").is_some() {
+        return Err("'glob' selects files within a tree and does not apply to a single rendered body; grep filters the produced text directly".to_string());
+    }
+    if grep_query_value(params, "type").is_some() {
+        return Err(
+            "'type' selects files within a tree and does not apply to a single rendered body"
+                .to_string(),
+        );
+    }
+    if let Some(mode) = grep_query_value(params, "output_mode") {
+        match mode {
+            "content" => {}
+            "files_with_matches" | "count" => {
+                return Err(format!(
+                    "output_mode '{}' needs a directory or multi-file target; grep over a single body returns line-numbered content",
+                    mode
+                ))
+            }
+            other => {
+                return Err(format!(
+                    "Invalid output_mode '{}'. A single-body grep only supports 'content'.",
+                    other
+                ))
+            }
+        }
+    }
+    let head_limit_fallback = grep_opt_u32(grep_query_value(params, "limit"), "limit")?;
+    let payload = build_grep_payload(
+        params,
+        pattern.to_string(),
+        None,
+        None,
+        Some("content".to_string()),
+        None,
+        head_limit_fallback,
+    )?;
+    Ok(Some(payload))
+}
+
+/// Run the universal post-render grep over an already-materialized body: grep
+/// the produced text with the same matcher/searcher/finalizer the single-file
+/// path uses (path-less output), then count real matches. Returns the rendered
+/// grep body and its match count.
+pub(crate) fn grep_materialized_body(body: &str, payload: &GrepPayload) -> (String, usize) {
+    let rendered = render_single_file_grep(body.as_bytes(), "", payload);
+    let (matches, _files) = crate::mcp::handlers::read::grep_counts(&rendered);
+    (rendered, matches)
+}
+
+/// Perform the actual in-process grep search over a filesystem tree.
+pub fn grep_search(
     payload: GrepPayload,
     search_path: &Path,
     output_mode: &str,
     show_line_numbers: bool,
+    deny_read: Vec<PathBuf>,
 ) -> Result<String, String> {
-    use grep_regex::RegexMatcherBuilder;
-    use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder};
     use ignore::overrides::OverrideBuilder;
     use ignore::types::TypesBuilder;
     use ignore::WalkBuilder;
 
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    if payload.case_insensitive.unwrap_or(false) {
-        matcher_builder.case_insensitive(true);
-    }
-    if payload.multiline.unwrap_or(false) {
-        matcher_builder.multi_line(true);
-        matcher_builder.dot_matches_new_line(true);
-    }
-    let matcher = matcher_builder
-        .build(&payload.pattern)
-        .map_err(|e| format!("Invalid regex pattern '{}': {}", payload.pattern, e))?;
+    let matcher = build_grep_matcher(&payload)?;
 
     let is_file = search_path.is_file();
     let walk_root = if is_file {
@@ -424,11 +917,13 @@ fn grep_search(
     };
 
     let mut walker_builder = WalkBuilder::new(if is_file { search_path } else { walk_root });
+    let filter_root = search_path.to_path_buf();
     walker_builder
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
-        .git_exclude(true);
+        .git_exclude(true)
+        .filter_entry(move |entry| should_walk_entry(entry.path(), &filter_root, &deny_read));
 
     if let Some(ref ft) = payload.file_type {
         let mut types = TypesBuilder::new();
@@ -454,28 +949,7 @@ fn grep_search(
         );
     }
 
-    let mut searcher_builder = SearcherBuilder::new();
-    searcher_builder
-        .binary_detection(BinaryDetection::quit(b'\x00'))
-        .line_number(true);
-
-    let context = payload.context_alias.or(payload.context);
-    if let Some(c) = context {
-        searcher_builder
-            .before_context(c as usize)
-            .after_context(c as usize);
-    }
-    if let Some(a) = payload.after_context {
-        searcher_builder.after_context(a as usize);
-    }
-    if let Some(b) = payload.before_context {
-        searcher_builder.before_context(b as usize);
-    }
-    if payload.multiline.unwrap_or(false) {
-        searcher_builder.multi_line(true);
-    }
-
-    let mut searcher = searcher_builder.build();
+    let mut searcher = build_grep_searcher(&payload);
 
     let base_path = if is_file {
         search_path.parent().unwrap_or(search_path)
@@ -508,106 +982,15 @@ fn grep_search(
             .to_string_lossy()
             .to_string();
 
-        match output_mode {
-            "files_with_matches" => {
-                let mut found = false;
-                let sink = grep_searcher::sinks::UTF8(|_, _| {
-                    found = true;
-                    Ok(false)
-                });
-                let _ = searcher.search_path(&matcher, &path, sink);
-                if found {
-                    output_lines.push(relative);
-                }
-            }
-            "count" => {
-                let mut count: u64 = 0;
-                let sink = grep_searcher::sinks::UTF8(|_, _| {
-                    count += 1;
-                    Ok(true)
-                });
-                let _ = searcher.search_path(&matcher, &path, sink);
-                if count > 0 {
-                    output_lines.push(format!("{}:{}", relative, count));
-                }
-            }
-            "content" => {
-                struct ContentSink {
-                    relative: String,
-                    show_line_numbers: bool,
-                    lines: Vec<String>,
-                    needs_separator: bool,
-                }
-
-                impl grep_searcher::Sink for ContentSink {
-                    type Error = std::io::Error;
-
-                    fn matched(
-                        &mut self,
-                        _searcher: &Searcher,
-                        mat: &grep_searcher::SinkMatch<'_>,
-                    ) -> Result<bool, Self::Error> {
-                        self.needs_separator = true;
-                        let text = std::str::from_utf8(mat.bytes())
-                            .unwrap_or("")
-                            .trim_end_matches('\n')
-                            .trim_end_matches('\r');
-                        if self.show_line_numbers {
-                            if let Some(n) = mat.line_number() {
-                                self.lines.push(format!("{}:{}:{}", self.relative, n, text));
-                            } else {
-                                self.lines.push(format!("{}:{}", self.relative, text));
-                            }
-                        } else {
-                            self.lines.push(format!("{}:{}", self.relative, text));
-                        }
-                        Ok(true)
-                    }
-
-                    fn context(
-                        &mut self,
-                        _searcher: &Searcher,
-                        ctx: &grep_searcher::SinkContext<'_>,
-                    ) -> Result<bool, Self::Error> {
-                        let text = std::str::from_utf8(ctx.bytes())
-                            .unwrap_or("")
-                            .trim_end_matches('\n')
-                            .trim_end_matches('\r');
-                        if self.show_line_numbers {
-                            if let Some(n) = ctx.line_number() {
-                                self.lines.push(format!("{}:{}-{}", self.relative, n, text));
-                            } else {
-                                self.lines.push(format!("{}-{}", self.relative, text));
-                            }
-                        } else {
-                            self.lines.push(format!("{}-{}", self.relative, text));
-                        }
-                        Ok(true)
-                    }
-
-                    fn context_break(&mut self, _searcher: &Searcher) -> Result<bool, Self::Error> {
-                        if self.needs_separator {
-                            self.lines.push("--".to_string());
-                            self.needs_separator = false;
-                        }
-                        Ok(true)
-                    }
-                }
-
-                let mut sink = ContentSink {
-                    relative: relative.clone(),
-                    show_line_numbers,
-                    lines: Vec::new(),
-                    needs_separator: false,
-                };
-                let _ = searcher.search_path(&matcher, &path, &mut sink);
-                if sink.lines.last().is_some_and(|l| l == "--") {
-                    sink.lines.pop();
-                }
-                output_lines.extend(sink.lines);
-            }
-            _ => unreachable!(),
-        }
+        grep_collect_into(
+            &mut searcher,
+            &matcher,
+            &relative,
+            GrepSource::Path(&path),
+            output_mode,
+            show_line_numbers,
+            &mut output_lines,
+        );
     }
 
     Ok(output_lines.join("\n"))
@@ -616,545 +999,319 @@ fn grep_search(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::DbState;
-    use crate::services::testing::TestServicesBuilder;
-    use crate::test_utils::test_diesel_conn;
-    use std::fs;
-    use std::sync::{Arc, Mutex};
 
-    fn test_orchestrator() -> Orchestrator {
-        let conn = test_diesel_conn();
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
-            db.clone(),
-            services.emitter.clone(),
-        ));
-        let sync_tx = Arc::new(Mutex::new(None));
-        Orchestrator {
-            db,
-            services: services.clone(),
-            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
-            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(PathBuf::from("/tmp"))),
-            warm_gc: None,
-            pty_state: Arc::new(crate::services::PtyState::default()),
-            permission_responses: tokio::sync::broadcast::channel(16).0,
-            run_completions: tokio::sync::broadcast::channel(64).0,
-            prompt_responses: tokio::sync::broadcast::channel(16).0,
-            trigger_events: tokio::sync::broadcast::channel(256).0,
-            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            identity_store: Arc::new(Mutex::new(None)),
-            mcp_binary_path: "cairn-mcp".to_string(),
-            config_dir: PathBuf::from("/tmp"),
-            schema_dir: None,
-            mcp_callback_port: 3847,
-            embedding_engine: None,
-            vibe_state: None,
-            account_manager,
-            sync_tx: sync_tx.clone(),
-            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
-            api_config: crate::api::ApiConfig::default(),
-            effect_tx: None,
-            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            provider_usage_snapshots: Default::default(),
-            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
+    #[test]
+    fn grep_default_mode_is_content_for_a_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("needle.txt");
+        std::fs::write(&file, "hay\nneedle\nhay\n").unwrap();
+
+        assert_eq!(default_grep_output_mode(&file), "content");
+    }
+
+    #[test]
+    fn grep_default_mode_is_files_with_matches_for_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(default_grep_output_mode(dir.path()), "files_with_matches");
+    }
+
+    #[test]
+    fn grep_default_mode_treats_missing_path_as_a_directory() {
+        // A nonexistent path isn't a file, so it falls back to the
+        // directory-style default rather than printing per-line content.
+        let missing = Path::new("/this/path/does/not/exist/anywhere");
+        assert_eq!(default_grep_output_mode(missing), "files_with_matches");
+    }
+
+    #[test]
+    fn grep_search_emits_context_lines() {
+        // Locks in the context-line feature reachable via `?grep=foo&-C=N`: the
+        // matched line uses a `:` separator, surrounding context lines use `-`.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ctx.txt");
+        std::fs::write(&file, "alpha\nbeta\nNEEDLE\ngamma\ndelta\n").unwrap();
+
+        let payload = GrepPayload {
+            pattern: "NEEDLE".to_string(),
+            path: Some(file.display().to_string()),
+            glob: None,
+            file_type: None,
+            output_mode: Some("content".to_string()),
+            context: None,
+            after_context: None,
+            before_context: None,
+            context_alias: Some(1),
+            case_insensitive: None,
+            line_numbers: Some(true),
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        };
+
+        let output = grep_search(payload, &file, "content", true, Vec::new()).unwrap();
+        // Match line, plus one context line on each side, in the expected format.
+        assert!(output.contains("ctx.txt:3:NEEDLE"), "match line: {output}");
+        assert!(
+            output.contains("ctx.txt:2-beta"),
+            "before-context: {output}"
+        );
+        assert!(
+            output.contains("ctx.txt:4-gamma"),
+            "after-context: {output}"
+        );
+        // Out-of-window lines are not surfaced with a single line of context.
+        assert!(!output.contains("alpha"), "alpha outside context: {output}");
+        assert!(!output.contains("delta"), "delta outside context: {output}");
+    }
+
+    fn qp(key: &str, value: &str) -> QueryParam {
+        QueryParam {
+            key: key.to_string(),
+            value: value.to_string(),
         }
     }
 
     #[test]
-    fn validate_search_path_within_allowed_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("sub");
-        fs::create_dir_all(&sub).unwrap();
-
-        let allowed = vec![dir.path().to_path_buf()];
-        assert!(validate_search_path(&sub, &allowed).is_ok());
+    fn body_grep_payload_none_without_grep() {
+        assert!(body_grep_payload(&[qp("limit", "5")], false)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn validate_search_path_rejects_outside_dir() {
-        let dir1 = tempfile::tempdir().unwrap();
-        let dir2 = tempfile::tempdir().unwrap();
-
-        let allowed = vec![dir1.path().to_path_buf()];
-        let result = validate_search_path(dir2.path(), &allowed);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("outside allowed directories"));
-    }
-
-    #[test]
-    fn validate_search_path_exact_match_allowed() {
-        let dir = tempfile::tempdir().unwrap();
-        let allowed = vec![dir.path().to_path_buf()];
-        assert!(validate_search_path(dir.path(), &allowed).is_ok());
-    }
-
-    #[test]
-    fn validate_search_path_rejects_nonexistent() {
-        let allowed = vec![PathBuf::from("/tmp")];
-        let result = validate_search_path(Path::new("/nonexistent/path/xyz"), &allowed);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Cannot resolve path"));
-    }
-
-    #[test]
-    fn validate_search_path_multiple_allowed_dirs() {
-        let dir1 = tempfile::tempdir().unwrap();
-        let dir2 = tempfile::tempdir().unwrap();
-        let sub2 = dir2.path().join("inner");
-        fs::create_dir_all(&sub2).unwrap();
-
-        let allowed = vec![dir1.path().to_path_buf(), dir2.path().to_path_buf()];
-        assert!(validate_search_path(&sub2, &allowed).is_ok());
-    }
-
-    #[test]
-    fn validate_search_path_rejects_symlink_escape() {
-        let allowed_dir = tempfile::tempdir().unwrap();
-        let outside_dir = tempfile::tempdir().unwrap();
-
-        let link = allowed_dir.path().join("escape");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(outside_dir.path(), &link).unwrap();
-
-        let allowed = vec![allowed_dir.path().to_path_buf()];
-        let result = validate_search_path(&link, &allowed);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn resolve_search_dir_absolute_path() {
-        let result = resolve_search_dir("/some/cwd", Some("/absolute/path"));
-        assert_eq!(result, PathBuf::from("/absolute/path"));
-    }
-
-    #[test]
-    fn resolve_search_dir_relative_path() {
-        let result = resolve_search_dir("/some/cwd", Some("relative/sub"));
-        assert_eq!(result, PathBuf::from("/some/cwd/relative/sub"));
-    }
-
-    #[test]
-    fn resolve_search_dir_none_uses_cwd() {
-        let result = resolve_search_dir("/some/cwd", None);
-        assert_eq!(result, PathBuf::from("/some/cwd"));
-    }
-
-    #[test]
-    fn handle_glob_within_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("foo.rs"), "fn main() {}").unwrap();
-        fs::write(dir.path().join("bar.txt"), "hello").unwrap();
-
-        let orch = test_orchestrator();
-
-        let request = McpCallbackRequest {
-            cwd: dir.path().to_string_lossy().to_string(),
-            run_id: None,
-            tool: "glob".to_string(),
-            payload: serde_json::json!({ "pattern": "*.rs" }),
-            tool_use_id: None,
-        };
-
-        let result = handle_glob(&orch, &request);
-        assert!(result.contains("foo.rs"), "Expected foo.rs in: {}", result);
-        assert!(!result.contains("bar.txt"));
-    }
-
-    #[test]
-    fn handle_glob_outside_cwd_rejected() {
-        let cwd = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("secret.txt"), "data").unwrap();
-
-        let orch = test_orchestrator();
-
-        let request = McpCallbackRequest {
-            cwd: cwd.path().to_string_lossy().to_string(),
-            run_id: None,
-            tool: "glob".to_string(),
-            payload: serde_json::json!({
-                "pattern": "*.txt",
-                "path": outside.path().to_string_lossy().to_string()
-            }),
-            tool_use_id: None,
-        };
-
-        let result = handle_glob(&orch, &request);
-        assert!(
-            result.contains("outside allowed directories"),
-            "Expected rejection, got: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn handle_glob_invalid_pattern() {
-        let dir = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator();
-
-        let request = McpCallbackRequest {
-            cwd: dir.path().to_string_lossy().to_string(),
-            run_id: None,
-            tool: "glob".to_string(),
-            payload: serde_json::json!({ "pattern": "[invalid" }),
-            tool_use_id: None,
-        };
-
-        let result = handle_glob(&orch, &request);
-        assert!(
-            result.contains("Invalid glob pattern"),
-            "Expected error, got: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn handle_glob_no_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("foo.txt"), "hello").unwrap();
-
-        let orch = test_orchestrator();
-
-        let request = McpCallbackRequest {
-            cwd: dir.path().to_string_lossy().to_string(),
-            run_id: None,
-            tool: "glob".to_string(),
-            payload: serde_json::json!({ "pattern": "*.rs" }),
-            tool_use_id: None,
-        };
-
-        let result = handle_glob(&orch, &request);
-        assert!(
-            result.contains("No files matched"),
-            "Expected no match message, got: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn handle_glob_sorts_by_mtime_most_recent_first() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create files with a time gap to ensure different mtimes
-        fs::write(dir.path().join("old.rs"), "old").unwrap();
-        // Set mtime to 10 seconds ago
-        let old_time = filetime::FileTime::from_unix_time(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                - 10,
-            0,
-        );
-        filetime::set_file_mtime(dir.path().join("old.rs"), old_time).unwrap();
-
-        fs::write(dir.path().join("new.rs"), "new").unwrap();
-
-        let orch = test_orchestrator();
-        let request = McpCallbackRequest {
-            cwd: dir.path().to_string_lossy().to_string(),
-            run_id: None,
-            tool: "glob".to_string(),
-            payload: serde_json::json!({ "pattern": "*.rs" }),
-            tool_use_id: None,
-        };
-
-        let result = handle_glob(&orch, &request);
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "new.rs", "Most recent file should be first");
-        assert_eq!(lines[1], "old.rs");
-    }
-
-    #[test]
-    fn handle_glob_invalid_payload() {
-        let dir = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator();
-
-        let request = McpCallbackRequest {
-            cwd: dir.path().to_string_lossy().to_string(),
-            run_id: None,
-            tool: "glob".to_string(),
-            payload: serde_json::json!({ "wrong_field": true }),
-            tool_use_id: None,
-        };
-
-        let result = handle_glob(&orch, &request);
-        assert!(
-            result.contains("Invalid payload"),
-            "Expected invalid payload error, got: {}",
-            result
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // handle_grep tests
-    // -----------------------------------------------------------------------
-
-    fn grep_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
-        McpCallbackRequest {
-            cwd: cwd.to_string(),
-            run_id: None,
-            tool: "grep".to_string(),
-            payload,
-            tool_use_id: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_grep_finds_matching_content() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("hello.txt"), "hello world\ngoodbye world").unwrap();
-
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "hello",
-                "output_mode": "content"
-            }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        assert!(
-            result.contains("hello world"),
-            "Expected match, got: {}",
-            result
-        );
-        assert!(!result.contains("goodbye"));
-    }
-
-    #[tokio::test]
-    async fn handle_grep_files_with_matches_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), "needle here").unwrap();
-        fs::write(dir.path().join("b.txt"), "no match").unwrap();
-
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "needle",
-                "output_mode": "files_with_matches"
-            }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        assert!(result.contains("a.txt"), "Expected a.txt, got: {}", result);
-        assert!(!result.contains("b.txt"));
-    }
-
-    #[tokio::test]
-    async fn handle_grep_count_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("data.txt"), "foo\nfoo\nbar").unwrap();
-
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "foo",
-                "output_mode": "count"
-            }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        // rg --count outputs "file:count"
-        assert!(
-            result.contains(":2"),
-            "Expected count of 2, got: {}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_grep_invalid_output_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("x.txt"), "data").unwrap();
-
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "data",
-                "output_mode": "bogus"
-            }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        assert!(
-            result.contains("Invalid output_mode"),
-            "Expected output_mode error, got: {}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_grep_no_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("data.txt"), "hello").unwrap();
-
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({ "pattern": "zzzznothere" }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        assert!(
-            result.contains("No matches found"),
-            "Expected no matches, got: {}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_grep_outside_cwd_rejected() {
-        let cwd = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        fs::write(outside.path().join("secret.txt"), "password").unwrap();
-
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &cwd.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "password",
-                "path": outside.path().to_string_lossy().to_string()
-            }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        assert!(
-            result.contains("outside allowed directories"),
-            "Expected rejection, got: {}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_grep_case_insensitive() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("data.txt"), "Hello World").unwrap();
-
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "hello",
-                "-i": true,
-                "output_mode": "content"
-            }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        assert!(
-            result.contains("Hello World"),
-            "Expected case-insensitive match, got: {}",
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn handle_grep_head_limit_and_offset() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("lines.txt"),
-            "line1 match\nline2 match\nline3 match\nline4 match\nline5 match",
+    fn body_grep_payload_rejects_invalid_combinations() {
+        // Empty pattern, offset+grep, and the tree-only output modes/selectors
+        // are all rejected on a single materialized body.
+        assert!(body_grep_payload(&[qp("grep", "")], false).is_err());
+        assert!(body_grep_payload(&[qp("grep", "x"), qp("offset", "2")], false).is_err());
+        assert!(body_grep_payload(
+            &[qp("grep", "x"), qp("output_mode", "files_with_matches")],
+            false
         )
+        .is_err());
+        assert!(body_grep_payload(&[qp("grep", "x"), qp("output_mode", "count")], false).is_err());
+        assert!(body_grep_payload(&[qp("grep", "x"), qp("type", "rust")], false).is_err());
+        // glob is rejected unless the caller (only `/changed`) allows it.
+        assert!(body_grep_payload(&[qp("grep", "x"), qp("glob", "*.rs")], false).is_err());
+        assert!(
+            body_grep_payload(&[qp("grep", "x"), qp("glob", "*.rs")], true)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn body_grep_payload_aliases_limit_and_defaults_to_content() {
+        let payload = body_grep_payload(&[qp("grep", "x"), qp("limit", "7")], false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(payload.head_limit, Some(7));
+        assert_eq!(payload.output_mode.as_deref(), Some("content"));
+        assert_eq!(payload.offset, None);
+        // An explicit head_limit wins over the limit alias.
+        let payload = body_grep_payload(
+            &[qp("grep", "x"), qp("limit", "7"), qp("head_limit", "3")],
+            false,
+        )
+        .unwrap()
         .unwrap();
+        assert_eq!(payload.head_limit, Some(3));
+    }
 
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "match",
-                "output_mode": "content",
-                "offset": 1,
-                "head_limit": 2,
-                "-n": false
-            }),
-        );
+    #[test]
+    fn grep_materialized_body_drops_path_and_counts_matches() {
+        let body = "alpha\nneedle one\ngamma\nneedle two\n";
+        let payload = body_grep_payload(&[qp("grep", "needle")], false)
+            .unwrap()
+            .unwrap();
+        let (rendered, matches) = grep_materialized_body(body, &payload);
+        assert_eq!(matches, 2);
+        // Path-less, line-number-prefixed match lines.
+        assert!(rendered.contains("2:needle one"), "{rendered}");
+        assert!(rendered.contains("4:needle two"), "{rendered}");
+        assert!(!rendered.contains(":2:"), "no path prefix: {rendered}");
 
-        let result = handle_grep(&orch, &request).await;
-        let lines: Vec<&str> = result.lines().collect();
+        // An empty result yields the shared finalizer's message.
+        let payload = body_grep_payload(&[qp("grep", "zzz")], false)
+            .unwrap()
+            .unwrap();
+        let (rendered, matches) = grep_materialized_body(body, &payload);
+        assert_eq!(matches, 0);
+        assert_eq!(rendered, "No matches found for pattern 'zzz'");
+    }
+
+    #[test]
+    fn grep_context_flag_implies_content_for_a_directory() {
+        // A directory grep that asks for context but names no output_mode must
+        // default to `content`, not `files_with_matches` — otherwise both the
+        // requested context and the matched lines are silently dropped.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_grep_output_mode(None, true, dir.path()), "content");
+    }
+
+    #[test]
+    fn grep_directory_without_context_stays_files_with_matches() {
+        let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            lines.len(),
-            2,
-            "Expected 2 lines after offset+limit, got: {:?}",
-            lines
+            resolve_grep_output_mode(None, false, dir.path()),
+            "files_with_matches"
         );
     }
 
-    #[tokio::test]
-    async fn handle_grep_invalid_payload() {
+    #[test]
+    fn grep_explicit_output_mode_wins_over_context_flag() {
+        // An explicit output_mode is honored even when context flags are set.
         let dir = tempfile::tempdir().unwrap();
-        let orch = test_orchestrator();
-
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({ "not_pattern": "x" }),
-        );
-
-        let result = handle_grep(&orch, &request).await;
-        assert!(
-            result.contains("Invalid payload"),
-            "Expected invalid payload error, got: {}",
-            result
+        assert_eq!(
+            resolve_grep_output_mode(Some("files_with_matches"), true, dir.path()),
+            "files_with_matches"
         );
     }
 
-    #[tokio::test]
-    async fn handle_grep_glob_filter() {
+    #[test]
+    fn grep_directory_with_context_returns_content_lines() {
+        // End-to-end: resolving the mode for a directory + context flag yields
+        // `content`, and grepping the directory in that mode surfaces the match
+        // plus its surrounding context lines.
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("code.rs"), "fn main() {}").unwrap();
-        fs::write(dir.path().join("readme.md"), "fn main() {}").unwrap();
+        let file = dir.path().join("ctx.txt");
+        std::fs::write(&file, "alpha\nbeta\nNEEDLE\ngamma\ndelta\n").unwrap();
 
-        let orch = test_orchestrator();
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({
-                "pattern": "fn main",
-                "glob": "*.rs",
-                "output_mode": "files_with_matches"
-            }),
-        );
+        let mode = resolve_grep_output_mode(None, true, dir.path());
+        assert_eq!(mode, "content");
 
-        let result = handle_grep(&orch, &request).await;
+        let payload = GrepPayload {
+            pattern: "NEEDLE".to_string(),
+            path: Some(dir.path().display().to_string()),
+            glob: None,
+            file_type: None,
+            output_mode: None,
+            context: None,
+            after_context: None,
+            before_context: None,
+            context_alias: Some(1),
+            case_insensitive: None,
+            line_numbers: Some(true),
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        };
+
+        let output = grep_search(payload, dir.path(), mode, true, Vec::new()).unwrap();
+        assert!(output.contains("ctx.txt:3:NEEDLE"), "match line: {output}");
         assert!(
-            result.contains("code.rs"),
-            "Expected code.rs, got: {}",
-            result
+            output.contains("ctx.txt:2-beta"),
+            "before-context: {output}"
         );
-        assert!(!result.contains("readme.md"));
+        assert!(
+            output.contains("ctx.txt:4-gamma"),
+            "after-context: {output}"
+        );
     }
 
-    #[tokio::test]
-    async fn handle_grep_default_mode_is_files_with_matches() {
+    fn grep_payload(pattern: &str) -> GrepPayload {
+        GrepPayload {
+            pattern: pattern.to_string(),
+            path: None,
+            glob: None,
+            file_type: None,
+            output_mode: None,
+            context: None,
+            after_context: None,
+            before_context: None,
+            context_alias: None,
+            case_insensitive: None,
+            line_numbers: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        }
+    }
+
+    /// Reference single-file grep through the filesystem walker — the behavior
+    /// `render_single_file_grep` must reproduce byte-for-byte from in-memory
+    /// bytes. Both paths share this module's matcher/searcher/collect/finalize
+    /// helpers, so this asserts the two entry points stay in lockstep.
+    fn fs_single_file_grep(content: &str, label: &str, payload: &GrepPayload) -> String {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("f.txt"), "target_data").unwrap();
+        let file = dir.path().join(label);
+        std::fs::write(&file, content).unwrap();
 
-        let orch = test_orchestrator();
-        // No output_mode specified — should default to files_with_matches
-        let request = grep_request(
-            &dir.path().to_string_lossy(),
-            serde_json::json!({ "pattern": "target_data" }),
-        );
+        let requested_context = payload.context.is_some()
+            || payload.context_alias.is_some()
+            || payload.after_context.is_some()
+            || payload.before_context.is_some();
+        let mode =
+            resolve_grep_output_mode(payload.output_mode.as_deref(), requested_context, &file)
+                .to_string();
+        let show = payload.line_numbers.unwrap_or(true);
+        let offset = payload.offset.unwrap_or(0) as usize;
+        let raw = grep_search(payload.clone(), &file, &mode, show, Vec::new()).unwrap();
+        finalize_grep_output(raw, &payload.pattern, offset, payload.head_limit)
+    }
 
-        let result = handle_grep(&orch, &request).await;
-        // files_with_matches returns filenames, not content lines
-        assert!(
-            result.contains("f.txt"),
-            "Expected filename in result, got: {}",
-            result
+    fn assert_single_file_grep_matches(content: &str, label: &str, payload: &GrepPayload) {
+        let expected = fs_single_file_grep(content, label, payload);
+        let actual = render_single_file_grep(content.as_bytes(), label, payload);
+        assert_eq!(actual, expected, "payload: {payload:?}");
+    }
+
+    #[test]
+    fn render_single_file_grep_plain_matches_filesystem() {
+        assert_single_file_grep_matches(
+            "alpha\nNEEDLE\ngamma\nNEEDLE again\n",
+            "f.txt",
+            &grep_payload("NEEDLE"),
         );
-        // Should not contain the actual matched content (just the filename)
-        assert!(
-            !result.contains("target_data"),
-            "Expected only filename, not content, got: {}",
-            result
+    }
+
+    #[test]
+    fn render_single_file_grep_with_context_matches_filesystem() {
+        let mut payload = grep_payload("NEEDLE");
+        payload.context_alias = Some(1);
+        assert_single_file_grep_matches("alpha\nbeta\nNEEDLE\ngamma\ndelta\n", "ctx.txt", &payload);
+    }
+
+    #[test]
+    fn render_single_file_grep_with_head_limit_matches_filesystem() {
+        let mut payload = grep_payload("NEEDLE");
+        payload.head_limit = Some(1);
+        assert_single_file_grep_matches(
+            "NEEDLE one\nNEEDLE two\nNEEDLE three\n",
+            "f.txt",
+            &payload,
+        );
+    }
+
+    #[test]
+    fn render_single_file_grep_case_insensitive_matches_filesystem() {
+        let mut payload = grep_payload("needle");
+        payload.case_insensitive = Some(true);
+        assert_single_file_grep_matches("NEEDLE\nhay\nNeEdLe\n", "f.txt", &payload);
+    }
+
+    #[test]
+    fn render_single_file_grep_count_mode_matches_filesystem() {
+        let mut payload = grep_payload("NEEDLE");
+        payload.output_mode = Some("count".to_string());
+        assert_single_file_grep_matches("NEEDLE\nNEEDLE\nhay\n", "f.txt", &payload);
+    }
+
+    #[test]
+    fn render_single_file_grep_files_with_matches_mode_matches_filesystem() {
+        let mut payload = grep_payload("NEEDLE");
+        payload.output_mode = Some("files_with_matches".to_string());
+        assert_single_file_grep_matches("NEEDLE\nhay\n", "f.txt", &payload);
+    }
+
+    #[test]
+    fn render_single_file_grep_no_matches_reports_no_matches() {
+        let payload = grep_payload("absent");
+        let rendered = render_single_file_grep(b"alpha\nbeta\n", "f.txt", &payload);
+        assert_eq!(rendered, "No matches found for pattern 'absent'");
+        assert_eq!(
+            rendered,
+            fs_single_file_grep("alpha\nbeta\n", "f.txt", &payload)
         );
     }
 }

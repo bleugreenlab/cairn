@@ -4,4 +4,6 @@
 //! This module retains the framework-agnostic helpers (no DB access)
 //! that are used by both the Tauri app and headless server.
 
+pub mod actions;
 pub mod helpers;
+pub mod ports;

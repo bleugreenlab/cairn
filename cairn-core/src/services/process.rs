@@ -5,9 +5,16 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 #[cfg(any(test, feature = "test-utils"))]
 use mockall::automock;
+
+use super::sandbox::SandboxPolicy;
 
 /// Configuration for spawning a process.
 #[derive(Debug, Clone)]
@@ -19,6 +26,9 @@ pub struct SpawnConfig {
     pub capture_stdout: bool,
     pub capture_stderr: bool,
     pub capture_stdin: bool,
+    /// OS-level filesystem confinement to apply to this spawn. `None` = run
+    /// unconfined (trusted agent, no run context, or platform without support).
+    pub sandbox: Option<SandboxPolicy>,
 }
 
 impl SpawnConfig {
@@ -31,7 +41,14 @@ impl SpawnConfig {
             capture_stdout: true,
             capture_stderr: true,
             capture_stdin: false,
+            sandbox: None,
         }
+    }
+
+    /// Apply an OS-level filesystem sandbox to this spawn.
+    pub fn sandbox(mut self, policy: Option<SandboxPolicy>) -> Self {
+        self.sandbox = policy;
+        self
     }
 
     pub fn stdin(mut self, capture: bool) -> Self {
@@ -88,6 +105,45 @@ pub trait ChildProcess: Send {
     fn kill(&mut self) -> std::io::Result<()>;
 }
 
+/// RAII guard that SIGKILLs an inline command's process group if it is dropped
+/// while still armed.
+///
+/// This ties process lifetime to the awaiting request future: if the future is
+/// dropped mid-wait (client disconnect, MCP cancel, handler abort), `Drop`
+/// reaps the whole tree — the cancellation-propagation fix. Disarm on normal
+/// completion, on an explicit self-kill, or on promotion (when ownership of the
+/// process moves to a terminal session whose own kill path reaps it later).
+pub struct KillOnDrop {
+    child: Arc<Mutex<Box<dyn ChildProcess>>>,
+    armed: AtomicBool,
+}
+
+impl KillOnDrop {
+    pub fn new(child: Arc<Mutex<Box<dyn ChildProcess>>>) -> Self {
+        Self {
+            child,
+            armed: AtomicBool::new(true),
+        }
+    }
+
+    /// Transfer ownership away from this guard so `Drop` does not reap.
+    pub fn disarm(&self) {
+        self.armed.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.armed.load(Ordering::SeqCst) {
+            // `kill()` SIGKILLs the whole process group; ESRCH on an
+            // already-dead group is harmless.
+            if let Ok(mut c) = self.child.lock() {
+                let _ = c.kill();
+            }
+        }
+    }
+}
+
 /// Result of running a command to completion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOutput {
@@ -112,19 +168,46 @@ pub trait ProcessSpawner: Send + Sync {
 /// Production process spawner using std::process.
 pub struct RealProcessSpawner;
 
+/// Build a `Command` from a spawn config, applying the OS sandbox if present.
+///
+/// On macOS the argv is rewritten to run under `sandbox-exec`; on Linux a
+/// landlock `pre_exec` hook is installed. The cwd and env are applied after so
+/// they take effect inside the wrapped invocation.
+fn build_command(config: &SpawnConfig) -> std::process::Command {
+    let (program, args) = match &config.sandbox {
+        Some(policy) => super::sandbox::wrap_argv(&config.program, &config.args, policy),
+        None => (config.program.clone(), config.args.clone()),
+    };
+
+    let mut cmd = crate::env::command(&program);
+    cmd.args(&args);
+
+    if let Some(ref cwd) = config.cwd {
+        cmd.current_dir(cwd);
+    }
+
+    for (key, value) in &config.env {
+        cmd.env(key, value);
+    }
+
+    if config.sandbox.is_some() {
+        // Mark fenced spawns so client tooling (e.g. the rustc cache wrapper)
+        // connects to the Cairn-owned build-service daemon instead of
+        // auto-starting its own confined one. Service-specific env (e.g.
+        // SCCACHE_*) is injected into `config.env` at the spawn seam.
+        cmd.env("CAIRN_SANDBOXED", "1");
+    }
+
+    if let Some(policy) = &config.sandbox {
+        super::sandbox::install_pre_exec(&mut cmd, policy);
+    }
+
+    cmd
+}
+
 impl ProcessSpawner for RealProcessSpawner {
     fn spawn(&self, config: SpawnConfig) -> Result<Box<dyn ChildProcess>, String> {
-        let mut cmd = crate::env::command(&config.program);
-
-        cmd.args(&config.args);
-
-        if let Some(ref cwd) = config.cwd {
-            cmd.current_dir(cwd);
-        }
-
-        for (key, value) in &config.env {
-            cmd.env(key, value);
-        }
+        let mut cmd = build_command(&config);
 
         if config.capture_stdout {
             cmd.stdout(Stdio::piped());
@@ -136,6 +219,14 @@ impl ProcessSpawner for RealProcessSpawner {
             cmd.stdin(Stdio::piped());
         }
 
+        #[cfg(unix)]
+        {
+            // Put spawned commands in their own process group so `kill()` can
+            // cancel shell-launched descendants (e.g. `npm install`, `bun build`),
+            // not just the wrapper shell process.
+            cmd.process_group(0);
+        }
+
         let child = cmd
             .spawn()
             .map_err(|e| format!("Failed to spawn process: {}", e))?;
@@ -144,17 +235,7 @@ impl ProcessSpawner for RealProcessSpawner {
     }
 
     fn run(&self, config: SpawnConfig) -> Result<CommandOutput, String> {
-        let mut cmd = crate::env::command(&config.program);
-
-        cmd.args(&config.args);
-
-        if let Some(ref cwd) = config.cwd {
-            cmd.current_dir(cwd);
-        }
-
-        for (key, value) in &config.env {
-            cmd.env(key, value);
-        }
+        let mut cmd = build_command(&config);
 
         let output = cmd
             .output()
@@ -205,6 +286,16 @@ impl ChildProcess for RealChildProcess {
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let pgid = nix::unistd::Pid::from_raw(self.child.id() as i32);
+            match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    log::debug!("failed to kill process group {}: {}", self.child.id(), err);
+                }
+            }
+        }
         self.child.kill()
     }
 }
@@ -321,6 +412,63 @@ impl ChildProcess for MockChildProcess {
     }
 }
 
+/// Test process spawner that records calls and returns inert success values.
+///
+/// Unlike the `mockall`-generated [`MockProcessSpawner`], this spawner has a
+/// permissive default: unexpected spawns become inspectable records rather than
+/// panics. Use it in higher-level harness tests where process startup is an
+/// incidental side effect and the assertion should live near the orchestration
+/// behavior under test.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Default)]
+pub struct RecordingProcessSpawner {
+    spawned: Arc<Mutex<Vec<SpawnConfig>>>,
+    ran: Arc<Mutex<Vec<SpawnConfig>>>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl RecordingProcessSpawner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn spawned(&self) -> Vec<SpawnConfig> {
+        self.spawned.lock().unwrap().clone()
+    }
+
+    pub fn ran(&self) -> Vec<SpawnConfig> {
+        self.ran.lock().unwrap().clone()
+    }
+
+    pub fn spawn_count(&self) -> usize {
+        self.spawned.lock().unwrap().len()
+    }
+
+    pub fn run_count(&self) -> usize {
+        self.ran.lock().unwrap().len()
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ProcessSpawner for RecordingProcessSpawner {
+    fn spawn(&self, config: SpawnConfig) -> Result<Box<dyn ChildProcess>, String> {
+        let mut spawned = self.spawned.lock().unwrap();
+        spawned.push(config);
+        let id = spawned.len() as u32;
+        Ok(Box::new(MockChildProcess::with_stdout(id, Vec::new())))
+    }
+
+    fn run(&self, config: SpawnConfig) -> Result<CommandOutput, String> {
+        self.ran.lock().unwrap().push(config);
+        Ok(CommandOutput {
+            success: true,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +523,67 @@ mod tests {
         assert!(mock.try_wait().unwrap().is_some());
     }
 
+    // The real spawner honors a SandboxPolicy end-to-end: an out-of-worktree
+    // write is blocked by the kernel. macOS-only (sandbox-exec present).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_spawner_blocks_out_of_worktree_write() {
+        use super::SandboxPolicy;
+        use tempfile::tempdir;
+
+        let wt = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let escape = outside.path().join("escape.txt");
+        let policy = SandboxPolicy {
+            worktree: wt.path().to_path_buf(),
+            writable_extra: vec![],
+            deny_read: vec![],
+            writable_regex: vec![],
+        };
+        let cfg = SpawnConfig::new("/bin/bash")
+            .args(["-c".to_string(), format!("echo x > {}", escape.display())])
+            .sandbox(Some(policy));
+        let out = RealProcessSpawner.run(cfg).unwrap();
+        assert!(!out.success, "out-of-worktree write must be denied");
+        assert!(!escape.exists(), "escape file must not be created");
+    }
+
+    #[test]
+    fn build_command_sets_cairn_sandboxed_only_when_confined() {
+        use super::SandboxPolicy;
+        use std::collections::HashMap;
+
+        let envs = |cmd: &std::process::Command| -> HashMap<String, String> {
+            cmd.get_envs()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+                .collect()
+        };
+
+        // Sandboxed spawn: CAIRN_SANDBOXED=1 plus the injected service env.
+        let policy = SandboxPolicy {
+            worktree: std::path::PathBuf::from("/work/wt"),
+            writable_extra: vec![],
+            deny_read: vec![],
+            writable_regex: vec![],
+        };
+        let cfg = SpawnConfig::new("echo")
+            .env("SCCACHE_SERVER_PORT", "4226")
+            .sandbox(Some(policy));
+        let confined = envs(&build_command(&cfg));
+        assert_eq!(
+            confined.get("CAIRN_SANDBOXED").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            confined.get("SCCACHE_SERVER_PORT").map(String::as_str),
+            Some("4226")
+        );
+
+        // Unsandboxed spawn: CAIRN_SANDBOXED is absent.
+        let plain = envs(&build_command(&SpawnConfig::new("echo")));
+        assert!(!plain.contains_key("CAIRN_SANDBOXED"));
+    }
+
     #[test]
     fn mock_process_spawner() {
         let mut mock_spawner = MockProcessSpawner::new();
@@ -393,5 +602,59 @@ mod tests {
         let stdout = child.take_stdout().unwrap();
         let line = stdout.lines().next().unwrap().unwrap();
         assert!(line.contains("test-program"));
+    }
+
+    #[test]
+    fn recording_process_spawner_records_without_expectations() {
+        let spawner = RecordingProcessSpawner::new();
+
+        let child = spawner
+            .spawn(SpawnConfig::new("unexpected-spawn").arg("--flag"))
+            .unwrap();
+        let output = spawner.run(SpawnConfig::new("unexpected-run")).unwrap();
+
+        assert_eq!(child.id(), 1);
+        assert!(output.success);
+        assert_eq!(spawner.spawned()[0].program, "unexpected-spawn");
+        assert_eq!(spawner.spawned()[0].args, vec!["--flag"]);
+        assert_eq!(spawner.ran()[0].program, "unexpected-run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_on_drop_reaps_when_armed() {
+        let child = RealProcessSpawner
+            .spawn(SpawnConfig::new("/bin/sh").args(["-c".to_string(), "sleep 30".to_string()]))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(child));
+        {
+            let _guard = KillOnDrop::new(shared.clone());
+        } // dropped while armed -> SIGKILLs the group
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut c = shared.lock().unwrap();
+        assert!(
+            c.try_wait().unwrap().is_some(),
+            "armed KillOnDrop should have reaped the child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_on_drop_is_noop_when_disarmed() {
+        let child = RealProcessSpawner
+            .spawn(SpawnConfig::new("/bin/sh").args(["-c".to_string(), "sleep 30".to_string()]))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(child));
+        {
+            let guard = KillOnDrop::new(shared.clone());
+            guard.disarm();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut c = shared.lock().unwrap();
+        assert!(
+            c.try_wait().unwrap().is_none(),
+            "disarmed KillOnDrop must not kill the child"
+        );
+        let _ = c.kill();
     }
 }

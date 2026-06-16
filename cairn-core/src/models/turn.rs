@@ -13,7 +13,6 @@ pub struct Turn {
     pub session_id: String,
     pub run_id: Option<String>,
     pub job_id: Option<String>,
-    pub manager_id: Option<String>,
     pub sequence: i32,
     pub predecessor_id: Option<String>,
     pub state: TurnState,
@@ -128,6 +127,11 @@ pub enum TurnStartReason {
     Retry,
     ManagerWake,
     DependencyUnblock,
+    /// The post-completion memory review/reflection turn. It runs after the
+    /// job's real work turn has already completed, so the job-status projection
+    /// excludes it when gathering facts (the work turn stays the latest fact),
+    /// and review completion keys off this turn actually ending.
+    MemoryReview,
 }
 
 impl std::fmt::Display for TurnStartReason {
@@ -140,6 +144,7 @@ impl std::fmt::Display for TurnStartReason {
             TurnStartReason::Retry => write!(f, "retry"),
             TurnStartReason::ManagerWake => write!(f, "manager_wake"),
             TurnStartReason::DependencyUnblock => write!(f, "dependency_unblock"),
+            TurnStartReason::MemoryReview => write!(f, "memory_review"),
         }
     }
 }
@@ -156,6 +161,7 @@ impl std::str::FromStr for TurnStartReason {
             "retry" => Ok(TurnStartReason::Retry),
             "manager_wake" => Ok(TurnStartReason::ManagerWake),
             "dependency_unblock" => Ok(TurnStartReason::DependencyUnblock),
+            "memory_review" => Ok(TurnStartReason::MemoryReview),
             _ => Err(format!("Unknown start reason: {}", s)),
         }
     }
@@ -220,6 +226,7 @@ mod tests {
             TurnStartReason::Retry,
             TurnStartReason::ManagerWake,
             TurnStartReason::DependencyUnblock,
+            TurnStartReason::MemoryReview,
         ] {
             let s = reason.to_string();
             let parsed: TurnStartReason = s.parse().unwrap();
@@ -244,12 +251,11 @@ mod tests {
 
     #[test]
     fn db_turn_conversion_unknown_state_falls_back() {
-        let db = crate::diesel_models::DbTurn {
+        let db = crate::db_records::DbTurn {
             id: "t1".into(),
             session_id: "s1".into(),
             run_id: None,
             job_id: None,
-            manager_id: None,
             sequence: 1,
             predecessor_id: None,
             state: "GARBAGE".into(),
@@ -266,12 +272,11 @@ mod tests {
 
     #[test]
     fn db_turn_conversion_unknown_start_reason_falls_back() {
-        let db = crate::diesel_models::DbTurn {
+        let db = crate::db_records::DbTurn {
             id: "t1".into(),
             session_id: "s1".into(),
             run_id: None,
             job_id: None,
-            manager_id: None,
             sequence: 1,
             predecessor_id: None,
             state: "running".into(),
@@ -288,12 +293,11 @@ mod tests {
 
     #[test]
     fn db_turn_conversion_unknown_yield_reason_becomes_none() {
-        let db = crate::diesel_models::DbTurn {
+        let db = crate::db_records::DbTurn {
             id: "t1".into(),
             session_id: "s1".into(),
             run_id: None,
             job_id: None,
-            manager_id: None,
             sequence: 1,
             predecessor_id: None,
             state: "yielded".into(),
@@ -309,14 +313,13 @@ mod tests {
     }
 }
 
-impl From<crate::diesel_models::DbTurn> for Turn {
-    fn from(db: crate::diesel_models::DbTurn) -> Self {
+impl From<crate::db_records::DbTurn> for Turn {
+    fn from(db: crate::db_records::DbTurn) -> Self {
         Turn {
             id: db.id,
             session_id: db.session_id,
             run_id: db.run_id,
             job_id: db.job_id,
-            manager_id: db.manager_id,
             sequence: db.sequence,
             predecessor_id: db.predecessor_id,
             state: db.state.parse().unwrap_or(TurnState::Pending),

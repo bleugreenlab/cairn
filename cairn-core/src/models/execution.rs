@@ -36,10 +36,10 @@ pub struct Execution {
 }
 
 /// Convert DbExecution to Execution
-impl TryFrom<crate::diesel_models::DbExecution> for Execution {
+impl TryFrom<crate::db_records::DbExecution> for Execution {
     type Error = String;
 
-    fn try_from(db: crate::diesel_models::DbExecution) -> Result<Self, Self::Error> {
+    fn try_from(db: crate::db_records::DbExecution) -> Result<Self, Self::Error> {
         let status: ExecutionStatus = db
             .status
             .parse()
@@ -90,8 +90,8 @@ pub struct ConditionEvaluation {
 }
 
 /// Convert DbConditionEvaluation to ConditionEvaluation
-impl From<crate::diesel_models::DbConditionEvaluation> for ConditionEvaluation {
-    fn from(db: crate::diesel_models::DbConditionEvaluation) -> Self {
+impl From<crate::db_records::DbConditionEvaluation> for ConditionEvaluation {
+    fn from(db: crate::db_records::DbConditionEvaluation) -> Self {
         ConditionEvaluation {
             id: db.id,
             execution_id: db.execution_id,
@@ -209,7 +209,7 @@ pub struct ExecutionDetail {
 
 #[cfg(test)]
 mod tests {
-    use crate::diesel_models::DbExecution;
+    use crate::db_records::DbExecution;
 
     fn base_db_execution() -> DbExecution {
         DbExecution {

@@ -43,6 +43,8 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+type HttpResultFuture<'a> = Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + 'a>>;
+
 impl HttpResponse {
     /// Check if status is 2xx.
     pub fn is_success(&self) -> bool {
@@ -70,42 +72,50 @@ impl HttpResponse {
 /// aren't directly object-safe.
 pub trait HttpClient: Send + Sync {
     /// Perform a GET request.
-    fn get(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>>;
+    fn get(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_>;
 
     /// Perform a POST request with JSON body.
-    fn post(
-        &self,
-        url: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>>;
+    fn post(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_>;
 
     /// Perform a PUT request with JSON body.
-    fn put(
-        &self,
-        url: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>>;
+    fn put(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_>;
 
     /// Perform a PATCH request with JSON body.
-    fn patch(
-        &self,
-        url: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>>;
+    fn patch(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_>;
 
     /// Perform a DELETE request.
-    fn delete(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>>;
+    fn delete(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_>;
+}
+
+#[derive(Clone, Copy)]
+enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl HttpMethod {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    fn reqwest_method(self) -> reqwest::Method {
+        match self {
+            Self::Get => reqwest::Method::GET,
+            Self::Post => reqwest::Method::POST,
+            Self::Put => reqwest::Method::PUT,
+            Self::Patch => reqwest::Method::PATCH,
+            Self::Delete => reqwest::Method::DELETE,
+        }
+    }
 }
 
 /// Production HTTP client using reqwest.
@@ -172,6 +182,33 @@ impl RealHttpClient {
             }
         }
     }
+
+    fn request(
+        &self,
+        method: HttpMethod,
+        url: &str,
+        body: Option<Value>,
+        headers: HeaderMap,
+    ) -> HttpResultFuture<'_> {
+        let url = url.to_string();
+        Box::pin(async move {
+            Self::with_retry(&self.config, || {
+                let request = self
+                    .client
+                    .request(method.reqwest_method(), &url)
+                    .headers(headers.clone());
+                let request = match &body {
+                    Some(body) => request
+                        .header("Content-Type", "application/json")
+                        .json(body),
+                    None => request,
+                };
+                request.send()
+            })
+            .await
+            .map_err(|e| format!("{} request failed: {}", method.label(), e))
+        })
+    }
 }
 
 impl Default for RealHttpClient {
@@ -181,97 +218,24 @@ impl Default for RealHttpClient {
 }
 
 impl HttpClient for RealHttpClient {
-    fn get(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let url = url.to_string();
-        Box::pin(async move {
-            Self::with_retry(&self.config, || {
-                self.client.get(&url).headers(headers.clone()).send()
-            })
-            .await
-            .map_err(|e| format!("GET request failed: {}", e))
-        })
+    fn get(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.request(HttpMethod::Get, url, None, headers)
     }
 
-    fn post(
-        &self,
-        url: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let url = url.to_string();
-        Box::pin(async move {
-            Self::with_retry(&self.config, || {
-                self.client
-                    .post(&url)
-                    .headers(headers.clone())
-                    .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send()
-            })
-            .await
-            .map_err(|e| format!("POST request failed: {}", e))
-        })
+    fn post(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.request(HttpMethod::Post, url, Some(body), headers)
     }
 
-    fn put(
-        &self,
-        url: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let url = url.to_string();
-        Box::pin(async move {
-            Self::with_retry(&self.config, || {
-                self.client
-                    .put(&url)
-                    .headers(headers.clone())
-                    .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send()
-            })
-            .await
-            .map_err(|e| format!("PUT request failed: {}", e))
-        })
+    fn put(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.request(HttpMethod::Put, url, Some(body), headers)
     }
 
-    fn patch(
-        &self,
-        url: &str,
-        body: Value,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let url = url.to_string();
-        Box::pin(async move {
-            Self::with_retry(&self.config, || {
-                self.client
-                    .patch(&url)
-                    .headers(headers.clone())
-                    .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send()
-            })
-            .await
-            .map_err(|e| format!("PATCH request failed: {}", e))
-        })
+    fn patch(&self, url: &str, body: Value, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.request(HttpMethod::Patch, url, Some(body), headers)
     }
 
-    fn delete(
-        &self,
-        url: &str,
-        headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let url = url.to_string();
-        Box::pin(async move {
-            Self::with_retry(&self.config, || {
-                self.client.delete(&url).headers(headers.clone()).send()
-            })
-            .await
-            .map_err(|e| format!("DELETE request failed: {}", e))
-        })
+    fn delete(&self, url: &str, headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.request(HttpMethod::Delete, url, None, headers)
     }
 }
 
@@ -309,6 +273,11 @@ impl MockHttpClient {
         }
         Err(format!("No mock response configured for URL: {}", url))
     }
+
+    fn response_future(&self, url: &str) -> HttpResultFuture<'_> {
+        let result = self.find_response(url);
+        Box::pin(async move { result })
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -320,52 +289,24 @@ impl Default for MockHttpClient {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl HttpClient for MockHttpClient {
-    fn get(
-        &self,
-        url: &str,
-        _headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let result = self.find_response(url);
-        Box::pin(async move { result })
+    fn get(&self, url: &str, _headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(url)
     }
 
-    fn post(
-        &self,
-        url: &str,
-        _body: Value,
-        _headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let result = self.find_response(url);
-        Box::pin(async move { result })
+    fn post(&self, url: &str, _body: Value, _headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(url)
     }
 
-    fn put(
-        &self,
-        url: &str,
-        _body: Value,
-        _headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let result = self.find_response(url);
-        Box::pin(async move { result })
+    fn put(&self, url: &str, _body: Value, _headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(url)
     }
 
-    fn patch(
-        &self,
-        url: &str,
-        _body: Value,
-        _headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let result = self.find_response(url);
-        Box::pin(async move { result })
+    fn patch(&self, url: &str, _body: Value, _headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(url)
     }
 
-    fn delete(
-        &self,
-        url: &str,
-        _headers: HeaderMap,
-    ) -> Pin<Box<dyn Future<Output = Result<HttpResponse, String>> + Send + '_>> {
-        let result = self.find_response(url);
-        Box::pin(async move { result })
+    fn delete(&self, url: &str, _headers: HeaderMap) -> HttpResultFuture<'_> {
+        self.response_future(url)
     }
 }
 

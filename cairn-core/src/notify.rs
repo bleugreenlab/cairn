@@ -1,4 +1,4 @@
-//! Notifier + WriteEffects — unified sync-and-emit for write operations.
+//! Unified sync-and-emit helpers for write operations.
 //!
 //! Every DB write that needs frontend invalidation and/or cloud sync currently
 //! repeats a 2–3 line pattern: `orch.sync(SyncMessage::Foo(…))` then
@@ -10,18 +10,83 @@
 //! orch.notifier.issue(&issue);          // sync + emit
 //! orch.notifier.emit_change("todos");   // emit only (local-only table)
 //! ```
-//!
-//! `WriteEffects` collects effects for multi-entity operations and flushes them
-//! all at once after the DB writes succeed — the "post-commit effects boundary."
 
 use std::sync::{Arc, Mutex};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::models;
 use crate::services::EventEmitter;
 use crate::sync::message::*;
+
+/// Build a fully-scoped `jobs` db-change payload.
+///
+/// LOAD-BEARING INVARIANT: any `jobs` db-change that carries `jobId` MUST also
+/// carry the complete scoping set (`issueId`/`executionId`/`parentJobId`/
+/// `parentToolUseId`/`projectId`). The frontend precisely-invalidates from these
+/// ids and has no cache-scan fallback to recover a missing one, so a payload
+/// with `jobId` but a missing `issueId` would silently skip the issue's
+/// job-list pane. Route every single-job change through this builder (it is
+/// always complete). Only the documented bare sweeps (`teardown`,
+/// `reconcile_stale_runs`) may emit `{table:"jobs"}` with no ids at all, which
+/// correctly degrades to a broad `["jobs"]` invalidation.
+#[allow(clippy::too_many_arguments)]
+pub fn job_db_change_ids(
+    action: &str,
+    job_id: &str,
+    issue_id: Option<&str>,
+    execution_id: Option<&str>,
+    parent_job_id: Option<&str>,
+    parent_tool_use_id: Option<&str>,
+    project_id: &str,
+) -> Value {
+    json!({
+        "table": "jobs",
+        "action": action,
+        "jobId": job_id,
+        "issueId": issue_id,
+        "executionId": execution_id,
+        "parentJobId": parent_job_id,
+        "parentToolUseId": parent_tool_use_id,
+        "projectId": project_id,
+    })
+}
+
+/// Build a fully-scoped `jobs` db-change payload from a `Job`.
+///
+/// See [`job_db_change_ids`] for the scoping invariant.
+pub fn job_db_change(job: &models::Job, action: &str) -> Value {
+    job_db_change_ids(
+        action,
+        &job.id,
+        job.issue_id.as_deref(),
+        job.execution_id.as_deref(),
+        job.parent_job_id.as_deref(),
+        job.parent_tool_use_id.as_deref(),
+        &job.project_id,
+    )
+}
+
+/// Build a scoped `runs` db-change payload.
+///
+/// The runs branch only needs `jobId` to scope to the affected job's run list;
+/// a payload with no `jobId` degrades to a broad `["runs"]` invalidation.
+pub fn run_db_change_ids(action: &str, run_id: &str, job_id: Option<&str>) -> Value {
+    json!({
+        "table": "runs",
+        "action": action,
+        "runId": run_id,
+        "jobId": job_id,
+    })
+}
+
+/// Build a scoped `runs` db-change payload from a `Run`.
+///
+/// See [`run_db_change_ids`].
+pub fn run_db_change(run: &models::Run, action: &str) -> Value {
+    run_db_change_ids(action, &run.id, run.job_id.as_deref())
+}
 
 /// Combines cloud sync and frontend event emission into a single call.
 ///
@@ -53,15 +118,17 @@ impl Notifier {
     }
 
     pub fn job(&self, j: &models::Job) {
-        self.sync_and_emit(SyncMessage::Job(j.into()), "jobs");
+        // Route through the scoped builder so the abstraction stays correct if
+        // this (currently caller-less) method ever gains callers.
+        self.sync_and_emit_payload(SyncMessage::Job(j.into()), job_db_change(j, "update"));
     }
 
     pub fn run(&self, r: &models::Run) {
-        self.sync_and_emit(SyncMessage::Run(r.into()), "runs");
+        self.sync_and_emit_payload(SyncMessage::Run(r.into()), run_db_change(r, "update"));
     }
 
-    pub fn event(&self, e: &models::Event) {
-        self.sync_and_emit(SyncMessage::Event(e.into()), "events");
+    pub fn event(&self, _e: &models::Event) {
+        self.emit_change("events");
     }
 
     pub fn artifact(&self, a: &models::Artifact) {
@@ -97,15 +164,17 @@ impl Notifier {
         self.emit_change(table);
     }
 
+    /// Send a sync message and emit a db-change event with a pre-built payload.
+    /// Used to carry the fully-scoped builders ([`job_db_change`] /
+    /// [`run_db_change`]) instead of a bare `{table}` poke.
+    pub fn sync_and_emit_payload(&self, msg: SyncMessage, payload: Value) {
+        self.sync(msg);
+        let _ = self.emitter.emit("db-change", payload);
+    }
+
     // --- Streaming (fire-and-forget, no emit) ---
 
-    pub fn stream_delta(&self, run_id: &str, event_id: &str, tokens: &str) {
-        self.sync(SyncMessage::StreamDelta(StreamDelta {
-            run_id: run_id.to_string(),
-            event_id: event_id.to_string(),
-            tokens: tokens.to_string(),
-        }));
-    }
+    pub fn stream_delta(&self, _run_id: &str, _event_id: &str, _tokens: &str) {}
 
     // --- Internal ---
 
@@ -118,149 +187,10 @@ impl Notifier {
     }
 }
 
-// ── WriteEffects ──────────────────────────────────────────────────────
-
-/// A single deferred effect to be flushed after DB writes complete.
-#[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
-enum Effect {
-    /// Cloud sync + frontend invalidation for a syncable entity.
-    SyncAndInvalidate {
-        msg: SyncMessage,
-        table: &'static str,
-    },
-    /// Frontend invalidation only (local-only table).
-    Invalidate { table: &'static str },
-}
-
-/// Collects post-write effects and flushes them through a Notifier.
-///
-/// Use this for operations that touch multiple entities — collect all effects,
-/// then flush once after all DB writes succeed. This is the "post-commit
-/// effects boundary."
-///
-/// ```ignore
-/// let mut fx = WriteEffects::new();
-/// diesel::update(...).execute(&mut conn)?;
-/// fx.run(&run);
-/// diesel::update(...).execute(&mut conn)?;
-/// fx.job(&job);
-/// fx.flush(&orch.notifier);
-/// ```
-pub struct WriteEffects {
-    effects: Vec<Effect>,
-}
-
-impl WriteEffects {
-    pub fn new() -> Self {
-        Self {
-            effects: Vec::new(),
-        }
-    }
-
-    // --- Syncable entities ---
-
-    pub fn project(&mut self, p: &models::Project) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Project(p.into()),
-            table: "projects",
-        });
-        self
-    }
-
-    pub fn issue(&mut self, i: &models::Issue) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Issue(i.into()),
-            table: "issues",
-        });
-        self
-    }
-
-    pub fn job(&mut self, j: &models::Job) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Job(j.into()),
-            table: "jobs",
-        });
-        self
-    }
-
-    pub fn run(&mut self, r: &models::Run) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Run(r.into()),
-            table: "runs",
-        });
-        self
-    }
-
-    pub fn event(&mut self, e: &models::Event) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Event(e.into()),
-            table: "events",
-        });
-        self
-    }
-
-    pub fn artifact(&mut self, a: &models::Artifact) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Artifact(a.into()),
-            table: "artifacts",
-        });
-        self
-    }
-
-    pub fn comment(&mut self, c: &models::Comment) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Comment(c.into()),
-            table: "comments",
-        });
-        self
-    }
-
-    // --- Delete ---
-
-    pub fn deleted(&mut self, table: &'static str, id: String) -> &mut Self {
-        self.effects.push(Effect::SyncAndInvalidate {
-            msg: SyncMessage::Delete {
-                table: table.to_string(),
-                id,
-            },
-            table,
-        });
-        self
-    }
-
-    // --- Local-only emit ---
-
-    pub fn emit(&mut self, table: &'static str) -> &mut Self {
-        self.effects.push(Effect::Invalidate { table });
-        self
-    }
-
-    /// Flush all collected effects through the notifier.
-    pub fn flush(self, notifier: &Notifier) {
-        for effect in self.effects {
-            match effect {
-                Effect::SyncAndInvalidate { msg, table } => {
-                    notifier.sync_and_emit(msg, table);
-                }
-                Effect::Invalidate { table } => {
-                    notifier.emit_change(table);
-                }
-            }
-        }
-    }
-}
-
-impl Default for WriteEffects {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{Comment, CommentSource, IssueStatus};
+    use crate::models::IssueStatus;
     use crate::services::testing::CapturingEmitter;
 
     fn test_notifier() -> (
@@ -293,17 +223,11 @@ mod tests {
             backend_override: None,
             merged_at: None,
             closed_at: None,
-            manager_id: None,
-        }
-    }
-
-    fn test_comment() -> Comment {
-        Comment {
-            id: "c-1".into(),
-            issue_id: "i-1".into(),
-            content: "hello".into(),
-            source: CommentSource::Agent,
-            created_at: 3000,
+            parent_issue_id: None,
+            unmet_dependency_count: 0,
+            depends_on: Vec::new(),
+            unmet_depends_on: Vec::new(),
+            labels: Vec::new(),
         }
     }
 
@@ -361,10 +285,7 @@ mod tests {
 
         notifier.stream_delta("run-1", "evt-1", "hello world");
 
-        let msg = rx.try_recv().unwrap();
-        assert!(matches!(msg, SyncMessage::StreamDelta(_)));
-
-        // No db-change event
+        assert!(rx.try_recv().is_err());
         assert!(emitter.events_named("db-change").is_empty());
     }
 
@@ -381,62 +302,108 @@ mod tests {
         assert_eq!(events.len(), 1);
     }
 
-    // ── WriteEffects tests ──
+    // ── Scoped payload builder tests ──
 
     #[test]
-    fn write_effects_batches_and_flushes() {
-        let (notifier, mut rx, emitter) = test_notifier();
-        let issue = test_issue();
-        let comment = test_comment();
+    fn job_db_change_ids_carries_complete_scoping_set() {
+        let payload = job_db_change_ids(
+            "update",
+            "job-1",
+            Some("issue-1"),
+            Some("exec-1"),
+            Some("parent-1"),
+            Some("tool-1"),
+            "project-1",
+        );
 
-        let mut fx = WriteEffects::new();
-        fx.issue(&issue).comment(&comment).emit("todos");
-
-        // Nothing sent yet
-        assert!(rx.try_recv().is_err());
-        assert!(emitter.events_named("db-change").is_empty());
-
-        // Flush
-        fx.flush(&notifier);
-
-        // Two sync messages (issue + comment)
-        let msg1 = rx.try_recv().unwrap();
-        assert!(matches!(msg1, SyncMessage::Issue(_)));
-        let msg2 = rx.try_recv().unwrap();
-        assert!(matches!(msg2, SyncMessage::Comment(_)));
-        assert!(rx.try_recv().is_err()); // no more
-
-        // Three db-change events (issues, comments, todos)
-        let events = emitter.events_named("db-change");
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0]["table"], "issues");
-        assert_eq!(events[1]["table"], "comments");
-        assert_eq!(events[2]["table"], "todos");
+        assert_eq!(payload["table"], "jobs");
+        assert_eq!(payload["action"], "update");
+        assert_eq!(payload["jobId"], "job-1");
+        assert_eq!(payload["issueId"], "issue-1");
+        assert_eq!(payload["executionId"], "exec-1");
+        assert_eq!(payload["parentJobId"], "parent-1");
+        assert_eq!(payload["parentToolUseId"], "tool-1");
+        assert_eq!(payload["projectId"], "project-1");
+        // No `scoped` flag — the scan is gone, so the marker is unnecessary.
+        assert!(payload.get("scoped").is_none());
     }
 
     #[test]
-    fn write_effects_deleted() {
-        let (notifier, mut rx, emitter) = test_notifier();
+    fn job_db_change_ids_serializes_absent_child_fields_as_null() {
+        let payload = job_db_change_ids("insert", "job-1", None, None, None, None, "project-1");
 
-        let mut fx = WriteEffects::new();
-        fx.deleted("issues", "i-1".into());
-        fx.flush(&notifier);
-
-        let msg = rx.try_recv().unwrap();
-        assert!(matches!(msg, SyncMessage::Delete { .. }));
-
-        let events = emitter.events_named("db-change");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["table"], "issues");
+        // Keys are present and explicitly null (not omitted) so the frontend's
+        // payloadString reads them as absent rather than choking.
+        assert!(payload.get("issueId").is_some());
+        assert!(payload["issueId"].is_null());
+        assert!(payload["executionId"].is_null());
+        assert!(payload["parentJobId"].is_null());
+        assert!(payload["parentToolUseId"].is_null());
+        assert_eq!(payload["jobId"], "job-1");
+        assert_eq!(payload["projectId"], "project-1");
     }
 
     #[test]
-    fn write_effects_empty_flush_is_noop() {
-        let (notifier, mut rx, emitter) = test_notifier();
+    fn job_db_change_builds_from_job() {
+        let job = test_job();
+        let payload = job_db_change(&job, "update");
 
-        WriteEffects::new().flush(&notifier);
+        assert_eq!(payload["table"], "jobs");
+        assert_eq!(payload["jobId"], "job-1");
+        assert_eq!(payload["issueId"], "issue-1");
+        assert_eq!(payload["executionId"], "exec-1");
+        assert_eq!(payload["parentJobId"], "parent-1");
+        assert_eq!(payload["parentToolUseId"], "tool-1");
+        assert_eq!(payload["projectId"], "project-1");
+    }
 
-        assert!(rx.try_recv().is_err());
-        assert!(emitter.events_named("db-change").is_empty());
+    #[test]
+    fn run_db_change_ids_carries_run_and_job() {
+        let payload = run_db_change_ids("update", "run-1", Some("job-1"));
+        assert_eq!(payload["table"], "runs");
+        assert_eq!(payload["action"], "update");
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["jobId"], "job-1");
+        assert!(payload.get("scoped").is_none());
+    }
+
+    #[test]
+    fn run_db_change_ids_serializes_absent_job_as_null() {
+        let payload = run_db_change_ids("insert", "run-1", None);
+        assert_eq!(payload["runId"], "run-1");
+        assert!(payload.get("jobId").is_some());
+        assert!(payload["jobId"].is_null());
+    }
+
+    fn test_job() -> models::Job {
+        models::Job {
+            id: "job-1".into(),
+            execution_id: Some("exec-1".into()),
+            recipe_node_id: None,
+            parent_job_id: Some("parent-1".into()),
+            worktree_path: None,
+            branch: None,
+            base_commit: None,
+            pack_anchor: None,
+            current_session_id: None,
+            status: models::JobStatus::Running,
+            agent_config_id: None,
+            issue_id: Some("issue-1".into()),
+            project_id: "project-1".into(),
+            task_description: None,
+            model: None,
+            created_at: 1000,
+            updated_at: 2000,
+            completed_at: None,
+            started_at: None,
+            available_tabs: vec!["chat".into()],
+            initial_tab: "chat".into(),
+            parent_tool_use_id: Some("tool-1".into()),
+            task_index: None,
+            node_name: None,
+            exec_seq: None,
+            base_branch: None,
+            uri_segment: None,
+        }
     }
 }

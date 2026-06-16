@@ -1,23 +1,36 @@
 //! Documentation operations — filesystem scanning and DB reference queries.
 
-use diesel::prelude::*;
-use diesel::SqliteConnection;
 use std::fs;
 use std::path::Path;
+use turso::params;
 
-use crate::diesel_models::docs::{DbDocReference, NewDocReference};
 use crate::models::{DocContent, DocFile, DocReference};
-use crate::schema::*;
+use crate::storage::{DbError, LocalDb, RowExt};
 
 const DEFAULT_DOC_ROOTS: &[&str] = &["docs/", "*.md"];
 
 /// Get doc_roots configuration for a project
-pub fn get_doc_roots(conn: &mut SqliteConnection, project_id: &str) -> Result<Vec<String>, String> {
-    let config_json: Option<String> = projects::table
-        .find(project_id)
-        .select(projects::config)
-        .first(conn)
-        .map_err(|e| format!("Project not found: {}", e))?;
+pub async fn get_doc_roots(db: &LocalDb, project_id: &str) -> Result<Vec<String>, String> {
+    let project_id = project_id.to_string();
+    let config_json = db
+        .read(|conn| {
+            let project_id = project_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT config FROM projects WHERE id = ?1",
+                        (project_id.as_str(),),
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| DbError::Row("project not found".to_string()))?;
+                row.opt_text(0)
+            })
+        })
+        .await
+        .map_err(|e| format!("Project not found: {e}"))?;
 
     if let Some(ref json_str) = config_json {
         if let Ok(config) = serde_json::from_str::<serde_json::Value>(json_str) {
@@ -189,61 +202,85 @@ pub fn write_doc(repo_path: &Path, doc_path: &str, content: &str) -> Result<(), 
 }
 
 /// Attach a doc reference to an issue.
-pub fn attach_doc(
-    conn: &mut SqliteConnection,
+pub async fn attach_doc(
+    db: &LocalDb,
     issue_id: &str,
     doc_path: &str,
 ) -> Result<DocReference, String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let created_at = chrono::Utc::now().timestamp_millis() as i32;
+    let issue_id = issue_id.to_string();
+    let doc_path = doc_path.to_string();
+    let created_at = chrono::Utc::now().timestamp_millis();
 
-    let new_doc_ref = NewDocReference {
-        id: &id,
-        issue_id,
-        doc_path,
-        created_at,
-    };
-
-    diesel::insert_into(doc_references::table)
-        .values(&new_doc_ref)
-        .execute(conn)
-        .map_err(|e| format!("Failed to attach doc: {}", e))?;
+    db.execute(
+        "INSERT INTO doc_references(id, issue_id, doc_path, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            id.as_str(),
+            issue_id.as_str(),
+            doc_path.as_str(),
+            created_at
+        ],
+    )
+    .await
+    .map_err(|e| format!("Failed to attach doc: {e}"))?;
 
     Ok(DocReference {
         id,
-        issue_id: issue_id.to_string(),
-        doc_path: doc_path.to_string(),
-        created_at: created_at as i64,
+        issue_id,
+        doc_path,
+        created_at,
     })
 }
 
 /// Detach a doc reference by ID.
-pub fn detach_doc(conn: &mut SqliteConnection, reference_id: &str) -> Result<(), String> {
-    diesel::delete(doc_references::table.find(reference_id))
-        .execute(conn)
-        .map_err(|e| format!("Failed to detach doc: {}", e))?;
-
-    Ok(())
+pub async fn detach_doc(db: &LocalDb, reference_id: &str) -> Result<(), String> {
+    let reference_id = reference_id.to_string();
+    db.write(|conn| {
+        let reference_id = reference_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "DELETE FROM doc_references WHERE id = ?1",
+                (reference_id.as_str(),),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to detach doc: {e}"))
 }
 
 /// List doc references for an issue.
-pub fn list_doc_references(
-    conn: &mut SqliteConnection,
+pub async fn list_doc_references(
+    db: &LocalDb,
     issue_id: &str,
 ) -> Result<Vec<DocReference>, String> {
-    let references = doc_references::table
-        .filter(doc_references::issue_id.eq(issue_id))
-        .order(doc_references::created_at.desc())
-        .load::<DbDocReference>(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(references
-        .into_iter()
-        .map(|r| DocReference {
-            id: r.id,
-            issue_id: r.issue_id,
-            doc_path: r.doc_path,
-            created_at: r.created_at as i64,
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, issue_id, doc_path, created_at
+                     FROM doc_references
+                     WHERE issue_id = ?1
+                     ORDER BY created_at DESC",
+                    (issue_id.as_str(),),
+                )
+                .await?;
+            let mut references = Vec::new();
+            while let Some(row) = rows.next().await? {
+                references.push(DocReference {
+                    id: row.text(0)?,
+                    issue_id: row.text(1)?,
+                    doc_path: row.text(2)?,
+                    created_at: row.i64(3)?,
+                });
+            }
+            Ok(references)
         })
-        .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())
 }

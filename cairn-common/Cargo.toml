@@ -17,3 +17,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"]
 tracing-appender = "0.2"
 tracing-log = "0.2"
 dirs = "6"
+
+[dev-dependencies]
+tempfile = "3"

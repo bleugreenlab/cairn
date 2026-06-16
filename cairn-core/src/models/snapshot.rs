@@ -8,9 +8,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::common::{Model, Preset, RuntimeExtras};
+use super::common::{Model, ModelSelection, Preset, RuntimeExtras};
 use super::execution::TriggerType;
-use super::permissions::{ApprovalPolicy, FilesystemScope};
+use super::permissions::{Fence, LegacyOnEscape, LegacySandbox};
 use super::recipe::{RecipeEdge, RecipeNode, RecipeTrigger};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -67,7 +67,6 @@ pub struct DelegatedWorkPacket {
 #[serde(rename_all = "snake_case")]
 pub enum DelegationOrigin {
     TaskTool,
-    Executor,
     Manager,
     Planner,
 }
@@ -88,9 +87,11 @@ pub enum DelegatedStatus {
 pub struct DelegatedOwnershipScope {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filesystem_scope: Option<FilesystemScope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
+    pub fence: Option<Fence>,
+    #[serde(default, skip_serializing)]
+    pub sandbox: Option<LegacySandbox>,
+    #[serde(default, skip_serializing)]
+    pub on_escape: Option<LegacyOnEscape>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,29 +125,40 @@ pub struct AgentSnapshot {
     pub description: String,
     pub prompt: String,
     pub tools: Vec<String>,
+    /// Authored tier default — a pre-fill for edit/re-resolution, not a runtime
+    /// input. The runtime reads `selection`, never this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<Model>,
+    /// Authored backend preference default (pre-fill, not a runtime input).
     #[serde(rename = "backend", alias = "backendPreference")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_preference: Option<String>,
-    pub model: Option<Model>,
+    /// Resolved atomic backend+model selection — the single runtime source of
+    /// truth for what runs where. Populated at resolve-early time and migrated
+    /// on read from the legacy flat `model`/`resolved_backend` for old snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ModelSelection>,
     pub disallowed_tools: Option<Vec<String>>,
     /// Skill IDs attached to this agent (None = inherit all available skills)
     pub skills: Option<Vec<String>>,
-    /// How tool invocations are approved
+    /// Worktree fence behavior for sandbox escapes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
-    /// What the agent can read/write on the filesystem
+    pub fence: Option<Fence>,
+    /// Legacy permission fields, accepted on read and collapsed into `fence`.
+    #[serde(default, skip_serializing)]
+    pub sandbox: Option<LegacySandbox>,
+    #[serde(default, skip_serializing)]
+    pub on_escape: Option<LegacyOnEscape>,
+    /// Backend-specific runtime parameters (effort, thinking) resolved early.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub filesystem_scope: Option<FilesystemScope>,
-    /// Concrete backend selected after resolving tier + authored backend.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub resolved_backend: Option<String>,
-    /// Backend-specific runtime parameters (per-agent overrides)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
     pub extras: Option<RuntimeExtras>,
+    /// Legacy flat resolved model — deserialize-only input consumed by
+    /// `migrate_on_read` to build `selection`; never serialized.
+    #[serde(default, skip_serializing)]
+    pub model: Option<Model>,
+    /// Legacy flat resolved backend — deserialize-only, see `model`.
+    #[serde(default, skip_serializing)]
+    pub resolved_backend: Option<String>,
 }
 
 /// Frozen preset matrix captured with an execution snapshot.
@@ -154,7 +166,6 @@ pub struct AgentSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotPresets {
     pub active_backend: String,
-    pub default_tier: String,
     pub tiers: Vec<String>,
     pub backends: HashMap<String, HashMap<String, Preset>>,
 }
@@ -168,18 +179,6 @@ pub struct SkillSnapshot {
     pub description: String,
     pub prompt: String,
     pub allowed_tools: Option<Vec<String>>,
-}
-
-/// Snapshot of a custom tool at execution time
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToolSnapshot {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-    pub code: String,
-    pub required_tools: Vec<String>,
 }
 
 /// Context about what triggered the execution
@@ -196,6 +195,12 @@ pub struct TriggerContext {
     /// Flows to downstream agents via context edges from the trigger node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_payload: Option<serde_json::Value>,
+    /// Attribution for who initiated this execution: `Some("external")` when
+    /// started by an authenticated external caller (e.g. a driving CLI session),
+    /// `None`/absent for the default user-initiated start. Display and audit
+    /// only — it does not gate anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiated_via: Option<String>,
 }
 
 /// Complete execution snapshot - everything needed to run/display an execution
@@ -208,13 +213,12 @@ pub struct ExecutionSnapshot {
     pub agents: HashMap<String, AgentSnapshot>,
     /// All skills referenced by agents (keyed by skill ID)
     pub skills: HashMap<String, SkillSnapshot>,
-    /// All custom tools available at execution time (keyed by tool ID)
-    #[serde(default)]
-    pub tools: HashMap<String, ToolSnapshot>,
     /// Context about what triggered this execution
     pub trigger_context: TriggerContext,
-    /// Frozen presets used to resolve tier/backend selections for this execution.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Legacy frozen preset matrix — deserialize-only input consumed by
+    /// `migrate_on_read` to recover `extras` for pre-resolve-early snapshots.
+    /// Never serialized; no runtime path reads it.
+    #[serde(default, skip_serializing)]
     pub presets: Option<SnapshotPresets>,
     /// Durable task delegations awaiting or resulting from materialization into the DAG
     #[serde(default)]
@@ -242,14 +246,12 @@ impl ExecutionSnapshot {
         recipe: RecipeSnapshot,
         agents: HashMap<String, AgentSnapshot>,
         skills: HashMap<String, SkillSnapshot>,
-        tools: HashMap<String, ToolSnapshot>,
         trigger_context: TriggerContext,
     ) -> Self {
         Self {
             recipe,
             agents,
             skills,
-            tools,
             trigger_context,
             presets: None,
             delegated_packets: Vec::new(),
@@ -262,10 +264,80 @@ impl ExecutionSnapshot {
         serde_json::to_string(self).map_err(|e| format!("Failed to serialize snapshot: {}", e))
     }
 
-    /// Deserialize from JSON string
-    #[allow(dead_code)]
+    /// Deserialize from JSON string, applying resolve-early migration on read.
+    ///
+    /// **All** snapshot deserialization must go through this so pre-resolve-early
+    /// snapshots (flat `model`/`resolvedBackend` + frozen `presets`) gain a
+    /// concrete atomic `selection` and recovered `extras` exactly once.
     pub fn from_json(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json).map_err(|e| format!("Failed to deserialize snapshot: {}", e))
+        let mut snapshot: Self = serde_json::from_str(json)
+            .map_err(|e| format!("Failed to deserialize snapshot: {}", e))?;
+        snapshot.migrate_on_read();
+        Ok(snapshot)
+    }
+
+    /// Fold legacy per-agent flat `model`/`resolved_backend` (and frozen
+    /// `presets`) into the atomic `selection` + `extras` representation, once.
+    ///
+    /// Recovers exactly what the runtime used to recompute: the backend prefers
+    /// the stored `resolved_backend`, else derives from the model, else the
+    /// frozen active backend; extras are recovered from the frozen preset matrix
+    /// when present. Clears the legacy fields and the frozen presets afterward so
+    /// the atomic field is the single representation going forward.
+    pub fn migrate_on_read(&mut self) {
+        let frozen = self
+            .presets
+            .as_ref()
+            .map(crate::config::presets::PresetsConfig::from);
+        for packet in &mut self.delegated_packets {
+            if packet.ownership.fence.is_none()
+                && (packet.ownership.sandbox.is_some() || packet.ownership.on_escape.is_some())
+            {
+                packet.ownership.fence = Some(Fence::from_legacy(
+                    packet.ownership.sandbox,
+                    packet.ownership.on_escape,
+                ));
+            }
+            packet.ownership.sandbox = None;
+            packet.ownership.on_escape = None;
+        }
+
+        for agent in self.agents.values_mut() {
+            if agent.fence.is_none() && (agent.sandbox.is_some() || agent.on_escape.is_some()) {
+                agent.fence = Some(Fence::from_legacy(agent.sandbox, agent.on_escape));
+            }
+            agent.sandbox = None;
+            agent.on_escape = None;
+
+            if agent.selection.is_none() {
+                if let Some(model) = agent.model.clone() {
+                    let backend = agent
+                        .resolved_backend
+                        .clone()
+                        .or_else(|| {
+                            crate::backends::backend_for_model(model.as_str()).map(str::to_string)
+                        })
+                        .or_else(|| frozen.as_ref().map(|p| p.active_backend.clone()))
+                        .unwrap_or_else(|| "claude".to_string());
+                    agent.selection = Some(ModelSelection { backend, model });
+                }
+            }
+            if agent.extras.is_none() {
+                if let Some(presets) = frozen.as_ref() {
+                    if let Ok(resolved) = crate::config::presets::resolve_selection_with_provenance(
+                        agent.tier.as_ref().map(Model::as_str),
+                        agent.backend_preference.as_deref(),
+                        None,
+                        presets,
+                    ) {
+                        agent.extras = Some(resolved.extras);
+                    }
+                }
+            }
+            agent.model = None;
+            agent.resolved_backend = None;
+        }
+        self.presets = None;
     }
 }
 
@@ -293,11 +365,13 @@ mod tests {
                     tools: vec!["Read".to_string(), "Write".to_string()],
                     tier: Some(Model::new(Model::SONNET)),
                     backend_preference: None,
+                    selection: None,
                     model: Some(Model::new(Model::SONNET)),
                     disallowed_tools: Some(vec!["Bash".to_string()]),
                     skills: Some(vec!["data-fetching".to_string()]),
-                    approval_policy: None,
-                    filesystem_scope: None,
+                    fence: None,
+                    sandbox: None,
+                    on_escape: None,
                     resolved_backend: None,
                     extras: None,
                 },
@@ -312,13 +386,13 @@ mod tests {
                     allowed_tools: Some(vec!["Read".to_string()]),
                 },
             )]),
-            tools: HashMap::new(),
             trigger_context: TriggerContext {
                 issue_id: Some("issue-1".to_string()),
                 project_id: "project-1".to_string(),
                 trigger_type: TriggerType::Manual,
 
                 event_payload: None,
+                initiated_via: None,
             },
             presets: None,
             delegated_packets: vec![DelegatedWorkPacket {
@@ -332,8 +406,9 @@ mod tests {
                 agent_config_id: "explore".to_string(),
                 ownership: DelegatedOwnershipScope {
                     cwd: "/tmp/test".to_string(),
-                    filesystem_scope: None,
-                    approval_policy: None,
+                    fence: None,
+                    sandbox: None,
+                    on_escape: None,
                 },
                 session: DelegatedSessionStrategy::default(),
                 acceptance: vec!["Return findings".to_string()],
@@ -392,6 +467,7 @@ mod tests {
                 "jobId": "j1",
                 "status": "complete"
             })),
+            initiated_via: None,
         };
         let json = serde_json::to_string(&ctx).unwrap();
         let restored: TriggerContext = serde_json::from_str(&json).unwrap();
@@ -429,11 +505,13 @@ mod tests {
             tools: vec![],
             tier: None,
             backend_preference: None,
+            selection: None,
             model: None,
             disallowed_tools: None,
             skills: None,
-            approval_policy: None,
-            filesystem_scope: None,
+            fence: None,
+            sandbox: None,
+            on_escape: None,
             resolved_backend: Some("codex".to_string()),
             extras: Some(RuntimeExtras {
                 max_thinking_tokens: None,
@@ -460,11 +538,13 @@ mod tests {
             tools: vec![],
             tier: None,
             backend_preference: None,
+            selection: None,
             model: None,
             disallowed_tools: None,
             skills: None,
-            approval_policy: None,
-            filesystem_scope: None,
+            fence: None,
+            sandbox: None,
+            on_escape: None,
             resolved_backend: None,
             extras: None,
         };
@@ -480,6 +560,7 @@ mod tests {
             project_id: "proj-1".to_string(),
             trigger_type: TriggerType::Manual,
             event_payload: None,
+            initiated_via: None,
         };
         let json = serde_json::to_string(&ctx).unwrap();
         assert!(!json.contains("eventPayload"));
@@ -505,6 +586,93 @@ mod tests {
         assert_eq!(packet.session.mode, DelegatedSessionMode::New);
     }
 
+    /// Pre-resolve-early snapshot (flat model/resolvedBackend + frozen presets,
+    /// no `selection`) migrates on read into a concrete atomic selection,
+    /// recovers `extras` from the frozen presets, and re-serializes with a
+    /// nested `selection` and no `presets`.
+    #[test]
+    fn migrate_on_read_builds_selection_from_legacy_fields() {
+        let json = r#"{
+            "recipe": {
+                "id": "r-1", "name": "R", "description": null,
+                "trigger": "manual", "nodes": [], "edges": []
+            },
+            "agents": {
+                "build": {
+                    "id": "build", "name": "Build", "description": "",
+                    "prompt": "p", "tools": [],
+                    "tier": "md",
+                    "model": "sonnet",
+                    "resolvedBackend": "claude"
+                }
+            },
+            "skills": {},
+            "triggerContext": {"issueId": null, "projectId": "p-1", "triggerType": "manual"},
+            "presets": {
+                "activeBackend": "claude",
+                "tiers": ["sm", "md", "lg"],
+                "backends": {
+                    "claude": {
+                        "md": {"model": "sonnet", "options": {"reasoningEffort": "high"}}
+                    }
+                }
+            },
+            "createdAt": 1
+        }"#;
+
+        let snapshot = ExecutionSnapshot::from_json(json).unwrap();
+        let agent = snapshot.agents.get("build").unwrap();
+        let selection = agent.selection.as_ref().expect("selection migrated");
+        assert_eq!(selection.backend, "claude");
+        assert_eq!(selection.model.as_str(), "sonnet");
+        assert_eq!(
+            agent.extras.as_ref().unwrap().reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert!(snapshot.presets.is_none());
+        assert!(agent.model.is_none());
+        assert!(agent.resolved_backend.is_none());
+
+        // Re-serialize: nested selection present, no presets, no flat model.
+        let reserialized = snapshot.to_json().unwrap();
+        assert!(reserialized.contains("\"selection\""));
+        assert!(!reserialized.contains("\"presets\""));
+        assert!(!reserialized.contains("resolvedBackend"));
+    }
+
+    /// An ancient snapshot with `presets: null` still loads; backend is derived
+    /// from the model when no frozen active backend is available.
+    #[test]
+    fn migrate_on_read_without_presets_derives_backend_from_model() {
+        let json = r#"{
+            "recipe": {
+                "id": "r-1", "name": "R", "description": null,
+                "trigger": "manual", "nodes": [], "edges": []
+            },
+            "agents": {
+                "build": {
+                    "id": "build", "name": "Build", "description": "",
+                    "prompt": "p", "tools": [],
+                    "model": "gpt-5.3-codex"
+                }
+            },
+            "skills": {},
+            "triggerContext": {"issueId": null, "projectId": "p-1", "triggerType": "manual"},
+            "createdAt": 1
+        }"#;
+
+        let snapshot = ExecutionSnapshot::from_json(json).unwrap();
+        let selection = snapshot
+            .agents
+            .get("build")
+            .unwrap()
+            .selection
+            .as_ref()
+            .unwrap();
+        assert_eq!(selection.backend, "codex");
+        assert_eq!(selection.model.as_str(), "gpt-5.3-codex");
+    }
+
     #[test]
     fn snapshot_backward_compat_without_delegated_packets() {
         let json = r#"{
@@ -518,7 +686,6 @@ mod tests {
             },
             "agents": {},
             "skills": {},
-            "tools": {},
             "triggerContext": {
                 "issueId": null,
                 "projectId": "project-1",

@@ -23,11 +23,24 @@ pub struct CallbackRequest {
 }
 
 /// Response from Tauri backend to MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `result` is the handler's output and is NEVER mutated by the augmentation
+/// layer. System-reminder augmentation (queued direct messages, the
+/// dirty-worktree notice) rides separately in `reminders` as data, so a handler
+/// that returns structured JSON (e.g. the read-batch envelope, a change report)
+/// stays parseable end-to-end. The CLI assembles the model-visible text at the
+/// transport edge: `result` first, then each reminder wrapped in a
+/// `<system-reminder>` block, in delivery order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CallbackResponse {
     pub result: String,
     /// Cairn artifact URI for this task's output, if available.
     /// Set by the task handler so batch_tasks can surface it in truncation messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_uri: Option<String>,
+    /// `<system-reminder>` bodies to append after `result`, in delivery order
+    /// (queued DMs, then the dirty-worktree notice). Each entry is the inner
+    /// text only; the CLI wraps it in the `<system-reminder>` envelope.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reminders: Vec<String>,
 }

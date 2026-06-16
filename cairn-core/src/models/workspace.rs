@@ -4,7 +4,17 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use std::collections::HashMap;
 
-use super::common::{MergeType, Model, Preset, ThinkingDisplayMode, ToolDetailLevel};
+use super::common::{MergeType, Model, Preset, ThinkingDisplayMode};
+
+/// How agent replies to the special `to: "external"` target are handled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExternalReplyMode {
+    /// Persist the reply to the issue message stream and wake `cairn watch` callers.
+    Watchers,
+    /// Accept the target but do not persist or wake.
+    Disabled,
+}
 
 /// Custom deserializer for nullable optional fields in UpdateSettings.
 /// Distinguishes between:
@@ -40,7 +50,6 @@ pub struct Workspace {
 pub struct Settings {
     // === Preset fields ===
     pub active_backend: String,
-    pub default_tier: String,
     pub tiers: Vec<String>,
     pub backends: HashMap<String, HashMap<String, Preset>>,
 
@@ -51,26 +60,17 @@ pub struct Settings {
     pub pull_on_merge: bool,
     /// Always true — setting removed, kept for serialization compat.
     pub auto_start_jobs: bool,
-    pub timezone: String,
     pub orphan_cleanup_days: i32,
-    /// Selected app bundle path for "Open In -> Terminal" (None = Terminal.app fallback)
-    pub default_terminal: Option<String>,
-    /// Selected app bundle path for "Open In -> Default App" (None = system default)
-    pub default_app: Option<String>,
-    /// Selected audio input device name for voice input (None = system default)
-    pub audio_device: Option<String>,
-    /// Selected whisper model name for voice input (None = no model selected)
-    pub whisper_model: Option<String>,
     /// Whether agent bug reports are enabled (default: true)
     pub bug_reports: bool,
     /// API key for web search (Jina Search)
     pub web_search_api_key: Option<String>,
-    /// Lookup tool display detail level (Read, Grep, Glob, non-committing Bash, etc.)
-    pub lookup_detail_level: ToolDetailLevel,
-    /// Change tool display detail level (Edit, Write, committing Bash)
-    pub change_detail_level: ToolDetailLevel,
     /// Thinking block display mode in chat transcripts
     pub thinking_display_mode: ThinkingDisplayMode,
+    /// Number of exact-scope pending memories that triggers a memory-triage issue.
+    pub pending_memory_threshold: i32,
+    /// Behavior for replies to the documented `to: "external"` target.
+    pub external_replies: ExternalReplyMode,
 }
 
 /// DTO for updating settings
@@ -79,7 +79,6 @@ pub struct Settings {
 pub struct UpdateSettings {
     // === Preset fields ===
     pub active_backend: Option<String>,
-    pub default_tier: Option<String>,
     pub tiers: Option<Vec<String>>,
     pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
 
@@ -94,29 +93,16 @@ pub struct UpdateSettings {
     /// Deprecated — auto_start_jobs is always true. Kept for deserialization compat.
     #[allow(dead_code)]
     pub auto_start_jobs: Option<bool>,
-    pub timezone: Option<String>,
     pub orphan_cleanup_days: Option<i32>,
-    /// Selected app bundle path for "Open In -> Terminal" (None = no change, Some(None) = clear)
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub default_terminal: Option<Option<String>>,
-    /// Selected app bundle path for "Open In -> Default App" (None = no change, Some(None) = clear)
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub default_app: Option<Option<String>>,
-    /// Selected audio input device name for voice input (None = no change, Some(None) = use default)
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub audio_device: Option<Option<String>>,
-    /// Selected whisper model name (None = no change, Some(None) = clear selection)
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub whisper_model: Option<Option<String>>,
     /// Whether agent bug reports are enabled
     pub bug_reports: Option<bool>,
     /// API key for web search (Jina Search)
     #[serde(default, deserialize_with = "deserialize_optional_nullable")]
     pub web_search_api_key: Option<Option<String>>,
-    /// Lookup tool display detail level
-    pub lookup_detail_level: Option<ToolDetailLevel>,
-    /// Change tool display detail level
-    pub change_detail_level: Option<ToolDetailLevel>,
     /// Thinking block display mode in chat transcripts
     pub thinking_display_mode: Option<ThinkingDisplayMode>,
+    /// Number of exact-scope pending memories that triggers a memory-triage issue.
+    pub pending_memory_threshold: Option<i32>,
+    /// Behavior for replies to the documented `to: "external"` target.
+    pub external_replies: Option<ExternalReplyMode>,
 }

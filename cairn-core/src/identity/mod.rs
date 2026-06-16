@@ -178,6 +178,9 @@ pub struct ProviderAccount {
     pub api_provider: ApiProvider,
     pub source: AccountSource,
     pub auth: ProviderAuth,
+    /// None = shared account; Some(project_id) = private to that project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Position = priority (lower = higher priority)
     pub sort_order: i32,
     pub created_at: i64,
@@ -200,7 +203,10 @@ impl ProviderAccount {
             (ApiProvider::GitHub, ProviderAuth::OAuthToken { .. }) => vec![],
             // Local CLI is CLI-specific
             (ApiProvider::Anthropic, ProviderAuth::LocalCli) => vec!["claude"],
-            (ApiProvider::OpenAI, ProviderAuth::LocalCli) => vec!["codex"],
+            // Codex/ChatGPT OAuth refresh tokens are single-use. Cairn must own
+            // and refresh its Codex credential explicitly instead of falling back
+            // to ambient CLI state that can be mutated by other processes.
+            (ApiProvider::OpenAI, ProviderAuth::LocalCli) => vec![],
             _ => vec![],
         }
     }
@@ -252,6 +258,7 @@ impl IdentityStore {
                 api_provider: ApiProvider::Anthropic,
                 source: AccountSource::Server,
                 auth: provider_auth,
+                project_id: None,
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
@@ -268,6 +275,7 @@ impl IdentityStore {
                 api_provider: ApiProvider::OpenAI,
                 source: AccountSource::Server,
                 auth: provider_auth,
+                project_id: None,
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
@@ -282,6 +290,7 @@ impl IdentityStore {
                 auth: ProviderAuth::ApiKey {
                     value: token.clone(),
                 },
+                project_id: None,
                 sort_order: 0,
                 created_at: now,
                 last_used_at: None,
@@ -303,13 +312,31 @@ impl IdentityStore {
     }
 
     /// Get accounts for a specific provider, sorted by priority.
-    pub fn accounts_for_provider(&self, provider: ApiProvider) -> Vec<&ProviderAccount> {
-        let mut accounts: Vec<_> = self
+    pub fn accounts_for_provider(
+        &self,
+        provider: ApiProvider,
+        project_id: Option<&str>,
+    ) -> Vec<&ProviderAccount> {
+        let mut private_accounts: Vec<_> = self
             .accounts
             .iter()
-            .filter(|a| a.api_provider == provider)
+            .filter(|a| {
+                a.api_provider == provider
+                    && project_id.is_some()
+                    && a.project_id.as_deref() == project_id
+            })
             .collect();
-        accounts.sort_by_key(|a| a.sort_order);
+        private_accounts.sort_by_key(|a| a.sort_order);
+
+        let mut shared_accounts: Vec<_> = self
+            .accounts
+            .iter()
+            .filter(|a| a.api_provider == provider && a.project_id.is_none())
+            .collect();
+        shared_accounts.sort_by_key(|a| a.sort_order);
+
+        let mut accounts = private_accounts;
+        accounts.extend(shared_accounts);
         accounts
     }
 
@@ -319,8 +346,9 @@ impl IdentityStore {
         provider: ApiProvider,
         backend: &str,
         override_id: Option<&str>,
+        project_id: Option<&str>,
     ) -> Option<&ProviderAccount> {
-        let accounts = self.accounts_for_provider(provider);
+        let accounts = self.accounts_for_provider(provider, project_id);
 
         // If there's an explicit override, use only that account — no fallback
         if let Some(id) = override_id {
@@ -345,7 +373,11 @@ impl IdentityStore {
     ///
     /// This finds the highest-priority compatible account per provider/backend
     /// and maps them to the fields `UserIdentity` expects.
-    pub fn resolve(&self, overrides: Option<&AccountOverrides>) -> UserIdentity {
+    pub fn resolve(
+        &self,
+        project_id: Option<&str>,
+        overrides: Option<&AccountOverrides>,
+    ) -> UserIdentity {
         let anthropic_override = overrides.and_then(|o| o.anthropic_account_id.as_deref());
         let openai_override = overrides.and_then(|o| o.openai_account_id.as_deref());
         let github_override = overrides.and_then(|o| o.github_account_id.as_deref());
@@ -353,7 +385,12 @@ impl IdentityStore {
 
         // Resolve Claude auth from best Anthropic account
         let claude_auth = self
-            .best_account_for(ApiProvider::Anthropic, "claude", anthropic_override)
+            .best_account_for(
+                ApiProvider::Anthropic,
+                "claude",
+                anthropic_override,
+                project_id,
+            )
             .and_then(|a| match &a.auth {
                 ProviderAuth::ApiKey { value } => Some(ClaudeAuth::ApiKey(value.clone())),
                 ProviderAuth::OAuthToken { value } => Some(ClaudeAuth::OAuthToken(value.clone())),
@@ -362,7 +399,7 @@ impl IdentityStore {
 
         // Resolve Codex auth from best OpenAI account
         let codex_auth = self
-            .best_account_for(ApiProvider::OpenAI, "codex", openai_override)
+            .best_account_for(ApiProvider::OpenAI, "codex", openai_override, project_id)
             .and_then(|a| match &a.auth {
                 ProviderAuth::ApiKey { value } => Some(CodexAuth::ApiKey(value.clone())),
                 ProviderAuth::OAuthToken { value } => Some(CodexAuth::OAuthToken(value.clone())),
@@ -371,7 +408,7 @@ impl IdentityStore {
 
         // Resolve GitHub token
         let github_token = self
-            .accounts_for_provider(ApiProvider::GitHub)
+            .accounts_for_provider(ApiProvider::GitHub, project_id)
             .into_iter()
             .find(|a| {
                 if let Some(id) = github_override {
@@ -382,19 +419,29 @@ impl IdentityStore {
             })
             .and_then(|a| a.auth.credential_value().map(|v| v.to_string()));
 
-        // Resolve git identity
-        let git_identity = if let Some(id) = git_override {
+        // Resolve git identity: inline project values first, then legacy gitIdentityId, then default.
+        let inline_git = overrides.and_then(|o| match (&o.git_name, &o.git_email) {
+            (Some(name), Some(email)) if !name.trim().is_empty() && !email.trim().is_empty() => {
+                Some((name.clone(), email.clone()))
+            }
+            _ => None,
+        });
+
+        let git_identity = if inline_git.is_none() && git_override.is_some() {
             self.git_identities
                 .iter()
-                .find(|g| g.id == id)
+                .find(|g| Some(g.id.as_str()) == git_override)
                 .or_else(|| self.default_git_identity())
         } else {
             self.default_git_identity()
         };
 
-        let (name, email) = match git_identity {
-            Some(gi) => (gi.name.clone(), gi.email.clone()),
-            None => (String::new(), String::new()),
+        let (name, email) = match inline_git {
+            Some(pair) => pair,
+            None => match git_identity {
+                Some(gi) => (gi.name.clone(), gi.email.clone()),
+                None => (String::new(), String::new()),
+            },
         };
 
         UserIdentity {
@@ -424,11 +471,13 @@ pub struct AccountOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub google_account_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_identity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_email: Option<String>,
 }
 
 /// Frontend-safe account info (no credential values exposed).
@@ -441,6 +490,7 @@ pub struct AccountInfo {
     pub source: AccountSource,
     pub auth_type: String,
     pub compatible_backends: Vec<String>,
+    pub project_id: Option<String>,
     pub sort_order: i32,
     pub last_used_at: Option<i64>,
 }
@@ -458,6 +508,7 @@ impl From<&ProviderAccount> for AccountInfo {
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect(),
+            project_id: account.project_id.clone(),
             sort_order: account.sort_order,
             last_used_at: account.last_used_at,
         }
@@ -509,9 +560,22 @@ mod tests {
             api_provider: provider,
             source: AccountSource::Configured,
             auth,
+            project_id: None,
             sort_order: 0,
             created_at: 0,
             last_used_at: None,
+        }
+    }
+
+    fn api_key_auth(value: &str) -> ProviderAuth {
+        ProviderAuth::ApiKey {
+            value: value.to_string(),
+        }
+    }
+
+    fn oauth_auth(value: &str) -> ProviderAuth {
+        ProviderAuth::OAuthToken {
+            value: value.to_string(),
         }
     }
 
@@ -532,23 +596,13 @@ mod tests {
 
     #[test]
     fn compatible_backends_anthropic_api_key() {
-        let account = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "sk-ant-test".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::Anthropic, api_key_auth("sk-ant-test"));
         assert_eq!(account.compatible_backends(), vec!["claude", "native"]);
     }
 
     #[test]
     fn compatible_backends_anthropic_oauth() {
-        let account = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::OAuthToken {
-                value: "oauth-token".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::Anthropic, oauth_auth("oauth-token"));
         assert_eq!(account.compatible_backends(), vec!["claude"]);
     }
 
@@ -560,30 +614,20 @@ mod tests {
 
     #[test]
     fn compatible_backends_openai_api_key() {
-        let account = test_account(
-            ApiProvider::OpenAI,
-            ProviderAuth::ApiKey {
-                value: "sk-test".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::OpenAI, api_key_auth("sk-test"));
         assert_eq!(account.compatible_backends(), vec!["codex", "native"]);
     }
 
     #[test]
     fn compatible_backends_google_api_key() {
-        let account = test_account(
-            ApiProvider::Google,
-            ProviderAuth::ApiKey {
-                value: "goog-key".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::Google, api_key_auth("goog-key"));
         assert_eq!(account.compatible_backends(), vec!["native"]);
     }
 
     #[test]
     fn resolve_empty_store() {
         let store = test_store();
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         assert_eq!(identity.user_id, "local-test");
         assert_eq!(identity.name, "Test User");
         assert_eq!(identity.email, "test@example.com");
@@ -597,11 +641,9 @@ mod tests {
         let mut store = test_store();
         store.accounts.push(test_account(
             ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "sk-ant-key".to_string(),
-            },
+            api_key_auth("sk-ant-key"),
         ));
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         match &identity.claude_auth {
             Some(ClaudeAuth::ApiKey(key)) => assert_eq!(key, "sk-ant-key"),
             other => panic!("Expected ApiKey, got {:?}", other),
@@ -611,21 +653,11 @@ mod tests {
     #[test]
     fn resolve_with_overrides() {
         let mut store = test_store();
-        let mut acc1 = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "primary-key".to_string(),
-            },
-        );
+        let mut acc1 = test_account(ApiProvider::Anthropic, api_key_auth("primary-key"));
         acc1.id = "acc_primary".to_string();
         acc1.sort_order = 0;
 
-        let mut acc2 = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "secondary-key".to_string(),
-            },
-        );
+        let mut acc2 = test_account(ApiProvider::Anthropic, api_key_auth("secondary-key"));
         acc2.id = "acc_secondary".to_string();
         acc2.sort_order = 1;
 
@@ -633,7 +665,7 @@ mod tests {
         store.accounts.push(acc2);
 
         // Without override: primary wins
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         match &identity.claude_auth {
             Some(ClaudeAuth::ApiKey(key)) => assert_eq!(key, "primary-key"),
             other => panic!("Expected primary key, got {:?}", other),
@@ -644,7 +676,7 @@ mod tests {
             anthropic_account_id: Some("acc_secondary".to_string()),
             ..Default::default()
         };
-        let identity = store.resolve(Some(&overrides));
+        let identity = store.resolve(None, Some(&overrides));
         match &identity.claude_auth {
             Some(ClaudeAuth::ApiKey(key)) => assert_eq!(key, "secondary-key"),
             other => panic!("Expected secondary key, got {:?}", other),
@@ -657,7 +689,7 @@ mod tests {
         store
             .accounts
             .push(test_account(ApiProvider::Anthropic, ProviderAuth::LocalCli));
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         // LocalCli doesn't produce a stored auth value
         assert!(identity.claude_auth.is_none());
     }
@@ -673,12 +705,7 @@ mod tests {
 
     #[test]
     fn account_info_from_provider_account() {
-        let account = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "secret".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::Anthropic, api_key_auth("secret"));
         let info = AccountInfo::from(&account);
         assert_eq!(info.api_provider, ApiProvider::Anthropic);
         assert_eq!(info.auth_type, "api_key");
@@ -686,29 +713,101 @@ mod tests {
     }
 
     #[test]
+    fn project_private_accounts_are_private_first_and_scoped() {
+        let mut store = test_store();
+        let mut shared = test_account(ApiProvider::Anthropic, api_key_auth("shared-key"));
+        shared.id = "shared".to_string();
+        shared.sort_order = 0;
+        let mut private_p = test_account(ApiProvider::Anthropic, api_key_auth("project-key"));
+        private_p.id = "private-p".to_string();
+        private_p.project_id = Some("project-p".to_string());
+        private_p.sort_order = 10;
+        let mut private_q = test_account(ApiProvider::Anthropic, api_key_auth("other-key"));
+        private_q.project_id = Some("project-q".to_string());
+
+        store.accounts.extend([shared, private_p, private_q]);
+
+        let p_accounts = store.accounts_for_provider(ApiProvider::Anthropic, Some("project-p"));
+        assert_eq!(
+            p_accounts.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            vec!["private-p", "shared"]
+        );
+        let qless_accounts = store.accounts_for_provider(ApiProvider::Anthropic, None);
+        assert_eq!(
+            qless_accounts
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["shared"]
+        );
+
+        let identity = store.resolve(Some("project-p"), None);
+        assert_eq!(
+            identity.claude_auth.as_ref().map(|a| a.value()),
+            Some("project-key")
+        );
+        let identity = store.resolve(Some("project-q"), None);
+        assert_eq!(
+            identity.claude_auth.as_ref().map(|a| a.value()),
+            Some("other-key")
+        );
+        let identity = store.resolve(Some("project-r"), None);
+        assert_eq!(
+            identity.claude_auth.as_ref().map(|a| a.value()),
+            Some("shared-key")
+        );
+    }
+
+    #[test]
+    fn override_pin_must_be_in_project_scope() {
+        let mut store = test_store();
+        let mut private_q = test_account(ApiProvider::OpenAI, api_key_auth("q-key"));
+        private_q.id = "private-q".to_string();
+        private_q.project_id = Some("project-q".to_string());
+        store.accounts.push(private_q);
+
+        let overrides = AccountOverrides {
+            openai_account_id: Some("private-q".to_string()),
+            ..Default::default()
+        };
+        let identity = store.resolve(Some("project-p"), Some(&overrides));
+        assert!(identity.codex_auth.is_none());
+        let identity = store.resolve(Some("project-q"), Some(&overrides));
+        assert_eq!(
+            identity.codex_auth.as_ref().map(|a| a.value()),
+            Some("q-key")
+        );
+    }
+
+    #[test]
+    fn inline_git_identity_takes_precedence() {
+        let store = test_store();
+        let overrides = AccountOverrides {
+            git_identity_id: Some("gi_1".to_string()),
+            git_name: Some("Project User".to_string()),
+            git_email: Some("project@example.com".to_string()),
+            ..Default::default()
+        };
+
+        let identity = store.resolve(Some("project-p"), Some(&overrides));
+        assert_eq!(identity.name, "Project User");
+        assert_eq!(identity.email, "project@example.com");
+    }
+
+    #[test]
     fn accounts_for_provider_sorted() {
         let mut store = test_store();
-        let mut acc_b = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "b".to_string(),
-            },
-        );
+        let mut acc_b = test_account(ApiProvider::Anthropic, api_key_auth("b"));
         acc_b.sort_order = 1;
         acc_b.label = "B".to_string();
-        let mut acc_a = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "a".to_string(),
-            },
-        );
+        let mut acc_a = test_account(ApiProvider::Anthropic, api_key_auth("a"));
         acc_a.sort_order = 0;
         acc_a.label = "A".to_string();
 
         store.accounts.push(acc_b);
         store.accounts.push(acc_a);
 
-        let accounts = store.accounts_for_provider(ApiProvider::Anthropic);
+        let accounts = store.accounts_for_provider(ApiProvider::Anthropic, None);
         assert_eq!(accounts.len(), 2);
         assert_eq!(accounts[0].label, "A");
         assert_eq!(accounts[1].label, "B");
@@ -718,52 +817,32 @@ mod tests {
 
     #[test]
     fn compatible_backends_openai_oauth() {
-        let account = test_account(
-            ApiProvider::OpenAI,
-            ProviderAuth::OAuthToken {
-                value: "chatgpt-oauth".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::OpenAI, oauth_auth("chatgpt-oauth"));
         assert_eq!(account.compatible_backends(), vec!["codex"]);
     }
 
     #[test]
     fn compatible_backends_openai_local_cli() {
         let account = test_account(ApiProvider::OpenAI, ProviderAuth::LocalCli);
-        assert_eq!(account.compatible_backends(), vec!["codex"]);
+        assert!(account.compatible_backends().is_empty());
     }
 
     #[test]
     fn compatible_backends_github_api_key_empty() {
-        let account = test_account(
-            ApiProvider::GitHub,
-            ProviderAuth::ApiKey {
-                value: "ghp_test".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::GitHub, api_key_auth("ghp_test"));
         // GitHub API keys don't map to any agent backend
         assert!(account.compatible_backends().is_empty());
     }
 
     #[test]
     fn compatible_backends_google_oauth_empty() {
-        let account = test_account(
-            ApiProvider::Google,
-            ProviderAuth::OAuthToken {
-                value: "goog-oauth".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::Google, oauth_auth("goog-oauth"));
         assert!(account.compatible_backends().is_empty());
     }
 
     #[test]
     fn compatible_backends_github_oauth_empty() {
-        let account = test_account(
-            ApiProvider::GitHub,
-            ProviderAuth::OAuthToken {
-                value: "gh-oauth".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::GitHub, oauth_auth("gh-oauth"));
         assert!(account.compatible_backends().is_empty());
     }
 
@@ -772,11 +851,9 @@ mod tests {
         let mut store = test_store();
         store.accounts.push(test_account(
             ApiProvider::OpenAI,
-            ProviderAuth::ApiKey {
-                value: "sk-openai-key".to_string(),
-            },
+            api_key_auth("sk-openai-key"),
         ));
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         match &identity.codex_auth {
             Some(CodexAuth::ApiKey(key)) => assert_eq!(key, "sk-openai-key"),
             other => panic!("Expected CodexAuth::ApiKey, got {:?}", other),
@@ -790,11 +867,9 @@ mod tests {
         let mut store = test_store();
         store.accounts.push(test_account(
             ApiProvider::OpenAI,
-            ProviderAuth::OAuthToken {
-                value: "chatgpt-oauth-json".to_string(),
-            },
+            oauth_auth("chatgpt-oauth-json"),
         ));
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         match &identity.codex_auth {
             Some(CodexAuth::OAuthToken(val)) => assert_eq!(val, "chatgpt-oauth-json"),
             other => panic!("Expected CodexAuth::OAuthToken, got {:?}", other),
@@ -806,31 +881,19 @@ mod tests {
         let mut store = test_store();
         store.accounts.push(test_account(
             ApiProvider::GitHub,
-            ProviderAuth::ApiKey {
-                value: "ghp_my_token".to_string(),
-            },
+            api_key_auth("ghp_my_token"),
         ));
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         assert_eq!(identity.github_token, Some("ghp_my_token".to_string()));
     }
 
     #[test]
     fn resolve_github_token_with_override() {
         let mut store = test_store();
-        let mut acc1 = test_account(
-            ApiProvider::GitHub,
-            ProviderAuth::ApiKey {
-                value: "ghp_primary".to_string(),
-            },
-        );
+        let mut acc1 = test_account(ApiProvider::GitHub, api_key_auth("ghp_primary"));
         acc1.id = "gh_1".to_string();
         acc1.sort_order = 0;
-        let mut acc2 = test_account(
-            ApiProvider::GitHub,
-            ProviderAuth::ApiKey {
-                value: "ghp_secondary".to_string(),
-            },
-        );
+        let mut acc2 = test_account(ApiProvider::GitHub, api_key_auth("ghp_secondary"));
         acc2.id = "gh_2".to_string();
         acc2.sort_order = 1;
 
@@ -838,7 +901,7 @@ mod tests {
         store.accounts.push(acc2);
 
         // Without override: first account wins
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         assert_eq!(identity.github_token, Some("ghp_primary".to_string()));
 
         // With override: selected account wins
@@ -846,7 +909,7 @@ mod tests {
             github_account_id: Some("gh_2".to_string()),
             ..Default::default()
         };
-        let identity = store.resolve(Some(&overrides));
+        let identity = store.resolve(None, Some(&overrides));
         assert_eq!(identity.github_token, Some("ghp_secondary".to_string()));
     }
 
@@ -863,7 +926,7 @@ mod tests {
         });
 
         // Without override: default (sort_order 0) wins
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         assert_eq!(identity.name, "Test User");
         assert_eq!(identity.email, "test@example.com");
 
@@ -872,7 +935,7 @@ mod tests {
             git_identity_id: Some("gi_2".to_string()),
             ..Default::default()
         };
-        let identity = store.resolve(Some(&overrides));
+        let identity = store.resolve(None, Some(&overrides));
         assert_eq!(identity.name, "Work Name");
         assert_eq!(identity.email, "work@corp.com");
     }
@@ -884,13 +947,11 @@ mod tests {
         let mut store = test_store();
         store.accounts.push(test_account(
             ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "real-key".to_string(),
-            },
+            api_key_auth("real-key"),
         ));
 
         // Without override: works fine
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         assert!(identity.claude_auth.is_some());
 
         // With invalid override: no fallback
@@ -898,7 +959,7 @@ mod tests {
             anthropic_account_id: Some("nonexistent_id".to_string()),
             ..Default::default()
         };
-        let identity = store.resolve(Some(&overrides));
+        let identity = store.resolve(None, Some(&overrides));
         assert!(
             identity.claude_auth.is_none(),
             "Explicit override to nonexistent account should not fall back"
@@ -914,7 +975,7 @@ mod tests {
             git_identity_id: Some("nonexistent_gi".to_string()),
             ..Default::default()
         };
-        let identity = store.resolve(Some(&overrides));
+        let identity = store.resolve(None, Some(&overrides));
         // Falls back to default git identity
         assert_eq!(identity.name, "Test User");
         assert_eq!(identity.email, "test@example.com");
@@ -928,7 +989,7 @@ mod tests {
             git_identities: vec![],
             project_overrides: Default::default(),
         };
-        let identity = store.resolve(None);
+        let identity = store.resolve(None, None);
         assert_eq!(identity.name, "");
         assert_eq!(identity.email, "");
     }
@@ -978,14 +1039,10 @@ mod tests {
 
     #[test]
     fn provider_auth_credential_value() {
-        let api_key = ProviderAuth::ApiKey {
-            value: "key-val".to_string(),
-        };
+        let api_key = api_key_auth("key-val");
         assert_eq!(api_key.credential_value(), Some("key-val"));
 
-        let oauth = ProviderAuth::OAuthToken {
-            value: "oauth-val".to_string(),
-        };
+        let oauth = oauth_auth("oauth-val");
         assert_eq!(oauth.credential_value(), Some("oauth-val"));
 
         let local = ProviderAuth::LocalCli;
@@ -994,20 +1051,8 @@ mod tests {
 
     #[test]
     fn provider_auth_type_labels() {
-        assert_eq!(
-            ProviderAuth::ApiKey {
-                value: "x".to_string()
-            }
-            .auth_type_label(),
-            "api_key"
-        );
-        assert_eq!(
-            ProviderAuth::OAuthToken {
-                value: "x".to_string()
-            }
-            .auth_type_label(),
-            "oauth_token"
-        );
+        assert_eq!(api_key_auth("x").auth_type_label(), "api_key");
+        assert_eq!(oauth_auth("x").auth_type_label(), "oauth_token");
         assert_eq!(ProviderAuth::LocalCli.auth_type_label(), "local_cli");
     }
 
@@ -1097,16 +1142,12 @@ mod tests {
 
     #[test]
     fn provider_auth_serde_roundtrip() {
-        let api_key = ProviderAuth::ApiKey {
-            value: "key".to_string(),
-        };
+        let api_key = api_key_auth("key");
         let json = serde_json::to_string(&api_key).unwrap();
         let parsed: ProviderAuth = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.credential_value(), Some("key"));
 
-        let oauth = ProviderAuth::OAuthToken {
-            value: "tok".to_string(),
-        };
+        let oauth = oauth_auth("tok");
         let json = serde_json::to_string(&oauth).unwrap();
         let parsed: ProviderAuth = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.credential_value(), Some("tok"));
@@ -1146,7 +1187,7 @@ mod tests {
     #[test]
     fn from_user_identity_claude_api_key_creates_anthropic_account() {
         let store = IdentityStore::from_user_identity(&test_user_identity());
-        let anthropic = store.accounts_for_provider(ApiProvider::Anthropic);
+        let anthropic = store.accounts_for_provider(ApiProvider::Anthropic, None);
         assert_eq!(anthropic.len(), 1);
         assert_eq!(anthropic[0].source, AccountSource::Server);
         match &anthropic[0].auth {
@@ -1162,7 +1203,7 @@ mod tests {
             ..test_user_identity()
         };
         let store = IdentityStore::from_user_identity(&identity);
-        let anthropic = store.accounts_for_provider(ApiProvider::Anthropic);
+        let anthropic = store.accounts_for_provider(ApiProvider::Anthropic, None);
         assert_eq!(anthropic.len(), 1);
         match &anthropic[0].auth {
             ProviderAuth::OAuthToken { value } => assert_eq!(value, "oauth-tok"),
@@ -1177,7 +1218,7 @@ mod tests {
             ..test_user_identity()
         };
         let store = IdentityStore::from_user_identity(&identity);
-        let openai = store.accounts_for_provider(ApiProvider::OpenAI);
+        let openai = store.accounts_for_provider(ApiProvider::OpenAI, None);
         assert_eq!(openai.len(), 1);
         match &openai[0].auth {
             ProviderAuth::ApiKey { value } => assert_eq!(value, "sk-openai"),
@@ -1188,7 +1229,7 @@ mod tests {
     #[test]
     fn from_user_identity_github_token_creates_github_account() {
         let store = IdentityStore::from_user_identity(&test_user_identity());
-        let github = store.accounts_for_provider(ApiProvider::GitHub);
+        let github = store.accounts_for_provider(ApiProvider::GitHub, None);
         assert_eq!(github.len(), 1);
         match &github[0].auth {
             ProviderAuth::ApiKey { value } => assert_eq!(value, "ghp_test123"),
@@ -1224,12 +1265,7 @@ mod tests {
 
     #[test]
     fn account_info_does_not_expose_credentials() {
-        let account = test_account(
-            ApiProvider::Anthropic,
-            ProviderAuth::ApiKey {
-                value: "super-secret-key".to_string(),
-            },
-        );
+        let account = test_account(ApiProvider::Anthropic, api_key_auth("super-secret-key"));
         let info = AccountInfo::from(&account);
         let json = serde_json::to_string(&info).unwrap();
         assert!(

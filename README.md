@@ -4,11 +4,11 @@ Agent orchestration engine in Rust.
 
 ## Crates
 
-**cairn-core** — Orchestration engine. Recipe-based DAG execution, Claude process management, database operations (SQLite/Diesel), configuration resolution, memory system, and all business logic.
+**cairn-core** — Orchestration engine. Recipe-based DAG execution, Claude process management, Turso-backed database operations, configuration resolution, memory system, and all business logic.
 
-**cairn-common** — Shared types. `cairn://` URI parser and serializer, authentication, and the callback protocol types that connect cairn-mcp to cairn-core.
+**cairn-common** — Shared types. `cairn://` URI parser and serializer, authentication, and the callback protocol types that connect cairn-cli to cairn-core.
 
-**cairn-mcp** — MCP server binary. Provides the tool interface agents use during execution: file I/O, shell commands, sub-agent spawning, memory management, and execution history navigation. Stateless — all operations are forwarded to cairn-core via HTTP callbacks.
+**cairn-cli** — MCP server binary. Provides the tool interface agents use during execution: file I/O, shell commands, sub-agent spawning, memory management, and execution history navigation. Stateless — all operations are forwarded to cairn-core via HTTP callbacks.
 
 ## Building
 

@@ -4,6 +4,7 @@
 //! binary to the callback HTTP server.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // ============================================================================
 // Request/Response Types (re-exported from cairn-common)
@@ -50,7 +51,7 @@ pub struct AddCommentPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadFilePayload {
     pub path: String,
-    pub offset: Option<usize>,
+    pub offset: Option<i64>,
     pub limit: Option<usize>,
     /// Include issue history for this file path
     #[serde(default)]
@@ -68,16 +69,6 @@ pub enum IssueHistoryMode {
     Verbose,
 }
 
-/// Payload for create_issue tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateIssuePayload {
-    pub title: String,
-    pub description: Option<String>,
-    /// Project key to create the issue in (e.g., "CAIRN"). Defaults to current project.
-    pub project: Option<String>,
-}
-
 /// Payload for update_issue tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,36 +76,45 @@ pub struct UpdateIssuePayload {
     pub issue_number: String,
     pub title: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
     /// Project key (e.g., "CAIRN"). Falls back to issue_number prefix or CWD.
     pub project: Option<String>,
 }
 
-/// A single file change in an edit batch
+/// Supported operations for the canonical change carrier.
+///
+/// Defined once in `cairn-common` so the contract table and this dispatcher
+/// share a single enum; re-exported here for the existing call sites.
+pub use cairn_common::contract::ChangeMode;
+
+/// A single change item in a change batch.
+///
+/// Every item — file and resource targets alike — is `{target, mode, payload}`.
+/// File-target keys (`content` for create/replace/append; `diff`, `patch`,
+/// `old_string`/`new_string`, `replace_all` for patch variants) live inside
+/// `payload`, exactly where resource-target keys already do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileChange {
-    pub path: String,
-    pub kind: String,
+pub struct ChangeItem {
+    pub target: String,
+    pub mode: ChangeMode,
+    /// Structured payload carrying this item's keys (file and resource targets alike).
     #[serde(default)]
-    pub content: Option<String>,
-    /// Unified diff for kind=update (alternative to old_string/new_string)
-    #[serde(default)]
-    pub diff: Option<String>,
-    /// Text to find for kind=update (use with new_string; alternative to diff)
-    #[serde(default)]
-    pub old_string: Option<String>,
-    /// Replacement text for kind=update (use with old_string)
-    #[serde(default)]
-    pub new_string: Option<String>,
-    /// Replace all occurrences (default: false, first match only)
-    #[serde(default)]
-    pub replace_all: Option<bool>,
+    pub payload: Option<Value>,
 }
 
-/// Payload for unified edit tool (file mutations)
+/// Payload for the canonical change tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileChangePayload {
-    pub changes: Vec<FileChange>,
-    pub commit_msg: String,
+pub struct ChangePayload {
+    pub changes: Vec<ChangeItem>,
+    #[serde(default)]
+    pub commit_msg: Option<String>,
+    #[serde(default)]
+    pub preview: Option<bool>,
+    #[serde(default)]
+    pub atomic: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -129,6 +129,9 @@ pub enum TaskSessionMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskPayload {
+    /// Required display title for the task: a short "what this task is" string.
+    /// The tasks-collection contract lists it as required, so a missing key is
+    /// rejected at deserialization (mirroring `subagentType`/`prompt`).
     pub description: String,
     pub prompt: String,
     pub subagent_type: String,
@@ -136,18 +139,15 @@ pub struct TaskPayload {
     pub tier: Option<String>,
     #[serde(default, rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<String>,
+    /// Fire-and-forget when true: spawn and return the task URI without blocking.
+    /// Accepts `runInBackground` (verb schema) or `background` (change-append payload).
+    #[serde(default, alias = "background")]
     pub run_in_background: Option<bool>,
     #[serde(default)]
     pub session: Option<TaskSessionMode>,
     /// Task index for batch_tasks ordering (0, 1, 2...)
     #[serde(default)]
     pub task_index: Option<i32>,
-}
-
-/// Payload for todo_write tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TodoWritePayload {
-    pub todos: Vec<crate::todos::TodoWriteItem>,
 }
 
 impl TaskPayload {
@@ -175,134 +175,122 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filechange_payload_deserializes() {
+    fn change_payload_deserializes_file_and_resource_targets() {
         let json = serde_json::json!({
             "changes": [
-                {"path": "src/lib.rs", "kind": "add", "content": "fn main() {}"},
-                {"path": "src/old.rs", "kind": "delete"},
-                {"path": "src/mod.rs", "kind": "update", "diff": "@@ -1,1 +1,1 @@\n-old\n+new"}
+                {"target": "file:src/lib.rs", "mode": "create", "payload": {"content": "fn main() {}"}},
+                {"target": "cairn://p/CAIRN/1", "mode": "patch", "payload": {"title": "Updated"}},
+                {"target": "cairn://p/CAIRN/messages", "mode": "append", "payload": {"content": "hello"}}
             ],
             "commit_msg": "test commit"
         });
 
-        let payload: FileChangePayload = serde_json::from_value(json).unwrap();
+        let payload: ChangePayload = serde_json::from_value(json).unwrap();
         assert_eq!(payload.changes.len(), 3);
-        assert_eq!(payload.changes[0].kind, "add");
-        assert_eq!(payload.changes[0].content.as_deref(), Some("fn main() {}"));
-        assert_eq!(payload.changes[1].kind, "delete");
-        assert!(payload.changes[1].content.is_none());
-        assert_eq!(payload.changes[2].kind, "update");
-        assert!(payload.changes[2].diff.is_some());
-        assert_eq!(payload.commit_msg, "test commit");
+        assert_eq!(payload.changes[0].target, "file:src/lib.rs");
+        assert_eq!(payload.changes[0].mode, ChangeMode::Create);
+        assert_eq!(
+            payload.changes[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("content"))
+                .and_then(|v| v.as_str()),
+            Some("fn main() {}")
+        );
+        assert_eq!(payload.changes[1].mode, ChangeMode::Patch);
+        assert_eq!(payload.changes[2].mode, ChangeMode::Append);
+        assert_eq!(payload.commit_msg.as_deref(), Some("test commit"));
     }
 
     #[test]
-    fn filechange_payload_missing_optional_fields() {
+    fn change_payload_missing_optional_fields() {
         let json = serde_json::json!({
-            "changes": [{"path": "f.rs", "kind": "delete"}],
-            "commit_msg": "^"
+            "changes": [{"target": "file:f.rs", "mode": "delete"}]
         });
 
-        let payload: FileChangePayload = serde_json::from_value(json).unwrap();
-        assert_eq!(payload.changes[0].path, "f.rs");
-        assert!(payload.changes[0].content.is_none());
-        assert!(payload.changes[0].diff.is_none());
-        assert_eq!(payload.commit_msg, "^");
+        let payload: ChangePayload = serde_json::from_value(json).unwrap();
+        assert_eq!(payload.changes[0].target, "file:f.rs");
+        assert!(payload.changes[0].payload.is_none());
+        assert_eq!(payload.commit_msg, None);
     }
 
     #[test]
-    fn filechange_update_with_old_new_string() {
+    fn change_payload_patch_keys_live_in_payload() {
+        // File-target keys now ride under `payload`, the same slot resource keys use.
         let json = serde_json::json!({
             "changes": [{
-                "path": "src/lib.rs",
-                "kind": "update",
-                "old_string": "let x = 1;",
-                "new_string": "let x = 2;"
+                "target": "file:src/lib.rs",
+                "mode": "patch",
+                "payload": {"old_string": "let x = 1;", "new_string": "let x = 2;"}
             }],
             "commit_msg": "fix"
         });
 
-        let payload: FileChangePayload = serde_json::from_value(json).unwrap();
-        let change = &payload.changes[0];
-        assert_eq!(change.old_string.as_deref(), Some("let x = 1;"));
-        assert_eq!(change.new_string.as_deref(), Some("let x = 2;"));
-        assert_eq!(change.replace_all, None);
-        assert!(change.diff.is_none());
+        let payload: ChangePayload = serde_json::from_value(json).unwrap();
+        let change_payload = payload.changes[0].payload.as_ref().unwrap();
+        assert_eq!(
+            change_payload.get("old_string").and_then(|v| v.as_str()),
+            Some("let x = 1;")
+        );
+        assert_eq!(
+            change_payload.get("new_string").and_then(|v| v.as_str()),
+            Some("let x = 2;")
+        );
+        assert!(change_payload.get("replace_all").is_none());
+        assert!(change_payload.get("diff").is_none());
     }
 
     #[test]
-    fn filechange_replace_all_true() {
+    fn change_payload_replace_all_in_payload() {
         let json = serde_json::json!({
             "changes": [{
-                "path": "src/lib.rs",
-                "kind": "update",
-                "old_string": "TODO",
-                "new_string": "DONE",
-                "replace_all": true
+                "target": "file:src/lib.rs",
+                "mode": "patch",
+                "payload": {"old_string": "TODO", "new_string": "DONE", "replace_all": true}
             }],
             "commit_msg": "replace all TODOs"
         });
 
-        let payload: FileChangePayload = serde_json::from_value(json).unwrap();
-        assert_eq!(payload.changes[0].replace_all, Some(true));
+        let payload: ChangePayload = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            payload.changes[0]
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("replace_all"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
-    fn filechange_replace_all_false() {
-        let json = serde_json::json!({
-            "changes": [{
-                "path": "src/lib.rs",
-                "kind": "update",
-                "old_string": "TODO",
-                "new_string": "DONE",
-                "replace_all": false
-            }],
-            "commit_msg": "replace first TODO"
-        });
-
-        let payload: FileChangePayload = serde_json::from_value(json).unwrap();
-        assert_eq!(payload.changes[0].replace_all, Some(false));
-    }
-
-    #[test]
-    fn task_payload_defaults_session_mode_to_new() {
-        let payload: TaskPayload = serde_json::from_value(serde_json::json!({
-            "description": "Explore",
-            "prompt": "Inspect the code",
-            "subagentType": "Explore"
-        }))
-        .unwrap();
-
-        assert_eq!(payload.session_mode().unwrap(), TaskSessionMode::New);
-    }
-
-    #[test]
-    fn task_payload_supports_fork_session_mode() {
-        let payload: TaskPayload = serde_json::from_value(serde_json::json!({
-            "description": "Explore",
-            "prompt": "Inspect the code",
+    fn task_payload_description_is_required() {
+        // The tasks-collection contract lists `description` as required, so the
+        // deserializer must reject a payload that omits it.
+        let missing = serde_json::json!({
             "subagentType": "Explore",
-            "session": "fork"
-        }))
-        .unwrap();
+            "prompt": "map parser flow"
+        });
+        assert!(serde_json::from_value::<TaskPayload>(missing).is_err());
 
-        assert_eq!(payload.session_mode().unwrap(), TaskSessionMode::Fork);
+        // A payload that provides it deserializes cleanly.
+        let json = serde_json::json!({
+            "subagentType": "Explore",
+            "description": "map parser flow",
+            "prompt": "trace the parser end to end"
+        });
+        let task: TaskPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(task.subagent_type, "Explore");
+        assert_eq!(task.description, "map parser flow");
+        assert_eq!(task.prompt, "trace the parser end to end");
     }
 
     #[test]
-    fn filechange_replace_all_defaults_to_none() {
+    fn change_payload_rejects_unknown_mode() {
         let json = serde_json::json!({
-            "changes": [{
-                "path": "src/lib.rs",
-                "kind": "update",
-                "old_string": "a",
-                "new_string": "b"
-            }],
-            "commit_msg": "edit"
+            "changes": [{"target": "file:src/lib.rs", "mode": "mutate"}]
         });
 
-        let payload: FileChangePayload = serde_json::from_value(json).unwrap();
-        // When omitted, replace_all should be None (defaults to first-match-only via unwrap_or(false))
-        assert_eq!(payload.changes[0].replace_all, None);
+        let error = serde_json::from_value::<ChangePayload>(json).unwrap_err();
+        assert!(error.to_string().contains("unknown variant"));
     }
 }

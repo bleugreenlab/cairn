@@ -1,117 +1,87 @@
 //! MCP config file generation for Claude CLI.
 //!
-//! Generates the JSON config that tells Claude CLI where to find the cairn-mcp binary
+//! Generates the JSON config that tells Claude CLI where to find the cairn-cli binary
 //! and how to connect to the callback server.
-
-use std::path::{Path, PathBuf};
 
 /// Build MCP config JSON for Claude CLI.
 ///
 /// This is the pure function for generating the config content.
 ///
-/// If `schema_path` is provided, adds `--schema <path>` args to cairn-mcp.
-/// If `tool_name` is provided, adds `--tool-name <name>`.
-/// If `tool_description` is provided, adds `--tool-description <desc>`.
 /// If `available_agents` is provided, adds `--agents <json>`.
-/// If `available_skills` is provided, adds `--skills <json>`.
-/// If `available_tools` is provided, adds `--tools <json>`.
-#[allow(clippy::too_many_arguments)]
+/// If `home_uri` is provided, sets `CAIRN_HOME_URI` in the MCP server env.
+/// If `cairn_home` is provided, sets `CAIRN_HOME` in the MCP server env so the
+/// child resolves the instance's home directory (and its on-disk MCP secret) on
+/// the disk-fallback path rather than the base `~/.cairn[-dev]`.
+///
+/// `cairn_env` ("dev"/"prod") is always set as `CAIRN_ENV` in the MCP server env
+/// so the child (built `--release`) resolves the same Cairn home and callback
+/// port as the app that spawned it, rather than keying on its own build profile.
 pub fn build_mcp_config_json(
-    cairn_mcp_path: &str,
+    cairn_cli_path: &str,
     callback_url: &str,
-    schema_path: Option<&str>,
-    tool_name: Option<&str>,
-    tool_description: Option<&str>,
     available_agents: Option<&str>,
-    available_skills: Option<&str>,
-    available_tools: Option<&str>,
+    home_uri: Option<&str>,
+    cairn_env: &str,
+    cairn_home: Option<&str>,
 ) -> serde_json::Value {
     let mut args: Vec<&str> = Vec::new();
-    if let Some(path) = schema_path {
-        args.push("--schema");
-        args.push(path);
-    }
-    if let Some(name) = tool_name {
-        args.push("--tool-name");
-        args.push(name);
-    }
-    if let Some(desc) = tool_description {
-        args.push("--tool-description");
-        args.push(desc);
-    }
     if let Some(agents_json) = available_agents {
         args.push("--agents");
         args.push(agents_json);
     }
-    if let Some(skills_json) = available_skills {
-        args.push("--skills");
-        args.push(skills_json);
+    let mut env = serde_json::json!({
+        "CAIRN_CALLBACK_URL": callback_url,
+        "CAIRN_ENV": cairn_env
+    });
+    if let Some(uri) = home_uri {
+        env["CAIRN_HOME_URI"] = serde_json::Value::String(uri.to_string());
     }
-    if let Some(tools_json) = available_tools {
-        args.push("--tools");
-        args.push(tools_json);
+    if let Some(home) = cairn_home {
+        env["CAIRN_HOME"] = serde_json::Value::String(home.to_string());
     }
 
     let servers = serde_json::json!({
         "cairn": {
             "type": "stdio",
-            "command": cairn_mcp_path,
+            "command": cairn_cli_path,
             "args": args,
-            "env": {
-                "CAIRN_CALLBACK_URL": callback_url
-            }
+            "env": env
         }
     });
 
     serde_json::json!({ "mcpServers": servers })
 }
 
-/// Ensure the MCP config file exists and return its path.
+/// Build the MCP config as a self-contained JSON string.
 ///
-/// `config_dir` is where the config file is written (host-specific).
-/// `mcp_binary_path` is the path to the cairn-mcp binary.
+/// Claude CLI's `--mcp-config` accepts the config inline as a string, so each
+/// run passes its own config directly rather than sharing a file on disk.
+/// Sharing a single `mcp-config.json` raced under concurrent session starts:
+/// the run-specific `CAIRN_HOME_URI` and the project-scoped `--agents` payload
+/// were overwritten by the last writer, so parallel agents (e.g. sibling
+/// delegated tasks) all resolved `cairn:~` to the same node. Passing the config
+/// inline removes the shared mutable file entirely.
+///
+/// `mcp_binary_path` is the path to the cairn-cli binary.
 /// `callback_port` is the MCP callback server port.
-#[allow(clippy::too_many_arguments)]
-pub fn ensure_mcp_config(
-    config_dir: &Path,
+pub fn build_mcp_config_string(
     mcp_binary_path: &str,
     callback_port: u16,
-    schema_path: Option<&str>,
-    tool_name: Option<&str>,
-    tool_description: Option<&str>,
     available_agents: Option<&str>,
-    available_skills: Option<&str>,
-    available_tools: Option<&str>,
-) -> Result<PathBuf, String> {
-    let config_path = config_dir.join("mcp-config.json");
-
-    // Ensure directory exists
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config dir: {}", e))?;
-    }
-
+    home_uri: Option<&str>,
+    cairn_env: &str,
+    cairn_home: Option<&str>,
+) -> String {
     let callback_url = format!("http://127.0.0.1:{}/api/mcp", callback_port);
     let config = build_mcp_config_json(
         mcp_binary_path,
         &callback_url,
-        schema_path,
-        tool_name,
-        tool_description,
         available_agents,
-        available_skills,
-        available_tools,
+        home_uri,
+        cairn_env,
+        cairn_home,
     );
-
-    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
-        .map_err(|e| format!("Failed to write MCP config: {}", e))?;
-
-    log::info!("MCP config written to: {}", config_path.display());
-    if let Some(path) = schema_path {
-        log::info!("MCP config includes schema: {}", path);
-    }
-
-    Ok(config_path)
+    serde_json::to_string(&config).expect("MCP config JSON always serializes")
 }
 
 #[cfg(test)]
@@ -121,13 +91,11 @@ mod tests {
     #[test]
     fn test_build_mcp_config_json_basic() {
         let config = build_mcp_config_json(
-            "/usr/bin/cairn-mcp",
+            "/usr/bin/cairn-cli",
             "http://127.0.0.1:3847/api/mcp",
             None,
             None,
-            None,
-            None,
-            None,
+            "prod",
             None,
         );
 
@@ -135,37 +103,99 @@ mod tests {
         let cairn = servers.get("cairn").unwrap();
         assert_eq!(
             cairn.get("command").unwrap().as_str().unwrap(),
-            "/usr/bin/cairn-mcp"
+            "/usr/bin/cairn-cli"
         );
+        let env = cairn.get("env").unwrap();
         assert_eq!(
-            cairn
-                .get("env")
-                .unwrap()
-                .get("CAIRN_CALLBACK_URL")
-                .unwrap()
-                .as_str()
-                .unwrap(),
+            env.get("CAIRN_CALLBACK_URL").unwrap().as_str().unwrap(),
             "http://127.0.0.1:3847/api/mcp"
+        );
+        // CAIRN_ENV is always propagated to the child.
+        assert_eq!(env.get("CAIRN_ENV").unwrap().as_str().unwrap(), "prod");
+        // No home URI / home provided — keys must be absent
+        assert!(env.get("CAIRN_HOME_URI").is_none());
+        assert!(env.get("CAIRN_HOME").is_none());
+    }
+
+    #[test]
+    fn test_build_mcp_config_json_with_cairn_home() {
+        let config = build_mcp_config_json(
+            "/usr/bin/cairn-cli",
+            "http://127.0.0.1:3861/api/mcp",
+            None,
+            None,
+            "dev",
+            Some("/Users/me/.cairn-dev-feature-x"),
+        );
+
+        let env = &config["mcpServers"]["cairn"]["env"];
+        assert_eq!(
+            env["CAIRN_HOME"].as_str().unwrap(),
+            "/Users/me/.cairn-dev-feature-x"
         );
     }
 
     #[test]
-    fn test_build_mcp_config_json_with_schema() {
+    fn test_build_mcp_config_json_with_home_uri() {
         let config = build_mcp_config_json(
-            "/usr/bin/cairn-mcp",
+            "/usr/bin/cairn-cli",
             "http://127.0.0.1:3847/api/mcp",
-            Some("/tmp/schema.json"),
-            Some("submit"),
-            Some("Submit output"),
             None,
+            Some("cairn://p/CAIRN/42/1/builder"),
+            "dev",
             None,
+        );
+
+        let env = &config["mcpServers"]["cairn"]["env"];
+        assert_eq!(
+            env["CAIRN_HOME_URI"].as_str().unwrap(),
+            "cairn://p/CAIRN/42/1/builder"
+        );
+        assert_eq!(env["CAIRN_ENV"].as_str().unwrap(), "dev");
+    }
+
+    #[test]
+    fn test_build_mcp_config_string_is_parseable_and_run_specific() {
+        let a = build_mcp_config_string(
+            "/usr/bin/cairn-cli",
+            3847,
+            None,
+            Some("cairn://p/CAIRN/1/1/planner/task/agent-spawn"),
+            "prod",
+            None,
+        );
+        let b = build_mcp_config_string(
+            "/usr/bin/cairn-cli",
+            3847,
+            None,
+            Some("cairn://p/CAIRN/1/1/planner/task/planbuild-recipe"),
+            "prod",
+            None,
+        );
+
+        // Each run gets its own home URI baked in — no shared file to clobber.
+        let parsed: serde_json::Value = serde_json::from_str(&a).unwrap();
+        assert_eq!(
+            parsed["mcpServers"]["cairn"]["env"]["CAIRN_HOME_URI"]
+                .as_str()
+                .unwrap(),
+            "cairn://p/CAIRN/1/1/planner/task/agent-spawn"
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_build_mcp_config_json_with_agents() {
+        let config = build_mcp_config_json(
+            "/usr/bin/cairn-cli",
+            "http://127.0.0.1:3847/api/mcp",
+            Some("[{\"name\":\"Explore\",\"description\":\"x\"}]"),
+            None,
+            "prod",
             None,
         );
 
         let args = config["mcpServers"]["cairn"]["args"].as_array().unwrap();
-        assert!(args.contains(&serde_json::json!("--schema")));
-        assert!(args.contains(&serde_json::json!("/tmp/schema.json")));
-        assert!(args.contains(&serde_json::json!("--tool-name")));
-        assert!(args.contains(&serde_json::json!("submit")));
+        assert!(args.contains(&serde_json::json!("--agents")));
     }
 }

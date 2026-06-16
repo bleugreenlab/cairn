@@ -1,4 +1,3 @@
-//! Artifact query and annotation operations.
+//! Artifact query operations.
 
-pub mod annotations;
 pub mod queries;

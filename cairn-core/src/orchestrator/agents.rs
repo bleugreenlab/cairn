@@ -3,13 +3,12 @@
 //! Consolidates scope resolution logic for agent configs:
 //! workspace-scoped (`~/.cairn/agents/`) vs project-scoped (`[project]/.cairn/agents/`).
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use crate::config::{agents as config_agents, get_project_path, ConfigResult};
+use crate::config::{agents as config_agents, ConfigResult};
 use crate::models::{AgentConfig, CreateAgentConfig, UpdateAgentConfig};
-use crate::projects;
 
+use super::config_resource::{self, merge_optional, ConfigResource};
 use super::Orchestrator;
 
 /// Convert a file agent to the API model.
@@ -17,8 +16,9 @@ fn file_agent_to_config(
     agent: config_agents::FileAgent,
     workspace_id: Option<String>,
     project_id: Option<String>,
+    now: i64,
 ) -> AgentConfig {
-    let now = chrono::Utc::now().timestamp() as i32;
+    let now = now as i32;
     AgentConfig {
         id: agent.id,
         name: agent.name,
@@ -32,29 +32,215 @@ fn file_agent_to_config(
         updated_at: now,
         disallowed_tools: agent.disallowed_tools,
         skills: agent.skills,
-        approval_policy: agent.approval_policy,
-        filesystem_scope: agent.filesystem_scope,
+        fence: agent.fence,
         backend_preference: agent.backend_preference,
+        // Authoring/display config: no resolved selection until a launch resolves it.
+        selection: None,
+        extras: None,
+    }
+}
+
+pub(crate) struct AgentResource;
+
+impl ConfigResource for AgentResource {
+    type Config = AgentConfig;
+    type File = config_agents::FileAgent;
+    type CreateInput = CreateAgentConfig;
+    type UpdateInput = UpdateAgentConfig;
+
+    const ENTITY_TYPE: &'static str = "agent";
+    const TABLE: &'static str = "agent_configs";
+    const SUBDIR: &'static str = "agents";
+
+    fn list_files(
+        config_dir: &Path,
+        project_path: Option<&Path>,
+    ) -> Result<Vec<ConfigResult<Self::File>>, String> {
+        config_agents::list_agents(config_dir, project_path)
+    }
+
+    fn get_file(
+        config_dir: &Path,
+        id: &str,
+        project_path: Option<&Path>,
+    ) -> Result<Option<Self::File>, String> {
+        config_agents::get_agent(config_dir, id, project_path)
+    }
+
+    fn save_file(
+        config_dir: &Path,
+        file: &Self::File,
+        project_path: Option<&Path>,
+    ) -> Result<PathBuf, String> {
+        config_agents::save_agent(config_dir, file, project_path)
+    }
+
+    fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String> {
+        config_agents::delete_agent(config_dir, id, project_path)
+    }
+
+    fn file_is_project_scoped(file: &Self::File) -> bool {
+        file.is_project_scoped
+    }
+
+    fn to_config(
+        file: Self::File,
+        workspace_id: Option<String>,
+        project_id: Option<String>,
+        now: i64,
+    ) -> Self::Config {
+        file_agent_to_config(file, workspace_id, project_id, now)
+    }
+
+    fn config_name(cfg: &Self::Config) -> &str {
+        &cfg.name
+    }
+
+    fn config_id(cfg: &Self::Config) -> String {
+        cfg.id.clone()
+    }
+
+    fn create_id(input: &Self::CreateInput) -> String {
+        input.id.clone()
+    }
+
+    fn create_input_scopes(input: &Self::CreateInput) -> (Option<String>, Option<String>) {
+        (input.workspace_id.clone(), input.project_id.clone())
+    }
+
+    fn build_create_file(
+        input: Self::CreateInput,
+        id: String,
+        is_project_scoped: bool,
+        _now: i64,
+    ) -> Self::File {
+        config_agents::FileAgent {
+            id,
+            name: input.name,
+            description: input.description,
+            prompt: input.prompt,
+            tools: input.tools,
+            tier: input.tier,
+            fence: input.fence.or_else(|| {
+                Some(crate::models::Fence::from_legacy(
+                    input.sandbox,
+                    input.on_escape,
+                ))
+            }),
+            backend_preference: input.backend_preference,
+            disallowed_tools: input.disallowed_tools,
+            skills: input.skills,
+            hooks: None,
+            is_project_scoped,
+            file_path: PathBuf::new(),
+        }
+    }
+
+    fn update_scope(
+        existing: &Self::File,
+        input: &Self::UpdateInput,
+        _target_project_id: Option<&str>,
+    ) -> (bool, Option<String>) {
+        let is_project_scoped = match (&input.workspace_id, &input.project_id) {
+            (Some(Some(_)), _) => false,
+            (_, Some(Some(_))) => true,
+            _ => existing.is_project_scoped,
+        };
+        let project_id = match &input.project_id {
+            Some(Some(pid)) => Some(pid.clone()),
+            _ => None,
+        };
+        (is_project_scoped, project_id)
+    }
+
+    fn build_update_file(
+        existing: &Self::File,
+        input: Self::UpdateInput,
+        id: &str,
+        new_is_project_scoped: bool,
+        scope_changing: bool,
+        _now: i64,
+    ) -> Self::File {
+        config_agents::FileAgent {
+            id: id.to_string(),
+            name: input.name.unwrap_or_else(|| existing.name.clone()),
+            description: input
+                .description
+                .unwrap_or_else(|| existing.description.clone()),
+            prompt: input.prompt.unwrap_or_else(|| existing.prompt.clone()),
+            tools: input.tools.unwrap_or_else(|| existing.tools.clone()),
+            tier: merge_optional(&existing.tier, &input.tier),
+            fence: merge_optional(&existing.fence, &input.fence),
+            backend_preference: merge_optional(
+                &existing.backend_preference,
+                &input.backend_preference,
+            ),
+            disallowed_tools: merge_optional(&existing.disallowed_tools, &input.disallowed_tools),
+            skills: merge_optional(&existing.skills, &input.skills),
+            hooks: existing.hooks.clone(),
+            is_project_scoped: new_is_project_scoped,
+            file_path: if scope_changing {
+                PathBuf::new()
+            } else {
+                existing.file_path.clone()
+            },
+        }
+    }
+
+    fn cleanup_after_scope_change(existing: &Self::File, _dest_path: &Path) {
+        if let Err(e) = std::fs::remove_file(&existing.file_path) {
+            log::warn!(
+                "Failed to delete old agent file {:?}: {}",
+                existing.file_path,
+                e
+            );
+        }
+    }
+
+    fn target_exists(scope_root: &Path, id: &str, is_project_scoped: bool) -> bool {
+        let root = if is_project_scoped {
+            scope_root.join(".cairn")
+        } else {
+            scope_root.to_path_buf()
+        };
+        root.join(Self::SUBDIR).join(format!("{}.md", id)).exists()
+    }
+
+    fn build_scoped_copy(
+        source: &Self::File,
+        id: &str,
+        is_project_scoped: bool,
+        _workspace_id: Option<String>,
+        _project_id: Option<String>,
+        _now: i64,
+    ) -> Self::File {
+        config_agents::FileAgent {
+            id: id.to_string(),
+            name: source.name.clone(),
+            description: source.description.clone(),
+            prompt: source.prompt.clone(),
+            tools: source.tools.clone(),
+            tier: source.tier.clone(),
+            fence: source.fence,
+            backend_preference: source.backend_preference.clone(),
+            disallowed_tools: source.disallowed_tools.clone(),
+            skills: source.skills.clone(),
+            hooks: source.hooks.clone(),
+            is_project_scoped,
+            file_path: PathBuf::new(),
+        }
+    }
+
+    fn post_save_copy(_source: &Self::File, _dest_path: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn primary_path(file: &Self::File) -> PathBuf {
+        file.file_path.clone()
     }
 }
 
 impl Orchestrator {
-    /// List all project (id, repo_path) pairs from DB.
-    pub(crate) fn all_project_paths(&self) -> Result<Vec<(String, PathBuf)>, String> {
-        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
-        let db_projects = projects::crud::list_db(&mut conn)?;
-        Ok(db_projects
-            .into_iter()
-            .map(|p| (p.id, PathBuf::from(p.repo_path)))
-            .collect())
-    }
-
-    /// Resolve project_id → repo path from DB.
-    pub(crate) fn project_path(&self, project_id: &str) -> Result<PathBuf, String> {
-        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
-        get_project_path(&mut conn, project_id)
-    }
-
     /// List agent configurations with optional scope filters.
     ///
     /// - Both `None`: load from ALL scopes (workspace + all projects)
@@ -65,68 +251,7 @@ impl Orchestrator {
         workspace_id: Option<&str>,
         project_id: Option<&str>,
     ) -> Result<Vec<AgentConfig>, String> {
-        let mut all_agents = Vec::new();
-
-        if workspace_id.is_none() && project_id.is_none() {
-            // Load workspace agents
-            let ws_results = config_agents::list_agents(&self.config_dir, None)?;
-            for result in ws_results {
-                if let ConfigResult::Ok(agent) = result {
-                    if !agent.is_project_scoped {
-                        all_agents.push(file_agent_to_config(
-                            agent,
-                            Some("default".to_string()),
-                            None,
-                        ));
-                    }
-                }
-            }
-
-            // Load agents from all projects
-            let projects = self.all_project_paths()?;
-            for (pid, project_path) in projects {
-                let proj_results =
-                    config_agents::list_agents(&self.config_dir, Some(&project_path))?;
-                for result in proj_results {
-                    if let ConfigResult::Ok(agent) = result {
-                        if agent.is_project_scoped {
-                            all_agents.push(file_agent_to_config(agent, None, Some(pid.clone())));
-                        }
-                    }
-                }
-            }
-        } else {
-            // Load agents for a specific scope
-            let project_path: Option<PathBuf> = if let Some(pid) = project_id {
-                Some(self.project_path(pid)?)
-            } else {
-                None
-            };
-
-            let results = config_agents::list_agents(&self.config_dir, project_path.as_deref())?;
-
-            for result in results {
-                if let ConfigResult::Ok(agent) = result {
-                    let include = match (workspace_id, project_id) {
-                        (Some(_), None) => !agent.is_project_scoped,
-                        (None, Some(_)) => agent.is_project_scoped,
-                        _ => true,
-                    };
-
-                    if include {
-                        let (ws_id, proj_id) = if agent.is_project_scoped {
-                            (None, project_id.map(|s| s.to_string()))
-                        } else {
-                            (workspace_id.map(|s| s.to_string()), None)
-                        };
-                        all_agents.push(file_agent_to_config(agent, ws_id, proj_id));
-                    }
-                }
-            }
-        }
-
-        all_agents.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(all_agents)
+        config_resource::list_configs::<AgentResource>(self, workspace_id, project_id)
     }
 
     /// Get a single agent configuration by ID.
@@ -135,106 +260,12 @@ impl Orchestrator {
         id: &str,
         project_id: Option<&str>,
     ) -> Result<Option<AgentConfig>, String> {
-        // If project_id specified, look there first
-        if let Some(pid) = project_id {
-            let project_path = self.project_path(pid)?;
-            let agent = config_agents::get_agent(&self.config_dir, id, Some(&project_path))?;
-            return Ok(agent.map(|a| {
-                let (ws_id, proj_id) = if a.is_project_scoped {
-                    (None, Some(pid.to_string()))
-                } else {
-                    (Some("default".to_string()), None)
-                };
-                file_agent_to_config(a, ws_id, proj_id)
-            }));
-        }
-
-        // No project_id — try workspace first
-        if let Some(agent) = config_agents::get_agent(&self.config_dir, id, None)? {
-            if !agent.is_project_scoped {
-                return Ok(Some(file_agent_to_config(
-                    agent,
-                    Some("default".to_string()),
-                    None,
-                )));
-            }
-        }
-
-        // Search all projects
-        let projects = self.all_project_paths()?;
-        for (pid, project_path) in projects {
-            if let Some(agent) =
-                config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
-            {
-                if agent.is_project_scoped {
-                    return Ok(Some(file_agent_to_config(agent, None, Some(pid))));
-                }
-            }
-        }
-
-        Ok(None)
+        config_resource::get_config::<AgentResource>(self, id, project_id)
     }
 
     /// Create a new agent configuration.
     pub fn create_agent_config(&self, input: CreateAgentConfig) -> Result<AgentConfig, String> {
-        if input.workspace_id.is_none() == input.project_id.is_none() {
-            return Err("Exactly one of workspace_id or project_id must be set".to_string());
-        }
-
-        let project_path: Option<PathBuf> = if let Some(ref pid) = input.project_id {
-            Some(self.project_path(pid)?)
-        } else {
-            None
-        };
-
-        let is_project_scoped = project_path.is_some();
-
-        let file_agent = config_agents::FileAgent {
-            id: input.id.clone(),
-            name: input.name.clone(),
-            description: input.description.clone(),
-            prompt: input.prompt.clone(),
-            tools: input.tools.clone(),
-            tier: input.tier.clone(),
-            approval_policy: input.approval_policy,
-            filesystem_scope: input.filesystem_scope,
-            backend_preference: input.backend_preference.clone(),
-            disallowed_tools: input.disallowed_tools.clone(),
-            skills: input.skills.clone(),
-            hooks: None,
-            is_project_scoped,
-            file_path: PathBuf::new(),
-        };
-
-        config_agents::save_agent(&self.config_dir, &file_agent, project_path.as_deref())?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "agent", "action": "created", "id": input.id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "agent_configs", "action": "insert"}),
-        );
-
-        let now = chrono::Utc::now().timestamp() as i32;
-        Ok(AgentConfig {
-            id: input.id,
-            name: input.name,
-            description: input.description,
-            prompt: input.prompt,
-            tools: input.tools,
-            tier: input.tier,
-            workspace_id: input.workspace_id,
-            project_id: input.project_id,
-            created_at: now,
-            updated_at: now,
-            disallowed_tools: input.disallowed_tools,
-            skills: input.skills,
-            approval_policy: input.approval_policy,
-            filesystem_scope: input.filesystem_scope,
-            backend_preference: input.backend_preference,
-        })
+        config_resource::create_config::<AgentResource>(self, input)
     }
 
     /// Update an existing agent configuration.
@@ -244,179 +275,12 @@ impl Orchestrator {
         input: UpdateAgentConfig,
         target_project_id: Option<&str>,
     ) -> Result<AgentConfig, String> {
-        // Find existing agent in the targeted scope
-        let existing = {
-            if let Some(pid) = target_project_id {
-                let project_path = self.project_path(pid)?;
-                config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
-                    .ok_or_else(|| format!("Agent not found: {}", id))?
-            } else if let Some(agent) = config_agents::get_agent(&self.config_dir, id, None)? {
-                agent
-            } else {
-                let projects = self.all_project_paths()?;
-                let mut found: Option<config_agents::FileAgent> = None;
-                for (_pid, project_path) in projects {
-                    if let Some(agent) =
-                        config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
-                    {
-                        found = Some(agent);
-                        break;
-                    }
-                }
-                found.ok_or_else(|| format!("Agent not found: {}", id))?
-            }
-        };
-
-        // Merge updates
-        let name = input.name.unwrap_or(existing.name);
-        let description = input.description.unwrap_or(existing.description);
-        let prompt = input.prompt.unwrap_or(existing.prompt);
-        let tools = input.tools.unwrap_or(existing.tools);
-        let tier = match input.tier {
-            None => existing.tier,
-            Some(None) => None,
-            Some(Some(m)) => Some(m),
-        };
-        let backend_preference = match input.backend_preference {
-            None => existing.backend_preference,
-            Some(None) => None,
-            Some(Some(value)) => Some(value),
-        };
-        let disallowed_tools = match input.disallowed_tools {
-            None => existing.disallowed_tools,
-            Some(None) => None,
-            Some(Some(v)) => Some(v),
-        };
-        let skills = match input.skills {
-            None => existing.skills,
-            Some(None) => None,
-            Some(Some(v)) => Some(v),
-        };
-        let approval_policy = match input.approval_policy {
-            None => existing.approval_policy,
-            Some(None) => None,
-            Some(Some(ap)) => Some(ap),
-        };
-        let filesystem_scope = match input.filesystem_scope {
-            None => existing.filesystem_scope,
-            Some(None) => None,
-            Some(Some(fm)) => Some(fm),
-        };
-
-        // Determine new scope
-        let new_is_project_scoped = match (&input.workspace_id, &input.project_id) {
-            (Some(Some(_)), _) => false,
-            (_, Some(Some(_))) => true,
-            _ => existing.is_project_scoped,
-        };
-
-        let new_project_id: Option<String> = match &input.project_id {
-            Some(Some(pid)) => Some(pid.clone()),
-            Some(None) => None,
-            None => None,
-        };
-
-        let scope_changing = new_is_project_scoped != existing.is_project_scoped;
-
-        let new_project_path: Option<PathBuf> = if new_is_project_scoped {
-            if let Some(ref pid) = new_project_id {
-                Some(self.project_path(pid)?)
-            } else if scope_changing {
-                return Err("Project ID required when changing to project scope".to_string());
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let file_agent = config_agents::FileAgent {
-            id: id.to_string(),
-            name: name.clone(),
-            description: description.clone(),
-            prompt: prompt.clone(),
-            tools: tools.clone(),
-            tier: tier.clone(),
-            approval_policy,
-            filesystem_scope,
-            backend_preference: backend_preference.clone(),
-            disallowed_tools: disallowed_tools.clone(),
-            skills: skills.clone(),
-            hooks: existing.hooks.clone(),
-            is_project_scoped: new_is_project_scoped,
-            file_path: if scope_changing {
-                PathBuf::new()
-            } else {
-                existing.file_path.clone()
-            },
-        };
-
-        config_agents::save_agent(&self.config_dir, &file_agent, new_project_path.as_deref())?;
-
-        // Delete old file if scope changed
-        if scope_changing {
-            if let Err(e) = std::fs::remove_file(&existing.file_path) {
-                log::warn!(
-                    "Failed to delete old agent file {:?}: {}",
-                    existing.file_path,
-                    e
-                );
-            }
-        }
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "agent", "action": "modified", "id": id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "agent_configs", "action": "update"}),
-        );
-
-        let now = chrono::Utc::now().timestamp() as i32;
-        Ok(AgentConfig {
-            id: id.to_string(),
-            name,
-            description,
-            prompt,
-            tools,
-            tier,
-            workspace_id: if !new_is_project_scoped {
-                Some("default".to_string())
-            } else {
-                None
-            },
-            project_id: new_project_id,
-            created_at: now,
-            updated_at: now,
-            disallowed_tools,
-            skills,
-            approval_policy,
-            filesystem_scope,
-            backend_preference,
-        })
+        config_resource::update_config::<AgentResource>(self, id, input, target_project_id)
     }
 
     /// Delete an agent configuration.
     pub fn delete_agent_config(&self, id: &str, project_id: Option<&str>) -> Result<(), String> {
-        let project_path: Option<PathBuf> = if let Some(pid) = project_id {
-            Some(self.project_path(pid)?)
-        } else {
-            None
-        };
-
-        config_agents::delete_agent(&self.config_dir, id, project_path.as_deref())?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "agent", "action": "removed", "id": id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "agent_configs", "action": "delete"}),
-        );
-
-        Ok(())
+        config_resource::delete_config::<AgentResource>(self, id, project_id)
     }
 
     /// Create a project override of an agent (from any scope).
@@ -424,67 +288,7 @@ impl Orchestrator {
     /// Resolves the agent with project context, then copies it to the target project.
     /// Errors if the target project already has an override with the same ID.
     pub fn create_agent_override(&self, id: &str, project_id: &str) -> Result<AgentConfig, String> {
-        let project_path = self.project_path(project_id)?;
-
-        // Resolve agent: try project context first (which gives project > workspace),
-        // then fall back to workspace-only lookup
-        let source = config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
-            .ok_or_else(|| format!("Agent not found: {}", id))?;
-
-        let target_path = project_path
-            .join(".cairn")
-            .join("agents")
-            .join(format!("{}.md", id));
-        if target_path.exists() {
-            return Err(format!("Agent '{}' already exists in this project", id));
-        }
-
-        let override_agent = config_agents::FileAgent {
-            id: id.to_string(),
-            name: source.name.clone(),
-            description: source.description.clone(),
-            prompt: source.prompt.clone(),
-            tools: source.tools.clone(),
-            tier: source.tier.clone(),
-            approval_policy: source.approval_policy,
-            filesystem_scope: source.filesystem_scope,
-            backend_preference: source.backend_preference.clone(),
-            disallowed_tools: source.disallowed_tools.clone(),
-            skills: source.skills.clone(),
-            hooks: source.hooks.clone(),
-            is_project_scoped: true,
-            file_path: PathBuf::new(),
-        };
-
-        config_agents::save_agent(&self.config_dir, &override_agent, Some(&project_path))?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "agent", "action": "created", "id": id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "agent_configs", "action": "insert"}),
-        );
-
-        let now = chrono::Utc::now().timestamp() as i32;
-        Ok(AgentConfig {
-            id: id.to_string(),
-            name: source.name,
-            description: source.description,
-            prompt: source.prompt,
-            tools: source.tools,
-            tier: source.tier,
-            workspace_id: None,
-            project_id: Some(project_id.to_string()),
-            created_at: now,
-            updated_at: now,
-            disallowed_tools: source.disallowed_tools,
-            skills: source.skills,
-            approval_policy: source.approval_policy,
-            filesystem_scope: source.filesystem_scope,
-            backend_preference: source.backend_preference,
-        })
+        config_resource::create_override::<AgentResource>(self, id, project_id)
     }
 
     /// Promote a project-only agent to workspace scope.
@@ -497,100 +301,103 @@ impl Orchestrator {
         id: &str,
         source_project_id: &str,
     ) -> Result<AgentConfig, String> {
-        let project_path = self.project_path(source_project_id)?;
-
-        // Load the project-scoped agent
-        let source = config_agents::get_agent(&self.config_dir, id, Some(&project_path))?
-            .ok_or_else(|| format!("Agent not found in project: {}", id))?;
-
-        if !source.is_project_scoped {
-            return Err("Agent is not project-scoped".to_string());
-        }
-
-        // Check workspace version doesn't already exist
-        let ws_path = self.config_dir.join("agents").join(format!("{}.md", id));
-        if ws_path.exists() {
-            return Err(format!("Agent '{}' already exists at workspace scope", id));
-        }
-
-        // Copy to workspace
-        let ws_agent = config_agents::FileAgent {
-            id: id.to_string(),
-            name: source.name.clone(),
-            description: source.description.clone(),
-            prompt: source.prompt.clone(),
-            tools: source.tools.clone(),
-            tier: source.tier.clone(),
-            approval_policy: source.approval_policy,
-            filesystem_scope: source.filesystem_scope,
-            backend_preference: source.backend_preference.clone(),
-            disallowed_tools: source.disallowed_tools.clone(),
-            skills: source.skills.clone(),
-            hooks: source.hooks.clone(),
-            is_project_scoped: false,
-            file_path: PathBuf::new(),
-        };
-
-        config_agents::save_agent(&self.config_dir, &ws_agent, None)?;
-
-        let _ = self.services.emitter.emit(
-            "config-changed",
-            serde_json::json!({"entity_type": "agent", "action": "created", "id": id}),
-        );
-        let _ = self.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "agent_configs", "action": "insert"}),
-        );
-
-        let now = chrono::Utc::now().timestamp() as i32;
-        Ok(AgentConfig {
-            id: id.to_string(),
-            name: source.name,
-            description: source.description,
-            prompt: source.prompt,
-            tools: source.tools,
-            tier: source.tier,
-            workspace_id: Some("default".to_string()),
-            project_id: None,
-            created_at: now,
-            updated_at: now,
-            disallowed_tools: source.disallowed_tools,
-            skills: source.skills,
-            approval_policy: source.approval_policy,
-            filesystem_scope: source.filesystem_scope,
-            backend_preference: source.backend_preference,
-        })
+        config_resource::promote_to_workspace::<AgentResource>(self, id, source_project_id)
     }
 
     /// List agents for a project context with workspace→project shadowing.
     pub fn list_agents_for_context(&self, project_id: &str) -> Result<Vec<AgentConfig>, String> {
-        let project_path = self.project_path(project_id)?;
-        let mut agents_map: HashMap<String, AgentConfig> = HashMap::new();
+        config_resource::list_for_context::<AgentResource>(self, project_id)
+    }
+}
 
-        // Workspace agents first
-        let ws_results = config_agents::list_agents(&self.config_dir, None)?;
-        for result in ws_results {
-            if let ConfigResult::Ok(agent) = result {
-                if !agent.is_project_scoped {
-                    let config = file_agent_to_config(agent, Some("default".to_string()), None);
-                    agents_map.insert(config.id.clone(), config);
-                }
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use crate::db::DbState;
+    use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use std::sync::Arc;
 
-        // Project agents shadow workspace agents with same ID
-        let proj_results = config_agents::list_agents(&self.config_dir, Some(&project_path))?;
-        for result in proj_results {
-            if let ConfigResult::Ok(agent) = result {
-                if agent.is_project_scoped {
-                    let config = file_agent_to_config(agent, None, Some(project_id.to_string()));
-                    agents_map.insert(config.id.clone(), config);
-                }
-            }
-        }
+    async fn build_orch(config_dir: std::path::PathBuf) -> Orchestrator {
+        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("orch.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db, services, config_dir).build()
+    }
 
-        let mut agents: Vec<AgentConfig> = agents_map.into_values().collect();
-        agents.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(agents)
+    /// A config file the loader rejects must not vanish: it stays out of the
+    /// valid list but surfaces through `list_invalid_configs` with its error.
+    #[tokio::test]
+    async fn invalid_agent_file_surfaces_through_list_path() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let agents_dir = config_dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("good.md"),
+            "---\nname: Good\ndescription: ok\ntools: Read\n---\n\nprompt",
+        )
+        .unwrap();
+        std::fs::write(agents_dir.join("broken.md"), "no frontmatter here").unwrap();
+
+        let orch = build_orch(config_dir.path().to_path_buf()).await;
+
+        let valid = orch.list_agent_configs(None, None).unwrap();
+        assert_eq!(valid.len(), 1, "only the valid agent should list");
+        assert_eq!(valid[0].id, "good");
+
+        let invalid = orch.list_invalid_configs(None, None).unwrap();
+        assert_eq!(invalid.len(), 1, "the broken agent must surface as invalid");
+        assert_eq!(invalid[0].id, "broken");
+        assert_eq!(invalid[0].entity_type, "agent");
+        assert!(invalid[0].project_id.is_none());
+        assert!(
+            !invalid[0].error.is_empty(),
+            "invalid entry must carry the parse error"
+        );
+    }
+
+    /// An agent the Settings form writes (empty tools) round-trips: it lists
+    /// normally and never appears as invalid.
+    #[tokio::test]
+    async fn ui_created_empty_tools_agent_lists_without_invalid() {
+        use crate::models::CreateAgentConfig;
+
+        let config_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config_dir.path().join("agents")).unwrap();
+        let orch = build_orch(config_dir.path().to_path_buf()).await;
+
+        orch.create_agent_config(CreateAgentConfig {
+            id: "my-agent".to_string(),
+            name: "My Agent".to_string(),
+            description: "desc".to_string(),
+            prompt: "prompt".to_string(),
+            tools: vec![],
+            tier: Some(crate::models::Model::new("xl")),
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            disallowed_tools: None,
+            skills: None,
+            fence: None,
+            on_escape: None,
+            sandbox: None,
+            backend_preference: None,
+        })
+        .unwrap();
+
+        let valid = orch.list_agent_configs(None, None).unwrap();
+        assert_eq!(valid.len(), 1);
+        assert_eq!(valid[0].id, "my-agent");
+        assert!(valid[0].tools.is_empty());
+
+        let invalid = orch.list_invalid_configs(None, None).unwrap();
+        assert!(invalid.is_empty(), "UI-created agent must not be invalid");
     }
 }

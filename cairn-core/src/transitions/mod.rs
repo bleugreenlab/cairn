@@ -23,14 +23,13 @@
 //! transitions::resolve_issue(&mut conn, &emitter, issue_id, Resolution::Merged)?;
 //! ```
 
-pub mod job;
 pub mod outcome;
+pub mod projection;
 mod run;
 mod session;
 mod status;
 pub mod turn;
 
-pub use job::transition_job;
 pub use run::{set_exit_reason, transition_run};
 pub use session::transition_session;
 pub use status::{

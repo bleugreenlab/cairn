@@ -79,16 +79,23 @@ pub fn list_skills(
     project_path: Option<&Path>,
 ) -> Result<Vec<ConfigResult<FileSkill>>, String> {
     let mut results = vec![];
+    let mut project_migrated = false;
 
-    let ws_dir = config_dir.join("skills");
-    if ws_dir.exists() {
-        scan_skills_dir(&ws_dir, false, &mut results)?;
+    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "skills") {
+        if dir.exists() && dir.is_dir() {
+            let mut migrated = false;
+            scan_skills_dir(&dir, is_project_scoped, &mut results, &mut migrated)?;
+            if migrated && is_project_scoped {
+                project_migrated = true;
+            }
+        }
     }
 
-    if let Some(proj_path) = project_path {
-        let proj_dir = proj_path.join(".cairn").join("skills");
-        if proj_dir.exists() && proj_dir.is_dir() {
-            scan_skills_dir(&proj_dir, true, &mut results)?;
+    // A project-scoped legacy `.md` skill was rewritten to directory format in
+    // the canonical checkout; commit it so it does not float as dirty state.
+    if project_migrated {
+        if let Some(project_path) = project_path {
+            super::commit_project_config_change(project_path, "cairn: migrate skills");
         }
     }
 
@@ -99,6 +106,7 @@ fn scan_skills_dir(
     dir: &Path,
     is_project_scoped: bool,
     results: &mut Vec<ConfigResult<FileSkill>>,
+    migrated: &mut bool,
 ) -> Result<(), String> {
     let entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("Failed to read skills directory: {}", e))?
@@ -125,6 +133,7 @@ fn scan_skills_dir(
                 if !dir_ids.contains(&id) {
                     match migrate_legacy_skill(dir, &id) {
                         Ok(()) => {
+                            *migrated = true;
                             log::info!("Auto-migrated legacy skill: {}", id);
                             let migrated_dir = dir.join(&id);
                             results.push(load_skill_dir(&migrated_dir, is_project_scoped));
@@ -153,15 +162,26 @@ pub fn get_skill(
     id: &str,
     project_path: Option<&Path>,
 ) -> Result<Option<FileSkill>, String> {
-    if let Some(proj_path) = project_path {
-        let skills_dir = proj_path.join(".cairn").join("skills");
-        if let Some(skill) = get_skill_from_dir(&skills_dir, id, true)? {
+    for (skills_dir, is_project_scoped) in
+        super::config_root_subdirs(config_dir, project_path, "skills")
+    {
+        let mut migrated = false;
+        let skill = get_skill_from_dir(&skills_dir, id, is_project_scoped, &mut migrated)?;
+        // A project-scoped legacy `.md` skill was rewritten to directory format in
+        // the canonical checkout; commit it so it does not float as dirty state.
+        if migrated && is_project_scoped {
+            if let Some(project_path) = project_path {
+                super::commit_project_config_change(
+                    project_path,
+                    &format!("cairn: migrate skill {id}"),
+                );
+            }
+        }
+        if let Some(skill) = skill {
             return Ok(Some(skill));
         }
     }
-
-    let skills_dir = config_dir.join("skills");
-    get_skill_from_dir(&skills_dir, id, false)
+    Ok(None)
 }
 
 /// Try to load a skill from a skills directory, auto-migrating legacy files.
@@ -169,6 +189,7 @@ fn get_skill_from_dir(
     skills_dir: &Path,
     id: &str,
     is_project_scoped: bool,
+    migrated: &mut bool,
 ) -> Result<Option<FileSkill>, String> {
     let dir_path = skills_dir.join(id);
     if dir_path.join("SKILL.md").exists() {
@@ -182,6 +203,7 @@ fn get_skill_from_dir(
     let legacy_path = skills_dir.join(format!("{}.md", id));
     if legacy_path.exists() {
         migrate_legacy_skill(skills_dir, id)?;
+        *migrated = true;
         return match load_skill_dir(&dir_path, is_project_scoped) {
             ConfigResult::Ok(skill) => Ok(Some(skill)),
             ConfigResult::Err { error, .. } => Err(error),
@@ -452,12 +474,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn write_skill_md(dir: &std::path::Path, markdown: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), markdown).unwrap();
+    }
+
     #[test]
     fn test_load_skill_dir_basic() {
         let temp = tempdir().unwrap();
         let skill_dir = temp.path().join("skills").join("testing");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: testing\ndescription: Test skill\nallowed-tools: Read Grep\nmetadata:\n  model: sonnet\n  display-name: Testing\n---\n\nRun the tests.\n").unwrap();
+        write_skill_md(&skill_dir, "---\nname: testing\ndescription: Test skill\nallowed-tools: Read Grep\nmetadata:\n  model: sonnet\n  display-name: Testing\n---\n\nRun the tests.\n");
 
         match load_skill_dir(&skill_dir, false) {
             ConfigResult::Ok(s) => {
@@ -476,12 +502,7 @@ mod tests {
     fn test_load_skill_dir_with_meta() {
         let temp = tempdir().unwrap();
         let d = temp.path().join("skills").join("testing");
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(
-            d.join("SKILL.md"),
-            "---\nname: testing\ndescription: Test\n---\n\nPrompt.",
-        )
-        .unwrap();
+        write_skill_md(&d, "---\nname: testing\ndescription: Test\n---\n\nPrompt.");
         std::fs::write(
             d.join(".meta.json"),
             r#"{"created_by":"Reviewer","source_issue":"CAIRN-949"}"#,
@@ -505,11 +526,7 @@ mod tests {
         std::fs::create_dir_all(d.join("references")).unwrap();
         std::fs::create_dir_all(d.join("scripts")).unwrap();
         std::fs::create_dir_all(d.join("assets")).unwrap();
-        std::fs::write(
-            d.join("SKILL.md"),
-            "---\nname: testing\ndescription: Test\n---\n\nPrompt.",
-        )
-        .unwrap();
+        write_skill_md(&d, "---\nname: testing\ndescription: Test\n---\n\nPrompt.");
 
         match load_skill_dir(&d, false) {
             ConfigResult::Ok(s) => {
@@ -583,11 +600,7 @@ mod tests {
             r#"{"created_at":"2026-01-01T00:00:00Z","created_by":"original"}"#,
         )
         .unwrap();
-        std::fs::write(
-            d.join("SKILL.md"),
-            "---\nname: testing\ndescription: Test\n---\n\nPrompt.",
-        )
-        .unwrap();
+        write_skill_md(&d, "---\nname: testing\ndescription: Test\n---\n\nPrompt.");
 
         let skill = FileSkill {
             id: "testing".into(),
@@ -626,12 +639,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let cfg = temp.path();
         let d = cfg.join("skills/testing");
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(
-            d.join("SKILL.md"),
-            "---\nname: testing\ndescription: Test\n---\n\nPrompt.",
-        )
-        .unwrap();
+        write_skill_md(&d, "---\nname: testing\ndescription: Test\n---\n\nPrompt.");
 
         delete_skill(cfg, "testing", None).unwrap();
         assert!(!d.exists());
@@ -682,12 +690,10 @@ mod tests {
 
         // A valid skill directory
         let valid = sd.join("valid-skill");
-        std::fs::create_dir_all(&valid).unwrap();
-        std::fs::write(
-            valid.join("SKILL.md"),
+        write_skill_md(
+            &valid,
             "---\nname: valid-skill\ndescription: Valid\n---\n\nPrompt.",
-        )
-        .unwrap();
+        );
 
         let results = list_skills(temp.path(), None).unwrap();
         // Should have 2: the valid dir + the auto-migrated legacy
@@ -728,12 +734,10 @@ mod tests {
 
         // One already-migrated (directory exists)
         let existing = sd.join("alpha");
-        std::fs::create_dir_all(&existing).unwrap();
-        std::fs::write(
-            existing.join("SKILL.md"),
+        write_skill_md(
+            &existing,
             "---\nname: alpha\ndescription: Already\n---\n\nExisting.",
-        )
-        .unwrap();
+        );
 
         let migrated = migrate_all_legacy_skills(cfg, None);
         // Only beta should be migrated (alpha dir already exists)
@@ -751,22 +755,18 @@ mod tests {
 
         // Create workspace skill
         let ws_dir = cfg.join("skills/my-skill");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::write(
-            ws_dir.join("SKILL.md"),
+        write_skill_md(
+            &ws_dir,
             "---\nname: my-skill\ndescription: WS\n---\n\nWS prompt.",
-        )
-        .unwrap();
+        );
 
         // Create project skill with same ID
         let proj = temp.path().join("project");
         let proj_dir = proj.join(".cairn/skills/my-skill");
-        std::fs::create_dir_all(&proj_dir).unwrap();
-        std::fs::write(
-            proj_dir.join("SKILL.md"),
+        write_skill_md(
+            &proj_dir,
             "---\nname: my-skill\ndescription: Proj\n---\n\nProj prompt.",
-        )
-        .unwrap();
+        );
 
         // Delete with project_path — should remove project version
         delete_skill(cfg, "my-skill", Some(&proj)).unwrap();
@@ -783,22 +783,18 @@ mod tests {
 
         // Create workspace skill
         let ws_dir = cfg.join("skills/my-skill");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::write(
-            ws_dir.join("SKILL.md"),
+        write_skill_md(
+            &ws_dir,
             "---\nname: my-skill\ndescription: Workspace version\n---\n\nWS.",
-        )
-        .unwrap();
+        );
 
         // Create project skill
         let proj = temp.path().join("project");
         let proj_dir = proj.join(".cairn/skills/my-skill");
-        std::fs::create_dir_all(&proj_dir).unwrap();
-        std::fs::write(
-            proj_dir.join("SKILL.md"),
+        write_skill_md(
+            &proj_dir,
             "---\nname: my-skill\ndescription: Project version\n---\n\nProj.",
-        )
-        .unwrap();
+        );
 
         let skill = get_skill(cfg, "my-skill", Some(&proj)).unwrap().unwrap();
         assert_eq!(skill.description, "Project version");
@@ -827,5 +823,86 @@ mod tests {
         assert_eq!(m.created_by, Some("builder-1".into()));
         assert_eq!(m.updated_by, Some("builder-1".into()));
         assert!(m.created_at.is_some());
+    }
+
+    fn init_git_repo(path: &Path) {
+        assert!(crate::env::git()
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn commit_all(repo: &Path, msg: &str) {
+        crate::env::git()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        crate::env::git()
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@local.invalid",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+    }
+
+    fn git_status(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["status", "--porcelain"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_head_subject(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn legacy_project_skill_migration_commits_in_canonical_repo() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        init_git_repo(&project);
+
+        let skills_dir = project.join(".cairn").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("legacy.md"),
+            "---\nname: Legacy\ndescription: Old skill\n---\n\nBody.\n",
+        )
+        .unwrap();
+        commit_all(&project, "seed legacy skill");
+
+        // Resolving the skill migrates legacy.md -> legacy/SKILL.md and commits it.
+        let skill = get_skill(&config_dir, "legacy", Some(&project))
+            .unwrap()
+            .unwrap();
+        assert!(skill.dir_path.join("SKILL.md").exists());
+        assert!(!skills_dir.join("legacy.md").exists());
+
+        assert!(
+            git_status(&project).is_empty(),
+            "migration left the canonical repo dirty"
+        );
+        assert_eq!(git_head_subject(&project), "cairn: migrate skill legacy");
     }
 }

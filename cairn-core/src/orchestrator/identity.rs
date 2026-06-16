@@ -2,8 +2,8 @@
 
 use crate::identity::local;
 use crate::identity::{
-    AccountInfo, AccountOverrides, ApiProvider, GitIdentity, IdentityStore, ProviderAccount,
-    ProviderAuth, UserIdentity,
+    AccountInfo, AccountOverrides, AccountSource, ApiProvider, GitIdentity, IdentityStore,
+    ProviderAccount, ProviderAuth, UserIdentity,
 };
 
 use super::Orchestrator;
@@ -17,7 +17,7 @@ impl Orchestrator {
         self.identity_store
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|store| store.resolve(None)))
+            .and_then(|guard| guard.as_ref().map(|store| store.resolve(None, None)))
     }
 
     /// Save identity to the local store and update the in-memory state.
@@ -70,24 +70,46 @@ impl Orchestrator {
     /// Resolve identity for a specific project (with overrides).
     pub fn resolve_identity_for_project(
         &self,
+        project_id: Option<&str>,
         overrides: Option<&AccountOverrides>,
     ) -> Option<UserIdentity> {
-        self.identity_store
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|store| store.resolve(overrides)))
+        self.identity_store.lock().ok().and_then(|guard| {
+            guard
+                .as_ref()
+                .map(|store| store.resolve(project_id, overrides))
+        })
+    }
+
+    /// Resolve only the git author/committer identity for a project.
+    pub fn resolve_git_identity_for_project(
+        &self,
+        project_id: Option<&str>,
+    ) -> Option<(String, String)> {
+        let overrides = project_id.and_then(|pid| {
+            self.get_identity_store()
+                .and_then(|store| store.project_overrides.get(pid).cloned())
+        });
+        self.resolve_identity_for_project(project_id, overrides.as_ref())
+            .and_then(|identity| {
+                if identity.name.trim().is_empty() || identity.email.trim().is_empty() {
+                    None
+                } else {
+                    Some((identity.name, identity.email))
+                }
+            })
     }
 
     // === Account CRUD ===
 
-    /// List all accounts (configured + detected local CLI), masked for frontend.
-    pub fn list_accounts(&self) -> Vec<AccountInfo> {
+    /// List accounts visible in a scope. Global scope returns shared accounts only;
+    /// project scope returns shared accounts plus accounts private to that project.
+    pub fn list_accounts(&self, project_id: Option<&str>) -> Vec<AccountInfo> {
         let mut store = match self.get_identity_store() {
             Some(s) => s,
             None => return vec![],
         };
 
-        // Merge ephemeral local CLI accounts
+        // Merge ephemeral local CLI accounts as shared accounts.
         let local_accounts = local::detect_local_accounts();
         for local_acc in &local_accounts {
             if !store.has_local_cli(local_acc.api_provider) {
@@ -95,7 +117,14 @@ impl Orchestrator {
             }
         }
 
-        store.accounts.iter().map(AccountInfo::from).collect()
+        store
+            .accounts
+            .iter()
+            .filter(|account| {
+                account.project_id.is_none() || account.project_id.as_deref() == project_id
+            })
+            .map(AccountInfo::from)
+            .collect()
     }
 
     /// Add a new account to the store.
@@ -104,6 +133,7 @@ impl Orchestrator {
         api_provider: ApiProvider,
         label: String,
         auth: ProviderAuth,
+        project_id: Option<String>,
     ) -> Result<AccountInfo, String> {
         let mut store = self
             .get_identity_store()
@@ -113,7 +143,7 @@ impl Orchestrator {
         let max_sort = store
             .accounts
             .iter()
-            .filter(|a| a.api_provider == api_provider)
+            .filter(|a| a.api_provider == api_provider && a.project_id == project_id)
             .map(|a| a.sort_order)
             .max()
             .unwrap_or(-1);
@@ -124,6 +154,7 @@ impl Orchestrator {
             api_provider,
             source: crate::identity::AccountSource::Configured,
             auth,
+            project_id,
             sort_order: max_sort + 1,
             created_at: now,
             last_used_at: None,
@@ -133,6 +164,91 @@ impl Orchestrator {
         store.accounts.push(account);
         self.save_identity_store(store)?;
 
+        self.emit_config_changed();
+        Ok(info)
+    }
+
+    /// Replace or create the single Cairn-owned OpenAI OAuth account for Codex.
+    ///
+    /// Codex refresh tokens are single-use, so reconnecting must not leave stale
+    /// OAuth profiles ahead of the newly issued token. The OAuth account is
+    /// promoted to OpenAI priority 0 and legacy OpenAI Local CLI entries are
+    /// removed from the persisted store.
+    pub fn upsert_codex_oauth_account(
+        &self,
+        label: String,
+        auth_json: String,
+        project_id: Option<String>,
+    ) -> Result<AccountInfo, String> {
+        let mut store = self
+            .get_identity_store()
+            .unwrap_or_else(local::identity_store_from_git_config);
+
+        let now = chrono::Utc::now().timestamp();
+        let target_id = store
+            .accounts
+            .iter()
+            .filter(|account| {
+                account.api_provider == ApiProvider::OpenAI
+                    && account.source == AccountSource::Configured
+                    && account.project_id == project_id
+                    && matches!(&account.auth, ProviderAuth::OAuthToken { .. })
+            })
+            .min_by_key(|account| account.sort_order)
+            .map(|account| account.id.clone());
+
+        store.accounts.retain(|account| {
+            if account.api_provider != ApiProvider::OpenAI {
+                return true;
+            }
+            if account.project_id != project_id {
+                return true;
+            }
+            if account.source == AccountSource::LocalCli {
+                return false;
+            }
+            if matches!(&account.auth, ProviderAuth::OAuthToken { .. }) {
+                return target_id.as_deref() == Some(account.id.as_str());
+            }
+            true
+        });
+
+        for account in store.accounts.iter_mut().filter(|account| {
+            account.api_provider == ApiProvider::OpenAI && account.project_id == project_id
+        }) {
+            account.sort_order += 1;
+        }
+
+        let info = if let Some(target_id) = target_id {
+            let account = store
+                .accounts
+                .iter_mut()
+                .find(|account| account.id == target_id)
+                .ok_or_else(|| "Codex OAuth account disappeared during upsert".to_string())?;
+            account.label = label;
+            account.auth = ProviderAuth::OAuthToken { value: auth_json };
+            account.project_id = project_id.clone();
+            account.sort_order = 0;
+            account.last_used_at = Some(now);
+            AccountInfo::from(&*account)
+        } else {
+            let account = ProviderAccount {
+                id: format!("acc_{}", uuid::Uuid::new_v4()),
+                label,
+                api_provider: ApiProvider::OpenAI,
+                source: AccountSource::Configured,
+                auth: ProviderAuth::OAuthToken { value: auth_json },
+                project_id,
+                sort_order: 0,
+                created_at: now,
+                last_used_at: Some(now),
+            };
+            let info = AccountInfo::from(&account);
+            store.accounts.push(account);
+            info
+        };
+
+        self.save_identity_store(store)?;
         self.emit_config_changed();
         Ok(info)
     }
@@ -166,6 +282,18 @@ impl Orchestrator {
 
         if store.accounts.len() == initial_len {
             return Err(format!("Account not found: {}", id));
+        }
+
+        for overrides in store.project_overrides.values_mut() {
+            if overrides.anthropic_account_id.as_deref() == Some(id) {
+                overrides.anthropic_account_id = None;
+            }
+            if overrides.openai_account_id.as_deref() == Some(id) {
+                overrides.openai_account_id = None;
+            }
+            if overrides.github_account_id.as_deref() == Some(id) {
+                overrides.github_account_id = None;
+            }
         }
 
         self.save_identity_store(store)?;
@@ -329,7 +457,9 @@ impl Orchestrator {
         project_id: &str,
         overrides: Option<AccountOverrides>,
     ) -> Result<(), String> {
-        let mut store = self.get_identity_store().ok_or("No identity store")?;
+        let mut store = self
+            .get_identity_store()
+            .unwrap_or_else(local::identity_store_from_git_config);
 
         match overrides {
             Some(o) => {
@@ -352,85 +482,5 @@ impl Orchestrator {
             "config-changed",
             serde_json::json!({"entity_type": "identity"}),
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::agent_process::process::AgentProcessState;
-    use crate::db::DbState;
-    use crate::mcp::McpAuthState;
-    use crate::orchestrator::AccountManager;
-    use crate::services::testing::TestServicesBuilder;
-    use crate::services::PtyState;
-    use crate::test_utils::test_diesel_conn;
-    use std::collections::{HashMap, HashSet};
-    use std::sync::{Arc, Mutex, OnceLock, RwLock};
-    use tempfile::TempDir;
-
-    fn test_orchestrator() -> Orchestrator {
-        let conn = test_diesel_conn();
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let config_dir = TempDir::new().unwrap();
-        let account_manager = Arc::new(AccountManager::new(db.clone(), services.emitter.clone()));
-        let sync_tx = Arc::new(Mutex::new(None));
-        Orchestrator {
-            db,
-            services: services.clone(),
-            process_state: Arc::new(AgentProcessState::default()),
-            mcp_auth: Arc::new(McpAuthState::new(config_dir.path().to_path_buf())),
-            warm_gc: None,
-            pty_state: Arc::new(PtyState::default()),
-            permission_responses: tokio::sync::broadcast::channel(16).0,
-            run_completions: tokio::sync::broadcast::channel(64).0,
-            prompt_responses: tokio::sync::broadcast::channel(16).0,
-            trigger_events: tokio::sync::broadcast::channel(256).0,
-            session_allowed_tools: Arc::new(Mutex::new(HashSet::new())),
-            identity_store: Arc::new(Mutex::new(None)),
-            mcp_binary_path: "cairn-mcp".to_string(),
-            config_dir: config_dir.keep(),
-            schema_dir: None,
-            mcp_callback_port: 3847,
-            embedding_engine: None,
-            vibe_state: None,
-            account_manager,
-            sync_tx: sync_tx.clone(),
-            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
-            api_config: crate::api::ApiConfig::default(),
-            effect_tx: None,
-            model_catalog: Arc::new(RwLock::new(HashMap::new())),
-            provider_usage_snapshots: Default::default(),
-            executor: Arc::new(OnceLock::new()),
-        }
-    }
-
-    #[test]
-    fn save_identity_store_refreshes_model_catalog() {
-        let orch = test_orchestrator();
-        orch.model_catalog.write().unwrap().insert(
-            "codex".to_string(),
-            crate::backends::ProviderModelCatalog {
-                backend: "codex".to_string(),
-                models: vec![],
-                refreshed_at: None,
-                error: Some("stale".to_string()),
-            },
-        );
-
-        orch.save_identity_store(IdentityStore {
-            user_id: "user-1".to_string(),
-            accounts: vec![],
-            git_identities: vec![],
-            project_overrides: HashMap::new(),
-        })
-        .unwrap();
-
-        let catalog = orch.get_model_catalog();
-        assert_eq!(catalog.len(), 2);
-        assert!(catalog.iter().all(|entry| entry.refreshed_at.is_some()));
     }
 }

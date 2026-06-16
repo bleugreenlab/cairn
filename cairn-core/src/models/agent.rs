@@ -2,8 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::common::Model;
-use super::permissions::{ApprovalPolicy, FilesystemScope};
+use super::common::{Model, ModelSelection, RuntimeExtras};
+use super::permissions::{Fence, LegacyOnEscape, LegacySandbox};
+use super::recipe::ConfirmPolicy;
 
 /// Output schema for an agent - either a preset name or custom JSON Schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +22,13 @@ pub enum OutputSchema {
 pub struct OutputSchemaInfo {
     /// The schema defining the output structure
     pub schema: OutputSchema,
+    /// The artifact's canonical name — the agent writes its output to
+    /// `cairn:~/<artifact_name>`. Taken from the producing node's own output
+    /// schema name (independent of where the field shape is inherited from).
+    pub artifact_name: Option<String>,
+    /// Whether the produced artifact auto-confirms or waits for a human. Drives
+    /// the gating language injected into the agent's prompt.
+    pub confirm_policy: ConfirmPolicy,
     /// Custom tool name (e.g., "write_plan", "create_pr") - defaults to "return" if None
     pub tool_name: Option<String>,
     /// Tool description shown to the agent
@@ -46,14 +54,22 @@ pub struct AgentConfig {
     pub disallowed_tools: Option<Vec<String>>,
     /// Skills to inject into the prompt
     pub skills: Option<Vec<String>>,
-    /// How tool invocations are approved
-    pub approval_policy: Option<ApprovalPolicy>,
-    /// What the agent can read/write on the filesystem
-    pub filesystem_scope: Option<FilesystemScope>,
+    /// Worktree fence behavior for sandbox escapes.
+    pub fence: Option<Fence>,
     /// Preferred backend to use when multiple providers are available.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<String>,
+    /// Resolved atomic backend+model selection carried from the execution
+    /// snapshot to session start. When set, the runtime uses it verbatim and
+    /// never re-resolves a tier. `None` only for authoring/display configs that
+    /// never run a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<ModelSelection>,
+    /// Backend-specific runtime parameters (effort, thinking) resolved early and
+    /// carried to session start instead of being recomputed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras: Option<RuntimeExtras>,
 }
 
 /// Input for creating an agent config
@@ -71,8 +87,11 @@ pub struct CreateAgentConfig {
     pub project_id: Option<String>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
-    pub approval_policy: Option<ApprovalPolicy>,
-    pub filesystem_scope: Option<FilesystemScope>,
+    pub fence: Option<Fence>,
+    #[serde(default, skip_serializing)]
+    pub sandbox: Option<LegacySandbox>,
+    #[serde(default, skip_serializing)]
+    pub on_escape: Option<LegacyOnEscape>,
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<String>,
 }
@@ -93,8 +112,7 @@ pub struct UpdateAgentConfig {
     pub workspace_id: Option<Option<String>>,
     /// New scope: project_id = Some(id) for project, None for workspace
     pub project_id: Option<Option<String>>,
-    pub approval_policy: Option<Option<ApprovalPolicy>>,
-    pub filesystem_scope: Option<Option<FilesystemScope>>,
+    pub fence: Option<Option<Fence>>,
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<Option<String>>,
 }

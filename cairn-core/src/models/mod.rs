@@ -6,8 +6,8 @@
 mod action;
 mod agent;
 mod artifact;
-mod chat;
 mod common;
+mod context_tokens;
 mod docs;
 mod embedding;
 mod execution;
@@ -15,7 +15,7 @@ mod files;
 mod github;
 mod issue;
 mod job;
-mod manager;
+mod label;
 mod memory;
 mod message;
 mod permissions;
@@ -36,13 +36,20 @@ pub mod webhook;
 mod workspace;
 
 // Common enums
-pub use common::{MergeType, Model, Preset, RuntimeExtras, ThinkingDisplayMode, ToolDetailLevel};
+pub use common::{
+    MergeType, Model, ModelSelection, Preset, PresetOptionValue, RuntimeExtras,
+    ThinkingDisplayMode, ToolDetailLevel,
+};
 
 // Workspace and settings
-pub use workspace::{Settings, UpdateSettings};
+pub use workspace::{ExternalReplyMode, Settings, UpdateSettings};
 
 // Project types
-pub use project::{CreateProject, Project, TerminalCommand, UpdateProject};
+pub use project::{CreateProject, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject};
+
+// Context token snapshot types
+pub(crate) use context_tokens::get_latest_context_token_event;
+pub use context_tokens::ContextTokenState;
 
 // Provider usage snapshot types
 pub use provider_usage::{
@@ -54,15 +61,10 @@ pub use issue::{
     Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress,
     IssueStatus, UpdateIssue,
 };
+pub use label::{CreateLabel, Label, UpdateLabel};
 
 // Job types (replaces timeline_nodes)
-pub use job::{Job, JobStatus};
-
-// Manager types
-pub use manager::{CreateManager, Manager, ManagerScopeKind, ManagerStatus, UpdateManager};
-
-// Chat types (project-level conversations)
-pub use chat::Chat;
+pub use job::{Job, JobStatus, NodeAttempt};
 
 // Execution types (recipe instances)
 pub use execution::{
@@ -71,7 +73,10 @@ pub use execution::{
 };
 
 // Run types
-pub use run::{Event, PermissionRequest, Prompt, Run, RunStartMode, RunStatus, RunTodos, TodoItem};
+pub use run::{
+    Event, PermissionRequest, PermissionStatus, Prompt, Run, RunStartMode, RunStatus, RunTodos,
+    TodoItem,
+};
 
 // Session types (durable conversation identity)
 pub use session::{Session, SessionStatus};
@@ -82,8 +87,8 @@ pub use turn::{Turn, TurnStartReason, TurnState, TurnYieldReason};
 // Recipe types
 pub use recipe::{
     AccumulationScope, ActionNodeConfig, AgentFilter, AgentFilterMode, AgentGitConfig,
-    AgentNodeConfig, ArtifactNodeConfig, CheckpointNodeConfig, CheckpointType,
-    ConditionErrorBehavior, ConditionNodeConfig, ConditionType, ContextNodeConfig, CreateRecipe,
+    AgentNodeConfig, ArtifactNodeConfig, CheckpointNodeConfig, ConditionErrorBehavior,
+    ConditionNodeConfig, ConditionType, ConfirmPolicy, ContextNodeConfig, CreateRecipe,
     EventFilter, NodeConfig, NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode,
     RecipeNodeType, RecipeTrigger, RecipeVersionInfo, ScheduleAt, ScheduleConfig, ScheduleEvery,
     ScheduleInterval, SchedulePeriod, SchemaConfig, TriggerConfig, TriggerScope, UpdateRecipe,
@@ -94,7 +99,7 @@ pub use recipe::{
 pub use recipe_file::{RecipeFile, RecipeFileValidation};
 
 // Artifact types
-pub use artifact::{AnnotationInput, Artifact};
+pub use artifact::Artifact;
 
 // PR types
 pub use pr::{
@@ -108,13 +113,10 @@ pub use agent::{
 };
 
 // Permission types
-pub use permissions::{
-    split_legacy_permission_mode, tool_policies_from_legacy_lists, tool_policies_to_legacy_lists,
-    ApprovalPolicy, FilesystemScope, ToolPolicy,
-};
+pub use permissions::{Fence, LegacyOnEscape, LegacySandbox};
 
 // Toolkit and MCP types
-pub use toolkit::ALWAYS_DISALLOWED_TOOLS;
+pub use toolkit::{ALL_NATIVE_TOOLS, ALWAYS_DISALLOWED_TOOLS};
 
 // Documentation types
 pub use docs::{DocContent, DocFile, DocReference};
@@ -122,7 +124,7 @@ pub use docs::{DocContent, DocFile, DocReference};
 // Action config types
 pub use action::{
     generate_input_schema, interpolate_template, parse_template, ActionConfig, ActionRun,
-    CreateActionConfig, TemplateVariable, UpdateActionConfig,
+    ActionRunStatus, CreateActionConfig, TemplateVariable, UpdateActionConfig,
 };
 
 // Skill config types
@@ -133,11 +135,11 @@ pub use snapshot::{
     AgentSnapshot, DelegatedOutputContract, DelegatedOwnershipScope, DelegatedSessionMode,
     DelegatedSessionStrategy, DelegatedStatus, DelegatedWorkPacket, DelegationOrigin,
     ExecutionSnapshot, RecipeSnapshot, SkillSnapshot, SnapshotOverrides, SnapshotPresets,
-    ToolSnapshot, TriggerContext,
+    TriggerContext,
 };
 
 // File browsing types
-pub use files::{detect_language, BranchInfo, FileContent, RepoFile};
+pub use files::{detect_language, BranchInfo, FileContent};
 
 // Message types
 pub use message::{ChannelType, Message};
@@ -147,7 +149,7 @@ pub use embedding::EventEmbedding;
 
 // Memory types
 pub use memory::{
-    CreateMemory, CreateMemoryTrigger, Memory, MemoryConfidence, MemoryTrigger, UpdateMemory,
+    CreateMemory, Memory, MemoryScope, MemoryStatus, MemoryTriageDecision, UpdateMemory,
 };
 
 // Trigger event types

@@ -1,13 +1,13 @@
-//! Remote sync — async channel for dual-writing SQLite changes to cloud Postgres.
+//! Remote sync — async channel for forwarding committed local changes.
 //!
-//! Core principle: SQLite is always source of truth. Sync failures never block local writes.
-//! StreamDeltas are fire-and-forget; durable entities retry with exponential backoff.
+//! Core principle: the embedded local database is source of truth. Sync failures never block local writes.
+//! StreamDeltas and transcript events stay local-only; durable non-event entities retry with exponential backoff.
 //!
 //! Architecture:
 //! - Write points call `orch.sync(msg)` after local DB writes
 //! - Messages flow through an mpsc channel to a background SyncTask
-//! - SyncTask batches durable messages and sends via WebSocket
-//! - StreamDelta messages are sent immediately (no batching, no retry)
+//! - SyncTask batches durable messages and sends them via HTTP
+//! - Local-only messages are dropped before transport
 
 pub mod initial;
 pub mod message;
@@ -16,7 +16,7 @@ pub mod task;
 
 pub use message::{
     StreamDelta, SyncArtifact, SyncComment, SyncEvent, SyncIssue, SyncJob, SyncMessage,
-    SyncProject, SyncRun,
+    SyncProject, SyncRun, SyncTranscriptEvent,
 };
 pub use sender::SyncSender;
 pub use task::SyncTask;

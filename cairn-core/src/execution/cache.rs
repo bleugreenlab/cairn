@@ -3,10 +3,8 @@
 //! Caching system for command results at checkpoint nodes to avoid
 //! re-executing expensive operations.
 
-use crate::diesel_models::{DbCheckpointCommandCache, DbJob};
 use crate::orchestrator::Orchestrator;
-use crate::schema::{checkpoint_command_cache, jobs};
-use diesel::prelude::*;
+use crate::storage::RowExt;
 
 /// Result of querying the checkpoint command cache for a job.
 #[derive(serde::Serialize)]
@@ -54,42 +52,79 @@ pub fn get_checkpoint_cache_result_impl(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<Option<CheckpointCacheResult>, String> {
-    let mut conn = orch
-        .db
-        .conn
-        .lock()
-        .map_err(|e| format!("DB lock error: {}", e))?;
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT c.command, c.exit_code, c.commit_sha, c.is_dirty,
+                               c.ran_at, j.worktree_path
+                        FROM checkpoint_command_cache c
+                        JOIN jobs j ON j.id = c.job_id
+                        WHERE c.job_id = ?1
+                        ORDER BY c.ran_at DESC
+                        LIMIT 1
+                        ",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
 
-    // Get cached result for this job
-    let cached: Option<DbCheckpointCommandCache> = checkpoint_command_cache::table
-        .filter(checkpoint_command_cache::job_id.eq(job_id))
-        .order(checkpoint_command_cache::ran_at.desc())
-        .first(&mut *conn)
-        .ok();
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
 
-    let Some(cached) = cached else {
-        return Ok(None);
-    };
+                let command = row.text(0)?;
+                let exit_code = row.i64(1)? as i32;
+                let commit_sha = row.text(2)?;
+                let is_dirty = row.i64(3)?;
+                let ran_at = row.i64(4)? as i32;
+                let worktree_path = row.opt_text(5)?;
 
-    // Get job's worktree to check current validity
-    let job: DbJob = jobs::table
-        .find(job_id)
-        .first(&mut *conn)
-        .map_err(|e| format!("Job not found: {}", e))?;
+                let is_valid = if let Some(worktree) = &worktree_path {
+                    let current_sha = get_current_head_sha(worktree).unwrap_or_default();
+                    let currently_dirty = is_worktree_dirty(worktree).unwrap_or(true);
+                    commit_sha == current_sha && is_dirty == 0 && !currently_dirty
+                } else {
+                    false
+                };
 
-    let is_valid = if let Some(worktree) = &job.worktree_path {
-        let current_sha = get_current_head_sha(worktree).unwrap_or_default();
-        let currently_dirty = is_worktree_dirty(worktree).unwrap_or(true);
-        cached.commit_sha == current_sha && cached.is_dirty == 0 && !currently_dirty
+                Ok(Some(CheckpointCacheResult {
+                    command,
+                    exit_code,
+                    commit_sha: commit_sha[..7.min(commit_sha.len())].to_string(),
+                    is_valid,
+                    ran_at,
+                }))
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn run_checkpoint_cache_db<T>(
+    future: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    fn run<T>(future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?
+            .block_on(future)
+    }
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || run(future))
+            .join()
+            .map_err(|_| "Checkpoint cache DB runtime thread panicked".to_string())?
     } else {
-        false
-    };
-
-    Ok(Some(CheckpointCacheResult {
-        command: cached.command,
-        exit_code: cached.exit_code,
-        commit_sha: cached.commit_sha[..7.min(cached.commit_sha.len())].to_string(),
-        is_valid,
-        ran_at: cached.ran_at,
-    }))
+        run(future)
+    }
 }

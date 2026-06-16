@@ -12,6 +12,12 @@ impl Orchestrator {
         settings::load_settings(&self.config_dir)
     }
 
+    /// The OS-sandbox read denylist for worktree agents (configured
+    /// `sandboxDenyRead` or the narrow built-in default: external secret stores).
+    pub fn sandbox_deny_read(&self) -> Vec<std::path::PathBuf> {
+        settings::load_sandbox_deny_read(&self.config_dir)
+    }
+
     /// Update settings with partial input.
     pub fn update_settings(&self, input: UpdateSettings) -> Result<Settings, String> {
         let mut current = settings::load_settings(&self.config_dir);
@@ -19,9 +25,6 @@ impl Orchestrator {
         // Preset fields
         if let Some(ab) = input.active_backend {
             current.active_backend = ab;
-        }
-        if let Some(dt) = input.default_tier {
-            current.default_tier = dt;
         }
         if let Some(t) = input.tiers {
             current.tiers = t;
@@ -43,35 +46,20 @@ impl Orchestrator {
             current.pull_on_merge = pull_on_merge;
         }
         // auto_start_jobs is always true — ignored
-        if let Some(tz) = input.timezone {
-            current.timezone = tz;
-        }
         if let Some(days) = input.orphan_cleanup_days {
             current.orphan_cleanup_days = days.clamp(1, 30);
-        }
-        if let Some(default_terminal) = input.default_terminal {
-            current.default_terminal = default_terminal;
-        }
-        if let Some(default_app) = input.default_app {
-            current.default_app = default_app;
-        }
-        if let Some(device) = input.audio_device {
-            current.audio_device = device;
-        }
-        if let Some(model) = input.whisper_model {
-            current.whisper_model = model;
         }
         if let Some(key) = input.web_search_api_key {
             current.web_search_api_key = key;
         }
-        if let Some(level) = input.lookup_detail_level {
-            current.lookup_detail_level = level;
-        }
-        if let Some(level) = input.change_detail_level {
-            current.change_detail_level = level;
-        }
         if let Some(mode) = input.thinking_display_mode {
             current.thinking_display_mode = mode;
+        }
+        if let Some(threshold) = input.pending_memory_threshold {
+            current.pending_memory_threshold = threshold.max(1);
+        }
+        if let Some(mode) = input.external_replies {
+            current.external_replies = mode;
         }
 
         settings::save_settings(&self.config_dir, &current)?;

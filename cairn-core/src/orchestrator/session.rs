@@ -8,17 +8,701 @@
 
 use crate::agent_process::stream::{ClaudeEvent, TranscriptEvent};
 use crate::backends::{self, SessionConfig, SessionStart};
-use crate::config::presets::{load_effective_presets, resolve_runtime_selection, PresetsConfig};
-use crate::diesel_models::*;
 use crate::models::Model;
-use crate::node_segments::visible_node_segment;
-use crate::schema::*;
-use diesel::prelude::*;
+
+use crate::storage::{run_db_blocking, DbError, DbResult, RowExt};
+use crate::sync::{SyncEvent, SyncMessage, SyncTranscriptEvent};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
+use turso::params;
 use uuid::Uuid;
 
 use super::Orchestrator;
+
+fn sha256_hex(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+/// Insert the assembled system prompt once per session/content hash so the UI
+/// can display the exact prompt without re-running prompt construction code.
+///
+/// Returns the next transcript sequence the backend reader should use. Even when
+/// the prompt event dedupes, this returns `MAX(sequence) + 1` so resumed streams
+/// append after the existing transcript instead of restarting at zero.
+pub fn persist_system_prompt_event(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: Option<&str>,
+    backend: &str,
+    segments: &[PromptSegment],
+) -> i32 {
+    // Concatenate the segments into the full prompt and record their byte spans as
+    // data on the event. Teardown archival uses the spans to content-address the
+    // static segments and inline only the dynamic tail, never re-running assembly.
+    let mut full_prompt = String::new();
+    let mut segment_map: Vec<serde_json::Value> = Vec::with_capacity(segments.len());
+    let mut has_backend_base = false;
+    for seg in segments {
+        let byte_offset = full_prompt.len();
+        full_prompt.push_str(&seg.text);
+        segment_map.push(serde_json::json!({
+            "kind": seg.kind,
+            "byteOffset": byte_offset,
+            "byteLen": seg.text.len(),
+        }));
+        if seg.kind == SEGMENT_KIND_BACKEND_BASE {
+            has_backend_base = true;
+        }
+    }
+
+    let hash = sha256_hex(&full_prompt);
+    let now = chrono::Utc::now().timestamp() as i32;
+    let event_id = Uuid::new_v4().to_string();
+    let run_id_owned = run_id.to_string();
+    let session_id_owned = session_id.map(|s| s.to_string());
+    let full_prompt_owned = full_prompt.clone();
+    let includes_backend_base = backend == "claude" && has_backend_base;
+
+    let transcript_event = TranscriptEvent {
+        event_type: "system:prompt".to_string(),
+        session_id: session_id_owned.clone(),
+        parent_tool_use_id: None,
+        content: Some(full_prompt_owned.clone()),
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error: false,
+        thinking_ms: None,
+        raw: Some(serde_json::json!({
+            "backend": backend,
+            "bytes": full_prompt.len(),
+            "hash": hash,
+            "includesBackendBase": includes_backend_base,
+            "segments": segment_map,
+        })),
+    };
+
+    let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+    let db = orch.db.local.clone();
+    let insert_result = run_db_blocking({
+        let event_id = event_id.clone();
+        let run_id = run_id_owned.clone();
+        let session_id = session_id_owned.clone();
+        let data = data.clone();
+        let hash = hash.clone();
+        move || async move {
+            db.write(|conn| {
+                let event_id = event_id.clone();
+                let run_id = run_id.clone();
+                let session_id = session_id.clone();
+                let data = data.clone();
+                let hash = hash.clone();
+                Box::pin(async move {
+                    // Live-only reader (no archival reconstruction): session
+                    // setup reads the active session's own `system:prompt`
+                    // events while it is still running, before teardown makes
+                    // anything archivable. It never sees a gitcoord/zstd stub.
+                    let latest_data = if let Some(ref session_id) = session_id {
+                        let mut rows = conn
+                            .query(
+                                "SELECT data
+                                 FROM events
+                                 WHERE event_type = 'system:prompt'
+                                   AND session_id = ?1
+                                 ORDER BY sequence DESC
+                                 LIMIT 1",
+                                (session_id.as_str(),),
+                            )
+                            .await?;
+                        crate::storage::next_text(&mut rows, 0).await?
+                    } else {
+                        let mut rows = conn
+                            .query(
+                                "SELECT data
+                                 FROM events
+                                 WHERE event_type = 'system:prompt'
+                                   AND run_id = ?1
+                                   AND session_id IS NULL
+                                 ORDER BY sequence DESC
+                                 LIMIT 1",
+                                (run_id.as_str(),),
+                            )
+                            .await?;
+                        crate::storage::next_text(&mut rows, 0).await?
+                    };
+
+                    let mut rows = conn
+                        .query(
+                            "SELECT MAX(sequence)
+                             FROM events
+                             WHERE run_id = ?1",
+                            (run_id.as_str(),),
+                        )
+                        .await?;
+                    let next_sequence = rows
+                        .next()
+                        .await?
+                        .map(|row| row.opt_i64(0))
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or(-1)
+                        + 1;
+
+                    if latest_data
+                        .as_deref()
+                        .and_then(|data| serde_json::from_str::<TranscriptEvent>(data).ok())
+                        .and_then(|event| event.raw)
+                        .and_then(|raw| raw.get("hash").and_then(|value| value.as_str()).map(str::to_string))
+                        .as_deref()
+                        == Some(hash.as_str())
+                    {
+                        return Ok((None, next_sequence as i32));
+                    }
+
+                    conn.execute(
+                        "INSERT INTO events (
+                            id, run_id, session_id, sequence, timestamp, event_type, data,
+                            parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                            cache_create_tokens, output_tokens, turn_id
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'system:prompt', ?6, NULL, ?5, NULL, NULL, NULL, NULL, NULL)",
+                        (
+                            event_id.as_str(),
+                            run_id.as_str(),
+                            session_id.as_deref(),
+                            next_sequence,
+                            i64::from(now),
+                            data.as_str(),
+                        ),
+                    )
+                    .await?;
+                    Ok((Some(next_sequence as i32), next_sequence as i32 + 1))
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    });
+
+    let Ok((inserted_sequence, next_sequence)) = insert_result else {
+        return 0;
+    };
+
+    if let Some(sequence) = inserted_sequence {
+        orch.sync(SyncMessage::Event(SyncEvent::transcript(
+            SyncTranscriptEvent {
+                id: event_id.clone(),
+                run_id: run_id_owned,
+                session_id: session_id_owned,
+                sequence,
+                event_type: "system:prompt".to_string(),
+                data: data.clone(),
+                created_at: i64::from(now),
+                turn_id: None,
+            },
+        )));
+
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "events", "action": "insert"}),
+        );
+    }
+
+    next_sequence
+}
+
+struct SessionDbContext {
+    /// Stable home URI for this run (always a full node URI: cairn://p/PROJECT/N/EXEC/NODE).
+    /// Required — session startup fails if the run lacks the components to build it.
+    home_uri: String,
+    run_issue_id: Option<String>,
+    project_id: Option<String>,
+    project_key: Option<String>,
+    project_path: Option<std::path::PathBuf>,
+    /// Effective base branch for this run's job (worktree base / PR target),
+    /// falling back to the project default for project-level runs or legacy rows.
+    effective_base_branch: Option<String>,
+    /// The run's job id, used to key the per-job scratch dir surfaced in the
+    /// orientation block. `None` for runs with no job (project chat).
+    job_id: Option<String>,
+}
+
+fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbContext, String> {
+    let db = orch.db.local.clone();
+    let run_id = run_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT runs.issue_id,
+                                COALESCE(runs.project_id, issues.project_id) AS project_id,
+                                projects.key,
+                                projects.repo_path,
+                                issues.number,
+                                jobs.uri_segment,
+                                executions.seq,
+                                parent_jobs.uri_segment AS parent_uri_segment,
+                                COALESCE(jobs.base_branch, projects.default_branch) AS effective_base_branch,
+                                runs.job_id
+                         FROM runs
+                         LEFT JOIN issues ON runs.issue_id = issues.id
+                         LEFT JOIN projects ON COALESCE(runs.project_id, issues.project_id) = projects.id
+                         LEFT JOIN jobs ON runs.job_id = jobs.id
+                         LEFT JOIN jobs AS parent_jobs ON jobs.parent_job_id = parent_jobs.id
+                         LEFT JOIN executions ON jobs.execution_id = executions.id
+                         WHERE runs.id = ?1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+
+                let Some(row) = rows.next().await? else {
+                    return Err(DbError::internal(format!("Failed to get run: {}", run_id)));
+                };
+
+                let run_issue_id = row.opt_text(0)?;
+                let project_id = row.opt_text(1)?;
+                let project_key = row.opt_text(2)?;
+                let project_path = row.opt_text(3)?.map(std::path::PathBuf::from);
+                let issue_number = row.opt_i64(4)?.map(|n| n as i32);
+                let uri_segment = row.opt_text(5)?;
+                let exec_seq = row.opt_i64(6)?.map(|n| n as i32);
+                // Present only for sub-agent task jobs; a top-level node has no parent.
+                let parent_uri_segment = row.opt_text(7)?;
+                let effective_base_branch = row.opt_text(8)?;
+                let job_id = row.opt_text(9)?;
+
+                // All four components are required. A missing component means the run
+                // record is corrupt or incomplete — fail rather than produce a partial URI.
+                // A task job nests under its parent node (`.../{parent}/task/{segment}`);
+                // a top-level node is `.../{segment}`.
+                let home_uri = match (
+                    project_key.as_deref(),
+                    issue_number,
+                    exec_seq,
+                    uri_segment.as_deref(),
+                ) {
+                    (Some(key), Some(num), Some(seq), Some(segment)) => {
+                        cairn_common::uri::build_job_base_uri(
+                            key,
+                            num,
+                            seq,
+                            segment,
+                            parent_uri_segment.as_deref(),
+                        )
+                    }
+                    _ => {
+                        return Err(DbError::internal(format!(
+                            "Cannot build home URI for run {}: project_key={:?}, issue_number={:?}, exec_seq={:?}, uri_segment={:?}",
+                            run_id, project_key, issue_number, exec_seq, uri_segment
+                        )));
+                    }
+                };
+
+                Ok(SessionDbContext {
+                    home_uri,
+                    run_issue_id,
+                    project_id,
+                    project_key,
+                    project_path,
+                    effective_base_branch,
+                    job_id,
+                })
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// Build the orientation block: the agent's concrete coordinates for this run —
+/// where it sits on disk, its canonical node URI (which `cairn:~/` resolves to),
+/// the project + repo root it operates against, the base branch worktrees fork
+/// from, and the host platform. Folds in the home-URI "Current Location" pointer
+/// that previously stood alone, so an agent no longer has to probe for paths it
+/// can simply be told.
+fn build_orientation_block(
+    working_dir: &str,
+    home_uri: &str,
+    project_key: Option<&str>,
+    repo_root: Option<&str>,
+    base_branch: Option<&str>,
+    scratch_dir: Option<&str>,
+) -> String {
+    let mut out = String::from("## Orientation\n\nYour coordinates for this run:\n\n");
+    out.push_str(&format!("- Working directory (cwd): `{}`\n", working_dir));
+    out.push_str(&format!(
+        "- Node (home URI): `{}` \u{2014} `cairn:~/` resolves here\n",
+        home_uri
+    ));
+    if let Some(key) = project_key {
+        out.push_str(&format!("- Project: `{}`\n", key));
+    }
+    if let Some(root) = repo_root {
+        out.push_str(&format!("- Repository root: `{}`\n", root));
+    }
+    if let Some(branch) = base_branch {
+        out.push_str(&format!("- Base branch: `{}`\n", branch));
+    }
+    out.push_str(&format!(
+        "- Platform: `{}/{}`\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    if let Some(scratch) = scratch_dir {
+        out.push_str(&format!(
+            "- Scratch dir (TMPDIR): `{}` \u{2014} already exported as `$TMPDIR`/`$TMP`/`$TEMP`; reclaimed at teardown\n",
+            scratch
+        ));
+    }
+    out.push_str(
+        "\nKeep scratch and temp files in the working directory or the scratch dir above (your `$TMPDIR`); other paths outside the worktree are gated by the fence.",
+    );
+    out
+}
+
+/// Render the `## Available Terminals` affordance: a project's named terminal
+/// shortcuts (`.cairn` `terminalCommands`), each by name + command, plus one
+/// runnable `create` example using the slug the system would generate for the
+/// first shortcut. Returns `None` for an empty list so the section is omitted
+/// entirely, mirroring the Available Agents / Skills empty-gating.
+///
+/// The example carries the command in the payload because terminal `create`
+/// requires it (see the terminal contracts in `cairn-common`) — a slug alone
+/// would be rejected.
+fn build_available_terminals_section(
+    terminal_commands: &[crate::models::TerminalCommand],
+) -> Option<String> {
+    if terminal_commands.is_empty() {
+        return None;
+    }
+    let mut out = String::from("## Available Terminals\n\n");
+    out.push_str(
+        "The project's named/suggested terminals. Create one with a `write` to its terminal URI \
+         (`cairn:~/terminal/<slug>` for a node terminal, `cairn://p/PROJECT/terminal/<slug>` for a \
+         project terminal), passing the command in the payload. You may also create ad-hoc \
+         terminals with any command.\n\n",
+    );
+    for tc in terminal_commands {
+        out.push_str(&format!("- **{}**: `{}`\n", tc.name, tc.command));
+    }
+    let first = &terminal_commands[0];
+    // Show the slug the system would generate so the example is runnable; fall
+    // back to a command-derived slug when the name slugifies empty.
+    let slug = {
+        let from_name = crate::mcp::handlers::slug::slugify(&first.name);
+        if from_name.is_empty() {
+            crate::mcp::handlers::slug::slugify_command(&first.command)
+        } else {
+            from_name
+        }
+    };
+    out.push_str(&format!(
+        "\nExample:\n`write({{changes:[{{target:\"cairn:~/terminal/{slug}\", mode:\"create\", payload:{{command:\"{}\"}}}}]}})`\n",
+        first.command
+    ));
+    Some(out)
+}
+
+struct PromptMessage {
+    /// `messages.rowid` — monotonic with insertion order; the key for the
+    /// per-session channel-injection cursor (`Option<i64>`).
+    rowid: i64,
+    sender_name: String,
+    content: String,
+    created_at: i64,
+}
+
+struct PeerAgent {
+    node_name: String,
+    status: String,
+    uri: String,
+}
+
+fn build_messaging_context(
+    orch: &Orchestrator,
+    project_key: &str,
+    issue_id: &str,
+    current_run_id: &str,
+) -> String {
+    let db = orch.db.local.clone();
+    let project_key = project_key.to_string();
+    let issue_id = issue_id.to_string();
+    let current_run_id = current_run_id.to_string();
+    let data = run_db_blocking(move || async move {
+        // Read phase: peers + channel messages newer than this session's
+        // injection cursor.
+        let (peers, recent, session_id) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let peers =
+                        find_peer_agents(conn, &project_key, &issue_id, &current_run_id).await?;
+                    let issue_key = issue_key(conn, &project_key, &issue_id).await?;
+                    let session_id = session_id_for_run(conn, &current_run_id).await?;
+                    let cursor = match session_id.as_deref() {
+                        Some(sid) => read_channel_cursor(conn, sid).await?,
+                        None => None,
+                    };
+                    let recent = recent_messages_for_run(
+                        conn,
+                        &project_key,
+                        issue_key.as_deref(),
+                        &current_run_id,
+                        cursor,
+                        20,
+                    )
+                    .await?;
+                    Ok((peers, recent, session_id))
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // Advance phase: record the newest injected message so the next cold
+        // resume of this session does not re-inject it. Runs without a session
+        // (legacy) carry no cursor and fall back to the recent-history view.
+        if let Some(session_id) = session_id {
+            if let Some(max_rowid) = recent.iter().map(|m| m.rowid).max() {
+                db.write(|conn| {
+                    let session_id = session_id.clone();
+                    Box::pin(
+                        async move { advance_channel_cursor(conn, &session_id, max_rowid).await },
+                    )
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            }
+        }
+
+        Ok::<_, String>((peers, recent))
+    })
+    .unwrap_or_default();
+
+    let (peers, recent) = data;
+    if peers.is_empty() && recent.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("## Agent Messaging\n\n");
+    out.push_str(
+        "You can communicate with other agents using `write` with message-channel URIs.\n",
+    );
+    out.push_str("Messages sent to the issue channel are visible to all agents on the issue.\n");
+    out.push_str(
+        "Direct messages go to a specific agent via their URI and auto-resume them if idle.\n\n",
+    );
+
+    if !peers.is_empty() {
+        out.push_str("### Active Peers\n\n");
+        for peer in &peers {
+            out.push_str(&format!(
+                "- **{}** ({}) - `{}`\n",
+                peer.node_name, peer.status, peer.uri
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !recent.is_empty() {
+        out.push_str("### Recent Messages\n\n");
+        for msg in &recent {
+            let ts = chrono::DateTime::from_timestamp(msg.created_at, 0)
+                .map(|dt| dt.format("%H:%M:%S").to_string())
+                .unwrap_or_else(|| "??:??:??".to_string());
+            out.push_str(&format!("[{}] {}: {}\n", ts, msg.sender_name, msg.content));
+        }
+    }
+
+    out
+}
+
+async fn issue_key(
+    conn: &turso::Connection,
+    project_key: &str,
+    issue_id: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT number
+             FROM issues
+             WHERE id = ?1",
+            (issue_id,),
+        )
+        .await?;
+    rows.next()
+        .await?
+        .map(|row| row.i64(0).map(|n| format!("{}/{}", project_key, n)))
+        .transpose()
+}
+
+async fn find_peer_agents(
+    conn: &turso::Connection,
+    project_key: &str,
+    issue_id: &str,
+    current_run_id: &str,
+) -> DbResult<Vec<PeerAgent>> {
+    let mut current_rows = conn
+        .query(
+            "SELECT job_id
+             FROM runs
+             WHERE id = ?1",
+            (current_run_id,),
+        )
+        .await?;
+    let current_job_id = current_rows
+        .next()
+        .await?
+        .map(|row| row.opt_text(0))
+        .transpose()?
+        .flatten();
+
+    let mut rows = conn
+        .query(
+            "SELECT jobs.id, jobs.node_name, jobs.uri_segment, jobs.status, executions.seq,
+                    parent_jobs.uri_segment AS parent_uri_segment
+             FROM jobs
+             LEFT JOIN executions ON jobs.execution_id = executions.id
+             LEFT JOIN jobs AS parent_jobs ON jobs.parent_job_id = parent_jobs.id
+             WHERE jobs.issue_id = ?1
+               AND jobs.status != 'pending'",
+            (issue_id,),
+        )
+        .await?;
+
+    let mut peers = Vec::new();
+    let issue_number = issue_key(conn, project_key, issue_id)
+        .await?
+        .and_then(|key| key.rsplit('/').next().and_then(|n| n.parse::<i32>().ok()));
+    let Some(issue_number) = issue_number else {
+        return Ok(peers);
+    };
+
+    while let Some(row) = rows.next().await? {
+        let job_id = row.text(0)?;
+        if current_job_id.as_deref() == Some(job_id.as_str()) {
+            continue;
+        }
+        let node_name = row.opt_text(1)?.unwrap_or_else(|| "unknown".to_string());
+        let uri_segment = row.opt_text(2)?;
+        let status = row.text(3)?;
+        let exec_seq = row.opt_i64(4)?.map(|n| n as i32).unwrap_or(1);
+        let parent_uri_segment = row.opt_text(5)?;
+        let Some(uri_segment) = uri_segment else {
+            continue;
+        };
+        let uri = cairn_common::uri::build_job_base_uri(
+            project_key,
+            issue_number,
+            exec_seq,
+            &uri_segment,
+            parent_uri_segment.as_deref(),
+        );
+        peers.push(PeerAgent {
+            node_name,
+            status,
+            uri,
+        });
+    }
+    Ok(peers)
+}
+
+async fn recent_messages_for_run(
+    conn: &turso::Connection,
+    project_key: &str,
+    issue_key: Option<&str>,
+    exclude_run_id: &str,
+    cursor: Option<i64>,
+    limit: i64,
+) -> DbResult<Vec<PromptMessage>> {
+    let mut rows = if let Some(issue_key) = issue_key {
+        conn.query(
+            "SELECT rowid, sender_name, content, created_at
+             FROM messages
+             WHERE (sender_run_id IS NULL OR sender_run_id != ?1)
+               AND (
+                    (channel_type = 'project' AND channel_id = ?2)
+                    OR (channel_type = 'issue' AND channel_id = ?3)
+               )
+               AND (?5 IS NULL OR rowid > ?5)
+             ORDER BY rowid DESC
+             LIMIT ?4",
+            params![exclude_run_id, project_key, issue_key, limit, cursor],
+        )
+        .await?
+    } else {
+        conn.query(
+            "SELECT rowid, sender_name, content, created_at
+             FROM messages
+             WHERE (sender_run_id IS NULL OR sender_run_id != ?1)
+               AND channel_type = 'project'
+               AND channel_id = ?2
+               AND (?4 IS NULL OR rowid > ?4)
+             ORDER BY rowid DESC
+             LIMIT ?3",
+            params![exclude_run_id, project_key, limit, cursor],
+        )
+        .await?
+    };
+
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next().await? {
+        messages.push(PromptMessage {
+            rowid: row.i64(0)?,
+            sender_name: row.text(1)?,
+            content: row.text(2)?,
+            created_at: row.i64(3)?,
+        });
+    }
+    messages.reverse();
+    Ok(messages)
+}
+
+/// Resolve the session id backing a run, used to scope the channel-injection
+/// cursor. Returns `None` for legacy runs with no session.
+async fn session_id_for_run(conn: &turso::Connection, run_id: &str) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query("SELECT session_id FROM runs WHERE id = ?1", params![run_id])
+        .await?;
+    match rows.next().await? {
+        Some(row) => row.opt_text(0),
+        None => Ok(None),
+    }
+}
+
+async fn read_channel_cursor(conn: &turso::Connection, session_id: &str) -> DbResult<Option<i64>> {
+    let mut rows = conn
+        .query(
+            "SELECT channel_cursor_rowid FROM sessions WHERE id = ?1",
+            params![session_id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => row.opt_i64(0),
+        None => Ok(None),
+    }
+}
+
+/// Move the session's channel-injection cursor forward to `rowid`. The guard
+/// keeps the cursor monotonic so a stale/concurrent build can never rewind it
+/// and re-surface already-injected messages.
+async fn advance_channel_cursor(
+    conn: &turso::Connection,
+    session_id: &str,
+    rowid: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE sessions
+            SET channel_cursor_rowid = ?2
+          WHERE id = ?1
+            AND (channel_cursor_rowid IS NULL OR ?2 > channel_cursor_rowid)",
+        params![session_id, rowid],
+    )
+    .await?;
+    Ok(())
+}
 
 /// Insert a synthetic system:error event for display in the transcript
 pub fn insert_error_event(
@@ -27,27 +711,17 @@ pub fn insert_error_event(
     session_id: Option<&str>,
     error_message: &str,
 ) {
-    let Ok(mut conn) = orch.db.conn.lock() else {
-        return;
-    };
-
-    // Get next sequence number
-    let sequence: i32 = events::table
-        .filter(events::run_id.eq(run_id))
-        .select(diesel::dsl::max(events::sequence))
-        .first::<Option<i32>>(&mut *conn)
-        .unwrap_or(None)
-        .unwrap_or(-1)
-        + 1;
-
     let now = chrono::Utc::now().timestamp() as i32;
     let event_id = Uuid::new_v4().to_string();
+    let run_id_owned = run_id.to_string();
+    let session_id_owned = session_id.map(|s| s.to_string());
+    let error_message = error_message.to_string();
 
     let transcript_event = TranscriptEvent {
         event_type: "system:error".to_string(),
-        session_id: session_id.map(|s| s.to_string()),
+        session_id: session_id_owned.clone(),
         parent_tool_use_id: None,
-        content: Some(error_message.to_string()),
+        content: Some(error_message.clone()),
         thinking: None,
         tool_name: None,
         tool_input: None,
@@ -55,47 +729,82 @@ pub fn insert_error_event(
         tool_use_id: None,
         tool_result: None,
         is_error: true,
-        usage: None,
+        thinking_ms: None,
         raw: Some(serde_json::json!({"error": error_message})),
     };
 
     let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+    let db = orch.db.local.clone();
+    let insert_result = run_db_blocking({
+        let event_id = event_id.clone();
+        let run_id = run_id_owned.clone();
+        let session_id = session_id_owned.clone();
+        let data = data.clone();
+        move || async move {
+            db.write(|conn| {
+                let event_id = event_id.clone();
+                let run_id = run_id.clone();
+                let session_id = session_id.clone();
+                let data = data.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT MAX(sequence)
+                             FROM events
+                             WHERE run_id = ?1",
+                            (run_id.as_str(),),
+                        )
+                        .await?;
+                    let sequence = rows
+                        .next()
+                        .await?
+                        .map(|row| row.opt_i64(0))
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or(-1)
+                        + 1;
 
-    let new_event = NewEvent {
-        id: &event_id,
-        run_id,
-        session_id,
-        sequence,
-        timestamp: now,
-        event_type: "system:error",
-        data: &data,
-        parent_tool_use_id: None,
-        created_at: now,
-        input_tokens: None,
-        cache_read_tokens: None,
-        cache_create_tokens: None,
-        output_tokens: None,
-        turn_id: None,
+                    conn.execute(
+                        "INSERT INTO events (
+                            id, run_id, session_id, sequence, timestamp, event_type, data,
+                            parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                            cache_create_tokens, output_tokens, turn_id
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 'system:error', ?6, NULL, ?5, NULL, NULL, NULL, NULL, NULL)",
+                        (
+                            event_id.as_str(),
+                            run_id.as_str(),
+                            session_id.as_deref(),
+                            sequence,
+                            i64::from(now),
+                            data.as_str(),
+                        ),
+                    )
+                    .await?;
+                    Ok(sequence as i32)
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    });
+
+    let Ok(sequence) = insert_result else {
+        return;
     };
 
-    let _ = diesel::insert_into(events::table)
-        .values(&new_event)
-        .execute(&mut *conn);
-
     // Sync event to cloud
-    orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
-        id: event_id.clone(),
-        run_id: run_id.to_string(),
-        session_id: session_id.map(|s| s.to_string()),
-        sequence: Some(sequence),
-        event_type: "system:error".to_string(),
-        data: Some(data.clone()),
-        input_tokens: None,
-        output_tokens: None,
-        cache_read_tokens: None,
-        created_at: Some(now as i64),
-        turn_id: None,
-    }));
+    orch.sync(SyncMessage::Event(SyncEvent::transcript(
+        SyncTranscriptEvent {
+            id: event_id.clone(),
+            run_id: run_id_owned,
+            session_id: session_id_owned,
+            sequence,
+            event_type: "system:error".to_string(),
+            data: data.clone(),
+            created_at: i64::from(now),
+            turn_id: None,
+        },
+    )));
 
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -146,6 +855,7 @@ pub fn extract_session_id(event: &ClaudeEvent) -> Option<String> {
         ClaudeEvent::Result { session_id, .. } => Some(session_id.clone()),
         ClaudeEvent::StreamEvent { session_id, .. } => Some(session_id.clone()),
         ClaudeEvent::ControlResponse { .. } => None,
+        ClaudeEvent::RateLimitEvent { .. } | ClaudeEvent::Unknown => None,
     }
 }
 
@@ -162,22 +872,14 @@ fn get_prompt_tmp_dir() -> PathBuf {
 pub fn write_system_prompt_file(
     run_id: &str,
     agent_prompt: Option<&str>,
+    workspace_instructions: Option<&str>,
 ) -> Result<PathBuf, String> {
     let tmp_dir = get_prompt_tmp_dir();
     fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
 
     let file_path = tmp_dir.join(format!("prompt-{}.md", run_id));
 
-    // Combine bundled system prompt with agent-specific content
-    let content = if let Some(agent_content) = agent_prompt {
-        format!(
-            "{}\n\n{}",
-            crate::system_prompt::CAIRN_SYSTEM_PROMPT,
-            agent_content
-        )
-    } else {
-        crate::system_prompt::CAIRN_SYSTEM_PROMPT.to_string()
-    };
+    let content = build_appended_system_prompt(agent_prompt, workspace_instructions);
 
     fs::write(&file_path, &content)
         .map_err(|e| format!("Failed to write system prompt file: {}", e))?;
@@ -187,6 +889,142 @@ pub fn write_system_prompt_file(
         file_path,
         content.len()
     );
+
+    Ok(file_path)
+}
+
+/// Segment kinds in an assembled system prompt's recorded boundary map. Every
+/// kind except [`SEGMENT_KIND_DYNAMIC`] is static across runs (a backend or app
+/// constant, the workspace doctrine, or an agent's role body) and is
+/// content-addressed into `archival_blobs` at teardown; the dynamic tail (the
+/// per-run orientation block) stays inline on the event.
+pub const SEGMENT_KIND_BACKEND_BASE: &str = "backend_base";
+pub const SEGMENT_KIND_CAIRN: &str = "cairn";
+pub const SEGMENT_KIND_WORKSPACE: &str = "workspace";
+pub const SEGMENT_KIND_AGENT: &str = "agent";
+pub const SEGMENT_KIND_DYNAMIC: &str = "dynamic";
+
+/// One labeled span of an assembled system prompt. Concatenating every segment's
+/// `text` in order reproduces the full prompt byte for byte; persisting the
+/// segments (not just the string) lets teardown archival content-address the
+/// static spans and inline only the per-run dynamic tail.
+#[derive(Debug, Clone)]
+pub struct PromptSegment {
+    pub kind: &'static str,
+    pub text: String,
+}
+
+impl PromptSegment {
+    pub fn new(kind: &'static str, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+        }
+    }
+}
+
+/// Assemble the ordered system-prompt segments shared by both backends. Their
+/// concatenation equals what `build_appended_system_prompt` /
+/// `build_effective_system_prompt` produce, plus the backend base prefix:
+/// `backend_base + "\n\n" + cairn + ["\n\n## Workspace Instructions\n\n" + ws] +
+/// ["\n\n" + agent]`.
+///
+/// `backend_base` is the backend's base prompt (`None` for a Claude run whose base
+/// file failed to write, where the base is omitted). `cairn` is the cairn prompt.
+/// `workspace` is the raw workspace-instructions body (the header is added here).
+/// `agent` is the full agent content; `dynamic_tail`, when it is a non-empty
+/// suffix of `agent`, splits it into a static head segment and the inlined
+/// dynamic tail. When `dynamic_tail` does not apply, the whole agent content is
+/// kept as one static segment (still correct, just less dedup).
+pub fn assemble_prompt_segments(
+    backend_base: Option<&str>,
+    cairn: &str,
+    workspace: Option<&str>,
+    agent: Option<&str>,
+    dynamic_tail: Option<&str>,
+) -> Vec<PromptSegment> {
+    let mut segments: Vec<PromptSegment> = Vec::new();
+    // The first top-level piece carries no leading separator; every subsequent
+    // piece is prefixed "\n\n".
+    macro_rules! lead {
+        () => {
+            if segments.is_empty() {
+                ""
+            } else {
+                "\n\n"
+            }
+        };
+    }
+
+    if let Some(base) = backend_base {
+        segments.push(PromptSegment::new(
+            SEGMENT_KIND_BACKEND_BASE,
+            base.to_string(),
+        ));
+    }
+    segments.push(PromptSegment::new(
+        SEGMENT_KIND_CAIRN,
+        format!("{}{}", lead!(), cairn),
+    ));
+    if let Some(ws) = workspace.filter(|content| !content.trim().is_empty()) {
+        segments.push(PromptSegment::new(
+            SEGMENT_KIND_WORKSPACE,
+            format!("{}## Workspace Instructions\n\n{}", lead!(), ws.trim()),
+        ));
+    }
+    if let Some(agent) = agent.filter(|content| !content.trim().is_empty()) {
+        let lead = lead!();
+        match dynamic_tail.filter(|tail| !tail.is_empty() && agent.ends_with(*tail)) {
+            Some(tail) => {
+                let head = &agent[..agent.len() - tail.len()];
+                segments.push(PromptSegment::new(
+                    SEGMENT_KIND_AGENT,
+                    format!("{lead}{head}"),
+                ));
+                segments.push(PromptSegment::new(SEGMENT_KIND_DYNAMIC, tail.to_string()));
+            }
+            None => {
+                segments.push(PromptSegment::new(
+                    SEGMENT_KIND_AGENT,
+                    format!("{lead}{agent}"),
+                ));
+            }
+        }
+    }
+    segments
+}
+
+/// Build the Cairn-controlled system prompt portion appended to backend base prompts.
+pub(crate) fn build_appended_system_prompt(
+    agent_prompt: Option<&str>,
+    workspace_instructions: Option<&str>,
+) -> String {
+    let mut combined = crate::system_prompt::cairn_system_prompt();
+    if let Some(workspace_content) =
+        workspace_instructions.filter(|content| !content.trim().is_empty())
+    {
+        combined.push_str("\n\n## Workspace Instructions\n\n");
+        combined.push_str(workspace_content.trim());
+    }
+    if let Some(agent_content) = agent_prompt.filter(|content| !content.trim().is_empty()) {
+        combined.push_str("\n\n");
+        combined.push_str(agent_content);
+    }
+    combined
+}
+
+/// Write the Claude base system prompt (replaces CC's default via
+/// `--system-prompt-file`) to a stable path and return it.
+///
+/// Content is static (compiled in), so the file is shared across runs.
+/// Always overwrites so binary updates pick up new prompt content.
+pub fn write_claude_base_system_prompt_file() -> Result<PathBuf, String> {
+    let tmp_dir = get_prompt_tmp_dir();
+    fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+
+    let file_path = tmp_dir.join("claude-system-prompt.md");
+    fs::write(&file_path, crate::system_prompt::CLAUDE_SYSTEM_PROMPT)
+        .map_err(|e| format!("Failed to write Claude base system prompt file: {}", e))?;
 
     Ok(file_path)
 }
@@ -267,84 +1105,29 @@ pub fn start_agent_session(
     model: Option<Model>,
     _initial_user_message: Option<&str>,
     agent_config: Option<&crate::models::AgentConfig>,
-    output_schema: Option<&crate::models::OutputSchemaInfo>,
+    _output_schema: Option<&crate::models::OutputSchemaInfo>,
     _is_job_level: bool,
-    execution_id: Option<&str>,
+    _execution_id: Option<&str>,
     identity_override: Option<crate::identity::UserIdentity>,
 ) -> Result<(), String> {
     log::debug!("start_agent_session: entered");
     let start_time = std::time::Instant::now();
     log::info!("[PROFILE] start_agent_session begin");
 
-    // Resolve output schema from provided info (if any)
-    let (schema_temp_path, resolved_tool_name, resolved_tool_description) = {
-        let resolved_info = output_schema.cloned();
-
-        let tool_name = resolved_info
-            .as_ref()
-            .and_then(|info| info.tool_name.clone());
-        let tool_description = resolved_info
-            .as_ref()
-            .and_then(|info| info.description.clone());
-
-        let temp_path = if let Some(ref info) = resolved_info {
-            log::debug!("start_agent_session: resolving output schema");
-            let schema_value = crate::output_schemas::resolve_output_schema(
-                orch.schema_dir.as_deref(),
-                &info.schema,
-            )
-            .map_err(|e| format!("Failed to resolve output schema: {}", e))?;
-            let temp_path = crate::output_schemas::write_schema_to_temp_file(&schema_value)
-                .map_err(|e| format!("Failed to write schema to temp file: {}", e))?;
-            log::debug!("start_agent_session: schema written to {:?}", temp_path);
-            Some(temp_path)
-        } else {
-            None
-        };
-
-        (temp_path, tool_name, tool_description)
-    };
-
-    // Ensure MCP config file exists and get its path
+    // Ensure MCP config file exists and get its path. The output schema is no
+    // longer plumbed to cairn-cli — agents write their artifact via `write`
+    // (validated server-side), and the schema is surfaced in the prompt.
     log::debug!("start_agent_session: ensuring MCP config");
-    let schema_path_str = schema_temp_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string());
 
-    // Serialize available agents, skills, and tools for MCP config
-    let (agents_json, skills_json, tools_json, _session_project_path, session_project_id) = {
-        let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
+    // Resolve session DB context early — home_uri is required for the MCP config.
+    let db_context = session_db_context(orch, run_id)?;
+    let home_uri = db_context.home_uri.clone();
+    log::info!("Session home URI: {}", home_uri);
 
-        // Get project_id from run
-        let project_id: Option<String> = {
-            let diesel_conn = &mut *conn;
-            let run: crate::diesel_models::DbRun = runs::table
-                .find(run_id)
-                .first(diesel_conn)
-                .map_err(|e| format!("Failed to get run: {}", e))?;
-
-            if let Some(pid) = run.project_id {
-                Some(pid)
-            } else if let Some(iid) = run.issue_id {
-                issues::table
-                    .find(&iid)
-                    .select(issues::project_id)
-                    .first::<String>(diesel_conn)
-                    .ok()
-            } else {
-                None
-            }
-        };
-
-        // Get project path for file-based config lookup
-        let project_path: Option<std::path::PathBuf> = project_id.as_ref().and_then(|pid| {
-            projects::table
-                .find(pid)
-                .select(projects::repo_path)
-                .first::<String>(&mut *conn)
-                .ok()
-                .map(std::path::PathBuf::from)
-        });
+    // Serialize available agents for MCP config
+    let (agents_json, _session_project_path, session_project_id) = {
+        let project_path = db_context.project_path.clone();
+        let project_id = db_context.project_id.clone();
 
         // Get available agents from files
         let agents = {
@@ -376,94 +1159,23 @@ pub fn start_agent_session(
             }
         };
 
-        // Get available skills from files
-        let skills = {
-            use crate::config::{skills as config_skills, ConfigResult};
-
-            let file_skills = config_skills::list_skills(&orch.config_dir, project_path.as_deref())
-                .unwrap_or_default();
-
-            let mut skill_infos: Vec<serde_json::Value> = file_skills
-                .into_iter()
-                .filter_map(|r| match r {
-                    ConfigResult::Ok(skill) => Some(serde_json::json!({
-                        "id": skill.id,
-                        "name": skill.name,
-                        "description": skill.description
-                    })),
-                    ConfigResult::Err { .. } => None,
-                })
-                .collect();
-
-            skill_infos.sort_by(|a, b| {
-                let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                a_name.cmp(b_name)
-            });
-
-            if !skill_infos.is_empty() {
-                serde_json::to_string(&skill_infos).ok()
-            } else {
-                None
-            }
-        };
-
-        // Get available custom tools from files
-        let tools = {
-            use crate::config::{tools as config_tools, ConfigResult};
-
-            let file_tools = config_tools::list_tools(&orch.config_dir, project_path.as_deref())
-                .unwrap_or_default();
-
-            let mut tool_infos: Vec<serde_json::Value> = file_tools
-                .into_iter()
-                .filter_map(|r| match r {
-                    ConfigResult::Ok(tool) => Some(serde_json::json!({
-                        "id": tool.id,
-                        "name": tool.name,
-                        "description": tool.description,
-                        "inputSchema": tool.input_schema
-                    })),
-                    ConfigResult::Err { .. } => None,
-                })
-                .collect();
-
-            tool_infos.sort_by(|a, b| {
-                let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                a_name.cmp(b_name)
-            });
-
-            if !tool_infos.is_empty() {
-                serde_json::to_string(&tool_infos).ok()
-            } else {
-                None
-            }
-        };
-
-        (agents, skills, tools, project_path, project_id)
+        (agents, project_path, project_id)
     };
 
-    let mcp_config_path = match crate::config::mcp_setup::ensure_mcp_config(
-        &orch.config_dir,
+    // Build the MCP config inline (passed per-run to the backend, never written
+    // to a shared file) so concurrent sessions can't clobber each other's
+    // `CAIRN_HOME_URI` / `--agents` payload.
+    let cairn_home = cairn_common::paths::cairn_home();
+    let cairn_home_str = cairn_home.to_string_lossy();
+    let mcp_config_json = crate::config::mcp_setup::build_mcp_config_string(
         &orch.mcp_binary_path,
         orch.mcp_callback_port,
-        schema_path_str.as_deref(),
-        resolved_tool_name.as_deref(),
-        resolved_tool_description.as_deref(),
         agents_json.as_deref(),
-        skills_json.as_deref(),
-        tools_json.as_deref(),
-    ) {
-        Ok(path) => {
-            log::debug!("start_agent_session: MCP config done, path={:?}", path);
-            path
-        }
-        Err(e) => {
-            log::debug!("start_agent_session: MCP config FAILED: {}", e);
-            return Err(e);
-        }
-    };
+        Some(home_uri.as_str()),
+        cairn_common::paths::env_str(),
+        Some(cairn_home_str.as_ref()),
+    );
+    log::debug!("start_agent_session: MCP config built inline");
     log::info!("[PROFILE] MCP config done: {:?}", start_time.elapsed());
 
     let workspace_settings = crate::config::settings::load_settings(&orch.config_dir);
@@ -479,180 +1191,25 @@ pub fn start_agent_session(
         effective_model,
         final_prompt,
         system_prompt_content,
+        system_prompt_dynamic_tail,
         backend,
         permissions,
         max_thinking_tokens,
         reasoning_effort,
     ) = {
         use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
-        use crate::diesel_models::DbRun;
-        use crate::schema::{issues, jobs, runs};
-        use diesel::prelude::*;
+        let run_issue_id = db_context.run_issue_id.clone();
+        let project_key = db_context.project_key.clone();
+        let project_path_for_prompt = db_context.project_path.clone();
 
-        let mut conn = orch.db.conn.lock().map_err(|e| e.to_string())?;
-
-        // Get run context for URI (project_key, issue_number, node_name)
-        // Also capture issue_id for messaging context injection
-        let (current_location_uri, run_issue_id): (Option<String>, Option<String>) = {
-            let diesel_conn = &mut *conn;
-            let run: DbRun = runs::table
-                .find(run_id)
-                .first(diesel_conn)
-                .map_err(|e| format!("Failed to get run: {}", e))?;
-
-            let issue_id_clone = run.issue_id.clone();
-
-            let project_key = run
-                .project_id
-                .as_ref()
-                .and_then(|pid| {
-                    projects::table
-                        .find(pid)
-                        .select(projects::key)
-                        .first::<String>(diesel_conn)
-                        .ok()
-                })
-                .or_else(|| {
-                    run.issue_id.as_ref().and_then(|iid| {
-                        issues::table
-                            .inner_join(projects::table)
-                            .filter(issues::id.eq(iid))
-                            .select(projects::key)
-                            .first::<String>(diesel_conn)
-                            .ok()
-                    })
-                });
-
-            let issue_number = run.issue_id.as_ref().and_then(|iid| {
-                issues::table
-                    .find(iid)
-                    .select(issues::number)
-                    .first::<i32>(diesel_conn)
-                    .ok()
-            });
-
-            // Get node identifiers, execution_id, and parent context from job
-            let (recipe_node_id, node_name, job_exec_id, parent_job_id) = run
-                .job_id
-                .as_ref()
-                .and_then(|jid| {
-                    jobs::table
-                        .find(jid)
-                        .select((
-                            jobs::recipe_node_id,
-                            jobs::node_name,
-                            jobs::execution_id,
-                            jobs::parent_job_id,
-                        ))
-                        .first::<(
-                            Option<String>,
-                            Option<String>,
-                            Option<String>,
-                            Option<String>,
-                        )>(diesel_conn)
-                        .ok()
-                })
-                .unwrap_or((None, None, None, None));
-
-            // Get exec_seq from the execution
-            let exec_seq = job_exec_id.as_deref().and_then(|eid| {
-                executions::table
-                    .find(eid)
-                    .select(executions::seq)
-                    .first::<Option<i32>>(diesel_conn)
-                    .ok()
-                    .flatten()
-            });
-
-            // If this is a task (has parent_job_id), get parent's identifiers
-            let (parent_recipe_node_id, parent_node_name) = parent_job_id
-                .as_deref()
-                .and_then(|pid| {
-                    jobs::table
-                        .find(pid)
-                        .select((jobs::recipe_node_id, jobs::node_name))
-                        .first::<(Option<String>, Option<String>)>(diesel_conn)
-                        .ok()
-                })
-                .unwrap_or((None, None));
-
-            let uri = project_key.map(|proj| {
-                build_current_location_uri(
-                    &proj,
-                    issue_number,
-                    exec_seq,
-                    parent_recipe_node_id.as_deref(),
-                    parent_node_name.as_deref(),
-                    recipe_node_id.as_deref(),
-                    node_name.as_deref(),
-                )
-            });
-
-            (uri, issue_id_clone)
-        };
-
-        // Get project_id from run (either directly or via issue)
-        let project_id = {
-            let diesel_conn = &mut *conn;
-            let run: DbRun = runs::table
-                .find(run_id)
-                .first(diesel_conn)
-                .map_err(|e| format!("Failed to get run: {}", e))?;
-
-            if let Some(pid) = run.project_id {
-                Some(pid)
-            } else if let Some(iid) = run.issue_id {
-                issues::table
-                    .find(&iid)
-                    .select(issues::project_id)
-                    .first::<String>(diesel_conn)
-                    .ok()
-            } else {
-                None
-            }
-        };
-
-        // Get project path for file-based config lookup
-        let project_path_for_prompt: Option<std::path::PathBuf> =
-            project_id.as_ref().and_then(|pid| {
-                projects::table
-                    .find(pid)
-                    .select(projects::repo_path)
-                    .first::<String>(&mut *conn)
-                    .ok()
-                    .map(std::path::PathBuf::from)
-            });
-
+        // Resolve-early: runtime extras (effort, thinking) come straight from the
+        // AgentConfig, resolved at launch/edit time — never recomputed against
+        // current presets here. This is the deferred-resolution deletion that
+        // keeps a resumed session stable across workspace-settings changes.
         let (max_thinking_tokens, reasoning_effort) = {
-            let presets = execution_id
-                .and_then(|eid| {
-                    executions::table
-                        .find(eid)
-                        .select(executions::snapshot)
-                        .first::<Option<String>>(&mut *conn)
-                        .ok()
-                        .flatten()
-                        .and_then(|json| {
-                            serde_json::from_str::<crate::models::ExecutionSnapshot>(&json)
-                                .ok()
-                                .and_then(|snapshot| {
-                                    snapshot.presets.as_ref().map(PresetsConfig::from)
-                                })
-                        })
-                })
-                .unwrap_or_else(|| {
-                    load_effective_presets(&orch.config_dir, project_path_for_prompt.as_deref())
-                });
-            let authored_tier = agent_config
+            let extras = agent_config
                 .as_ref()
-                .and_then(|ac| ac.tier.as_ref())
-                .or(model.as_ref())
-                .map(Model::as_str);
-            let authored_backend = agent_config
-                .as_ref()
-                .and_then(|ac| ac.backend_preference.as_deref());
-            let extras = resolve_runtime_selection(authored_tier, authored_backend, &presets)
-                .map(|(_, _, extras)| extras)
+                .and_then(|ac| ac.extras.clone())
                 .unwrap_or_default();
             (
                 extras
@@ -667,12 +1224,19 @@ pub fn start_agent_session(
             let agents =
                 config_agents::list_agents(&orch.config_dir, project_path_for_prompt.as_deref())
                     .unwrap_or_default();
-            let mut result: Vec<(String, String, String)> = agents
+            let mut by_id = std::collections::BTreeMap::new();
+            for result in agents {
+                if let ConfigResult::Ok(agent) = result {
+                    // config_root_subdirs yields project first, so keep the first
+                    // occurrence for each id to avoid duplicate prompt entries.
+                    by_id
+                        .entry(agent.id)
+                        .or_insert((agent.name, agent.description));
+                }
+            }
+            let mut result: Vec<(String, String, String)> = by_id
                 .into_iter()
-                .filter_map(|r| match r {
-                    ConfigResult::Ok(agent) => Some((agent.id, agent.name, agent.description)),
-                    ConfigResult::Err { .. } => None,
-                })
+                .map(|(id, (name, description))| (id, name, description))
                 .collect();
             result.sort_by(|a, b| a.1.cmp(&b.1));
             result
@@ -683,12 +1247,19 @@ pub fn start_agent_session(
             let skills =
                 config_skills::list_skills(&orch.config_dir, project_path_for_prompt.as_deref())
                     .unwrap_or_default();
-            let mut result: Vec<(String, String, String)> = skills
+            let mut by_id = std::collections::BTreeMap::new();
+            for result in skills {
+                if let ConfigResult::Ok(skill) = result {
+                    // config_root_subdirs yields project first, so keep the first
+                    // occurrence for each id to avoid duplicate prompt entries.
+                    by_id
+                        .entry(skill.id)
+                        .or_insert((skill.name, skill.description));
+                }
+            }
+            let mut result: Vec<(String, String, String)> = by_id
                 .into_iter()
-                .filter_map(|r| match r {
-                    ConfigResult::Ok(skill) => Some((skill.id, skill.name, skill.description)),
-                    ConfigResult::Err { .. } => None,
-                })
+                .map(|(id, (name, description))| (id, name, description))
                 .collect();
             result.sort_by(|a, b| a.1.cmp(&b.1));
             result
@@ -699,9 +1270,15 @@ pub fn start_agent_session(
         // can control which tools are allowed/disallowed).
         // ================================================================
 
-        let agent_backend_name = agent_config
-            .as_ref()
-            .and_then(|ac| ac.backend_preference.clone());
+        // Resolve-early: the concrete backend comes from the AgentConfig's atomic
+        // selection. backend_preference and model-derivation are fallbacks only
+        // for configs that lack a resolved selection.
+        let agent_backend_name = agent_config.as_ref().and_then(|ac| {
+            ac.selection
+                .as_ref()
+                .map(|s| s.backend.clone())
+                .or_else(|| ac.backend_preference.clone())
+        });
 
         // Runtime model should already be resolved before session start.
         let resolved_model = model.clone();
@@ -715,14 +1292,13 @@ pub fn start_agent_session(
 
         let backend = backends::backend_for_name(effective_backend_name.as_deref());
 
-        // Build canonical permissions from agent config fields
-        let permissions = {
-            let (ap, fs) = agent_config
+        // Build canonical fence permissions. Escape gating happens in the verb handlers.
+        let permissions = backends::AgentPermissions::new(
+            agent_config
                 .as_ref()
-                .map(|ac| (ac.approval_policy, ac.filesystem_scope))
-                .unwrap_or_default();
-            backends::AgentPermissions::new(ap.unwrap_or_default(), fs.unwrap_or_default())
-        };
+                .and_then(|ac| ac.fence)
+                .unwrap_or_default(),
+        );
 
         // ================================================================
         // Tool resolution via backend adapter
@@ -739,75 +1315,122 @@ pub fn start_agent_session(
             .unwrap_or_default();
 
         let resolved = backend.resolve_tools(&agent_tools, &agent_disallowed);
-        let mut allowed = resolved.allowed;
+        let allowed = resolved.allowed;
         let disallowed = resolved.disallowed;
 
-        // Strip file mutation tools when filesystem scope is ReadOnly
-        if permissions.filesystem == crate::models::FilesystemScope::ReadOnly {
-            allowed.retain(|t| {
-                !matches!(
-                    t.as_str(),
-                    "mcp__cairn__write" | "mcp__cairn__edit" | "mcp__cairn__filechange"
-                )
-            });
-        }
+        // No per-scope tool stripping: the three verbs are always allow-listed
+        // and out-of-worktree file/shell access is gated by the worktree fence
+        // in the verb handlers (governed by the agent's fence setting), not by
+        // removing tools from the allow-list. See CAIRN-1172.
 
-        // Add custom submission tool name if an output schema defines one
-        let submission_tool = resolved_tool_name
-            .as_ref()
-            .map(|n| format!("mcp__cairn__{}", n))
-            .unwrap_or_else(|| "mcp__cairn__return".to_string());
+        // The agent submits its output by writing its artifact via `write`
+        // (cairn:~/<name>); there is no dedicated submission tool to allow.
 
-        if !allowed.contains(&submission_tool) {
-            allowed.push(submission_tool.clone());
-        }
-
-        // Build system prompt content from agent prompt + context
-        let system_prompt_content = {
+        // Build system prompt content from agent prompt + context. Also yields the
+        // per-run dynamic tail (the orientation block + wrapper close) so archival
+        // can content-address the static agent head and inline only this suffix.
+        let (system_prompt_content, system_prompt_dynamic_tail) = {
             let mut content = agent_config
                 .as_ref()
                 .map(|a| a.prompt.clone())
                 .unwrap_or_default();
 
-            // Append available agents list if task tool is available
-            if allowed.contains(&"mcp__cairn__task".to_string()) && !available_agents.is_empty() {
+            // Append available agents list if the change tool is available.
+            // Sub-agents are spawned by appending to the node's tasks collection
+            // (`cairn:~/tasks`) via `write`, so the roster is gated on `write`.
+            if allowed.contains(&"mcp__cairn__write".to_string()) && !available_agents.is_empty() {
                 if !content.is_empty() {
                     content.push_str("\n\n");
                 }
                 content.push_str("## Available Agents\n\n");
-                content.push_str("You can spawn these agents using the task tool:\n\n");
+                content.push_str(
+                    "Spawn these agents by appending to your node's tasks collection (`cairn:~/tasks`) via `write`, using the agent name as `subagentType`:\n\n",
+                );
                 for (_id, name, description) in &available_agents {
                     content.push_str(&format!("- **{}**: {}\n", name, description));
                 }
             }
 
-            // Append available skills list if skill tool is available
-            if allowed.contains(&"mcp__cairn__skill".to_string())
+            // Append skills resource pointer if the read tool is available
+            if allowed.contains(&"mcp__cairn__read".to_string())
                 && !available_skills_for_prompt.is_empty()
             {
                 if !content.is_empty() {
                     content.push_str("\n\n");
                 }
-                content.push_str("## Available Skills\n\n");
-                content.push_str("You can retrieve skill instructions using the skill tool:\n\n");
+                content.push_str("## Skills\n\n");
+                content.push_str(
+                    "Skills are readable resources. Read `cairn://skills` for the full list, or read a specific skill with `cairn://skills/<id>`:\n\n",
+                );
                 for (id, name, description) in &available_skills_for_prompt {
                     content.push_str(&format!("- **{}** (`{}`): {}\n", name, id, description));
                 }
             }
 
-            // Inject project resources section
+            // MCP servers affordance block: configured (enabled) external servers
+            // reachable through the cairn://mcp gateway, each tool rendered as a
+            // terse one-line contract from the persisted tool store (captured when
+            // the server was saved in Settings, so it's available synchronously on
+            // the very first session). Full argument schemas stay a
+            // `read cairn://mcp/<srv>` away; a server with no captured tools renders
+            // a read pointer. Gated on `read` since discovery and invocation go
+            // through it.
+            if allowed.contains(&"mcp__cairn__read".to_string()) {
+                let mcp_servers = crate::config::mcp_servers::resolve_mcp_servers(
+                    &orch.config_dir,
+                    project_path_for_prompt.as_deref(),
+                );
+                if !mcp_servers.is_empty() {
+                    let tools_by_server = crate::config::mcp_tools::resolve_tools(
+                        &orch.config_dir,
+                        project_path_for_prompt.as_deref(),
+                    );
+                    if let Some(section) =
+                        crate::mcp::handlers::mcp_resources::render_mcp_affordance_block(
+                            &mcp_servers,
+                            &tools_by_server,
+                        )
+                    {
+                        if !content.is_empty() {
+                            content.push_str("\n\n");
+                        }
+                        content.push_str(&section);
+                    }
+                }
+            }
+
+            // Inject project-config-derived sections: available terminals and
+            // project references. Both read from the same loaded project config.
             if let Some(ref project_path) = project_path_for_prompt {
                 let proj_config =
                     crate::config::project_settings::load_project_settings(project_path);
-                if let Some(ref resources) = proj_config.resources {
-                    if !resources.is_empty() {
-                        let resources_section =
-                            crate::resources::build_resources_prompt(&orch.config_dir, resources);
-                        if !resources_section.is_empty() {
+
+                // Available Terminals: the project's named terminal shortcuts.
+                // Terminals are created via `write`, so gate on it (mirroring
+                // the Available Agents gate). Absent when none are configured.
+                if allowed.contains(&"mcp__cairn__write".to_string()) {
+                    if let Some(ref terminal_commands) = proj_config.terminal_commands {
+                        if let Some(section) = build_available_terminals_section(terminal_commands)
+                        {
                             if !content.is_empty() {
                                 content.push_str("\n\n");
                             }
-                            content.push_str(&resources_section);
+                            content.push_str(&section);
+                        }
+                    }
+                }
+
+                if let Some(ref references) = proj_config.references {
+                    if !references.is_empty() {
+                        let references_section = crate::references::build_references_prompt(
+                            &orch.config_dir,
+                            references,
+                        );
+                        if !references_section.is_empty() {
+                            if !content.is_empty() {
+                                content.push_str("\n\n");
+                            }
+                            content.push_str(&references_section);
                         }
                     }
                 }
@@ -815,17 +1438,9 @@ pub fn start_agent_session(
 
             // Inject messaging context (peers + recent history)
             if let Some(ref issue_id) = run_issue_id {
-                // Look up project key for channel queries
-                let msg_project_key: Option<String> = project_id.as_ref().and_then(|pid| {
-                    projects::table
-                        .find(pid)
-                        .select(projects::key)
-                        .first::<String>(&mut *conn)
-                        .ok()
-                });
-                let messaging_section = crate::messages::prompt::build_messaging_context(
-                    &mut conn,
-                    msg_project_key.as_deref().unwrap_or(""),
+                let messaging_section = build_messaging_context(
+                    orch,
+                    project_key.as_deref().unwrap_or(""),
                     issue_id,
                     run_id,
                 );
@@ -837,20 +1452,96 @@ pub fn start_agent_session(
                 }
             }
 
-            // Add current location URI if available
-            if let Some(ref uri) = current_location_uri {
-                if !content.is_empty() {
-                    content.push_str("\n\n");
+            // Inject the output-artifact instruction when this node produces one.
+            // The schema is no longer a visible tool input, so the agent learns
+            // the target URI, the fields, and the submit-then-stop protocol here.
+            if let Some(info) = _output_schema {
+                if let Ok(schema_value) = crate::output_schemas::resolve_output_schema(
+                    orch.schema_dir.as_deref(),
+                    &info.schema,
+                ) {
+                    let name = info.artifact_name.as_deref().unwrap_or("artifact");
+                    let mut section = format!(
+                        "## Output artifact\n\nWhen your work is complete, record your result as this node's output artifact: write it with the `write` verb to `cairn:~/{name}` (mode `create`; use mode `patch` to revise). The payload is validated against the schema below before it is accepted.\n\n"
+                    );
+                    let required: Vec<String> = schema_value
+                        .get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(props) = schema_value.get("properties").and_then(|p| p.as_object())
+                    {
+                        section.push_str("Fields:\n");
+                        for (key, val) in props {
+                            let ty = val.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+                            let desc = val
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("");
+                            let req = if required.iter().any(|r| r == key) {
+                                "required"
+                            } else {
+                                "optional"
+                            };
+                            let sep = if desc.is_empty() { "" } else { ": " };
+                            section.push_str(&format!("- `{key}` ({ty}, {req}){sep}{desc}\n"));
+                        }
+                    }
+                    // Writing the artifact is itself the signal that the work is
+                    // ready — it notifies the user and advances the workflow. The
+                    // gating sentence is only true when the node waits on a human.
+                    section.push_str(
+                        "\nWriting this artifact is the last action of your turn. The write itself signals that your work is ready — it notifies the user and pauses the run for review; a reply to this same session continues it.",
+                    );
+                    if matches!(info.confirm_policy, crate::models::ConfirmPolicy::User) {
+                        section.push_str(
+                            " The artifact is held for user confirmation before downstream work proceeds.",
+                        );
+                    }
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str(&section);
                 }
-                content.push_str(&format!("Current Location: `{}`", uri));
             }
 
-            if content.is_empty() {
-                None
-            } else {
-                // Wrap in <agent_role> tags to distinguish from MCP instructions
-                Some(format!("<agent_role>\n{}\n</agent_role>", content))
+            // Orientation block: the agent's coordinates for this run. Folds in
+            // the home-URI pointer that previously stood alone here. Everything
+            // appended from here on is the per-run dynamic tail.
+            let dynamic_start = content.len();
+            if !content.is_empty() {
+                content.push_str("\n\n");
             }
+            // Provision the per-job scratch dir up front so it exists the moment
+            // the agent reads the orientation block (before any `run` spawn that
+            // would otherwise lazily create it). The same path is exported as
+            // TMPDIR for each spawned command in `execute_process`.
+            let scratch_dir = db_context.job_id.as_deref().map(|jid| {
+                crate::scratch::ensure_job_scratch_dir(jid)
+                    .to_string_lossy()
+                    .to_string()
+            });
+            content.push_str(&build_orientation_block(
+                working_dir,
+                &home_uri,
+                project_key.as_deref(),
+                project_path_for_prompt.as_ref().and_then(|p| p.to_str()),
+                db_context.effective_base_branch.as_deref(),
+                scratch_dir.as_deref(),
+            ));
+
+            // The dynamic tail = everything appended from `dynamic_start` (the
+            // orientation block and its leading separator) plus the wrapper close,
+            // a suffix of the wrapped content. `build_orientation_block` is never
+            // empty, so the wrapped content is always present.
+            let dynamic_tail = format!("{}\n</agent_role>", &content[dynamic_start..]);
+            // Wrap in <agent_role> tags to distinguish from MCP instructions.
+            let wrapped = format!("<agent_role>\n{}\n</agent_role>", content);
+            (Some(wrapped), Some(dynamic_tail))
         };
 
         // Base prompt stays as user message
@@ -862,6 +1553,7 @@ pub fn start_agent_session(
             resolved_model,
             resolved_prompt,
             system_prompt_content,
+            system_prompt_dynamic_tail,
             backend,
             permissions,
             max_thinking_tokens,
@@ -875,7 +1567,7 @@ pub fn start_agent_session(
             orch.get_identity_store()
                 .and_then(|store| store.project_overrides.get(pid).cloned())
         });
-        orch.resolve_identity_for_project(project_overrides.as_ref())
+        orch.resolve_identity_for_project(session_project_id.as_deref(), project_overrides.as_ref())
     });
 
     let session_config = SessionConfig {
@@ -883,11 +1575,13 @@ pub fn start_agent_session(
         working_dir: working_dir.to_string(),
         prompt: final_prompt,
         system_prompt_content,
+        system_prompt_dynamic_tail,
         model: effective_model,
         session_start,
         allowed_tools,
         disallowed_tools,
-        mcp_config_path,
+        mcp_config_json,
+        home_uri: home_uri.clone(),
         max_thinking_tokens,
         reasoning_effort,
         permissions,
@@ -898,429 +1592,698 @@ pub fn start_agent_session(
     backend.start_session(session_config, orch)
 }
 
-/// Build the `current_location_uri` for an agent session.
-///
-/// Produces URIs matching the cairn:// scheme:
-/// - Job node: `cairn://PROJECT/NUMBER/EXEC/NODE`
-/// - Issue fallback: `cairn://PROJECT/NUMBER`
-/// - Project fallback: `cairn://PROJECT`
-pub(crate) fn build_current_location_uri(
-    project_key: &str,
-    issue_number: Option<i32>,
-    exec_seq: Option<i32>,
-    parent_recipe_node_id: Option<&str>,
-    parent_node_name: Option<&str>,
-    recipe_node_id: Option<&str>,
-    node_name: Option<&str>,
-) -> String {
-    let _ = (parent_recipe_node_id, parent_node_name);
-    match (issue_number, exec_seq) {
-        (Some(num), Some(seq)) => {
-            if let Some(node_segment) = visible_node_segment(recipe_node_id, node_name) {
-                return format!("cairn://{}/{}/{}/{}", project_key, num, seq, node_segment);
-            }
-
-            format!("cairn://{}/{}", project_key, num)
-        }
-        // Fallbacks
-        (Some(num), _) => format!("cairn://{}/{}", project_key, num),
-        _ => format!("cairn://{}", project_key),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_process::stream::{MessageContent, MessageContentInner};
-    use crate::services::SpawnConfig;
+    use crate::db::DbState;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, RowExt, SearchIndex};
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
-    fn make_system_event(session_id: &str) -> ClaudeEvent {
-        ClaudeEvent::System {
-            subtype: "init".to_string(),
-            session_id: session_id.to_string(),
-            data: serde_json::json!({}),
-        }
+    #[test]
+    fn orientation_block_states_run_coordinates() {
+        let block = build_orientation_block(
+            "/work/CAIRN-1288-builder-0",
+            "cairn://p/CAIRN/1288/1/builder",
+            Some("CAIRN"),
+            Some("/repos/cairn"),
+            Some("main"),
+            Some("/tmp/cairn-scratch-job-1"),
+        );
+        assert!(block.contains("## Orientation"));
+        assert!(block.contains("/work/CAIRN-1288-builder-0"));
+        assert!(block.contains("cairn://p/CAIRN/1288/1/builder"));
+        assert!(block.contains("cairn:~/"));
+        assert!(block.contains("Project: `CAIRN`"));
+        assert!(block.contains("Repository root: `/repos/cairn`"));
+        assert!(block.contains("Base branch: `main`"));
+        // Platform is always present, regardless of optional fields.
+        assert!(block.contains(std::env::consts::OS));
+        // Scratch dir is surfaced as the agent's TMPDIR when provided.
+        assert!(block.contains("Scratch dir (TMPDIR): `/tmp/cairn-scratch-job-1`"));
+        assert!(block.contains("$TMPDIR"));
     }
 
-    fn make_user_event(session_id: &str) -> ClaudeEvent {
-        ClaudeEvent::User {
-            uuid: "user-uuid".to_string(),
-            session_id: session_id.to_string(),
-            message: MessageContent {
-                role: "user".to_string(),
-                content: MessageContentInner::Text("hello".to_string()),
+    #[tokio::test]
+    async fn session_context_uses_job_base_branch_for_child_issue_runs() {
+        let db = Arc::new(migrated_db().await);
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at)
+             VALUES('w', 'Workspace', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES('proj', 'w', 'Project', 'CAIRN', '/repos/cairn', 'main', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES('parent', 'proj', 1, 'Parent', 'active', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
+             VALUES('child', 'proj', 2, 'Child', 'active', 'parent', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES('exec-child', 'recipe', 'child', 'proj', 'running', 1, 1);
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, base_branch, created_at, updated_at)
+             VALUES('job-child', 'exec-child', 'child', 'proj', 'running', 'builder', 'builder', 'agent/CAIRN-1-coordinator-0', 1, 1);
+            INSERT INTO runs(id, issue_id, project_id, job_id, status, created_at, updated_at)
+             VALUES('run-child', 'child', 'proj', 'job-child', 'running', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(Arc::clone(&db));
+
+        let context = session_db_context(&orch, "run-child").unwrap();
+
+        assert_eq!(
+            context.effective_base_branch.as_deref(),
+            Some("agent/CAIRN-1-coordinator-0")
+        );
+        assert_ne!(context.effective_base_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn orientation_block_omits_missing_optionals() {
+        let block =
+            build_orientation_block("/work/wt", "cairn://p/P/1/1/node", None, None, None, None);
+        assert!(block.contains("Working directory (cwd): `/work/wt`"));
+        assert!(!block.contains("Project:"));
+        assert!(!block.contains("Repository root:"));
+        assert!(!block.contains("Base branch:"));
+        assert!(block.contains("Platform:"));
+        // No scratch line when the run has no job (e.g. project chat).
+        assert!(!block.contains("Scratch dir"));
+    }
+
+    #[test]
+    fn available_terminals_section_renders_for_non_empty_list() {
+        let cmds = vec![
+            crate::models::TerminalCommand {
+                name: "Dev Server".to_string(),
+                command: "npm run dev".to_string(),
             },
-            parent_tool_use_id: None,
-        }
-    }
-
-    fn make_assistant_event(session_id: &str) -> ClaudeEvent {
-        ClaudeEvent::Assistant {
-            uuid: "asst-uuid".to_string(),
-            session_id: session_id.to_string(),
-            message: MessageContent {
-                role: "assistant".to_string(),
-                content: MessageContentInner::Text("hi".to_string()),
+            crate::models::TerminalCommand {
+                name: "Tests".to_string(),
+                command: "bun run test".to_string(),
             },
-            parent_tool_use_id: None,
-        }
-    }
-
-    fn make_result_event(session_id: &str) -> ClaudeEvent {
-        ClaudeEvent::Result {
-            subtype: "success".to_string(),
-            session_id: session_id.to_string(),
-            is_error: false,
-            duration_ms: Some(1000),
-            num_turns: Some(1),
-            total_cost_usd: Some(0.01),
-            result: None,
-            usage: None,
-            data: serde_json::json!({}),
-        }
+        ];
+        let section = build_available_terminals_section(&cmds)
+            .expect("non-empty list should render a section");
+        assert!(section.contains("## Available Terminals"));
+        // Each shortcut by name + command.
+        assert!(section.contains("- **Dev Server**: `npm run dev`"));
+        assert!(section.contains("- **Tests**: `bun run test`"));
+        // A runnable create example: the system-generated slug for the first
+        // shortcut plus the command in the payload (create requires it).
+        assert!(section.contains("cairn:~/terminal/dev-server"));
+        assert!(section.contains("mode:\"create\""));
+        assert!(section.contains("command:\"npm run dev\""));
     }
 
     #[test]
-    fn extract_session_id_from_system_event() {
-        let event = make_system_event("session-123");
-        let result = extract_session_id(&event);
-        assert_eq!(result, Some("session-123".to_string()));
+    fn available_terminals_section_absent_for_empty_list() {
+        assert!(build_available_terminals_section(&[]).is_none());
     }
 
-    #[test]
-    fn extract_session_id_from_user_event() {
-        let event = make_user_event("session-456");
-        let result = extract_session_id(&event);
-        assert_eq!(result, Some("session-456".to_string()));
+    async fn migrated_db() -> LocalDb {
+        crate::storage::migrated_test_db("session-channel-cursor.db").await
     }
 
-    #[test]
-    fn extract_session_id_from_assistant_event() {
-        let event = make_assistant_event("session-789");
-        let result = extract_session_id(&event);
-        assert_eq!(result, Some("session-789".to_string()));
+    fn test_orchestrator(db: Arc<LocalDb>) -> Orchestrator {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.keep();
+        let index_path = config_dir.join("search-index.db");
+        let db_state = Arc::new(DbState::new(
+            db,
+            Arc::new(SearchIndex::open_or_create(index_path).unwrap()),
+        ));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        Orchestrator::builder(db_state, services, config_dir).build()
     }
 
-    #[test]
-    fn extract_session_id_from_result_event() {
-        let event = make_result_event("session-abc");
-        let result = extract_session_id(&event);
-        assert_eq!(result, Some("session-abc".to_string()));
+    async fn seed_run(db: &LocalDb, run_id: &str) {
+        let run_id = run_id.to_string();
+        db.write(|conn| {
+            let run_id = run_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO runs(id, status, created_at, updated_at) VALUES(?1, 'running', 1, 1)",
+                    (run_id.as_str(),),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 
-    #[test]
-    fn test_spawn_config_from_claude_args() {
-        use crate::agent_process::args::{build_claude_args, ClaudeArgsConfig};
-        use crate::backends::SessionStart;
-        use crate::models::Model;
-
-        let args_config = ClaudeArgsConfig {
-            mcp_config_path: "/path/to/mcp.json".to_string(),
-            skip_permissions: false,
-            permission_prompt_tool: None,
-            model: Some(Model::new(Model::OPUS)),
-            session_start: SessionStart::New {
-                session_id: "session-1".to_string(),
-            },
-            prompt: "Test prompt".to_string(),
-            max_thinking_tokens: Some(31999),
-            allowed_tools: vec!["Read".to_string()],
-            disallowed_tools: vec![],
-            append_system_prompt_file: None,
-            settings_path: None,
-            bidirectional: true,
-        };
-
-        let args = build_claude_args(&args_config);
-
-        let spawn_config = SpawnConfig::new("claude")
-            .args(&args)
-            .cwd("/some/path")
-            .stdin(true);
-
-        assert_eq!(spawn_config.program, "claude");
-        assert_eq!(spawn_config.cwd, Some("/some/path".to_string()));
-        assert!(spawn_config.args.contains(&"--model".to_string()));
-        assert!(spawn_config.args.contains(&"opus[1m]".to_string()));
-        assert!(spawn_config.args.contains(&"--input-format".to_string()));
-        assert!(spawn_config.capture_stdin);
+    async fn fetch_system_prompt_events(db: &LocalDb, run_id: &str) -> Vec<TranscriptEvent> {
+        let run_id = run_id.to_string();
+        db.read(|conn| {
+            let run_id = run_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT data FROM events WHERE run_id = ?1 AND event_type = 'system:prompt' ORDER BY sequence ASC",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                let mut events = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    let data = row.text(0)?;
+                    events.push(serde_json::from_str::<TranscriptEvent>(&data).unwrap());
+                }
+                Ok(events)
+            })
+        })
+        .await
+        .unwrap()
     }
 
-    // =========================================================================
-    // build_current_location_uri
-    // =========================================================================
+    async fn insert_backend_like_event(
+        db: &LocalDb,
+        run_id: &str,
+        session_id: Option<&str>,
+        sequence: i32,
+        event_type: &str,
+    ) {
+        let run_id = run_id.to_string();
+        let session_id = session_id.map(str::to_string);
+        let event_type = event_type.to_string();
+        db.write(|conn| {
+            let run_id = run_id.clone();
+            let session_id = session_id.clone();
+            let event_type = event_type.clone();
+            Box::pin(async move {
+                let event = TranscriptEvent {
+                    event_type: event_type.clone(),
+                    session_id: session_id.clone(),
+                    parent_tool_use_id: None,
+                    content: Some("normal event".to_string()),
+                    thinking: None,
+                    tool_name: None,
+                    tool_input: None,
+                    tool_uses: None,
+                    tool_use_id: None,
+                    tool_result: None,
+                    is_error: false,
+                    thinking_ms: None,
+                    raw: None,
+                };
+                let data = serde_json::to_string(&event).unwrap();
+                conn.execute(
+                    "INSERT INTO events (
+                        id, run_id, session_id, sequence, timestamp, event_type, data,
+                        parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                        cache_create_tokens, output_tokens, turn_id
+                     ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, 1, NULL, NULL, NULL, NULL, NULL)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        run_id,
+                        session_id,
+                        sequence,
+                        event_type,
+                        data,
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
 
-    #[test]
-    fn uri_for_task_agent() {
-        let uri = build_current_location_uri(
-            "CAIRN",
-            Some(831),
-            Some(1),
-            None,
-            Some("Builder"),
-            None,
-            Some("Explore"),
+    async fn fetch_event_sequences(db: &LocalDb, run_id: &str) -> Vec<(String, i64)> {
+        let run_id = run_id.to_string();
+        db.read(|conn| {
+            let run_id = run_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT event_type, sequence FROM events WHERE run_id = ?1 ORDER BY sequence ASC",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                let mut events = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    events.push((row.text(0)?, row.i64(1)?));
+                }
+                Ok(events)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn persist_system_prompt_event_inserts_prompt_content() {
+        let db = Arc::new(migrated_db().await);
+        seed_run(&db, "run-prompt").await;
+        let orch = test_orchestrator(Arc::clone(&db));
+
+        let next_sequence = persist_system_prompt_event(
+            &orch,
+            "run-prompt",
+            Some("sess"),
+            "codex",
+            &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "rendered prompt")],
         );
-        assert_eq!(uri, "cairn://CAIRN/831/1/explore");
-    }
 
-    #[test]
-    fn uri_for_task_agent_with_suffix() {
-        let uri = build_current_location_uri(
-            "CAIRN",
-            Some(831),
-            Some(1),
-            None,
-            Some("Builder"),
-            None,
-            Some("Explore-2"),
+        assert_eq!(next_sequence, 1);
+        let events = fetch_system_prompt_events(&db, "run-prompt").await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "system:prompt");
+        assert_eq!(events[0].session_id.as_deref(), Some("sess"));
+        assert_eq!(events[0].content.as_deref(), Some("rendered prompt"));
+        let raw = events[0].raw.as_ref().unwrap();
+        assert_eq!(raw.get("backend").and_then(|v| v.as_str()), Some("codex"));
+        assert_eq!(raw.get("bytes").and_then(|v| v.as_u64()), Some(15));
+        assert_eq!(
+            raw.get("includesBackendBase").and_then(|v| v.as_bool()),
+            Some(false)
         );
-        assert_eq!(uri, "cairn://CAIRN/831/1/explore-2");
+        assert!(raw.get("hash").and_then(|v| v.as_str()).unwrap().len() >= 64);
     }
 
-    #[test]
-    fn uri_for_recipe_node() {
-        let uri = build_current_location_uri(
-            "CAIRN",
-            Some(831),
-            Some(1),
-            None,
-            None,
-            None,
-            Some("builder-1"),
+    #[tokio::test]
+    async fn persist_system_prompt_event_returns_sequence_for_next_backend_event() {
+        let db = Arc::new(migrated_db().await);
+        seed_run(&db, "run-prompt-sequence").await;
+        let orch = test_orchestrator(Arc::clone(&db));
+
+        let mut backend_sequence = persist_system_prompt_event(
+            &orch,
+            "run-prompt-sequence",
+            Some("sess"),
+            "codex",
+            &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "same")],
         );
-        assert_eq!(uri, "cairn://CAIRN/831/1/builder-1");
-    }
+        insert_backend_like_event(
+            &db,
+            "run-prompt-sequence",
+            Some("sess"),
+            backend_sequence,
+            "system:init",
+        )
+        .await;
+        backend_sequence += 1;
 
-    #[test]
-    fn uri_prefers_slugified_node_name_over_recipe_node_id() {
-        let uri = build_current_location_uri(
-            "CAIRN",
-            Some(831),
-            Some(1),
-            None,
-            None,
-            Some("54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67"),
-            Some("Builder"),
+        assert_eq!(backend_sequence, 2);
+        assert_eq!(
+            fetch_event_sequences(&db, "run-prompt-sequence").await,
+            vec![
+                ("system:prompt".to_string(), 0),
+                ("system:init".to_string(), 1),
+            ]
         );
-        assert_eq!(uri, "cairn://CAIRN/831/1/builder");
+    }
+
+    #[tokio::test]
+    async fn persist_system_prompt_event_dedupe_returns_sequence_after_existing_events() {
+        let db = Arc::new(migrated_db().await);
+        seed_run(&db, "run-prompt-dedupe").await;
+        let orch = test_orchestrator(Arc::clone(&db));
+
+        let first_next = persist_system_prompt_event(
+            &orch,
+            "run-prompt-dedupe",
+            Some("sess"),
+            "codex",
+            &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "same")],
+        );
+        insert_backend_like_event(
+            &db,
+            "run-prompt-dedupe",
+            Some("sess"),
+            first_next,
+            "system:init",
+        )
+        .await;
+
+        let deduped_next = persist_system_prompt_event(
+            &orch,
+            "run-prompt-dedupe",
+            Some("sess"),
+            "codex",
+            &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "same")],
+        );
+        let events = fetch_system_prompt_events(&db, "run-prompt-dedupe").await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(deduped_next, 2);
+
+        persist_system_prompt_event(
+            &orch,
+            "run-prompt-dedupe",
+            Some("sess"),
+            "codex",
+            &[PromptSegment::new(SEGMENT_KIND_DYNAMIC, "changed")],
+        );
+        let events = fetch_system_prompt_events(&db, "run-prompt-dedupe").await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].content.as_deref(), Some("changed"));
+        assert_eq!(
+            fetch_event_sequences(&db, "run-prompt-dedupe").await,
+            vec![
+                ("system:prompt".to_string(), 0),
+                ("system:init".to_string(), 1),
+                ("system:prompt".to_string(), 2),
+            ]
+        );
     }
 
     #[test]
-    fn uri_falls_back_to_recipe_node_id_when_name_missing() {
-        let uri = build_current_location_uri(
+    fn build_appended_system_prompt_includes_base_and_agent_content() {
+        let prompt = build_appended_system_prompt(Some("agent instructions"), None);
+        assert!(prompt.contains(&crate::system_prompt::cairn_system_prompt()));
+        assert!(prompt.contains("agent instructions"));
+        assert!(prompt.contains("\n\nagent instructions"));
+    }
+
+    #[test]
+    fn build_appended_system_prompt_includes_workspace_instructions_before_agent_content() {
+        let prompt =
+            build_appended_system_prompt(Some("agent instructions"), Some("workspace doctrine"));
+        assert!(prompt
+            .contains("\n\n## Workspace Instructions\n\nworkspace doctrine\n\nagent instructions"));
+    }
+
+    #[test]
+    fn build_appended_system_prompt_omits_workspace_section_when_absent() {
+        let prompt = build_appended_system_prompt(None, None);
+        assert!(!prompt.contains("\n## Workspace Instructions\n"));
+    }
+
+    #[test]
+    fn build_appended_system_prompt_omits_memory_injection_block() {
+        let prompt = build_appended_system_prompt(None, None);
+        assert!(!prompt.contains("\n## Memories\n"));
+        assert!(!prompt.contains("Stored context you can pull"));
+        assert!(prompt.contains("## Capture Notes"));
+    }
+
+    /// The Claude/Codex assembly path (base + cairn + workspace + agent) yields an
+    /// ordered segment map whose concatenation is the composed prompt, and whose
+    /// agent content is split into a static head and the inlined dynamic tail.
+    #[test]
+    fn assemble_prompt_segments_splits_static_head_from_dynamic_tail() {
+        let agent = "<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>";
+        let dynamic = "\n\nORIENTATION\n</agent_role>";
+        let segs = assemble_prompt_segments(
+            Some("BASE"),
             "CAIRN",
-            Some(831),
-            Some(1),
-            None,
-            None,
-            Some("54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67"),
-            None,
+            Some("ws doctrine"),
+            Some(agent),
+            Some(dynamic),
+        );
+        let kinds: Vec<&str> = segs.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SEGMENT_KIND_BACKEND_BASE,
+                SEGMENT_KIND_CAIRN,
+                SEGMENT_KIND_WORKSPACE,
+                SEGMENT_KIND_AGENT,
+                SEGMENT_KIND_DYNAMIC,
+            ]
+        );
+        let full: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            full,
+            "BASE\n\nCAIRN\n\n## Workspace Instructions\n\nws doctrine\n\n<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>"
         );
         assert_eq!(
-            uri,
-            "cairn://CAIRN/831/1/54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67"
+            segs.iter()
+                .find(|s| s.kind == SEGMENT_KIND_DYNAMIC)
+                .unwrap()
+                .text,
+            dynamic
+        );
+        assert_eq!(
+            segs.iter()
+                .find(|s| s.kind == SEGMENT_KIND_AGENT)
+                .unwrap()
+                .text,
+            "\n\n<agent_role>\nbuilder body"
         );
     }
 
+    /// A Claude run whose base file failed to write (no backend base) and which
+    /// has no workspace doctrine: those segments are omitted, and with no dynamic
+    /// tail the agent content stays one static segment.
     #[test]
-    fn uri_fallback_issue_only() {
-        // No exec_seq — can't build full path
-        let uri =
-            build_current_location_uri("CAIRN", Some(831), None, None, None, None, Some("Builder"));
-        assert_eq!(uri, "cairn://CAIRN/831");
-    }
-
-    #[test]
-    fn uri_fallback_issue_no_node() {
-        let uri = build_current_location_uri("CAIRN", Some(831), Some(1), None, None, None, None);
-        assert_eq!(uri, "cairn://CAIRN/831");
-    }
-
-    #[test]
-    fn uri_fallback_project_only() {
-        let uri = build_current_location_uri("CAIRN", None, None, None, None, None, None);
-        assert_eq!(uri, "cairn://CAIRN");
-    }
-
-    #[test]
-    fn uri_task_requires_all_four_components() {
-        // Has parent but no node_name — falls back to issue
-        let uri = build_current_location_uri(
+    fn assemble_prompt_segments_omits_absent_pieces() {
+        let segs = assemble_prompt_segments(
+            None,
             "CAIRN",
-            Some(831),
-            Some(1),
             None,
-            Some("Builder"),
-            None,
+            Some("<agent_role>\nx\n</agent_role>"),
             None,
         );
-        assert_eq!(uri, "cairn://CAIRN/831");
+        let kinds: Vec<&str> = segs.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, vec![SEGMENT_KIND_CAIRN, SEGMENT_KIND_AGENT]);
+        let full: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(full, "CAIRN\n\n<agent_role>\nx\n</agent_role>");
     }
 
-    // =========================================================================
-    // insert_error_event
-    // =========================================================================
-
-    use crate::db::DbState;
-    use crate::diesel_models::{DbEvent, NewRun};
-    use crate::orchestrator::Orchestrator;
-    use crate::schema::events;
-    use crate::services::testing::TestServicesBuilder;
-    use crate::test_utils::test_diesel_conn;
-    use std::sync::{Arc, Mutex};
-
-    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection) -> Orchestrator {
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
-            db.clone(),
-            services.emitter.clone(),
-        ));
-        let sync_tx = Arc::new(Mutex::new(None));
-        Orchestrator {
-            db,
-            services: services.clone(),
-            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
-            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
-                "/tmp",
-            ))),
-            warm_gc: None,
-            pty_state: Arc::new(crate::services::PtyState::default()),
-            permission_responses: tokio::sync::broadcast::channel(16).0,
-            run_completions: tokio::sync::broadcast::channel(64).0,
-            prompt_responses: tokio::sync::broadcast::channel(16).0,
-            trigger_events: tokio::sync::broadcast::channel(256).0,
-            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            identity_store: Arc::new(Mutex::new(None)),
-            mcp_binary_path: "cairn-mcp".to_string(),
-            config_dir: std::path::PathBuf::from("/tmp"),
-            schema_dir: None,
-            mcp_callback_port: 3847,
-            embedding_engine: None,
-            vibe_state: None,
-            account_manager,
-            sync_tx: sync_tx.clone(),
-            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
-            api_config: crate::api::ApiConfig::default(),
-            effect_tx: None,
-            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            provider_usage_snapshots: Default::default(),
-            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
-        }
+    /// Seed the minimal workspace/project/issue/job/session rows needed for the
+    /// per-session channel cursor (`sess`).
+    async fn seed_session(db: &LocalDb) {
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('i', 'p', 1, 'Issue', 'backlog', 'backlog', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+            VALUES('j', 'p', 'i', 'running', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+            VALUES('sess', 'j', 'claude', 'open', 1, 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
     }
 
-    fn create_test_run(
-        conn: &mut diesel::sqlite::SqliteConnection,
-        run_id: &str,
-        job_id: Option<&str>,
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_msg(
+        db: &LocalDb,
+        id: &str,
+        channel_type: &str,
+        channel_id: &str,
+        sender_run_id: Option<&str>,
+        sender_name: &str,
+        content: &str,
+        created_at: i64,
     ) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        let new_run = NewRun {
-            id: run_id,
-            issue_id: None,
-            project_id: None,
-            job_id,
-            status: Some("live"),
-            session_id: None,
-            error_message: None,
-            started_at: Some(now),
-            exited_at: None,
-            created_at: now,
-            updated_at: now,
-            backend: None,
-            exit_reason: None,
-            start_mode: None,
-            chat_id: None,
-        };
-        diesel::insert_into(runs::table)
-            .values(&new_run)
-            .execute(conn)
-            .expect("Failed to create test run");
+        let id = id.to_string();
+        let channel_type = channel_type.to_string();
+        let channel_id = channel_id.to_string();
+        let sender_run_id = sender_run_id.map(str::to_string);
+        let sender_name = sender_name.to_string();
+        let content = content.to_string();
+        db.write(|conn| {
+            let id = id.clone();
+            let channel_type = channel_type.clone();
+            let channel_id = channel_id.clone();
+            let sender_run_id = sender_run_id.clone();
+            let sender_name = sender_name.clone();
+            let content = content.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO messages(id, channel_type, channel_id, sender_run_id, sender_name, content, created_at)
+                     VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![id, channel_type, channel_id, sender_run_id, sender_name, content, created_at],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 
-    #[test]
-    fn insert_error_event_creates_system_error_event() {
-        let conn = test_diesel_conn();
-        let orch = test_orchestrator(conn);
-
-        // Create a run first (events have FK to runs)
-        {
-            let mut conn = orch.db.conn.lock().unwrap();
-            create_test_run(&mut conn, "run-1", None);
-        }
-
-        insert_error_event(&orch, "run-1", None, "Something went wrong");
-
-        let mut conn = orch.db.conn.lock().unwrap();
-        let events: Vec<DbEvent> = events::table
-            .filter(events::run_id.eq("run-1"))
-            .load(&mut *conn)
-            .unwrap();
-
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        assert_eq!(event.event_type, "system:error");
-        assert_eq!(event.run_id, "run-1");
-        assert_eq!(event.session_id, None);
-        assert_eq!(event.sequence, 0);
-
-        // Verify the data payload contains the error message (camelCase due to serde rename)
-        let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
-        assert_eq!(data["content"], "Something went wrong");
-        assert_eq!(data["isError"], true);
-        assert_eq!(data["eventType"], "system:error");
+    async fn read_cursor(db: &LocalDb, session_id: &str) -> Option<i64> {
+        let session_id = session_id.to_string();
+        db.read(|conn| {
+            let session_id = session_id.clone();
+            Box::pin(async move { read_channel_cursor(conn, &session_id).await })
+        })
+        .await
+        .unwrap()
     }
 
-    #[test]
-    fn insert_error_event_includes_session_id() {
-        let conn = test_diesel_conn();
-        let orch = test_orchestrator(conn);
-
-        {
-            let mut conn = orch.db.conn.lock().unwrap();
-            create_test_run(&mut conn, "run-2", None);
-        }
-
-        insert_error_event(&orch, "run-2", Some("session-abc"), "Config error");
-
-        let mut conn = orch.db.conn.lock().unwrap();
-        let event: DbEvent = events::table
-            .filter(events::run_id.eq("run-2"))
-            .first(&mut *conn)
-            .unwrap();
-
-        assert_eq!(event.session_id, Some("session-abc".to_string()));
-
-        let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
-        assert_eq!(data["sessionId"], "session-abc");
+    async fn advance(db: &LocalDb, session_id: &str, rowid: i64) {
+        let session_id = session_id.to_string();
+        db.write(|conn| {
+            let session_id = session_id.clone();
+            Box::pin(async move { advance_channel_cursor(conn, &session_id, rowid).await })
+        })
+        .await
+        .unwrap();
     }
 
-    #[test]
-    fn insert_error_event_increments_sequence() {
-        let conn = test_diesel_conn();
-        let orch = test_orchestrator(conn);
+    async fn fetch_recent(
+        db: &LocalDb,
+        issue_key: &str,
+        exclude_run_id: &str,
+        cursor: Option<i64>,
+    ) -> Vec<PromptMessage> {
+        let issue_key = issue_key.to_string();
+        let exclude_run_id = exclude_run_id.to_string();
+        db.read(|conn| {
+            let issue_key = issue_key.clone();
+            let exclude_run_id = exclude_run_id.clone();
+            Box::pin(async move {
+                recent_messages_for_run(conn, "PROJ", Some(&issue_key), &exclude_run_id, cursor, 20)
+                    .await
+            })
+        })
+        .await
+        .unwrap()
+    }
 
-        {
-            let mut conn = orch.db.conn.lock().unwrap();
-            create_test_run(&mut conn, "run-3", None);
-        }
+    /// CAIRN-1302 Part 2: a channel message is injected at most once per
+    /// session (the cursor advances), while a newer message still surfaces.
+    #[tokio::test]
+    async fn channel_injection_dedupes_per_session() {
+        let db = migrated_db().await;
+        seed_session(&db).await;
+        insert_msg(
+            &db,
+            "m1",
+            "issue",
+            "PROJ/1",
+            Some("run-child"),
+            "system",
+            "salvage-frozen finished successfully",
+            1000,
+        )
+        .await;
 
-        // Insert two error events — second should get sequence 1
-        insert_error_event(&orch, "run-3", None, "First error");
-        insert_error_event(&orch, "run-3", None, "Second error");
+        // First injection: empty cursor surfaces the message.
+        let cursor0 = read_cursor(&db, "sess").await;
+        assert!(cursor0.is_none());
+        let first = fetch_recent(&db, "PROJ/1", "run-self", cursor0).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].content, "salvage-frozen finished successfully");
 
-        let mut conn = orch.db.conn.lock().unwrap();
-        let events: Vec<DbEvent> = events::table
-            .filter(events::run_id.eq("run-3"))
-            .order(events::sequence.asc())
-            .load(&mut *conn)
-            .unwrap();
+        // Advancing to the newest injected rowid persists the cursor.
+        let max_rowid = first.iter().map(|m| m.rowid).max().unwrap();
+        advance(&db, "sess", max_rowid).await;
+        let cursor1 = read_cursor(&db, "sess").await;
+        assert_eq!(cursor1, Some(max_rowid));
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].sequence, 0);
-        assert_eq!(events[1].sequence, 1);
+        // Second injection on the same session: the message is deduped.
+        let second = fetch_recent(&db, "PROJ/1", "run-self", cursor1).await;
+        assert!(
+            second.is_empty(),
+            "already-injected message must not re-surface"
+        );
+
+        // A later message still surfaces.
+        insert_msg(
+            &db,
+            "m2",
+            "issue",
+            "PROJ/1",
+            Some("run-child"),
+            "system",
+            "new notice",
+            2000,
+        )
+        .await;
+        let third = fetch_recent(&db, "PROJ/1", "run-self", cursor1).await;
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].content, "new notice");
+    }
+
+    /// Regression: a message arriving in the same wall-clock second as the
+    /// cursor but inserted later (larger rowid) must still surface. A
+    /// (created_at, id) cursor over random-UUID ids would drop it whenever the
+    /// later id sorts lower; the monotonic rowid cursor never does.
+    #[tokio::test]
+    async fn channel_injection_surfaces_same_second_later_arrival() {
+        let db = migrated_db().await;
+        seed_session(&db).await;
+        // First message at second 1000 with a high-sorting id.
+        insert_msg(
+            &db,
+            "ffff",
+            "issue",
+            "PROJ/1",
+            Some("run-child"),
+            "system",
+            "first",
+            1000,
+        )
+        .await;
+        let first = fetch_recent(&db, "PROJ/1", "run-self", None).await;
+        advance(&db, "sess", first.iter().map(|m| m.rowid).max().unwrap()).await;
+        let cursor = read_cursor(&db, "sess").await;
+
+        // Second message: SAME second, inserted later (larger rowid), but a
+        // lexicographically-smaller id than the cursor's id.
+        insert_msg(
+            &db,
+            "0000",
+            "issue",
+            "PROJ/1",
+            Some("run-child"),
+            "system",
+            "same-second later",
+            1000,
+        )
+        .await;
+        let next = fetch_recent(&db, "PROJ/1", "run-self", cursor).await;
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].content, "same-second later");
+    }
+
+    /// Ported from the removed messages::db tests: a run never sees the system
+    /// messages describing itself, but does see peers'.
+    #[tokio::test]
+    async fn recent_excludes_callers_own_system_messages() {
+        let db = migrated_db().await;
+        // System message about run-1 (the caller).
+        insert_msg(
+            &db,
+            "a",
+            "issue",
+            "PROJ/1",
+            Some("run-1"),
+            "system",
+            "builder-1 started working",
+            1000,
+        )
+        .await;
+        // System message about run-2 (a peer).
+        insert_msg(
+            &db,
+            "b",
+            "issue",
+            "PROJ/1",
+            Some("run-2"),
+            "system",
+            "builder-2 started working",
+            2000,
+        )
+        .await;
+        // Regular message from run-2.
+        insert_msg(
+            &db,
+            "c",
+            "issue",
+            "PROJ/1",
+            Some("run-2"),
+            "builder-2",
+            "taking src/api/",
+            3000,
+        )
+        .await;
+
+        let as_run_1 = fetch_recent(&db, "PROJ/1", "run-1", None).await;
+        assert_eq!(as_run_1.len(), 2);
+        assert_eq!(as_run_1[0].content, "builder-2 started working");
+        assert_eq!(as_run_1[1].content, "taking src/api/");
     }
 }

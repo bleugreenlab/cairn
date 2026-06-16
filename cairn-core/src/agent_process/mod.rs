@@ -6,7 +6,6 @@
 //! The Tauri app re-exports these types and builds session management on top.
 
 pub mod args;
-pub mod checkpoints;
 pub mod gc;
 pub mod process;
 pub mod stdin;

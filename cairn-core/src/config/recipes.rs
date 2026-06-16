@@ -34,47 +34,24 @@ pub fn list_recipes(
 ) -> Result<Vec<ConfigResult<FileRecipe>>, String> {
     let mut results = vec![];
 
-    // Read workspace-scoped recipes
-    let ws_dir = config_dir.join("recipes");
-    if ws_dir.exists() {
-        for entry in std::fs::read_dir(&ws_dir)
+    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "recipes")
+    {
+        if !dir.exists() || !dir.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&dir)
             .map_err(|e| format!("Failed to read recipes directory: {}", e))?
         {
             let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
             let path = entry.path();
-
-            // Skip directories
             if path.is_dir() {
                 continue;
             }
-
-            // Accept both .yaml and .yml
             let ext = path.extension().and_then(|e| e.to_str());
             if ext != Some("yaml") && ext != Some("yml") {
                 continue;
             }
-
-            results.push(load_recipe_file(&path, false));
-        }
-    }
-
-    // Read project-scoped recipes if project path specified
-    if let Some(proj_path) = project_path {
-        let proj_dir = proj_path.join(".cairn").join("recipes");
-        if proj_dir.exists() && proj_dir.is_dir() {
-            for entry in std::fs::read_dir(&proj_dir)
-                .map_err(|e| format!("Failed to read project recipes directory: {}", e))?
-            {
-                let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
-                let path = entry.path();
-
-                let ext = path.extension().and_then(|e| e.to_str());
-                if ext != Some("yaml") && ext != Some("yml") {
-                    continue;
-                }
-
-                results.push(load_recipe_file(&path, true));
-            }
+            results.push(load_recipe_file(&path, is_project_scoped));
         }
     }
 
@@ -89,31 +66,16 @@ pub fn get_recipe(
     id: &str,
     project_path: Option<&Path>,
 ) -> Result<Option<FileRecipe>, String> {
-    // Try project-scoped first if project specified
-    if let Some(proj_path) = project_path {
+    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "recipes")
+    {
         for ext in ["yaml", "yml"] {
-            let path = proj_path
-                .join(".cairn")
-                .join("recipes")
-                .join(format!("{}.{}", id, ext));
+            let path = dir.join(format!("{}.{}", id, ext));
             if path.exists() {
-                return match load_recipe_file(&path, true) {
+                return match load_recipe_file(&path, is_project_scoped) {
                     ConfigResult::Ok(recipe) => Ok(Some(recipe)),
                     ConfigResult::Err { error, .. } => Err(error),
                 };
             }
-        }
-    }
-
-    // Try workspace-scoped
-    let ws_dir = config_dir.join("recipes");
-    for ext in ["yaml", "yml"] {
-        let path = ws_dir.join(format!("{}.{}", id, ext));
-        if path.exists() {
-            return match load_recipe_file(&path, false) {
-                ConfigResult::Ok(recipe) => Ok(Some(recipe)),
-                ConfigResult::Err { error, .. } => Err(error),
-            };
         }
     }
 

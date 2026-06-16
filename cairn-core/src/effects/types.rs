@@ -56,9 +56,6 @@ pub enum WorkflowEffect {
         event: JobEvent,
     },
 
-    /// Wake manager on job failure.
-    WakeManager { job_id: String },
-
     /// Store a condition evaluation result and advance.
     StoreConditionEvaluation {
         execution_id: String,
@@ -70,11 +67,10 @@ pub enum WorkflowEffect {
     /// Apply checkpoint approval (DB transition + follow-on effects).
     ApplyCheckpointApproval { job_id: String },
 
-    /// Apply checkpoint rejection (DB transition + follow-on effects).
-    ApplyCheckpointRejection {
-        job_id: String,
-        reason: Option<String>,
-    },
+    /// Block a checkpoint job after its command failed: seed an unconfirmed
+    /// checkpoint artifact and recompute so the projection derives Blocked (a
+    /// resumable halt). Replaces the former DAG-level rejection path.
+    BlockCheckpointJob { job_id: String },
 
     /// Mark a job as failed (transition + error event).
     MarkJobFailed { job_id: String, error: String },
@@ -84,9 +80,6 @@ pub enum WorkflowEffect {
         action_run_id: String,
         error: String,
     },
-
-    /// Clean up worktrees for completed non-issue executions.
-    CleanupWorktrees { execution_id: String },
 
     // ── Host effects (dispatched to EffectExecutor) ────────────────────
     /// Start ready agent jobs (host prepares worktree + spawns process).
@@ -119,14 +112,6 @@ pub enum WorkflowEffect {
         condition: ConditionSpec,
         ctx: EffectContext,
     },
-
-    /// Create a worktree for an executor node.
-    CreateExecutorWorktree {
-        job_id: String,
-        execution_id: String,
-        project_id: String,
-        ctx: EffectContext,
-    },
 }
 
 /// Lightweight condition spec extracted from DbRecipeNode config.
@@ -157,12 +142,6 @@ pub enum EffectResult {
         error_msg: Option<String>,
     },
 
-    /// Worktree created for executor node.
-    WorktreeCreated {
-        job_id: String,
-        execution_id: String,
-    },
-
     /// Worktree creation failed.
     WorktreeFailed { job_id: String, error: String },
 
@@ -191,10 +170,6 @@ impl std::fmt::Debug for WorkflowEffect {
                 .debug_struct("EmitLifecycleMessage")
                 .field("job_id", job_id)
                 .finish(),
-            Self::WakeManager { job_id } => f
-                .debug_struct("WakeManager")
-                .field("job_id", job_id)
-                .finish(),
             Self::StoreConditionEvaluation {
                 execution_id,
                 node_id,
@@ -208,8 +183,8 @@ impl std::fmt::Debug for WorkflowEffect {
                 .debug_struct("ApplyCheckpointApproval")
                 .field("job_id", job_id)
                 .finish(),
-            Self::ApplyCheckpointRejection { job_id, .. } => f
-                .debug_struct("ApplyCheckpointRejection")
+            Self::BlockCheckpointJob { job_id } => f
+                .debug_struct("BlockCheckpointJob")
                 .field("job_id", job_id)
                 .finish(),
             Self::MarkJobFailed { job_id, .. } => f
@@ -219,10 +194,6 @@ impl std::fmt::Debug for WorkflowEffect {
             Self::MarkActionRunFailed { action_run_id, .. } => f
                 .debug_struct("MarkActionRunFailed")
                 .field("action_run_id", action_run_id)
-                .finish(),
-            Self::CleanupWorktrees { execution_id } => f
-                .debug_struct("CleanupWorktrees")
-                .field("execution_id", execution_id)
                 .finish(),
             Self::StartAgentJobs(jobs) => f
                 .debug_struct("StartAgentJobs")
@@ -253,15 +224,6 @@ impl std::fmt::Debug for WorkflowEffect {
                 .field("execution_id", execution_id)
                 .field("node_name", node_name)
                 .finish(),
-            Self::CreateExecutorWorktree {
-                job_id,
-                execution_id,
-                ..
-            } => f
-                .debug_struct("CreateExecutorWorktree")
-                .field("job_id", job_id)
-                .field("execution_id", execution_id)
-                .finish(),
         }
     }
 }
@@ -284,14 +246,6 @@ impl std::fmt::Debug for EffectResult {
                 .field("execution_id", execution_id)
                 .field("node_id", node_id)
                 .field("port", port)
-                .finish(),
-            Self::WorktreeCreated {
-                job_id,
-                execution_id,
-            } => f
-                .debug_struct("WorktreeCreated")
-                .field("job_id", job_id)
-                .field("execution_id", execution_id)
                 .finish(),
             Self::WorktreeFailed { job_id, .. } => f
                 .debug_struct("WorktreeFailed")

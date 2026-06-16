@@ -15,18 +15,41 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum JobStatus {
     #[default]
-    Pending, // Waiting on upstream control edges
-    Ready,    // Dependencies satisfied, waiting for process spawn
-    Running,  // Has an active run
+    Pending, // Not started: deps unmet, or deps met but not yet claimed by advancement
+    Running,  // Started/claimed: a turn is attached or being spun up (also crash-in-flight)
     Complete, // Finished with artifacts
     Failed,   // Error occurred or cascaded from upstream
     Blocked,  // Checkpoint awaiting approval
+    // Archived: the job's recipe node was removed from the execution snapshot
+    // mid-flight. Not derived from facts — it is an explicit override the status
+    // projection treats as sticky (see `execution::advancement::recompute`). The
+    // transcript (runs/events/turns/sessions/artifacts) is preserved; the job is
+    // excluded from DAG readiness/advancement and never counts toward an
+    // execution's running/failed status.
+    Cancelled,
+}
+
+/// One attempt in a recipe node's job lineage (oldest→newest), including
+/// archived (`cancelled`) attempts. Restart-node archives the prior job and
+/// creates a fresh one, so a node can own several attempts; this is the
+/// “Attempt N of M” view, with each attempt's transcript reachable via its
+/// session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeAttempt {
+    pub id: String,
+    pub status: String,
+    pub created_at: i32,
+    pub current_session_id: Option<String>,
 }
 
 impl JobStatus {
     /// Whether the job is in a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, JobStatus::Complete | JobStatus::Failed)
+        matches!(
+            self,
+            JobStatus::Complete | JobStatus::Failed | JobStatus::Cancelled
+        )
     }
 }
 
@@ -34,11 +57,11 @@ impl std::fmt::Display for JobStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             JobStatus::Pending => write!(f, "pending"),
-            JobStatus::Ready => write!(f, "ready"),
             JobStatus::Running => write!(f, "running"),
             JobStatus::Complete => write!(f, "complete"),
             JobStatus::Failed => write!(f, "failed"),
             JobStatus::Blocked => write!(f, "blocked"),
+            JobStatus::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -49,11 +72,14 @@ impl std::str::FromStr for JobStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "pending" => Ok(JobStatus::Pending),
-            "ready" => Ok(JobStatus::Ready),
+            // `ready` is a removed status; any lingering rows read back as Pending
+            // (the migration converts them, this guards in-flight reads).
+            "ready" => Ok(JobStatus::Pending),
             "running" => Ok(JobStatus::Running),
             "complete" => Ok(JobStatus::Complete),
             "failed" => Ok(JobStatus::Failed),
             "blocked" => Ok(JobStatus::Blocked),
+            "cancelled" => Ok(JobStatus::Cancelled),
             _ => Err(format!("Unknown job status: {}", s)),
         }
     }
@@ -72,6 +98,9 @@ pub struct Job {
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
     pub base_commit: Option<String>,
+    /// Nearest durable ancestor commit (reachable from the project default
+    /// branch), captured alongside `base_commit` at worktree creation.
+    pub pack_anchor: Option<String>,
     pub current_session_id: Option<String>,
 
     pub status: JobStatus,
@@ -106,6 +135,8 @@ pub struct Job {
     pub exec_seq: Option<i32>,
     /// Base branch for worktree creation and PR targeting (None = use HEAD / repo default)
     pub base_branch: Option<String>,
+    /// Stable URI segment assigned at creation for addressable job resources.
+    pub uri_segment: Option<String>,
 }
 
 fn default_available_tabs() -> Vec<String> {
@@ -117,10 +148,10 @@ fn default_initial_tab() -> String {
 }
 
 /// Convert DbJob to Job
-impl TryFrom<crate::diesel_models::DbJob> for Job {
+impl TryFrom<crate::db_records::DbJob> for Job {
     type Error = String;
 
-    fn try_from(db: crate::diesel_models::DbJob) -> Result<Self, Self::Error> {
+    fn try_from(db: crate::db_records::DbJob) -> Result<Self, Self::Error> {
         let status: JobStatus = db
             .status
             .parse()
@@ -136,6 +167,7 @@ impl TryFrom<crate::diesel_models::DbJob> for Job {
             worktree_path: db.worktree_path,
             branch: db.branch,
             base_commit: db.base_commit,
+            pack_anchor: db.pack_anchor,
             current_session_id: db.current_session_id,
             status,
             agent_config_id: db.agent_config_id,
@@ -154,6 +186,7 @@ impl TryFrom<crate::diesel_models::DbJob> for Job {
             node_name: db.node_name,
             exec_seq: None, // Populated by query functions via execution join
             base_branch: db.base_branch,
+            uri_segment: db.uri_segment,
         })
     }
 }

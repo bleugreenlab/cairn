@@ -1,296 +1,110 @@
-//! Full-text search using SQLite FTS5.
-//!
-//! Provides BM25-ranked search with recency boost across issues,
-//! comments, artifacts, and events.
+//! Full-text search using a local Tantivy index fed by database outbox rows.
 
 use crate::models::{SearchContentType, SearchFilters, SearchResult};
-use crate::schema::{executions, jobs, projects};
-use diesel::prelude::*;
-use diesel::sql_query;
-use diesel::sql_types::{Integer, Nullable, Text};
-use diesel::sqlite::SqliteConnection;
-
-/// Raw row from FTS5 query
-#[derive(QueryableByName, Debug)]
-struct FtsRow {
-    #[diesel(sql_type = Text)]
-    source_id: String,
-    #[diesel(sql_type = Text)]
-    content_type: String,
-    #[diesel(sql_type = Text)]
-    project_id: String,
-    #[diesel(sql_type = Nullable<Text>)]
-    issue_id: Option<String>,
-    #[diesel(sql_type = Nullable<Text>)]
-    job_id: Option<String>,
-    #[diesel(sql_type = Text)]
-    title: String,
-    #[diesel(sql_type = Text)]
-    snippet: String,
-    #[diesel(sql_type = diesel::sql_types::Double)]
-    rank: f64,
-    #[diesel(sql_type = Integer)]
-    created_at: i32,
-}
+use crate::storage::{DbError, LocalDb, RowExt, SearchIndex, SearchIndexHit};
+use cairn_common::uri::{
+    build_issue_messages_uri, build_issue_uri, build_node_artifact_uri, build_node_chat_uri,
+    build_project_messages_uri, build_project_uri,
+};
+use std::collections::HashMap;
 
 /// Build a URI for navigation based on content type and IDs.
 fn build_uri(
     project_key: &str,
     content_type: &SearchContentType,
-    _issue_id: Option<&str>,
-    job_id: Option<&str>,
+    job_info: Option<&(Option<String>, Option<i32>)>,
     issue_number: Option<i32>,
 ) -> String {
     match content_type {
-        SearchContentType::Issue => {
-            if let Some(num) = issue_number {
-                format!("cairn://{}/{}", project_key, num)
+        SearchContentType::Issue | SearchContentType::Comment => issue_number
+            .map(|num| build_issue_uri(project_key, num))
+            .unwrap_or_else(|| build_project_uri(project_key)),
+        SearchContentType::Message => issue_number
+            .map(|num| build_issue_messages_uri(project_key, num))
+            .unwrap_or_else(|| build_project_messages_uri(project_key)),
+        SearchContentType::Artifact => {
+            if let (Some(num), Some((Some(node_name), Some(exec_seq)))) = (issue_number, job_info) {
+                build_node_artifact_uri(project_key, num, *exec_seq, node_name)
             } else {
-                format!("cairn://{}", project_key)
+                issue_number
+                    .map(|num| build_issue_uri(project_key, num))
+                    .unwrap_or_else(|| build_project_uri(project_key))
             }
         }
-        SearchContentType::Comment => {
-            if let Some(num) = issue_number {
-                format!("cairn://{}/{}/comments", project_key, num)
+        SearchContentType::Event => {
+            if let (Some(num), Some((Some(node_name), Some(exec_seq)))) = (issue_number, job_info) {
+                build_node_chat_uri(project_key, num, *exec_seq, node_name)
             } else {
-                format!("cairn://{}", project_key)
-            }
-        }
-        SearchContentType::Message => {
-            if let Some(num) = issue_number {
-                format!("cairn://{}/{}/messages", project_key, num)
-            } else {
-                format!("cairn://{}/messages", project_key)
-            }
-        }
-        SearchContentType::Artifact | SearchContentType::Event => {
-            if let (Some(_job), Some(num)) = (job_id, issue_number) {
-                format!("cairn://{}/{}", project_key, num)
-            } else {
-                format!("cairn://{}", project_key)
+                issue_number
+                    .map(|num| build_issue_uri(project_key, num))
+                    .unwrap_or_else(|| build_project_uri(project_key))
             }
         }
     }
 }
 
-/// Search content across issues, comments, artifacts, and events.
+/// Search content through the local Tantivy index.
 ///
-/// Uses FTS5 with BM25 ranking combined with recency boost.
-/// Supports filtering by project, issue, content types, and time range.
-pub fn search_content(
-    conn: &mut SqliteConnection,
+pub async fn search_content(
+    db: &LocalDb,
+    index: &SearchIndex,
     query: &str,
     filters: Option<SearchFilters>,
 ) -> Result<Vec<SearchResult>, String> {
-    let filters = filters.unwrap_or_default();
+    index
+        .apply_pending(db)
+        .await
+        .map_err(|error| format!("Search index update failed: {error}"))?;
+
+    let hits = index
+        .search(query, filters.clone())
+        .map_err(|error| format!("Search failed: {error}"))?;
+
+    enrich_search_hits(db, hits, filters.unwrap_or_default()).await
+}
+
+async fn enrich_search_hits(
+    db: &LocalDb,
+    hits: Vec<SearchIndexHit>,
+    filters: SearchFilters,
+) -> Result<Vec<SearchResult>, String> {
+    let mut project_ids: Vec<String> = hits.iter().map(|hit| hit.project_id.clone()).collect();
+    project_ids.sort();
+    project_ids.dedup();
+
+    let mut issue_ids: Vec<String> = hits.iter().filter_map(|hit| hit.issue_id.clone()).collect();
+    issue_ids.sort();
+    issue_ids.dedup();
+
+    let mut job_ids: Vec<String> = hits.iter().filter_map(|hit| hit.job_id.clone()).collect();
+    job_ids.sort();
+    job_ids.dedup();
+
+    let project_keys = load_project_keys(db, project_ids).await?;
+    let issue_info = load_issue_info(db, issue_ids).await?;
+    let job_info = load_job_info(db, job_ids).await?;
     let limit = filters.limit.unwrap_or(50).min(100);
 
-    let safe_query = escape_fts_query(query);
-
-    if safe_query.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Build WHERE clauses for filters
-    let mut where_clauses = vec!["content_fts MATCH ?1".to_string()];
-    let mut param_index = 2;
-
-    if filters.project_id.is_some() {
-        where_clauses.push(format!("project_id = ?{}", param_index));
-        param_index += 1;
-    }
-
-    if filters.issue_id.is_some() {
-        where_clauses.push(format!("issue_id = ?{}", param_index));
-        param_index += 1;
-    }
-
-    if let Some(ref content_types) = filters.content_types {
-        if !content_types.is_empty() {
-            let placeholders: Vec<String> = content_types
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", param_index + i))
-                .collect();
-            where_clauses.push(format!("content_type IN ({})", placeholders.join(", ")));
-            param_index += content_types.len();
-        }
-    }
-
-    if filters.since.is_some() {
-        where_clauses.push(format!("created_at >= ?{}", param_index));
-    }
-
-    let where_clause = where_clauses.join(" AND ");
-
-    let sql = format!(
-        r#"
-        SELECT 
-            source_id,
-            content_type,
-            project_id,
-            issue_id,
-            job_id,
-            title,
-            snippet(content_fts, 1, '<mark>', '</mark>', '...', 32) AS snippet,
-            (-bm25(content_fts) + (1.0 / (1.0 + ((strftime('%s', 'now') - created_at) / 31536000.0))) * 5.0) AS rank,
-            created_at
-        FROM content_fts
-        WHERE {}
-        ORDER BY rank DESC, created_at DESC
-        LIMIT {}
-        "#,
-        where_clause, limit
-    );
-
-    // Execute based on which filters are present
-    let rows: Vec<FtsRow> = match (
-        &filters.project_id,
-        &filters.issue_id,
-        &filters.content_types,
-        &filters.since,
-    ) {
-        (None, None, None, None) => sql_query(&sql)
-            .bind::<Text, _>(&safe_query)
-            .load(conn)
-            .map_err(|e| format!("Search failed: {}", e))?,
-
-        (Some(project_id), None, None, None) => sql_query(&sql)
-            .bind::<Text, _>(&safe_query)
-            .bind::<Text, _>(project_id)
-            .load(conn)
-            .map_err(|e| format!("Search failed: {}", e))?,
-
-        (Some(project_id), Some(issue_id), None, None) => sql_query(&sql)
-            .bind::<Text, _>(&safe_query)
-            .bind::<Text, _>(project_id)
-            .bind::<Text, _>(issue_id)
-            .load(conn)
-            .map_err(|e| format!("Search failed: {}", e))?,
-
-        (Some(project_id), None, Some(content_types), None) if content_types.len() == 1 => {
-            sql_query(&sql)
-                .bind::<Text, _>(&safe_query)
-                .bind::<Text, _>(project_id)
-                .bind::<Text, _>(&content_types[0])
-                .load(conn)
-                .map_err(|e| format!("Search failed: {}", e))?
-        }
-
-        (None, None, Some(content_types), None) if content_types.len() == 1 => sql_query(&sql)
-            .bind::<Text, _>(&safe_query)
-            .bind::<Text, _>(&content_types[0])
-            .load(conn)
-            .map_err(|e| format!("Search failed: {}", e))?,
-
-        // For complex filter combinations, fall back to simpler query
-        _ => {
-            let simple_sql = r#"
-                SELECT 
-                    source_id,
-                    content_type,
-                    project_id,
-                    issue_id,
-                    job_id,
-                    title,
-                    snippet(content_fts, 1, '<mark>', '</mark>', '...', 32) AS snippet,
-                    (-bm25(content_fts) + (1.0 / (1.0 + ((strftime('%s', 'now') - created_at) / 31536000.0))) * 5.0) AS rank,
-                    created_at
-                FROM content_fts
-                WHERE content_fts MATCH ?1
-                ORDER BY rank DESC, created_at DESC
-                LIMIT ?2
-            "#;
-            sql_query(simple_sql)
-                .bind::<Text, _>(&safe_query)
-                .bind::<Integer, _>(limit as i32)
-                .load(conn)
-                .map_err(|e| format!("Search failed: {}", e))?
-        }
-    };
-
-    // Get project keys for URI building
-    let project_ids: Vec<String> = rows.iter().map(|r| r.project_id.clone()).collect();
-    let project_keys: std::collections::HashMap<String, String> = if !project_ids.is_empty() {
-        projects::table
-            .filter(projects::id.eq_any(&project_ids))
-            .select((projects::id, projects::key))
-            .load::<(String, String)>(conn)
-            .map_err(|e| format!("Failed to load project keys: {}", e))?
-            .into_iter()
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    // Get issue numbers and titles
-    let issue_ids: Vec<String> = rows.iter().filter_map(|r| r.issue_id.clone()).collect();
-    let issue_info: std::collections::HashMap<String, (i32, String)> = if !issue_ids.is_empty() {
-        use crate::schema::issues;
-        issues::table
-            .filter(issues::id.eq_any(&issue_ids))
-            .select((issues::id, issues::number, issues::title))
-            .load::<(String, i32, String)>(conn)
-            .map_err(|e| format!("Failed to load issue info: {}", e))?
-            .into_iter()
-            .map(|(id, num, title)| (id, (num, title)))
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    // Get job info (node_name, exec_seq) for navigation
-    let job_ids: Vec<String> = rows.iter().filter_map(|r| r.job_id.clone()).collect();
-    let job_info: std::collections::HashMap<String, (Option<String>, Option<i32>)> =
-        if !job_ids.is_empty() {
-            jobs::table
-                .left_join(executions::table)
-                .filter(jobs::id.eq_any(&job_ids))
-                .select((
-                    jobs::id,
-                    jobs::node_name.nullable(),
-                    executions::seq.nullable(),
-                ))
-                .load::<(String, Option<String>, Option<i32>)>(conn)
-                .map_err(|e| format!("Failed to load job info: {}", e))?
-                .into_iter()
-                .map(|(id, name, seq)| (id, (name, seq)))
-                .collect()
-        } else {
-            std::collections::HashMap::new()
-        };
-
-    // Convert to SearchResult
-    let results: Vec<SearchResult> = rows
+    Ok(hits
         .into_iter()
-        .filter_map(|row| {
-            let content_type: SearchContentType = row.content_type.parse().ok()?;
-            let project_key = project_keys.get(&row.project_id)?;
-
-            let (issue_number, issue_title) = row
+        .filter_map(|hit| {
+            let project_key = project_keys.get(&hit.project_id)?;
+            let (issue_number, issue_title) = hit
                 .issue_id
                 .as_ref()
                 .and_then(|id| issue_info.get(id))
                 .map(|(num, title)| (Some(*num), Some(title.clone())))
                 .unwrap_or((None, None));
+            let job_nav = hit.job_id.as_ref().and_then(|id| job_info.get(id));
+            let uri = build_uri(project_key, &hit.content_type, job_nav, issue_number);
 
-            let uri = build_uri(
-                project_key,
-                &content_type,
-                row.issue_id.as_deref(),
-                row.job_id.as_deref(),
-                issue_number,
-            );
-
-            // For issues, don't include issue context (it's redundant)
-            let (ctx_number, ctx_title) = if content_type == SearchContentType::Issue {
+            let (ctx_number, ctx_title) = if hit.content_type == SearchContentType::Issue {
                 (None, None)
             } else {
                 (issue_number, issue_title)
             };
 
-            // Get job navigation info
-            let (node_name, exec_seq) = row
+            let (node_name, exec_seq) = hit
                 .job_id
                 .as_ref()
                 .and_then(|id| job_info.get(id))
@@ -298,15 +112,15 @@ pub fn search_content(
                 .unwrap_or((None, None));
 
             Some(SearchResult {
-                id: row.source_id,
-                content_type,
-                project_id: row.project_id,
-                issue_id: row.issue_id,
-                job_id: row.job_id,
-                title: row.title,
-                snippet: row.snippet,
-                rank: row.rank,
-                created_at: row.created_at as i64,
+                id: hit.id,
+                content_type: hit.content_type,
+                project_id: hit.project_id,
+                issue_id: hit.issue_id,
+                job_id: hit.job_id,
+                title: hit.title,
+                snippet: hit.snippet,
+                rank: hit.rank,
+                created_at: hit.created_at,
                 uri,
                 issue_number: ctx_number,
                 issue_title: ctx_title,
@@ -314,120 +128,218 @@ pub fn search_content(
                 exec_seq,
             })
         })
-        .collect();
-
-    // Apply post-query filters if we couldn't apply them in SQL
-    let results = if filters.project_id.is_some()
-        || filters.issue_id.is_some()
-        || filters.content_types.is_some()
-        || filters.since.is_some()
-    {
-        results
-            .into_iter()
-            .filter(|r| {
-                if let Some(ref pid) = filters.project_id {
-                    if &r.project_id != pid {
-                        return false;
-                    }
-                }
-                if let Some(ref iid) = filters.issue_id {
-                    if r.issue_id.as_ref() != Some(iid) {
-                        return false;
-                    }
-                }
-                if let Some(ref types) = filters.content_types {
-                    if !types.contains(&r.content_type.to_string()) {
-                        return false;
-                    }
-                }
-                if let Some(since) = filters.since {
-                    if r.created_at < since {
-                        return false;
-                    }
-                }
-                true
-            })
-            .take(limit)
-            .collect()
-    } else {
-        results
-    };
-
-    Ok(results)
+        .take(limit)
+        .collect())
 }
 
-/// Escape special FTS5 query characters to prevent syntax errors.
-pub fn escape_fts_query(query: &str) -> String {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
+async fn load_project_keys(
+    db: &LocalDb,
+    project_ids: Vec<String>,
+) -> Result<HashMap<String, String>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut map = HashMap::new();
+            for project_id in project_ids {
+                let mut rows = conn
+                    .query(
+                        "SELECT key FROM projects WHERE id = ?1",
+                        (project_id.as_str(),),
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    map.insert(project_id, row.text(0)?);
+                }
+            }
+            Ok(map)
+        })
+    })
+    .await
+    .map_err(storage_error)
+}
 
-    // If query already contains quotes, assume user knows FTS5 syntax
-    if trimmed.contains('"') {
-        return trimmed.to_string();
-    }
+async fn load_issue_info(
+    db: &LocalDb,
+    issue_ids: Vec<String>,
+) -> Result<HashMap<String, (i32, String)>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut map = HashMap::new();
+            for issue_id in issue_ids {
+                let mut rows = conn
+                    .query(
+                        "SELECT number, title FROM issues WHERE id = ?1",
+                        (issue_id.as_str(),),
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    map.insert(issue_id, (row.i64(0)? as i32, row.text(1)?));
+                }
+            }
+            Ok(map)
+        })
+    })
+    .await
+    .map_err(storage_error)
+}
 
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-    if words.len() == 1 {
-        // Single word: use prefix match
-        format!("\"{}\"*", words[0])
-    } else {
-        // Multiple words: search for all terms
-        words
-            .iter()
-            .map(|w| format!("\"{}\"", w))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
+async fn load_job_info(
+    db: &LocalDb,
+    job_ids: Vec<String>,
+) -> Result<HashMap<String, (Option<String>, Option<i32>)>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut map = HashMap::new();
+            for job_id in job_ids {
+                let mut rows = conn
+                    .query(
+                        "SELECT j.node_name, e.seq
+                         FROM jobs j
+                         LEFT JOIN executions e ON e.id = j.execution_id
+                         WHERE j.id = ?1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    map.insert(
+                        job_id,
+                        (row.opt_text(0)?, row.opt_i64(1)?.map(|v| v as i32)),
+                    );
+                }
+            }
+            Ok(map)
+        })
+    })
+    .await
+    .map_err(storage_error)
+}
+
+fn storage_error(error: DbError) -> String {
+    error.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{LocalDb, SearchIndex};
+    use tempfile::tempdir;
 
-    #[test]
-    fn test_escape_fts_query_single_word() {
-        assert_eq!(escape_fts_query("hello"), "\"hello\"*");
-    }
-
-    #[test]
-    fn test_escape_fts_query_multiple_words() {
-        assert_eq!(escape_fts_query("hello world"), "\"hello\" \"world\"");
-    }
-
-    #[test]
-    fn test_escape_fts_query_preserves_quotes() {
-        assert_eq!(escape_fts_query("\"exact phrase\""), "\"exact phrase\"");
-    }
-
-    #[test]
-    fn test_escape_fts_query_empty() {
-        assert_eq!(escape_fts_query(""), "");
-        assert_eq!(escape_fts_query("   "), "");
+    async fn migrated_db() -> LocalDb {
+        crate::storage::migrated_test_db("cairn-search-content-turso.db").await
     }
 
     #[test]
     fn test_build_uri_issue() {
-        let uri = build_uri(
-            "TEST",
-            &SearchContentType::Issue,
-            Some("id"),
-            None,
-            Some(42),
-        );
-        assert_eq!(uri, "cairn://TEST/42");
+        let uri = build_uri("TEST", &SearchContentType::Issue, None, Some(42));
+        assert_eq!(uri, "cairn://p/TEST/42");
     }
 
     #[test]
     fn test_build_uri_comment() {
+        let uri = build_uri("TEST", &SearchContentType::Comment, None, Some(42));
+        assert_eq!(uri, "cairn://p/TEST/42");
+    }
+
+    #[test]
+    fn test_build_uri_message_uses_message_resources() {
+        let project_uri = build_uri("TEST", &SearchContentType::Message, None, None);
+        assert_eq!(project_uri, "cairn://p/TEST/messages");
+
+        let issue_uri = build_uri("TEST", &SearchContentType::Message, None, Some(42));
+        assert_eq!(issue_uri, "cairn://p/TEST/42/messages");
+    }
+
+    #[test]
+    fn test_build_uri_artifact_prefers_node_artifact_when_job_navigation_exists() {
         let uri = build_uri(
             "TEST",
-            &SearchContentType::Comment,
-            Some("id"),
-            None,
+            &SearchContentType::Artifact,
+            Some(&(Some("builder-1".to_string()), Some(3))),
             Some(42),
         );
-        assert_eq!(uri, "cairn://TEST/42/comments");
+        assert_eq!(uri, "cairn://p/TEST/42/3/builder-1/artifact");
+    }
+
+    #[test]
+    fn test_build_uri_artifact_falls_back_when_job_navigation_missing() {
+        let issue_uri = build_uri(
+            "TEST",
+            &SearchContentType::Artifact,
+            Some(&(Some("builder-1".to_string()), None)),
+            Some(42),
+        );
+        assert_eq!(issue_uri, "cairn://p/TEST/42");
+
+        let project_uri = build_uri("TEST", &SearchContentType::Artifact, None, None);
+        assert_eq!(project_uri, "cairn://p/TEST");
+    }
+
+    #[test]
+    fn test_build_uri_event_prefers_node_chat_when_job_navigation_exists() {
+        let uri = build_uri(
+            "TEST",
+            &SearchContentType::Event,
+            Some(&(Some("builder-1".to_string()), Some(3))),
+            Some(42),
+        );
+        assert_eq!(uri, "cairn://p/TEST/42/3/builder-1/chat");
+    }
+
+    #[test]
+    fn test_build_uri_event_falls_back_when_job_navigation_missing() {
+        let issue_uri = build_uri(
+            "TEST",
+            &SearchContentType::Event,
+            Some(&(None, Some(3))),
+            Some(42),
+        );
+        assert_eq!(issue_uri, "cairn://p/TEST/42");
+
+        let project_uri = build_uri("TEST", &SearchContentType::Event, None, None);
+        assert_eq!(project_uri, "cairn://p/TEST");
+    }
+
+    #[tokio::test]
+    async fn search_content_returns_existing_search_result_shape() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at)
+             VALUES ('workspace-1', 'Workspace', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-1', 'workspace-1', 'Project', 'PROJ', '/tmp/project', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+             VALUES ('issue-1', 'project-1', 7, 'Turso migration', 'issue body', 1, 1);
+            INSERT INTO comments(id, issue_id, content, source, created_at)
+             VALUES ('comment-1', 'issue-1', 'tantivy replacement comment', 'user', 2);
+            ",
+        )
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        let results = search_content(
+            &db,
+            &index,
+            "tantivy",
+            Some(SearchFilters {
+                project_id: Some("project-1".to_string()),
+                issue_id: Some("issue-1".to_string()),
+                content_types: Some(vec!["comment".to_string()]),
+                since: None,
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(result.id, "comment-1");
+        assert_eq!(result.content_type, SearchContentType::Comment);
+        assert_eq!(result.uri, "cairn://p/PROJ/7");
+        assert_eq!(result.issue_number, Some(7));
+        assert_eq!(result.issue_title.as_deref(), Some("Turso migration"));
+        assert!(result.snippet.contains("<mark>tantivy</mark>"));
     }
 }

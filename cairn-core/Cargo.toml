@@ -11,8 +11,6 @@ keywords = ["agent", "orchestration", "mcp"]
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-diesel = { version = "2.2", features = ["sqlite", "returning_clauses_for_sqlite_3_35"] }
-diesel_migrations = "2.2"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 regex = "1"
 evalexpr = "11"
@@ -23,7 +21,9 @@ log = "0.4"
 nix = { version = "0.29", features = ["signal"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
+thiserror = "2"
 serde_yaml = "0.9"
+toml = "0.8"
 json5 = "0.4"
 base64 = "0.22"
 rand = "0.8"
@@ -42,13 +42,42 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 tempfile = "3"
-fastembed = "5"
 crossbeam-channel = "0.5"
 zip = "4.2"
+turso = { git = "https://github.com/tursodatabase/turso", rev = "96781e3d007a9d4d0d74f99b29ea8543482d994d", default-features = false }
+tantivy = "0.26.1"
+jsonschema = { version = "0.26", default-features = false }
+tiktoken-rs = "0.6"
 
 # Optional: test utilities (mocking)
 mockall = { version = "0.13", optional = true }
 jsonwebtoken = "9.3.1"
+zstd = "0.13"
+# Session archival object access (CAIRN-1538). Focused gix crates only — not the
+# umbrella `gix` — to read range packs and the repo ODB in-process. gix-features
+# is pulled directly for its `zlib::Inflate`, required by gix-pack's entry decoder.
+gix-pack = { version = "0.71", features = ["sha1"] }
+gix-object = { version = "0.61", features = ["sha1"] }
+gix-hash = { version = "0.25", features = ["sha1"] }
+gix-odb = { version = "0.81.0", features = ["sha1"] }
+gix-features = { version = "0.48", features = ["zlib"] }
+lsp-types = "0.97"
+
+# OS keychain access for MCP server secrets. Backend is selected per target so a
+# Finder-launched app (minimal process env) still resolves token-bearing
+# servers. Declared per-target to avoid pulling secret-service/dbus deps into
+# the macOS/Windows builds.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+# Linux: keyring (secret-service) for MCP secrets + landlock for the OS-level
+# worktree-fence sandbox (origin/main).
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+landlock = "0.4"
 
 [dev-dependencies]
 filetime = "0.2"
@@ -62,5 +91,21 @@ internal-api = []
 test-utils = ["dep:mockall", "internal-api"]
 
 [[example]]
-name = "backfill_embeddings"
+name = "compute_vibe_axes"
+required-features = ["internal-api"]
+
+[[example]]
+name = "vibe_corpus_dump"
+required-features = ["internal-api"]
+
+[[example]]
+name = "backfill_resource_embeddings"
+required-features = ["internal-api"]
+
+[[example]]
+name = "concurrent_db_probe"
+required-features = ["internal-api"]
+
+[[example]]
+name = "db_lock_probe"
 required-features = ["internal-api"]

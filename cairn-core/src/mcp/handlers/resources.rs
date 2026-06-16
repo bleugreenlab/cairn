@@ -1,475 +1,749 @@
 //! MCP resource handlers for terminal and issue resources.
 //!
-//! Provides list_resources and read_resource handlers for terminal output and issue data.
+//! Provides the read_resource handler for terminal output.
 
-use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::lookup_run;
-use super::slug::build_terminal_uri;
 use crate::mcp::types::McpCallbackRequest;
-use crate::node_segments::{matches_node_uri_segment, visible_node_segment};
+
 use crate::orchestrator::Orchestrator;
-use crate::schema::{executions, issues, job_terminals, jobs, projects};
+use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_common::query::split_target_query;
+use cairn_common::uri::{parse_uri, CairnResource};
+use turso::params;
 
 /// Type alias for read cursor state: session_id -> bytes_read
 /// Uses per-terminal cursor so reads "consume" output regardless of which run is reading.
 pub type ReadCursorState = Mutex<HashMap<String, usize>>;
 
-/// Terminal read result for read_resource response
+/// Terminal read result for read_resource response.
+///
+/// `output` carries a one-line status banner followed by the rendered buffer.
+/// The structured status fields mirror the banner so callers can branch on them
+/// without parsing text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalReadResult {
-    /// New output since last read (or all output on first read)
+    /// Status banner plus rendered terminal output (the full buffer by default,
+    /// or only the bytes appended since the cursor when read with `?new=true`).
     pub output: String,
-    /// Terminal status: "running" or "exited"
+    /// Terminal status: "running", "exited", or "error".
     pub status: String,
-    /// Exit code if terminal has exited
+    /// Exit code if the terminal has exited.
     pub exit_code: Option<i32>,
-    /// Bytes returned in this read
+    /// Bytes returned in this read.
     pub new_bytes: usize,
-    /// Total bytes in terminal buffer
+    /// Total bytes in the terminal buffer.
     pub total_bytes: usize,
+    /// Seconds the terminal has been (or was) running, measured from spawn time.
+    #[serde(default)]
+    pub runtime_secs: Option<i64>,
+    /// Seconds since the most recent output byte; `None` when there has been no
+    /// output (or the live session is gone).
+    #[serde(default)]
+    pub idle_secs: Option<i64>,
 }
 
-/// Payload for read_resource request
+/// Payload for read_resource request. Terminal-specific params (`new`, `full`,
+/// `annotations`) ride in the URI query string and are parsed there; any extra
+/// JSON fields are ignored, so an older client sending `full` still deserializes.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReadResourcePayload {
     pub uri: String,
-    /// If true, return full history instead of just new content since last read
-    #[serde(default)]
-    pub full: bool,
 }
 
-/// Resource info for list_resources response (used for both terminals and issues)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceInfo {
-    pub uri: String,
-    pub name: String,
-    pub description: Option<String>,
-}
-
-/// Handle list_resources request - returns terminal resources for current job + recent issues
-fn visible_terminal_node_segment(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    job_id: &str,
-    node_name: Option<&str>,
-) -> Option<String> {
-    let recipe_node_id = jobs::table
-        .find(job_id)
-        .select(jobs::recipe_node_id)
-        .first::<Option<String>>(conn)
-        .ok()
-        .flatten();
-
-    visible_node_segment(recipe_node_id.as_deref(), node_name)
-}
-
-fn find_terminal_target_job_id(
-    conn: &mut diesel::sqlite::SqliteConnection,
+async fn find_terminal_target_job_id(
+    conn: &turso::Connection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,
     node_id: &str,
-) -> Option<String> {
-    let issue_id: String = issues::table
-        .inner_join(projects::table)
-        .filter(projects::key.eq(project_key))
-        .filter(issues::number.eq(issue_number))
-        .select(issues::id)
-        .first(conn)
-        .ok()?;
+) -> DbResult<Option<String>> {
+    let lookup_key = project_key.to_uppercase();
+    let mut issue_rows = conn
+        .query(
+            "
+            SELECT i.id
+            FROM issues i
+            JOIN projects p ON i.project_id = p.id
+            WHERE p.key = ?1 AND i.number = ?2
+            LIMIT 1
+            ",
+            params![lookup_key.as_str(), issue_number],
+        )
+        .await?;
 
-    let exec_id: String = executions::table
-        .filter(executions::issue_id.eq(&issue_id))
-        .filter(executions::seq.eq(exec_seq))
-        .select(executions::id)
-        .first(conn)
-        .ok()?;
-
-    let candidates: Vec<(String, Option<String>, Option<String>)> = jobs::table
-        .filter(jobs::issue_id.eq(&issue_id))
-        .filter(jobs::execution_id.eq(&exec_id))
-        .select((jobs::id, jobs::node_name, jobs::recipe_node_id))
-        .load(conn)
-        .ok()?;
-
-    candidates
-        .into_iter()
-        .find_map(|(job_id, stored_node_name, recipe_node_id)| {
-            if matches_node_uri_segment(
-                node_id,
-                recipe_node_id.as_deref(),
-                stored_node_name.as_deref(),
-            ) {
-                Some(job_id)
-            } else {
-                None
-            }
-        })
-}
-
-pub async fn handle_list_resources(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let mut conn = match orch.db.conn.lock() {
-        Ok(c) => c,
-        Err(e) => return format!("Database error: {}", e),
+    let Some(issue_row) = issue_rows.next().await? else {
+        return Ok(None);
     };
+    let issue_id = issue_row.text(0)?;
 
-    let mut resources: Vec<ResourceInfo> = Vec::new();
+    let mut exec_rows = conn
+        .query(
+            "
+            SELECT id
+            FROM executions
+            WHERE issue_id = ?1 AND seq = ?2
+            LIMIT 1
+            ",
+            params![issue_id.as_str(), exec_seq],
+        )
+        .await?;
 
-    // Try to get run context for terminal resources
-    let run_context = lookup_run(&mut conn, request).ok();
+    let Some(exec_row) = exec_rows.next().await? else {
+        return Ok(None);
+    };
+    let exec_id = exec_row.text(0)?;
 
-    // 1. Terminal resources (if we have a run context)
-    if let Some(ref ctx) = run_context {
-        let terminals: Vec<(Option<String>, String, Option<String>, String)> = job_terminals::table
-            .filter(job_terminals::job_id.eq(&ctx.job_id))
-            .filter(job_terminals::slug.is_not_null())
-            .select((
-                job_terminals::slug,
-                job_terminals::command,
-                job_terminals::description,
-                job_terminals::status,
-            ))
-            .load(&mut *conn)
-            .unwrap_or_default();
-
-        for (slug, command, description, status) in terminals {
-            if let Some(slug) = slug {
-                let node_segment =
-                    visible_terminal_node_segment(&mut *conn, &ctx.job_id, ctx.job_name.as_deref());
-                let uri = build_terminal_uri(
-                    &ctx.project_key,
-                    ctx.issue_number,
-                    ctx.exec_seq,
-                    node_segment.as_deref(),
-                    &slug,
-                );
-                let name = description.clone().unwrap_or_else(|| {
-                    if command.len() > 30 {
-                        format!("{}...", &command[..30])
-                    } else {
-                        command
-                    }
-                });
-                resources.push(ResourceInfo {
-                    uri,
-                    name,
-                    description: Some(format!("Terminal ({})", status)),
-                });
-            }
-        }
+    let mut exact_rows = conn
+        .query(
+            "
+            SELECT id
+            FROM jobs
+            WHERE issue_id = ?1
+              AND execution_id = ?2
+              AND parent_job_id IS NULL
+              AND uri_segment = ?3
+            LIMIT 1
+            ",
+            params![issue_id.as_str(), exec_id.as_str(), node_id],
+        )
+        .await?;
+    if let Some(row) = exact_rows.next().await? {
+        return Ok(Some(row.text(0)?));
     }
 
-    // 2. Issue resources - get recent active/waiting issues from current project
-    let project_id = run_context
-        .as_ref()
-        .map(|ctx| ctx.project_id.clone())
-        .or_else(|| {
-            // Try to get project from cwd
-            let cwd = &request.cwd;
-            projects::table
-                .filter(projects::repo_path.eq(cwd))
-                .select(projects::id)
-                .first::<String>(&mut *conn)
-                .ok()
-        });
-
-    if let Some(project_id) = project_id {
-        // Get project key for URI
-        let project_key: Option<String> = projects::table
-            .filter(projects::id.eq(&project_id))
-            .select(projects::key)
-            .first(&mut *conn)
-            .ok();
-
-        if let Some(project_key) = project_key {
-            // Get recent issues (active/waiting first, then by updated_at)
-            // Limit to 20 most recent
-            let issue_rows: Vec<(i32, String, String)> = issues::table
-                .filter(issues::project_id.eq(&project_id))
-                .order((
-                    diesel::dsl::sql::<diesel::sql_types::Integer>(
-                        "CASE status WHEN 'Active' THEN 0 WHEN 'Waiting' THEN 1 ELSE 2 END",
-                    ),
-                    issues::updated_at.desc(),
-                ))
-                .limit(20)
-                .select((issues::number, issues::title, issues::status))
-                .load(&mut *conn)
-                .unwrap_or_default();
-
-            for (number, title, status) in issue_rows {
-                resources.push(ResourceInfo {
-                    uri: format!("cairn://{}/{}", project_key, number),
-                    name: format!("{}-{}", project_key, number),
-                    description: Some(format!("[{}] {}", status, title)),
-                });
-            }
-        }
-    }
-
-    serde_json::to_string(&resources).unwrap_or_else(|_| "[]".to_string())
+    Ok(None)
 }
 
-/// Handle read_resource request - returns terminal output for a given URI
+async fn find_task_terminal_target_job_id(
+    conn: &turso::Connection,
+    project_key: &str,
+    issue_number: i32,
+    exec_seq: i32,
+    parent_node_id: &str,
+    task_name: &str,
+) -> DbResult<Option<String>> {
+    let lookup_key = project_key.to_uppercase();
+    let mut rows = conn
+        .query(
+            "
+            SELECT child.id
+            FROM jobs parent
+            JOIN jobs child ON child.parent_job_id = parent.id
+            JOIN issues i ON parent.issue_id = i.id
+            JOIN projects p ON i.project_id = p.id
+            JOIN executions e ON parent.execution_id = e.id
+            WHERE p.key = ?1
+              AND i.number = ?2
+              AND e.seq = ?3
+              AND parent.parent_job_id IS NULL
+              AND parent.uri_segment = ?4
+              AND child.uri_segment = ?5
+            LIMIT 1
+            ",
+            params![
+                lookup_key.as_str(),
+                issue_number,
+                exec_seq,
+                parent_node_id,
+                task_name
+            ],
+        )
+        .await?;
+    rows.next().await?.map(|row| row.text(0)).transpose()
+}
+
+/// Handle read_resource request - returns terminal output for a given URI.
 ///
-/// Uses cursor-based reading: each read returns only new content since the last read.
-/// The cursor is tracked per (run_id, session_id) so different runs see full history.
+/// Reads are idempotent by default: a plain read returns the full buffer and
+/// does NOT advance the per-terminal cursor, so repeated reads are stable.
+/// `?new=true` switches to incremental mode, returning only the bytes appended
+/// since the last `new=true` read and advancing the cursor.
 pub async fn handle_read_resource(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     read_cursors: &ReadCursorState,
 ) -> String {
-    let payload: ReadResourcePayload = match serde_json::from_value(request.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => return format!("Invalid payload: {}", e),
+    let payload: ReadResourcePayload = match super::parse_payload(request) {
+        Ok(payload) => payload,
+        Err(error) => return error,
     };
 
     log::info!("read_resource: uri={}", payload.uri);
 
-    // Parse the URI to extract slug and query params
     let parsed = match parse_terminal_uri(&payload.uri) {
-        Some(p) => p,
-        None => {
-            return serde_json::to_string(&TerminalReadResult {
-                output: format!("Invalid terminal URI: {}", payload.uri),
-                status: "error".to_string(),
-                exit_code: None,
-                new_bytes: 0,
-                total_bytes: 0,
-            })
-            .unwrap_or_else(|_| "{}".to_string())
+        Ok(parsed) => parsed,
+        Err(message) => return terminal_error_json(message),
+    };
+
+    let consume = parsed.new;
+
+    let info = match lookup_terminal_info(&orch.db.local, &parsed).await {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            let slugs = list_terminal_slugs_in_scope(&orch.db.local, &parsed)
+                .await
+                .unwrap_or_default();
+            return terminal_error_json(not_found_message(&parsed.slug, &slugs));
+        }
+        Err(error) => {
+            return terminal_error_json(format!(
+                "Failed to look up terminal '{}': {error}",
+                parsed.slug
+            ))
         }
     };
 
-    // Full history if requested via payload OR query param
-    let full = payload.full || parsed.full;
+    let (output, new_bytes, total_bytes, idle_secs) = get_buffer_content(
+        orch,
+        read_cursors,
+        &info.session_id,
+        &info.status,
+        consume,
+        info.output_tail.as_deref(),
+    );
 
-    // Look up the terminal by slug
-    // For project-level terminals (node_id is None), look up by project_id
-    // For node-level terminals, look up by job_id from run context
-    let terminal_info = {
-        let mut conn = match orch.db.conn.lock() {
-            Ok(c) => c,
-            Err(e) => return format!("Database error: {}", e),
-        };
-
-        if parsed.node_id.is_none() {
-            // Project-level terminal: look up by project_key
-            let project_id: Option<String> = projects::table
-                .filter(projects::key.eq(&parsed.project_key))
-                .select(projects::id)
-                .first(&mut *conn)
-                .ok();
-
-            match project_id {
-                Some(pid) => job_terminals::table
-                    .filter(job_terminals::project_id.eq(&pid))
-                    .filter(job_terminals::job_id.is_null())
-                    .filter(job_terminals::slug.eq(&parsed.slug))
-                    .select((
-                        job_terminals::session_id,
-                        job_terminals::status,
-                        job_terminals::exit_code,
-                    ))
-                    .first::<(String, String, Option<i32>)>(&mut *conn)
-                    .ok(),
-                None => None,
-            }
-        } else {
-            // Node-level terminal: resolve target job from parsed URI components
-            // (not the caller's run context — any agent can read any terminal by URI)
-            let target_job_id = (|| -> Option<String> {
-                let issue_number = parsed.issue_number?;
-                let exec_seq = parsed.exec_seq?;
-                let node_id = parsed.node_id.as_deref()?;
-
-                find_terminal_target_job_id(
-                    &mut *conn,
-                    &parsed.project_key,
-                    issue_number,
-                    exec_seq,
-                    node_id,
-                )
-            })();
-
-            match target_job_id {
-                Some(job_id) => job_terminals::table
-                    .filter(job_terminals::job_id.eq(&job_id))
-                    .filter(job_terminals::slug.eq(&parsed.slug))
-                    .select((
-                        job_terminals::session_id,
-                        job_terminals::status,
-                        job_terminals::exit_code,
-                    ))
-                    .first::<(String, String, Option<i32>)>(&mut *conn)
-                    .ok(),
-                None => None,
-            }
-        }
+    let runtime_secs = {
+        let end = info.exited_at.unwrap_or_else(unix_now);
+        Some((end - info.created_at).max(0))
     };
 
-    let (session_id, status, exit_code) = match terminal_info {
-        Some(info) => info,
-        None => {
-            return serde_json::to_string(&TerminalReadResult {
-                output: format!("Terminal not found: {}", parsed.slug),
-                status: "error".to_string(),
-                exit_code: None,
-                new_bytes: 0,
-                total_bytes: 0,
-            })
-            .unwrap_or_else(|_| "{}".to_string())
-        }
-    };
+    let banner = format_status_banner(
+        &parsed.slug,
+        &info.status,
+        info.exit_code,
+        runtime_secs,
+        idle_secs,
+        total_bytes,
+    );
+    let mut body = format!("{banner}\n\n{output}");
 
-    // Get buffer content with cursor-based reading (consumed on read)
-    // If full=true, return complete history; otherwise return only new content
-    let (output, new_bytes, total_bytes) =
-        get_buffer_content_from_cursor(orch, read_cursors, &session_id, &status, full);
+    if !parsed.annotations_suppressed {
+        append_inline_annotations(orch, &mut body, &parsed.anchor_uri).await;
+    }
 
     serde_json::to_string(&TerminalReadResult {
-        output,
-        status,
-        exit_code,
+        output: body,
+        status: info.status,
+        exit_code: info.exit_code,
         new_bytes,
         total_bytes,
+        runtime_secs,
+        idle_secs,
     })
     .unwrap_or_else(|_| "{}".to_string())
 }
 
+fn terminal_error_json(message: String) -> String {
+    serde_json::to_string(&TerminalReadResult {
+        output: message,
+        status: "error".to_string(),
+        exit_code: None,
+        new_bytes: 0,
+        total_bytes: 0,
+        runtime_secs: None,
+        idle_secs: None,
+    })
+    .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Human-readable status banner shown as the first line of a terminal read.
+/// Distinguishes "running but quiet" (running + age of last output) from "dead"
+/// (exited + code) so a polling agent has something actionable.
+fn format_status_banner(
+    slug: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    runtime_secs: Option<i64>,
+    idle_secs: Option<i64>,
+    total_bytes: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if status == "running" {
+        parts.push("running".to_string());
+        if let Some(rt) = runtime_secs {
+            parts.push(format!("{} elapsed", fmt_duration(rt)));
+        }
+        if total_bytes == 0 {
+            parts.push("no output yet".to_string());
+        } else if let Some(idle) = idle_secs {
+            parts.push(format!("last output {} ago", fmt_duration(idle)));
+        }
+    } else {
+        match exit_code {
+            Some(code) => parts.push(format!("exited code {code}")),
+            None => parts.push(status.to_string()),
+        }
+        if let Some(rt) = runtime_secs {
+            parts.push(format!("ran {}", fmt_duration(rt)));
+        }
+    }
+    format!("[terminal {slug}: {}]", parts.join(", "))
+}
+
+/// Compact duration: `45s`, `2m05s`, `1h03m`.
+fn fmt_duration(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+fn not_found_message(slug: &str, slugs: &[String]) -> String {
+    if slugs.is_empty() {
+        format!(
+            "Terminal '{slug}' not found; no terminals exist in this scope. \
+             Create one with a write (mode=create) on this URI."
+        )
+    } else {
+        format!(
+            "Terminal '{slug}' not found. Existing terminals in this scope: {}.",
+            slugs.join(", ")
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TerminalInfo {
+    session_id: String,
+    status: String,
+    exit_code: Option<i32>,
+    created_at: i64,
+    exited_at: Option<i64>,
+    /// Retained tail of the buffer for an exited terminal whose live PTY session
+    /// is gone, so a post-exit read still returns its final output.
+    output_tail: Option<String>,
+}
+
+async fn lookup_terminal_info(
+    db: &LocalDb,
+    parsed: &ParsedTerminalUri,
+) -> DbResult<Option<TerminalInfo>> {
+    let project_key = parsed.project_key.clone();
+    let slug = parsed.slug.clone();
+    let issue_number = parsed.issue_number;
+    let exec_seq = parsed.exec_seq;
+    let node_id = parsed.node_id.clone();
+    let task_name = parsed.task_name.clone();
+
+    db.read(|conn| {
+        let project_key = project_key.clone();
+        let slug = slug.clone();
+        let node_id = node_id.clone();
+        let task_name = task_name.clone();
+        Box::pin(async move {
+            let row = if node_id.is_none() {
+                let lookup_key = project_key.to_uppercase();
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail
+                        FROM job_terminals jt
+                        JOIN projects p ON jt.project_id = p.id
+                        WHERE p.key = ?1
+                          AND jt.job_id IS NULL
+                          AND jt.slug = ?2
+                        LIMIT 1
+                        ",
+                        params![lookup_key.as_str(), slug.as_str()],
+                    )
+                    .await?;
+                rows.next().await?
+            } else {
+                let (Some(issue_number), Some(exec_seq), Some(node_id)) =
+                    (issue_number, exec_seq, node_id.as_deref())
+                else {
+                    return Ok(None);
+                };
+                let job_id = if let Some(task_name) = task_name.as_deref() {
+                    find_task_terminal_target_job_id(
+                        conn,
+                        &project_key,
+                        issue_number,
+                        exec_seq,
+                        node_id,
+                        task_name,
+                    )
+                    .await?
+                } else {
+                    find_terminal_target_job_id(conn, &project_key, issue_number, exec_seq, node_id)
+                        .await?
+                };
+                let Some(job_id) = job_id else {
+                    return Ok(None);
+                };
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail
+                        FROM job_terminals
+                        WHERE job_id = ?1 AND slug = ?2
+                        LIMIT 1
+                        ",
+                        params![job_id.as_str(), slug.as_str()],
+                    )
+                    .await?;
+                rows.next().await?
+            };
+
+            row.map(|row| {
+                Ok(TerminalInfo {
+                    session_id: row.text(0)?,
+                    status: row.text(1)?,
+                    exit_code: row.opt_i64(2)?.map(|value| value as i32),
+                    created_at: row.i64(3)?,
+                    exited_at: row.opt_i64(4)?,
+                    output_tail: row.opt_text(5)?,
+                })
+            })
+            .transpose()
+        })
+    })
+    .await
+}
+
+/// List the terminal slugs that exist in the same scope as `parsed`, for a
+/// helpful "not found" message. Project scope lists project-level terminals;
+/// node scope lists the node job's terminals.
+async fn list_terminal_slugs_in_scope(
+    db: &LocalDb,
+    parsed: &ParsedTerminalUri,
+) -> DbResult<Vec<String>> {
+    let project_key = parsed.project_key.clone();
+    let issue_number = parsed.issue_number;
+    let exec_seq = parsed.exec_seq;
+    let node_id = parsed.node_id.clone();
+    let task_name = parsed.task_name.clone();
+
+    db.read(|conn| {
+        let project_key = project_key.clone();
+        let node_id = node_id.clone();
+        let task_name = task_name.clone();
+        Box::pin(async move {
+            let mut rows = if node_id.is_none() {
+                let lookup_key = project_key.to_uppercase();
+                conn.query(
+                    "
+                    SELECT jt.slug
+                    FROM job_terminals jt
+                    JOIN projects p ON jt.project_id = p.id
+                    WHERE p.key = ?1 AND jt.job_id IS NULL AND jt.slug IS NOT NULL
+                    ORDER BY jt.slug
+                    ",
+                    params![lookup_key.as_str()],
+                )
+                .await?
+            } else {
+                let (Some(issue_number), Some(exec_seq), Some(node_id)) =
+                    (issue_number, exec_seq, node_id.as_deref())
+                else {
+                    return Ok(Vec::new());
+                };
+                let job_id = if let Some(task_name) = task_name.as_deref() {
+                    find_task_terminal_target_job_id(
+                        conn,
+                        &project_key,
+                        issue_number,
+                        exec_seq,
+                        node_id,
+                        task_name,
+                    )
+                    .await?
+                } else {
+                    find_terminal_target_job_id(conn, &project_key, issue_number, exec_seq, node_id)
+                        .await?
+                };
+                let Some(job_id) = job_id else {
+                    return Ok(Vec::new());
+                };
+                conn.query(
+                    "
+                    SELECT slug
+                    FROM job_terminals
+                    WHERE job_id = ?1 AND slug IS NOT NULL
+                    ORDER BY slug
+                    ",
+                    params![job_id.as_str()],
+                )
+                .await?
+            };
+
+            let mut slugs = Vec::new();
+            while let Some(row) = rows.next().await? {
+                slugs.push(row.text(0)?);
+            }
+            Ok(slugs)
+        })
+    })
+    .await
+}
+
 /// Parsed terminal URI components
+#[derive(Debug)]
 struct ParsedTerminalUri {
     project_key: String,
     issue_number: Option<i32>,
     exec_seq: Option<i32>,
     node_id: Option<String>,
+    task_name: Option<String>,
     slug: String,
-    full: bool,
+    /// `?new=true`: incremental cursor read instead of the idempotent full buffer.
+    new: bool,
+    annotations_suppressed: bool,
+    anchor_uri: String,
 }
 
-/// Parse a terminal URI into components.
-///
-/// Supports formats:
-/// - `cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG` (node-level terminal, canonical)
-/// - `cairn://PROJECT/terminal/SLUG` (project-level terminal)
-///
-/// Query param: `?full=true` for complete history
-fn parse_terminal_uri(uri: &str) -> Option<ParsedTerminalUri> {
-    // Split off query string if present
-    let (uri_path, query) = if let Some(idx) = uri.find('?') {
-        (&uri[..idx], Some(&uri[idx + 1..]))
-    } else {
-        (uri, None)
-    };
+/// Query keys owned by the batch view layer (line windowing + universal grep).
+/// They legitimately ride on a terminal target, so the terminal parser ignores
+/// them instead of rejecting them; the batch layer strips and applies them.
+const VIEW_GRAMMAR_KEYS: &[&str] = &[
+    "offset",
+    "limit",
+    "char_offset",
+    "grep",
+    "-i",
+    "-n",
+    "-A",
+    "-B",
+    "-C",
+    "context",
+    "head_limit",
+    "multiline",
+    "output_mode",
+];
 
-    let path = uri_path.strip_prefix("cairn://")?;
-    let parts: Vec<&str> = path.split('/').collect();
+/// Detect malformed task terminal-like shapes and return a targeted hint.
+pub(crate) fn task_terminal_hint(uri: &str) -> Option<String> {
+    let identity = split_target_query(uri)
+        .map(|split| split.identity)
+        .unwrap_or_else(|_| uri.to_string());
+    let path = identity.strip_prefix("cairn://")?;
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let n = segments.len();
+    if n >= 3 && segments[n - 1] == "terminal" && segments[n - 3] == "task" {
+        return Some(
+            "Task terminal URI is missing a slug. Expected \
+             `cairn://p/PROJECT/NUMBER/EXEC/NODE/task/TASK/terminal/SLUG`."
+                .to_string(),
+        );
+    }
+    None
+}
 
-    // Parse query params for full=true
-    let full = query
-        .map(|q| q.split('&').any(|p| p == "full=true" || p == "full=1"))
-        .unwrap_or(false);
+fn terminal_shape_error(identity: &str) -> String {
+    if let Some(hint) = task_terminal_hint(identity) {
+        return hint;
+    }
+    format!(
+        "Not a terminal URI: '{identity}'. Expected `cairn://p/PROJECT/terminal/SLUG`, \
+         `cairn://p/PROJECT/NUMBER/EXEC/NODE/terminal/SLUG`, or \
+         `cairn://p/PROJECT/NUMBER/EXEC/NODE/task/TASK/terminal/SLUG`."
+    )
+}
 
-    match parts.as_slice() {
-        // cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG (canonical format with exec_seq)
-        [project_key, number, exec_seq_str, node_id, "terminal", slug]
-            if exec_seq_str.parse::<i32>().is_ok() =>
-        {
-            Some(ParsedTerminalUri {
-                project_key: project_key.to_string(),
-                issue_number: number.parse().ok(),
-                exec_seq: exec_seq_str.parse().ok(),
-                node_id: Some(node_id.to_string()),
-                slug: slug.to_string(),
-                full,
-            })
+/// Parse a terminal URI into components, applying the terminal-specific query
+/// params (`new`, `full`, `annotations`) and ignoring the universal read grammar
+/// (`offset`/`limit`/`grep`...), which the batch view layer owns. Any other param
+/// is an error that names the offending key; a non-terminal URI shape returns an
+/// error that names the expected shape.
+fn parse_terminal_uri(uri: &str) -> Result<ParsedTerminalUri, String> {
+    let split =
+        split_target_query(uri).map_err(|error| format!("Malformed URI '{uri}': {error}"))?;
+    let mut new = false;
+    let mut annotations_suppressed = false;
+    for param in &split.params {
+        match param.key.as_str() {
+            "full" => match param.value.as_str() {
+                "true" | "1" | "false" | "0" | "" => {}
+                other => {
+                    return Err(format!(
+                        "Invalid value '{other}' for `full` (expected true or false)."
+                    ))
+                }
+            },
+            "new" => match param.value.as_str() {
+                "true" | "1" => new = true,
+                "false" | "0" | "" => {}
+                other => {
+                    return Err(format!(
+                        "Invalid value '{other}' for `new` (expected true or false)."
+                    ))
+                }
+            },
+            "annotations" => match param.value.as_str() {
+                "none" => annotations_suppressed = true,
+                "" => {}
+                other => {
+                    return Err(format!(
+                        "Invalid value '{other}' for `annotations` (expected `none`)."
+                    ))
+                }
+            },
+            key if VIEW_GRAMMAR_KEYS.contains(&key) => {}
+            key => {
+                return Err(format!(
+                    "Unsupported query parameter `{key}` for terminal reads. Supported: `new`, \
+                     `full`, `annotations`, plus the universal `offset`/`limit`/`grep` grammar."
+                ))
+            }
         }
-        // cairn://PROJECT/terminal/SLUG (project-level)
-        [project_key, "terminal", slug] => Some(ParsedTerminalUri {
-            project_key: project_key.to_string(),
+    }
+
+    let resource =
+        parse_uri(&split.identity).ok_or_else(|| terminal_shape_error(&split.identity))?;
+    let anchor_uri = resource.to_uri();
+    match resource {
+        CairnResource::NodeTerminal {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            slug,
+        } => Ok(ParsedTerminalUri {
+            project_key: project,
+            issue_number: Some(number),
+            exec_seq: Some(exec_seq),
+            node_id: Some(node_id),
+            task_name: None,
+            slug,
+            new,
+            annotations_suppressed,
+            anchor_uri,
+        }),
+        CairnResource::TaskTerminal {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            slug,
+        } => Ok(ParsedTerminalUri {
+            project_key: project,
+            issue_number: Some(number),
+            exec_seq: Some(exec_seq),
+            node_id: Some(node_id),
+            task_name: Some(task_name),
+            slug,
+            new,
+            annotations_suppressed,
+            anchor_uri,
+        }),
+        CairnResource::ProjectTerminal { project, slug } => Ok(ParsedTerminalUri {
+            project_key: project,
             issue_number: None,
             exec_seq: None,
             node_id: None,
-            slug: slug.to_string(),
-            full,
+            task_name: None,
+            slug,
+            new,
+            annotations_suppressed,
+            anchor_uri,
         }),
-        _ => None,
+        _ => Err(terminal_shape_error(&split.identity)),
     }
 }
 
-/// Get buffer content from cursor position, updating cursor after read.
-/// Returns (output, new_bytes, total_bytes).
-/// Uses per-terminal cursor so reads "consume" output regardless of which run is reading.
-/// If `full` is true, returns complete history from the start (ignores cursor).
-fn get_buffer_content_from_cursor(
+async fn append_inline_annotations(_orch: &Orchestrator, _output: &mut String, _anchor_uri: &str) {}
+
+/// Read the live buffer for `session_id` and render it via the cursor model.
+/// Returns (output, new_bytes, total_bytes, idle_secs). Idempotent reads
+/// (`consume == false`) return the whole buffer and leave the cursor untouched;
+/// incremental reads (`consume == true`) return bytes since the cursor and
+/// advance it.
+fn get_buffer_content(
     orch: &Orchestrator,
     read_cursors: &ReadCursorState,
     session_id: &str,
     status: &str,
-    full: bool,
-) -> (String, usize, usize) {
-    // Try to get buffer content
-    let buffer_result = (|| {
+    consume: bool,
+    fallback_tail: Option<&str>,
+) -> (String, usize, usize, Option<i64>) {
+    let snapshot = (|| {
         let sessions = orch.pty_state.sessions.lock().ok()?;
         let session_arc = sessions.get(session_id)?;
         let session = session_arc.lock().ok()?;
         let buffer = session.output_buffer.as_ref()?;
-        let buf_guard = buffer.lock().ok()?;
-        let bytes: Vec<u8> = buf_guard.iter().copied().collect();
-        Some(bytes)
+        let bytes: Vec<u8> = buffer.lock().ok()?.iter().copied().collect();
+        let idle = session
+            .last_output_at
+            .as_ref()
+            .and_then(|ts| ts.lock().ok().map(|t| *t))
+            .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs() as i64);
+        Some((bytes, idle))
     })();
 
-    let bytes = match buffer_result {
-        Some(b) => b,
+    let (bytes, idle) = match snapshot {
+        Some(value) => value,
         None => {
+            // No live PTY session. For an exited terminal, fall back to the
+            // retained output tail so a post-exit read still shows final output.
+            if status != "running" {
+                if let Some(tail) = fallback_tail.filter(|t| !t.is_empty()) {
+                    let len = tail.len();
+                    return (tail.to_string(), len, len, None);
+                }
+            }
             let msg = if status == "running" {
                 "(no output yet)"
             } else {
                 "(terminal ended - no buffered output)"
             };
-            return (msg.to_string(), 0, 0);
+            return (msg.to_string(), 0, 0, None);
         }
     };
 
-    let total_bytes = bytes.len();
-
-    // If full=true, read from start; otherwise use cursor position
-    let cursor_pos = if full {
-        0
-    } else {
+    let prior_cursor = {
         let cursors = read_cursors.lock().unwrap_or_else(|e| e.into_inner());
         *cursors.get(session_id).unwrap_or(&0)
     };
 
-    log::info!(
-        "read_resource cursor: session_id={}, cursor_pos={}, total_bytes={}, full={}",
-        &session_id[..session_id.len().min(8)],
-        cursor_pos,
-        total_bytes,
-        full
-    );
+    let (output, new_bytes, total_bytes, next_cursor) =
+        render_buffer_slice(&bytes, prior_cursor, consume);
 
-    // Slice from cursor position to get content
-    let new_bytes = total_bytes.saturating_sub(cursor_pos);
+    if consume {
+        let mut cursors = read_cursors.lock().unwrap_or_else(|e| e.into_inner());
+        cursors.insert(session_id.to_string(), next_cursor);
+    }
 
-    let output = if cursor_pos < total_bytes {
-        let raw = String::from_utf8_lossy(&bytes[cursor_pos..]).to_string();
-        // Strip ANSI escape sequences for cleaner agent consumption
-        strip_ansi_sequences(&raw)
+    let idle_secs = if total_bytes == 0 { None } else { idle };
+    (output, new_bytes, total_bytes, idle_secs)
+}
+
+/// Pure cursor/render core, isolated for testing. `consume == false` reads the
+/// whole buffer and leaves the cursor where it was; `consume == true` reads from
+/// the cursor and advances it to the end. Returns
+/// (output, new_bytes, total_bytes, next_cursor).
+fn render_buffer_slice(
+    bytes: &[u8],
+    cursor: usize,
+    consume: bool,
+) -> (String, usize, usize, usize) {
+    let total = bytes.len();
+    let start = if consume { cursor.min(total) } else { 0 };
+    let new_bytes = total.saturating_sub(start);
+    let output = if total == 0 {
+        "(no output yet)".to_string()
+    } else if start < total {
+        strip_ansi_sequences(&String::from_utf8_lossy(&bytes[start..]))
     } else {
         "(no new output)".to_string()
     };
-
-    // Update cursor to current buffer length (even for full reads, to mark as "seen")
-    {
-        let mut cursors = read_cursors.lock().unwrap_or_else(|e| e.into_inner());
-        cursors.insert(session_id.to_string(), total_bytes);
-    }
-
-    (output, new_bytes, total_bytes)
+    let next_cursor = if consume { total } else { cursor };
+    (output, new_bytes, total, next_cursor)
 }
 
 /// Strip ANSI escape sequences from terminal output for cleaner agent consumption.
@@ -646,307 +920,336 @@ fn strip_ansi_sequences(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::DbState;
-    use crate::diesel_models::{NewExecution, NewJob, NewJobTerminal};
-    use crate::orchestrator::Orchestrator;
-    use crate::services::testing::TestServicesBuilder;
-    use crate::test_utils::{create_test_issue, create_test_project, test_diesel_conn};
-    use std::sync::{Arc, Mutex};
-    use uuid::Uuid;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
 
-    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection) -> Orchestrator {
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
-            db.clone(),
-            services.emitter.clone(),
-        ));
-        let sync_tx = Arc::new(Mutex::new(None));
+    #[test]
+    fn fmt_duration_scales() {
+        assert_eq!(fmt_duration(5), "5s");
+        assert_eq!(fmt_duration(65), "1m05s");
+        assert_eq!(fmt_duration(3725), "1h02m");
+        assert_eq!(fmt_duration(-3), "0s");
+    }
 
-        Orchestrator {
+    #[test]
+    fn parse_accepts_universal_grammar_and_terminal_params() {
+        // The CAIRN-1489 repro set: bare, the universal grammar, and the
+        // terminal-specific params — all must parse instead of being rejected.
+        for uri in [
+            "cairn://p/CAIRN/terminal/ci",
+            "cairn://p/CAIRN/terminal/ci?limit=50",
+            "cairn://p/CAIRN/terminal/ci?grep=foo",
+            "cairn://p/CAIRN/terminal/ci?offset=-20",
+            "cairn://p/CAIRN/terminal/ci?head_limit=10&grep=foo",
+            "cairn://p/CAIRN/terminal/ci?new=true",
+            "cairn://p/CAIRN/terminal/ci?full=true",
+            "cairn://p/CAIRN/terminal/ci?annotations=none",
+            "cairn://p/CAIRN/42/2/builder/terminal/dev?limit=5",
+            "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci?limit=5",
+            "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci?new=true",
+        ] {
+            assert!(parse_terminal_uri(uri).is_ok(), "expected Ok for {uri}");
+        }
+        assert!(
+            parse_terminal_uri("cairn://p/CAIRN/terminal/ci?new=true")
+                .unwrap()
+                .new
+        );
+        assert!(
+            !parse_terminal_uri("cairn://p/CAIRN/terminal/ci")
+                .unwrap()
+                .new
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_param_naming_it() {
+        let err = parse_terminal_uri("cairn://p/CAIRN/terminal/ci?bogus=1").unwrap_err();
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("Supported"), "{err}");
+    }
+
+    #[test]
+    fn parse_non_terminal_uri_explains_shape() {
+        let err = parse_terminal_uri("cairn://p/CAIRN/1").unwrap_err();
+        assert!(err.contains("Expected"), "{err}");
+    }
+
+    #[test]
+    fn parse_accepts_task_terminal_shape() {
+        let parsed = parse_terminal_uri("cairn://p/CAIRN/1/1/builder/task/Explore/terminal/ci")
+            .expect("task terminal URI should parse");
+        assert_eq!(parsed.project_key, "CAIRN");
+        assert_eq!(parsed.node_id.as_deref(), Some("builder"));
+        assert_eq!(parsed.task_name.as_deref(), Some("Explore"));
+        assert_eq!(parsed.slug, "ci");
+        assert!(
+            task_terminal_hint("cairn://p/CAIRN/1/1/builder/task/Explore/terminal/ci").is_none()
+        );
+        let err =
+            parse_terminal_uri("cairn://p/CAIRN/1/1/builder/task/Explore/terminal").unwrap_err();
+        assert!(err.contains("missing a slug"), "{err}");
+    }
+
+    #[test]
+    fn render_buffer_slice_is_idempotent_until_consumed() {
+        let bytes = b"hello\nworld\n";
+        // Idempotent: full buffer, cursor untouched, repeatable.
+        let (out1, new1, total1, cur1) = render_buffer_slice(bytes, 0, false);
+        let (out2, _new2, _total2, cur2) = render_buffer_slice(bytes, 0, false);
+        assert_eq!(out1, out2);
+        assert_eq!(cur1, 0);
+        assert_eq!(cur2, 0);
+        assert_eq!(new1, bytes.len());
+        assert_eq!(total1, bytes.len());
+        assert!(out1.contains("hello") && out1.contains("world"));
+
+        // Consume: first read returns all and advances; second returns nothing new.
+        let (_o, n_first, total, next) = render_buffer_slice(bytes, 0, true);
+        assert_eq!(n_first, bytes.len());
+        assert_eq!(next, total);
+        let (o2, n_second, _t, next2) = render_buffer_slice(bytes, next, true);
+        assert_eq!(n_second, 0);
+        assert_eq!(next2, total);
+        assert_eq!(o2, "(no new output)");
+    }
+
+    #[test]
+    fn banner_distinguishes_running_quiet_from_exited() {
+        let running_quiet = format_status_banner("ci", "running", None, Some(70), Some(40), 1024);
+        assert!(running_quiet.contains("running"));
+        assert!(running_quiet.contains("elapsed"));
+        assert!(running_quiet.contains("last output"));
+
+        let running_no_output = format_status_banner("ci", "running", None, Some(5), None, 0);
+        assert!(running_no_output.contains("no output yet"));
+
+        let exited = format_status_banner("ci", "exited", Some(0), Some(83), None, 2048);
+        assert!(exited.contains("exited code 0"));
+        assert!(exited.contains("ran"));
+    }
+
+    #[test]
+    fn not_found_message_lists_or_explains() {
+        let empty = not_found_message("ci", &[]);
+        assert!(empty.contains("no terminals exist"));
+        let listed = not_found_message("ci", &["build".to_string(), "dev".to_string()]);
+        assert!(listed.contains("build, dev"), "{listed}");
+    }
+
+    // ---- integration: real orchestrator + seeded job_terminals row ----
+
+    async fn seeded_orch() -> Orchestrator {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use std::sync::Arc;
+
+        let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        OrchestratorBuilder::new(
             db,
-            services: services.clone(),
-            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
-            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
-                "/tmp",
-            ))),
-            warm_gc: None,
-            pty_state: Arc::new(crate::services::PtyState::default()),
-            permission_responses: tokio::sync::broadcast::channel(16).0,
-            run_completions: tokio::sync::broadcast::channel(64).0,
-            prompt_responses: tokio::sync::broadcast::channel(16).0,
-            trigger_events: tokio::sync::broadcast::channel(256).0,
-            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            identity_store: Arc::new(Mutex::new(None)),
-            mcp_binary_path: "cairn-mcp".to_string(),
-            config_dir: std::path::PathBuf::from("/tmp"),
-            schema_dir: None,
-            mcp_callback_port: 3847,
-            embedding_engine: None,
-            vibe_state: None,
-            account_manager,
-            sync_tx: sync_tx.clone(),
-            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
-            api_config: crate::api::ApiConfig::default(),
-            effect_tx: None,
-            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            provider_usage_snapshots: Default::default(),
-            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build()
+    }
+
+    async fn exec(orch: &Orchestrator, sql: &'static str) {
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(sql, ()).await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn read_terminal(orch: &Orchestrator, uri: &str) -> TerminalReadResult {
+        let request = McpCallbackRequest {
+            cwd: "/tmp".to_string(),
+            run_id: None,
+            tool: "read_resource".to_string(),
+            payload: serde_json::json!({ "uri": uri }),
+            tool_use_id: None,
+        };
+        let cursors = StdMutex::new(HashMap::new());
+        let raw = handle_read_resource(orch, &request, &cursors).await;
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    async fn seed_node_and_task_terminals(orch: &Orchestrator) {
+        exec(
+            orch,
+            "INSERT INTO workspaces (id, name, created_at, updated_at)
+             VALUES ('ws-nt', 'WS', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-nt', 'ws-nt', 'NT', 'NT', '/tmp/repo', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES ('issue-nt', 'proj-nt', 42, 'I', 'active', 'active', 'none', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-nt', 'recipe', 'issue-nt', 'proj-nt', 'running', 1, 2)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO jobs (id, project_id, issue_id, execution_id, uri_segment, status, created_at, updated_at)
+             VALUES ('parent-nt', 'proj-nt', 'issue-nt', 'exec-nt', 'builder', 'running', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO jobs (id, project_id, issue_id, execution_id, parent_job_id, uri_segment, status, created_at, updated_at)
+             VALUES ('task-nt', 'proj-nt', 'issue-nt', 'exec-nt', 'parent-nt', 'Explore', 'running', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug, output_tail)
+             VALUES ('term-parent-nt', 'parent-nt', NULL, NULL, 'sess-parent-nt', 'ci', 'exited', 1, 'ci', 'parent-output')",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug, output_tail)
+             VALUES ('term-task-nt', 'task-nt', NULL, NULL, 'sess-task-nt', 'ci', 'exited', 1, 'ci', 'task-output')",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug, output_tail)
+             VALUES ('term-task-other-nt', 'task-nt', NULL, NULL, 'sess-task-other-nt', 'other', 'exited', 1, 'task-only', 'task-only-output')",
+        )
+        .await;
+    }
+
+    async fn seed_project_terminal(orch: &Orchestrator) {
+        exec(
+            orch,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-t', 'default', 'TM', 'TM', '/tmp/repo', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO job_terminals
+               (id, job_id, project_id, run_id, session_id, command, status, created_at, slug)
+             VALUES ('term-1', NULL, 'proj-t', NULL, 'sess-1', 'sleep 1', 'running', 1, 'ci')",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_terminal_read_is_scoped_to_child_job() {
+        let orch = seeded_orch().await;
+        seed_node_and_task_terminals(&orch).await;
+
+        let parent = read_terminal(&orch, "cairn://p/NT/42/2/builder/terminal/ci").await;
+        assert_eq!(parent.status, "exited");
+        assert!(parent.output.contains("parent-output"), "{}", parent.output);
+        assert!(!parent.output.contains("task-output"), "{}", parent.output);
+
+        let task = read_terminal(&orch, "cairn://p/NT/42/2/builder/task/Explore/terminal/ci").await;
+        assert_eq!(task.status, "exited");
+        assert!(task.output.contains("task-output"), "{}", task.output);
+        assert!(!task.output.contains("parent-output"), "{}", task.output);
+
+        let missing = read_terminal(&orch, "cairn://p/NT/42/2/builder/terminal/task-only").await;
+        assert_eq!(missing.status, "error");
+        assert!(
+            missing
+                .output
+                .contains("Existing terminals in this scope: ci."),
+            "{}",
+            missing.output
+        );
+        assert!(
+            !missing.output.contains("task-only-output"),
+            "{}",
+            missing.output
+        );
+    }
+
+    #[tokio::test]
+    async fn created_terminal_is_readable_with_universal_grammar() {
+        let orch = seeded_orch().await;
+        seed_project_terminal(&orch).await;
+
+        // Bare, the universal grammar, the canonical form, and `new=true` all
+        // resolve — never the old "Invalid terminal URI" rejection.
+        for uri in [
+            "cairn://p/TM/terminal/ci",
+            "cairn://p/TM/terminal/ci?limit=50",
+            "cairn://p/TM/terminal/ci?grep=foo",
+            "cairn://p/TM/terminal/ci?offset=-20",
+            "cairn://p/TM/terminal/ci?new=true",
+        ] {
+            let result = read_terminal(&orch, uri).await;
+            assert_ne!(
+                result.status, "error",
+                "unexpected error for {uri}: {}",
+                result.output
+            );
+            assert!(
+                !result.output.contains("Invalid terminal URI"),
+                "stale rejection for {uri}"
+            );
+            assert!(
+                result.output.contains("[terminal ci:"),
+                "missing banner for {uri}"
+            );
         }
     }
 
-    fn insert_issue_job_with_terminal(
-        conn: &mut diesel::sqlite::SqliteConnection,
-        issue_id: &str,
-        project_id: &str,
-        recipe_node_id: &str,
-        node_name: Option<&str>,
-        slug: &str,
-    ) -> String {
-        let execution_id = Uuid::new_v4().to_string();
-        let job_id = Uuid::new_v4().to_string();
-        let terminal_id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().timestamp() as i32;
-
-        diesel::insert_into(executions::table)
-            .values(&NewExecution {
-                id: &execution_id,
-                recipe_id: "recipe-1",
-                issue_id: Some(issue_id),
-                project_id: None,
-                status: "running",
-                started_at: now,
-                completed_at: None,
-                snapshot: None,
-                seq: Some(1),
-                initiator_sub: None,
-                initiator_auth_mode: None,
-                initiator_org_id: None,
-                triggered_by: "manual",
-            })
-            .execute(conn)
-            .unwrap();
-
-        diesel::insert_into(jobs::table)
-            .values(&NewJob {
-                id: &job_id,
-                execution_id: Some(&execution_id),
-                manager_id: None,
-                recipe_node_id: Some(recipe_node_id),
-                parent_job_id: None,
-                worktree_path: None,
-                branch: None,
-                base_commit: None,
-                current_session_id: None,
-                resume_session_id: None,
-                status: "running",
-                agent_config_id: Some("Build"),
-                issue_id: Some(issue_id),
-                project_id,
-                task_description: None,
-                created_at: now,
-                updated_at: now,
-                completed_at: None,
-                parent_tool_use_id: None,
-                task_index: None,
-                started_at: Some(now),
-                model: None,
-                node_name,
-                base_branch: None,
-                current_turn_id: None,
-            })
-            .execute(conn)
-            .unwrap();
-
-        diesel::insert_into(job_terminals::table)
-            .values(&NewJobTerminal {
-                id: &terminal_id,
-                job_id: Some(&job_id),
-                project_id: None,
-                run_id: None,
-                session_id: "session-1",
-                command: "cargo test",
-                title: None,
-                description: Some("Test terminal"),
-                status: "running",
-                exit_code: None,
-                created_at: now,
-                exited_at: None,
-                slug: Some(slug),
-            })
-            .execute(conn)
-            .unwrap();
-
-        job_id
+    #[tokio::test]
+    async fn plain_read_does_not_consume() {
+        let orch = seeded_orch().await;
+        seed_project_terminal(&orch).await;
+        let first = read_terminal(&orch, "cairn://p/TM/terminal/ci").await;
+        let second = read_terminal(&orch, "cairn://p/TM/terminal/ci").await;
+        // No live session, so both report the same buffer state and never flip to
+        // "(no new output)" the way a consuming read would.
+        assert_eq!(first.status, "running");
+        assert_eq!(second.status, "running");
+        assert_eq!(first.total_bytes, second.total_bytes);
+        assert!(first.output.contains("(no output yet)"));
+        assert!(second.output.contains("(no output yet)"));
     }
 
-    #[test]
-    fn test_parse_terminal_uri_node_level() {
-        // Canonical 6-segment format: PROJECT/NUMBER/EXEC/NODE/terminal/SLUG
-        let result =
-            parse_terminal_uri("cairn://CAIRN/123/1/builder-1/terminal/dev-server").unwrap();
-        assert_eq!(result.project_key, "CAIRN");
-        assert_eq!(result.issue_number, Some(123));
-        assert_eq!(result.exec_seq, Some(1));
-        assert_eq!(result.node_id, Some("builder-1".to_string()));
-        assert_eq!(result.slug, "dev-server");
-        assert!(!result.full);
-    }
-
-    #[test]
-    fn test_parse_terminal_uri_project_level() {
-        let result = parse_terminal_uri("cairn://CAIRN/terminal/build").unwrap();
-        assert_eq!(result.project_key, "CAIRN");
-        assert_eq!(result.issue_number, None);
-        assert_eq!(result.node_id, None);
-        assert_eq!(result.slug, "build");
-        assert!(!result.full);
-    }
-
-    #[test]
-    fn test_parse_terminal_uri_with_full_flag() {
-        let result =
-            parse_terminal_uri("cairn://CAIRN/123/1/builder-1/terminal/dev-server?full=true")
-                .unwrap();
-        assert_eq!(result.slug, "dev-server");
-        assert!(result.full);
-
-        let result2 = parse_terminal_uri("cairn://CAIRN/terminal/build?full=1").unwrap();
-        assert!(result2.full);
-    }
-
-    #[test]
-    fn test_parse_terminal_uri_invalid() {
-        assert!(parse_terminal_uri("file:///test.txt").is_none());
-        assert!(parse_terminal_uri("cairn://CAIRN/slug").is_none());
-        assert!(parse_terminal_uri("invalid").is_none());
-        // Old terminal:// scheme no longer supported
-        assert!(parse_terminal_uri("terminal://CAIRN/main/build").is_none());
-        // 5-segment format without exec_seq is not valid
-        assert!(parse_terminal_uri("cairn://CAIRN/123/builder-1/terminal/dev-server").is_none());
-        // 6-segment with non-numeric exec_seq is not valid
-        assert!(
-            parse_terminal_uri("cairn://CAIRN/123/abc/builder-1/terminal/dev-server").is_none()
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_read_resource_accepts_legacy_recipe_node_id_terminal_uri() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "CAIRN");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Test Issue");
-        let recipe_node_id = "54e54f2d-4ff1-45c5-ad0e-5e5f5846ea67";
-        insert_issue_job_with_terminal(
-            &mut conn,
-            &issue_id,
-            &project_id,
-            recipe_node_id,
-            None,
-            "dev-server",
-        );
-
-        let orch = test_orchestrator(conn);
-        let read_cursors = ReadCursorState::default();
-        let request = crate::mcp::types::McpCallbackRequest {
-            cwd: "/tmp/test-repo".to_string(),
-            run_id: None,
-            tool: "read_resource".to_string(),
-            payload: serde_json::json!({
-                "uri": format!(
-                    "cairn://CAIRN/1/1/{}/terminal/dev-server",
-                    recipe_node_id
-                )
-            }),
-            tool_use_id: None,
-        };
-
-        let response = handle_read_resource(&orch, &request, &read_cursors).await;
-        let parsed: TerminalReadResult = serde_json::from_str(&response).unwrap();
-
-        assert_eq!(parsed.status, "running");
-        assert_ne!(parsed.output, "Terminal not found: dev-server");
-    }
-
-    #[test]
-    fn test_build_terminal_uri_node_level() {
-        let uri = build_terminal_uri("CAIRN", Some(123), Some(1), Some("builder-1"), "dev-server");
-        assert_eq!(uri, "cairn://CAIRN/123/1/builder-1/terminal/dev-server");
-    }
-
-    #[test]
-    fn test_build_terminal_uri_project_level() {
-        let uri = build_terminal_uri("CAIRN", None, None, None, "build");
-        assert_eq!(uri, "cairn://CAIRN/terminal/build");
-    }
-
-    #[test]
-    fn test_build_terminal_uri_missing_exec_seq_falls_back_to_project() {
-        // When issue_number exists but exec_seq is None, URI drops to project-level
-        let uri = build_terminal_uri("CAIRN", Some(123), None, Some("builder-1"), "dev-server");
-        assert_eq!(uri, "cairn://CAIRN/terminal/dev-server");
-    }
-
-    #[test]
-    fn test_build_terminal_uri_missing_node_falls_back_to_project() {
-        // When issue_number and exec_seq exist but node_id is None
-        let uri = build_terminal_uri("CAIRN", Some(123), Some(1), None, "dev-server");
-        assert_eq!(uri, "cairn://CAIRN/terminal/dev-server");
-    }
-
-    #[test]
-    fn test_strip_ansi_plain_text() {
-        assert_eq!(strip_ansi_sequences("hello world"), "hello world");
-    }
-
-    #[test]
-    fn test_strip_ansi_color_codes() {
-        assert_eq!(
-            strip_ansi_sequences("\x1b[32mgreen\x1b[0m text"),
-            "green text"
-        );
-    }
-
-    #[test]
-    fn test_strip_ansi_carriage_return_overwrite() {
-        // Bare \r (not followed by \n) clears the line — only new content remains
-        assert_eq!(strip_ansi_sequences("loading...\rdone!"), "done!");
-        // Multiple rewrites — only final version kept
-        assert_eq!(strip_ansi_sequences("10%\r50%\r100%"), "100%");
-    }
-
-    #[test]
-    fn test_strip_ansi_cr_lf_sequence() {
-        // Normal \r\n line endings should produce clean lines
-        assert_eq!(strip_ansi_sequences("line1\r\nline2\r\n"), "line1\nline2");
-    }
-
-    #[test]
-    fn test_strip_ansi_backspace() {
-        // "abc" then 2 backspaces then "xy" → "axy"
-        assert_eq!(strip_ansi_sequences("abc\x08\x08xy"), "axy");
-    }
-
-    #[test]
-    fn test_strip_ansi_autocomplete_simulation() {
-        // Simulates: user types "ca", autocomplete overwrites with "cargo build"
-        // PTY output: "ca" then \r to go back, then full "cargo build" overwrites
-        assert_eq!(
-            strip_ansi_sequences("$ ca\r$ cargo build\n"),
-            "$ cargo build"
-        );
-    }
-
-    #[test]
-    fn test_strip_ansi_erase_line() {
-        // ESC[K erases from cursor to end of line
-        assert_eq!(strip_ansi_sequences("hello world\r$ cmd\x1b[K\n"), "$ cmd");
-    }
-
-    #[test]
-    fn test_strip_ansi_osc_sequences() {
-        // OSC title-setting sequences should be stripped
-        assert_eq!(strip_ansi_sequences("\x1b]0;my-title\x07$ ls\n"), "$ ls");
+    #[tokio::test]
+    async fn missing_slug_lists_existing_slugs() {
+        let orch = seeded_orch().await;
+        seed_project_terminal(&orch).await;
+        let result = read_terminal(&orch, "cairn://p/TM/terminal/nope").await;
+        assert_eq!(result.status, "error");
+        assert!(result.output.contains("nope"), "{}", result.output);
+        assert!(result.output.contains("ci"), "{}", result.output);
     }
 }

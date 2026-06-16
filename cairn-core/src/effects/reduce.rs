@@ -13,18 +13,14 @@ use super::types::{EffectResult, WorkflowEffect};
 /// that re-enter the effect loop.
 pub fn reduce_effect_result(result: EffectResult) -> Vec<WorkflowEffect> {
     match result {
-        EffectResult::CheckpointComplete {
-            job_id,
-            passed,
-            error,
-        } => {
+        EffectResult::CheckpointComplete { job_id, passed, .. } => {
             if passed {
+                // Pass: confirm the artifact -> projection derives Complete.
                 vec![WorkflowEffect::ApplyCheckpointApproval { job_id }]
             } else {
-                vec![WorkflowEffect::ApplyCheckpointRejection {
-                    job_id,
-                    reason: error,
-                }]
+                // Fail: block the checkpoint job (resumable halt). No DAG-level
+                // rejection/branching — the run can be re-tried after a fix.
+                vec![WorkflowEffect::BlockCheckpointJob { job_id }]
             }
         }
         EffectResult::ConditionEvaluated {
@@ -38,12 +34,6 @@ pub fn reduce_effect_result(result: EffectResult) -> Vec<WorkflowEffect> {
                 node_id,
                 port,
                 error_msg,
-            }]
-        }
-        EffectResult::WorktreeCreated { execution_id, .. } => {
-            vec![WorkflowEffect::AdvanceDag {
-                execution_id,
-                outbox_entry_id: None,
             }]
         }
         EffectResult::WorktreeFailed { job_id, error } => {
@@ -93,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_fail_produces_rejection() {
+    fn checkpoint_fail_produces_block() {
         let effects = reduce_effect_result(EffectResult::CheckpointComplete {
             job_id: "j1".into(),
             passed: false,
@@ -102,8 +92,7 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert!(matches!(
             &effects[0],
-            WorkflowEffect::ApplyCheckpointRejection { job_id, reason }
-                if job_id == "j1" && reason.as_deref() == Some("test failed")
+            WorkflowEffect::BlockCheckpointJob { job_id } if job_id == "j1"
         ));
     }
 
@@ -120,19 +109,6 @@ mod tests {
             &effects[0],
             WorkflowEffect::StoreConditionEvaluation { execution_id, node_id, port, .. }
                 if execution_id == "e1" && node_id == "n1" && port == "yes"
-        ));
-    }
-
-    #[test]
-    fn worktree_created_advances_dag() {
-        let effects = reduce_effect_result(EffectResult::WorktreeCreated {
-            job_id: "j1".into(),
-            execution_id: "e1".into(),
-        });
-        assert_eq!(effects.len(), 1);
-        assert!(matches!(
-            &effects[0],
-            WorkflowEffect::AdvanceDag { execution_id, .. } if execution_id == "e1"
         ));
     }
 

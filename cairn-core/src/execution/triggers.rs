@@ -6,20 +6,17 @@
 //! 3. Starts new executions for each matched recipe
 //! 4. Enqueues DAG advancement on the effect queue
 
-use diesel::prelude::*;
+use std::future::Future;
 
-use crate::diesel_models::NewTriggerSource;
-use crate::execution::creation::create_jobs_for_execution;
 use crate::execution::Initiator;
 use crate::models::{
     ExecutionSnapshot, JobEndedEvent, Recipe, RecipeNodeType, RecipeTrigger, SkillCalledEvent,
     TriggerScope, TriggerType,
 };
 use crate::orchestrator::Orchestrator;
-use crate::schema::execution_trigger_sources;
 
 use super::accumulator;
-use super::recipe::start_event_triggered_execution;
+use super::recipe::{create_jobs_for_execution, start_event_triggered_execution};
 
 /// Check if a single recipe matches a JobEnded event.
 fn matches_job_ended(recipe: &Recipe, event: &JobEndedEvent) -> bool {
@@ -163,34 +160,32 @@ pub fn dispatch_event_recipes(
     initiator: Option<Initiator>,
 ) {
     for recipe in recipes {
-        // Check if this recipe uses accumulation
         let effective_payload = if let Some(policy) = accumulator::get_accumulation_policy(&recipe)
         {
-            let Ok(mut conn) = orch.db.conn.lock() else {
-                log::error!("Failed to lock DB for accumulator");
-                continue;
-            };
-            match accumulator::try_accumulate(
-                &mut conn,
-                &recipe.id,
-                &policy,
-                &event_payload,
-                project_id,
-                event_issue_id,
-            ) {
-                Ok(Some(accumulated)) => accumulated,
-                Ok(None) => {
-                    log::info!(
-                        "Accumulator for '{}': event stored ({}/{})",
+            let db = orch.db.local.clone();
+            let recipe_id = recipe.id.clone();
+            let payload = event_payload.clone();
+            let project_id = project_id.to_string();
+            let issue_id = event_issue_id.map(str::to_string);
+            match block_on_trigger_db(async move {
+                accumulator::try_accumulate(
+                    &db,
+                    &recipe_id,
+                    &policy,
+                    &payload,
+                    &project_id,
+                    issue_id.as_deref(),
+                )
+                .await
+            }) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => continue,
+                Err(error) => {
+                    log::error!(
+                        "Failed to accumulate event for recipe '{}': {}",
                         recipe.name,
-                        // Can't easily get current count here, just log the threshold
-                        "?",
-                        policy.every
+                        error
                     );
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("Accumulator error for recipe '{}': {}", recipe.name, e);
                     continue;
                 }
             }
@@ -229,42 +224,37 @@ pub fn dispatch_event_recipes(
             initiator.clone(),
         ) {
             Ok(execution) => {
-                // Create jobs for the execution
-                if let Ok(mut conn) = orch.db.conn.lock() {
-                    let job_issue_id = issue_id.unwrap_or("");
-                    if let Err(e) = create_jobs_for_execution(
-                        &mut conn,
-                        &execution.id,
-                        job_issue_id,
-                        project_id,
-                    ) {
+                if let Err(error) = record_trigger_sources(orch, &execution.id, &effective_payload)
+                {
+                    log::error!(
+                        "Failed to record trigger sources for execution {}: {}",
+                        &execution.id[..execution.id.len().min(8)],
+                        error
+                    );
+                }
+
+                match create_jobs_for_execution(orch, &execution.id) {
+                    Ok(jobs) => {
+                        log::info!(
+                            "Created {} job(s) for event-triggered execution {}",
+                            jobs.len(),
+                            &execution.id[..execution.id.len().min(8)]
+                        );
+                        // One scoped jobs event per created job (frontend dedupes).
+                        for job in &jobs {
+                            let _ = orch
+                                .services
+                                .emitter
+                                .emit("db-change", crate::notify::job_db_change(job, "insert"));
+                        }
+                    }
+                    Err(error) => {
                         log::error!(
                             "Failed to create jobs for event-triggered execution {}: {}",
-                            &execution.id[..8],
-                            e
+                            &execution.id[..execution.id.len().min(8)],
+                            error
                         );
                         continue;
-                    }
-
-                    // Insert trigger source junction rows
-                    let source_job_ids = extract_source_job_ids(&effective_payload);
-                    let now = chrono::Utc::now().timestamp() as i32;
-                    for job_id in &source_job_ids {
-                        if let Err(e) = diesel::insert_into(execution_trigger_sources::table)
-                            .values(NewTriggerSource {
-                                id: &uuid::Uuid::new_v4().to_string(),
-                                source_job_id: job_id,
-                                triggered_execution_id: &execution.id,
-                                created_at: now,
-                            })
-                            .execute(&mut *conn)
-                        {
-                            log::warn!(
-                                "Failed to insert trigger source for execution {}: {}",
-                                &execution.id[..8],
-                                e
-                            );
-                        }
                     }
                 }
 
@@ -273,10 +263,7 @@ pub fn dispatch_event_recipes(
                     "db-change",
                     serde_json::json!({"table": "executions", "action": "insert"}),
                 );
-                let _ = orch.services.emitter.emit(
-                    "db-change",
-                    serde_json::json!({"table": "jobs", "action": "insert"}),
-                );
+                // Per-job scoped `jobs` events are emitted in the Ok arm above.
                 let _ = orch.services.emitter.emit(
                     "db-change",
                     serde_json::json!({"table": "execution_trigger_sources", "action": "insert"}),
@@ -309,6 +296,70 @@ pub fn dispatch_event_recipes(
             }
         }
     }
+}
+
+fn block_on_trigger_db<T, Fut>(future: Fut) -> Result<T, String>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    fn run<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?
+            .block_on(future)
+    }
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || run(future))
+            .join()
+            .map_err(|_| "event trigger database task panicked".to_string())?
+    } else {
+        run(future)
+    }
+}
+
+fn record_trigger_sources(
+    orch: &Orchestrator,
+    execution_id: &str,
+    payload: &serde_json::Value,
+) -> Result<usize, String> {
+    let source_job_ids = extract_source_job_ids(payload);
+    if source_job_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let db = orch.db.local.clone();
+    let execution_id = execution_id.to_string();
+    block_on_trigger_db(async move {
+        db.write(|conn| {
+            let source_job_ids = source_job_ids.clone();
+            let execution_id = execution_id.clone();
+            Box::pin(async move {
+                let now = chrono::Utc::now().timestamp() as i32;
+                for source_job_id in &source_job_ids {
+                    let id = uuid::Uuid::new_v4().to_string();
+                    conn.execute(
+                        "INSERT INTO execution_trigger_sources(
+                            id, source_job_id, triggered_execution_id, created_at
+                         )
+                         VALUES (?1, ?2, ?3, ?4)",
+                        turso::params![
+                            id.as_str(),
+                            source_job_id.as_str(),
+                            execution_id.as_str(),
+                            now
+                        ],
+                    )
+                    .await?;
+                }
+                Ok(source_job_ids.len())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
 }
 
 /// Extract source job IDs from an event payload.
@@ -467,13 +518,13 @@ mod tests {
             },
             agents: HashMap::new(),
             skills: HashMap::new(),
-            tools: HashMap::new(),
             trigger_context: TriggerContext {
                 issue_id: None,
                 project_id: "p".to_string(),
                 trigger_type: tt,
 
                 event_payload: None,
+                initiated_via: None,
             },
             presets: None,
             delegated_packets: vec![],

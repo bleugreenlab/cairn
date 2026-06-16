@@ -8,34 +8,39 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::models::{Preset, TerminalCommand};
-
-/// External reference resource (git repo or local directory).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Resource {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub git: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-}
+use crate::references::ProjectReference;
 
 /// Worktree behavior settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeSettings {
-    /// When true, seed gitignored repo content into new worktrees.
-    #[serde(default = "default_true")]
-    pub seed_ignored: bool,
+    /// Legacy field — deserialized for migration but not re-serialized.
+    #[serde(default, skip_serializing)]
+    pub seed_ignored: Option<bool>,
+    /// Rules for populating gitignored paths into new worktrees, grouped by strategy.
+    #[serde(default, skip_serializing_if = "PopulateConfig::is_empty")]
+    pub populate: PopulateConfig,
 }
 
-impl Default for WorktreeSettings {
-    fn default() -> Self {
-        Self { seed_ignored: true }
+/// Configuration for how gitignored paths are populated into new worktrees.
+///
+/// Paths matching `copy` patterns are copied (isolated per worktree).
+/// Paths matching `symlink` patterns are symlinked (shared with main repo).
+/// Unmatched paths are skipped — new worktrees start clean by default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PopulateConfig {
+    /// Patterns whose matching paths are copied into the worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy: Vec<String>,
+    /// Patterns whose matching paths are symlinked to the main repo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symlink: Vec<String>,
+}
+
+impl PopulateConfig {
+    pub fn is_empty(&self) -> bool {
+        self.copy.is_empty() && self.symlink.is_empty()
     }
 }
 
@@ -51,31 +56,30 @@ pub struct ProjectSettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources: Option<Vec<Resource>>,
+    pub references: Option<Vec<ProjectReference>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSettings>,
     /// Project-level override for active backend
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_backend: Option<String>,
-    /// Project-level override for default tier
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_tier: Option<String>,
     /// Project-level preset overrides (deep-merged with workspace)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    /// Project-level external MCP servers (overlay workspace set; project wins
+    /// on key collision).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
 }
 
 impl ProjectSettingsFile {
-    pub fn should_seed_worktree_ignored(&self) -> bool {
+    /// Get the populate config for worktrees.
+    /// Returns the configured PopulateConfig, or empty (skip-all) by default.
+    pub fn populate_config(&self) -> PopulateConfig {
         self.worktree
             .as_ref()
-            .map(|worktree| worktree.seed_ignored)
-            .unwrap_or(true)
+            .map(|w| w.populate.clone())
+            .unwrap_or_default()
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Intermediate struct for loading legacy config files.
@@ -94,16 +98,16 @@ struct LegacyProjectSettingsFile {
     #[serde(default)]
     default_branch: Option<String>,
     #[serde(default)]
-    resources: Option<Vec<Resource>>,
+    references: Option<Vec<ProjectReference>>,
     #[serde(default)]
     worktree: Option<WorktreeSettings>,
     // Preset fields — must be present so they survive the legacy parse path
     #[serde(default)]
     active_backend: Option<String>,
     #[serde(default)]
-    default_tier: Option<String>,
-    #[serde(default)]
     backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    #[serde(default)]
+    mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
 }
 
 /// Legacy terminal command with persistent field
@@ -116,7 +120,7 @@ struct LegacyTerminalCommand {
     persistent: bool,
 }
 
-/// Get the path to the project config file ([project]/.cairn/config.yaml)
+/// Get the path to the project config file (\[project\]/.cairn/config.yaml)
 pub fn get_project_config_path(project_path: &Path) -> PathBuf {
     project_path.join(".cairn").join("config.yaml")
 }
@@ -131,8 +135,16 @@ pub fn load_project_settings(project_path: &Path) -> ProjectSettingsFile {
                     "Migrating project config at {:?} (removing deprecated fields)",
                     project_path
                 );
-                if let Err(e) = save_project_settings(project_path, &file) {
-                    log::warn!("Failed to migrate project settings: {}", e);
+                match save_project_settings(project_path, &file) {
+                    Ok(()) => {
+                        // The rewrite lands in the project's canonical checkout;
+                        // commit it so the migration does not float as dirt.
+                        super::commit_project_config_change(
+                            project_path,
+                            "cairn: migrate project config",
+                        );
+                    }
+                    Err(e) => log::warn!("Failed to migrate project settings: {}", e),
                 }
             }
             file
@@ -146,6 +158,23 @@ pub fn load_project_settings(project_path: &Path) -> ProjectSettingsFile {
             ProjectSettingsFile::default()
         }
     }
+}
+
+/// Resolve the effective default branch for a project.
+///
+/// Precedence: an explicit `defaultBranch` in the project's `.cairn/config.yaml`
+/// wins, then the value stored on the project row, then the hard fallback
+/// `"main"`. Both the UI projection and worktree creation resolve through this
+/// helper so they always agree on which branch worktrees are based on.
+pub fn resolve_default_branch(
+    config: &ProjectSettingsFile,
+    stored_default_branch: Option<&str>,
+) -> String {
+    config
+        .default_branch
+        .clone()
+        .or_else(|| stored_default_branch.map(str::to_string))
+        .unwrap_or_else(|| "main".to_string())
 }
 
 /// Load the raw project settings file.
@@ -170,7 +199,7 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
     if let Some(ref files) = legacy.copy_files {
         log::warn!(
             "Removing deprecated copyFiles from project config: {:?}. \
-             Gitignored content is now auto-seeded into worktrees via symlinks.",
+             Use worktree.populate.copy patterns instead.",
             files
         );
     }
@@ -179,7 +208,14 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
         .as_ref()
         .map(|cmds| cmds.iter().any(|c| c.persistent))
         .unwrap_or(false);
-    let needs_migration = has_ci_commands || has_copy_files || has_persistent;
+    // Legacy seedIgnored field triggers migration to clear it from the file
+    let has_legacy_seed_ignored = legacy
+        .worktree
+        .as_ref()
+        .and_then(|w| w.seed_ignored)
+        .is_some();
+    let needs_migration =
+        has_ci_commands || has_copy_files || has_persistent || has_legacy_seed_ignored;
 
     // Convert to current format (dropping deprecated fields)
     let settings = ProjectSettingsFile {
@@ -193,11 +229,11 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
                 .collect()
         }),
         default_branch: legacy.default_branch,
-        resources: legacy.resources,
+        references: legacy.references,
         worktree: legacy.worktree,
         active_backend: legacy.active_backend,
-        default_tier: legacy.default_tier,
         backends: legacy.backends,
+        mcp_servers: legacy.mcp_servers,
     };
 
     Ok((settings, needs_migration))
@@ -245,13 +281,19 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 # This file configures how Cairn works with this project.
 # It can be committed to version control to share settings with your team.
 #
-# Worktrees can be seeded with gitignored content from the main repo
-# (node_modules, target/, .env files, etc.).
-# Directories are symlinked (instant, shared), files are copied.
+# Worktree population: control which gitignored content is pre-populated.
+# Paths matching 'copy' patterns are copied (isolated per worktree).
+# Paths matching 'symlink' patterns are symlinked (shared with main repo).
+# Unmatched paths are skipped — setup commands handle the rest.
 #
-# Toggle seeding on or off per project (default: true)
 # worktree:
-#   seedIgnored: true
+#   populate:
+#     copy:
+#       - ".env"
+#       - ".env.*"
+#     symlink:
+#       - "target/"
+#       - ".cache/"
 
 # Commands to run when setting up a new worktree
 # setupCommands:
@@ -268,7 +310,7 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 # defaultBranch: main
 
 # External reference repositories and directories
-# resources:
+# references:
 #   - name: docs
 #     git: https://github.com/org/docs.git
 #     description: Project documentation
@@ -287,12 +329,24 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn resolve_default_branch_precedence() {
+        let mut config = ProjectSettingsFile::default();
+        // Nothing configured: hard fallback.
+        assert_eq!(resolve_default_branch(&config, None), "main");
+        // Stored column used when there is no config override.
+        assert_eq!(resolve_default_branch(&config, Some("staging")), "staging");
+        // Config override wins over the stored column.
+        config.default_branch = Some("develop".to_string());
+        assert_eq!(resolve_default_branch(&config, Some("staging")), "develop");
+    }
+
+    #[test]
     fn test_project_settings_defaults() {
         let settings = ProjectSettingsFile::default();
         assert!(settings.setup_commands.is_none());
         assert!(settings.terminal_commands.is_none());
         assert!(settings.default_branch.is_none());
-        assert!(settings.should_seed_worktree_ignored());
+        assert!(settings.populate_config().is_empty());
     }
 
     #[test]
@@ -330,22 +384,44 @@ defaultBranch: main
         );
         assert_eq!(settings.default_branch, Some("main".to_string()));
         assert!(settings.terminal_commands.is_none());
-        assert!(settings.should_seed_worktree_ignored());
+        assert!(settings.populate_config().is_empty());
     }
 
     #[test]
-    fn test_worktree_seed_ignored_can_be_disabled() {
+    fn test_worktree_legacy_seed_ignored_parsed() {
         let yaml = r#"
 worktree:
   seedIgnored: false
 "#;
         let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
 
+        // Legacy field is deserialized as Option<bool>
         assert_eq!(
-            settings.worktree.as_ref().map(|w| w.seed_ignored),
+            settings.worktree.as_ref().and_then(|w| w.seed_ignored),
             Some(false)
         );
-        assert!(!settings.should_seed_worktree_ignored());
+        // But populate_config is still empty (legacy field doesn't populate anything)
+        assert!(settings.populate_config().is_empty());
+    }
+
+    #[test]
+    fn test_worktree_populate_config() {
+        let yaml = r#"
+worktree:
+  populate:
+    copy:
+      - ".env"
+      - ".env.*"
+    symlink:
+      - "target/"
+      - ".cache/"
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let config = settings.populate_config();
+
+        assert!(!config.is_empty());
+        assert_eq!(config.copy, vec![".env", ".env.*"]);
+        assert_eq!(config.symlink, vec!["target/", ".cache/"]);
     }
 
     #[test]
@@ -392,6 +468,39 @@ copyFiles:
     }
 
     #[test]
+    fn test_populate_config_save_and_load_roundtrip() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+
+        let settings = ProjectSettingsFile {
+            worktree: Some(WorktreeSettings {
+                seed_ignored: None,
+                populate: PopulateConfig {
+                    copy: vec![".env".to_string(), ".env.*".to_string()],
+                    symlink: vec!["target/".to_string()],
+                },
+            }),
+            ..Default::default()
+        };
+
+        save_project_settings(project_path, &settings).unwrap();
+
+        let loaded = load_project_settings(project_path);
+        let config = loaded.populate_config();
+        assert_eq!(config.copy, vec![".env", ".env.*"]);
+        assert_eq!(config.symlink, vec!["target/"]);
+
+        // Verify the serialized YAML contains expected structure
+        let config_path = get_project_config_path(project_path);
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("populate"));
+        assert!(raw.contains(".env"));
+        assert!(raw.contains("target/"));
+        // seedIgnored should never appear in new files
+        assert!(!raw.contains("seedIgnored"));
+    }
+
+    #[test]
     fn test_create_default_config() {
         let temp = TempDir::new().unwrap();
         let project_path = temp.path();
@@ -432,9 +541,9 @@ copyFiles:
     }
 
     #[test]
-    fn test_resource_serde_git() {
+    fn test_reference_serde_git() {
         let yaml = r#"
-resources:
+references:
   - name: openpnp
     git: https://github.com/openpnp/openpnp.git
     description: OpenPnP source code
@@ -444,27 +553,27 @@ resources:
     description: Hardware specifications
 "#;
         let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
-        let resources = settings.resources.unwrap();
-        assert_eq!(resources.len(), 2);
+        let references = settings.references.unwrap();
+        assert_eq!(references.len(), 2);
 
-        assert_eq!(resources[0].name, "openpnp");
+        assert_eq!(references[0].name, "openpnp");
         assert_eq!(
-            resources[0].git.as_deref(),
+            references[0].git.as_deref(),
             Some("https://github.com/openpnp/openpnp.git")
         );
-        assert!(resources[0].path.is_none());
-        assert_eq!(resources[0].branch.as_deref(), Some("develop"));
+        assert!(references[0].path.is_none());
+        assert_eq!(references[0].branch.as_deref(), Some("develop"));
 
-        assert_eq!(resources[1].name, "local-specs");
-        assert!(resources[1].git.is_none());
-        assert_eq!(resources[1].path.as_deref(), Some("~/Documents/specs"));
-        assert!(resources[1].branch.is_none());
+        assert_eq!(references[1].name, "local-specs");
+        assert!(references[1].git.is_none());
+        assert_eq!(references[1].path.as_deref(), Some("~/Documents/specs"));
+        assert!(references[1].branch.is_none());
     }
 
     #[test]
-    fn test_resource_roundtrip() {
+    fn test_reference_roundtrip() {
         let settings = ProjectSettingsFile {
-            resources: Some(vec![Resource {
+            references: Some(vec![ProjectReference {
                 name: "docs".to_string(),
                 git: Some("https://github.com/org/docs.git".to_string()),
                 path: None,
@@ -476,23 +585,34 @@ resources:
 
         let yaml = serde_yaml::to_string(&settings).unwrap();
         let parsed: ProjectSettingsFile = serde_yaml::from_str(&yaml).unwrap();
-        let resources = parsed.resources.unwrap();
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].name, "docs");
+        let references = parsed.references.unwrap();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].name, "docs");
         assert_eq!(
-            resources[0].git.as_deref(),
+            references[0].git.as_deref(),
             Some("https://github.com/org/docs.git")
         );
     }
 
     #[test]
-    fn test_settings_without_resources() {
+    fn test_settings_without_references() {
         let yaml = r#"
 setupCommands:
   - npm install
 "#;
         let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
-        assert!(settings.resources.is_none());
+        assert!(settings.references.is_none());
+    }
+
+    #[test]
+    fn test_resources_key_is_not_accepted_as_references() {
+        let yaml = r#"
+resources:
+  - name: docs
+    git: https://github.com/org/docs.git
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        assert!(settings.references.is_none());
     }
 
     #[test]
@@ -545,12 +665,12 @@ defaultBranch: main
 setupCommands:
   - npm install
 activeBackend: codex
-defaultTier: lg
 backends:
   codex:
     lg:
-      model: gpt-5.4
-      reasoningEffort: high
+      model: gpt-5.5
+      options:
+        reasoningEffort: high
 "#;
         let config_path = get_project_config_path(project_path);
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
@@ -560,11 +680,10 @@ backends:
 
         // Preset fields must survive the legacy parse path
         assert_eq!(loaded.active_backend.as_deref(), Some("codex"));
-        assert_eq!(loaded.default_tier.as_deref(), Some("lg"));
         assert!(loaded.backends.is_some());
         let backends = loaded.backends.unwrap();
         assert!(backends.contains_key("codex"));
-        assert_eq!(backends["codex"]["lg"].model.as_str(), "gpt-5.4");
+        assert_eq!(backends["codex"]["lg"].model.as_str(), "gpt-5.5");
     }
 
     #[test]
@@ -581,7 +700,6 @@ setupCommands:
 worktree:
   seedIgnored: false
 activeBackend: codex
-defaultTier: sm
 "#;
         let config_path = get_project_config_path(project_path);
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
@@ -592,14 +710,95 @@ defaultTier: sm
 
         // Preset fields must survive the migration rewrite
         assert_eq!(loaded.active_backend.as_deref(), Some("codex"));
-        assert_eq!(loaded.default_tier.as_deref(), Some("sm"));
-        assert!(!loaded.should_seed_worktree_ignored());
+        // Legacy seedIgnored is parsed but results in empty populate config
+        assert!(loaded.populate_config().is_empty());
 
         // Verify rewritten file still has preset fields
         let rewritten = std::fs::read_to_string(&config_path).unwrap();
         assert!(rewritten.contains("activeBackend"));
         assert!(rewritten.contains("codex"));
-        assert!(rewritten.contains("seedIgnored: false"));
+        // seedIgnored is skip_serializing, so it's dropped on migration rewrite
+        assert!(!rewritten.contains("seedIgnored"));
         assert!(!rewritten.contains("ciCommands"));
+    }
+
+    fn init_git_repo(path: &Path) {
+        assert!(crate::env::git()
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn commit_all(repo: &Path, msg: &str) {
+        crate::env::git()
+            .args(["add", "-A"])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        crate::env::git()
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@local.invalid",
+                "commit",
+                "-q",
+                "-m",
+                msg,
+            ])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+    }
+
+    fn git_status(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["status", "--porcelain"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_head_subject(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn legacy_config_migration_commits_in_canonical_repo() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+        init_git_repo(project_path);
+
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "ciCommands:\n  - npm test\nsetupCommands:\n  - npm install\n",
+        )
+        .unwrap();
+        commit_all(project_path, "seed legacy config");
+
+        // Loading migrates the file (drops ciCommands) and commits the rewrite.
+        let loaded = load_project_settings(project_path);
+        assert_eq!(loaded.setup_commands, Some(vec!["npm install".to_string()]));
+
+        let migrated = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!migrated.contains("ciCommands"));
+        assert!(
+            git_status(project_path).is_empty(),
+            "migration left the canonical repo dirty"
+        );
+        assert_eq!(
+            git_head_subject(project_path),
+            "cairn: migrate project config"
+        );
     }
 }

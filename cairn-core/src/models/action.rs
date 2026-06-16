@@ -193,10 +193,10 @@ fn shell_escape(s: &str) -> String {
 }
 
 /// Convert from database model to domain model
-impl TryFrom<crate::diesel_models::DbActionConfig> for ActionConfig {
+impl TryFrom<crate::db_records::DbActionConfig> for ActionConfig {
     type Error = String;
 
-    fn try_from(db: crate::diesel_models::DbActionConfig) -> Result<Self, Self::Error> {
+    fn try_from(db: crate::db_records::DbActionConfig) -> Result<Self, Self::Error> {
         let input_schema = db
             .input_schema
             .as_ref()
@@ -235,6 +235,11 @@ impl TryFrom<crate::diesel_models::DbActionConfig> for ActionConfig {
 pub enum ActionRunStatus {
     Pending,
     Running,
+    /// The action ran but is holding the DAG open pending external resolution
+    /// (e.g. a `pr` node: the PR is open and awaits merge/close). Drives the
+    /// `NeedsApproval` attention the same way a blocked job does, but without
+    /// being a job. Resolves to `Complete` (or `Failed`) when the wait ends.
+    Blocked,
     Complete,
     Failed,
 }
@@ -244,6 +249,7 @@ impl std::fmt::Display for ActionRunStatus {
         match self {
             ActionRunStatus::Pending => write!(f, "pending"),
             ActionRunStatus::Running => write!(f, "running"),
+            ActionRunStatus::Blocked => write!(f, "blocked"),
             ActionRunStatus::Complete => write!(f, "complete"),
             ActionRunStatus::Failed => write!(f, "failed"),
         }
@@ -257,6 +263,7 @@ impl std::str::FromStr for ActionRunStatus {
         match s.to_lowercase().as_str() {
             "pending" => Ok(ActionRunStatus::Pending),
             "running" => Ok(ActionRunStatus::Running),
+            "blocked" => Ok(ActionRunStatus::Blocked),
             "complete" => Ok(ActionRunStatus::Complete),
             "failed" => Ok(ActionRunStatus::Failed),
             _ => Err(format!("Unknown action run status: {}", s)),
@@ -282,13 +289,18 @@ pub struct ActionRun {
     pub completed_at: Option<i64>,
     pub created_at: i64,
     pub parent_job_id: Option<String>,
+    /// Stable URI segment used to address this action node via cairn:// (e.g.
+    /// `pr`). Allocated at insert time, deduped across jobs + action_runs for
+    /// the execution. `None` only for rows that predate the column and could
+    /// not be backfilled.
+    pub uri_segment: Option<String>,
 }
 
 /// Convert from database model to domain model
-impl TryFrom<crate::diesel_models::DbActionRun> for ActionRun {
+impl TryFrom<crate::db_records::DbActionRun> for ActionRun {
     type Error = String;
 
-    fn try_from(db: crate::diesel_models::DbActionRun) -> Result<Self, Self::Error> {
+    fn try_from(db: crate::db_records::DbActionRun) -> Result<Self, Self::Error> {
         let status: ActionRunStatus = db
             .status
             .parse()
@@ -309,6 +321,7 @@ impl TryFrom<crate::diesel_models::DbActionRun> for ActionRun {
             completed_at: db.completed_at.map(|t| t as i64),
             created_at: db.created_at as i64,
             parent_job_id: db.parent_job_id,
+            uri_segment: db.uri_segment,
         })
     }
 }

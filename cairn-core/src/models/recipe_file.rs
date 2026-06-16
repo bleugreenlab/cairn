@@ -120,8 +120,6 @@ pub struct NodeFileConfig {
 
     // Common nested configs
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<CheckpointNodeConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<SchemaConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<SchemaConfig>,
@@ -299,7 +297,6 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
     // Agent config
     if let Some(ac) = &node.agent_config {
         config.agent = ac.agent_config_id.clone();
-        config.checkpoint = ac.checkpoint.clone();
         config.output_schema = ac.output_schema.clone();
         // Export worktree_mode if non-default
         if let Some(ref gc) = ac.git_config {
@@ -320,12 +317,9 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
             config.action_params = Some(ac.action_params.clone());
         }
         config.input_schema = ac.input_schema.clone();
-        // For action nodes, output_schema and checkpoint come from action_config
+        // For action nodes, output_schema comes from action_config
         if config.output_schema.is_none() {
             config.output_schema = ac.output_schema.clone();
-        }
-        if config.checkpoint.is_none() {
-            config.checkpoint = ac.checkpoint.clone();
         }
         has_config = true;
     }
@@ -525,13 +519,11 @@ impl RecipeFile {
                         if edge.edge_type != RecipeEdgeType::Control {
                             return false;
                         }
-                        // Check if source is an agent or executor node
+                        // Check if source is an agent node
                         let (source_node, _) = parse_node_handle(&edge.from);
-                        self.nodes.iter().any(|n| {
-                            n.id == source_node
-                                && (n.node_type == RecipeNodeType::Agent
-                                    || n.node_type == RecipeNodeType::Executor)
-                        })
+                        self.nodes
+                            .iter()
+                            .any(|n| n.id == source_node && n.node_type == RecipeNodeType::Agent)
                     });
                     if !has_agent_parent {
                         warnings.push(format!(
@@ -586,7 +578,6 @@ impl RecipeFileNode {
         });
 
         let agent_config = if config.agent.is_some()
-            || config.checkpoint.is_some()
             || config.output_schema.is_some()
             || config.worktree_mode.is_some()
         {
@@ -598,7 +589,6 @@ impl RecipeFileNode {
                 });
                 Some(AgentNodeConfig {
                     agent_config_id: config.agent,
-                    checkpoint: config.checkpoint.clone(),
                     output_schema: config.output_schema.clone(),
                     git_config,
                 })
@@ -609,7 +599,10 @@ impl RecipeFileNode {
             None
         };
 
-        let action_config = if config.action.is_some() || config.action_config_id.is_some() {
+        let action_config = if config.action.is_some()
+            || config.action_config_id.is_some()
+            || (self.node_type == RecipeNodeType::Pr && config.input_schema.is_some())
+        {
             Some(ActionNodeConfig {
                 action_config_id: config.action_config_id,
                 action: config.action.unwrap_or_default(),
@@ -619,11 +612,6 @@ impl RecipeFileNode {
                 input_schema: config.input_schema,
                 output_schema: if self.node_type == RecipeNodeType::Action {
                     config.output_schema
-                } else {
-                    None
-                },
-                checkpoint: if self.node_type == RecipeNodeType::Action {
-                    config.checkpoint
                 } else {
                     None
                 },
@@ -824,7 +812,6 @@ mod tests {
                     trigger_config: None,
                     agent_config: Some(AgentNodeConfig {
                         agent_config_id: Some("plan".to_string()),
-                        checkpoint: None,
                         output_schema: None,
                         git_config: None,
                     }),
@@ -1330,5 +1317,157 @@ edges: []
         }));
         let result = file.validate();
         assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn bundled_recipes_parse_and_validate() {
+        // The bundled recipes drive the confirm-gated artifact workflow; they must
+        // parse and validate after the checkpoint -> confirm_policy cutover.
+        let recipes: &[(&str, &str)] = &[
+            (
+                "planbuild",
+                include_str!("../../../../recipes/planbuild.yaml"),
+            ),
+            ("build", include_str!("../../../../recipes/build.yaml")),
+            (
+                "task-list",
+                include_str!("../../../../recipes/task-list.yaml"),
+            ),
+            ("setup", include_str!("../../../../recipes/setup.yaml")),
+        ];
+        for (name, yaml) in recipes {
+            let parsed = RecipeFile::from_yaml(yaml)
+                .unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
+            let validation = parsed.validate();
+            assert!(
+                validation.valid,
+                "{name} failed validation: {:?}",
+                validation.errors
+            );
+        }
+    }
+
+    #[test]
+    fn checkpoint_command_chain_parses_and_validates() {
+        // A command-checkpoint gate between an agent and a PR node: the
+        // checkpoint runs a command, exit 0 continues, non-zero blocks (and now
+        // wakes the agent). No bundled recipe exercises a checkpoint node, so
+        // this guards the recipe-file loading path for one.
+        let yaml = r#"
+cairnVersion: 1
+name: Checkpoint Chain
+description: agent -> command checkpoint -> pr
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+    scope: issue
+- id: builder-1
+  type: agent
+  name: Builder
+  position: 0@100
+  config:
+    agent: quickbuild
+- id: ci-1
+  type: checkpoint
+  name: CI
+  position: 0@200
+  config:
+    checkpointConfig:
+      command: bun run ci
+- id: pr-1
+  type: pr
+  name: PR
+  position: 0@300
+  config:
+    inputSchema:
+      name: create-pr
+      confirmPolicy: auto
+      schema:
+        type: object
+        required: [title, body]
+        properties:
+          title: { type: string }
+          body: { type: string }
+edges:
+- from: trigger-1@control-out
+  to: builder-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: builder-1@context-in
+  type: context
+- from: builder-1@control-out
+  to: ci-1@control-in
+  type: control
+- from: ci-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: builder-1@context-out
+  to: pr-1@context-in
+  type: context
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).expect("checkpoint chain parses");
+        let ci = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "ci-1")
+            .expect("ci-1 node");
+        assert_eq!(ci.node_type, crate::models::RecipeNodeType::Checkpoint);
+        assert_eq!(
+            ci.config
+                .as_ref()
+                .and_then(|c| c.checkpoint_config.as_ref())
+                .and_then(|cc| cc.command.as_deref()),
+            Some("bun run ci")
+        );
+        let validation = parsed.validate();
+        assert!(
+            validation.valid,
+            "checkpoint chain failed validation: {:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn task_list_uses_executor_agent_node() {
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../../recipes/task-list.yaml")).unwrap();
+        let executor = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "executor-1")
+            .expect("executor-1 node");
+
+        assert_eq!(executor.node_type, crate::models::RecipeNodeType::Agent);
+        assert_eq!(
+            executor
+                .config
+                .as_ref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("executor")
+        );
+        assert!(parsed.nodes.iter().all(|node| node.id != "executor"));
+    }
+
+    #[test]
+    fn planbuild_planner_uses_user_confirm_policy() {
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../../recipes/planbuild.yaml")).unwrap();
+        let planner = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "planner-1")
+            .expect("planner-1 node");
+        let schema = planner
+            .config
+            .as_ref()
+            .and_then(|c| c.output_schema.as_ref())
+            .expect("planner output schema");
+        assert_eq!(schema.name, "plan");
+        assert_eq!(schema.confirm_policy, crate::models::ConfirmPolicy::User);
     }
 }

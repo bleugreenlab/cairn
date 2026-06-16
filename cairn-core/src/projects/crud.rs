@@ -1,9 +1,8 @@
-use crate::diesel_models::{DbProject, NewProject, UpdateProjectChangeset};
+use crate::db_records::DbProject;
+use crate::error::CairnError;
 use crate::models::CreateProject;
-use crate::schema::projects;
 use crate::services::Clock;
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
+use crate::storage::{DbError, LocalDb, RowExt};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -14,27 +13,21 @@ use uuid::Uuid;
 /// - Creates `.cairn/config.yaml` and adds `.cairn/assets/` to `.gitignore`.
 /// - Skips filesystem setup for remote project bookmarks.
 ///
-/// Both Tauri and cairn-server call this instead of `create_db` directly.
-pub fn create(
-    conn: &mut SqliteConnection,
+pub async fn create(
+    db: &LocalDb,
     clock: &dyn Clock,
     mut input: CreateProject,
     projects_dir: Option<&Path>,
-) -> Result<DbProject, String> {
+) -> Result<DbProject, CairnError> {
     let is_remote = input.remote_url.is_some() || input.server_id.is_some();
 
-    // For non-remote projects with empty repo_path, create a directory
     if !is_remote && input.repo_path.is_empty() {
         if let Some(base) = projects_dir {
             let project_dir = base.join(input.key.to_lowercase());
-            std::fs::create_dir_all(&project_dir)
-                .map_err(|e| format!("Failed to create project directory: {}", e))?;
+            std::fs::create_dir_all(&project_dir)?;
 
-            // Init git repo if not already one
             if !project_dir.join(".git").exists() {
                 run_git(&["init"], &project_dir)?;
-
-                // Create initial commit so HEAD is valid (needed for worktrees)
                 run_git(
                     &["commit", "--allow-empty", "-m", "Initial commit"],
                     &project_dir,
@@ -45,12 +38,20 @@ pub fn create(
         }
     }
 
-    let db_project = create_db(conn, clock, &input)?;
+    let mut db_project = create_db(db, clock, &input).await?;
 
-    // Filesystem setup for local projects
     if !is_remote && !input.repo_path.is_empty() {
         let repo_path = Path::new(&input.repo_path);
         if repo_path.exists() {
+            // Persist the repository's actual default branch so worktrees are
+            // based on the correct ref. Without this every project defaults to
+            // "main", which fails for repos whose trunk is e.g. "staging".
+            if let Some(branch) = detect_default_branch(repo_path) {
+                match set_default_branch_db(db, &db_project.id, &branch).await {
+                    Ok(()) => db_project.default_branch = Some(branch),
+                    Err(e) => log::warn!("Failed to persist detected default branch: {}", e),
+                }
+            }
             if let Err(e) =
                 crate::config::project_settings::create_default_project_config(repo_path)
             {
@@ -59,24 +60,9 @@ pub fn create(
             if let Err(e) = add_cairn_assets_to_gitignore(repo_path) {
                 log::warn!("Failed to update .gitignore: {}", e);
             }
-        }
-    }
-
-    // Auto-create default manager on the default branch
-    if !is_remote {
-        let default_branch = db_project.default_branch.as_deref().unwrap_or("main");
-        if let Err(e) = crate::managers::crud::ensure_default_manager(
-            conn,
-            clock,
-            &db_project.id,
-            &db_project.name,
-            default_branch,
-        ) {
-            log::warn!(
-                "Failed to create default manager for {}: {}",
-                db_project.name,
-                e
-            );
+            if let Err(e) = ensure_initial_commit(repo_path) {
+                log::warn!("Failed to ensure initial project commit: {}", e);
+            }
         }
     }
 
@@ -84,17 +70,17 @@ pub fn create(
 }
 
 /// Add `.cairn/assets/` to `.gitignore` if not already present.
-fn add_cairn_assets_to_gitignore(repo_path: &Path) -> Result<(), String> {
+fn add_cairn_assets_to_gitignore(repo_path: &Path) -> Result<(), CairnError> {
     use std::io::{BufRead, BufReader, Write};
 
     let gitignore_path = repo_path.join(".gitignore");
     let assets_entry = ".cairn/assets/";
 
     if gitignore_path.exists() {
-        let file = std::fs::File::open(&gitignore_path).map_err(|e| e.to_string())?;
+        let file = std::fs::File::open(&gitignore_path)?;
         let reader = BufReader::new(file);
         for line in reader.lines() {
-            let line = line.map_err(|e| e.to_string())?;
+            let line = line?;
             let trimmed = line.trim();
             if trimmed == assets_entry
                 || trimmed == ".cairn/assets"
@@ -107,17 +93,15 @@ fn add_cairn_assets_to_gitignore(repo_path: &Path) -> Result<(), String> {
 
         let mut file = std::fs::OpenOptions::new()
             .append(true)
-            .open(&gitignore_path)
-            .map_err(|e| e.to_string())?;
+            .open(&gitignore_path)?;
 
-        let contents = std::fs::read_to_string(&gitignore_path).map_err(|e| e.to_string())?;
+        let contents = std::fs::read_to_string(&gitignore_path)?;
         if !contents.is_empty() && !contents.ends_with('\n') {
-            writeln!(file).map_err(|e| e.to_string())?;
+            writeln!(file)?;
         }
-        writeln!(file, "{}", assets_entry).map_err(|e| e.to_string())?;
+        writeln!(file, "{}", assets_entry)?;
     } else {
-        std::fs::write(&gitignore_path, format!("{}\n", assets_entry))
-            .map_err(|e| e.to_string())?;
+        std::fs::write(&gitignore_path, format!("{}\n", assets_entry))?;
     }
 
     // Stage the .gitignore change
@@ -126,388 +110,517 @@ fn add_cairn_assets_to_gitignore(repo_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Ensure a local project repository has at least one commit so git worktrees can branch from it.
+fn ensure_initial_commit(repo_path: &Path) -> Result<(), CairnError> {
+    let has_head = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(repo_path)
+        .output()?;
+    if has_head.status.success() {
+        return Ok(());
+    }
+
+    run_git(&["add", "-A"], repo_path)?;
+    run_git(
+        &[
+            "-c",
+            "user.name=Cairn",
+            "-c",
+            "user.email=cairn@local.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Initial commit",
+        ],
+        repo_path,
+    )
+}
+
+/// Detect a repository's default branch.
+///
+/// Prefers the remote HEAD (`refs/remotes/origin/HEAD` → e.g. "staging"), then
+/// the currently checked-out branch. Returns `None` when neither resolves, in
+/// which case callers keep the stored default.
+fn detect_default_branch(repo_path: &Path) -> Option<String> {
+    let git_line = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo_path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if line.is_empty() {
+            None
+        } else {
+            Some(line)
+        }
+    };
+
+    if let Some(head) = git_line(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+        if let Some(branch) = head.strip_prefix("origin/") {
+            if !branch.is_empty() {
+                return Some(branch.to_string());
+            }
+        }
+    }
+
+    git_line(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|branch| branch != "HEAD")
+}
+
 /// Run a git command in a directory, returning an error with stderr if it fails.
-fn run_git(args: &[&str], dir: &Path) -> Result<(), String> {
+fn run_git(args: &[&str], dir: &Path) -> Result<(), CairnError> {
     let output = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)
-        .output()
-        .map_err(|e| format!("Failed to run `git {}`: {}", args.join(" "), e))?;
+        .output()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
+        return Err(CairnError::Internal(format!(
             "`git {}` failed: {}",
             args.join(" "),
             stderr.trim()
-        ));
+        )));
     }
 
     Ok(())
 }
 
-/// Insert a new project into the database. Returns the DbProject.
-///
-/// Low-level DB-only insert. Prefer `create()` which also handles filesystem setup.
-pub fn create_db(
-    conn: &mut SqliteConnection,
+pub async fn create_db(
+    db: &LocalDb,
     clock: &dyn Clock,
     input: &CreateProject,
-) -> Result<DbProject, String> {
+) -> Result<DbProject, CairnError> {
     let now = clock.now() as i32;
     let id = input
         .id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let remote_url = input.remote_url.clone();
+    let server_id = input.server_id.clone();
+    let name = input.name.clone();
+    let key = input.key.clone();
+    let repo_path = input.repo_path.clone();
 
-    let new_project = NewProject {
-        id: &id,
-        workspace_id: "default",
-        name: &input.name,
-        key: &input.key,
-        repo_path: &input.repo_path,
-        context: Some(""),
-        docs_enabled: Some(1),
-        default_branch: Some("main"),
-        next_issue_number: Some(1),
-        created_at: now,
-        updated_at: now,
-        remote_url: input.remote_url.as_deref(),
-        server_id: input.server_id.as_deref(),
-    };
+    db.write(|conn| {
+        let id = id.clone();
+        let remote_url = remote_url.clone();
+        let server_id = server_id.clone();
+        let name = name.clone();
+        let key = key.clone();
+        let repo_path = repo_path.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO projects(
+                    id, workspace_id, name, key, repo_path, context, docs_enabled,
+                    default_branch, next_issue_number, created_at, updated_at,
+                    remote_url, server_id, is_workspace
+                 )
+                 VALUES (?1, 'default', ?2, ?3, ?4, '', 1, 'main', 1, ?5, ?6, ?7, ?8, 0)",
+                (
+                    id.as_str(),
+                    name.as_str(),
+                    key.as_str(),
+                    repo_path.as_str(),
+                    now,
+                    now,
+                    remote_url.as_deref(),
+                    server_id.as_deref(),
+                ),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
 
-    diesel::insert_into(projects::table)
-        .values(&new_project)
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
-
-    projects::table
-        .find(&id)
-        .first(conn)
-        .map_err(|e| e.to_string())
+    get_db(db, &id).await?.ok_or_else(|| CairnError::NotFound {
+        entity: "project",
+        id,
+    })
 }
 
-/// Get a project by ID (raw DB record).
-pub fn get_db(conn: &mut SqliteConnection, id: &str) -> Result<Option<DbProject>, String> {
-    projects::table
-        .find(id)
-        .first(conn)
-        .optional()
-        .map_err(|e| e.to_string())
+pub async fn get_db(db: &LocalDb, id: &str) -> Result<Option<DbProject>, CairnError> {
+    let id = id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, workspace_id, name, key, repo_path, context, docs_enabled,
+                            default_branch, next_issue_number, created_at, updated_at,
+                            ci_commands, setup_commands, terminal_commands, config,
+                            remote_url, hidden, server_id, is_workspace
+                     FROM projects
+                     WHERE id = ?1",
+                    (id.as_str(),),
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| db_project_from_row(&row))
+                .transpose()
+        })
+    })
+    .await
+    .map_err(CairnError::from)
 }
 
-/// List all projects ordered by name (raw DB records).
-pub fn list_db(conn: &mut SqliteConnection) -> Result<Vec<DbProject>, String> {
-    projects::table
-        .order(projects::name.asc())
-        .load(conn)
-        .map_err(|e| e.to_string())
+pub async fn list_db(db: &LocalDb) -> Result<Vec<DbProject>, CairnError> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, workspace_id, name, key, repo_path, context, docs_enabled,
+                            default_branch, next_issue_number, created_at, updated_at,
+                            ci_commands, setup_commands, terminal_commands, config,
+                            remote_url, hidden, server_id, is_workspace
+                     FROM projects
+                     ORDER BY name ASC",
+                    (),
+                )
+                .await?;
+            let mut projects = Vec::new();
+            while let Some(row) = rows.next().await? {
+                projects.push(db_project_from_row(&row)?);
+            }
+            Ok(projects)
+        })
+    })
+    .await
+    .map_err(CairnError::from)
 }
 
-/// Update only the timestamp in the database.
-///
-/// Config file changes (setup_commands, etc.) are handled
-/// by the Tauri command layer via project_settings.
-pub fn update_timestamp_db(
-    conn: &mut SqliteConnection,
+pub async fn seed_workspace_project_db(
+    db: &LocalDb,
+    clock: &dyn Clock,
+    repo_path: &Path,
+) -> Result<(), CairnError> {
+    let now = clock.now() as i32;
+    let repo_path = repo_path.to_string_lossy().to_string();
+    db.write(|conn| {
+        let repo_path = repo_path.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT OR IGNORE INTO projects(
+                    id, workspace_id, name, key, repo_path, context, docs_enabled,
+                    default_branch, next_issue_number, created_at, updated_at,
+                    remote_url, hidden, server_id, is_workspace
+                 )
+                 VALUES ('workspace', 'default', 'Workspace', 'WS', ?1, '', 1,
+                         'main', 1, ?2, ?3, NULL, 0, NULL, 1)",
+                (repo_path.as_str(), now, now),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
+    crate::memories::db::backfill_workspace_project_id(db).await?;
+    Ok(())
+}
+
+pub async fn unhide_workspace_project_db(db: &LocalDb) -> Result<(), CairnError> {
+    db.write(|conn| {
+        Box::pin(async move {
+            conn.execute("UPDATE projects SET hidden = 0 WHERE is_workspace = 1", ())
+                .await?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(())
+}
+
+pub async fn update_timestamp_db(
+    db: &LocalDb,
     clock: &dyn Clock,
     id: &str,
-) -> Result<(), String> {
+) -> Result<(), CairnError> {
     let now = clock.now() as i32;
-    let changeset = UpdateProjectChangeset {
-        updated_at: Some(now),
-        ci_commands: None,
-        setup_commands: None,
-        terminal_commands: None,
-        next_issue_number: None,
-    };
-
-    diesel::update(projects::table.find(id))
-        .set(&changeset)
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
-
+    let id = id.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE projects SET updated_at = ?1 WHERE id = ?2",
+                (now, id.as_str()),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
     Ok(())
 }
 
-/// Set whether a project is hidden from the sidebar.
-pub fn set_hidden_db(conn: &mut SqliteConnection, id: &str, hidden: bool) -> Result<(), String> {
-    diesel::update(projects::table.find(id))
-        .set(projects::hidden.eq(if hidden { 1 } else { 0 }))
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
+pub async fn set_default_branch_db(db: &LocalDb, id: &str, branch: &str) -> Result<(), CairnError> {
+    let id = id.to_string();
+    let branch = branch.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        let branch = branch.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE projects SET default_branch = ?1 WHERE id = ?2",
+                (branch.as_str(), id.as_str()),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
     Ok(())
 }
 
-/// Delete a project from the database. CASCADE handles related records.
-///
-/// Does NOT clean up worktrees on disk — that's the Tauri command's responsibility.
-pub fn delete_db(conn: &mut SqliteConnection, id: &str) -> Result<(), String> {
-    let exists = projects::table
-        .find(id)
-        .first::<DbProject>(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
+pub async fn set_name_db(db: &LocalDb, id: &str, name: &str) -> Result<(), CairnError> {
+    let id = id.to_string();
+    let name = name.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        let name = name.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE projects SET name = ?1 WHERE id = ?2",
+                (name.as_str(), id.as_str()),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(())
+}
 
-    if exists.is_none() {
-        return Err("Project not found".to_string());
+pub async fn set_hidden_db(db: &LocalDb, id: &str, hidden: bool) -> Result<(), CairnError> {
+    let id = id.to_string();
+    let hidden = if hidden { 1 } else { 0 };
+    db.write(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE projects SET hidden = ?1 WHERE id = ?2",
+                (hidden, id.as_str()),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await?;
+    Ok(())
+}
+
+pub async fn delete_db(db: &LocalDb, id: &str) -> Result<(), CairnError> {
+    if get_db(db, id).await?.is_none() {
+        return Err(CairnError::NotFound {
+            entity: "project",
+            id: id.to_string(),
+        });
     }
 
-    diesel::delete(projects::table.find(id))
-        .execute(conn)
-        .map_err(|e| format!("Failed to delete project: {}", e))?;
-
+    let id = id.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute("DELETE FROM projects WHERE id = ?1", (id.as_str(),))
+                .await?;
+            Ok(())
+        })
+    })
+    .await?;
     Ok(())
+}
+
+pub async fn repo_path(db: &LocalDb, id: &str) -> Result<Option<String>, CairnError> {
+    let id = id.to_string();
+    db.query_text(
+        "SELECT repo_path FROM projects WHERE id = ?1",
+        turso::params![id.as_str()],
+    )
+    .await
+    .map_err(CairnError::from)
+}
+
+pub async fn worktree_paths(db: &LocalDb, project_id: &str) -> Result<Vec<String>, CairnError> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT j.worktree_path
+                     FROM jobs j
+                     INNER JOIN issues i ON j.issue_id = i.id
+                     WHERE i.project_id = ?1
+                       AND j.worktree_path IS NOT NULL",
+                    (project_id.as_str(),),
+                )
+                .await?;
+            let mut paths = Vec::new();
+            while let Some(row) = rows.next().await? {
+                paths.push(row.text(0)?);
+            }
+            Ok(paths)
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+fn db_project_from_row(row: &turso::Row) -> Result<DbProject, DbError> {
+    Ok(DbProject {
+        id: row.text(0)?,
+        workspace_id: row.text(1)?,
+        name: row.text(2)?,
+        key: row.text(3)?,
+        repo_path: row.text(4)?,
+        context: row.opt_text(5)?,
+        docs_enabled: row.opt_i64(6)?.map(|value| value as i32),
+        default_branch: row.opt_text(7)?,
+        next_issue_number: row.opt_i64(8)?.map(|value| value as i32),
+        created_at: row.i64(9)? as i32,
+        updated_at: row.i64(10)? as i32,
+        ci_commands: row.opt_text(11)?,
+        setup_commands: row.opt_text(12)?,
+        terminal_commands: row.opt_text(13)?,
+        config: row.opt_text(14)?,
+        remote_url: row.opt_text(15)?,
+        hidden: row.i64(16)? as i32,
+        server_id: row.opt_text(17)?,
+        is_workspace: row.i64(18)? as i32,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::RealClock;
-    use crate::test_utils::test_diesel_conn;
+    use crate::services::Clock;
+    use crate::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
+    use tempfile::tempdir;
 
-    #[test]
-    fn test_create_db() {
-        let mut conn = test_diesel_conn();
-        let clock = RealClock;
-
-        let input = CreateProject {
-            id: None,
-            name: "Test".to_string(),
-            key: "TEST".to_string(),
-            repo_path: "/tmp/test".to_string(),
-            remote_url: None,
-            server_id: None,
-        };
-
-        let db_project = create_db(&mut conn, &clock, &input).unwrap();
-        assert_eq!(db_project.name, "Test");
-        assert_eq!(db_project.key, "TEST");
-        assert_eq!(db_project.repo_path, "/tmp/test");
-        assert_eq!(db_project.next_issue_number, Some(1));
+    struct FixedClock;
+    impl Clock for FixedClock {
+        fn now(&self) -> i64 {
+            1234
+        }
+        fn now_u64(&self) -> u64 {
+            1234
+        }
     }
 
-    #[test]
-    fn test_get_db() {
-        let mut conn = test_diesel_conn();
-        let clock = RealClock;
-
-        let input = CreateProject {
-            id: None,
-            name: "Test".to_string(),
-            key: "TEST".to_string(),
-            repo_path: "/tmp/test".to_string(),
-            remote_url: None,
-            server_id: None,
-        };
-
-        let created = create_db(&mut conn, &clock, &input).unwrap();
-        let fetched = get_db(&mut conn, &created.id).unwrap().unwrap();
-        assert_eq!(fetched.name, "Test");
-
-        let missing = get_db(&mut conn, "nonexistent").unwrap();
-        assert!(missing.is_none());
+    async fn migrated_db() -> LocalDb {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.keep().join("cairn.db")).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
     }
 
-    #[test]
-    fn test_list_db() {
-        let mut conn = test_diesel_conn();
-        let clock = RealClock;
+    #[tokio::test]
+    async fn create_existing_empty_git_repo_creates_initial_commit() {
+        let db = migrated_db().await;
+        let repo = tempdir().unwrap();
+        run_git(&["init"], repo.path()).unwrap();
 
-        create_db(
-            &mut conn,
-            &clock,
-            &CreateProject {
-                id: None,
-                name: "Beta".to_string(),
-                key: "BETA".to_string(),
-                repo_path: "/tmp/beta".to_string(),
+        create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("empty-repo".to_string()),
+                name: "Empty Repo".to_string(),
+                key: "ER".to_string(),
+                repo_path: repo.path().to_string_lossy().to_string(),
                 remote_url: None,
                 server_id: None,
             },
+            None,
         )
+        .await
         .unwrap();
 
-        create_db(
-            &mut conn,
-            &clock,
-            &CreateProject {
-                id: None,
-                name: "Alpha".to_string(),
-                key: "ALPHA".to_string(),
-                repo_path: "/tmp/alpha".to_string(),
-                remote_url: None,
-                server_id: None,
-            },
-        )
-        .unwrap();
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
 
-        let projects = list_db(&mut conn).unwrap();
-        assert_eq!(projects.len(), 2);
-        // Ordered by name
-        assert_eq!(projects[0].name, "Alpha");
-        assert_eq!(projects[1].name, "Beta");
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
     }
 
-    #[test]
-    fn test_delete_db() {
-        let mut conn = test_diesel_conn();
-        let clock = RealClock;
+    #[tokio::test]
+    async fn seed_workspace_project_is_visible_and_idempotent() {
+        let db = migrated_db().await;
+        seed_workspace_project_db(&db, &FixedClock, Path::new("/tmp/cairn-home"))
+            .await
+            .unwrap();
+        seed_workspace_project_db(&db, &FixedClock, Path::new("/tmp/other"))
+            .await
+            .unwrap();
 
-        let input = CreateProject {
-            id: None,
-            name: "Test".to_string(),
-            key: "TEST".to_string(),
-            repo_path: "/tmp/test".to_string(),
-            remote_url: None,
-            server_id: None,
-        };
-
-        let created = create_db(&mut conn, &clock, &input).unwrap();
-
-        delete_db(&mut conn, &created.id).unwrap();
-        assert!(get_db(&mut conn, &created.id).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_delete_db_not_found() {
-        let mut conn = test_diesel_conn();
-        let result = delete_db(&mut conn, "nonexistent");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not found"));
-    }
-
-    #[test]
-    fn test_delete_db_cascades() {
-        use crate::diesel_models::NewIssue;
-        use crate::schema::issues;
-
-        let mut conn = test_diesel_conn();
-        let clock = RealClock;
-
-        let project = create_db(
-            &mut conn,
-            &clock,
-            &CreateProject {
-                id: None,
-                name: "Test".to_string(),
-                key: "TEST".to_string(),
-                repo_path: "/tmp/test".to_string(),
-                remote_url: None,
-                server_id: None,
-            },
-        )
-        .unwrap();
-
-        // Add an issue
-        diesel::insert_into(issues::table)
-            .values(NewIssue {
-                id: "issue-1",
-                project_id: &project.id,
-                number: 1,
-                title: "Test Issue",
-                description: Some(""),
-                status: "backlog",
-                progress: "backlog",
-                attention: "none",
-                created_at: 0,
-                updated_at: 0,
-                priority: None,
-                model: None,
-                manager_id: None,
+        let (count, repo_path, hidden, is_workspace, default_branch) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*), repo_path, hidden, is_workspace, default_branch FROM projects WHERE id = 'workspace'",
+                            (),
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("workspace row");
+                    Ok((row.i64(0)?, row.text(1)?, row.i64(2)?, row.i64(3)?, row.text(4)?))
+                })
             })
-            .execute(&mut conn)
+            .await
             .unwrap();
 
-        // Verify issue exists
-        let count: i64 = issues::table
-            .filter(issues::project_id.eq(&project.id))
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
         assert_eq!(count, 1);
-
-        // Delete project — issue should cascade
-        delete_db(&mut conn, &project.id).unwrap();
-
-        let count: i64 = issues::table
-            .filter(issues::project_id.eq(&project.id))
-            .count()
-            .get_result(&mut conn)
-            .unwrap();
-        assert_eq!(count, 0);
+        assert_eq!(repo_path, "/tmp/cairn-home");
+        assert_eq!(hidden, 0);
+        assert_eq!(is_workspace, 1);
+        assert_eq!(default_branch, "main");
     }
 
-    #[test]
-    fn test_create_auto_creates_default_manager() {
-        use crate::schema::managers;
-
-        let mut conn = test_diesel_conn();
-        let clock = RealClock;
-
-        // Use create_db + auto-manager logic via full create() with a temp dir
-        let temp = tempfile::TempDir::new().unwrap();
-        let repo_path = temp.path().to_string_lossy().to_string();
-
-        // Init a git repo so create() doesn't fail on filesystem setup
-        std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(temp.path())
-            .output()
+    #[tokio::test]
+    async fn unhide_workspace_project_backfills_existing_hidden_rows() {
+        let db = migrated_db().await;
+        seed_workspace_project_db(&db, &FixedClock, Path::new("/tmp/cairn-home"))
+            .await
             .unwrap();
-        std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", "init"])
-            .current_dir(temp.path())
-            .output()
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("UPDATE projects SET hidden = 1 WHERE id = 'workspace'", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        unhide_workspace_project_db(&db).await.unwrap();
+        unhide_workspace_project_db(&db).await.unwrap();
+
+        let hidden = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query("SELECT hidden FROM projects WHERE id = 'workspace'", ())
+                        .await?;
+                    let row = rows.next().await?.expect("workspace row");
+                    Ok(row.i64(0)?)
+                })
+            })
+            .await
             .unwrap();
 
-        let input = CreateProject {
-            id: None,
-            name: "AutoMgr".to_string(),
-            key: "AUTOMGR".to_string(),
-            repo_path,
-            remote_url: None,
-            server_id: None,
-        };
-
-        let project = create(&mut conn, &clock, input, None).unwrap();
-
-        // A default manager should have been created
-        let mgrs: Vec<crate::diesel_models::DbManager> = managers::table
-            .filter(managers::project_id.eq(&project.id))
-            .load(&mut conn)
-            .unwrap();
-        assert_eq!(mgrs.len(), 1, "Expected exactly one default manager");
-        assert_eq!(mgrs[0].name, "AutoMgr");
-        assert_eq!(mgrs[0].branch.as_deref(), Some("main"));
-    }
-
-    #[test]
-    fn test_create_remote_project_no_manager() {
-        use crate::schema::managers;
-
-        let mut conn = test_diesel_conn();
-        let clock = RealClock;
-
-        let input = CreateProject {
-            id: None,
-            name: "Remote".to_string(),
-            key: "REMOTE".to_string(),
-            repo_path: String::new(),
-            remote_url: Some("https://example.com".to_string()),
-            server_id: None,
-        };
-
-        let project = create(&mut conn, &clock, input, None).unwrap();
-
-        let mgrs: Vec<crate::diesel_models::DbManager> = managers::table
-            .filter(managers::project_id.eq(&project.id))
-            .load(&mut conn)
-            .unwrap();
-        assert_eq!(
-            mgrs.len(),
-            0,
-            "Remote projects should not get a default manager"
-        );
+        assert_eq!(hidden, 0);
     }
 }

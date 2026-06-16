@@ -77,4 +77,59 @@ impl ProviderUsageSnapshot {
             raw,
         }
     }
+
+    /// Relative richness of this snapshot for the Backends usage panel.
+    ///
+    /// The manual probe sources carry the canonical 5-hour + weekly windows;
+    /// the live Claude `rate_limit_event` only carries a single coarse status
+    /// window. The store path uses this so a coarse live snapshot never
+    /// downgrades a richer one already on display, keeping the panel's shape
+    /// stable regardless of which source last fired. Errors and unsupported
+    /// results rank lowest so a real snapshot always wins over a failed probe.
+    pub fn panel_rank(&self) -> u8 {
+        if self.error.is_some() || self.unsupported_reason.is_some() {
+            return 0;
+        }
+        match self.source.as_str() {
+            "claude_usage_tui" | "codex_rate_limits" => 2,
+            _ => 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(source: &str) -> ProviderUsageSnapshot {
+        ProviderUsageSnapshot {
+            backend: "claude".to_string(),
+            source: source.to_string(),
+            captured_at: 0,
+            windows: Vec::new(),
+            credits: None,
+            error: None,
+            unsupported_reason: None,
+            raw: None,
+        }
+    }
+
+    #[test]
+    fn panel_rank_prefers_rich_probe_sources_over_coarse_live() {
+        assert_eq!(snapshot("claude_usage_tui").panel_rank(), 2);
+        assert_eq!(snapshot("codex_rate_limits").panel_rank(), 2);
+        assert_eq!(snapshot("claude_rate_limit_event").panel_rank(), 1);
+    }
+
+    #[test]
+    fn panel_rank_zero_for_error_and_unsupported() {
+        assert_eq!(
+            ProviderUsageSnapshot::error("claude", "claude_usage_tui", "boom", None).panel_rank(),
+            0
+        );
+        assert_eq!(
+            ProviderUsageSnapshot::unsupported("claude", "claude_usage_tui", "nope").panel_rank(),
+            0
+        );
+    }
 }

@@ -16,6 +16,8 @@ pub struct Project {
     pub next_issue_number: i32,
     pub setup_commands: Option<String>,
     pub terminal_commands: Option<String>,
+    /// Worktree populate config as JSON (copy/symlink pattern lists).
+    pub worktree_populate: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     /// When set, this project is a remote bookmark pointing to a cairn-server instance.
@@ -24,6 +26,16 @@ pub struct Project {
     pub hidden: bool,
     /// Server this project belongs to (for remote projects).
     pub server_id: Option<String>,
+    /// Whether this project represents the Cairn workspace config root.
+    pub is_workspace: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRemoteStatus {
+    pub has_remote: bool,
+    pub remote_url: Option<String>,
+    pub is_workspace: bool,
 }
 
 /// Terminal shortcut command configuration
@@ -56,4 +68,5 @@ pub struct UpdateProject {
     pub id: String,
     pub setup_commands: Option<Vec<String>>,
     pub terminal_commands: Option<Vec<TerminalCommand>>,
+    pub worktree_populate: Option<crate::config::project_settings::PopulateConfig>,
 }

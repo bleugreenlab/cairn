@@ -3,7 +3,7 @@
 //! This module handles parsing agent markdown files for import/export.
 //! Supports Claude Code-compatible format.
 
-use crate::models::{ApprovalPolicy, FilesystemScope};
+use crate::models::{Fence, LegacyOnEscape, LegacySandbox};
 use serde::{Deserialize, Serialize};
 
 /// Agent frontmatter from markdown files (Claude Code compatible)
@@ -14,20 +14,29 @@ pub struct AgentFrontmatter {
     pub id: Option<String>,
     pub name: String,
     pub description: String,
-    /// Comma-separated list of tools (Claude Code format) or YAML array
-    #[serde(deserialize_with = "deserialize_tools")]
+    /// Comma-separated list of tools (Claude Code format) or YAML array.
+    ///
+    /// Optional. A missing or empty `tools` field means "the default surface":
+    /// the three core verbs (`read`/`write`/`run`) are always ensured at runtime
+    /// via `ensure_core_verbs`, so an empty list is a valid, runnable agent. The
+    /// UI agent form has no tools editor and legitimately writes empty tools, so
+    /// the loader must accept what the form writes rather than reject it.
+    #[serde(default, deserialize_with = "deserialize_tools")]
     pub tools: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(alias = "model")]
     pub tier: Option<String>,
-    /// Legacy field — kept for backward compat when reading old YAML files
+    /// Worktree fence behavior for sandbox escapes.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_policy: Option<ApprovalPolicy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub filesystem_scope: Option<FilesystemScope>,
+    pub fence: Option<Fence>,
+    /// Legacy permission fields accepted on read and collapsed into `fence`.
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    pub sandbox: Option<LegacySandbox>,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    pub on_escape: Option<LegacyOnEscape>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hooks: Option<serde_json::Value>,
     /// Tools to disallow (added to blocked list)
@@ -75,6 +84,15 @@ where
             }
             Ok(tools.join(", "))
         }
+
+        // YAML null (`tools:` with no value) and absent fields resolve to the
+        // empty list — a valid "default surface" agent, not a parse error.
+        fn visit_unit<E>(self) -> Result<String, E>
+        where
+            E: de::Error,
+        {
+            Ok(String::new())
+        }
     }
 
     deserializer.deserialize_any(ToolsVisitor)
@@ -90,8 +108,7 @@ pub struct ParsedAgent {
     pub prompt: String,
     pub tools: Vec<String>,
     pub tier: Option<String>,
-    pub approval_policy: Option<ApprovalPolicy>,
-    pub filesystem_scope: Option<FilesystemScope>,
+    pub fence: Option<Fence>,
     pub hooks: Option<serde_json::Value>,
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
@@ -119,7 +136,7 @@ fn slugify(name: &str) -> String {
 /// description: Description
 /// tools: Read, Grep, Glob
 /// model: sonnet
-/// permissionMode: plan
+/// onEscape: allow
 /// ---
 ///
 /// # Agent prompt content in markdown
@@ -152,21 +169,17 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
     if frontmatter.description.is_empty() {
         return Err("Agent description cannot be empty".to_string());
     }
-    if frontmatter.tools.trim().is_empty() {
-        return Err("Agent must have at least one tool".to_string());
-    }
 
-    // Parse tools from comma-separated string
+    // Parse tools from comma-separated string. An empty list is valid: it means
+    // "the default surface" (the three core verbs are ensured at runtime). The UI
+    // agent form has no tools editor and writes empty tools, so rejecting empty
+    // here is exactly the save/load asymmetry that makes new agents invisible.
     let tools: Vec<String> = frontmatter
         .tools
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-
-    if tools.is_empty() {
-        return Err("Agent must have at least one tool".to_string());
-    }
 
     // Generate ID if not provided
     let (id, id_generated) = if let Some(id) = frontmatter.id {
@@ -178,17 +191,12 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         (slugify(&frontmatter.name), true)
     };
 
-    // Prefer new fields; fall back to legacy permissionMode conversion
-    let (approval_policy, filesystem_scope) =
-        if frontmatter.approval_policy.is_some() || frontmatter.filesystem_scope.is_some() {
-            (frontmatter.approval_policy, frontmatter.filesystem_scope)
-        } else if frontmatter.permission_mode.is_some() {
-            let (a, f) =
-                crate::models::split_legacy_permission_mode(frontmatter.permission_mode.as_deref());
-            (Some(a), Some(f))
-        } else {
-            (None, None)
-        };
+    let fence = frontmatter.fence.or_else(|| {
+        Some(Fence::from_legacy(
+            frontmatter.sandbox,
+            frontmatter.on_escape,
+        ))
+    });
 
     Ok(ParsedAgent {
         id,
@@ -198,8 +206,7 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         prompt,
         tools,
         tier: frontmatter.tier,
-        approval_policy,
-        filesystem_scope,
+        fence,
         hooks: frontmatter.hooks,
         disallowed_tools: frontmatter.disallowed_tools,
         skills: frontmatter.skills,
@@ -216,8 +223,7 @@ pub struct AgentExportData<'a> {
     pub tools: &'a [String],
     pub tier: Option<&'a str>,
     pub prompt: &'a str,
-    pub approval_policy: Option<ApprovalPolicy>,
-    pub filesystem_scope: Option<FilesystemScope>,
+    pub fence: Option<Fence>,
     pub disallowed_tools: Option<&'a [String]>,
     pub skills: Option<&'a [String]>,
     pub hooks: Option<&'a serde_json::Value>,
@@ -233,20 +239,22 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         tools,
         tier,
         prompt,
-        approval_policy,
-        filesystem_scope,
+        fence,
         disallowed_tools,
         skills,
         hooks,
         backend_preference,
     } = data;
 
-    let mut frontmatter = format!(
-        "---\nname: {}\ndescription: {}\ntools: {}\n",
-        name,
-        description,
-        tools.join(", ")
-    );
+    let mut frontmatter = format!("---\nname: {}\ndescription: {}\n", name, description);
+
+    // Only emit a `tools:` line when there are tools. An empty value serializes
+    // to YAML null, which the loader would otherwise have to special-case;
+    // omitting the line keeps the file clean and round-trips through the
+    // optional, defaulted `tools` field.
+    if !tools.is_empty() {
+        frontmatter.push_str(&format!("tools: {}\n", tools.join(", ")));
+    }
 
     if let Some(t) = tier {
         frontmatter.push_str(&format!("tier: {}\n", t));
@@ -256,19 +264,11 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         frontmatter.push_str(&format!("backend: {}\n", b));
     }
 
-    // Write approvalPolicy only when non-default (default is Ask)
-    if let Some(policy) = approval_policy {
-        if policy != ApprovalPolicy::Ask {
-            let val = serde_json::to_string(&policy).unwrap_or_default();
-            frontmatter.push_str(&format!("approvalPolicy: {}\n", val.trim_matches('"')));
-        }
-    }
-
-    // Write filesystemScope only when non-default (default is CwdOnly)
-    if let Some(mode) = filesystem_scope {
-        if mode != FilesystemScope::CwdOnly {
-            let val = serde_json::to_string(&mode).unwrap_or_default();
-            frontmatter.push_str(&format!("filesystemScope: {}\n", val.trim_matches('"')));
+    // Write fence only when non-default (default is Ask)
+    if let Some(f) = fence {
+        if f != Fence::Ask {
+            let val = serde_json::to_string(&f).unwrap_or_default();
+            frontmatter.push_str(&format!("fence: {}\n", val.trim_matches('"')));
         }
     }
 
@@ -320,6 +320,52 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_tools_roundtrips_through_writer_and_loader() {
+        // Mirrors exactly what the Settings agent form writes: no tools (the form
+        // has no tools editor and passes `tools: []`) plus a custom tier. This is
+        // the save/load asymmetry from CAIRN-1656 — the written file must reload.
+        let markdown = agent_to_markdown(AgentExportData {
+            id: "my-agent",
+            name: "My Agent",
+            description: "desc",
+            tools: &[],
+            tier: Some("xl"),
+            prompt: "prompt",
+            fence: None,
+            disallowed_tools: None,
+            skills: None,
+            hooks: None,
+            backend_preference: None,
+        });
+        assert!(
+            !markdown.contains("tools:"),
+            "empty tools should omit the line, got:\n{markdown}"
+        );
+        let parsed = parse_agent_markdown(&markdown).expect("empty-tools agent must reload");
+        assert_eq!(parsed.name, "My Agent");
+        assert!(parsed.tools.is_empty());
+        assert_eq!(parsed.tier.as_deref(), Some("xl"));
+    }
+
+    #[test]
+    fn explicit_null_tools_field_is_accepted() {
+        // Pre-fix files written by the old writer carry a bare `tools:` line,
+        // which YAML parses as null. The loader must recover them, not reject.
+        let content =
+            "---\nname: Legacy\ndescription: legacy agent\ntools: \ntier: xl\n---\n\nprompt";
+        let parsed = parse_agent_markdown(content).expect("null tools must parse");
+        assert_eq!(parsed.name, "Legacy");
+        assert!(parsed.tools.is_empty());
+    }
+
+    #[test]
+    fn missing_tools_field_is_accepted() {
+        let content = "---\nname: NoTools\ndescription: no tools field\n---\n\nprompt";
+        let parsed = parse_agent_markdown(content).expect("missing tools must parse");
+        assert!(parsed.tools.is_empty());
+    }
 
     #[test]
     fn test_parse_claude_code_format() {
@@ -421,8 +467,7 @@ Prompt
             tools: &tools,
             tier: Some("sonnet"),
             prompt: "# Test Prompt\n\nThis is the prompt.",
-            approval_policy: None,
-            filesystem_scope: None,
+            fence: None,
             disallowed_tools: None,
             skills: None,
             hooks: None,
@@ -449,8 +494,7 @@ Prompt
             tools: &tools,
             tier: None,
             prompt: "Plan stuff.",
-            approval_policy: Some(ApprovalPolicy::AcceptAll),
-            filesystem_scope: None,
+            fence: Some(Fence::Allow),
             disallowed_tools: Some(&disallowed),
             skills: Some(&skills),
             hooks: None,
@@ -463,16 +507,17 @@ Prompt
         assert!(markdown.contains("skills:"));
         assert!(markdown.contains("  - api-conventions"));
         assert!(markdown.contains("  - error-handling"));
-        assert!(markdown.contains("approvalPolicy: acceptAll"));
+        assert!(markdown.contains("fence: allow"));
     }
 
     #[test]
-    fn test_permission_mode_parsing() {
+    fn test_legacy_sandbox_on_escape_parsing() {
         let content = r#"---
 name: Editor
 description: Edits code
 tools: Read
-permissionMode: acceptEdits
+sandbox: full
+onEscape: allow
 ---
 
 Prompt
@@ -482,8 +527,26 @@ Prompt
         assert!(result.is_ok());
 
         let agent = result.unwrap();
-        assert_eq!(agent.approval_policy, Some(ApprovalPolicy::AcceptAll));
-        assert_eq!(agent.filesystem_scope, Some(FilesystemScope::CwdOnly));
+        assert_eq!(agent.fence, Some(Fence::Allow));
+    }
+
+    #[test]
+    fn test_legacy_permission_keys_are_ignored() {
+        // Legacy permission frontmatter is no longer honored (migration removed).
+        let content = r#"---
+name: Old
+description: Old agent
+tools: Read
+permissionMode: bypassPermissions
+approvalPolicy: acceptAll
+filesystemScope: fullAccess
+---
+
+Prompt
+"#;
+
+        let agent = parse_agent_markdown(content).unwrap();
+        assert_eq!(agent.fence, Some(Fence::Ask));
     }
 
     #[test]
@@ -587,8 +650,7 @@ Build stuff.
             tools: &agent.tools,
             tier: None,
             prompt: &agent.prompt,
-            approval_policy: None,
-            filesystem_scope: None,
+            fence: None,
             disallowed_tools: None,
             skills: None,
             hooks: agent.hooks.as_ref(),
@@ -622,8 +684,7 @@ Build with Codex.
             tools: &agent.tools,
             tier: None,
             prompt: &agent.prompt,
-            approval_policy: None,
-            filesystem_scope: None,
+            fence: None,
             disallowed_tools: None,
             skills: None,
             hooks: None,
@@ -642,8 +703,7 @@ Build with Codex.
             tools: &["Read".to_string()],
             tier: Some("sonnet"),
             prompt: "Do stuff.",
-            approval_policy: None,
-            filesystem_scope: None,
+            fence: None,
             disallowed_tools: None,
             skills: None,
             hooks: None,

@@ -6,8 +6,10 @@
 
 pub mod auth;
 pub mod diff;
+pub mod gateway;
 pub mod git;
 pub mod handlers;
+pub mod oauth;
 pub mod types;
 pub mod wildcard;
 

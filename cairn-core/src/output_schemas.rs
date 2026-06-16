@@ -3,7 +3,7 @@
 //! Preset schemas are loaded from a configurable directory.
 //! Custom schemas are passed directly as JSON.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn embedded_preset_schema(schema_name: &str) -> Option<&'static str> {
     match schema_name {
@@ -92,21 +92,6 @@ pub fn resolve_output_schema(
         }
         crate::models::OutputSchema::Custom(schema) => Ok(schema.clone()),
     }
-}
-
-/// Write a schema to a temporary file for passing to cairn-mcp via --schema arg
-pub fn write_schema_to_temp_file(schema: &serde_json::Value) -> Result<PathBuf, String> {
-    let temp_dir = std::env::temp_dir();
-    let file_name = format!("cairn-schema-{}.json", uuid::Uuid::new_v4());
-    let temp_path = temp_dir.join(file_name);
-
-    let content = serde_json::to_string_pretty(schema)
-        .map_err(|e| format!("Failed to serialize schema: {}", e))?;
-
-    std::fs::write(&temp_path, content)
-        .map_err(|e| format!("Failed to write schema to temp file: {}", e))?;
-
-    Ok(temp_path)
 }
 
 #[cfg(test)]

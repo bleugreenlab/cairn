@@ -1,227 +1,190 @@
 //! Comment operations.
 
-use crate::diesel_models::{DbComment, NewComment};
+use crate::error::CairnError;
 use crate::models::{Comment, CommentSource, CreateComment};
-use crate::schema::comments;
 use crate::services::Clock;
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use turso::params;
 use uuid::Uuid;
 
-/// Convert DbComment to Comment model.
-pub fn db_comment_to_comment(db: DbComment) -> Comment {
-    Comment {
-        id: db.id,
-        issue_id: db.issue_id,
-        content: db.content,
-        source: db.source.parse().unwrap_or(CommentSource::User),
-        created_at: db.created_at as i64,
-    }
+const COMMENT_COLUMNS: &str = "id, issue_id, content, source, created_at, seq";
+
+fn comment_from_row(row: &turso::Row) -> DbResult<Comment> {
+    Ok(Comment {
+        id: row.text(0)?,
+        issue_id: row.text(1)?,
+        content: row.text(2)?,
+        source: row.text(3)?.parse().unwrap_or(CommentSource::User),
+        created_at: row.i64(4)?,
+        seq: row.i64(5)?,
+    })
 }
 
-/// List all comments for an issue, oldest first.
-pub fn list(conn: &mut SqliteConnection, issue_id: &str) -> Result<Vec<Comment>, String> {
-    let db_comments: Vec<DbComment> = comments::table
-        .filter(comments::issue_id.eq(issue_id))
-        .order(comments::created_at.asc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(db_comments.into_iter().map(db_comment_to_comment).collect())
+/// Next 1-based per-issue comment sequence. Computed inside the caller's write
+/// transaction so the local single-writer DB assigns gap-free, stable seqs.
+pub(crate) async fn next_issue_comment_seq(
+    conn: &turso::Connection,
+    issue_id: &str,
+) -> DbResult<i64> {
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM comments WHERE issue_id = ?1",
+            params![issue_id],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| DbError::Row("comment seq query returned no row".to_string()))?;
+    row.i64(0)
 }
 
-/// Create a new comment.
-pub fn create(
-    conn: &mut SqliteConnection,
+/// Resolve a per-issue comment `seq` to its stable comment id, if present.
+pub async fn id_for_issue_seq(
+    db: &LocalDb,
+    issue_id: &str,
+    seq: i64,
+) -> Result<Option<String>, CairnError> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM comments WHERE issue_id = ?1 AND seq = ?2 LIMIT 1",
+                    params![issue_id.as_str(), seq],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(row.text(0)?)),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+async fn load_conn(conn: &turso::Connection, id: &str) -> DbResult<Comment> {
+    let sql = format!("SELECT {COMMENT_COLUMNS} FROM comments WHERE id = ?1");
+    let mut rows = conn.query(&sql, params![id]).await?;
+    rows.next()
+        .await?
+        .map(|row| comment_from_row(&row))
+        .transpose()?
+        .ok_or_else(|| DbError::Row(format!("comment not found: {id}")))
+}
+
+pub async fn list(db: &LocalDb, issue_id: &str) -> Result<Vec<Comment>, CairnError> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let sql = format!(
+                "SELECT {COMMENT_COLUMNS}
+                 FROM comments
+                 WHERE issue_id = ?1
+                 ORDER BY created_at ASC"
+            );
+            let mut rows = conn.query(&sql, params![issue_id.as_str()]).await?;
+            let mut comments = Vec::new();
+            while let Some(row) = rows.next().await? {
+                comments.push(comment_from_row(&row)?);
+            }
+            Ok(comments)
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+pub async fn create(
+    db: &LocalDb,
     clock: &dyn Clock,
     input: CreateComment,
-) -> Result<Comment, String> {
-    let now = clock.now() as i32;
+) -> Result<Comment, CairnError> {
+    let CreateComment {
+        issue_id,
+        content,
+        source,
+    } = input;
     let id = Uuid::new_v4().to_string();
+    let created_at = clock.now();
+    let source_text = source.to_string();
 
-    let new_comment = NewComment {
-        id: &id,
-        issue_id: &input.issue_id,
-        content: &input.content,
-        source: &input.source.to_string(),
-        created_at: now,
-    };
+    db.write(|conn| {
+        let id = id.clone();
+        let issue_id = issue_id.clone();
+        let content = content.clone();
+        let source = source.clone();
+        let source_text = source_text.clone();
+        Box::pin(async move {
+            let seq = next_issue_comment_seq(conn, &issue_id).await?;
+            conn.execute(
+                "INSERT INTO comments (id, issue_id, content, source, created_at, seq)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id.as_str(),
+                    issue_id.as_str(),
+                    content.as_str(),
+                    source_text.as_str(),
+                    created_at,
+                    seq
+                ],
+            )
+            .await?;
 
-    diesel::insert_into(comments::table)
-        .values(&new_comment)
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
+            Ok(Comment {
+                id,
+                issue_id,
+                content,
+                source,
+                created_at,
+                seq,
+            })
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
 
-    Ok(Comment {
-        id,
-        issue_id: input.issue_id,
-        content: input.content,
-        source: input.source,
-        created_at: now as i64,
+pub async fn update(db: &LocalDb, id: &str, content: &str) -> Result<Comment, CairnError> {
+    let id = id.to_string();
+    let content = content.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        let content = content.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE comments SET content = ?1 WHERE id = ?2",
+                params![content.as_str(), id.as_str()],
+            )
+            .await?;
+            load_conn(conn, &id).await
+        })
+    })
+    .await
+    .map_err(|error| match error {
+        DbError::Row(message) if message.starts_with("comment not found: ") => {
+            CairnError::NotFound {
+                entity: "comment",
+                id,
+            }
+        }
+        error => CairnError::from(error),
     })
 }
 
-/// Update a comment's content. Returns the updated comment.
-pub fn update(conn: &mut SqliteConnection, id: &str, content: &str) -> Result<Comment, String> {
-    let db_comment: DbComment = comments::table
-        .find(id)
-        .first(conn)
-        .map_err(|e| format!("Comment not found: {}", e))?;
-
-    diesel::update(comments::table.find(id))
-        .set(comments::content.eq(content))
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(Comment {
-        id: id.to_string(),
-        issue_id: db_comment.issue_id,
-        content: content.to_string(),
-        source: db_comment.source.parse().unwrap_or(CommentSource::User),
-        created_at: db_comment.created_at as i64,
+pub async fn delete(db: &LocalDb, id: &str) -> Result<(), CairnError> {
+    let id = id.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute("DELETE FROM comments WHERE id = ?1", params![id.as_str()])
+                .await?;
+            Ok(())
+        })
     })
-}
-
-/// Delete a comment.
-pub fn delete(conn: &mut SqliteConnection, id: &str) -> Result<(), String> {
-    diesel::delete(comments::table.find(id))
-        .execute(conn)
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::diesel_models::NewComment;
-    use crate::services::testing::MockClock;
-    use crate::test_utils::{create_test_project, test_diesel_conn};
-
-    fn create_test_issue(conn: &mut SqliteConnection, project_id: &str) -> String {
-        use crate::services::RealClock;
-        crate::issues::crud::create(
-            conn,
-            &RealClock,
-            crate::models::CreateIssue {
-                project_id: project_id.to_string(),
-                title: "Test Issue".to_string(),
-                description: None,
-                backend_override: None,
-                manager_id: None,
-            },
-        )
-        .unwrap()
-        .id
-    }
-
-    #[test]
-    fn test_create_comment_with_clock() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-        let issue_id = create_test_issue(&mut conn, &project_id);
-
-        let mut mock_clock = MockClock::new();
-        mock_clock.expect_now().returning(|| 1700004000);
-
-        let comment = create(
-            &mut conn,
-            &mock_clock,
-            CreateComment {
-                issue_id: issue_id.clone(),
-                content: "Test comment".to_string(),
-                source: CommentSource::User,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(comment.content, "Test comment");
-        assert_eq!(comment.created_at, 1700004000);
-        assert_eq!(comment.source, CommentSource::User);
-    }
-
-    #[test]
-    fn test_create_comment_agent_source() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-        let issue_id = create_test_issue(&mut conn, &project_id);
-
-        let mut mock_clock = MockClock::new();
-        mock_clock.expect_now().returning(|| 1700005000);
-
-        let comment = create(
-            &mut conn,
-            &mock_clock,
-            CreateComment {
-                issue_id: issue_id.clone(),
-                content: "Agent comment".to_string(),
-                source: CommentSource::Agent,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(comment.source, CommentSource::Agent);
-
-        let db_comment: DbComment = comments::table.find(&comment.id).first(&mut conn).unwrap();
-        assert_eq!(db_comment.source, "agent");
-    }
-
-    #[test]
-    fn test_list_comments_ordered() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-        let issue_id = create_test_issue(&mut conn, &project_id);
-
-        let c1 = NewComment {
-            id: "c1",
-            issue_id: &issue_id,
-            content: "First",
-            source: "user",
-            created_at: 100,
-        };
-        let c2 = NewComment {
-            id: "c2",
-            issue_id: &issue_id,
-            content: "Second",
-            source: "agent",
-            created_at: 200,
-        };
-        let c3 = NewComment {
-            id: "c3",
-            issue_id: &issue_id,
-            content: "Third",
-            source: "user",
-            created_at: 150,
-        };
-
-        diesel::insert_into(comments::table)
-            .values(&c1)
-            .execute(&mut conn)
-            .unwrap();
-        diesel::insert_into(comments::table)
-            .values(&c2)
-            .execute(&mut conn)
-            .unwrap();
-        diesel::insert_into(comments::table)
-            .values(&c3)
-            .execute(&mut conn)
-            .unwrap();
-
-        let result = list(&mut conn, &issue_id).unwrap();
-
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0].content, "First");
-        assert_eq!(result[1].content, "Third");
-        assert_eq!(result[2].content, "Second");
-    }
-
-    #[test]
-    fn test_list_comments_empty() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-        let issue_id = create_test_issue(&mut conn, &project_id);
-
-        let comments = list(&mut conn, &issue_id).unwrap();
-        assert!(comments.is_empty());
-    }
+    .await
+    .map_err(CairnError::from)
 }

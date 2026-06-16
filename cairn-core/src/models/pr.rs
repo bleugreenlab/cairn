@@ -22,6 +22,9 @@ pub struct PrCache {
     pub checks: Vec<Check>,
     pub fetched_at: i64,
     pub updated_at: i64,
+    pub is_local: bool,
+    pub source_branch: Option<String>,
+    pub target_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -241,6 +244,5 @@ pub struct ProjectPrEntry {
     pub issue_id: Option<String>,
     pub issue_number: Option<i32>,
     pub issue_title: Option<String>,
-    pub manager_id: Option<String>,
     pub execution_id: String,
 }

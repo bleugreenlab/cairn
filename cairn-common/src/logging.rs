@@ -1,7 +1,9 @@
 //! Unified logging module for all Cairn binaries.
 //!
 //! Provides a dual-layer tracing subscriber:
-//! - JSON Lines file layer (daily rotation, 14-day retention) → ~/.cairn/logs/
+//! - JSON Lines file layer (daily rotation, 14-day retention). The directory is
+//!   resolved by `paths::cairn_log_dir`, which separates dev (`~/.cairn-dev/logs`)
+//!   from prod (`~/.cairn/logs`) and honors the `CAIRN_LOG_DIR` override.
 //! - Pretty stderr layer (ANSI when TTY, respects RUST_LOG)
 //!
 //! All `log::` crate calls are bridged into tracing via `tracing-log`.
@@ -43,16 +45,42 @@ pub struct LogConfig {
 /// process — dropping it flushes and stops the background writer thread.
 pub struct LogGuard(#[allow(dead_code)] WorkerGuard);
 
-/// Default log directory: `~/.cairn/logs/`
+/// Default log directory, resolved by the shared paths resolver (dev/prod
+/// separated; `CAIRN_LOG_DIR` override honored).
 fn default_log_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".cairn")
-        .join("logs")
+    crate::paths::cairn_log_dir()
 }
 
 fn default_stderr_filter() -> EnvFilter {
     EnvFilter::new("info").add_directive("profiler=off".parse().expect("valid profiler directive"))
+}
+
+fn default_file_filter_directives() -> &'static str {
+    "info,cairn_lib=debug,cairn_core=debug,cairn_cli=debug,profiler=info"
+}
+
+fn default_file_filter() -> EnvFilter {
+    EnvFilter::new(default_file_filter_directives())
+}
+
+fn file_filter_from_env() -> EnvFilter {
+    match std::env::var("CAIRN_FILE_LOG") {
+        Ok(value) if !value.trim().is_empty() => value
+            .parse::<EnvFilter>()
+            .unwrap_or_else(|_| default_file_filter()),
+        _ => default_file_filter(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_file_filter_suppresses_dependency_debug_noise() {
+        assert_eq!(
+            super::default_file_filter_directives(),
+            "info,cairn_lib=debug,cairn_core=debug,cairn_cli=debug,profiler=info"
+        );
+    }
 }
 
 fn stderr_filter_from_env() -> EnvFilter {
@@ -96,8 +124,9 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
         .with_thread_ids(false)
         .with_thread_names(false);
 
-    // File layer filter: DEBUG and above (captures everything worth logging)
-    let file_filter = EnvFilter::new("debug");
+    // File layer filter: keep app/profiler diagnostics while avoiding verbose dependency
+    // DEBUG logs that can make the desktop app spend most of its time writing JSONL.
+    let file_filter = file_filter_from_env();
 
     // Build the subscriber
     let registry = tracing_subscriber::registry().with(file_layer.with_filter(file_filter));

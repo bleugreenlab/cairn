@@ -1,0 +1,615 @@
+//! OS-level filesystem sandbox applied at the process-spawn seam.
+//!
+//! The `run` verb's commands execute **in the Cairn app / cairn-server process**
+//! with the app's full privileges (agent → `run` MCP tool → HTTP callback →
+//! `handle_run` → `execute_process` → `services.process.spawn`), *not* inside
+//! the agent CLI's own sandbox. So a worktree boundary can only be enforced by
+//! wrapping each command Cairn spawns on the agent's behalf. This module builds
+//! a per-spawn [`SandboxPolicy`] and applies it to the spawned `Command`:
+//!
+//! - **macOS**: rewrite argv to `sandbox-exec -p <SBPL profile> <program> …`.
+//! - **Linux**: install a `landlock` ruleset in a `pre_exec` hook (child-side,
+//!   before `exec`).
+//! - **Windows / other**: no kernel primitive — runs unconfined (documented).
+//!
+//! The policy confines **writes** to `{worktree, tmp, granted paths}`, allows
+//! **reads broadly** (the toolchain reads `~/.cargo`, `~/.npm`, `~/.gitconfig`,
+//! `/usr/lib`, …), and **hard-denies reads** of a sensitive denylist (cloud
+//! credential stores plus Cairn's own `~/.cairn[-dev]`, which hold the MCP
+//! callback secret and the local DB). See `docs/worktree-fence.md`.
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+/// A per-spawn filesystem confinement profile.
+///
+/// Built fresh for each spawn from the current worktree and the session's
+/// granted crossings, so a user-approved crossing path widens the very next
+/// spawn's writable set (and drops out of the read denylist).
+#[derive(Debug, Clone)]
+pub struct SandboxPolicy {
+    /// The agent's worktree — writable (and always readable).
+    pub worktree: PathBuf,
+    /// Additional writable subpaths: temp dirs, toolchain caches, and
+    /// session-granted crossings. Also re-allowed for reads.
+    pub writable_extra: Vec<PathBuf>,
+    /// Subpaths whose reads are denied — the narrow set of obviously-sensitive
+    /// secrets (external credential stores). For an `Ask` agent a denied read
+    /// still surfaces as an approvable crossing; only `Deny` makes it final.
+    pub deny_read: Vec<PathBuf>,
+    /// Additional writable scopes expressed as anchored regexes rather than
+    /// concrete subpaths. These let a long-lived **service** sandbox (see
+    /// [`SandboxPolicy::for_service`]) grant writes across many sibling paths
+    /// that do not yet exist — e.g. every worktree's `target/` tree — which a
+    /// fixed `subpath` list cannot express. Empty for ordinary `for_run`
+    /// policies. Enforced on macOS via SBPL `(regex ...)`; the Linux landlock
+    /// path is allowlist-by-concrete-fd and does not yet translate these (the
+    /// service sandbox is macOS-first, mirroring the read-denylist gap).
+    pub writable_regex: Vec<String>,
+}
+
+impl SandboxPolicy {
+    /// Build a policy for a worktree run.
+    ///
+    /// `granted` is the set of session-allowed crossing descriptors (resolved
+    /// paths for path crossings). Any granted path is added to the writable set,
+    /// which is re-allowed for reads after the denylist — so an approved crossing
+    /// wins over a denylist entry whose subtree contains it.
+    pub fn for_run(worktree: &Path, granted: &[String], deny_read: Vec<PathBuf>) -> Self {
+        let granted_paths: Vec<PathBuf> = granted
+            .iter()
+            .filter(|g| g.starts_with('/'))
+            .map(PathBuf::from)
+            .collect();
+
+        let mut writable_extra = default_writable_extra();
+        writable_extra.extend(granted_paths);
+
+        Self {
+            worktree: worktree.to_path_buf(),
+            writable_extra,
+            deny_read,
+            writable_regex: Vec::new(),
+        }
+    }
+
+    /// Build a policy for a long-lived **build service** daemon (see
+    /// `docs/worktree-fence.md` — Managed Build Services).
+    ///
+    /// A service is shared across every worktree it serves, so it cannot be
+    /// confined to a single worktree like `for_run`. Instead it is allowed to
+    /// write only its own `state_dir` (its cache/state home), the standard
+    /// temp/toolchain dirs, and the configured `writable_globs` (the explicit
+    /// cross-worktree grant, e.g. `{worktrees}/**/target/**`). Reads stay broad
+    /// minus `deny_read`, so the daemon still cannot read external secret
+    /// stores, and it notably cannot write worktree source, `$HOME`, or secrets.
+    ///
+    /// `writable_globs` are already template-expanded absolute glob patterns;
+    /// each is converted to an anchored regex for the OS layer.
+    pub fn for_service(
+        state_dir: &Path,
+        writable_globs: &[String],
+        deny_read: Vec<PathBuf>,
+    ) -> Self {
+        let mut writable_extra = default_writable_extra();
+        writable_extra.push(state_dir.to_path_buf());
+
+        Self {
+            // The daemon's state dir is its primary writable+readable root; it
+            // stands in for `worktree` (a service has no single worktree).
+            worktree: state_dir.to_path_buf(),
+            writable_extra,
+            deny_read,
+            writable_regex: writable_globs.iter().map(|g| glob_to_regex(g)).collect(),
+        }
+    }
+
+    /// All writable subpaths: worktree + extras (temp + toolchain + grants).
+    /// Also the set re-allowed for reads after the denylist, so the worktree
+    /// stays readable even if a denylist entry covers a prefix of it.
+    pub fn writable_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.worktree.clone()];
+        paths.extend(self.writable_extra.iter().cloned());
+        paths
+    }
+}
+
+/// The default read denylist, anchored at the user's home directory.
+///
+/// Deliberately **narrow** — hard-deny is a last resort for *obviously sensitive*
+/// secrets the agent cannot otherwise reach: external credential stores and
+/// private keys (`~/.aws`, `~/.config/gcloud`, `~/.netrc`, `~/.ssh`, `~/.gnupg`).
+///
+/// Cairn's own `~/.cairn[-dev]` is **not** denied: its DB contents are already
+/// reachable through `cairn://` resources, the callback secret is injected into
+/// every spawn's env regardless, and the workspace packages (`skills/`,
+/// `agents/`, `recipes/`, `tools/`, `resources/`) plus the worktree itself live
+/// there and must stay readable. The agent reading its own state dir is
+/// expected, not a leak. `~/.config/gh` is likewise not denied — the toolchain
+/// reads it to push, and it is already an app-scoped token.
+///
+/// (For an `Ask` agent these denials are not impassable: a denied read surfaces
+/// as an approvable crossing and a grant lets it through. Only `Deny` agents
+/// hard-fail. `~/.ssh` is conservative — an ssh git remote needs a one-time
+/// grant or its removal via settings.)
+pub fn default_deny_read() -> Vec<PathBuf> {
+    match home_dir() {
+        Some(h) => default_deny_read_in(&h),
+        None => Vec::new(),
+    }
+}
+
+fn default_deny_read_in(home: &Path) -> Vec<PathBuf> {
+    [".aws", ".config/gcloud", ".netrc", ".ssh", ".gnupg"]
+        .iter()
+        .map(|rel| home.join(rel))
+        .collect()
+}
+
+/// Whether OS-level sandboxing is available on this platform/host at runtime.
+///
+/// macOS: `sandbox-exec` is always present. Linux: requires a landlock-capable
+/// kernel (ABI ≥ 1, kernel 5.13+). Other platforms: unavailable.
+pub fn is_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::is_available()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Rewrite a spawn's `(program, args)` to apply the sandbox.
+///
+/// On macOS this returns the `sandbox-exec`-wrapped invocation. On Linux and
+/// other platforms the argv is unchanged (Linux confines via `pre_exec`; see
+/// [`install_pre_exec`]).
+pub fn wrap_argv(program: &str, args: &[String], policy: &SandboxPolicy) -> (String, Vec<String>) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::wrap_argv(program, args, policy)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = policy;
+        (program.to_string(), args.to_vec())
+    }
+}
+
+/// Install the sandbox on a `std::process::Command` for platforms that confine
+/// in-process (Linux landlock via `pre_exec`). No-op on macOS (argv-wrapped)
+/// and unsupported platforms.
+pub fn install_pre_exec(cmd: &mut std::process::Command, policy: &SandboxPolicy) {
+    #[cfg(target_os = "linux")]
+    {
+        linux::install_pre_exec(cmd, policy);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (cmd, policy);
+    }
+}
+
+/// A detected sandbox denial, used to drive the worktree fence after a command
+/// was blocked by the kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxDenial {
+    /// A precise denied path was recovered (macOS unified log) — the fence can
+    /// raise a path-scoped crossing whose grant generalizes across commands.
+    Path(PathBuf),
+    /// A denial occurred but no path was recovered — the fence raises a
+    /// command-scoped crossing.
+    Command,
+}
+
+/// Detect whether a sandboxed command was blocked by the kernel.
+///
+/// The unified trigger across platforms: command output carrying a
+/// permission-denial signature. A clean final shell exit suppresses synthetic
+/// command-scoped fallback for Deny agents, but not for Ask agents: shells can
+/// mask an earlier sandbox denial with `;`, `||`, traps, or harness cleanup. On
+/// macOS the precise denied path is recovered from the unified log (best-effort),
+/// upgrading a command-scoped denial to a path-scoped one.
+/// `command_scoped_fallback` lets Ask agents raise a recoverable prompt when
+/// macOS path recovery misses while Deny agents keep the raw command failure.
+/// Only call this when the sandbox was actually applied (worktree agent with
+/// `OnEscape` Ask/Deny).
+pub fn detect_denial(
+    exit_code: Option<i32>,
+    combined_output: &str,
+    pid: Option<u32>,
+    since: SystemTime,
+    command_scoped_fallback: bool,
+) -> Option<SandboxDenial> {
+    // A clean final shell exit can mask an earlier sandbox denial (`cmd; echo
+    // $?`, `cmd || true`, traps, harness cleanup). For Ask agents, keep looking
+    // for a denial signature so the user has a recovery path. For Deny agents
+    // (fallback disabled), preserve the historical raw-output behavior.
+    if exit_code == Some(0) && !command_scoped_fallback {
+        return None;
+    }
+    // Gate on a denial signature so ordinary exits (test failures, grep
+    // no-match, successful commands) never raise the fence — and so the macOS log
+    // query only runs for plausibly-denied commands.
+    if !has_denial_signature(combined_output) {
+        return None;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // Prefer the authoritative, path-scoped kernel log violation. For Ask
+        // agents, fall back to a recoverable command-scoped crossing if the log
+        // lookup misses; for Deny agents, preserve the historical fail-fast raw
+        // command output rather than synthesizing a denial.
+        match pid {
+            Some(pid) => match macos::detect_violation(pid, since) {
+                Some(path) => Some(SandboxDenial::Path(path)),
+                None if command_scoped_fallback => Some(SandboxDenial::Command),
+                None => None,
+            },
+            None if command_scoped_fallback => Some(SandboxDenial::Command),
+            None => None,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No out-of-band violation signal; the signature is the only trigger
+        // (command-scoped). This can false-positive on a genuine non-sandbox
+        // permission error — documented in docs/worktree-fence.md. Keep Linux
+        // behavior unchanged for both Ask and Deny agents.
+        let _ = (pid, since, command_scoped_fallback);
+        Some(SandboxDenial::Command)
+    }
+}
+
+/// Whether the OS sandbox applies for a given fence policy. Pure selection
+/// predicate (the DB lookup that produces `Fence` lives in the caller): ask/deny
+/// modes confine first and adjudicate denials through the fence; allow runs
+/// unconfined.
+pub fn sandbox_applies(fence: crate::models::Fence) -> bool {
+    matches!(
+        fence,
+        crate::models::Fence::Ask | crate::models::Fence::Deny
+    )
+}
+
+/// Whether output carries a filesystem permission-denial signature.
+pub(crate) fn has_denial_signature(output: &str) -> bool {
+    const SIGS: [&str; 4] = [
+        "Operation not permitted",
+        "Permission denied",
+        "EACCES",
+        "EPERM",
+    ];
+    SIGS.iter().any(|s| output.contains(s))
+}
+
+/// The static writable carve-outs shared by the OS sandbox **and** the `write`
+/// verb's fence: temp dirs + toolchain cache/state dirs (cargo registry +
+/// package-cache lock, npm cache, …). `$HOME` is otherwise read-only, so without
+/// these a cold-cache or dependency-adding `cargo build`/`npm ci` would be
+/// kernel-denied. Excludes session grants (those flow through the fence's grant
+/// check) and the worktree. The `write` verb treats a write here as in-sandbox
+/// (no prompt), matching a shell write under `run`.
+pub fn default_writable_extra() -> Vec<PathBuf> {
+    let mut dirs = temp_dirs();
+    dirs.extend(toolchain_writable_dirs());
+    dirs
+}
+
+/// Standard temp directories that must stay writable so the toolchain (cargo,
+/// rustc, npm, git) can use scratch space.
+/// Toolchain cache/state dirs that must stay writable so build tools work with
+/// their shared caches in `$HOME`. Confining writes to the worktree alone breaks
+/// cargo (`~/.cargo` registry cache + `.package-cache` lock), npm (`~/.npm`),
+/// and friends — they write to these on a cold cache or when a dependency is
+/// added. Only existing dirs are emitted (a missing one is inert in the rules).
+fn toolchain_writable_dirs() -> Vec<PathBuf> {
+    match home_dir() {
+        Some(h) => toolchain_writable_dirs_in(&h),
+        None => Vec::new(),
+    }
+}
+
+fn toolchain_writable_dirs_in(home: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = [
+        ".cargo",
+        ".rustup",
+        ".npm",
+        ".bun",
+        ".yarn",
+        ".cache",
+        ".pnpm-store",
+        ".local/share/pnpm",
+        ".gradle",
+        ".m2",
+        ".deno",
+        "go",
+        // macOS XDG-cache equivalent (go-build, many tools).
+        "Library/Caches",
+    ]
+    .iter()
+    .map(|rel| home.join(rel))
+    .collect();
+    dirs.retain(|p| p.exists());
+    dirs
+}
+
+fn temp_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![std::env::temp_dir()];
+    for p in [
+        "/tmp",
+        "/private/tmp",
+        "/var/folders",
+        "/private/var/folders",
+    ] {
+        let path = PathBuf::from(p);
+        if path.exists() && !dirs.contains(&path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
+/// Convert an absolute writable glob into a start-anchored regex string for the
+/// OS sandbox layer (macOS SBPL `(regex ...)`).
+///
+/// Glob semantics: `**` matches any depth (including `/`), `*` matches within a
+/// single path segment. The result is anchored at the start (`^`) but not the
+/// end, so it matches the glob's prefix and everything beneath it (subpath
+/// semantics). Regex metacharacters in the literal portions are escaped.
+pub(crate) fn glob_to_regex(glob: &str) -> String {
+    let chars: Vec<char> = glob.chars().collect();
+    let mut re = String::from("^");
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    // `**` — any depth, including path separators.
+                    re.push_str(".*");
+                    i += 2;
+                } else {
+                    // `*` — within a single segment.
+                    re.push_str("[^/]*");
+                    i += 1;
+                }
+            }
+            // Escape regex metacharacters that can appear in literal path parts.
+            c @ ('.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '?' | '|' | '\\') => {
+                re.push('\\');
+                re.push(c);
+                i += 1;
+            }
+            c => {
+                re.push(c);
+                i += 1;
+            }
+        }
+    }
+    re
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_denylist_is_external_secrets_only() {
+        // Pure: no global-env mutation, so it can't race other tests.
+        let deny = default_deny_read_in(Path::new("/home/tester"));
+        // External credential stores + keys are denied (the narrow last resort).
+        assert!(deny.contains(&PathBuf::from("/home/tester/.aws")));
+        assert!(deny.contains(&PathBuf::from("/home/tester/.ssh")));
+        assert!(deny.contains(&PathBuf::from("/home/tester/.gnupg")));
+        assert!(deny.contains(&PathBuf::from("/home/tester/.config/gcloud")));
+        // Cairn's own state dir is NOT denied: DB contents are URI-reachable,
+        // the secret is in env, and skills/agents/recipes + the worktree live
+        // there and must stay readable.
+        assert!(!deny.contains(&PathBuf::from("/home/tester/.cairn")));
+        assert!(!deny.contains(&PathBuf::from("/home/tester/.cairn/cairn.db")));
+        assert!(!deny.contains(&PathBuf::from("/home/tester/.cairn/skills")));
+    }
+
+    #[test]
+    fn for_run_grant_is_writable_and_read_reallowed() {
+        let wt = PathBuf::from("/work/wt");
+        let deny = vec![PathBuf::from("/home/x/.aws"), PathBuf::from("/secret/data")];
+        let granted = vec!["/secret/data".to_string()];
+        let policy = SandboxPolicy::for_run(&wt, &granted, deny);
+
+        // Granted path is writable (and re-allowed for reads via the writable
+        // set), so it wins over the denylist entry without mutating the denylist.
+        assert!(policy
+            .writable_extra
+            .contains(&PathBuf::from("/secret/data")));
+        assert!(policy
+            .writable_paths()
+            .contains(&PathBuf::from("/secret/data")));
+        assert!(policy.deny_read.contains(&PathBuf::from("/secret/data")));
+        assert!(policy.deny_read.contains(&PathBuf::from("/home/x/.aws")));
+        // Worktree is always writable (and thus readable via the re-allow).
+        assert!(policy.writable_paths().contains(&wt));
+    }
+
+    #[test]
+    fn no_denial_on_success_or_unrelated_failure_without_signature() {
+        let t = SystemTime::now();
+        // Clean exit with no signature: never a denial.
+        assert_eq!(detect_denial(Some(0), "all good", None, t, false), None);
+        assert_eq!(detect_denial(Some(0), "all good", None, t, true), None);
+        // Non-zero but no signature: a normal failure, not a fence.
+        assert_eq!(
+            detect_denial(Some(1), "test failed: 2 errors", None, t, false),
+            None
+        );
+        assert_eq!(
+            detect_denial(Some(1), "test failed: 2 errors", None, t, true),
+            None
+        );
+    }
+
+    #[test]
+    fn streaming_signature_helper_detects_known_denials() {
+        assert!(has_denial_signature(
+            "bash: /tmp/x: Operation not permitted"
+        ));
+        assert!(has_denial_signature("Permission denied"));
+        assert!(has_denial_signature("EACCES"));
+        assert!(has_denial_signature("EPERM"));
+        assert!(!has_denial_signature("ordinary test failure"));
+    }
+
+    #[test]
+    fn ask_fallback_detects_denial_even_when_shell_exit_is_masked() {
+        let t = SystemTime::now();
+        let output = "bash: /Users/u/probe: Operation not permitted\nexit=1";
+        // Ask fallback still prompts: `cmd; echo exit=$?` can make the shell's
+        // final status zero even though the sandbox blocked an earlier write.
+        assert_eq!(
+            detect_denial(Some(0), output, None, t, true),
+            Some(SandboxDenial::Command)
+        );
+        // Deny/no-fallback preserves raw output for clean final exits.
+        assert_eq!(detect_denial(Some(0), output, None, t, false), None);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn denial_signature_without_path_is_command_scoped() {
+        let t = SystemTime::now();
+        // No out-of-band signal: the signature is the trigger (command-scoped).
+        assert_eq!(
+            detect_denial(
+                Some(1),
+                "bash: /etc/x: Operation not permitted",
+                None,
+                t,
+                false,
+            ),
+            Some(SandboxDenial::Command)
+        );
+        assert_eq!(
+            detect_denial(Some(13), "open: Permission denied", None, t, true),
+            Some(SandboxDenial::Command)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_signature_without_logged_violation_is_ask_fallback_only() {
+        let t = SystemTime::now();
+        // Ask agents get a recoverable command-scoped crossing when the unified
+        // log path lookup misses (represented here by pid=None).
+        assert_eq!(
+            detect_denial(
+                Some(1),
+                "bash: /etc/x: Operation not permitted",
+                None,
+                t,
+                true,
+            ),
+            Some(SandboxDenial::Command)
+        );
+        // Deny agents preserve the old fail-fast raw-output behavior.
+        assert_eq!(
+            detect_denial(
+                Some(1),
+                "bash: /etc/x: Operation not permitted",
+                None,
+                t,
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sandbox_applies_matrix() {
+        use crate::models::Fence;
+        assert!(sandbox_applies(Fence::Ask));
+        assert!(sandbox_applies(Fence::Deny));
+        assert!(!sandbox_applies(Fence::Allow));
+    }
+
+    #[test]
+    fn toolchain_caches_are_writable_when_present() {
+        // Pure: cargo/npm caches present in a home → they are in the writable set,
+        // so cold-cache / dependency-adding builds are not kernel-denied.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".cargo")).unwrap();
+        std::fs::create_dir_all(home.path().join(".npm")).unwrap();
+
+        let dirs = toolchain_writable_dirs_in(home.path());
+        assert!(dirs.contains(&home.path().join(".cargo")));
+        assert!(dirs.contains(&home.path().join(".npm")));
+        // A cache dir that doesn't exist is not emitted (inert in the rules).
+        assert!(!dirs.contains(&home.path().join(".gradle")));
+    }
+
+    #[test]
+    fn glob_to_regex_converts_glob_semantics() {
+        // `**` spans path separators; `*` stays within a segment; `.` is escaped.
+        assert_eq!(
+            glob_to_regex("/home/u/.cairn/worktrees/**/target/**"),
+            "^/home/u/\\.cairn/worktrees/.*/target/.*"
+        );
+        assert_eq!(glob_to_regex("/a/*/b"), "^/a/[^/]*/b");
+        // A concrete worktree target path matches the worktrees glob.
+        let re =
+            regex::Regex::new(&glob_to_regex("/home/u/.cairn/worktrees/**/target/**")).unwrap();
+        assert!(re.is_match("/home/u/.cairn/worktrees/CAIRN-1/src-tauri/target/release/deps/x.d"));
+        // A worktree source path does NOT match (writes there stay denied).
+        assert!(!re.is_match("/home/u/.cairn/worktrees/CAIRN-1/src-tauri/src/lib.rs"));
+    }
+
+    #[test]
+    fn for_service_grants_state_dir_and_globs_only() {
+        let state = PathBuf::from("/home/u/.cairn/sccache");
+        let policy = SandboxPolicy::for_service(
+            &state,
+            &["/home/u/.cairn/worktrees/**/target/**".to_string()],
+            vec![PathBuf::from("/home/u/.aws")],
+        );
+        // State dir is writable+readable; the worktrees glob is a regex grant.
+        assert!(policy.writable_paths().contains(&state));
+        assert_eq!(
+            policy.writable_regex,
+            vec!["^/home/u/\\.cairn/worktrees/.*/target/.*".to_string()]
+        );
+        // Secret store stays denied.
+        assert!(policy.deny_read.contains(&PathBuf::from("/home/u/.aws")));
+    }
+
+    #[test]
+    fn for_run_ignores_non_path_grants() {
+        // A normalized-command descriptor (no leading slash) is not a path grant.
+        let policy = SandboxPolicy::for_run(
+            Path::new("/work/wt"),
+            &["sudo rm -rf /".to_string()],
+            vec![PathBuf::from("/home/x/.aws")],
+        );
+        assert!(!policy
+            .writable_extra
+            .contains(&PathBuf::from("sudo rm -rf /")));
+        assert!(policy.deny_read.contains(&PathBuf::from("/home/x/.aws")));
+    }
+}

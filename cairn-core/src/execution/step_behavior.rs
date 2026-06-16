@@ -2,7 +2,7 @@
 //!
 //! Resolves node configuration to determine execution behavior.
 
-use crate::diesel_models::DbRecipeNode;
+use crate::db_records::DbRecipeNode;
 use crate::models::{AgentGitConfig, WorktreeMode};
 
 /// Resolved behavior for executing a recipe node

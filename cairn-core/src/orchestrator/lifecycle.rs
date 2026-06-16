@@ -12,13 +12,630 @@
 //! - Preserve Claude's conversation cache
 //! - Can be reused for continuation without spawning a new process
 
-use crate::agent_process::checkpoints::has_approval_checkpoint_slot;
 use crate::mcp::handlers::{emit_attention, AttentionEvent};
-use crate::models::RunStatus;
-use crate::schema::{executions, issues, job_terminals, jobs, projects, runs, turns};
-use diesel::prelude::*;
+use crate::models::{Run, RunStatus, TurnState};
+use crate::storage::{run_db_blocking, DbError, DbResult, RowExt};
 
 use super::Orchestrator;
+
+fn emit_db_change(orch: &Orchestrator, table: &str, action: &str) {
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": table, "action": action}),
+    );
+}
+
+fn transition_error(
+    entity: &'static str,
+    id: &str,
+    from: impl Into<String>,
+    to: impl Into<String>,
+    reason: impl Into<String>,
+) -> String {
+    crate::transitions::TransitionError {
+        entity,
+        id: id.to_string(),
+        from: from.into(),
+        to: to.into(),
+        reason: reason.into(),
+    }
+    .to_string()
+}
+
+fn db_internal(message: impl Into<String>) -> DbError {
+    DbError::internal(message.into())
+}
+
+fn apply_turn_outcome(
+    orch: &Orchestrator,
+    turn_id: &str,
+    outcome: TurnState,
+) -> Result<(), String> {
+    if !matches!(
+        outcome,
+        TurnState::Complete | TurnState::Failed | TurnState::Cancelled
+    ) {
+        return Err(transition_error(
+            "turn",
+            turn_id,
+            "unknown",
+            outcome.to_string(),
+            "apply_turn_outcome only accepts Complete, Failed, or Cancelled",
+        ));
+    }
+
+    let db = orch.db.local.clone();
+    let turn_id = turn_id.to_string();
+    let outcome_str = outcome.to_string();
+    run_db_blocking(move || async move {
+        db.write(|conn| {
+            let turn_id = turn_id.clone();
+            let outcome_str = outcome_str.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT state
+                         FROM turns
+                         WHERE id = ?1",
+                        (turn_id.as_str(),),
+                    )
+                    .await?;
+                let current_str = crate::storage::next_text(&mut rows, 0).await?;
+                let Some(current_str) = current_str else {
+                    return Err(db_internal(transition_error(
+                        "turn",
+                        &turn_id,
+                        "unknown",
+                        outcome_str,
+                        "turn not found",
+                    )));
+                };
+
+                let from: TurnState = current_str.parse().map_err(|_| {
+                    db_internal(transition_error(
+                        "turn",
+                        &turn_id,
+                        current_str.clone(),
+                        outcome_str.clone(),
+                        format!("unparseable current state: {}", current_str),
+                    ))
+                })?;
+
+                let outcome: TurnState = outcome_str.parse().map_err(db_internal)?;
+                if from == outcome {
+                    return Ok(());
+                }
+                if from.is_terminal() {
+                    return Err(db_internal(transition_error(
+                        "turn",
+                        &turn_id,
+                        from.to_string(),
+                        outcome.to_string(),
+                        "turn already terminal",
+                    )));
+                }
+
+                match (&from, &outcome) {
+                    (TurnState::Running, _) => {}
+                    (TurnState::Pending, TurnState::Failed | TurnState::Cancelled) => {}
+                    _ => {
+                        return Err(db_internal(transition_error(
+                            "turn",
+                            &turn_id,
+                            from.to_string(),
+                            outcome.to_string(),
+                            format!("invalid transition: {:?} -> {:?}", from, outcome),
+                        )));
+                    }
+                }
+
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE turns
+                     SET state = ?1,
+                         ended_at = ?2,
+                         updated_at = ?2
+                     WHERE id = ?3",
+                    (outcome.to_string().as_str(), now, turn_id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    emit_db_change(orch, "turns", "update");
+    Ok(())
+}
+
+fn interrupt_turn(orch: &Orchestrator, turn_id: &str) -> Result<(), String> {
+    let db = orch.db.local.clone();
+    let turn_id = turn_id.to_string();
+    run_db_blocking(move || async move {
+        db.write(|conn| {
+            let turn_id = turn_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT state
+                         FROM turns
+                         WHERE id = ?1",
+                        (turn_id.as_str(),),
+                    )
+                    .await?;
+                let current_str = crate::storage::next_text(&mut rows, 0).await?;
+                let Some(current_str) = current_str else {
+                    return Err(db_internal(transition_error(
+                        "turn",
+                        &turn_id,
+                        "unknown",
+                        "interrupted",
+                        "turn not found",
+                    )));
+                };
+
+                let from: TurnState = current_str.parse().map_err(|_| {
+                    db_internal(transition_error(
+                        "turn",
+                        &turn_id,
+                        current_str.clone(),
+                        "interrupted",
+                        format!("unparseable current state: {}", current_str),
+                    ))
+                })?;
+
+                if from == TurnState::Interrupted {
+                    return Ok(());
+                }
+                if from.is_terminal() {
+                    return Err(db_internal(transition_error(
+                        "turn",
+                        &turn_id,
+                        from.to_string(),
+                        "interrupted",
+                        "turn already terminal",
+                    )));
+                }
+                if from != TurnState::Running {
+                    return Err(db_internal(transition_error(
+                        "turn",
+                        &turn_id,
+                        from.to_string(),
+                        "interrupted",
+                        "can only interrupt a running turn",
+                    )));
+                }
+
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE turns
+                     SET state = 'interrupted',
+                         ended_at = ?1,
+                         updated_at = ?1
+                     WHERE id = ?2",
+                    (now, turn_id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    emit_db_change(orch, "turns", "update");
+    Ok(())
+}
+
+fn transition_run(orch: &Orchestrator, run_id: &str, to: RunStatus) -> Result<RunStatus, String> {
+    let db = orch.db.local.clone();
+    let run_id = run_id.to_string();
+    let emit_run_id = run_id.clone();
+    let to_str = to.to_string();
+    let from = run_db_blocking(move || async move {
+        db.write(|conn| {
+            let run_id = run_id.clone();
+            let to_str = to_str.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT status
+                         FROM runs
+                         WHERE id = ?1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                let current_str = crate::storage::next_opt_text(&mut rows, 0)
+                    .await?
+                    .ok_or_else(|| {
+                        db_internal(transition_error(
+                            "run",
+                            &run_id,
+                            "unknown",
+                            to_str.clone(),
+                            "run not found",
+                        ))
+                    })?;
+
+                let from: RunStatus = current_str.parse().map_err(|_| {
+                    db_internal(transition_error(
+                        "run",
+                        &run_id,
+                        current_str.clone(),
+                        to_str.clone(),
+                        format!("unparseable current status: {}", current_str),
+                    ))
+                })?;
+                let to: RunStatus = to_str.parse().map_err(db_internal)?;
+                let valid = matches!(
+                    (&from, &to),
+                    (RunStatus::Starting, RunStatus::Live)
+                        | (RunStatus::Starting, RunStatus::Exited)
+                        | (RunStatus::Starting, RunStatus::Crashed)
+                        | (RunStatus::Live, RunStatus::Exited)
+                        | (RunStatus::Live, RunStatus::Crashed)
+                );
+                if !valid {
+                    return Err(db_internal(transition_error(
+                        "run",
+                        &run_id,
+                        from.to_string(),
+                        to.to_string(),
+                        "transition not allowed",
+                    )));
+                }
+
+                let now = chrono::Utc::now().timestamp();
+                match to {
+                    RunStatus::Live => {
+                        conn.execute(
+                            "UPDATE runs
+                             SET status = ?1,
+                                 started_at = ?2,
+                                 updated_at = ?2
+                             WHERE id = ?3",
+                            (to.to_string().as_str(), now, run_id.as_str()),
+                        )
+                        .await?;
+                    }
+                    RunStatus::Exited | RunStatus::Crashed => {
+                        conn.execute(
+                            "UPDATE runs
+                             SET status = ?1,
+                                 exited_at = ?2,
+                                 updated_at = ?2
+                             WHERE id = ?3",
+                            (to.to_string().as_str(), now, run_id.as_str()),
+                        )
+                        .await?;
+                    }
+                    RunStatus::Starting => {
+                        conn.execute(
+                            "UPDATE runs
+                             SET status = ?1,
+                                 updated_at = ?2
+                             WHERE id = ?3",
+                            (to.to_string().as_str(), now, run_id.as_str()),
+                        )
+                        .await?;
+                    }
+                }
+                Ok(from)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let job_id = job_id_for_run(orch, &emit_run_id);
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        crate::notify::run_db_change_ids("update", &emit_run_id, job_id.as_deref()),
+    );
+    Ok(from)
+}
+
+fn set_exit_reason(orch: &Orchestrator, run_id: &str, reason: &str) -> Result<(), String> {
+    let db = orch.db.local.clone();
+    let run_id = run_id.to_string();
+    let reason = reason.to_string();
+    run_db_blocking(move || async move {
+        db.write(|conn| {
+            let run_id = run_id.clone();
+            let reason = reason.clone();
+            Box::pin(async move {
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE runs
+                     SET exit_reason = ?1,
+                         updated_at = ?2
+                     WHERE id = ?3",
+                    (reason.as_str(), now, run_id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn finalize_todos(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move { crate::todos::finalize_todos(&db, &job_id).await })
+}
+
+#[derive(Clone, Copy)]
+enum TextColumn {
+    Required,
+    Optional,
+}
+
+fn blocking_text_lookup(
+    orch: &Orchestrator,
+    key: &str,
+    query: &'static str,
+    column: TextColumn,
+) -> Option<String> {
+    let db = orch.db.local.clone();
+    let key = key.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(query, (key.as_str(),)).await?;
+                match column {
+                    TextColumn::Required => crate::storage::next_text(&mut rows, 0).await,
+                    TextColumn::Optional => crate::storage::next_opt_text(&mut rows, 0).await,
+                }
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .ok()
+    .flatten()
+}
+
+fn current_turn_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
+    blocking_text_lookup(
+        orch,
+        run_id,
+        "SELECT jobs.current_turn_id
+         FROM runs
+         JOIN jobs ON runs.job_id = jobs.id
+         WHERE runs.id = ?1
+           AND runs.job_id IS NOT NULL",
+        TextColumn::Optional,
+    )
+}
+
+fn turn_state(orch: &Orchestrator, turn_id: &str) -> Option<String> {
+    blocking_text_lookup(
+        orch,
+        turn_id,
+        "SELECT state
+         FROM turns
+         WHERE id = ?1",
+        TextColumn::Required,
+    )
+}
+
+fn active_turn_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
+    orch.process_state
+        .get_current_turn_id(run_id)
+        .or_else(|| current_turn_id_for_run(orch, run_id))
+}
+
+pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str) {
+    let Some(turn_id) = active_turn_id_for_run(orch, run_id) else {
+        return;
+    };
+
+    let Some(state) = turn_state(orch, &turn_id) else {
+        log::warn!("Run {} current turn {} was not found", run_id, turn_id);
+        return;
+    };
+
+    let result = match state.as_str() {
+        "running" => interrupt_turn(orch, &turn_id),
+        "pending" => apply_turn_outcome(orch, &turn_id, TurnState::Cancelled),
+        _ => Ok(()),
+    };
+
+    if let Err(error) = result {
+        log::warn!(
+            "Failed to stop turn {} for run {} from state {}: {}",
+            turn_id,
+            run_id,
+            state,
+            error
+        );
+    }
+}
+
+fn run_from_row(row: &turso::Row) -> DbResult<Run> {
+    Ok(Run {
+        id: row.text(0)?,
+        issue_id: row.opt_text(1)?,
+        project_id: row.opt_text(2)?,
+        job_id: row.opt_text(3)?,
+        status: row
+            .opt_text(4)?
+            .and_then(|status| status.parse().ok())
+            .unwrap_or(RunStatus::Starting),
+        session_id: row.opt_text(5)?,
+        error_message: row.opt_text(6)?,
+        started_at: row.opt_i64(7)?,
+        exited_at: row.opt_i64(8)?,
+        created_at: row.i64(9)?,
+        updated_at: row.i64(10)?,
+        chat_id: row.opt_text(11)?,
+        backend: row.opt_text(12)?,
+        exit_reason: row.opt_text(13)?,
+        start_mode: row.opt_text(14)?.and_then(|mode| mode.parse().ok()),
+    })
+}
+
+fn run_for_sync(orch: &Orchestrator, run_id: &str) -> Option<Run> {
+    let db = orch.db.local.clone();
+    let run_id = run_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, issue_id, project_id, job_id, status, session_id,
+                                error_message, started_at, exited_at, created_at, updated_at,
+                                chat_id, backend, exit_reason, start_mode
+                         FROM runs
+                         WHERE id = ?1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                rows.next().await?.map(|row| run_from_row(&row)).transpose()
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .ok()
+    .flatten()
+}
+
+fn run_status(orch: &Orchestrator, run_id: &str) -> Option<String> {
+    blocking_text_lookup(
+        orch,
+        run_id,
+        "SELECT status
+         FROM runs
+         WHERE id = ?1",
+        TextColumn::Optional,
+    )
+}
+
+/// Synchronously read `(issue_id, IssueAttentionContext)` from a job_id.
+/// Returns None when the job has no issue (project-level jobs).
+fn issue_for_attention_by_job(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Option<(
+    String,
+    crate::orchestrator::attention::IssueAttentionContext,
+)> {
+    let db = orch.db.local.clone();
+    let issue_id = blocking_text_lookup(
+        orch,
+        job_id,
+        "SELECT issue_id FROM jobs WHERE id = ?1",
+        TextColumn::Optional,
+    )?;
+    run_db_blocking(move || async move {
+        let ctx = crate::orchestrator::attention::read_issue_for_attention(&db, &issue_id).await?;
+        Ok(Some((issue_id, ctx)))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Emit the typed attention event for a turn that just terminalized.
+/// - Issue reached a terminal status → `Resolved`
+/// - Issue still needs the driver (attention != None) → `AgentIdleWithWork`
+/// - Issue has an open PR work product while attention is None → `AgentIdleWithWork`
+///   pointing at the producing builder's `/pr` (the freshly-opened-PR case the
+///   attention projection deliberately leaves silent)
+/// - Otherwise: no emit (the turn ended cleanly with no work left).
+///
+/// Returns `true` when an actionable fact was emitted, `false` when the turn
+/// ended with nothing for the driver to act on. The warm-transition caller uses
+/// this to gate the desktop "completed" toast so it fires only on a real
+/// idle-with-work, not on every intermediate turn-end (CAIRN-1625).
+///
+/// Fact construction is shared with the boundary wake (`wake_for_issue`) via
+/// [`attention::idle_fact_for_issue`] so the two paths cannot diverge. The
+/// terminalized `job_id` biases the open-PR lookup toward this builder's `/pr`.
+fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
+    let Some((issue_id, ctx)) = issue_for_attention_by_job(orch, job_id) else {
+        return false;
+    };
+    let issue_uri = ctx.issue_uri();
+    // CAIRN-1647: the child's turn just ended — enrich any unresponded
+    // message items for its issue with the response state so the requesting
+    // parent's next briefing shows the child already acted on the message.
+    crate::orchestrator::attention_delivery::enrich_message_items_on_turn_end(
+        orch, &issue_id, &issue_uri,
+    );
+    // Resolve the fact (and any detail URI) synchronously via the shared helper.
+    let db = orch.db.local.clone();
+    let issue_id_for_fact = issue_id.clone();
+    let ctx_for_fact = ctx.clone();
+    let job_id_owned = job_id.to_string();
+    let idle = run_db_blocking(move || async move {
+        Ok::<_, String>(
+            crate::orchestrator::attention::idle_fact_for_issue(
+                &db,
+                &issue_id_for_fact,
+                &ctx_for_fact,
+                Some(&job_id_owned),
+            )
+            .await,
+        )
+    })
+    .ok()
+    .flatten();
+    let Some(idle) = idle else {
+        return false;
+    };
+    orch.emit_attention_event(crate::orchestrator::AttentionEvent {
+        issue_id,
+        issue_uri,
+        fact: idle.fact,
+        attention: ctx.attention,
+        status: ctx.status,
+        updated_at: idle.updated_at,
+    });
+    true
+}
+
+fn job_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
+    blocking_text_lookup(
+        orch,
+        run_id,
+        "SELECT job_id
+         FROM runs
+         WHERE id = ?1
+           AND job_id IS NOT NULL",
+        TextColumn::Optional,
+    )
+}
+
+fn running_terminals_for_job(orch: &Orchestrator, job_id: &str) -> Vec<(String, String)> {
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, session_id
+                         FROM job_terminals
+                         WHERE job_id = ?1
+                           AND status = 'running'",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                let mut terminals = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    terminals.push((row.text(0)?, row.text(1)?));
+                }
+                Ok(terminals)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or_default()
+}
 
 /// Transition a run to warm state after successful turn completion.
 ///
@@ -28,15 +645,9 @@ use super::Orchestrator;
 /// Returns true if the process was successfully transitioned to warm.
 pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
     // Complete the current turn before transitioning occupancy
-    if let Some(turn_id) = orch.process_state.get_current_turn_id(run_id) {
-        if let Ok(mut conn) = orch.db.conn.lock() {
-            let _ = crate::transitions::apply_turn_outcome(
-                &mut conn,
-                &turn_id,
-                crate::models::TurnState::Complete,
-                &*orch.services.emitter,
-            );
-        }
+    let completed_turn_id = orch.process_state.get_current_turn_id(run_id);
+    if let Some(turn_id) = completed_turn_id.as_deref() {
+        let _ = apply_turn_outcome(orch, turn_id, TurnState::Complete);
     }
 
     if orch.process_state.transition_to_warm(run_id) {
@@ -50,6 +661,63 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
             "Run {} transitioned to warm state (process retained for potential follow-up)",
             &run_id[..run_id.len().min(8)]
         );
+
+        // The turn just completed (recorded above). Job status is a derived
+        // projection, so recompute it now that the turn is terminal — this is
+        // what derives Blocked (open `user` confirm gate), Complete, and the DAG
+        // advance. Previously the `return` tool's interrupt routed completion
+        // through `finalize_run`; with the interrupt gone, the clean warm
+        // transition is the turn-complete signal and must drive the recompute.
+        if let Some(job_id) = job_id_for_run(orch, run_id) {
+            if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
+                log::error!(
+                    "Failed to recompute job {} after warm transition: {}",
+                    job_id,
+                    e
+                );
+            }
+            finish_memory_review_if_due(orch, &job_id, run_id);
+            // Turn-end: the agent went idle. Emit a fact-driven event so any
+            // in-flight `watch` learns the issue is actionable (or resolved)
+            // without depending on the recompute sweep poke that this work
+            // is replacing.
+            let needs_attention = emit_for_turn_end(orch, &job_id);
+            // Raise the desktop "completed" toast only when that idle left
+            // something for the driver/user to act on — a plan awaiting
+            // confirmation, a PR awaiting merge, a pending question, or a
+            // terminal status. A bare turn-end with no work left (e.g. a planner
+            // that just spawned child tasks and is now waiting on them) is not a
+            // completion worth pinging about (CAIRN-1625).
+            if needs_attention {
+                emit_agent_terminal_attention_once(orch, run_id, "completed");
+            }
+            // Flush any directs/side-channel notices queued mid-turn for this
+            // run. If this turn was the run's last, no further prompt boundary
+            // fires, so without this they would sit unclaimed (CAIRN-1297).
+            crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
+        }
+
+        // CAIRN-1576 routes terminal-tool completion (e.g. a child's `return`)
+        // through this warm transition instead of `finalize_run`, so the full
+        // completion contract must live here too. Mirror `finalize_run`'s tail:
+        //
+        // 1. Wake a suspended delegated parent. A child that completes via the
+        //    terminal-tool warm path is recomputed to `complete` but its process
+        //    is retained warm — it never reaches stdout EOF, so `finalize_run`
+        //    never runs for it. Without this call the resume trigger is dropped
+        //    entirely and a suspended batch parent hangs forever. self-gates on
+        //    the packet/sibling terminal state, so it is a cheap no-op for
+        //    non-delegated jobs and every other warm-transition caller.
+        try_resume_delegated_parent(orch, run_id);
+
+        // 2. Signal the internal completion broadcast consumed by
+        //    `spawn_task_packets`' inline 45s wait so a child that finishes
+        //    fast is detected and the batch returns inline. This is the tokio
+        //    broadcast, NOT the frontend `run-completed` emit — the run is warm,
+        //    not exited, so the frontend keeps receiving `run-turn-completed`.
+        //    Harmless for top-level jobs: their run ids are never in an inline
+        //    wait's pending set.
+        let _ = orch.run_completions.send(run_id.to_string());
 
         true
     } else {
@@ -76,6 +744,173 @@ pub fn suspend_run_for_durable_wait(
     Ok(())
 }
 
+/// Wake a delegated parent whose turn was suspended waiting on this job's run.
+///
+/// Called on every run finalization (normal exit, crash, or re-finalization of
+/// an already-settled run). The resume logic self-gates: it only proceeds when
+/// the finalized job maps to a delegated packet whose siblings are all terminal,
+/// so calling it for non-delegated jobs or partially-complete batches is a
+/// cheap no-op. This must run even on the already-finalized fast path, because
+/// a child that submits via the `return` tool settles its run before the
+/// process exit re-enters here — skipping it leaves suspended batch parents
+/// stopped forever.
+fn finish_memory_review_if_due(orch: &Orchestrator, job_id: &str, run_id: &str) {
+    let state = match crate::memories::commands::memory_review_idle_state_for_job(orch, job_id) {
+        Ok(state) => state,
+        Err(error) => {
+            log::warn!("Failed to read memory review state for job {job_id}: {error}");
+            return;
+        }
+    };
+
+    match state.state.as_deref() {
+        // Fire the end-step when the job has finished its real work (an
+        // artifact exists) and either captured drafts to review (any run,
+        // tasks included) or is a top-level node job worth a reflection nudge.
+        None if state.has_artifact && (state.draft_count > 0 || !state.is_task) => {
+            match crate::memories::commands::send_memory_review_on_idle(orch, job_id, run_id) {
+                Ok(true) => log::info!(
+                    "Sent memory {} prompt for job {} ({} draft memor{})",
+                    if state.draft_count > 0 {
+                        "review"
+                    } else {
+                        "reflection"
+                    },
+                    &job_id[..job_id.len().min(8)],
+                    state.draft_count,
+                    if state.draft_count == 1 { "y" } else { "ies" }
+                ),
+                Ok(false) => {}
+                Err(error) => log::warn!(
+                    "Failed to send memory review prompt for job {}: {error}",
+                    &job_id[..job_id.len().min(8)]
+                ),
+            }
+            return;
+        }
+        // Complete the review only once its MemoryReview turn has actually
+        // ended. The review prompt resumes the agent into a turn tagged
+        // `memory_review`; completing the review must key off that turn reaching
+        // a terminal state, not the next warm transition after the prompt was
+        // sent. The old `Some("sent") => {}` fall-through completed on the very
+        // next (often back-to-back) warm transition — confirming surviving
+        // drafts before the reflection turn had run, and orphaning drafts the
+        // reflection turn was still writing (CAIRN-1576).
+        Some("sent") if memory_review_turn_ended(orch, job_id) => {}
+        _ => return,
+    }
+
+    match crate::memories::commands::complete_sent_memory_review(orch, job_id) {
+        Ok(completion) => {
+            log::info!(
+                "Completed memory review for job {}; confirmed {} surviving draft memor{}",
+                &job_id[..job_id.len().min(8)],
+                completion.confirmed_count,
+                if completion.confirmed_count == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            );
+            let triage_orch = orch.clone();
+            let confirmed_scopes = completion.confirmed_scopes.clone();
+            if let Err(error) = run_db_blocking(move || async move {
+                crate::memories::triage::maybe_spawn_triage(triage_orch, confirmed_scopes).await
+            }) {
+                log::warn!("memory triage check after review failed: {error}");
+            }
+            if let Err(error) = crate::execution::advancement::recompute_job(orch, job_id) {
+                log::warn!(
+                    "Failed to recompute job {} after memory review completion: {error}",
+                    &job_id[..job_id.len().min(8)]
+                );
+            }
+            close_terminal_sessions_after_memory_review(orch, job_id);
+        }
+        Err(error) => log::warn!(
+            "Failed to complete memory review for job {}: {error}",
+            &job_id[..job_id.len().min(8)]
+        ),
+    }
+}
+
+/// Whether the job's MemoryReview turn has ended. The review prompt resumes the
+/// agent into a turn tagged `memory_review`; review completion keys off that
+/// turn reaching a terminal, non-yielded state (a yielded review turn is paused
+/// on a host wait, not done). Returns false when the latest turn is the work
+/// turn or a still-running review turn, so a warm transition that fires before
+/// the reflection turn ends does not complete the review early.
+pub(crate) fn memory_review_turn_ended(orch: &Orchestrator, job_id: &str) -> bool {
+    blocking_text_lookup(
+        orch,
+        job_id,
+        "SELECT CASE
+                  WHEN start_reason = 'memory_review'
+                   AND state IN ('complete', 'failed', 'interrupted', 'cancelled')
+                  THEN '1' ELSE '0' END
+         FROM turns WHERE job_id = ?1
+         ORDER BY created_at DESC, sequence DESC LIMIT 1",
+        TextColumn::Optional,
+    )
+    .as_deref()
+        == Some("1")
+}
+
+fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str) {
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    let _ = run_db_blocking(move || async move {
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT i.status
+                         FROM jobs j
+                         JOIN issues i ON i.id = j.issue_id
+                         WHERE j.id = ?1
+                         LIMIT 1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(());
+                };
+                let status = row.text(0)?;
+                if !matches!(status.as_str(), "closed" | "merged") {
+                    return Ok(());
+                }
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE sessions
+                     SET status = 'closed', terminal_reason = 'issue_closed', closed_at = ?1, updated_at = ?1
+                     WHERE job_id = ?2 AND status = 'open'",
+                    (now, job_id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    });
+}
+
+fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
+    let Some(job_id) = job_id_for_run(orch, run_id) else {
+        return;
+    };
+    if let Err(e) =
+        crate::execution::delegation::resume_suspended_parent_after_task_completion(orch, &job_id)
+    {
+        log::warn!(
+            "Failed to resume suspended delegated parent after job {} finalized: {}",
+            job_id,
+            e
+        );
+    }
+}
+
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     // Clean up system prompt temp file
     super::session::cleanup_prompt_file(run_id);
@@ -83,42 +918,26 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     // Finalize the current turn based on run outcome.
     // Primary: in-memory process state. Fallback: job's current_turn_id in DB
     // (covers crashes where the process was never registered or already deregistered).
-    let turn_id = orch.process_state.get_current_turn_id(run_id).or_else(|| {
-        let mut conn = orch.db.conn.lock().ok()?;
-        runs::table
-            .find(run_id)
-            .inner_join(jobs::table.on(runs::job_id.assume_not_null().eq(jobs::id)))
-            .select(jobs::current_turn_id)
-            .first::<Option<String>>(&mut *conn)
-            .ok()
-            .flatten()
-    });
+    let turn_id = orch
+        .process_state
+        .get_current_turn_id(run_id)
+        .or_else(|| current_turn_id_for_run(orch, run_id));
     let had_active_turn = turn_id.is_some();
-    if let Some(turn_id) = turn_id {
-        if let Ok(mut conn) = orch.db.conn.lock() {
-            let turn_state: Option<String> = turns::table
-                .find(&turn_id)
-                .select(turns::state)
-                .first::<String>(&mut *conn)
-                .optional()
-                .unwrap_or_default();
-
+    if let Some(ref turn_id) = turn_id {
+        if let Some(turn_state) = turn_state(orch, turn_id) {
             let result = if status == RunStatus::Exited {
-                crate::transitions::apply_turn_outcome(
-                    &mut conn,
-                    &turn_id,
-                    crate::models::TurnState::Complete,
-                    &*orch.services.emitter,
-                )
-            } else if turn_state.as_deref() == Some("running") {
-                crate::transitions::interrupt_turn(&mut conn, &turn_id, &*orch.services.emitter)
+                // Clean exit: a Running turn completed; a turn that never reached
+                // Running (Pending) produced nothing, so fail it rather than
+                // leaving it live (which would keep the job derived as Running).
+                if turn_state.as_str() == "pending" {
+                    apply_turn_outcome(orch, turn_id, TurnState::Failed)
+                } else {
+                    apply_turn_outcome(orch, turn_id, TurnState::Complete)
+                }
+            } else if turn_state.as_str() == "running" {
+                interrupt_turn(orch, turn_id)
             } else {
-                crate::transitions::apply_turn_outcome(
-                    &mut conn,
-                    &turn_id,
-                    crate::models::TurnState::Failed,
-                    &*orch.services.emitter,
-                )
+                apply_turn_outcome(orch, turn_id, TurnState::Failed)
             };
 
             if let Err(e) = result {
@@ -134,110 +953,72 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
 
     // Transition run via transition_run (validates state machine, emits db-change).
     // Also get the job_id for subsequent job lifecycle.
-    let job_id: Option<String> = if let Ok(mut conn) = orch.db.conn.lock() {
-        // Check current status - don't overwrite terminal states
-        let current_status: Option<String> = runs::table
-            .find(run_id)
-            .select(runs::status)
-            .first::<Option<String>>(&mut *conn)
-            .ok()
-            .flatten();
+    let current_status = run_status(orch, run_id);
+    if matches!(current_status.as_deref(), Some("exited") | Some("crashed")) {
+        log::info!(
+            "Run {} already finalized as {:?}, skipping re-finalization as {:?}",
+            &run_id[..run_id.len().min(8)],
+            current_status,
+            status
+        );
+        // Still emit run-completed so task handlers waiting on this event are unblocked.
+        let _ = orch
+            .services
+            .emitter
+            .emit("run-completed", serde_json::json!(run_id));
+        let _ = orch.run_completions.send(run_id.to_string());
+        // A delegated child whose run was already settled (typically via the
+        // return tool, which finalizes before the process exits) must still wake
+        // a suspended parent batch. Without this, the parent never resumes.
+        try_resume_delegated_parent(orch, run_id);
+        // The run settled via the `return` tool before this process-exit
+        // re-entry; still flush any direct queued against it so a parent that
+        // finalized that way isn't left unaware of a stuck child (CAIRN-1297).
+        crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
+        return;
+    }
 
-        if matches!(current_status.as_deref(), Some("exited") | Some("crashed")) {
-            log::info!(
-                "Run {} already finalized as {:?}, skipping re-finalization as {:?}",
-                &run_id[..run_id.len().min(8)],
-                current_status,
-                status
-            );
-            // Still emit run-completed so task handlers waiting on this event are unblocked.
-            let _ = orch
-                .services
-                .emitter
-                .emit("run-completed", serde_json::json!(run_id));
-            let _ = orch.run_completions.send(run_id.to_string());
-            return;
-        }
+    if let Err(e) = transition_run(orch, run_id, status.clone()) {
+        log::error!("Failed to transition run {}: {}", run_id, e);
+    }
 
-        // Use transition_run for validated status change + db-change emission
-        match crate::transitions::transition_run(
-            &mut conn,
-            run_id,
-            status.clone(),
-            &*orch.services.emitter,
-        ) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("Failed to transition run {}: {}", run_id, e);
-            }
-        }
+    if let Some(run) = run_for_sync(orch, run_id) {
+        orch.sync(crate::sync::SyncMessage::Run((&run).into()));
+    }
 
-        // Sync the finalized run
-        if let Ok(db_run) = runs::table
-            .find(run_id)
-            .first::<crate::diesel_models::DbRun>(&mut *conn)
-        {
-            orch.sync(crate::sync::SyncMessage::Run(
-                (&crate::runs::queries::db_run_to_run(db_run)).into(),
-            ));
-        }
-
-        // Get job_id
-        runs::table
-            .inner_join(jobs::table.on(runs::job_id.assume_not_null().eq(jobs::id)))
-            .filter(runs::id.eq(run_id))
-            .filter(runs::job_id.is_not_null())
-            .select(runs::job_id.assume_not_null())
-            .first::<String>(&mut *conn)
-            .ok()
-    } else {
-        None
-    };
+    let job_id = job_id_for_run(orch, run_id);
 
     if had_active_turn {
         // Finalize todos: mark any in_progress as completed
         if let Some(ref job_id) = job_id {
-            if let Ok(mut conn) = orch.db.conn.lock() {
-                let _ = crate::todos::finalize_todos(&mut conn, job_id);
-            }
+            let _ = finalize_todos(orch, job_id);
         }
 
-        // Apply step outcome via unified reducer (transition + system message +
-        // manager wake + DAG advance signal). Idempotent: if handle_return already
-        // transitioned the job, the reducer returns AlreadySettled — no duplicate effects.
+        // Job status is a derived projection. The turn outcome was already
+        // recorded above (Complete on clean exit, Failed/Interrupted on crash);
+        // recompute derives the job's status from it — Complete, Blocked (open
+        // approval checkpoint), or Failed — and cascades + advances the DAG.
+        // This is purely mechanical now; finalize_run no longer decides outcomes.
         if let Some(job_id) = job_id.clone() {
-            use crate::transitions::outcome::{
-                apply_step_outcome, emit_outcome_effects, OutcomeContext, OutcomeSource,
-                StepOutcome,
-            };
-
-            let outcome = if status == RunStatus::Exited {
-                if let Ok(mut conn) = orch.db.conn.lock() {
-                    if has_approval_checkpoint_slot(&mut conn, &job_id) {
-                        log::info!("Job {} has checkpoint slot, blocking for approval", job_id);
-                        StepOutcome::Blocked
-                    } else {
-                        StepOutcome::Complete
-                    }
-                } else {
-                    StepOutcome::Complete
-                }
-            } else {
-                StepOutcome::Failed
-            };
-            let ctx = OutcomeContext {
-                run_id: Some(run_id),
-                source: if status == RunStatus::Exited {
-                    OutcomeSource::ProcessExit
-                } else {
-                    OutcomeSource::ProcessCrash
-                },
-            };
-
-            match apply_step_outcome(orch, &job_id, &ctx, outcome) {
-                Ok((_result, effects)) => emit_outcome_effects(orch, effects),
-                Err(e) => log::error!("Failed to apply step outcome for {}: {}", job_id, e),
+            if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
+                log::error!(
+                    "Failed to recompute job {} after run finalize: {}",
+                    job_id,
+                    e
+                );
             }
+            finish_memory_review_if_due(orch, &job_id, run_id);
+            // Turn-end on any terminal run outcome (clean exit or crash): the
+            // agent is idle now. The recompute above may have flipped status
+            // to terminal (→ Resolved) or left attention pointing at the next
+            // human action (→ AgentIdleWithWork). Either way, the long-poll
+            // hears about it through this fact rather than the recompute-sweep
+            // poke this work removes.
+            emit_for_turn_end(orch, &job_id);
+            // Run-terminal idle: flush any directs/side-channel notices still
+            // pending for this run so a queued child-attention update is not
+            // stranded when the run never takes another turn (CAIRN-1297).
+            crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
         }
     } else if let Some(ref job_id) = job_id {
         log::info!(
@@ -247,21 +1028,11 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
         );
     }
 
-    if status == RunStatus::Exited {
-        if let Some(ref job_id) = job_id {
-            if let Err(e) =
-                crate::mcp::handlers::agents::resume_suspended_parent_after_task_completion(
-                    orch, job_id,
-                )
-            {
-                log::warn!(
-                    "Failed to resume suspended delegated parent after job {} completed: {}",
-                    job_id,
-                    e
-                );
-            }
-        }
-    }
+    // Wake a suspended delegated parent on any terminal outcome (exit or crash):
+    // a crashed child still resolves its packet to Failed, and the parent should
+    // resume with that failure rather than hang. resume_... self-gates on the
+    // packet/sibling terminal state.
+    try_resume_delegated_parent(orch, run_id);
 
     // Emit run completed event (frontend)
     let _ = orch
@@ -277,84 +1048,115 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
         log_session_crash_context(orch, run_id);
     }
 
-    // Emit agent-attention only when this exit actually finalized an in-flight turn.
-    if had_active_turn {
-        emit_attention_for_run(orch, run_id, status);
+    // Completion attention fires when the agent goes idle/warm. Finalization is
+    // only a legacy toast source for genuine crash paths that terminalize an
+    // in-flight turn without reaching the idle boundary first.
+    if had_active_turn && status == RunStatus::Crashed {
+        emit_agent_terminal_attention_once(orch, run_id, "failed");
     }
 }
 
 /// Log session context when a run crashes. If this was a resume attempt, the session
 /// may be invalid — log a warning so operators can investigate.
 fn log_session_crash_context(orch: &Orchestrator, run_id: &str) {
-    let Ok(mut conn) = orch.db.conn.lock() else {
-        return;
-    };
-
-    let run_info: Option<(Option<String>, Option<String>)> = runs::table
-        .find(run_id)
-        .select((runs::session_id, runs::start_mode))
-        .first(&mut *conn)
-        .ok();
+    let db = orch.db.local.clone();
+    let log_run_id = run_id.to_string();
+    let run_id = run_id.to_string();
+    let run_info = run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT session_id, start_mode
+                         FROM runs
+                         WHERE id = ?1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                rows.next()
+                    .await?
+                    .map(|row| Ok((row.opt_text(0)?, row.opt_text(1)?)))
+                    .transpose()
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .ok()
+    .flatten();
 
     if let Some((Some(session_id), start_mode)) = run_info {
         if start_mode.as_deref() == Some("resume") {
             log::warn!(
                 "Resume run {} crashed for session {} — \
                  session may be invalid. If this repeats, session rotation may be needed.",
-                &run_id[..run_id.len().min(8)],
+                &log_run_id[..log_run_id.len().min(8)],
                 &session_id[..session_id.len().min(8)]
             );
         }
     }
 }
 
-/// Emit agent-attention for a completed/failed run, but only if it's a top-level job.
-fn emit_attention_for_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
-    let Ok(mut conn) = orch.db.conn.lock() else {
-        return;
+/// Emit legacy `agent-attention` terminal toast once per run, but only for top-level jobs.
+fn emit_agent_terminal_attention_once(
+    orch: &Orchestrator,
+    run_id: &str,
+    attention_type: &'static str,
+) {
+    let inserted = {
+        let mut seen = orch.agent_completion_attention_dedupe.lock().unwrap();
+        seen.insert(run_id.to_string())
     };
-
-    // Query top-level job data (parent_job_id IS NULL filters out sub-tasks)
-    type AttentionRow = (
-        String,
-        Option<i32>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let row: Option<AttentionRow> = runs::table
-        .inner_join(jobs::table.on(runs::job_id.assume_not_null().eq(jobs::id)))
-        .inner_join(projects::table.on(jobs::project_id.eq(projects::id)))
-        .left_join(issues::table.on(jobs::issue_id.eq(issues::id.nullable())))
-        .filter(runs::id.eq(run_id))
-        .filter(jobs::parent_job_id.is_null())
-        .select((
-            projects::key,
-            issues::number.nullable(),
-            issues::title.nullable(),
-            jobs::node_name,
-            jobs::execution_id,
-        ))
-        .first(&mut *conn)
-        .ok();
-
-    let Some((project_key, issue_number, issue_title, node_name, execution_id)) = row else {
+    if !inserted {
+        log::debug!(
+            "Suppressing duplicate legacy agent-attention terminal event for run {} ({})",
+            run_id,
+            attention_type
+        );
         return;
-    };
+    }
 
-    let exec_seq = execution_id.as_deref().and_then(|eid| {
-        executions::table
-            .find(eid)
-            .select(executions::seq)
-            .first::<Option<i32>>(&mut *conn)
-            .ok()
-            .flatten()
-    });
+    let db = orch.db.local.clone();
+    let run_id = run_id.to_string();
+    let row = run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT projects.key, issues.number, issues.title, jobs.node_name, executions.seq
+                         FROM runs
+                         JOIN jobs ON runs.job_id = jobs.id
+                         JOIN projects ON jobs.project_id = projects.id
+                         LEFT JOIN issues ON jobs.issue_id = issues.id
+                         LEFT JOIN executions ON jobs.execution_id = executions.id
+                         WHERE runs.id = ?1
+                           AND jobs.parent_job_id IS NULL
+                           AND runs.job_id IS NOT NULL",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                rows.next()
+                    .await?
+                    .map(|row| {
+                        Ok((
+                            row.text(0)?,
+                            row.opt_i64(1)?.map(|n| n as i32),
+                            row.opt_text(2)?,
+                            row.opt_text(3)?,
+                            row.opt_i64(4)?.map(|n| n as i32),
+                        ))
+                    })
+                    .transpose()
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .ok()
+    .flatten();
 
-    let attention_type = if status == RunStatus::Exited {
-        "completed"
-    } else {
-        "failed"
+    let Some((project_key, issue_number, issue_title, node_name, exec_seq)) = row else {
+        return;
     };
 
     emit_attention(
@@ -371,20 +1173,46 @@ fn emit_attention_for_run(orch: &Orchestrator, run_id: &str, status: RunStatus) 
     );
 }
 
-/// Find all descendant job IDs for a given job (children, grandchildren, etc.)
-fn find_descendant_job_ids(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    job_id: &str,
-) -> Vec<String> {
+fn child_run_ids_for_run(orch: &Orchestrator, run_id: &str) -> Vec<String> {
+    let Some(job_id) = job_id_for_run(orch, run_id) else {
+        return Vec::new();
+    };
+    let db = orch.db.local.clone();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let descendant_job_ids = find_descendant_job_ids(conn, &job_id).await?;
+                if descendant_job_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                get_running_runs_for_jobs(conn, &descendant_job_ids).await
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or_default()
+}
+
+async fn find_descendant_job_ids(conn: &turso::Connection, job_id: &str) -> DbResult<Vec<String>> {
     let mut all_descendants = Vec::new();
     let mut current_parents = vec![job_id.to_string()];
 
     while !current_parents.is_empty() {
-        let children: Vec<String> = jobs::table
-            .filter(jobs::parent_job_id.eq_any(&current_parents))
-            .select(jobs::id)
-            .load(conn)
-            .unwrap_or_default();
+        let mut children = Vec::new();
+        for parent_id in &current_parents {
+            let mut rows = conn
+                .query(
+                    "SELECT id
+                     FROM jobs
+                     WHERE parent_job_id = ?1",
+                    (parent_id.as_str(),),
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                children.push(row.text(0)?);
+            }
+        }
 
         if children.is_empty() {
             break;
@@ -394,46 +1222,57 @@ fn find_descendant_job_ids(
         current_parents = children;
     }
 
-    all_descendants
+    Ok(all_descendants)
 }
 
-/// Get all running run IDs for a set of job IDs
-fn get_running_runs_for_jobs(
-    conn: &mut diesel::sqlite::SqliteConnection,
+async fn get_running_runs_for_jobs(
+    conn: &turso::Connection,
     job_ids: &[String],
-) -> Vec<String> {
-    runs::table
-        .filter(runs::job_id.eq_any(job_ids))
-        .filter(runs::status.eq_any(&["starting", "live"]))
-        .select(runs::id)
-        .load(conn)
-        .unwrap_or_default()
+) -> DbResult<Vec<String>> {
+    let mut run_ids = Vec::new();
+    for job_id in job_ids {
+        let mut rows = conn
+            .query(
+                "SELECT id
+                 FROM runs
+                 WHERE job_id = ?1
+                   AND status IN ('starting', 'live')",
+                (job_id.as_str(),),
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            run_ids.push(row.text(0)?);
+        }
+    }
+    Ok(run_ids)
+}
+
+/// Resolve the live (`starting`/`live`) run id for a job, if one exists.
+///
+/// Used by the resource-layer node `stop` action to find the run whose turn to
+/// interrupt. Returns `None` when the node has no active run (already complete,
+/// failed, or never started), letting the caller report a clear no-op rather
+/// than guessing a run id.
+pub fn live_run_id_for_job(orch: &Orchestrator, job_id: &str) -> Option<String> {
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(
+                async move { get_running_runs_for_jobs(conn, std::slice::from_ref(&job_id)).await },
+            )
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .ok()
+    .and_then(|ids| ids.into_iter().next())
 }
 
 /// Stop a running backend session, cascading to child runs
 pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     // First, collect child runs to stop
-    let child_run_ids: Vec<String> = if let Ok(mut conn) = orch.db.conn.lock() {
-        let job_id: Option<String> = runs::table
-            .filter(runs::id.eq(run_id))
-            .select(runs::job_id)
-            .first::<Option<String>>(&mut *conn)
-            .ok()
-            .flatten();
-
-        if let Some(job_id) = job_id {
-            let descendant_job_ids = find_descendant_job_ids(&mut conn, &job_id);
-            if !descendant_job_ids.is_empty() {
-                get_running_runs_for_jobs(&mut conn, &descendant_job_ids)
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let child_run_ids = child_run_ids_for_run(orch, run_id);
 
     // Stop child runs first
     for child_run_id in &child_run_ids {
@@ -455,13 +1294,9 @@ pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
 /// to warm state. The process is NOT killed - it stays available for follow-up
 /// messages.
 fn stop_session_internal(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
-    // Interrupt the current turn
-    if let Some(turn_id) = orch.process_state.get_current_turn_id(run_id) {
-        if let Ok(mut conn) = orch.db.conn.lock() {
-            let _ =
-                crate::transitions::interrupt_turn(&mut conn, &turn_id, &*orch.services.emitter);
-        }
-    }
+    // Interrupt/cancel the current turn. Fall back to the DB current_turn_id so
+    // stop repairs stale UI-visible state even when the process map lost the run.
+    stop_active_turn_for_run(orch, run_id);
 
     // Send interrupt via backend-aware stdin handler
     if let Err(e) = crate::backends::stdin::send_interrupt(&orch.process_state, run_id) {
@@ -482,6 +1317,20 @@ fn stop_session_internal(orch: &Orchestrator, run_id: &str) -> Result<(), String
             "Run {} not found in process map after interrupt",
             &run_id[..run_id.len().min(8)]
         );
+        if matches!(
+            run_status(orch, run_id).as_deref(),
+            Some("starting" | "live" | "running" | "idle")
+        ) {
+            let _ = set_exit_reason(orch, run_id, "user_stop");
+            if let Err(error) = transition_run(orch, run_id, RunStatus::Exited) {
+                log::warn!("Failed to finalize stopped stale run {}: {}", run_id, error);
+            }
+            let _ = orch
+                .services
+                .emitter
+                .emit("run-completed", serde_json::json!(run_id));
+            let _ = orch.run_completions.send(run_id.to_string());
+        }
     }
 
     Ok(())
@@ -500,601 +1349,28 @@ fn cleanup_inline_commands(orch: &Orchestrator, run_id: &str) {
     }
 }
 
-/// Kill background terminals associated with a run's job.
+/// Finalize background terminals associated with a run's job on hard kill (not
+/// interrupt).
 ///
-/// Called during hard kill (not interrupt) to clean up PTY sessions
-/// and their database records.
+/// This runs on user-stop / GC eviction: the run stops but the issue/job
+/// persists and may resume, so terminals are marked `exited` (retained) rather
+/// than deleted — deletion is reserved for true job teardown
+/// (`execution/teardown.rs`). Each terminal converges on the single finalize
+/// sink, which kills the child, records an honest non-success exit code, routes
+/// the exit wake, and drops the live session.
 fn cleanup_job_terminals(orch: &Orchestrator, run_id: &str) {
-    let job_id = {
-        let Ok(mut conn) = orch.db.conn.lock() else {
-            return;
-        };
-
-        runs::table
-            .find(run_id)
-            .select(runs::job_id)
-            .first::<Option<String>>(&mut *conn)
-            .ok()
-            .flatten()
-    };
-
+    let job_id = job_id_for_run(orch, run_id);
     let Some(job_id) = job_id else {
         return;
     };
 
-    let running_terminals = {
-        let Ok(mut conn) = orch.db.conn.lock() else {
-            return;
-        };
+    let running_terminals = running_terminals_for_job(orch, &job_id);
 
-        job_terminals::table
-            .filter(job_terminals::job_id.eq(&job_id))
-            .filter(job_terminals::status.eq("running"))
-            .select((job_terminals::id, job_terminals::session_id))
-            .load::<(String, String)>(&mut *conn)
-            .ok()
-            .unwrap_or_default()
-    };
-
-    if running_terminals.is_empty() {
-        return;
-    }
-
-    for (terminal_id, session_id) in running_terminals {
+    for (_terminal_id, session_id) in running_terminals {
+        if let Err(error) =
+            crate::mcp::handlers::bash::finalize_terminal_by_session_id(orch, &session_id)
         {
-            let Ok(mut sessions) = orch.pty_state.sessions.lock() else {
-                continue;
-            };
-
-            if let Some(session_arc) = sessions.remove(&session_id) {
-                if let Ok(mut session) = session_arc.lock() {
-                    let _ = session.child.kill();
-                    let _ = session.child.wait();
-                }
-            }
-        }
-
-        if let Ok(mut conn) = orch.db.conn.lock() {
-            let _ = diesel::delete(job_terminals::table.find(&terminal_id)).execute(&mut *conn);
-        }
-    }
-
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "job_terminals", "action": "delete"}),
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::DbState;
-    use crate::diesel_models::{NewJobTerminal, NewRun, NewTurn};
-    use crate::models::CreateManager;
-    use crate::schema::job_terminals;
-    use crate::services::testing::{MockChildProcess, MockClock, TestServicesBuilder};
-    use crate::services::PtySession;
-    use crate::test_utils::{
-        create_test_issue, create_test_job, create_test_project, test_diesel_conn,
-    };
-    use portable_pty::{CommandBuilder, PtySize};
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-
-    /// Create a manager and return its ID.
-    fn create_manager(conn: &mut diesel::sqlite::SqliteConnection, project_id: &str) -> String {
-        let mut clock = MockClock::new();
-        clock.expect_now().returning(|| 1700000000);
-        let mgr = crate::managers::crud::create(
-            conn,
-            &clock,
-            CreateManager {
-                project_id: project_id.to_string(),
-                home_project_id: None,
-                scope_kind: None,
-                name: "Test Manager".to_string(),
-                branch: "mgr/test".to_string(),
-                description: None,
-                agent_config_id: None,
-                tier: None,
-                parent_manager_id: None,
-            },
-        )
-        .unwrap();
-        mgr.id
-    }
-
-    /// Set manager_id on an issue.
-    fn set_manager_id(
-        conn: &mut diesel::sqlite::SqliteConnection,
-        issue_id: &str,
-        manager_id: &str,
-    ) {
-        diesel::update(issues::table.find(issue_id))
-            .set(issues::manager_id.eq(Some(manager_id)))
-            .execute(conn)
-            .unwrap();
-    }
-
-    fn test_orchestrator(conn: diesel::sqlite::SqliteConnection) -> Orchestrator {
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let services = Arc::new(TestServicesBuilder::new().build());
-        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
-            db.clone(),
-            services.emitter.clone(),
-        ));
-        let sync_tx = Arc::new(Mutex::new(None));
-        Orchestrator {
-            db,
-            services: services.clone(),
-            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
-            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
-                "/tmp",
-            ))),
-            warm_gc: None,
-            pty_state: Arc::new(crate::services::PtyState::default()),
-            permission_responses: tokio::sync::broadcast::channel(16).0,
-            run_completions: tokio::sync::broadcast::channel(64).0,
-            prompt_responses: tokio::sync::broadcast::channel(16).0,
-            trigger_events: tokio::sync::broadcast::channel(256).0,
-            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            identity_store: Arc::new(Mutex::new(None)),
-            mcp_binary_path: "cairn-mcp".to_string(),
-            config_dir: std::path::PathBuf::from("/tmp"),
-            schema_dir: None,
-            mcp_callback_port: 3847,
-            embedding_engine: None,
-            vibe_state: None,
-            account_manager,
-            sync_tx: sync_tx.clone(),
-            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
-            api_config: crate::api::ApiConfig::default(),
-            effect_tx: None,
-            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            provider_usage_snapshots: Default::default(),
-            executor: std::sync::Arc::new(std::sync::OnceLock::new()),
-        }
-    }
-
-    fn insert_test_run(
-        conn: &mut diesel::sqlite::SqliteConnection,
-        run_id: &str,
-        issue_id: &str,
-        project_id: &str,
-        job_id: &str,
-    ) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        diesel::insert_into(runs::table)
-            .values(&NewRun {
-                id: run_id,
-                issue_id: Some(issue_id),
-                project_id: Some(project_id),
-                job_id: Some(job_id),
-                status: Some("live"),
-                session_id: None,
-                error_message: None,
-                started_at: Some(now),
-                exited_at: None,
-                created_at: now,
-                updated_at: now,
-                backend: None,
-                exit_reason: None,
-                start_mode: None,
-                chat_id: None,
-            })
-            .execute(conn)
-            .unwrap();
-    }
-
-    #[test]
-    fn wake_info_returns_manager_for_managed_issue_top_level_job() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "TST");
-        let manager_id = create_manager(&mut conn, &project_id);
-        let issue_id = create_test_issue(&mut conn, &project_id, "Managed task");
-        set_manager_id(&mut conn, &issue_id, &manager_id);
-
-        let job_id = create_test_job(&mut conn, &issue_id, &project_id, "build", "failed", None);
-
-        let result = get_manager_wake_info(&mut conn, &job_id);
-        assert!(result.is_some());
-        let (mgr_id, number, title) = result.unwrap();
-        assert_eq!(mgr_id, manager_id);
-        assert_eq!(number, 1);
-        assert_eq!(title, "Managed task");
-    }
-
-    #[test]
-    fn wake_info_returns_none_for_unmanaged_issue() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "TST");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Regular task");
-        // No manager_id set
-
-        let job_id = create_test_job(&mut conn, &issue_id, &project_id, "build", "failed", None);
-
-        let result = get_manager_wake_info(&mut conn, &job_id);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn wake_info_returns_manager_for_sub_task_job() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "TST");
-        let manager_id = create_manager(&mut conn, &project_id);
-        let issue_id = create_test_issue(&mut conn, &project_id, "Managed task");
-        set_manager_id(&mut conn, &issue_id, &manager_id);
-
-        // Create parent job
-        let parent_job_id =
-            create_test_job(&mut conn, &issue_id, &project_id, "build", "running", None);
-        // Create sub-task job
-        let child_job_id = create_test_job(
-            &mut conn,
-            &issue_id,
-            &project_id,
-            "build",
-            "failed",
-            Some(&parent_job_id),
-        );
-
-        // Sub-task failure should still wake the manager for the managed issue
-        let result = get_manager_wake_info(&mut conn, &child_job_id);
-        assert!(result.is_some());
-
-        // Parent job should also return wake info
-        let result = get_manager_wake_info(&mut conn, &parent_job_id);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn wake_info_returns_none_for_nonexistent_job() {
-        let mut conn = test_diesel_conn();
-        let result = get_manager_wake_info(&mut conn, "nonexistent-job-id");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn stop_session_cleans_up_inline_commands() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "TST");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Task");
-        let job_id = create_test_job(&mut conn, &issue_id, &project_id, "build", "running", None);
-        insert_test_run(&mut conn, "run-inline", &issue_id, &project_id, &job_id);
-        let orch = test_orchestrator(conn);
-
-        let child = Arc::new(Mutex::new(
-            Box::new(MockChildProcess::with_stdout(42, vec![]))
-                as Box<dyn crate::services::ChildProcess>,
-        ));
-        orch.pty_state.register_inline_command(
-            "run-inline".to_string(),
-            "cmd-1".to_string(),
-            child.clone(),
-        );
-
-        stop_session_internal(&orch, "run-inline").unwrap();
-
-        assert!(orch.pty_state.take_inline_commands("run-inline").is_empty());
-        assert!(child.lock().unwrap().try_wait().unwrap().is_some());
-    }
-
-    #[test]
-    fn stop_session_preserves_background_terminals() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "TST");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Task");
-        let job_id = create_test_job(&mut conn, &issue_id, &project_id, "build", "running", None);
-        insert_test_run(&mut conn, "run-terminal", &issue_id, &project_id, &job_id);
-
-        let session_id = "session-1".to_string();
-        let terminal_id = "terminal-1".to_string();
-        let now = chrono::Utc::now().timestamp() as i32;
-        diesel::insert_into(job_terminals::table)
-            .values(&NewJobTerminal {
-                id: &terminal_id,
-                job_id: Some(&job_id),
-                project_id: None,
-                run_id: Some("run-terminal"),
-                session_id: &session_id,
-                command: "sleep 30",
-                title: None,
-                description: None,
-                status: "running",
-                exit_code: None,
-                created_at: now,
-                exited_at: None,
-                slug: Some("sleep"),
-            })
-            .execute(&mut conn)
-            .unwrap();
-
-        let orch = test_orchestrator(conn);
-
-        let pty_system = portable_pty::native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut cmd = CommandBuilder::new("sleep");
-        cmd.arg("30");
-        let child = pair.slave.spawn_command(cmd).unwrap();
-        let writer = pair.master.take_writer().unwrap();
-        let session = PtySession {
-            master: pair.master,
-            writer,
-            child,
-            output_buffer: Some(Arc::new(Mutex::new(VecDeque::new()))),
-            is_agent_spawned: true,
-        };
-        orch.pty_state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), Arc::new(Mutex::new(session)));
-
-        // Interrupt (stop) should NOT kill background terminals
-        stop_session_internal(&orch, "run-terminal").unwrap();
-
-        // Background terminal session should still be alive
-        assert!(orch
-            .pty_state
-            .sessions
-            .lock()
-            .unwrap()
-            .contains_key(&session_id));
-        // Terminal DB record should still exist
-        let mut conn = orch.db.conn.lock().unwrap();
-        let remaining: i64 = job_terminals::table.count().get_result(&mut *conn).unwrap();
-        assert_eq!(remaining, 1);
-    }
-
-    #[test]
-    fn cleanup_job_terminals_kills_background_terminals() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "TST");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Task");
-        let job_id = create_test_job(&mut conn, &issue_id, &project_id, "build", "running", None);
-        insert_test_run(&mut conn, "run-terminal", &issue_id, &project_id, &job_id);
-
-        let session_id = "session-1".to_string();
-        let terminal_id = "terminal-1".to_string();
-        let now = chrono::Utc::now().timestamp() as i32;
-        diesel::insert_into(job_terminals::table)
-            .values(&NewJobTerminal {
-                id: &terminal_id,
-                job_id: Some(&job_id),
-                project_id: None,
-                run_id: Some("run-terminal"),
-                session_id: &session_id,
-                command: "sleep 30",
-                title: None,
-                description: None,
-                status: "running",
-                exit_code: None,
-                created_at: now,
-                exited_at: None,
-                slug: Some("sleep"),
-            })
-            .execute(&mut conn)
-            .unwrap();
-
-        let orch = test_orchestrator(conn);
-
-        let pty_system = portable_pty::native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut cmd = CommandBuilder::new("sleep");
-        cmd.arg("30");
-        let child = pair.slave.spawn_command(cmd).unwrap();
-        let writer = pair.master.take_writer().unwrap();
-        let session = PtySession {
-            master: pair.master,
-            writer,
-            child,
-            output_buffer: Some(Arc::new(Mutex::new(VecDeque::new()))),
-            is_agent_spawned: true,
-        };
-        orch.pty_state
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), Arc::new(Mutex::new(session)));
-
-        // Direct call to cleanup_job_terminals (used by kill_session path)
-        super::cleanup_job_terminals(&orch, "run-terminal");
-
-        // Background terminal session should be removed
-        assert!(!orch
-            .pty_state
-            .sessions
-            .lock()
-            .unwrap()
-            .contains_key(&session_id));
-        // Terminal DB record should be deleted
-        let mut conn = orch.db.conn.lock().unwrap();
-        let remaining: i64 = job_terminals::table.count().get_result(&mut *conn).unwrap();
-        assert_eq!(remaining, 0);
-    }
-
-    #[test]
-    fn finalize_run_marks_active_running_turn_interrupted_on_crash() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "TST");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Task");
-        let job_id = create_test_job(&mut conn, &issue_id, &project_id, "build", "running", None);
-        insert_test_run(&mut conn, "run-crash", &issue_id, &project_id, &job_id);
-
-        let now = chrono::Utc::now().timestamp() as i32;
-        diesel::insert_into(turns::table)
-            .values(&NewTurn {
-                id: "turn-crash",
-                session_id: "session-crash",
-                run_id: Some("run-crash"),
-                job_id: Some(&job_id),
-                manager_id: None,
-                sequence: 1,
-                predecessor_id: None,
-                state: "running",
-                yield_reason: None,
-                start_reason: "initial",
-                created_at: now,
-                started_at: Some(now),
-                ended_at: None,
-                updated_at: now,
-            })
-            .execute(&mut conn)
-            .unwrap();
-        diesel::update(jobs::table.find(&job_id))
-            .set(jobs::current_turn_id.eq(Some("turn-crash")))
-            .execute(&mut conn)
-            .unwrap();
-
-        let orch = test_orchestrator(conn);
-        finalize_run(&orch, "run-crash", RunStatus::Crashed);
-
-        let mut conn = orch.db.conn.lock().unwrap();
-        let turn_state: String = turns::table
-            .find("turn-crash")
-            .select(turns::state)
-            .first(&mut *conn)
-            .unwrap();
-        assert_eq!(turn_state, "interrupted");
-    }
-}
-/// Query whether a failed job belongs to a managed issue.
-///
-/// Returns `(manager_id, issue_number, issue_title)` if the job is linked to an
-/// issue with a `manager_id`.
-///
-/// We deliberately wake on any failed job under a managed issue. Manager mailbox
-/// batching absorbs duplicate failures, and in practice nested job failures still
-/// represent manager-relevant state transitions for the issue.
-#[cfg_attr(test, allow(dead_code))]
-pub(crate) fn get_manager_wake_info(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    job_id: &str,
-) -> Option<(String, i32, String)> {
-    jobs::table
-        .inner_join(issues::table.on(jobs::issue_id.eq(issues::id.nullable())))
-        .filter(jobs::id.eq(job_id))
-        .filter(issues::manager_id.is_not_null())
-        .select((
-            issues::manager_id.assume_not_null(),
-            issues::number,
-            issues::title,
-        ))
-        .first(conn)
-        .ok()
-}
-
-/// Check if a failed job belongs to a managed issue and wake the manager.
-///
-/// This is called from `finalize_run` when a job transitions to Failed.
-/// The failing job is on the *managed issue*, not the manager's own job.
-pub fn wake_manager_on_failure(orch: &Orchestrator, job_id: &str) {
-    let wake_info: Option<(String, i32, String)> = {
-        let Ok(mut conn) = orch.db.conn.lock() else {
-            return;
-        };
-        get_manager_wake_info(&mut conn, job_id)
-    };
-
-    let Some((manager_id, issue_number, issue_title)) = wake_info else {
-        return;
-    };
-
-    log::info!(
-        "Managed issue #{} failed, waking manager {}",
-        issue_number,
-        manager_id
-    );
-
-    // wake_manager handles first-wake vs subsequent-wake.
-    // For FirstWake, we can only log + start_agent_session here since we're in cairn-core.
-    // But this is fine — wake_manager returns WakeResult which the caller handles.
-    // In this case we're in cairn-core so we need to handle FirstWake inline.
-    use crate::managers::wake::{
-        acknowledge_prepared_manager_wake, release_prepared_manager_wake, wake_manager, WakeResult,
-        WakeTrigger,
-    };
-
-    let trigger = WakeTrigger::IssueFailed {
-        issue_number,
-        issue_title,
-        error: None,
-    };
-
-    match wake_manager(orch, &manager_id, trigger) {
-        Ok(WakeResult::FirstWake(prepared)) => {
-            let run = &prepared.prepared_job;
-            if let Err(e) = crate::orchestrator::session::start_agent_session(
-                orch,
-                &run.run_id,
-                &run.prompt,
-                &run.worktree_path,
-                crate::backends::SessionStart::New {
-                    session_id: run.session_id.clone(),
-                },
-                run.job_model.clone(),
-                None,
-                run.agent_config.as_ref(),
-                run.artifact_schema_info.as_ref(),
-                false,
-                run.execution_id.as_deref(),
-                None,
-            ) {
-                let _ = release_prepared_manager_wake(orch, &prepared);
-                log::error!("Failed to start manager session on issue failure: {}", e);
-            } else {
-                if let Err(e) = acknowledge_prepared_manager_wake(orch, &prepared) {
-                    log::error!("Failed to acknowledge prepared manager wake: {}", e);
-                }
-                // Wire turn lifecycle
-                orch.process_state
-                    .set_current_turn_id(&run.run_id, Some(&run.turn_id));
-                if let Ok(mut conn) = orch.db.conn.lock() {
-                    let _ = crate::transitions::start_turn(
-                        &mut conn,
-                        &run.turn_id,
-                        &run.run_id,
-                        &*orch.services.emitter,
-                    );
-                }
-            }
-        }
-        Ok(WakeResult::Resumed(run)) => {
-            log::info!(
-                "Manager {} resumed on issue failure, run {}",
-                manager_id,
-                &run.id[..run.id.len().min(8)]
-            );
-        }
-        Ok(WakeResult::AlreadyRunning) => {
-            log::info!(
-                "Manager {} already running, failure trigger delivered inline",
-                manager_id
-            );
-        }
-        Ok(WakeResult::Inactive) => {}
-        Err(e) => {
-            log::error!(
-                "Failed to wake manager {} on issue failure: {}",
-                manager_id,
-                e
-            );
+            log::warn!("failed to finalize terminal {session_id} on session kill: {error}");
         }
     }
 }
@@ -1158,9 +1434,7 @@ pub fn kill_session_with_reason(
         RunStatus::Exited
     };
 
-    if let Ok(mut conn) = orch.db.conn.lock() {
-        let _ = crate::transitions::set_exit_reason(&mut conn, run_id, exit_reason);
-    }
+    let _ = set_exit_reason(orch, run_id, exit_reason);
 
     finalize_run(orch, run_id, final_status);
 
@@ -1168,210 +1442,738 @@ pub fn kill_session_with_reason(
 }
 
 #[cfg(test)]
-mod warm_exit_tests {
-    use super::*;
+mod memory_review_tests {
+    use super::finish_memory_review_if_due;
     use crate::db::DbState;
-    use crate::diesel_models::NewRun;
-    use crate::schema::{jobs, runs};
-    use crate::services::testing::{CapturingEmitter, MockChildProcess, TestServicesBuilder};
-    use crate::test_utils::{
-        create_test_issue, create_test_job, create_test_project, test_diesel_conn,
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{
+        DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
     };
+    use std::sync::Arc;
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("memory-review.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    fn test_orchestrator(db: LocalDb) -> crate::orchestrator::Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        std::fs::write(
+            config_dir.join("recipes/memory-triage.yaml"),
+            include_str!("../../../../recipes/memory-triage.yaml"),
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("agents/integrator.md"),
+            include_str!("../../../../agents/integrator.md"),
+        )
+        .unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    async fn seed_job(db: &LocalDb, review_state: Option<&str>) {
+        seed_job_row(db, review_state, false).await;
+        insert_draft_memory(db, "m-review", 1).await;
+    }
+
+    /// Insert the project/issue/execution scaffold and the `j-review` job
+    /// without any draft memory. When `is_task` is set, a parent job is
+    /// inserted first and `j-review.parent_job_id` points at it, so the job
+    /// reads back as a sub-agent task.
+    async fn seed_job_row(db: &LocalDb, review_state: Option<&str>, is_task: bool) {
+        db.write(|conn| {
+            let review_state = review_state.map(str::to_string);
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-review','recipe','i-review','p-review','running',1,1)", ()).await?;
+                let parent_job_id = if is_task {
+                    conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-parent','e-review','coordinator','i-review','p-review','complete','coordinator','coordinator',1,1)", ()).await?;
+                    Some("j-parent")
+                } else {
+                    None
+                };
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, memory_review_state, created_at, updated_at) VALUES ('j-review','e-review','builder',?1,'i-review','p-review','complete','builder','builder',?2,1,1)",
+                    (parent_job_id, review_state.as_deref()),
+                ).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn insert_draft_memory(db: &LocalDb, id: &str, node_seq: i64) {
+        crate::memories::db::create_memory(
+            db,
+            id,
+            Some(id),
+            "remember durable behavior",
+            Some("p-review"),
+            "project",
+            "p-review",
+            Some("j-review"),
+            Some(node_seq),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_artifact(db: &LocalDb) {
+        db.execute(
+            "INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-review','j-review','create-pr',1,'{}',1,'create-pr',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_run_session_with_turns(db: &LocalDb, turn_count: i64) {
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO sessions (id, job_id, status, created_at, updated_at) VALUES ('s-review','j-review','open',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs (id, issue_id, project_id, job_id, status, session_id, created_at, updated_at) VALUES ('run-review','i-review','p-review','j-review','completed','s-review',1,1)",
+                    (),
+                )
+                .await?;
+                for sequence in 1..=turn_count {
+                    conn.execute(
+                        "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES (?1,'s-review','run-review','j-review',?2,'complete','initial',?2,?2)",
+                        (format!("t-work-{sequence}"), sequence),
+                    )
+                    .await?;
+                }
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Insert a MemoryReview turn for `j-review` in the given state. Review
+    /// completion now keys off this turn reaching a terminal state, so the
+    /// `sent` path needs one present to fire.
+    async fn insert_review_turn(db: &LocalDb, state: &str) {
+        db.write(|conn| {
+            let state = state.to_string();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT OR IGNORE INTO sessions (id, job_id, status, created_at, updated_at) VALUES ('s-review','j-review','open',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('t-review','s-review','j-review',1,?1,'memory_review',2,2)",
+                    (state,),
+                )
+                .await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn memory_status(orch: &crate::orchestrator::Orchestrator) -> String {
+        orch.db
+            .local
+            .query_one(
+                "SELECT status FROM memories WHERE id = 'm-review'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn review_state(orch: &crate::orchestrator::Orchestrator) -> Option<String> {
+        orch.db
+            .local
+            .query_one(
+                "SELECT memory_review_state FROM jobs WHERE id = 'j-review'",
+                (),
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn null_with_drafts_sends_review_without_confirming() {
+        let db = test_db().await;
+        seed_job(&db, None).await;
+        insert_artifact(&db).await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
+        assert_eq!(memory_status(&orch).await, "draft");
+        let messages = orch
+            .db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND recipient_run_id = 'run-review' AND content LIKE '%Draft memories:%'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(messages, 1);
+    }
+
+    #[tokio::test]
+    async fn null_with_drafts_but_no_artifact_does_not_send_review() {
+        let db = test_db().await;
+        seed_job(&db, None).await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await, None);
+        assert_eq!(memory_status(&orch).await, "draft");
+        let messages = orch
+            .db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND recipient_run_id = 'run-review'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(messages, 0);
+    }
+
+    #[tokio::test]
+    async fn sent_idle_confirms_surviving_drafts_and_spawns_triage() {
+        let db = test_db().await;
+        seed_job(&db, Some("sent")).await;
+        for node_seq in 2..=5 {
+            insert_draft_memory(&db, &format!("m-review-{node_seq}"), node_seq).await;
+        }
+        // The review turn has ended (Complete): completion is allowed to fire.
+        insert_review_turn(&db, "complete").await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await.as_deref(), Some("done"));
+        assert_eq!(
+            orch.db
+                .local
+                .query_one(
+                    "SELECT COUNT(*) FROM memories WHERE job_id = 'j-review' AND status = 'draft'",
+                    (),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_one(
+                    "SELECT COUNT(*) FROM memories WHERE job_id = 'j-review' AND status = 'claimed' AND scope = 'project' AND scope_value = 'p-review'",
+                    (),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_one(
+                    "SELECT COUNT(*)
+                     FROM issues i
+                     JOIN executions e ON e.issue_id = i.id
+                     WHERE i.project_id = 'p-review'
+                       AND i.title LIKE 'Memory triage: project=p-review%'
+                       AND e.recipe_id = 'memory-triage'",
+                    (),
+                    |row| row.i64(0),
+                )
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    async fn direct_message_count(orch: &crate::orchestrator::Orchestrator, like: &str) -> i64 {
+        let like = like.to_string();
+        orch.db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND recipient_run_id = 'run-review' AND content LIKE ?1",
+                (like,),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn null_no_drafts_node_job_short_session_does_not_send_reflection() {
+        let db = test_db().await;
+        seed_job_row(&db, None, false).await;
+        insert_artifact(&db).await;
+        insert_run_session_with_turns(&db, 10).await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await, None);
+        assert_eq!(direct_message_count(&orch, "%").await, 0);
+    }
+
+    #[tokio::test]
+    async fn null_no_drafts_node_job_long_session_sends_reflection() {
+        let db = test_db().await;
+        seed_job_row(&db, None, false).await;
+        insert_artifact(&db).await;
+        insert_run_session_with_turns(&db, 11).await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
+        // A reflection prompt went out, and it is not the draft-review variant.
+        assert_eq!(direct_message_count(&orch, "%reflect%").await, 1);
+        assert_eq!(direct_message_count(&orch, "%Draft memories:%").await, 0);
+    }
+
+    #[tokio::test]
+    async fn null_no_drafts_task_does_not_send_reflection() {
+        let db = test_db().await;
+        seed_job_row(&db, None, true).await;
+        insert_artifact(&db).await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await, None);
+        assert_eq!(direct_message_count(&orch, "%").await, 0);
+    }
+
+    #[tokio::test]
+    async fn null_with_drafts_task_sends_review() {
+        let db = test_db().await;
+        seed_job_row(&db, None, true).await;
+        insert_draft_memory(&db, "m-review", 1).await;
+        insert_artifact(&db).await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        // Review fires for tasks too when they captured drafts.
+        assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
+        assert_eq!(direct_message_count(&orch, "%Draft memories:%").await, 1);
+    }
+
+    #[tokio::test]
+    async fn sent_with_running_review_turn_does_not_complete() {
+        // The core CAIRN-1576 fix: a warm transition that lands while the
+        // reflection turn is still running must not confirm surviving drafts or
+        // mark the review done. Completion waits for the review turn to end.
+        let db = test_db().await;
+        seed_job(&db, Some("sent")).await;
+        insert_review_turn(&db, "running").await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
+        assert_eq!(memory_status(&orch).await, "draft");
+    }
+
+    #[tokio::test]
+    async fn done_state_is_noop() {
+        let db = test_db().await;
+        seed_job(&db, Some("done")).await;
+        let orch = test_orchestrator(db);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+
+        assert_eq!(review_state(&orch).await.as_deref(), Some("done"));
+        assert_eq!(memory_status(&orch).await, "draft");
+    }
+}
+
+/// CAIRN-1582: a run that completes via the terminal-tool warm transition
+/// (instead of `finalize_run`) must still carry the full completion contract —
+/// wake a suspended delegated parent and signal the internal completion
+/// broadcast. CAIRN-1576 routed terminal-tool completion through
+/// `transition_to_warm_state`, and that path had dropped both, leaving batch
+/// parents hung forever.
+#[cfg(test)]
+mod warm_completion_tests {
+    use super::{finalize_run, transition_to_warm_state};
+    use crate::agent_process::process::{wrap_plain_stdin, RunHandle};
+    use crate::db::DbState;
+    use crate::models::RunStatus;
+    use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::services::EventEmitter;
+    use crate::storage::{
+        DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
+    };
+    use serde_json::Value;
     use std::sync::{Arc, Mutex};
 
-    fn test_orchestrator_with_emitter(
-        conn: diesel::sqlite::SqliteConnection,
-    ) -> (Orchestrator, Arc<CapturingEmitter>) {
-        let db = Arc::new(DbState {
-            conn: Mutex::new(conn),
-        });
-        let emitter = Arc::new(CapturingEmitter::new());
-        let mut services = TestServicesBuilder::new().build();
-        services.emitter = emitter.clone();
-        let services = Arc::new(services);
-        let account_manager = Arc::new(crate::orchestrator::AccountManager::new(
-            db.clone(),
-            services.emitter.clone(),
-        ));
-        let sync_tx = Arc::new(Mutex::new(None));
-        let orch = Orchestrator {
-            db,
-            services: services.clone(),
-            process_state: Arc::new(crate::agent_process::process::AgentProcessState::default()),
-            mcp_auth: Arc::new(crate::mcp::McpAuthState::new(std::path::PathBuf::from(
-                "/tmp",
-            ))),
-            warm_gc: None,
-            pty_state: Arc::new(crate::services::PtyState::default()),
-            permission_responses: tokio::sync::broadcast::channel(16).0,
-            run_completions: tokio::sync::broadcast::channel(64).0,
-            prompt_responses: tokio::sync::broadcast::channel(16).0,
-            trigger_events: tokio::sync::broadcast::channel(256).0,
-            session_allowed_tools: Arc::new(Mutex::new(std::collections::HashSet::new())),
-            identity_store: Arc::new(Mutex::new(None)),
-            mcp_binary_path: "cairn-mcp".to_string(),
-            config_dir: std::path::PathBuf::from("/tmp"),
-            schema_dir: None,
-            mcp_callback_port: 3847,
-            embedding_engine: None,
-            vibe_state: None,
-            account_manager,
-            sync_tx: sync_tx.clone(),
-            notifier: crate::notify::Notifier::new(sync_tx, services.emitter.clone()),
-            api_config: crate::api::ApiConfig::default(),
-            effect_tx: None,
-            model_catalog: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-            provider_usage_snapshots: Default::default(),
-            executor: Arc::new(std::sync::OnceLock::new()),
-        };
-        (orch, emitter)
+    #[derive(Clone, Default)]
+    struct SharedCaptureEmitter {
+        events: Arc<Mutex<Vec<(String, Value)>>>,
     }
 
-    fn insert_test_run(
-        conn: &mut diesel::sqlite::SqliteConnection,
-        run_id: &str,
-        issue_id: &str,
-        project_id: &str,
-        job_id: &str,
-        session_id: &str,
-    ) {
-        let now = chrono::Utc::now().timestamp() as i32;
-        diesel::insert_into(runs::table)
-            .values(&NewRun {
-                id: run_id,
-                issue_id: Some(issue_id),
-                project_id: Some(project_id),
-                job_id: Some(job_id),
-                status: Some("live"),
-                session_id: Some(session_id),
-                error_message: None,
-                started_at: Some(now),
-                exited_at: None,
-                created_at: now,
-                updated_at: now,
-                backend: None,
-                exit_reason: None,
-                start_mode: None,
-                chat_id: None,
-            })
-            .execute(conn)
+    impl SharedCaptureEmitter {
+        fn events_named(&self, name: &str) -> Vec<Value> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(event, _)| event == name)
+                .map(|(_, payload)| payload.clone())
+                .collect()
+        }
+    }
+
+    impl EventEmitter for SharedCaptureEmitter {
+        fn emit(&self, event: &str, payload: Value) -> Result<(), String> {
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.to_string(), payload));
+            Ok(())
+        }
+
+        fn emit_empty(&self, event: &str) -> Result<(), String> {
+            self.emit(event, Value::Null)
+        }
+    }
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.keep().join("warm-completion.db"))
+            .await
             .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
     }
 
-    fn register_warm_process(orch: &Orchestrator, run_id: &str, session_id: &str, job_id: &str) {
-        let child = Arc::new(Mutex::new(Some(Box::new(MockChildProcess::with_stdout(
-            999_999,
-            vec![],
-        ))
-            as Box<dyn crate::services::ChildProcess>)));
-        let stdin = Arc::new(Mutex::new(None));
-        let mut handle = crate::agent_process::process::RunHandle::new(
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        test_orchestrator_with_emitter(db, None).0
+    }
+
+    fn test_orchestrator_with_emitter(
+        db: LocalDb,
+        emitter: Option<SharedCaptureEmitter>,
+    ) -> (Orchestrator, SharedCaptureEmitter) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let emitter = emitter.unwrap_or_default();
+        let services = Arc::new(
+            TestServicesBuilder::new()
+                .with_emitter(emitter.clone())
+                .build(),
+        );
+        (
+            OrchestratorBuilder::new(db_state, services, config_dir).build(),
+            emitter,
+        )
+    }
+
+    /// Register a warm-able process so `transition_to_warm` succeeds. The stdin
+    /// is an in-memory writer; the child slot is empty (no real process).
+    fn register_warm_process(orch: &Orchestrator, run_id: &str, job_id: Option<&str>) {
+        let mut processes = orch.process_state.processes.lock().unwrap();
+        let child = Arc::new(Mutex::new(None));
+        let stdin = Arc::new(Mutex::new(Some(wrap_plain_stdin(Box::new(
+            Vec::<u8>::new(),
+        )))));
+        let handle = RunHandle::new(
             child,
             stdin,
-            Some(session_id.to_string()),
-            Some(job_id.to_string()),
+            Some(format!("sess-{run_id}")),
+            job_id.map(str::to_string),
         );
-        handle.transition_to_warm();
-        orch.process_state
-            .processes
-            .lock()
+        processes.register(run_id.to_string(), handle);
+    }
+
+    async fn turn_state(orch: &Orchestrator, id: &str) -> String {
+        let id = id.to_string();
+        orch.db
+            .local
+            .read(move |conn| {
+                let id = id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query("SELECT state FROM turns WHERE id = ?1", (id.as_str(),))
+                        .await?;
+                    rows.next().await?.unwrap().text(0)
+                })
+            })
+            .await
             .unwrap()
-            .register(run_id.to_string(), handle);
     }
 
-    #[test]
-    fn warm_evict_does_not_emit_duplicate_completion_attention() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "WARM");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Warm issue");
-        let job_id = create_test_job(
-            &mut conn,
-            &issue_id,
-            &project_id,
-            "planner",
-            "complete",
-            None,
+    async fn seed_top_level_run(
+        db: &LocalDb,
+        run_id: &str,
+        job_id: &str,
+        turn_id: &str,
+        attention: &str,
+    ) {
+        let run_id = run_id.to_string();
+        let job_id = job_id.to_string();
+        let turn_id = turn_id.to_string();
+        let attention = attention.to_string();
+        db.write(move |conn| {
+            let run_id = run_id.clone();
+            let job_id = job_id.clone();
+            let turn_id = turn_id.clone();
+            let attention = attention.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-attn','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-attn','w-attn','Project','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-attn','p-attn',42,'Toast issue','active',?1,1,1)", (attention.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, issue_id, project_id, status, node_name, created_at, updated_at) VALUES (?1,'i-attn','p-attn','running','builder',1,1)", (job_id.as_str(),)).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES (?1,?2,'live',1,1)", (run_id.as_str(), job_id.as_str())).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES (?1,'sess-attn',?2,1,'running','initial',1,1)", (turn_id.as_str(), job_id.as_str())).await?;
+                conn.execute("UPDATE jobs SET current_turn_id = ?1 WHERE id = ?2", (turn_id.as_str(), job_id.as_str())).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    }
+
+    fn agent_attention_events(emitter: &SharedCaptureEmitter, attention_type: &str) -> Vec<Value> {
+        emitter
+            .events_named("agent-attention")
+            .into_iter()
+            .filter(|payload| payload.get("type").and_then(Value::as_str) == Some(attention_type))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn warm_transition_emits_completion_attention_for_top_level_run() {
+        let db = test_db().await;
+        // Issue still needs the driver (plan/PR awaiting confirmation looks like
+        // this): the turn-end is a real idle-with-work, so the toast fires.
+        seed_top_level_run(&db, "run-attn", "job-attn", "turn-attn", "needs_approval").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+        register_warm_process(&orch, "run-attn", Some("job-attn"));
+        orch.process_state
+            .set_current_turn_id("run-attn", Some("turn-attn"));
+
+        assert!(transition_to_warm_state(&orch, "run-attn"));
+
+        let completed = agent_attention_events(&emitter, "completed");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(
+            completed[0].get("projectKey"),
+            Some(&Value::String("PRJ".into()))
         );
-        insert_test_run(
-            &mut conn,
-            "run-warm",
-            &issue_id,
-            &project_id,
-            &job_id,
-            "session-1",
+        assert_eq!(
+            completed[0].get("issueNumber").and_then(Value::as_i64),
+            Some(42)
         );
-
-        let (orch, emitter) = test_orchestrator_with_emitter(conn);
-        register_warm_process(&orch, "run-warm", "session-1", &job_id);
-
-        kill_session_with_reason(&orch, "run-warm", "warm_evict").unwrap();
-
-        let mut conn = orch.db.conn.lock().unwrap();
-        let job_status: String = jobs::table
-            .find(&job_id)
-            .select(jobs::status)
-            .first(&mut *conn)
-            .unwrap();
-        let run_status: Option<String> = runs::table
-            .find("run-warm")
-            .select(runs::status)
-            .first(&mut *conn)
-            .unwrap();
-        drop(conn);
-
-        assert_eq!(job_status, "complete");
-        assert_eq!(run_status.as_deref(), Some("exited"));
-        assert!(
-            emitter.events_named("agent-attention").is_empty(),
-            "warm eviction should not emit a new completion notification"
+        assert_eq!(
+            completed[0].get("issueTitle").and_then(Value::as_str),
+            Some("Toast issue")
+        );
+        assert_eq!(
+            completed[0].get("nodeName").and_then(Value::as_str),
+            Some("builder")
         );
     }
 
-    #[test]
-    fn warm_evict_preserves_blocked_job_status() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test", "WARM");
-        let issue_id = create_test_issue(&mut conn, &project_id, "Blocked issue");
-        let job_id = create_test_job(
-            &mut conn,
-            &issue_id,
-            &project_id,
-            "builder",
-            "blocked",
-            None,
-        );
-        insert_test_run(
-            &mut conn,
-            "run-blocked",
-            &issue_id,
-            &project_id,
-            &job_id,
-            "session-2",
-        );
+    #[tokio::test]
+    async fn warm_transition_without_actionable_work_skips_completed_attention() {
+        let db = test_db().await;
+        // attention=none, status=active, no PR: the turn ended cleanly with
+        // nothing for the driver to act on — a planner that just spawned child
+        // tasks and is now waiting on them looks exactly like this. The desktop
+        // "completed" toast must stay silent (CAIRN-1625).
+        seed_top_level_run(&db, "run-quiet", "job-quiet", "turn-quiet", "none").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+        register_warm_process(&orch, "run-quiet", Some("job-quiet"));
+        orch.process_state
+            .set_current_turn_id("run-quiet", Some("turn-quiet"));
 
-        let (orch, emitter) = test_orchestrator_with_emitter(conn);
-        register_warm_process(&orch, "run-blocked", "session-2", &job_id);
+        assert!(transition_to_warm_state(&orch, "run-quiet"));
 
-        kill_session_with_reason(&orch, "run-blocked", "warm_evict").unwrap();
+        assert!(agent_attention_events(&emitter, "completed").is_empty());
+    }
 
-        let mut conn = orch.db.conn.lock().unwrap();
-        let job_status: String = jobs::table
-            .find(&job_id)
-            .select(jobs::status)
-            .first(&mut *conn)
-            .unwrap();
-        let run_status: Option<String> = runs::table
-            .find("run-blocked")
-            .select(runs::status)
-            .first(&mut *conn)
-            .unwrap();
-        drop(conn);
+    #[tokio::test]
+    async fn later_finalize_does_not_duplicate_completed_attention() {
+        let db = test_db().await;
+        seed_top_level_run(
+            &db,
+            "run-dedupe",
+            "job-dedupe",
+            "turn-dedupe",
+            "needs_approval",
+        )
+        .await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+        register_warm_process(&orch, "run-dedupe", Some("job-dedupe"));
+        orch.process_state
+            .set_current_turn_id("run-dedupe", Some("turn-dedupe"));
 
-        assert_eq!(job_status, "blocked");
-        assert_eq!(run_status.as_deref(), Some("exited"));
-        assert!(
-            emitter.events_named("agent-attention").is_empty(),
-            "warm eviction should not surface a new attention event for blocked jobs"
-        );
+        assert!(transition_to_warm_state(&orch, "run-dedupe"));
+        finalize_run(&orch, "run-dedupe", RunStatus::Exited);
+
+        assert_eq!(agent_attention_events(&emitter, "completed").len(), 1);
+        assert_eq!(emitter.events_named("run-completed").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clean_finalize_without_prior_warm_does_not_emit_completed_attention() {
+        let db = test_db().await;
+        seed_top_level_run(&db, "run-finalize", "job-finalize", "turn-finalize", "none").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+
+        finalize_run(&orch, "run-finalize", RunStatus::Exited);
+
+        assert!(agent_attention_events(&emitter, "completed").is_empty());
+    }
+
+    #[tokio::test]
+    async fn crash_finalize_emits_failed_attention_once() {
+        let db = test_db().await;
+        seed_top_level_run(&db, "run-crash", "job-crash", "turn-crash", "none").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+
+        finalize_run(&orch, "run-crash", RunStatus::Crashed);
+        finalize_run(&orch, "run-crash", RunStatus::Crashed);
+
+        assert_eq!(agent_attention_events(&emitter, "failed").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn warm_transition_broadcasts_run_completion() {
+        let db = test_db().await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch, "run-bcast", None);
+
+        // `spawn_task_packets`' inline 45s wait subscribes here to detect a
+        // fast-finishing child. A warmed child must broadcast on it just like
+        // `finalize_run` does, or a sub-45s batch never returns inline.
+        let mut rx = orch.run_completions.subscribe();
+        assert!(transition_to_warm_state(&orch, "run-bcast"));
+
+        assert_eq!(rx.try_recv().ok(), Some("run-bcast".to_string()));
+    }
+
+    /// Seed a parent suspended on a delegated wait (anchor turn + pending
+    /// `dependency_unblock` successor it points at) and a completed delegated
+    /// child whose execution snapshot carries the matching packet. The parent
+    /// has no session, so once the resume gate claims the successor the
+    /// subsequent `continue_job_impl` fast-fails cleanly — the claimed successor
+    /// is the observable proof the resume fired.
+    async fn seed_suspended_parent_with_completed_child(db: &LocalDb, snapshot: String) {
+        db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-warm','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-warm','p-warm',1,'T','active','none',1,1)", ()).await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-warm','recipe','i-warm','p-warm','running',1,1,?1)",
+                    (snapshot.as_str(),),
+                ).await?;
+                // Anchor turn the parent suspended on, plus its pending
+                // dependency_unblock successor (what the resume gate claims).
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('anchor','s-parent','j-parent',1,'yielded','dependency_wait','initial',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at) VALUES ('succ','s-parent','j-parent',2,'anchor','pending','dependency_unblock',1,1)", ()).await?;
+                // Suspended parent: current_turn_id points at the pending
+                // successor; no current_session_id so the post-claim
+                // continue_job_impl fast-fails after the successor is claimed.
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, current_turn_id, created_at, updated_at) VALUES ('j-parent','e-warm','i-warm','p-warm','waiting','succ',1,1)", ()).await?;
+                // Completed delegated child whose run finishes via the warm path.
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, created_at, updated_at) VALUES ('j-child','e-warm','j-parent','i-warm','p-warm','complete',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','live',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn warm_completion_resumes_suspended_delegated_parent() {
+        let snapshot = serde_json::json!({
+            "recipe": {"id": "r", "name": "R", "description": null, "trigger": "manual", "nodes": [], "edges": []},
+            "agents": {},
+            "skills": {},
+            "triggerContext": {"issueId": "i-warm", "projectId": "p-warm", "triggerType": "manual"},
+            "delegatedPackets": [{
+                "id": "pkt-1",
+                "parentJobId": "j-parent",
+                "parentTurnId": "anchor",
+                "parentToolUseId": "tool-1",
+                "origin": "task_tool",
+                "title": "Explore",
+                "problemStatement": "x",
+                "agentConfigId": "Explore",
+                "ownership": {"cwd": "/tmp"},
+                "outputContract": {"schemaType": "return"},
+                "resultArtifactJobId": "j-child",
+                "status": "completed",
+                "taskIndex": 0,
+                "createdAt": 0
+            }],
+            "createdAt": 0
+        })
+        .to_string();
+
+        let db = test_db().await;
+        seed_suspended_parent_with_completed_child(&db, snapshot).await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch, "run-child", Some("j-child"));
+
+        // Pre-completion: the parent's resume successor is still pending.
+        assert_eq!(turn_state(&orch, "succ").await, "pending");
+
+        // The child completes through the warm path (CAIRN-1576), not finalize_run.
+        assert!(transition_to_warm_state(&orch, "run-child"));
+
+        // The resume gate fired: the pending successor was claimed (flipped
+        // terminal), the linkage finalize_run's try_resume_delegated_parent
+        // produces. Before the fix this stayed 'pending' forever and the parent
+        // batch hung.
+        assert_eq!(turn_state(&orch, "succ").await, "complete");
     }
 }

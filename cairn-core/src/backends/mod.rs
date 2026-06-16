@@ -20,13 +20,14 @@
 
 pub mod claude;
 pub mod codex;
+pub mod context_window;
+mod run_state;
 pub mod stdin;
 
 use crate::agent_process::process::BackendStdin;
-use crate::models::{ApprovalPolicy, FilesystemScope, Model};
+use crate::models::{Fence, Model};
 use crate::orchestrator::Orchestrator;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStart {
@@ -71,33 +72,21 @@ impl SessionStart {
 
 /// Backend-resolved agent permissions.
 ///
-/// Constructed from the two enum fields on agent configs / snapshots.
-/// Each backend translates these into its own CLI flags or protocol fields.
+/// Each backend translates the canonical [`Fence`] into its own CLI flags or
+/// protocol fields. Actual enforcement lives in Cairn's verb handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentPermissions {
-    pub approval: ApprovalPolicy,
-    pub filesystem: FilesystemScope,
+    pub fence: Fence,
 }
 
 impl AgentPermissions {
-    pub fn new(approval: ApprovalPolicy, filesystem: FilesystemScope) -> Self {
-        Self {
-            approval,
-            filesystem,
-        }
+    pub fn new(fence: Fence) -> Self {
+        Self { fence }
     }
 
     /// Convert to a legacy permission mode string for the runtime stdin protocol.
-    ///
-    /// The stdin protocol (`send_set_permission_mode`) still speaks legacy strings.
-    /// This is lossy for novel combinations — falls back by approval policy.
     pub fn to_legacy_str(&self) -> &'static str {
-        match (self.approval, self.filesystem) {
-            (ApprovalPolicy::AcceptAll, FilesystemScope::FullAccess) => "bypassPermissions",
-            (ApprovalPolicy::AcceptAll, _) => "acceptEdits",
-            (_, FilesystemScope::ReadOnly) => "plan",
-            _ => "default",
-        }
+        self.fence.to_legacy_permission_mode()
     }
 }
 
@@ -135,6 +124,42 @@ pub struct DiscoveredModel {
     pub default_reasoning_effort: Option<String>,
     #[serde(default)]
     pub supported_reasoning_efforts: Vec<DiscoveredReasoningEffort>,
+    #[serde(default)]
+    pub context_window: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderOptionDescriptor {
+    /// Runtime-supported option key. Add variants here only when preset
+    /// resolution and backend launch paths also carry the option end-to-end.
+    pub key: ProviderOptionKey,
+    pub label: String,
+    pub kind: OptionKind,
+    #[serde(default)]
+    pub choices: Vec<OptionChoice>,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OptionChoice {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderOptionKey {
+    ReasoningEffort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OptionKind {
+    Enum,
+    Boolean,
+    String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,6 +167,8 @@ pub struct DiscoveredModel {
 pub struct ProviderModelCatalog {
     pub backend: String,
     pub models: Vec<DiscoveredModel>,
+    #[serde(default)]
+    pub options: Vec<ProviderOptionDescriptor>,
     pub refreshed_at: Option<i64>,
     pub error: Option<String>,
 }
@@ -165,6 +192,11 @@ pub struct SessionConfig {
     pub prompt: String,
     /// Agent role instructions (injected as system prompt content)
     pub system_prompt_content: Option<String>,
+    /// The trailing per-run dynamic suffix of `system_prompt_content` (the
+    /// orientation block + `</agent_role>` close). A suffix of
+    /// `system_prompt_content`; used only to split the agent content into a static
+    /// head and the inlined dynamic tail when recording the segment boundary map.
+    pub system_prompt_dynamic_tail: Option<String>,
     /// Resolved model (job > agent > workspace default)
     pub model: Option<Model>,
     /// Explicit session start semantics for this backend invocation.
@@ -173,11 +205,17 @@ pub struct SessionConfig {
     pub allowed_tools: Vec<String>,
     /// Resolved disallowed tools list
     pub disallowed_tools: Vec<String>,
-    /// Path to the MCP config file (already generated)
-    pub mcp_config_path: PathBuf,
+    /// The MCP config as a self-contained JSON string (built per run, never
+    /// shared on disk). Claude passes it inline via `--mcp-config <json>`; Codex
+    /// parses it to extract the cairn-cli args.
+    pub mcp_config_json: String,
+    /// Stable home URI for this run (full node URI). Forwarded to the MCP child
+    /// as `CAIRN_HOME_URI` so `cairn:~/...` shorthand resolves. Claude bakes this
+    /// into its inline MCP config JSON env; Codex inherits it via the process env.
+    pub home_uri: String,
     /// Max thinking tokens (None = disabled)
     pub max_thinking_tokens: Option<i32>,
-    /// Codex: reasoning effort level ("low", "medium", "high")
+    /// Codex: reasoning effort level ("low", "medium", "high", "xhigh")
     pub reasoning_effort: Option<String>,
     /// Canonical agent permissions (replaces opaque permission_mode string).
     pub permissions: AgentPermissions,
@@ -204,6 +242,11 @@ pub trait AgentBackend: Send + Sync {
 
     /// Discover currently available model options for this backend.
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String>;
+
+    /// Backend-published preset option descriptors.
+    fn option_descriptors(&self) -> Vec<ProviderOptionDescriptor> {
+        Vec::new()
+    }
 
     /// Resolve agent tool names into backend-specific allowed/disallowed lists.
     /// Called after backend selection, before prompt building.
@@ -282,17 +325,16 @@ pub(crate) mod tests {
             working_dir: "/tmp".into(),
             prompt: "hello".into(),
             system_prompt_content: None,
+            system_prompt_dynamic_tail: None,
             model: None,
             session_start,
             allowed_tools: vec![],
             disallowed_tools: vec![],
-            mcp_config_path: PathBuf::from("/tmp/mcp.json"),
+            mcp_config_json: "{\"mcpServers\":{}}".into(),
+            home_uri: "cairn://p/TEST/1/1/node".into(),
             max_thinking_tokens: None,
             reasoning_effort: None,
-            permissions: AgentPermissions::new(
-                ApprovalPolicy::default(),
-                FilesystemScope::default(),
-            ),
+            permissions: AgentPermissions::new(Fence::default()),
             bidirectional: false,
             identity: None,
         }
@@ -303,26 +345,20 @@ pub(crate) mod tests {
     // =========================================================================
 
     #[test]
-    fn to_legacy_str_bypass() {
-        let perms = AgentPermissions::new(ApprovalPolicy::AcceptAll, FilesystemScope::FullAccess);
-        assert_eq!(perms.to_legacy_str(), "bypassPermissions");
-    }
-
-    #[test]
-    fn to_legacy_str_accept_edits() {
-        let perms = AgentPermissions::new(ApprovalPolicy::AcceptAll, FilesystemScope::CwdOnly);
+    fn to_legacy_str_allow_is_accept_edits() {
+        let perms = AgentPermissions::new(Fence::Allow);
         assert_eq!(perms.to_legacy_str(), "acceptEdits");
     }
 
     #[test]
     fn to_legacy_str_ask_is_default() {
-        let perms = AgentPermissions::new(ApprovalPolicy::Ask, FilesystemScope::CwdOnly);
+        let perms = AgentPermissions::new(Fence::Ask);
         assert_eq!(perms.to_legacy_str(), "default");
     }
 
     #[test]
-    fn to_legacy_str_reject_all_is_default() {
-        let perms = AgentPermissions::new(ApprovalPolicy::RejectAll, FilesystemScope::CwdOnly);
+    fn to_legacy_str_deny_is_default() {
+        let perms = AgentPermissions::new(Fence::Deny);
         assert_eq!(perms.to_legacy_str(), "default");
     }
 
@@ -423,6 +459,7 @@ pub(crate) mod tests {
         assert_eq!(backend_for_model("sonnet"), None);
         assert_eq!(backend_for_model("opus"), None);
         assert_eq!(backend_for_model("haiku"), None);
+        assert_eq!(backend_for_model("fable"), None);
     }
 
     #[test]
@@ -448,28 +485,108 @@ pub(crate) mod tests {
         let rt = backend.resolve_tools(&["Read".into(), "Bash".into()], &[]);
         // Should contain Cairn versions
         assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
-        assert!(rt.allowed.contains(&"mcp__cairn__bash".into()));
+        assert!(rt.allowed.contains(&"mcp__cairn__run".into()));
         // Native versions in disallowed
         assert!(rt.disallowed.contains(&"Read".into()));
         assert!(rt.disallowed.contains(&"Bash".into()));
     }
 
     #[test]
-    fn claude_resolve_tools_auto_adds_glob_grep() {
+    fn claude_resolve_tools_aliases_all_three_verbs() {
         let backend = claude::ClaudeBackend;
-        let rt = backend.resolve_tools(&["Read".into()], &[]);
-        assert!(rt.allowed.contains(&"mcp__cairn__glob".into()));
-        assert!(rt.allowed.contains(&"mcp__cairn__grep".into()));
+        let rt = backend.resolve_tools(
+            &["Read".into(), "Write".into(), "Edit".into(), "Bash".into()],
+            &[],
+        );
+        assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
+        assert!(rt.allowed.contains(&"mcp__cairn__write".into()));
+        assert!(rt.allowed.contains(&"mcp__cairn__run".into()));
+        // Friendly names never survive into allowed.
+        assert!(!rt.allowed.contains(&"Read".into()));
+        assert!(!rt.allowed.contains(&"Write".into()));
+        assert!(!rt.allowed.contains(&"Edit".into()));
+        assert!(!rt.allowed.contains(&"Bash".into()));
+    }
+
+    #[test]
+    fn claude_resolve_tools_drops_and_disallows_all_native() {
+        let backend = claude::ClaudeBackend;
+        let native = [
+            "Task",
+            "TaskOutput",
+            "AskUserQuestion",
+            "WebFetch",
+            "WebSearch",
+            "Glob",
+            "Grep",
+            "LSP",
+            "Skill",
+            "NotebookEdit",
+        ];
+        let input: Vec<String> = std::iter::once("Read".to_string())
+            .chain(native.iter().map(|t| t.to_string()))
+            .collect();
+        let rt = backend.resolve_tools(&input, &[]);
+        for tool in native {
+            assert!(
+                !rt.allowed.contains(&tool.to_string()),
+                "{tool} must be dropped from allowed"
+            );
+            assert!(
+                rt.disallowed.contains(&tool.to_string()),
+                "{tool} must be in Claude's disallowed list"
+            );
+        }
+        // Only the aliased read verb + auto-added return survive.
+        assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
+        assert!(rt.allowed.contains(&"mcp__cairn__return".into()));
+    }
+
+    #[test]
+    fn claude_resolve_tools_drops_dead_cairn_names() {
+        let backend = claude::ClaudeBackend;
+        let rt = backend.resolve_tools(
+            &[
+                "mcp__cairn__task".into(),
+                "mcp__cairn__batch_tasks".into(),
+                "mcp__cairn__ask_user".into(),
+                "mcp__cairn__web_fetch".into(),
+                "mcp__cairn__web_search".into(),
+            ],
+            &[],
+        );
+        // None of the dead names survive; the always-on core-verb floor
+        // (CAIRN-1172) plus the auto-added return are all that remain.
+        assert_eq!(
+            rt.allowed,
+            vec![
+                "mcp__cairn__read".to_string(),
+                "mcp__cairn__write".to_string(),
+                "mcp__cairn__run".to_string(),
+                "mcp__cairn__return".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_resolve_tools_keeps_corpus_tools() {
+        let backend = claude::ClaudeBackend;
+        let rt = backend.resolve_tools(
+            &["mcp__cairn__create_pr".into(), "mcp__cairn__read".into()],
+            &[],
+        );
+        assert!(rt.allowed.contains(&"mcp__cairn__create_pr".into()));
+        assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
     }
 
     #[test]
     fn claude_resolve_tools_includes_agent_disallowed() {
         let backend = claude::ClaudeBackend;
         let rt = backend.resolve_tools(
-            &["Read".into(), "mcp__cairn__create_issue".into()],
-            &["mcp__cairn__create_issue".into()],
+            &["Read".into(), "mcp__cairn__update_issue".into()],
+            &["mcp__cairn__update_issue".into()],
         );
-        assert!(rt.disallowed.contains(&"mcp__cairn__create_issue".into()));
+        assert!(rt.disallowed.contains(&"mcp__cairn__update_issue".into()));
     }
 
     #[test]
@@ -478,7 +595,7 @@ pub(crate) mod tests {
         let rt = backend.resolve_tools(&["Read".into(), "Bash".into()], &[]);
         // Codex should have tools in allowed
         assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
-        assert!(rt.allowed.contains(&"mcp__cairn__bash".into()));
+        assert!(rt.allowed.contains(&"mcp__cairn__run".into()));
         // Codex disallowed is empty (Codex ignores it)
         assert!(rt.disallowed.is_empty());
     }
@@ -488,28 +605,14 @@ pub(crate) mod tests {
     // =========================================================================
 
     #[test]
-    fn to_legacy_accept_all_filesystem_scope_determines_legacy() {
-        // AcceptAll + CwdOnly → "acceptEdits"; AcceptAll + FullAccess → "bypassPermissions"
-        let perms_cwd = AgentPermissions {
-            approval: ApprovalPolicy::AcceptAll,
-            filesystem: FilesystemScope::CwdOnly,
+    fn to_legacy_fence_determines_legacy() {
+        let allow = AgentPermissions {
+            fence: Fence::Allow,
         };
-        assert_eq!(perms_cwd.to_legacy_str(), "acceptEdits");
+        assert_eq!(allow.to_legacy_str(), "acceptEdits");
 
-        let perms_full = AgentPermissions {
-            approval: ApprovalPolicy::AcceptAll,
-            filesystem: FilesystemScope::FullAccess,
-        };
-        assert_eq!(perms_full.to_legacy_str(), "bypassPermissions");
-    }
-
-    #[test]
-    fn to_legacy_ask_full_access_falls_to_default() {
-        let perms = AgentPermissions {
-            approval: ApprovalPolicy::Ask,
-            filesystem: FilesystemScope::FullAccess,
-        };
-        assert_eq!(perms.to_legacy_str(), "default");
+        let ask = AgentPermissions { fence: Fence::Ask };
+        assert_eq!(ask.to_legacy_str(), "default");
     }
 
     // =========================================================================
@@ -517,7 +620,7 @@ pub(crate) mod tests {
     // =========================================================================
 
     #[test]
-    fn claude_resolve_tools_auto_adds_return_and_skill() {
+    fn claude_resolve_tools_auto_adds_return() {
         let backend = claude::ClaudeBackend;
         let rt = backend.resolve_tools(&["Read".into()], &[]);
         assert!(
@@ -525,8 +628,8 @@ pub(crate) mod tests {
             "return tool should be auto-added"
         );
         assert!(
-            rt.allowed.contains(&"mcp__cairn__skill".into()),
-            "skill tool should be auto-added"
+            !rt.allowed.contains(&"mcp__cairn__skill".into()),
+            "skill tool was removed and must not be auto-added"
         );
     }
 
@@ -557,7 +660,60 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn codex_resolve_tools_auto_adds_return_and_skill() {
+    fn claude_resolve_tools_blocks_host_harness_tools() {
+        let backend = claude::ClaudeBackend;
+        // Claude Code (the host harness) declares its built-in tools to the
+        // model unless they are named in --disallowedTools. None has a Cairn
+        // equivalent, so even if an agent config lists one it must be stripped
+        // from `allowed` and present in `disallowed`.
+        let harness_tools = [
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "ScheduleWakeup",
+            "RemoteTrigger",
+            "EnterWorktree",
+            "ExitWorktree",
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            "Monitor",
+            "TaskStop",
+            "PushNotification",
+            "DesignSync",
+        ];
+        let agent_tools: Vec<String> = harness_tools.iter().map(|t| t.to_string()).collect();
+        let rt = backend.resolve_tools(&agent_tools, &[]);
+        for tool in harness_tools {
+            assert!(
+                rt.disallowed.contains(&tool.to_string()),
+                "{tool} must be disallowed"
+            );
+            assert!(
+                !rt.allowed.contains(&tool.to_string()),
+                "{tool} must not be in allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_resolve_tools_blocks_native_todo_write() {
+        let backend = claude::ClaudeBackend;
+        // Agents previously carried `TodoWrite`; todos now go through `write`.
+        // Native TodoWrite must be disallowed, never silently enabled (it would
+        // store nothing).
+        let rt = backend.resolve_tools(&["Read".into(), "TodoWrite".into()], &[]);
+        assert!(
+            rt.disallowed.contains(&"TodoWrite".into()),
+            "TodoWrite must be disallowed"
+        );
+        assert!(
+            !rt.allowed.contains(&"TodoWrite".into()),
+            "TodoWrite must not be in allowed"
+        );
+    }
+
+    #[test]
+    fn codex_resolve_tools_auto_adds_return() {
         let backend = codex::CodexBackend;
         let rt = backend.resolve_tools(&["Read".into()], &[]);
         assert!(
@@ -565,29 +721,19 @@ pub(crate) mod tests {
             "return tool should be auto-added"
         );
         assert!(
-            rt.allowed.contains(&"mcp__cairn__skill".into()),
-            "skill tool should be auto-added"
+            !rt.allowed.contains(&"mcp__cairn__skill".into()),
+            "skill tool was removed and must not be auto-added"
         );
     }
 
     #[test]
     fn codex_resolve_tools_ignores_agent_disallowed() {
         let backend = codex::CodexBackend;
-        let rt = backend.resolve_tools(
-            &["Read".into(), "Bash".into()],
-            &["mcp__cairn__bash".into()],
-        );
+        let rt =
+            backend.resolve_tools(&["Read".into(), "Bash".into()], &["mcp__cairn__run".into()]);
         // Codex should still have empty disallowed — agent_disallowed is ignored
         assert!(rt.disallowed.is_empty());
         // And the tool should still be in allowed
-        assert!(rt.allowed.contains(&"mcp__cairn__bash".into()));
-    }
-
-    #[test]
-    fn codex_resolve_tools_auto_adds_glob_grep() {
-        let backend = codex::CodexBackend;
-        let rt = backend.resolve_tools(&["Read".into()], &[]);
-        assert!(rt.allowed.contains(&"mcp__cairn__glob".into()));
-        assert!(rt.allowed.contains(&"mcp__cairn__grep".into()));
+        assert!(rt.allowed.contains(&"mcp__cairn__run".into()));
     }
 }

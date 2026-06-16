@@ -1,199 +1,24 @@
-//! Event embedding computation and storage.
+//! Embedding storage, vibe coloring, and the async gateway worker.
 //!
-//! Computes vector embeddings for assistant text and thinking events
-//! using a local embedding model (no API calls). Embeddings enable
-//! semantic analysis: vibe coloring, loop detection, run comparison.
+//! Embeddings are produced by the cloud `/embed` gateway (Bedrock Cohere v4),
+//! not locally. Assistant event text is embedded at store time by an async
+//! worker, used to assign a vibe color (persisted in `event_vibes`), then
+//! discarded. Corpus resources (issues, skills, memories, artifacts) persist
+//! their vectors in `resource_embeddings` for in-engine recall.
 
-mod engine;
+pub mod client;
+pub mod position;
 pub mod queries;
+pub mod resource_text;
+pub mod vector;
 pub mod vibes;
+mod worker;
 
-pub use engine::{EmbeddingEngine, EmbeddingError};
+pub use client::{EmbeddingClient, InputType, TokenProvider, COHERE_DIMS, COHERE_MODEL};
+pub use position::{PositionConfig, PositionKind, PositionMeta};
+pub use resource_text::artifact_embed_text;
 pub use vibes::VibeState;
-
-use std::sync::{Arc, Mutex};
-
-use diesel::sqlite::SqliteConnection;
-
-/// Startup result: initialized engine + computed VibeState.
-pub struct EmbeddingInit {
-    pub engine: Arc<Mutex<EmbeddingEngine>>,
-    pub vibe_state: Arc<VibeState>,
-}
-
-/// Initialize the embedding engine and compute VibeState on a background thread.
-///
-/// If `model_dir` points to a directory containing bundled model files (model.onnx + tokenizer),
-/// loads from there. Otherwise falls back to downloading from HuggingFace.
-///
-/// Blocks until complete (model init + loci embedding). Returns None if init fails.
-pub fn init_blocking(model_dir: Option<std::path::PathBuf>) -> Option<EmbeddingInit> {
-    let (tx, rx) = std::sync::mpsc::channel();
-
-    std::thread::Builder::new()
-        .name("embedding-init".into())
-        .spawn(move || {
-            let engine_result = match &model_dir {
-                Some(dir) if dir.join("model.onnx").exists() => {
-                    log::info!("Loading bundled embedding model from {:?}", dir);
-                    EmbeddingEngine::with_local_model(dir)
-                }
-                _ => {
-                    log::info!("Downloading embedding model from HuggingFace");
-                    EmbeddingEngine::new()
-                }
-            };
-
-            let mut engine = match engine_result {
-                Ok(e) => e,
-                Err(e) => {
-                    log::error!("Failed to init embedding engine: {}", e);
-                    let _ = tx.send(None);
-                    return;
-                }
-            };
-            log::info!(
-                "Embedding engine ready: model={}, dims={}",
-                engine.model_name(),
-                engine.dimensions()
-            );
-
-            let vibe_state = match VibeState::new(&mut engine, vibes::default_loci()) {
-                Ok(state) => {
-                    log::info!("VibeState initialized with {} loci", state.loci.len());
-                    state
-                }
-                Err(e) => {
-                    log::error!("Failed to compute VibeState: {}", e);
-                    let _ = tx.send(None);
-                    return;
-                }
-            };
-
-            let _ = tx.send(Some(EmbeddingInit {
-                engine: Arc::new(Mutex::new(engine)),
-                vibe_state: Arc::new(vibe_state),
-            }));
-        })
-        .expect("Failed to spawn embedding init thread");
-
-    rx.recv().ok().flatten()
-}
-
-/// Compute and store an embedding for an event inline.
-///
-/// Called at event storage time. ~5ms per event. Silently skips
-/// if the text has no embeddable content.
-pub fn embed_event_inline(
-    engine: &Mutex<EmbeddingEngine>,
-    conn: &mut SqliteConnection,
-    event_id: &str,
-    data_json: &str,
-) {
-    let text = match extract_embeddable_text(data_json) {
-        Some(t) => t,
-        None => return,
-    };
-
-    let mut eng = match engine.lock() {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    match eng.embed_one(&text) {
-        Ok(embedding) => {
-            let bytes = EmbeddingEngine::to_bytes(&embedding);
-            if let Err(e) = queries::upsert_embedding(
-                conn,
-                event_id,
-                &bytes,
-                eng.model_name(),
-                eng.dimensions() as i32,
-            ) {
-                log::error!("Failed to store embedding for {}: {}", event_id, e);
-            }
-        }
-        Err(e) => {
-            log::error!("Embedding failed for {}: {}", event_id, e);
-        }
-    }
-}
-
-/// Backfill missing embeddings for a session. Called on-demand when
-/// vibe colors are requested and some events lack embeddings.
-///
-/// Returns the number of events newly embedded.
-pub fn backfill_session(
-    engine: &Mutex<EmbeddingEngine>,
-    conn: &mut SqliteConnection,
-    session_id: &str,
-) -> usize {
-    use diesel::prelude::*;
-
-    use crate::schema::{event_embeddings, events};
-
-    // Find assistant events in this session that lack embeddings
-    let missing: Vec<(String, String)> = match events::table
-        .left_join(event_embeddings::table.on(event_embeddings::event_id.eq(events::id)))
-        .filter(events::session_id.eq(session_id))
-        .filter(events::event_type.eq("assistant"))
-        .filter(event_embeddings::event_id.is_null())
-        .select((events::id, events::data))
-        .load::<(String, String)>(conn)
-    {
-        Ok(rows) => rows,
-        Err(_) => return 0,
-    };
-
-    if missing.is_empty() {
-        return 0;
-    }
-
-    // Filter to events with embeddable text
-    let embeddable: Vec<(String, String)> = missing
-        .into_iter()
-        .filter_map(|(id, data)| extract_embeddable_text(&data).map(|text| (id, text)))
-        .collect();
-
-    if embeddable.is_empty() {
-        return 0;
-    }
-
-    let mut eng = match engine.lock() {
-        Ok(e) => e,
-        Err(_) => return 0,
-    };
-
-    let texts: Vec<String> = embeddable.iter().map(|(_, t)| t.clone()).collect();
-    let embeddings = match eng.embed(texts) {
-        Ok(e) => e,
-        Err(e) => {
-            log::error!("Backfill embed failed: {}", e);
-            return 0;
-        }
-    };
-
-    let mut count = 0;
-    for ((event_id, _), embedding) in embeddable.iter().zip(embeddings.iter()) {
-        let bytes = EmbeddingEngine::to_bytes(embedding);
-        if queries::upsert_embedding(
-            conn,
-            event_id,
-            &bytes,
-            eng.model_name(),
-            eng.dimensions() as i32,
-        )
-        .is_ok()
-        {
-            count += 1;
-        }
-    }
-
-    if count > 0 {
-        log::info!("Backfilled {} embeddings for session", count);
-    }
-    count
-}
+pub use worker::{spawn_embed_worker, EmbedJob};
 
 /// Extract embeddable text from a TranscriptEvent JSON string.
 /// Combines content and thinking fields, separated by newline.
@@ -210,9 +35,132 @@ pub fn extract_embeddable_text(data_json: &str) -> Option<String> {
     }
 }
 
+/// Extract the structural change signal from a TranscriptEvent JSON string:
+/// the `commit_msg` plus each touched `target` (paths/URIs only — never file
+/// contents) across every `write` tool-use in the event. Returns `None` when
+/// the event has no `write` tool-use or yields no signal text.
+pub fn extract_change_signal_text(data_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(data_json).ok()?;
+    let tool_uses = value.get("toolUses").and_then(|t| t.as_array())?;
+
+    let mut parts: Vec<String> = Vec::new();
+    for tool in tool_uses {
+        if tool.get("name").and_then(|n| n.as_str()) != Some("change") {
+            continue;
+        }
+        let Some(input) = tool.get("input") else {
+            continue;
+        };
+        // The tool input may be a JSON object or a JSON-encoded string.
+        let input_obj = if input.is_string() {
+            match serde_json::from_str::<serde_json::Value>(input.as_str().unwrap_or("")) {
+                Ok(v) => v,
+                Err(_) => continue,
+            }
+        } else {
+            input.clone()
+        };
+
+        if let Some(msg) = input_obj.get("commit_msg").and_then(|m| m.as_str()) {
+            let msg = msg.trim();
+            // "^" amends the previous commit and carries no new signal.
+            if !msg.is_empty() && msg != "^" {
+                parts.push(msg.to_string());
+            }
+        }
+        if let Some(changes) = input_obj.get("changes").and_then(|c| c.as_array()) {
+            for change in changes {
+                if let Some(target) = change.get("target").and_then(|t| t.as_str()) {
+                    if !target.is_empty() {
+                        parts.push(target.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_change_signal_pulls_commit_msg_and_targets() {
+        let json = r#"{
+            "toolUses": [
+                {
+                    "name": "change",
+                    "input": {
+                        "commit_msg": "Add validation",
+                        "changes": [
+                            {"target": "file:src/lib.rs", "mode": "patch"},
+                            {"target": "file:src/main.rs", "mode": "create"}
+                        ]
+                    }
+                }
+            ]
+        }"#;
+        assert_eq!(
+            extract_change_signal_text(json),
+            Some("Add validation\nfile:src/lib.rs\nfile:src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_change_signal_handles_stringified_input() {
+        let json = r#"{
+            "toolUses": [
+                {
+                    "name": "change",
+                    "input": "{\"commit_msg\":\"Fix bug\",\"changes\":[{\"target\":\"file:a.rs\"}]}"
+                }
+            ]
+        }"#;
+        assert_eq!(
+            extract_change_signal_text(json),
+            Some("Fix bug\nfile:a.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_change_signal_skips_amend_commit_msg() {
+        let json = r#"{
+            "toolUses": [
+                {"name": "change", "input": {"commit_msg": "^", "changes": [{"target": "file:x.rs"}]}}
+            ]
+        }"#;
+        assert_eq!(
+            extract_change_signal_text(json),
+            Some("file:x.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_change_signal_none_for_non_change_tool() {
+        let json = r#"{
+            "toolUses": [
+                {"name": "bash", "input": {"command": "ls"}}
+            ]
+        }"#;
+        assert_eq!(extract_change_signal_text(json), None);
+    }
+
+    #[test]
+    fn extract_change_signal_none_when_no_tool_uses() {
+        let json = r#"{"content": "just talking", "thinking": ""}"#;
+        assert_eq!(extract_change_signal_text(json), None);
+    }
+
+    #[test]
+    fn extract_change_signal_none_for_invalid_json() {
+        assert_eq!(extract_change_signal_text("not json"), None);
+    }
 
     #[test]
     fn extract_content_only() {

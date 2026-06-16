@@ -1,354 +1,404 @@
 //! Tests for entity override and promote operations.
-//!
-//! Verifies the claims made by the create_*_override and promote_*_to_workspace
-//! methods on Orchestrator: scope resolution, guard conditions, and file placement.
 
 mod common;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use cairn_core::internal::agent_process::process::AgentProcessState;
 use cairn_core::internal::db::DbState;
-use cairn_core::internal::mcp::McpAuthState;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
-use cairn_core::internal::services::PtyState;
-use tempfile::tempdir;
+use cairn_core::internal::services::RealClock;
+use cairn_core::internal::storage::SearchIndex;
+use cairn_core::models::{AgentConfig, CreateProject, Recipe, SkillConfig};
+use cairn_core::projects::crud as project_crud;
+use tempfile::{tempdir, TempDir};
 
-/// Build a minimal Orchestrator backed by an in-memory DB and temp directories.
-///
-/// Returns (orchestrator, config_dir, project_dir, project_id).
-fn test_orchestrator() -> (Orchestrator, PathBuf, PathBuf, String) {
+struct TestOrchestrator {
+    orch: Orchestrator,
+    _db_temp: TempDir,
+    _temp: TempDir,
+    config_dir: PathBuf,
+    project_dir: PathBuf,
+    project_id: String,
+}
+
+async fn test_config_orchestrator() -> TestOrchestrator {
     let temp = tempdir().unwrap();
     let config_dir = temp.path().join("config");
     let project_dir = temp.path().join("project");
+    let search_dir = temp.path().join("search");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&project_dir).unwrap();
 
-    let mut conn = common::test_conn();
+    let (db_temp, db) = common::migrated_db().await;
+    let local = Arc::new(db);
+    let search_index = Arc::new(SearchIndex::open_or_create(&search_dir).unwrap());
+    let db_state = Arc::new(DbState::new(local.clone(), search_index));
+    let services = Arc::new(TestServicesBuilder::new().build());
 
-    // Insert a project whose repo_path points to our temp project_dir
     let project_id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
-    let project_path_str = project_dir.to_str().unwrap().to_string();
-    diesel::sql_query(
-        "INSERT INTO projects (id, workspace_id, name, key, repo_path, docs_enabled, default_branch, next_issue_number, created_at, updated_at)
-         VALUES (?, 'default', 'Test', 'TST', ?, 1, 'main', 1, ?, ?)"
+    project_crud::create_db(
+        &local,
+        &RealClock,
+        &CreateProject {
+            id: Some(project_id.clone()),
+            name: "Test".to_string(),
+            key: "TST".to_string(),
+            repo_path: project_dir.to_string_lossy().to_string(),
+            remote_url: None,
+            server_id: None,
+        },
     )
-    .bind::<diesel::sql_types::Text, _>(&project_id)
-    .bind::<diesel::sql_types::Text, _>(&project_path_str)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(&mut conn)
-    .expect("insert project");
+    .await
+    .unwrap();
 
-    use diesel::RunQueryDsl;
-
-    let services = TestServicesBuilder::new().build();
-    let (perm_tx, _) = tokio::sync::broadcast::channel(1);
-    let (run_tx, _) = tokio::sync::broadcast::channel(1);
-
-    let db = Arc::new(DbState {
-        conn: Mutex::new(conn),
-    });
-    let services = Arc::new(services);
-    let orch = Orchestrator::builder(db, services, config_dir.clone())
-        .process_state(Arc::new(AgentProcessState::default()))
-        .mcp_auth(Arc::new(McpAuthState::new(config_dir.clone())))
-        .pty_state(Arc::new(PtyState::default()))
-        .permission_responses(perm_tx)
-        .run_completions(run_tx)
+    let orch = Orchestrator::builder(db_state, services, config_dir.clone())
         .mcp_binary_path(String::new())
         .build();
-    // Leak temp so it isn't cleaned up while orch holds paths
-    std::mem::forget(temp);
 
-    (orch, config_dir, project_dir, project_id)
+    TestOrchestrator {
+        orch,
+        _db_temp: db_temp,
+        _temp: temp,
+        config_dir,
+        project_dir,
+        project_id,
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Agent override & promote
-// ---------------------------------------------------------------------------
+fn assert_err_contains<T>(result: Result<T, String>, expected: &str) {
+    match result {
+        Ok(_) => panic!("expected error containing {expected:?}"),
+        Err(err) => assert!(err.contains(expected), "expected {expected:?} in {err:?}"),
+    }
+}
 
-fn write_agent(dir: &std::path::Path, id: &str, name: &str) {
-    let agents_dir = dir.join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    let content = format!(
-        "---\nname: {name}\ndescription: test agent\ntools:\n  - Read\n---\n\nYou are {name}.\n"
+#[derive(Clone, Copy, Debug)]
+enum ConfigKind {
+    Agent,
+    Skill,
+    Recipe,
+}
+
+#[derive(Clone, Copy)]
+enum ConfigScope {
+    Workspace,
+    Project,
+}
+
+struct ConfigResourceResult {
+    id: String,
+    name: String,
+    workspace_id: Option<String>,
+    project_id: Option<String>,
+}
+
+trait IntoConfigResourceResult {
+    fn into_config_resource_result(self) -> ConfigResourceResult;
+}
+
+macro_rules! impl_config_resource_result {
+    ($ty:ty) => {
+        impl IntoConfigResourceResult for $ty {
+            fn into_config_resource_result(self) -> ConfigResourceResult {
+                ConfigResourceResult {
+                    id: self.id,
+                    name: self.name,
+                    workspace_id: self.workspace_id,
+                    project_id: self.project_id,
+                }
+            }
+        }
+    };
+}
+
+impl_config_resource_result!(AgentConfig);
+impl_config_resource_result!(SkillConfig);
+impl_config_resource_result!(Recipe);
+
+fn normalize_config_result<T>(result: Result<T, String>) -> Result<ConfigResourceResult, String>
+where
+    T: IntoConfigResourceResult,
+{
+    result.map(IntoConfigResourceResult::into_config_resource_result)
+}
+
+impl ConfigKind {
+    fn write_workspace(self, ctx: &TestOrchestrator, id: &str, name: &str) {
+        self.write(ctx, ConfigScope::Workspace, id, name);
+    }
+
+    fn write_project(self, ctx: &TestOrchestrator, id: &str, name: &str) {
+        self.write(ctx, ConfigScope::Project, id, name);
+    }
+
+    fn create_override(
+        self,
+        ctx: &TestOrchestrator,
+        id: &str,
+    ) -> Result<ConfigResourceResult, String> {
+        match self {
+            ConfigKind::Agent => {
+                normalize_config_result(ctx.orch.create_agent_override(id, &ctx.project_id))
+            }
+            ConfigKind::Skill => {
+                normalize_config_result(ctx.orch.create_skill_override(id, &ctx.project_id))
+            }
+            ConfigKind::Recipe => {
+                normalize_config_result(ctx.orch.create_recipe_override(id, &ctx.project_id))
+            }
+        }
+    }
+
+    fn promote_to_workspace(
+        self,
+        ctx: &TestOrchestrator,
+        id: &str,
+    ) -> Result<ConfigResourceResult, String> {
+        match self {
+            ConfigKind::Agent => {
+                normalize_config_result(ctx.orch.promote_agent_to_workspace(id, &ctx.project_id))
+            }
+            ConfigKind::Skill => {
+                normalize_config_result(ctx.orch.promote_skill_to_workspace(id, &ctx.project_id))
+            }
+            ConfigKind::Recipe => {
+                normalize_config_result(ctx.orch.promote_recipe_to_workspace(id, &ctx.project_id))
+            }
+        }
+    }
+
+    fn workspace_path(self, ctx: &TestOrchestrator, id: &str) -> PathBuf {
+        self.path(ctx, ConfigScope::Workspace, id)
+    }
+
+    fn project_path(self, ctx: &TestOrchestrator, id: &str) -> PathBuf {
+        self.path(ctx, ConfigScope::Project, id)
+    }
+
+    fn write(self, ctx: &TestOrchestrator, scope: ConfigScope, id: &str, name: &str) {
+        let path = self.path(ctx, scope, id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, self.content(scope, id, name)).unwrap();
+    }
+
+    fn path(self, ctx: &TestOrchestrator, scope: ConfigScope, id: &str) -> PathBuf {
+        let root = match scope {
+            ConfigScope::Workspace => ctx.config_dir.clone(),
+            ConfigScope::Project => ctx.project_dir.join(".cairn"),
+        };
+
+        match self {
+            ConfigKind::Agent => root.join(format!("agents/{id}.md")),
+            ConfigKind::Skill => root.join(format!("skills/{id}/SKILL.md")),
+            ConfigKind::Recipe => root.join(format!("recipes/{id}.yaml")),
+        }
+    }
+
+    fn content(self, scope: ConfigScope, id: &str, name: &str) -> String {
+        match self {
+            ConfigKind::Agent => {
+                let description = match scope {
+                    ConfigScope::Workspace => "test agent",
+                    ConfigScope::Project => "project agent",
+                };
+                format!(
+                    "---\nname: {name}\ndescription: {description}\ntools:\n  - Read\n---\n\nYou are {name}.\n"
+                )
+            }
+            ConfigKind::Skill => {
+                let description = match scope {
+                    ConfigScope::Workspace => "test skill",
+                    ConfigScope::Project => "project skill",
+                };
+                format!(
+                    "---\nname: {id}\ndescription: {description}\nmetadata:\n  display-name: {name}\n---\n\nSkill content for {name}.\n"
+                )
+            }
+            ConfigKind::Recipe => {
+                let description = match scope {
+                    ConfigScope::Workspace => "test recipe",
+                    ConfigScope::Project => "project recipe",
+                };
+                format!(
+                    "cairnVersion: 1\nname: {name}\ndescription: {description}\ntrigger: issue\ncontext: issue\nnodes:\n  - id: t1\n    type: trigger\n    name: Trigger\n    position: 0@0\nedges: []\n"
+                )
+            }
+        }
+    }
+}
+
+async fn assert_create_override_from_workspace(
+    kind: ConfigKind,
+    id: &str,
+    workspace_name: &str,
+    expected_result_name: Option<&str>,
+) {
+    let ctx = test_config_orchestrator().await;
+
+    kind.write_workspace(&ctx, id, workspace_name);
+
+    let result = kind.create_override(&ctx, id).unwrap();
+    assert_eq!(result.id, id, "{kind:?}");
+    if let Some(expected_name) = expected_result_name {
+        assert_eq!(result.name, expected_name, "{kind:?}");
+    }
+    assert_eq!(result.project_id, Some(ctx.project_id.clone()), "{kind:?}");
+    assert!(kind.project_path(&ctx, id).exists(), "{kind:?}");
+}
+
+async fn assert_create_override_rejects_duplicate(
+    kind: ConfigKind,
+    id: &str,
+    workspace_name: &str,
+) {
+    let ctx = test_config_orchestrator().await;
+
+    kind.write_workspace(&ctx, id, workspace_name);
+    kind.write_project(&ctx, id, "Already There");
+
+    assert_err_contains(kind.create_override(&ctx, id), "already exists");
+}
+
+async fn assert_promote_to_workspace_success(
+    kind: ConfigKind,
+    id: &str,
+    project_name: &str,
+    expect_project_file: bool,
+) {
+    let ctx = test_config_orchestrator().await;
+
+    kind.write_project(&ctx, id, project_name);
+
+    let result = kind.promote_to_workspace(&ctx, id).unwrap();
+    assert_eq!(result.id, id, "{kind:?}");
+    assert_eq!(result.workspace_id, Some("default".to_string()), "{kind:?}");
+    assert!(kind.workspace_path(&ctx, id).exists(), "{kind:?}");
+    if expect_project_file {
+        assert!(kind.project_path(&ctx, id).exists(), "{kind:?}");
+    }
+}
+
+async fn assert_promote_rejects_non_project_scoped(
+    kind: ConfigKind,
+    id: &str,
+    workspace_name: &str,
+) {
+    let ctx = test_config_orchestrator().await;
+
+    kind.write_workspace(&ctx, id, workspace_name);
+
+    assert_err_contains(kind.promote_to_workspace(&ctx, id), "not project-scoped");
+}
+
+async fn assert_promote_rejects_if_workspace_exists(
+    kind: ConfigKind,
+    id: &str,
+    workspace_name: &str,
+) {
+    let ctx = test_config_orchestrator().await;
+
+    kind.write_workspace(&ctx, id, workspace_name);
+    kind.write_project(&ctx, id, "Project Version");
+
+    assert_err_contains(
+        kind.promote_to_workspace(&ctx, id),
+        "already exists at workspace",
     );
-    std::fs::write(agents_dir.join(format!("{id}.md")), content).unwrap();
 }
 
-fn write_project_agent(project_dir: &std::path::Path, id: &str, name: &str) {
-    let agents_dir = project_dir.join(".cairn").join("agents");
-    std::fs::create_dir_all(&agents_dir).unwrap();
-    let content = format!(
-        "---\nname: {name}\ndescription: project agent\ntools:\n  - Read\n---\n\nYou are {name}.\n"
-    );
-    std::fs::write(agents_dir.join(format!("{id}.md")), content).unwrap();
+#[tokio::test]
+async fn create_agent_override_from_workspace() {
+    assert_create_override_from_workspace(
+        ConfigKind::Agent,
+        "my-agent",
+        "My Agent",
+        Some("My Agent"),
+    )
+    .await;
 }
 
-#[test]
-fn create_agent_override_from_workspace() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_agent(&config_dir, "my-agent", "My Agent");
-
-    let result = orch.create_agent_override("my-agent", &project_id).unwrap();
-    assert_eq!(result.id, "my-agent");
-    assert_eq!(result.name, "My Agent");
-    assert_eq!(result.project_id, Some(project_id.clone()));
-
-    // File should exist in project
-    let project_file = project_dir.join(".cairn/agents/my-agent.md");
-    assert!(project_file.exists(), "override file should be created");
+#[tokio::test]
+async fn create_agent_override_rejects_duplicate() {
+    assert_create_override_rejects_duplicate(ConfigKind::Agent, "my-agent", "My Agent").await;
 }
 
-#[test]
-fn create_agent_override_rejects_duplicate() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
+#[tokio::test]
+async fn create_agent_override_from_project_scope_rejects_duplicate() {
+    let ctx = test_config_orchestrator().await;
 
-    write_agent(&config_dir, "my-agent", "My Agent");
-    write_project_agent(&project_dir, "my-agent", "Already There");
+    ConfigKind::Agent.write_project(&ctx, "proj-only", "Project Only Agent");
 
-    let result = orch.create_agent_override("my-agent", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists"));
+    let result = ctx.orch.create_agent_override("proj-only", &ctx.project_id);
+    assert_err_contains(result, "already exists");
 }
 
-#[test]
-fn create_agent_override_from_project_scope() {
-    let (orch, _config_dir, project_dir, project_id) = test_orchestrator();
-
-    // Source is a project-scoped agent (no workspace version exists).
-    // The old fork_agent_config would reject this; create_agent_override should resolve it.
-    write_project_agent(&project_dir, "proj-only", "Project Only Agent");
-
-    // Creating an override in the same project should fail (already exists)
-    let result = orch.create_agent_override("proj-only", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists"));
+#[tokio::test]
+async fn promote_agent_to_workspace_success() {
+    assert_promote_to_workspace_success(ConfigKind::Agent, "proj-agent", "Project Agent", true)
+        .await;
 }
 
-#[test]
-fn promote_agent_to_workspace_success() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    // Create a project-only agent (no workspace version)
-    write_project_agent(&project_dir, "proj-agent", "Project Agent");
-
-    let result = orch
-        .promote_agent_to_workspace("proj-agent", &project_id)
-        .unwrap();
-    assert_eq!(result.id, "proj-agent");
-    assert_eq!(result.workspace_id, Some("default".to_string()));
-    assert_eq!(result.project_id, None);
-
-    // Workspace file should exist
-    let ws_file = config_dir.join("agents/proj-agent.md");
-    assert!(ws_file.exists(), "workspace file should be created");
-
-    // Original project file should still exist
-    let proj_file = project_dir.join(".cairn/agents/proj-agent.md");
-    assert!(proj_file.exists(), "project file should remain");
+#[tokio::test]
+async fn promote_agent_rejects_non_project_scoped() {
+    assert_promote_rejects_non_project_scoped(ConfigKind::Agent, "ws-agent", "WS Agent").await;
 }
 
-#[test]
-fn promote_agent_rejects_non_project_scoped() {
-    let (orch, config_dir, _project_dir, project_id) = test_orchestrator();
-
-    // Workspace-scoped agent
-    write_agent(&config_dir, "ws-agent", "WS Agent");
-
-    let result = orch.promote_agent_to_workspace("ws-agent", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("not project-scoped"));
+#[tokio::test]
+async fn promote_agent_rejects_if_workspace_exists() {
+    assert_promote_rejects_if_workspace_exists(ConfigKind::Agent, "dual-agent", "WS Version").await;
 }
 
-#[test]
-fn promote_agent_rejects_if_workspace_exists() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_agent(&config_dir, "dual-agent", "WS Version");
-    write_project_agent(&project_dir, "dual-agent", "Project Version");
-
-    let result = orch.promote_agent_to_workspace("dual-agent", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists at workspace"));
+#[tokio::test]
+async fn create_skill_override_from_workspace() {
+    assert_create_override_from_workspace(ConfigKind::Skill, "my-skill", "My Skill", None).await;
 }
 
-// ---------------------------------------------------------------------------
-// Skill override & promote
-// ---------------------------------------------------------------------------
-
-fn write_skill(dir: &std::path::Path, id: &str, name: &str) {
-    let skill_dir = dir.join("skills").join(id);
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    let content =
-        format!("---\nname: {id}\ndescription: test skill\nmetadata:\n  display-name: {name}\n---\n\nSkill content for {name}.\n");
-    std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+#[tokio::test]
+async fn create_skill_override_rejects_duplicate() {
+    assert_create_override_rejects_duplicate(ConfigKind::Skill, "my-skill", "My Skill").await;
 }
 
-fn write_project_skill(project_dir: &std::path::Path, id: &str, name: &str) {
-    let skill_dir = project_dir.join(".cairn").join("skills").join(id);
-    std::fs::create_dir_all(&skill_dir).unwrap();
-    let content = format!(
-        "---\nname: {id}\ndescription: project skill\nmetadata:\n  display-name: {name}\n---\n\nSkill content for {name}.\n"
-    );
-    std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+#[tokio::test]
+async fn promote_skill_to_workspace_success() {
+    assert_promote_to_workspace_success(ConfigKind::Skill, "proj-skill", "Project Skill", false)
+        .await;
 }
 
-#[test]
-fn create_skill_override_from_workspace() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_skill(&config_dir, "my-skill", "My Skill");
-
-    let result = orch.create_skill_override("my-skill", &project_id).unwrap();
-    assert_eq!(result.id, "my-skill");
-    assert_eq!(result.project_id, Some(project_id.clone()));
-
-    let project_file = project_dir.join(".cairn/skills/my-skill/SKILL.md");
-    assert!(project_file.exists());
+#[tokio::test]
+async fn promote_skill_rejects_non_project_scoped() {
+    assert_promote_rejects_non_project_scoped(ConfigKind::Skill, "ws-skill", "WS Skill").await;
 }
 
-#[test]
-fn create_skill_override_rejects_duplicate() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_skill(&config_dir, "my-skill", "My Skill");
-    write_project_skill(&project_dir, "my-skill", "Already There");
-
-    let result = orch.create_skill_override("my-skill", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists"));
+#[tokio::test]
+async fn promote_skill_rejects_if_workspace_exists() {
+    assert_promote_rejects_if_workspace_exists(ConfigKind::Skill, "dual-skill", "WS Version").await;
 }
 
-#[test]
-fn promote_skill_to_workspace_success() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_project_skill(&project_dir, "proj-skill", "Project Skill");
-
-    let result = orch
-        .promote_skill_to_workspace("proj-skill", &project_id)
-        .unwrap();
-    assert_eq!(result.id, "proj-skill");
-    assert_eq!(result.workspace_id, Some("default".to_string()));
-
-    let ws_file = config_dir.join("skills/proj-skill/SKILL.md");
-    assert!(ws_file.exists());
+#[tokio::test]
+async fn create_recipe_override_from_workspace() {
+    assert_create_override_from_workspace(ConfigKind::Recipe, "my-recipe", "My Recipe", None).await;
 }
 
-#[test]
-fn promote_skill_rejects_non_project_scoped() {
-    let (orch, config_dir, _project_dir, project_id) = test_orchestrator();
-
-    write_skill(&config_dir, "ws-skill", "WS Skill");
-
-    let result = orch.promote_skill_to_workspace("ws-skill", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("not project-scoped"));
+#[tokio::test]
+async fn create_recipe_override_rejects_duplicate() {
+    assert_create_override_rejects_duplicate(ConfigKind::Recipe, "my-recipe", "My Recipe").await;
 }
 
-#[test]
-fn promote_skill_rejects_if_workspace_exists() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_skill(&config_dir, "dual-skill", "WS Version");
-    write_project_skill(&project_dir, "dual-skill", "Project Version");
-
-    let result = orch.promote_skill_to_workspace("dual-skill", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists at workspace"));
+#[tokio::test]
+async fn promote_recipe_to_workspace_success() {
+    assert_promote_to_workspace_success(ConfigKind::Recipe, "proj-recipe", "Project Recipe", false)
+        .await;
 }
 
-// ---------------------------------------------------------------------------
-// Recipe override & promote
-// ---------------------------------------------------------------------------
-
-fn write_recipe(dir: &std::path::Path, id: &str, name: &str) {
-    let recipes_dir = dir.join("recipes");
-    std::fs::create_dir_all(&recipes_dir).unwrap();
-    let content = format!(
-        "cairnVersion: 1\nname: {name}\ndescription: test recipe\ntrigger: issue\ncontext: issue\nnodes:\n  - id: t1\n    type: trigger\n    name: Trigger\n    position: 0@0\nedges: []\n"
-    );
-    std::fs::write(recipes_dir.join(format!("{id}.yaml")), content).unwrap();
+#[tokio::test]
+async fn promote_recipe_rejects_non_project_scoped() {
+    assert_promote_rejects_non_project_scoped(ConfigKind::Recipe, "ws-recipe", "WS Recipe").await;
 }
 
-fn write_project_recipe(project_dir: &std::path::Path, id: &str, name: &str) {
-    let recipes_dir = project_dir.join(".cairn").join("recipes");
-    std::fs::create_dir_all(&recipes_dir).unwrap();
-    let content = format!(
-        "cairnVersion: 1\nname: {name}\ndescription: project recipe\ntrigger: issue\ncontext: issue\nnodes:\n  - id: t1\n    type: trigger\n    name: Trigger\n    position: 0@0\nedges: []\n"
-    );
-    std::fs::write(recipes_dir.join(format!("{id}.yaml")), content).unwrap();
-}
-
-#[test]
-fn create_recipe_override_from_workspace() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_recipe(&config_dir, "my-recipe", "My Recipe");
-
-    let result = orch
-        .create_recipe_override("my-recipe", &project_id)
-        .unwrap();
-    assert_eq!(result.id, "my-recipe");
-    assert_eq!(result.project_id, Some(project_id.clone()));
-
-    let project_file = project_dir.join(".cairn/recipes/my-recipe.yaml");
-    assert!(project_file.exists());
-}
-
-#[test]
-fn create_recipe_override_rejects_duplicate() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_recipe(&config_dir, "my-recipe", "My Recipe");
-    write_project_recipe(&project_dir, "my-recipe", "Already There");
-
-    let result = orch.create_recipe_override("my-recipe", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists"));
-}
-
-#[test]
-fn promote_recipe_to_workspace_success() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_project_recipe(&project_dir, "proj-recipe", "Project Recipe");
-
-    let result = orch
-        .promote_recipe_to_workspace("proj-recipe", &project_id)
-        .unwrap();
-    assert_eq!(result.id, "proj-recipe");
-    assert_eq!(result.workspace_id, Some("default".to_string()));
-
-    let ws_file = config_dir.join("recipes/proj-recipe.yaml");
-    assert!(ws_file.exists());
-}
-
-#[test]
-fn promote_recipe_rejects_non_project_scoped() {
-    let (orch, config_dir, _project_dir, project_id) = test_orchestrator();
-
-    write_recipe(&config_dir, "ws-recipe", "WS Recipe");
-
-    let result = orch.promote_recipe_to_workspace("ws-recipe", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("not project-scoped"));
-}
-
-#[test]
-fn promote_recipe_rejects_if_workspace_exists() {
-    let (orch, config_dir, project_dir, project_id) = test_orchestrator();
-
-    write_recipe(&config_dir, "dual-recipe", "WS Version");
-    write_project_recipe(&project_dir, "dual-recipe", "Project Version");
-
-    let result = orch.promote_recipe_to_workspace("dual-recipe", &project_id);
-    assert!(result.is_err());
-    assert!(result.unwrap_err().contains("already exists at workspace"));
+#[tokio::test]
+async fn promote_recipe_rejects_if_workspace_exists() {
+    assert_promote_rejects_if_workspace_exists(ConfigKind::Recipe, "dual-recipe", "WS Version")
+        .await;
 }

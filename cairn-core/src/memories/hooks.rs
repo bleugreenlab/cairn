@@ -1,4 +1,4 @@
-//! Hook settings file generation for memory surfacing and slash commands.
+//! Hook settings file generation for the channel-message pull and slash commands.
 //!
 //! Writes a standalone settings JSON file that gets passed to Claude CLI
 //! via `--settings`, keeping hooks scoped to Cairn runs only.

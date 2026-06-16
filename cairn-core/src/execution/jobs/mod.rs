@@ -1,0 +1,159 @@
+//! Job lifecycle functions — start, continue, complete, create child task.
+//!
+//! All business logic lives here. Host layers (Tauri, cairn-server) provide thin
+//! wrappers that handle framework-specific concerns (async spawning, process start).
+//!
+//! ## Key functions
+//!
+//! - [`prepare_job`] — DB work + worktree setup, returns [`PreparedJob`] for session spawn.
+//! - [`continue_job_impl`] — sends follow-up message to a running/warm job.
+//! - [`on_job_complete_impl`] — DAG advancement after a job finishes.
+//! - [`create_child_task`] — user-initiated sub-agent under a running job.
+
+use crate::agent_process::stream::TranscriptEvent;
+use crate::config::presets::{
+    load_effective_presets, resolve_agent_snapshot, resolve_runtime_selection,
+    LaunchSelectionOverride,
+};
+use crate::config::project_settings::load_project_settings;
+use crate::config::{self, agents as config_agents, ConfigResult};
+use crate::db_records::{db_job_from_row, DbJob, DbRecipeEdge, DbRecipeNode, JOB_COLUMNS};
+use crate::execution::advancement::{format_resolved_inputs, ResolvedInput};
+use crate::execution::dag::{recipe_edge_to_db, recipe_node_to_db};
+use crate::execution::step_behavior::resolve_node_behavior;
+use crate::models::{
+    AgentConfig, AgentSnapshot, ExecutionSnapshot, Job, JobStatus, Model, OutputSchema,
+    OutputSchemaInfo, RecipeEdge, RecipeNode, Run, RunStatus, Session, SessionStatus,
+    TurnStartReason, TurnState,
+};
+use crate::orchestrator::Orchestrator;
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use crate::sync::SyncMessage;
+use crate::transcripts::stream_store::{get_next_sequence, insert_event, EventInsert};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use turso::params;
+use uuid::Uuid;
+
+mod child_tasks;
+mod config_loading;
+mod inputs;
+mod lifecycle;
+mod persistence;
+pub(crate) mod setup_progress;
+mod slash_commands;
+mod snapshots;
+mod status;
+mod turns;
+mod worktrees;
+
+pub use child_tasks::create_child_task;
+pub(crate) use inputs::{
+    find_downstream_artifact_schema_conn, find_downstream_artifact_schema_with_snapshot_conn,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;
+pub use lifecycle::{continue_job_impl, on_job_complete_impl, prepare_job, ResumeContext};
+pub use slash_commands::resolve_skill_slash_command;
+pub use snapshots::store_tool_result_event_with_turn;
+pub(crate) use worktrees::prepare_worktree_for_job;
+
+use config_loading::*;
+use inputs::*;
+use persistence::*;
+use snapshots::*;
+use status::*;
+use turns::*;
+
+// ============================================================================
+// Public types
+// ============================================================================
+
+/// Input for creating a user-initiated child task.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChildTaskInput {
+    pub parent_job_id: String,
+    pub description: String,
+    pub prompt: String,
+    pub subagent_type: String,
+    #[serde(alias = "model")]
+    pub tier: Option<String>,
+    #[serde(rename = "backend", alias = "backendPreference")]
+    pub backend_preference: Option<String>,
+}
+
+/// Result of creating a child task.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateChildTaskResult {
+    pub job_id: String,
+    pub run_id: String,
+}
+
+/// Everything needed by the host layer to spawn a Claude process for a job.
+///
+/// Returned by [`prepare_job`] after all DB work, worktree setup, run creation,
+/// and initial user-event storage are complete.
+pub const SETUP_CANCELLED_ERROR: &str = "__cairn_setup_cancelled__";
+
+pub struct PreparedJob {
+    pub run_id: String,
+    pub session_id: String,
+    pub session_start: crate::backends::SessionStart,
+    pub prompt: String,
+    pub worktree_path: String,
+    pub job_model: Option<Model>,
+    pub agent_config: Option<AgentConfig>,
+    pub artifact_schema_info: Option<OutputSchemaInfo>,
+    pub execution_id: Option<String>,
+    pub turn_id: String,
+}
+
+fn run_start_mode(session_start: &crate::backends::SessionStart) -> &'static str {
+    match session_start {
+        crate::backends::SessionStart::New { .. } => "fresh",
+        crate::backends::SessionStart::Resume { .. } => "resume",
+        crate::backends::SessionStart::Fork { .. } => "fork",
+    }
+}
+
+fn resolve_continue_session_start(
+    session: &crate::models::Session,
+) -> Result<crate::backends::SessionStart, String> {
+    if let Some(backend_id) = session.backend_id.clone() {
+        return Ok(crate::backends::SessionStart::Resume {
+            session_id: session.id.clone(),
+            backend_id,
+        });
+    }
+
+    Err(format!(
+        "Session {} has no confirmed backend resume handle; cannot continue an unstarted or failed startup",
+        &session.id[..session.id.len().min(8)]
+    ))
+}
+
+fn run_db<T, Fut>(future: Fut) -> Result<T, String>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to start database runtime: {}", e))?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| "Database task panicked".to_string())?
+}
+
+fn db_error(context: &str, error: DbError) -> String {
+    format!("{context}: {error}")
+}

@@ -1,25 +1,37 @@
 //! Wildcard-anchored text matching and replacement.
 //!
-//! When `old_string` contains `\n~~~~~\n`, the text is split into a "head"
-//! anchor and a "tail" anchor. The edit replaces everything from head through
-//! tail in the target content, using delimiter-balanced matching to find the
-//! correct tail position.
+//! `old_string` may contain one or more `~~*~~` markers. Each marker punches a
+//! "hole" between two literal anchor segments: the text is split on unescaped
+//! markers into N+1 anchors, and the edit replaces everything from the start of
+//! the first anchor's match through the end of the last anchor's match.
+//!
+//! For each gap (between an already-matched anchor and the next anchor to find)
+//! the marker-facing edges are whitespace-trimmed, then the gap is resolved one
+//! of two ways:
+//!
+//! - **Balanced** — when the preceding anchor's trimmed right edge ends with an
+//!   opener (`{`/`[`/`(`) and the next anchor's trimmed left edge begins with
+//!   the matching closer. The closer is located by local single-pair depth
+//!   matching (string/comment aware), so nested delimiters inside the hole are
+//!   skipped. `"const arr = [~~*~~]"` matches the outer `]`.
+//! - **Span** — otherwise. The next anchor is found at its first literal
+//!   occurrence after the cursor. No delimiter counting.
+//!
+//! Whitespace at marker-facing edges is absorbed into the replaced region (and
+//! reproduced via `new_string`), so own-line (`"fn f() {\n~~*~~\n}"`) and tight
+//! (`"fn f() {~~*~~}"`) forms behave identically.
+//!
+//! A `~~*~~` immediately preceded by a backslash (`\~~*~~`) is treated as
+//! literal content, not a marker; the backslash is stripped from the anchor.
 
-/// The wildcard separator used in old_string for anchored matching.
-/// When old_string contains this on its own line, the text before it is the
-/// "head anchor" and text after is the "tail anchor". Everything from the
-/// start of the head match through the end of the tail match gets replaced.
-///
-/// Tail matching is delimiter-balanced: depth is tracked across the gap
-/// (wildcard region) only. The tail matches at the first position where the
-/// gap's accumulated delimiter depth returns to zero for all pairs.
-pub const WILDCARD_SEP: &str = "\n~~~~~\n";
+/// The wildcard marker used in `old_string` for anchored matching.
+pub const WILDCARD_TOKEN: &str = "~~*~~";
 
 /// Scan mode for lightweight tokenization during balanced matching.
 /// Delimiters inside strings and comments are ignored.
 #[derive(Clone, Copy, PartialEq)]
 enum ScanMode {
-    /// Normal code — track delimiters, check for tail match
+    /// Normal code — track delimiters, check for closer
     Code,
     /// Inside "..." (skip until unescaped ")
     DoubleQuote,
@@ -31,186 +43,125 @@ enum ScanMode {
     BlockComment,
 }
 
-/// Track net depth of paired delimiters for balanced matching.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DelimDepth {
-    pub brace: i32,   // { }
-    pub bracket: i32, // [ ]
-    pub paren: i32,   // ( )
-}
+/// Split `old_string` into anchors around unescaped `~~*~~` markers.
+///
+/// Returns `None` when no unescaped marker is present (the caller falls back to
+/// literal matching). Escaped markers (`\~~*~~`) are folded into the surrounding
+/// anchor as literal `~~*~~` with the backslash removed.
+///
+/// Empty-anchor rules:
+/// - A truly-empty *leading* anchor is rejected (no starting anchor).
+/// - Empty *middle* anchors are rejected.
+/// - An empty *trailing* anchor is permitted only when the preceding anchor's
+///   trimmed right edge ends with an opener (`{`/`[`/`(`) — balance supplies the
+///   matching closer.
+pub fn parse_wildcard(old_string: &str) -> Option<Vec<String>> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut found_separator = false;
+    let mut rest = old_string;
 
-impl DelimDepth {
-    fn zero() -> Self {
-        Self {
-            brace: 0,
-            bracket: 0,
-            paren: 0,
+    while let Some(pos) = rest.find(WILDCARD_TOKEN) {
+        current.push_str(&rest[..pos]);
+        if current.ends_with('\\') {
+            // Escaped marker: literal `~~*~~`, drop the backslash.
+            current.pop();
+            current.push_str(WILDCARD_TOKEN);
+        } else {
+            found_separator = true;
+            segments.push(std::mem::take(&mut current));
         }
+        rest = &rest[pos + WILDCARD_TOKEN.len()..];
+    }
+    current.push_str(rest);
+    segments.push(current);
+
+    if !found_separator {
+        return None;
     }
 
-    pub(crate) fn from_text(text: &str) -> Self {
-        let mut d = Self::zero();
-        let bytes = text.as_bytes();
-        let mut mode = ScanMode::Code;
-        let mut i = 0;
-        while i < bytes.len() {
-            match mode {
-                ScanMode::Code => {
-                    if i + 1 < bytes.len() {
-                        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
-                            mode = ScanMode::LineComment;
-                            i += 2;
-                            continue;
-                        }
-                        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                            mode = ScanMode::BlockComment;
-                            i += 2;
-                            continue;
-                        }
-                    }
-                    if bytes[i] == b'"' {
-                        mode = ScanMode::DoubleQuote;
-                    } else if bytes[i] == b'\'' {
-                        mode = ScanMode::SingleQuote;
-                    } else {
-                        d.track(bytes[i]);
-                    }
-                }
-                ScanMode::DoubleQuote => {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        i += 2;
-                        continue;
-                    } else if bytes[i] == b'"' || bytes[i] == b'\n' {
-                        mode = ScanMode::Code;
-                    }
-                }
-                ScanMode::SingleQuote => {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                        i += 2;
-                        continue;
-                    } else if bytes[i] == b'\'' || bytes[i] == b'\n' {
-                        mode = ScanMode::Code;
-                    }
-                }
-                ScanMode::LineComment => {
-                    if bytes[i] == b'\n' {
-                        mode = ScanMode::Code;
-                    }
-                }
-                ScanMode::BlockComment => {
-                    if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                        mode = ScanMode::Code;
-                        i += 2;
-                        continue;
-                    }
-                }
+    let n = segments.len();
+    for (idx, seg) in segments.iter().enumerate() {
+        if seg.is_empty() {
+            let is_trailing = idx == n - 1;
+            let prev_opener = idx > 0 && segments[idx - 1].trim_end().ends_with(['{', '[', '(']);
+            if !(is_trailing && prev_opener) {
+                return None;
             }
-            i += 1;
-        }
-        d
-    }
-
-    fn track(&mut self, byte: u8) {
-        match byte {
-            b'{' => self.brace += 1,
-            b'}' => self.brace -= 1,
-            b'[' => self.bracket += 1,
-            b']' => self.bracket -= 1,
-            b'(' => self.paren += 1,
-            b')' => self.paren -= 1,
-            _ => {}
         }
     }
 
-    fn negated(&self) -> Self {
-        Self {
-            brace: -self.brace,
-            bracket: -self.bracket,
-            paren: -self.paren,
-        }
-    }
-}
-
-/// Split old_string into anchors around wildcard separators.
-/// Returns None if no separator is present or any segment is empty.
-/// A single separator yields 2 anchors; N separators yield N+1.
-pub fn parse_wildcard(old_string: &str) -> Option<Vec<&str>> {
-    if !old_string.contains(WILDCARD_SEP) {
-        return None;
-    }
-    let segments: Vec<&str> = old_string.split(WILDCARD_SEP).collect();
-    if segments.len() < 2 || segments.iter().any(|s| s.is_empty()) {
-        return None;
-    }
     Some(segments)
 }
 
-/// Scan content from `start` for an anchor using delimiter-balanced matching.
-///
-/// Depth is tracked across the gap only. Returns the absolute byte position
-/// where the anchor starts, or an error if not found.
-fn scan_for_anchor(content: &str, start: usize, anchor: &str) -> Result<usize, ()> {
-    let target = DelimDepth::from_text(anchor).negated();
-    let search = &content[start..];
-    let search_bytes = search.as_bytes();
-    let mut depth = target.clone();
-    let mut mode = ScanMode::Code;
+/// Strip escaping backslashes from `\~~*~~` sequences, yielding the literal text
+/// to match when `old_string` is not a wildcard edit (so an escaped marker still
+/// targets a literal `~~*~~` in the file).
+pub fn unescape_literal(old: &str) -> String {
+    old.replace("\\~~*~~", WILDCARD_TOKEN)
+}
 
-    let mut i = 0;
-    while i < search_bytes.len() {
+/// Locate the closer that balances an opener at depth 1 starting just past the
+/// opener (`start`). Tracks only the single flanking pair, skipping delimiters
+/// inside strings and comments. Returns the byte position of the matching
+/// closer, or `None` if depth never returns to zero.
+fn find_balanced_closer(content: &str, start: usize, opener: u8, closer: u8) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut depth: i32 = 1;
+    let mut mode = ScanMode::Code;
+    let mut i = start;
+
+    while i < bytes.len() {
         match mode {
             ScanMode::Code => {
-                if depth == target && search.is_char_boundary(i) && search[i..].starts_with(anchor)
-                {
-                    return Ok(start + i);
-                }
-
-                if i + 1 < search_bytes.len() {
-                    if search_bytes[i] == b'/' && search_bytes[i + 1] == b'/' {
+                if i + 1 < bytes.len() {
+                    if bytes[i] == b'/' && bytes[i + 1] == b'/' {
                         mode = ScanMode::LineComment;
                         i += 2;
                         continue;
                     }
-                    if search_bytes[i] == b'/' && search_bytes[i + 1] == b'*' {
+                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
                         mode = ScanMode::BlockComment;
                         i += 2;
                         continue;
                     }
                 }
-                if search_bytes[i] == b'"' {
+                if bytes[i] == b'"' {
                     mode = ScanMode::DoubleQuote;
-                } else if search_bytes[i] == b'\'' {
+                } else if bytes[i] == b'\'' {
                     mode = ScanMode::SingleQuote;
-                } else {
-                    depth.track(search_bytes[i]);
+                } else if bytes[i] == opener {
+                    depth += 1;
+                } else if bytes[i] == closer {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
                 }
             }
             ScanMode::DoubleQuote => {
-                if search_bytes[i] == b'\\' && i + 1 < search_bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     i += 2;
                     continue;
-                } else if search_bytes[i] == b'"' || search_bytes[i] == b'\n' {
+                } else if bytes[i] == b'"' || bytes[i] == b'\n' {
                     mode = ScanMode::Code;
                 }
             }
             ScanMode::SingleQuote => {
-                if search_bytes[i] == b'\\' && i + 1 < search_bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
                     i += 2;
                     continue;
-                } else if search_bytes[i] == b'\'' || search_bytes[i] == b'\n' {
+                } else if bytes[i] == b'\'' || bytes[i] == b'\n' {
                     mode = ScanMode::Code;
                 }
             }
             ScanMode::LineComment => {
-                if search_bytes[i] == b'\n' {
+                if bytes[i] == b'\n' {
                     mode = ScanMode::Code;
                 }
             }
             ScanMode::BlockComment => {
-                if search_bytes[i] == b'*'
-                    && i + 1 < search_bytes.len()
-                    && search_bytes[i + 1] == b'/'
-                {
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
                     mode = ScanMode::Code;
                     i += 2;
                     continue;
@@ -219,58 +170,141 @@ fn scan_for_anchor(content: &str, start: usize, anchor: &str) -> Result<usize, (
         }
         i += 1;
     }
-
-    // Check at end of search — anchor could match after last byte
-    if mode == ScanMode::Code && depth == target && search.ends_with(anchor) {
-        return Ok(content.len() - anchor.len());
-    }
-
-    Err(())
+    None
 }
 
-/// Find the anchored region in content using balanced delimiter matching
-/// with lightweight string/comment awareness.
+/// Collapse all runs of whitespace to a single space (and trim ends).
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `anchor` is absent literally but present after whitespace
+/// normalization — i.e. the only difference is indentation/spacing.
+fn is_whitespace_near_miss(haystack: &str, anchor: &str) -> bool {
+    let needle = collapse_ws(anchor);
+    !needle.is_empty() && !haystack.contains(anchor) && collapse_ws(haystack).contains(&needle)
+}
+
+/// The closer byte that balances an opener, if it is one of `{`/`[`/`(`.
+fn matching_closer(opener: u8) -> Option<u8> {
+    match opener {
+        b'{' => Some(b'}'),
+        b'[' => Some(b']'),
+        b'(' => Some(b')'),
+        _ => None,
+    }
+}
+
+/// Find the anchored region in `content` and produce the edited content along
+/// with the replaced span.
 ///
-/// Supports multiple gaps: `anchors` contains N segments (N >= 2) separated
-/// by wildcards. Each gap between consecutive anchors is scanned independently
-/// with delimiter-aware depth tracking.
-///
-/// Delimiters inside `"..."`, `'...'`, `// ...`, and `/* ... */` are not
-/// counted toward depth.
-pub fn apply_wildcard_edit(
+/// `anchors` holds N segments (N >= 2) produced by [`parse_wildcard`]. The first
+/// anchor's right edge and the last anchor's left edge each face one marker;
+/// middle anchors face a marker on both sides. Those marker-facing edges are
+/// whitespace-trimmed before matching. Each gap is resolved as balanced or span
+/// per the module docs.
+pub fn apply_wildcard_edit<S: AsRef<str>>(
     content: &str,
-    anchors: &[&str],
+    anchors: &[S],
     new_string: &str,
 ) -> Result<(String, String), String> {
-    assert!(anchors.len() >= 2, "need at least 2 anchors");
     let n = anchors.len();
+    assert!(n >= 2, "need at least 2 anchors");
     let is_single_gap = n == 2;
 
-    // Find head anchor via simple substring search
-    let head_start = content.find(anchors[0]).ok_or_else(|| {
-        format!(
-            "Head anchor not found in file. Make sure the text before ~~~~~ matches exactly.\nSearching for:\n{}",
-            anchors[0]
-        )
-    })?;
-    let mut cursor = head_start + anchors[0].len();
-
-    // Scan for each subsequent anchor
-    for (i, anchor) in anchors.iter().enumerate().skip(1) {
-        let anchor_start = scan_for_anchor(content, cursor, anchor).map_err(|_| {
-            if is_single_gap {
-                format!(
-                    "Tail anchor not found after head anchor. Make sure the text after ~~~~~ matches exactly.\nSearching for:\n{}",
-                    anchor
-                )
+    // Trim each anchor's marker-facing edge(s).
+    let eff: Vec<&str> = anchors
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let s = a.as_ref();
+            if i == 0 {
+                s.trim_end()
+            } else if i == n - 1 {
+                s.trim_start()
             } else {
-                format!(
-                    "Anchor {} of {} not found after previous anchor.\nSearching for:\n{}",
-                    i + 1, n, anchor
-                )
+                s.trim()
             }
-        })?;
-        cursor = anchor_start + anchor.len();
+        })
+        .collect();
+
+    let head = eff[0];
+    let head_start = content.find(head).ok_or_else(|| {
+        if is_whitespace_near_miss(content, head) {
+            format!(
+                "Head anchor not found exactly, but a match exists after whitespace normalization — check indentation and spacing.\nSearching for:\n{head}"
+            )
+        } else {
+            format!(
+                "Head anchor not found in file. Make sure the text before the first `~~*~~` matches exactly.\nSearching for:\n{head}"
+            )
+        }
+    })?;
+    let mut cursor = head_start + head.len();
+
+    for i in 1..n {
+        let prev = eff[i - 1];
+        let next = eff[i];
+
+        let opener = prev.as_bytes().last().copied();
+        let closer = opener.and_then(matching_closer);
+        let is_balanced = match closer {
+            Some(c) => next.is_empty() || next.as_bytes().first() == Some(&c),
+            None => false,
+        };
+
+        let anchor_start = if is_balanced {
+            let opener_b = opener.expect("opener present when balanced");
+            let closer_b = closer.expect("closer present when balanced");
+            match find_balanced_closer(content, cursor, opener_b, closer_b) {
+                Some(p) if content[p..].starts_with(next) => p,
+                _ => {
+                    return Err(format!(
+                        "Could not balance the `{}` ending the preceding anchor to a matching `{}`{}.\nSearching for:\n{}",
+                        opener_b as char,
+                        closer_b as char,
+                        if next.is_empty() {
+                            String::new()
+                        } else {
+                            " followed by the next anchor text".to_string()
+                        },
+                        next
+                    ));
+                }
+            }
+        } else {
+            match content[cursor..].find(next) {
+                Some(off) => cursor + off,
+                None => {
+                    let base = if is_single_gap {
+                        format!(
+                            "Tail anchor not found after head anchor. Make sure the text after `~~*~~` matches exactly.\nSearching for:\n{next}"
+                        )
+                    } else {
+                        format!(
+                            "Anchor {} of {} not found after previous anchor.\nSearching for:\n{}",
+                            i + 1,
+                            n,
+                            next
+                        )
+                    };
+                    return Err(if is_whitespace_near_miss(&content[cursor..], next) {
+                        format!(
+                            "{base}\n(Note: a match exists after whitespace normalization — check indentation and spacing.)"
+                        )
+                    } else {
+                        base
+                    });
+                }
+            }
+        };
+
+        let matched_len = if is_balanced && next.is_empty() {
+            1 // consume the supplied closer
+        } else {
+            next.len()
+        };
+        cursor = anchor_start + matched_len;
     }
 
     let replaced = content[head_start..cursor].to_string();
@@ -288,127 +322,137 @@ pub fn apply_wildcard_edit(
 mod tests {
     use super::*;
 
-    // --- DelimDepth tests ---
-
-    #[test]
-    fn delim_depth_from_balanced_text() {
-        let d = DelimDepth::from_text("fn foo(x: i32) { bar() }");
-        assert_eq!(d, DelimDepth::zero());
-    }
-
-    #[test]
-    fn delim_depth_from_unbalanced_opener() {
-        let d = DelimDepth::from_text("fn main() {");
-        assert_eq!(
-            d,
-            DelimDepth {
-                brace: 1,
-                bracket: 0,
-                paren: 0
-            }
-        );
-    }
-
-    #[test]
-    fn delim_depth_mixed_delimiters() {
-        let d = DelimDepth::from_text("fn foo(items: &[");
-        assert_eq!(
-            d,
-            DelimDepth {
-                brace: 0,
-                bracket: 1,
-                paren: 1
-            }
-        );
-    }
-
-    #[test]
-    fn delim_depth_negated() {
-        let d = DelimDepth::from_text("])");
-        assert_eq!(
-            d.negated(),
-            DelimDepth {
-                brace: 0,
-                bracket: 1,
-                paren: 1
-            }
-        );
+    fn assert_wildcard_result<S: AsRef<str>>(
+        content: &str,
+        anchors: &[S],
+        replacement: &str,
+        expected: &str,
+    ) {
+        let (result, _) = apply_wildcard_edit(content, anchors, replacement).unwrap();
+        assert_eq!(result, expected);
     }
 
     // --- parse_wildcard tests ---
 
     #[test]
     fn parse_wildcard_basic() {
-        let input = "head line\n~~~~~\ntail line";
-        let anchors = parse_wildcard(input).unwrap();
+        let anchors = parse_wildcard("head line~~*~~tail line").unwrap();
         assert_eq!(anchors, vec!["head line", "tail line"]);
     }
 
     #[test]
+    fn parse_wildcard_own_line_form() {
+        let anchors = parse_wildcard("head\n~~*~~\ntail").unwrap();
+        assert_eq!(anchors, vec!["head\n", "\ntail"]);
+    }
+
+    #[test]
     fn parse_wildcard_multiline_anchors() {
-        let input = "line1\nline2\n~~~~~\nline4\nline5";
-        let anchors = parse_wildcard(input).unwrap();
+        let anchors = parse_wildcard("line1\nline2~~*~~line4\nline5").unwrap();
         assert_eq!(anchors, vec!["line1\nline2", "line4\nline5"]);
     }
 
     #[test]
-    fn parse_wildcard_no_separator() {
+    fn parse_wildcard_no_marker() {
         assert!(parse_wildcard("just normal text").is_none());
     }
 
     #[test]
-    fn parse_wildcard_separator_at_start_returns_none() {
-        assert!(parse_wildcard("\n~~~~~\ntail").is_none());
+    fn parse_wildcard_old_token_not_matched() {
+        // The retired `~~~~~` token is no longer recognized.
+        assert!(parse_wildcard("head\n~~~~~\ntail").is_none());
     }
 
     #[test]
-    fn parse_wildcard_separator_at_end_returns_none() {
-        assert!(parse_wildcard("head\n~~~~~\n").is_none());
+    fn parse_wildcard_leading_empty_rejected() {
+        assert!(parse_wildcard("~~*~~tail").is_none());
     }
 
     #[test]
-    fn parse_wildcard_tildes_inline_not_matched() {
-        assert!(parse_wildcard("foo~~~~~ bar").is_none());
+    fn parse_wildcard_trailing_empty_without_opener_rejected() {
+        assert!(parse_wildcard("head~~*~~").is_none());
     }
 
-    // --- apply_wildcard_edit: basic behavior ---
+    #[test]
+    fn parse_wildcard_trailing_empty_with_opener_allowed() {
+        let anchors = parse_wildcard("HEAD {~~*~~").unwrap();
+        assert_eq!(anchors, vec!["HEAD {", ""]);
+    }
 
     #[test]
-    fn wildcard_replace_body() {
-        let content = "fn main() {\n    let x = 1;\n    let y = 2;\n}";
+    fn parse_wildcard_trailing_empty_with_trailing_ws_opener_allowed() {
+        // Trimmed right edge ends with an opener even though raw ends in newline.
+        let anchors = parse_wildcard("HEAD {\n~~*~~").unwrap();
+        assert_eq!(anchors, vec!["HEAD {\n", ""]);
+    }
+
+    #[test]
+    fn parse_wildcard_empty_middle_anchor_rejected() {
+        assert!(parse_wildcard("head~~*~~~~*~~tail").is_none());
+    }
+
+    #[test]
+    fn parse_wildcard_multiple_markers() {
+        let anchors = parse_wildcard("head~~*~~middle~~*~~tail").unwrap();
+        assert_eq!(anchors, vec!["head", "middle", "tail"]);
+    }
+
+    #[test]
+    fn parse_wildcard_escaped_marker_is_literal() {
+        // A single escaped marker, no real separator → not a wildcard edit.
+        let result = parse_wildcard("keep \\~~*~~ literal");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_wildcard_escaped_and_real_marker() {
+        let anchors = parse_wildcard("a\\~~*~~b~~*~~c").unwrap();
+        assert_eq!(anchors, vec!["a~~*~~b", "c"]);
+    }
+
+    #[test]
+    fn unescape_literal_strips_backslash() {
+        assert_eq!(unescape_literal("keep \\~~*~~ here"), "keep ~~*~~ here");
+        // No escape → unchanged.
+        assert_eq!(unescape_literal("plain text"), "plain text");
+        // A bare marker is left as-is (the dispatch handles it separately).
+        assert_eq!(unescape_literal("a ~~*~~ b"), "a ~~*~~ b");
+    }
+
+    // --- apply_wildcard_edit: span (default) behavior ---
+
+    #[test]
+    fn wildcard_specimen_span_delete_and_replace() {
+        // The motivating specimen: head ends in `{`, tail begins with non-closer
+        // (`pub`). Global balance produced an unsatisfiable brace constraint;
+        // span finds the first literal occurrence of the tail and succeeds.
+        let content = "\
+fn lookup_project_by_cwd() {
+    old_impl();
+}
+
+pub async fn handle_read_resource() {
+    body();
+}";
         let (result, replaced) = apply_wildcard_edit(
             content,
-            &["fn main() {", "}"],
-            "fn main() {\n    let z = 42;\n}",
-        )
-        .unwrap();
-        assert_eq!(result, "fn main() {\n    let z = 42;\n}");
-        assert_eq!(replaced, content);
-    }
-
-    #[test]
-    fn wildcard_preserves_surrounding_content() {
-        let content = "// header\nfn foo() {\n    old_code();\n}\n// footer";
-        let (result, replaced) = apply_wildcard_edit(
-            content,
-            &["fn foo() {", "}"],
-            "fn foo() {\n    new_code();\n}",
+            &["fn lookup_project_by_cwd() {", "pub async fn handle_read_resource("],
+            "fn lookup_project_by_cwd() {\n    new_impl();\n}\n\npub async fn handle_read_resource(",
         )
         .unwrap();
         assert_eq!(
             result,
-            "// header\nfn foo() {\n    new_code();\n}\n// footer"
-        );
-        assert_eq!(replaced, "fn foo() {\n    old_code();\n}");
-    }
+            "\
+fn lookup_project_by_cwd() {
+    new_impl();
+}
 
-    #[test]
-    fn wildcard_multiline_anchors() {
-        let content = "a\nb\nc\nd\ne\nf\ng";
-        let (result, replaced) =
-            apply_wildcard_edit(content, &["b\nc", "f\ng"], "B\nC\nD\nE\nF\nG").unwrap();
-        assert_eq!(result, "a\nB\nC\nD\nE\nF\nG");
-        assert_eq!(replaced, "b\nc\nd\ne\nf\ng");
+pub async fn handle_read_resource() {
+    body();
+}"
+        );
+        assert!(replaced.starts_with("fn lookup_project_by_cwd() {"));
+        assert!(replaced.ends_with("pub async fn handle_read_resource("));
     }
 
     #[test]
@@ -421,38 +465,21 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_head_not_found() {
-        let result = apply_wildcard_edit("some content", &["nonexistent", "also missing"], "new");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Head anchor not found"));
-    }
-
-    #[test]
-    fn wildcard_tail_not_found() {
-        let result = apply_wildcard_edit("some content here", &["some", "nonexistent"], "new");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Tail anchor not found"));
-    }
-
-    #[test]
     fn wildcard_uses_first_head_match() {
-        let content = "fn a() {\n    x\n}\nfn a() {\n    y\n}";
+        let content = "fn a() {X}\nfn a() {Y}";
         let (result, replaced) =
-            apply_wildcard_edit(content, &["fn a() {", "}"], "fn a() {\n    z\n}").unwrap();
-        assert_eq!(result, "fn a() {\n    z\n}\nfn a() {\n    y\n}");
-        assert_eq!(replaced, "fn a() {\n    x\n}");
+            apply_wildcard_edit(content, &["fn a() {", "}"], "fn a() {Z}").unwrap();
+        assert_eq!(result, "fn a() {Z}\nfn a() {Y}");
+        assert_eq!(replaced, "fn a() {X}");
     }
 
     #[test]
-    fn wildcard_tail_after_head() {
-        let content = "} early\nfn start() {\n    body\n} end";
-        let (result, _) = apply_wildcard_edit(
-            content,
-            &["fn start() {", "} end"],
-            "fn start() {\n    new\n} end",
-        )
-        .unwrap();
-        assert_eq!(result, "} early\nfn start() {\n    new\n} end");
+    fn wildcard_no_delimiters_uses_first_match() {
+        let content = "// START\nfoo\n// END\nbar\n// END";
+        let (result, replaced) =
+            apply_wildcard_edit(content, &["// START", "// END"], "// START\nnew\n// END").unwrap();
+        assert_eq!(result, "// START\nnew\n// END\nbar\n// END");
+        assert_eq!(replaced, "// START\nfoo\n// END");
     }
 
     #[test]
@@ -463,11 +490,26 @@ mod tests {
         assert_eq!(replaced, "aXb");
     }
 
+    // --- apply_wildcard_edit: whitespace absorption ---
+
+    #[test]
+    fn wildcard_whitespace_own_line_and_tight_forms_match() {
+        let content = "fn main() {\n    let x = 1;\n}";
+        let new = "fn main() {\n    let z = 42;\n}";
+
+        // own-line marker form
+        let own = parse_wildcard("fn main() {\n~~*~~\n}").unwrap();
+        assert_wildcard_result(content, &own, new, new);
+
+        // tight marker form
+        let tight = parse_wildcard("fn main() {~~*~~}").unwrap();
+        assert_wildcard_result(content, &tight, new, new);
+    }
+
     // --- apply_wildcard_edit: balanced delimiter matching ---
 
     #[test]
     fn wildcard_balanced_braces_skips_inner() {
-        // Inner `}` should be skipped, outer `}` matched
         let content = "fn main() {\n    if true {\n        x\n    }\n    y\n}";
         let (result, replaced) =
             apply_wildcard_edit(content, &["fn main() {", "}"], "fn main() {\n    z\n}").unwrap();
@@ -477,7 +519,6 @@ mod tests {
 
     #[test]
     fn wildcard_balanced_brackets_skips_inner() {
-        // Inner `]` in nested arrays should be skipped
         let content = "const arr = [\n    [1, 2],\n    [3, 4],\n]";
         let (result, replaced) = apply_wildcard_edit(
             content,
@@ -491,44 +532,34 @@ mod tests {
 
     #[test]
     fn wildcard_balanced_deeply_nested() {
-        // Three levels of nesting
         let content = "a {\n  b {\n    c {\n      x\n    }\n  }\n}";
-        let (result, _) = apply_wildcard_edit(content, &["a {", "}"], "a {\n  new\n}").unwrap();
-        assert_eq!(result, "a {\n  new\n}");
+        assert_wildcard_result(content, &["a {", "}"], "a {\n  new\n}", "a {\n  new\n}");
     }
 
     #[test]
     fn wildcard_balanced_multiple_same_level() {
-        // Multiple blocks at same nesting level — should match after last inner close
         let content = "fn main() {\n    if a {\n        x\n    }\n    if b {\n        y\n    }\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn main() {", "}"], "fn main() {\n    z\n}").unwrap();
-        assert_eq!(result, "fn main() {\n    z\n}");
+        assert_wildcard_result(
+            content,
+            &["fn main() {", "}"],
+            "fn main() {\n    z\n}",
+            "fn main() {\n    z\n}",
+        );
     }
 
     #[test]
     fn wildcard_balanced_mixed_delimiters() {
-        // Head opens `{` and middle contains `[]` and `()` — only `{}` depth matters for tail `}`
         let content = "fn foo() {\n    let v = vec![1, 2];\n    bar(v);\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    baz();\n}")
-                .unwrap();
-        assert_eq!(result, "fn foo() {\n    baz();\n}");
-    }
-
-    #[test]
-    fn wildcard_no_delimiters_uses_first_match() {
-        // No delimiters in head/tail — degrades to first-match
-        let content = "// START\nfoo\n// END\nbar\n// END";
-        let (result, replaced) =
-            apply_wildcard_edit(content, &["// START", "// END"], "// START\nnew\n// END").unwrap();
-        assert_eq!(result, "// START\nnew\n// END\nbar\n// END");
-        assert_eq!(replaced, "// START\nfoo\n// END");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    baz();\n}",
+            "fn foo() {\n    baz();\n}",
+        );
     }
 
     #[test]
     fn wildcard_balanced_real_world_navigation_array() {
-        // The original bug: `]` matching `],` inside nested objects
         let content = r#"const nav = [
     { label: "Home", items: ["a", "b"] },
     { label: "About", items: ["c"] },
@@ -545,275 +576,186 @@ mod tests {
 
     #[test]
     fn wildcard_balanced_empty_body() {
-        // Tail immediately after head — empty middle
         let content = "fn empty() {}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn empty() {", "}"], "fn empty() { 42 }").unwrap();
-        assert_eq!(result, "fn empty() { 42 }");
+        assert_wildcard_result(
+            content,
+            &["fn empty() {", "}"],
+            "fn empty() { 42 }",
+            "fn empty() { 42 }",
+        );
     }
 
     #[test]
     fn wildcard_balanced_parens() {
-        // Paren balancing for function call arguments
         let content = "call(\n    inner(1, 2),\n    inner(3, 4),\n)";
-        let (result, _) =
-            apply_wildcard_edit(content, &["call(", ")"], "call(\n    inner(5),\n)").unwrap();
-        assert_eq!(result, "call(\n    inner(5),\n)");
+        assert_wildcard_result(
+            content,
+            &["call(", ")"],
+            "call(\n    inner(5),\n)",
+            "call(\n    inner(5),\n)",
+        );
     }
 
     #[test]
     fn wildcard_balanced_preserves_after_match() {
-        // Content after the matched region should be preserved
         let content = "fn a() {\n    if x {\n        y\n    }\n}\nfn b() {\n    z\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn a() {", "}"], "fn a() {\n    new\n}").unwrap();
-        assert_eq!(result, "fn a() {\n    new\n}\nfn b() {\n    z\n}");
+        assert_wildcard_result(
+            content,
+            &["fn a() {", "}"],
+            "fn a() {\n    new\n}",
+            "fn a() {\n    new\n}\nfn b() {\n    z\n}",
+        );
     }
 
-    // --- apply_wildcard_edit: string/comment awareness ---
+    #[test]
+    fn wildcard_balanced_tail_after_head() {
+        let content = "} early\nfn start() {\n    body\n} end";
+        assert_wildcard_result(
+            content,
+            &["fn start() {", "} end"],
+            "fn start() {\n    new\n} end",
+            "} early\nfn start() {\n    new\n} end",
+        );
+    }
+
+    // --- apply_wildcard_edit: empty trailing anchor with head opener ---
+
+    #[test]
+    fn wildcard_trailing_empty_anchor_consumes_closer() {
+        let content = "fn main() {\n    body();\n}\nafter";
+        let anchors = parse_wildcard("fn main() {~~*~~").unwrap();
+        let (result, replaced) =
+            apply_wildcard_edit(content, &anchors, "fn main() {\n    new();\n}").unwrap();
+        assert_eq!(result, "fn main() {\n    new();\n}\nafter");
+        assert_eq!(replaced, "fn main() {\n    body();\n}");
+    }
+
+    // --- apply_wildcard_edit: leading bare-opener form ---
+
+    #[test]
+    fn wildcard_leading_bare_opener() {
+        let content = "prefix {\n    inner();\n} suffix";
+        let anchors = parse_wildcard("{~~*~~}").unwrap();
+        assert_eq!(anchors, vec!["{", "}"]);
+        let (result, replaced) = apply_wildcard_edit(content, &anchors, "{ new }").unwrap();
+        assert_eq!(result, "prefix { new } suffix");
+        assert_eq!(replaced, "{\n    inner();\n}");
+    }
+
+    // --- apply_wildcard_edit: string/comment awareness (balanced) ---
 
     #[test]
     fn wildcard_ignores_brace_in_double_quote_string() {
         let content = "fn foo() {\n    let x = \"}\";\n    real_code();\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    new();\n}")
-                .unwrap();
-        // Should match the outer }, not the } inside the string
-        assert_eq!(result, "fn foo() {\n    new();\n}");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    new();\n}",
+            "fn foo() {\n    new();\n}",
+        );
     }
 
     #[test]
     fn wildcard_ignores_bracket_in_string() {
         let content = "const arr = [\n    \"]not a bracket\",\n    real,\n]";
-        let (result, _) = apply_wildcard_edit(
+        assert_wildcard_result(
             content,
             &["const arr = [", "]"],
             "const arr = [\n    new,\n]",
-        )
-        .unwrap();
-        assert_eq!(result, "const arr = [\n    new,\n]");
+            "const arr = [\n    new,\n]",
+        );
     }
 
     #[test]
     fn wildcard_ignores_brace_in_single_quote_string() {
         let content = "fn foo() {\n    let x = '}';\n    code();\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    new();\n}")
-                .unwrap();
-        assert_eq!(result, "fn foo() {\n    new();\n}");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    new();\n}",
+            "fn foo() {\n    new();\n}",
+        );
     }
 
     #[test]
     fn wildcard_ignores_brace_in_line_comment() {
         let content = "fn foo() {\n    // } this is a comment\n    code();\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    new();\n}")
-                .unwrap();
-        assert_eq!(result, "fn foo() {\n    new();\n}");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    new();\n}",
+            "fn foo() {\n    new();\n}",
+        );
     }
 
     #[test]
     fn wildcard_ignores_brace_in_block_comment() {
         let content = "fn foo() {\n    /* } not real */\n    code();\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    new();\n}")
-                .unwrap();
-        assert_eq!(result, "fn foo() {\n    new();\n}");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    new();\n}",
+            "fn foo() {\n    new();\n}",
+        );
     }
 
     #[test]
     fn wildcard_handles_escaped_quote_in_string() {
-        // The \" inside the string should not end the string
         let content = "fn foo() {\n    let x = \"\\\"}\";\n    code();\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    new();\n}")
-                .unwrap();
-        assert_eq!(result, "fn foo() {\n    new();\n}");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    new();\n}",
+            "fn foo() {\n    new();\n}",
+        );
     }
 
     #[test]
     fn wildcard_multiple_strings_with_braces() {
         let content = "fn foo() {\n    log(\"{}\");\n    fmt(\"{}\");\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    new();\n}")
-                .unwrap();
-        assert_eq!(result, "fn foo() {\n    new();\n}");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    new();\n}",
+            "fn foo() {\n    new();\n}",
+        );
     }
 
     #[test]
     fn wildcard_block_comment_with_nested_delimiters() {
         let content = "fn foo() {\n    /* { [ ( } ] ) */\n    code();\n}";
-        let (result, _) =
-            apply_wildcard_edit(content, &["fn foo() {", "}"], "fn foo() {\n    new();\n}")
-                .unwrap();
-        assert_eq!(result, "fn foo() {\n    new();\n}");
+        assert_wildcard_result(
+            content,
+            &["fn foo() {", "}"],
+            "fn foo() {\n    new();\n}",
+            "fn foo() {\n    new();\n}",
+        );
     }
 
     #[test]
-    fn wildcard_no_false_tail_match_in_string() {
-        // Tail text appears inside a string — should not match there
+    fn wildcard_no_false_closer_match_in_string() {
         let content = "fn start() {\n    let s = \"} end\";\n    code();\n} end";
-        let (result, _) = apply_wildcard_edit(
+        assert_wildcard_result(
             content,
             &["fn start() {", "} end"],
             "fn start() {\n    new();\n} end",
-        )
-        .unwrap();
-        assert_eq!(result, "fn start() {\n    new();\n} end");
-    }
-
-    // --- Bug 1: unbalanced head/tail (gap-only depth tracking) ---
-
-    #[test]
-    fn wildcard_unbalanced_head_opens_more_than_tail_closes() {
-        // Head opens 2 braces (function + if-let), tail closes 1.
-        // This is the agent's exact failure case that motivated the fix.
-        let content = "\
-fn foo() {
-    if x {
-        body();
-    }
-
-    // next
-    rest();
-}";
-        let (result, _) = apply_wildcard_edit(
-            content,
-            &["fn foo() {\n    if x {", "    }\n\n    // next"],
-            "fn foo() {\n    if x {\n        new_body();\n    }\n\n    // next",
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            "\
-fn foo() {
-    if x {
-        new_body();
-    }
-
-    // next
-    rest();
-}"
+            "fn start() {\n    new();\n} end",
         );
-    }
-
-    #[test]
-    fn wildcard_unbalanced_head_in_function_tail_is_comment() {
-        // Head opens { but tail has no delimiters — editing inside a scope
-        let content = "fn main() {\n    // START\n    code();\n    // END\n}";
-        let (result, _) = apply_wildcard_edit(
-            content,
-            &["fn main() {\n    // START", "    // END"],
-            "fn main() {\n    // START\n    new_code();\n    // END",
-        )
-        .unwrap();
-        assert_eq!(
-            result,
-            "fn main() {\n    // START\n    new_code();\n    // END\n}"
-        );
-    }
-
-    #[test]
-    fn wildcard_unbalanced_nested_three_levels() {
-        // Head opens 3 levels, tail closes 1. Gap has balanced inner braces.
-        let content = "mod m {\nfn f() {\nif true {\n    old();\n}\n}\n}";
-        let (result, _) = apply_wildcard_edit(
-            content,
-            &["mod m {\nfn f() {\nif true {", "}"],
-            "mod m {\nfn f() {\nif true {\n    new();\n}",
-        )
-        .unwrap();
-        // Should match the first } after the gap returns to depth 0
-        assert_eq!(result, "mod m {\nfn f() {\nif true {\n    new();\n}\n}\n}");
-    }
-
-    #[test]
-    fn wildcard_head_opens_paren_tail_has_no_delimiters() {
-        // Unbalanced parens: head opens (, tail is plain text
-        let content = "call(\n    arg1,\n    arg2,\n    // done\n)";
-        let (result, _) = apply_wildcard_edit(
-            content,
-            &["call(", "    // done"],
-            "call(\n    new_arg,\n    // done",
-        )
-        .unwrap();
-        assert_eq!(result, "call(\n    new_arg,\n    // done\n)");
-    }
-
-    // --- Bug 2: from_text string/comment awareness ---
-
-    #[test]
-    fn wildcard_from_text_ignores_brace_in_line_comment() {
-        let d = DelimDepth::from_text("fn foo() { // {");
-        assert_eq!(d.brace, 1);
-    }
-
-    #[test]
-    fn wildcard_from_text_ignores_brace_in_string() {
-        let d = DelimDepth::from_text(r#"let x = "{[";"#);
-        assert_eq!(d.brace, 0);
-        assert_eq!(d.bracket, 0);
-    }
-
-    #[test]
-    fn wildcard_from_text_ignores_brace_in_block_comment() {
-        let d = DelimDepth::from_text("start /* { [ ( */ end");
-        assert_eq!(d.brace, 0);
-        assert_eq!(d.bracket, 0);
-        assert_eq!(d.paren, 0);
-    }
-
-    #[test]
-    fn wildcard_from_text_ignores_escaped_quote() {
-        // Escaped quote inside string should not end the string early
-        let d = DelimDepth::from_text(r#"let x = "hello\"{";"#);
-        assert_eq!(d.brace, 0);
-    }
-
-    #[test]
-    fn wildcard_from_text_handles_single_quote_with_brace() {
-        let d = DelimDepth::from_text("let c = '{';");
-        assert_eq!(d.brace, 0);
-    }
-
-    #[test]
-    fn wildcard_from_text_mixed_comments_and_strings() {
-        // Multiple comment/string types in one line
-        let d = DelimDepth::from_text(r#"fn f() { let s = "{"; /* } */ }"#);
-        // Real braces: { at fn body, } at end = net 0
-        // "{" brace and /* } */ brace are ignored
-        assert_eq!(d.brace, 0);
     }
 
     #[test]
     fn wildcard_head_with_brace_in_comment() {
-        // Head has { in a line comment — should not affect depth matching
         let content = "fn foo() { // {\n    body();\n}";
-        let (result, _) = apply_wildcard_edit(
+        assert_wildcard_result(
             content,
             &["fn foo() { // {", "}"],
             "fn foo() { // {\n    new_body();\n}",
-        )
-        .unwrap();
-        assert_eq!(result, "fn foo() { // {\n    new_body();\n}");
+            "fn foo() { // {\n    new_body();\n}",
+        );
     }
 
     #[test]
-    fn wildcard_tail_with_brace_in_string() {
-        // Tail contains a brace in a string literal — from_text should ignore it
-        let content = "fn f() {\n    old();\n    let end = \"}\";\n}";
-        let (result, _) = apply_wildcard_edit(
-            content,
-            &["fn f() {", "    let end = \"}\";\n}"],
-            "fn f() {\n    new();\n    let end = \"}\";\n}",
-        )
-        .unwrap();
-        assert_eq!(result, "fn f() {\n    new();\n    let end = \"}\";\n}");
-    }
-
-    #[test]
-    fn wildcard_gap_only_depth_with_multiple_inner_scopes() {
-        // Head opens 1 brace, gap has multiple balanced inner scopes
+    fn wildcard_gap_with_multiple_inner_scopes() {
         let content = "\
 impl Foo {
     fn a() {
@@ -822,33 +764,16 @@ impl Foo {
     fn b() {
         b_body();
     }
-    fn c() {
-        c_body();
-    }
 }";
-        let (result, _) = apply_wildcard_edit(
+        assert_wildcard_result(
             content,
             &["impl Foo {", "}"],
             "impl Foo {\n    fn new_method() {}\n}",
-        )
-        .unwrap();
-        assert_eq!(result, "impl Foo {\n    fn new_method() {}\n}");
+            "impl Foo {\n    fn new_method() {}\n}",
+        );
     }
 
-    // --- Multi-gap wildcard tests ---
-
-    #[test]
-    fn parse_wildcard_multiple_separators() {
-        let input = "head\n~~~~~\nmiddle\n~~~~~\ntail";
-        let anchors = parse_wildcard(input).unwrap();
-        assert_eq!(anchors, vec!["head", "middle", "tail"]);
-    }
-
-    #[test]
-    fn parse_wildcard_empty_middle_anchor_returns_none() {
-        // Two adjacent separators produce an empty middle segment
-        assert!(parse_wildcard("head\n~~~~~\n\n~~~~~\ntail").is_none());
-    }
+    // --- multi-gap tests ---
 
     #[test]
     fn wildcard_multi_gap_basic() {
@@ -870,7 +795,6 @@ impl Foo {
 
     #[test]
     fn wildcard_multi_gap_balanced_braces() {
-        // Each gap has nested delimiters
         let content = "\
 fn a() {
     inner_a();
@@ -883,18 +807,16 @@ fn b() {
 fn c() {
     inner_c();
 }";
-        let (result, _) = apply_wildcard_edit(
+        assert_wildcard_result(
             content,
             &["fn a() {", "}\nfn b() {", "}\nfn c() {", "}"],
             "fn combined() {\n    all();\n}",
-        )
-        .unwrap();
-        assert_eq!(result, "fn combined() {\n    all();\n}");
+            "fn combined() {\n    all();\n}",
+        );
     }
 
     #[test]
     fn wildcard_multi_gap_match_arms() {
-        // The motivating use case: removing multiple match arms
         let content = "\
 match cmd {
     \"foo\" => {
@@ -928,19 +850,8 @@ match cmd {
     _ => {}
 }"
         );
-        // replaced should span from "foo" through end of "baz" opening
         assert!(replaced.starts_with("\"foo\" => {"));
         assert!(replaced.ends_with("\"baz\" => {"));
-    }
-
-    #[test]
-    fn wildcard_multi_gap_middle_anchor_not_found() {
-        let content = "aaa\nbbb\nccc";
-        let result = apply_wildcard_edit(content, &["aaa", "MISSING", "ccc"], "new");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("Anchor 2 of 3"), "got: {}", err);
-        assert!(err.contains("MISSING"));
     }
 
     #[test]
@@ -953,7 +864,6 @@ match cmd {
 
     #[test]
     fn wildcard_single_gap_unchanged() {
-        // Regression: existing 2-anchor behavior is preserved
         let content = "fn main() {\n    let x = 1;\n}";
         let (result, replaced) = apply_wildcard_edit(
             content,
@@ -963,5 +873,54 @@ match cmd {
         .unwrap();
         assert_eq!(result, "fn main() {\n    let y = 2;\n}");
         assert_eq!(replaced, content);
+    }
+
+    // --- error messages ---
+
+    #[test]
+    fn wildcard_head_not_found() {
+        let result = apply_wildcard_edit("some content", &["nonexistent", "also missing"], "new");
+        let err = result.unwrap_err();
+        assert!(err.contains("Head anchor not found"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_head_whitespace_near_miss() {
+        // Head differs only by internal spacing.
+        let result = apply_wildcard_edit("fn  main() {\n  x\n}", &["fn main() {", "}"], "new");
+        let err = result.unwrap_err();
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_tail_not_found() {
+        let result = apply_wildcard_edit("some content here", &["some", "nonexistent"], "new");
+        let err = result.unwrap_err();
+        assert!(err.contains("Tail anchor not found"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_tail_whitespace_near_miss() {
+        // Tail (span) differs only by internal spacing.
+        let result = apply_wildcard_edit("head then  tail here", &["head", "then tail"], "new");
+        let err = result.unwrap_err();
+        assert!(err.contains("whitespace"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_multi_gap_middle_anchor_not_found() {
+        let result = apply_wildcard_edit("aaa\nbbb\nccc", &["aaa", "MISSING", "ccc"], "new");
+        let err = result.unwrap_err();
+        assert!(err.contains("Anchor 2 of 3"), "got: {err}");
+        assert!(err.contains("MISSING"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_balanced_closer_not_found() {
+        // Head opens a brace, next anchor begins with the closer, but there is no
+        // balancing `}` in the content.
+        let result = apply_wildcard_edit("fn main() {\n    body();", &["fn main() {", "}"], "new");
+        let err = result.unwrap_err();
+        assert!(err.contains("Could not balance"), "got: {err}");
     }
 }

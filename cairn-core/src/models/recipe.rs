@@ -242,11 +242,11 @@ pub enum RecipeNodeType {
     Trigger,
     Agent,
     Action,
+    Pr,
     Checkpoint,
     Artifact,
     Condition,
     Context,
-    Executor,
 }
 
 impl std::fmt::Display for RecipeNodeType {
@@ -255,11 +255,11 @@ impl std::fmt::Display for RecipeNodeType {
             RecipeNodeType::Trigger => write!(f, "trigger"),
             RecipeNodeType::Agent => write!(f, "agent"),
             RecipeNodeType::Action => write!(f, "action"),
+            RecipeNodeType::Pr => write!(f, "pr"),
             RecipeNodeType::Checkpoint => write!(f, "checkpoint"),
             RecipeNodeType::Artifact => write!(f, "artifact"),
             RecipeNodeType::Condition => write!(f, "condition"),
             RecipeNodeType::Context => write!(f, "context"),
-            RecipeNodeType::Executor => write!(f, "executor"),
         }
     }
 }
@@ -272,11 +272,11 @@ impl std::str::FromStr for RecipeNodeType {
             "trigger" => Ok(RecipeNodeType::Trigger),
             "agent" => Ok(RecipeNodeType::Agent),
             "action" => Ok(RecipeNodeType::Action),
+            "pr" => Ok(RecipeNodeType::Pr),
             "checkpoint" => Ok(RecipeNodeType::Checkpoint),
             "artifact" => Ok(RecipeNodeType::Artifact),
             "condition" => Ok(RecipeNodeType::Condition),
             "context" => Ok(RecipeNodeType::Context),
-            "executor" => Ok(RecipeNodeType::Executor),
             _ => Err(format!("Unknown recipe node type: {}", s)),
         }
     }
@@ -335,9 +335,6 @@ pub struct NodeConfig {
     // Agent config
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_config_id: Option<String>,
-    /// Nested checkpoint for agent nodes
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<CheckpointNodeConfig>,
     /// Nested output schema for agent nodes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<SchemaConfig>,
@@ -356,13 +353,11 @@ pub struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<SchemaConfig>,
     /// Nested output schema for action nodes (uses output_schema field above)
-    /// Nested checkpoint for action nodes (uses checkpoint field above)
 
-    // Legacy checkpoint config (for standalone checkpoint nodes)
+    // Standalone checkpoint node config (command gate). A `checkpoint`-type node
+    // runs this command: exit 0 passes (continue), non-zero blocks (resumable).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkpoint_type: Option<CheckpointType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>, // For programmatic checkpoints
+    pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
 
@@ -535,9 +530,6 @@ fn is_default_worktree_mode(mode: &WorktreeMode) -> bool {
 #[serde(rename_all = "camelCase")]
 pub struct AgentNodeConfig {
     pub agent_config_id: Option<String>,
-    /// Checkpoint attached to agent (docks below, replaces ctrl-out)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<CheckpointNodeConfig>,
     /// Output schema attached to agent (docks to right)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<SchemaConfig>,
@@ -563,19 +555,39 @@ pub struct ActionNodeConfig {
     /// Output schema attached below action
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<SchemaConfig>,
-    /// Checkpoint attached below action
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<CheckpointNodeConfig>,
+}
+
+/// How a produced artifact's confirm gate resolves.
+///
+/// `Auto` flips `artifact.confirmed` true on the first write (the projection
+/// derives Complete immediately); `User` leaves it false until a human confirms
+/// in the UI (the projection derives Blocked while the latest artifact is
+/// unconfirmed). A node with no declared schema defaults to `Auto`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmPolicy {
+    #[default]
+    Auto,
+    User,
 }
 
 /// Schema configuration for agent output or action input/output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SchemaConfig {
+    /// The artifact's canonical name and `cairn:~/<name>` URI segment. One
+    /// identifier — no separate display label, no preset reference.
     pub name: String,
-    pub schema_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fields: Option<Vec<SchemaField>>,
+    /// The full, self-contained JSON Schema for the artifact payload. Presets are
+    /// baked in at authoring time (an editor convenience), never referenced at
+    /// runtime. `None` means the field shape is inherited from a downstream
+    /// context-edge target (e.g. a builder whose PR shape comes from `create_pr`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// Whether the produced artifact auto-confirms or waits for a human. The
+    /// producing node's gate decision, independent of any inherited field shape.
+    #[serde(default)]
+    pub confirm_policy: ConfirmPolicy,
     /// Custom tool name (defaults to "return")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
@@ -584,54 +596,19 @@ pub struct SchemaConfig {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SchemaField {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub field_type: String,
-}
-
-/// Checkpoint type - how the checkpoint is evaluated
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CheckpointType {
-    #[default]
-    Approval, // Manual user approval
-    Programmatic, // Run command, evaluate exit code
-}
-
-impl std::fmt::Display for CheckpointType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheckpointType::Approval => write!(f, "approval"),
-            CheckpointType::Programmatic => write!(f, "programmatic"),
-        }
-    }
-}
-
-impl std::str::FromStr for CheckpointType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "approval" => Ok(CheckpointType::Approval),
-            "programmatic" => Ok(CheckpointType::Programmatic),
-            // Legacy support
-            "prompt" => Ok(CheckpointType::Approval),
-            _ => Err(format!("Unknown checkpoint type: {}", s)),
-        }
-    }
-}
-
+/// Standalone checkpoint node config — a single pass-through command gate.
+///
+/// The command runs in the execution worktree: exit 0 passes (continue), a
+/// non-zero exit blocks the checkpoint job (a resumable halt). There is no
+/// human-approval checkpoint variant; a producing node's `confirm_policy` on its
+/// output schema is the sole human-approval gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointNodeConfig {
-    pub checkpoint_type: CheckpointType,
-    /// For programmatic checkpoints: command to run (exit 0 = approve, non-zero = reject)
+    /// Command to run (exit 0 = pass/continue, non-zero = fail/block).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Optional prompt/message to show user
+    /// Optional prompt/message to show the user.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
 }
@@ -749,10 +726,10 @@ pub struct RecipeEdge {
 }
 
 /// Convert DbRecipeNode to RecipeNode
-impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
+impl TryFrom<crate::db_records::DbRecipeNode> for RecipeNode {
     type Error = String;
 
-    fn try_from(db: crate::diesel_models::DbRecipeNode) -> Result<Self, Self::Error> {
+    fn try_from(db: crate::db_records::DbRecipeNode) -> Result<Self, Self::Error> {
         let node_type: RecipeNodeType = db
             .node_type
             .parse()
@@ -778,7 +755,6 @@ impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
         ) = if let Some(cfg) = config {
             // Build agent config with nested checkpoint/schema/git_config
             let agent_config = if cfg.agent_config_id.is_some()
-                || cfg.checkpoint.is_some()
                 || cfg.output_schema.is_some()
                 || cfg.git_config.is_some()
             {
@@ -786,7 +762,6 @@ impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
                 if node_type == RecipeNodeType::Agent {
                     Some(AgentNodeConfig {
                         agent_config_id: cfg.agent_config_id,
-                        checkpoint: cfg.checkpoint.clone(),
                         output_schema: cfg.output_schema.clone(),
                         git_config: cfg.git_config,
                     })
@@ -798,7 +773,10 @@ impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
             };
 
             // Build action config with nested schemas/checkpoint
-            let action_config = if cfg.action.is_some() || cfg.action_config_id.is_some() {
+            let action_config = if cfg.action.is_some()
+                || cfg.action_config_id.is_some()
+                || (node_type == RecipeNodeType::Pr && cfg.input_schema.is_some())
+            {
                 Some(ActionNodeConfig {
                     action_config_id: cfg.action_config_id,
                     action: cfg.action.unwrap_or_default(),
@@ -808,11 +786,6 @@ impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
                     input_schema: cfg.input_schema,
                     output_schema: if node_type == RecipeNodeType::Action {
                         cfg.output_schema
-                    } else {
-                        None
-                    },
-                    checkpoint: if node_type == RecipeNodeType::Action {
-                        cfg.checkpoint
                     } else {
                         None
                     },
@@ -845,12 +818,16 @@ impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
                 }),
                 agent_config,
                 action_config,
-                // Legacy standalone checkpoint config
-                cfg.checkpoint_type.map(|ct| CheckpointNodeConfig {
-                    checkpoint_type: ct,
-                    command: cfg.command,
-                    prompt: cfg.prompt,
-                }),
+                // Standalone checkpoint node config (command gate). Keyed on the
+                // node type now that the command is the only checkpoint shape.
+                if node_type == RecipeNodeType::Checkpoint {
+                    Some(CheckpointNodeConfig {
+                        command: cfg.command,
+                        prompt: cfg.prompt,
+                    })
+                } else {
+                    None
+                },
                 // Legacy standalone artifact config
                 cfg.artifact_type.map(|at| ArtifactNodeConfig {
                     artifact_type: at,
@@ -885,10 +862,10 @@ impl TryFrom<crate::diesel_models::DbRecipeNode> for RecipeNode {
 }
 
 /// Convert DbRecipeEdge to RecipeEdge
-impl TryFrom<crate::diesel_models::DbRecipeEdge> for RecipeEdge {
+impl TryFrom<crate::db_records::DbRecipeEdge> for RecipeEdge {
     type Error = String;
 
-    fn try_from(db: crate::diesel_models::DbRecipeEdge) -> Result<Self, Self::Error> {
+    fn try_from(db: crate::db_records::DbRecipeEdge) -> Result<Self, Self::Error> {
         let edge_type: RecipeEdgeType = db
             .edge_type
             .parse()
@@ -918,7 +895,17 @@ pub struct RecipeVersionInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diesel_models::{DbRecipeEdge, DbRecipeNode};
+    use crate::db_records::{DbRecipeEdge, DbRecipeNode};
+
+    fn assert_parse_cases<T>(cases: &[(&str, T)])
+    where
+        T: std::str::FromStr + PartialEq + std::fmt::Debug + Clone,
+        T::Err: std::fmt::Debug,
+    {
+        for (input, expected) in cases {
+            assert_eq!(input.parse::<T>().unwrap(), expected.clone());
+        }
+    }
 
     // =========================================================================
     // RecipeTrigger tests
@@ -933,23 +920,72 @@ mod tests {
     }
 
     #[test]
-    fn recipe_trigger_from_str() {
-        assert_eq!(
-            "manual".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Manual
-        );
-        assert_eq!(
-            "schedule".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Schedule
-        );
-        assert_eq!(
-            "job_ended".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::JobEnded
-        );
-        assert_eq!(
-            "skill_called".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::SkillCalled
-        );
+    fn recipe_enums_parse_canonical_values() {
+        assert_parse_cases(&[
+            ("manual", RecipeTrigger::Manual),
+            ("schedule", RecipeTrigger::Schedule),
+            ("job_ended", RecipeTrigger::JobEnded),
+            ("skill_called", RecipeTrigger::SkillCalled),
+        ]);
+        assert_parse_cases(&[
+            ("issue", TriggerScope::Issue),
+            ("project", TriggerScope::Project),
+        ]);
+        assert_parse_cases(&[
+            ("trigger", RecipeNodeType::Trigger),
+            ("agent", RecipeNodeType::Agent),
+            ("action", RecipeNodeType::Action),
+            ("checkpoint", RecipeNodeType::Checkpoint),
+            ("artifact", RecipeNodeType::Artifact),
+            ("condition", RecipeNodeType::Condition),
+            ("context", RecipeNodeType::Context),
+        ]);
+        assert_parse_cases(&[
+            ("control", RecipeEdgeType::Control),
+            ("context", RecipeEdgeType::Context),
+        ]);
+        assert_parse_cases(&[
+            ("programmatic", ConditionType::Programmatic),
+            ("ai", ConditionType::Ai),
+        ]);
+        assert_parse_cases(&[
+            ("own", WorktreeMode::Own),
+            ("inherit", WorktreeMode::Inherit),
+            ("none", WorktreeMode::None),
+        ]);
+        assert_parse_cases(&[
+            ("usedefault", ConditionErrorBehavior::UseDefault),
+            ("block", ConditionErrorBehavior::Block),
+        ]);
+    }
+
+    #[test]
+    fn recipe_enums_parse_case_insensitively() {
+        assert_parse_cases(&[
+            ("MANUAL", RecipeTrigger::Manual),
+            ("Schedule", RecipeTrigger::Schedule),
+        ]);
+        assert_parse_cases(&[
+            ("TRIGGER", RecipeNodeType::Trigger),
+            ("Agent", RecipeNodeType::Agent),
+        ]);
+        assert_parse_cases(&[
+            ("CONTROL", RecipeEdgeType::Control),
+            ("Context", RecipeEdgeType::Context),
+        ]);
+        assert_parse_cases(&[
+            ("PROGRAMMATIC", ConditionType::Programmatic),
+            ("AI", ConditionType::Ai),
+        ]);
+        assert_parse_cases(&[
+            ("OWN", WorktreeMode::Own),
+            ("Inherit", WorktreeMode::Inherit),
+            ("NONE", WorktreeMode::None),
+        ]);
+        assert_parse_cases(&[
+            ("USEDEFAULT", ConditionErrorBehavior::UseDefault),
+            ("Block", ConditionErrorBehavior::Block),
+        ]);
     }
 
     #[test]
@@ -961,18 +997,6 @@ mod tests {
         assert_eq!(
             "ISSUE".parse::<RecipeTrigger>().unwrap(),
             RecipeTrigger::Manual
-        );
-    }
-
-    #[test]
-    fn recipe_trigger_from_str_case_insensitive() {
-        assert_eq!(
-            "MANUAL".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Manual
-        );
-        assert_eq!(
-            "Schedule".parse::<RecipeTrigger>().unwrap(),
-            RecipeTrigger::Schedule
         );
     }
 
@@ -1003,18 +1027,6 @@ mod tests {
     fn trigger_scope_display() {
         assert_eq!(TriggerScope::Issue.to_string(), "issue");
         assert_eq!(TriggerScope::Project.to_string(), "project");
-    }
-
-    #[test]
-    fn trigger_scope_from_str() {
-        assert_eq!(
-            "issue".parse::<TriggerScope>().unwrap(),
-            TriggerScope::Issue
-        );
-        assert_eq!(
-            "project".parse::<TriggerScope>().unwrap(),
-            TriggerScope::Project
-        );
     }
 
     #[test]
@@ -1233,54 +1245,17 @@ mod tests {
     }
 
     #[test]
-    fn recipe_node_type_from_str() {
-        assert_eq!(
-            "trigger".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Trigger
-        );
-        assert_eq!(
-            "agent".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Agent
-        );
-        assert_eq!(
-            "action".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Action
-        );
-        assert_eq!(
-            "checkpoint".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Checkpoint
-        );
-        assert_eq!(
-            "artifact".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Artifact
-        );
-        assert_eq!(
-            "condition".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Condition
-        );
-        assert_eq!(
-            "context".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Context
-        );
-    }
-
-    #[test]
-    fn recipe_node_type_from_str_case_insensitive() {
-        assert_eq!(
-            "TRIGGER".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Trigger
-        );
-        assert_eq!(
-            "Agent".parse::<RecipeNodeType>().unwrap(),
-            RecipeNodeType::Agent
-        );
-    }
-
-    #[test]
     fn recipe_node_type_from_str_invalid() {
         let result = "invalid".parse::<RecipeNodeType>();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown recipe node type"));
+    }
+
+    #[test]
+    fn recipe_node_type_executor_is_unknown() {
+        let result = "executor".parse::<RecipeNodeType>();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Unknown recipe node type: executor");
     }
 
     // =========================================================================
@@ -1294,89 +1269,10 @@ mod tests {
     }
 
     #[test]
-    fn recipe_edge_type_from_str() {
-        assert_eq!(
-            "control".parse::<RecipeEdgeType>().unwrap(),
-            RecipeEdgeType::Control
-        );
-        assert_eq!(
-            "context".parse::<RecipeEdgeType>().unwrap(),
-            RecipeEdgeType::Context
-        );
-    }
-
-    #[test]
-    fn recipe_edge_type_from_str_case_insensitive() {
-        assert_eq!(
-            "CONTROL".parse::<RecipeEdgeType>().unwrap(),
-            RecipeEdgeType::Control
-        );
-        assert_eq!(
-            "Context".parse::<RecipeEdgeType>().unwrap(),
-            RecipeEdgeType::Context
-        );
-    }
-
-    #[test]
     fn recipe_edge_type_from_str_invalid() {
         let result = "invalid".parse::<RecipeEdgeType>();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown recipe edge type"));
-    }
-
-    // =========================================================================
-    // CheckpointType tests
-    // =========================================================================
-
-    #[test]
-    fn checkpoint_type_display() {
-        assert_eq!(CheckpointType::Approval.to_string(), "approval");
-        assert_eq!(CheckpointType::Programmatic.to_string(), "programmatic");
-    }
-
-    #[test]
-    fn checkpoint_type_from_str() {
-        assert_eq!(
-            "approval".parse::<CheckpointType>().unwrap(),
-            CheckpointType::Approval
-        );
-        assert_eq!(
-            "programmatic".parse::<CheckpointType>().unwrap(),
-            CheckpointType::Programmatic
-        );
-    }
-
-    #[test]
-    fn checkpoint_type_from_str_legacy_prompt() {
-        // "prompt" is a legacy alias for "approval"
-        assert_eq!(
-            "prompt".parse::<CheckpointType>().unwrap(),
-            CheckpointType::Approval
-        );
-    }
-
-    #[test]
-    fn checkpoint_type_from_str_case_insensitive() {
-        assert_eq!(
-            "APPROVAL".parse::<CheckpointType>().unwrap(),
-            CheckpointType::Approval
-        );
-        assert_eq!(
-            "Programmatic".parse::<CheckpointType>().unwrap(),
-            CheckpointType::Programmatic
-        );
-    }
-
-    #[test]
-    fn checkpoint_type_from_str_invalid() {
-        let result = "invalid".parse::<CheckpointType>();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unknown checkpoint type"));
-    }
-
-    #[test]
-    fn checkpoint_type_default() {
-        assert_eq!(CheckpointType::default(), CheckpointType::Approval);
     }
 
     // =========================================================================
@@ -1387,24 +1283,6 @@ mod tests {
     fn condition_type_display() {
         assert_eq!(ConditionType::Programmatic.to_string(), "programmatic");
         assert_eq!(ConditionType::Ai.to_string(), "ai");
-    }
-
-    #[test]
-    fn condition_type_from_str() {
-        assert_eq!(
-            "programmatic".parse::<ConditionType>().unwrap(),
-            ConditionType::Programmatic
-        );
-        assert_eq!("ai".parse::<ConditionType>().unwrap(), ConditionType::Ai);
-    }
-
-    #[test]
-    fn condition_type_from_str_case_insensitive() {
-        assert_eq!(
-            "PROGRAMMATIC".parse::<ConditionType>().unwrap(),
-            ConditionType::Programmatic
-        );
-        assert_eq!("AI".parse::<ConditionType>().unwrap(), ConditionType::Ai);
     }
 
     #[test]
@@ -1431,26 +1309,6 @@ mod tests {
     }
 
     #[test]
-    fn worktree_mode_from_str() {
-        assert_eq!("own".parse::<WorktreeMode>().unwrap(), WorktreeMode::Own);
-        assert_eq!(
-            "inherit".parse::<WorktreeMode>().unwrap(),
-            WorktreeMode::Inherit
-        );
-        assert_eq!("none".parse::<WorktreeMode>().unwrap(), WorktreeMode::None);
-    }
-
-    #[test]
-    fn worktree_mode_from_str_case_insensitive() {
-        assert_eq!("OWN".parse::<WorktreeMode>().unwrap(), WorktreeMode::Own);
-        assert_eq!(
-            "Inherit".parse::<WorktreeMode>().unwrap(),
-            WorktreeMode::Inherit
-        );
-        assert_eq!("NONE".parse::<WorktreeMode>().unwrap(), WorktreeMode::None);
-    }
-
-    #[test]
     fn worktree_mode_from_str_invalid() {
         let result = "invalid".parse::<WorktreeMode>();
         assert!(result.is_err());
@@ -1473,35 +1331,11 @@ mod tests {
     }
 
     #[test]
-    fn condition_error_behavior_from_str() {
-        assert_eq!(
-            "usedefault".parse::<ConditionErrorBehavior>().unwrap(),
-            ConditionErrorBehavior::UseDefault
-        );
-        assert_eq!(
-            "block".parse::<ConditionErrorBehavior>().unwrap(),
-            ConditionErrorBehavior::Block
-        );
-    }
-
-    #[test]
     fn condition_error_behavior_from_str_alternate_format() {
         // "use_default" is an alternate format
         assert_eq!(
             "use_default".parse::<ConditionErrorBehavior>().unwrap(),
             ConditionErrorBehavior::UseDefault
-        );
-    }
-
-    #[test]
-    fn condition_error_behavior_from_str_case_insensitive() {
-        assert_eq!(
-            "USEDEFAULT".parse::<ConditionErrorBehavior>().unwrap(),
-            ConditionErrorBehavior::UseDefault
-        );
-        assert_eq!(
-            "Block".parse::<ConditionErrorBehavior>().unwrap(),
-            ConditionErrorBehavior::Block
         );
     }
 
@@ -1574,20 +1408,6 @@ mod tests {
     }
 
     #[test]
-    fn try_from_db_recipe_node_agent_with_checkpoint() {
-        let config = r#"{"agentConfigId": "agent-123", "checkpoint": {"checkpointType": "approval", "prompt": "Review?"}}"#;
-        let db = make_db_recipe_node("agent", Some(config));
-
-        let node = RecipeNode::try_from(db).unwrap();
-
-        let agent_config = node.agent_config.unwrap();
-        assert!(agent_config.checkpoint.is_some());
-        let checkpoint = agent_config.checkpoint.unwrap();
-        assert_eq!(checkpoint.checkpoint_type, CheckpointType::Approval);
-        assert_eq!(checkpoint.prompt, Some("Review?".to_string()));
-    }
-
-    #[test]
     fn try_from_db_recipe_node_agent_with_git_config() {
         let config = r#"{"agentConfigId": "agent-123", "gitConfig": {"worktreeMode": "inherit"}}"#;
         let db = make_db_recipe_node("agent", Some(config));
@@ -1619,7 +1439,7 @@ mod tests {
 
     #[test]
     fn try_from_db_recipe_node_checkpoint() {
-        let config = r#"{"checkpointType": "programmatic", "command": "npm test"}"#;
+        let config = r#"{"command": "npm test", "prompt": "CI"}"#;
         let db = make_db_recipe_node("checkpoint", Some(config));
 
         let node = RecipeNode::try_from(db).unwrap();
@@ -1627,11 +1447,8 @@ mod tests {
         assert_eq!(node.node_type, RecipeNodeType::Checkpoint);
         assert!(node.checkpoint_config.is_some());
         let checkpoint_config = node.checkpoint_config.unwrap();
-        assert_eq!(
-            checkpoint_config.checkpoint_type,
-            CheckpointType::Programmatic
-        );
         assert_eq!(checkpoint_config.command, Some("npm test".to_string()));
+        assert_eq!(checkpoint_config.prompt, Some("CI".to_string()));
     }
 
     #[test]

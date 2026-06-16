@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::settings::load_settings;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
-
-use super::lookup_run;
+use crate::storage::{DbResult, LocalDb, RowExt};
 
 // ============================================================================
 // Payload Types
@@ -37,36 +36,40 @@ struct BugReportRequest {
 // Handler
 // ============================================================================
 
-/// Handle bug_report tool call.
+/// Submit a bug report via `change → cairn://bug, append`.
 ///
-/// Checks opt-out setting, enriches with context, and fires off the report
-/// to the Cairn bug report API in the background.
-pub async fn handle_bug_report(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let payload: BugReportPayload = match serde_json::from_value(request.payload.clone()) {
-        Ok(p) => p,
-        Err(e) => return format!("Invalid payload: {}", e),
-    };
+/// Checks the opt-out setting, enriches with agent context, and fires the
+/// report to the Cairn bug report API in the background.
+///
+/// `payload_value` must contain `category` (String), `title` (String), `description` (String),
+/// and optionally `toolName` (String).
+pub async fn submit_bug_report(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    payload_value: &serde_json::Value,
+) -> Result<String, String> {
+    let payload: BugReportPayload = serde_json::from_value(payload_value.clone())
+        .map_err(|e| format!("Invalid payload: {e}"))?;
 
     // Check opt-out setting
     let settings = load_settings(&orch.config_dir);
     if !settings.bug_reports {
-        return "Bug reports are disabled in settings.".to_string();
+        return Ok("Bug reports are disabled in settings.".to_string());
     }
 
     // Look up agent context for enrichment
-    let agent_type = {
-        let conn_result = orch.db.conn.lock();
-        match conn_result {
-            Ok(mut conn) => lookup_run(&mut conn, request)
-                .ok()
-                .and_then(|ctx| ctx.job_name.or(Some(ctx.job_type))),
-            Err(_) => None,
+    let agent_type = match lookup_agent_type(&orch.db.local, request).await {
+        Ok(agent_type) => agent_type,
+        Err(error) => {
+            log::debug!("bug_report: agent context lookup failed: {}", error);
+            None
         }
     };
 
+    let title = payload.title.clone();
     let report = BugReportRequest {
         category: payload.category,
-        title: payload.title.clone(),
+        title: payload.title,
         description: payload.description,
         cairn_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         agent_type,
@@ -101,5 +104,80 @@ pub async fn handle_bug_report(orch: &Orchestrator, request: &McpCallbackRequest
         }
     });
 
-    format!("Report submitted: {}", payload.title)
+    Ok(format!("Report submitted: {title}"))
+}
+
+async fn lookup_agent_type(db: &LocalDb, request: &McpCallbackRequest) -> DbResult<Option<String>> {
+    if let Some(run_id) = request.run_id.as_deref() {
+        let run_id = run_id.to_string();
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT j.node_name,
+                               CASE
+                                   WHEN j.issue_id IS NULL THEN 'project'
+                                   ELSE 'implementation'
+                               END
+                        FROM runs r
+                        JOIN jobs j ON r.job_id = j.id
+                        WHERE r.id = ?1
+                        LIMIT 1
+                        ",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+
+                rows.next()
+                    .await?
+                    .map(|row| {
+                        let job_name = row.opt_text(0)?;
+                        let job_type = row.text(1)?;
+                        Ok(job_name.or(Some(job_type)))
+                    })
+                    .transpose()
+                    .map(|value| value.flatten())
+            })
+        })
+        .await
+    } else {
+        let cwd = request.cwd.clone();
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT j.node_name,
+                               CASE
+                                   WHEN j.issue_id IS NULL THEN 'project'
+                                   ELSE 'implementation'
+                               END
+                        FROM runs r
+                        JOIN jobs j ON r.job_id = j.id
+                        LEFT JOIN projects p ON j.project_id = p.id
+                        WHERE r.status IN ('starting', 'live')
+                          AND (j.worktree_path = ?1 OR (p.repo_path = ?1 AND j.issue_id IS NULL))
+                        ORDER BY
+                            CASE WHEN j.worktree_path = ?1 THEN 0 ELSE 1 END,
+                            r.created_at DESC
+                        LIMIT 1
+                        ",
+                        (cwd.as_str(),),
+                    )
+                    .await?;
+
+                rows.next()
+                    .await?
+                    .map(|row| {
+                        let job_name = row.opt_text(0)?;
+                        let job_type = row.text(1)?;
+                        Ok(job_name.or(Some(job_type)))
+                    })
+                    .transpose()
+                    .map(|value| value.flatten())
+            })
+        })
+        .await
+    }
 }

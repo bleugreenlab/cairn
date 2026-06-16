@@ -1,101 +1,195 @@
 //! Execution and job query functions.
 //!
-//! Canonical home for all read-only execution queries (snapshots, node statuses,
-//! listing, detail) **and** job queries (tabs, list, get, children).
+//! Canonical home for read-only execution queries (snapshots, node statuses,
+//! listing, detail) and job query helpers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
 
-use diesel::prelude::*;
+use turso::params;
 
-use crate::diesel_models::{DbActionRun, DbExecution, DbJob};
+use crate::db_records::{db_job_from_row, DbActionRun, DbExecution, DbJob, JOB_COLUMNS};
 use crate::models::{
     ActionRun, Execution, ExecutionDetail, ExecutionFilters, ExecutionListItem,
-    ExecutionListResult, ExecutionSnapshot, ExecutionStatus, Job, RecipeNode, TriggerType,
+    ExecutionListResult, ExecutionSnapshot, ExecutionStatus, Job, NodeAttempt, RecipeNode,
+    TriggerType,
 };
 use crate::orchestrator::Orchestrator;
-use crate::schema::{action_runs, artifacts, executions, issues, jobs, projects};
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+
+const EXECUTION_COLUMNS: &str = "id, recipe_id, issue_id, project_id, status, started_at,
+    completed_at, snapshot, seq, initiator_sub, initiator_auth_mode, initiator_org_id,
+    triggered_by";
+
+const ACTION_RUN_COLUMNS: &str = "id, execution_id, recipe_node_id, action_config_id,
+    issue_id, project_id, status, inputs, output, error_message, started_at, completed_at,
+    created_at, parent_job_id, uri_segment";
 
 // ── Execution queries ────────────────────────────────────────────
 
-/// Get the full execution snapshot for an execution.
 pub fn get_execution_snapshot(
-    conn: &mut diesel::sqlite::SqliteConnection,
+    db: Arc<LocalDb>,
     execution_id: &str,
 ) -> Result<Option<ExecutionSnapshot>, String> {
-    let snapshot_json: Option<String> = executions::table
-        .find(execution_id)
-        .select(executions::snapshot)
-        .first(conn)
-        .optional()
-        .map_err(|e| format!("Failed to load execution: {}", e))?
-        .flatten();
-
-    match snapshot_json {
-        Some(json) => {
-            let snapshot: ExecutionSnapshot = serde_json::from_str(&json)
-                .map_err(|e| format!("Failed to parse snapshot: {}", e))?;
-            Ok(Some(snapshot))
-        }
-        None => Ok(None),
-    }
+    let execution_id = execution_id.to_string();
+    run_query_db(async move { get_execution_snapshot_async(&db, &execution_id).await })
 }
 
-/// Get job statuses for all nodes in an execution.
-///
-/// Returns a map of recipe_node_id -> job status for the editor to display
-/// execution state and restrict editing of running/complete nodes.
 pub fn get_execution_node_statuses(
-    conn: &mut diesel::sqlite::SqliteConnection,
+    db: Arc<LocalDb>,
     execution_id: &str,
 ) -> Result<HashMap<String, String>, String> {
-    let job_data: Vec<(Option<String>, String)> = jobs::table
-        .filter(jobs::execution_id.eq(execution_id))
-        .select((jobs::recipe_node_id, jobs::status))
-        .load(conn)
-        .map_err(|e| format!("Failed to load jobs: {}", e))?;
+    let execution_id = execution_id.to_string();
+    run_query_db(async move {
+        db.read(|conn| {
+            let execution_id = execution_id.clone();
+            Box::pin(async move { node_statuses_conn(conn, &execution_id).await })
+        })
+        .await
+        .map_err(|e| format!("Failed to load jobs: {e}"))
+    })
+}
 
-    let mut statuses = HashMap::new();
-    for (node_id, status) in job_data {
-        if let Some(id) = node_id {
-            statuses.insert(id, status);
+/// Connection-level node→status projection: the newest live (non-cancelled) job
+/// status per recipe node.
+///
+/// Restart-node archives a node's prior job as `cancelled` and creates a fresh
+/// one, so a node can map to several rows. Excluding cancelled archives and
+/// ordering oldest→newest means the newest live attempt wins the per-node
+/// collapse (a `HashMap` keeps the last value inserted for a key).
+pub(crate) async fn node_statuses_conn(
+    conn: &turso::Connection,
+    execution_id: &str,
+) -> DbResult<HashMap<String, String>> {
+    let mut rows = conn
+        .query(
+            "SELECT recipe_node_id, status FROM jobs
+             WHERE execution_id = ?1 AND status <> 'cancelled'
+             ORDER BY created_at ASC",
+            params![execution_id],
+        )
+        .await?;
+    let mut map = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        if let Some(node_id) = row.opt_text(0)? {
+            map.insert(node_id, row.text(1)?);
         }
     }
-
-    Ok(statuses)
+    Ok(map)
 }
 
-/// Get the execution for an issue (if any).
+/// List every attempt (job row) for a recipe node within an execution, oldest
+/// to newest, **including** archived (`cancelled`) attempts. Powers the
+/// attempt-lineage view: a restarted node keeps its prior attempts reachable and
+/// comparable rather than dropping them from history.
+pub fn list_node_attempts(
+    db: Arc<LocalDb>,
+    execution_id: &str,
+    recipe_node_id: &str,
+) -> Result<Vec<NodeAttempt>, String> {
+    let execution_id = execution_id.to_string();
+    let recipe_node_id = recipe_node_id.to_string();
+    run_query_db(async move {
+        db.read(|conn| {
+            let execution_id = execution_id.clone();
+            let recipe_node_id = recipe_node_id.clone();
+            Box::pin(
+                async move { list_node_attempts_conn(conn, &execution_id, &recipe_node_id).await },
+            )
+        })
+        .await
+        .map_err(|e| format!("Failed to load node attempts: {e}"))
+    })
+}
+
+pub(crate) async fn list_node_attempts_conn(
+    conn: &turso::Connection,
+    execution_id: &str,
+    recipe_node_id: &str,
+) -> DbResult<Vec<NodeAttempt>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, status, created_at, current_session_id
+             FROM jobs
+             WHERE execution_id = ?1 AND recipe_node_id = ?2
+             ORDER BY created_at ASC",
+            params![execution_id, recipe_node_id],
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(NodeAttempt {
+            id: row.text(0)?,
+            status: row.text(1)?,
+            created_at: row.i64(2)? as i32,
+            current_session_id: row.opt_text(3)?,
+        });
+    }
+    Ok(out)
+}
+
 pub fn get_execution_for_issue(
-    conn: &mut diesel::sqlite::SqliteConnection,
+    db: Arc<LocalDb>,
     issue_id: &str,
 ) -> Result<Option<Execution>, String> {
-    let db_exec: Option<DbExecution> = executions::table
-        .filter(executions::issue_id.eq(issue_id))
-        .first(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    db_exec.map(Execution::try_from).transpose()
+    let issue_id = issue_id.to_string();
+    run_query_db(async move {
+        db.query_opt(
+            format!(
+                "SELECT {EXECUTION_COLUMNS}
+                 FROM executions
+                 WHERE issue_id = ?1
+                 LIMIT 1"
+            ),
+            params![issue_id.as_str()],
+            db_execution_from_row,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .map(Execution::try_from)
+        .transpose()
+    })
 }
 
-/// List all executions for an issue, ordered by started_at descending (newest first).
 pub fn list_executions_for_issue(
-    conn: &mut diesel::sqlite::SqliteConnection,
+    db: Arc<LocalDb>,
     issue_id: &str,
 ) -> Result<Vec<Execution>, String> {
-    let db_execs: Vec<DbExecution> = executions::table
-        .filter(executions::issue_id.eq(issue_id))
-        .order(executions::started_at.desc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
+    let issue_id = issue_id.to_string();
+    run_query_db(async move {
+        let db_execs = db
+            .read(|conn| {
+                let issue_id = issue_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            &format!(
+                                "SELECT {EXECUTION_COLUMNS}
+                                 FROM executions
+                                 WHERE issue_id = ?1
+                                 ORDER BY started_at DESC"
+                            ),
+                            params![issue_id.as_str()],
+                        )
+                        .await?;
+                    let mut executions = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        executions.push(db_execution_from_row(&row)?);
+                    }
+                    Ok(executions)
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
 
-    db_execs
-        .into_iter()
-        .map(Execution::try_from)
-        .collect::<Result<Vec<_>, _>>()
+        db_execs
+            .into_iter()
+            .map(Execution::try_from)
+            .collect::<Result<Vec<_>, _>>()
+    })
 }
 
-/// Extract recipe name from execution snapshot JSON.
 fn extract_recipe_name_from_snapshot(snapshot_json: Option<&str>) -> String {
     snapshot_json
         .and_then(|s| serde_json::from_str::<ExecutionSnapshot>(s).ok())
@@ -103,442 +197,481 @@ fn extract_recipe_name_from_snapshot(snapshot_json: Option<&str>) -> String {
         .unwrap_or_else(|| "Unknown Recipe".to_string())
 }
 
-/// List all executions with filters and pagination (for the Executions view).
 pub fn list_all_executions(
-    conn: &mut diesel::sqlite::SqliteConnection,
+    db: Arc<LocalDb>,
     filters: &ExecutionFilters,
     limit: i64,
     offset: i64,
 ) -> Result<ExecutionListResult, String> {
-    let mut query = executions::table
-        .left_join(issues::table.on(issues::id.nullable().eq(executions::issue_id)))
-        .left_join(projects::table.on(projects::id.nullable().eq(executions::project_id)))
-        .into_boxed();
+    let filters = filters.clone();
+    run_query_db(async move { list_all_executions_async(&db, &filters, limit, offset).await })
+}
 
-    // Apply filters
-    if let Some(status) = &filters.status {
-        query = query.filter(executions::status.eq(status));
-    }
+pub fn get_execution_detail(
+    db: Arc<LocalDb>,
+    execution_id: &str,
+) -> Result<ExecutionDetail, String> {
+    let execution_id = execution_id.to_string();
+    run_query_db(async move { get_execution_detail_async(&db, &execution_id).await })
+}
 
-    if let Some(project_id) = &filters.project_id {
-        query = query.filter(
-            executions::project_id
-                .eq(project_id)
-                .or(issues::project_id.eq(project_id)),
-        );
-    }
+pub fn list_triggered_executions_for_execution(
+    db: Arc<LocalDb>,
+    execution_id: &str,
+) -> Result<Vec<(String, crate::models::TriggeredExecution)>, String> {
+    let execution_id = execution_id.to_string();
+    run_query_db(async move {
+        db.query_all(
+            "SELECT ets.source_job_id, e.id, e.status, e.started_at,
+                    e.triggered_by, e.snapshot, e.completed_at
+             FROM execution_trigger_sources ets
+             INNER JOIN jobs j ON j.id = ets.source_job_id
+             INNER JOIN executions e ON e.id = ets.triggered_execution_id
+             WHERE j.execution_id = ?1",
+            params![execution_id.as_str()],
+            |row| {
+                let status: ExecutionStatus = row.text(2)?.parse().unwrap_or_default();
+                let triggered_by: TriggerType = row.text(4)?.parse().unwrap_or_default();
+                let snapshot_json = row.opt_text(5)?;
+                Ok((
+                    row.text(0)?,
+                    crate::models::TriggeredExecution {
+                        id: row.text(1)?,
+                        recipe_name: extract_recipe_name_from_snapshot(snapshot_json.as_deref()),
+                        status,
+                        triggered_by,
+                        started_at: row.i64(3)?,
+                        completed_at: row.opt_i64(6)?,
+                    },
+                ))
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to query trigger sources: {e}"))
+    })
+}
 
-    if let Some(triggered_by) = &filters.triggered_by {
-        match triggered_by.as_str() {
-            "issue" => {
-                query = query.filter(executions::issue_id.is_not_null());
-            }
-            _ => {
-                query = query.filter(executions::issue_id.is_null());
-            }
-        }
-    }
+async fn get_execution_snapshot_async(
+    db: &LocalDb,
+    execution_id: &str,
+) -> Result<Option<ExecutionSnapshot>, String> {
+    let execution_id = execution_id.to_string();
+    let snapshot_json = db
+        .query_opt_text(
+            "SELECT snapshot FROM executions WHERE id = ?1",
+            params![execution_id.as_str()],
+        )
+        .await
+        .map_err(|e| format!("Failed to load execution: {e}"))?;
 
-    // Rebuild filters for count query
-    let mut count_query = executions::table
-        .left_join(issues::table.on(issues::id.nullable().eq(executions::issue_id)))
-        .left_join(projects::table.on(projects::id.nullable().eq(executions::project_id)))
-        .into_boxed();
+    snapshot_json
+        .map(|json| ExecutionSnapshot::from_json(&json))
+        .transpose()
+}
 
-    if let Some(status) = &filters.status {
-        count_query = count_query.filter(executions::status.eq(status));
-    }
-    if let Some(project_id) = &filters.project_id {
-        count_query = count_query.filter(
-            executions::project_id
-                .eq(project_id)
-                .or(issues::project_id.eq(project_id)),
-        );
-    }
-    if let Some(triggered_by) = &filters.triggered_by {
-        match triggered_by.as_str() {
-            "issue" => {
-                count_query = count_query.filter(executions::issue_id.is_not_null());
-            }
-            _ => {
-                count_query = count_query.filter(executions::issue_id.is_null());
-            }
-        }
-    }
+async fn list_all_executions_async(
+    db: &LocalDb,
+    filters: &ExecutionFilters,
+    limit: i64,
+    offset: i64,
+) -> Result<ExecutionListResult, String> {
+    let status = filters.status.clone();
+    let project_id = filters.project_id.clone();
+    let triggered_by = filters.triggered_by.clone();
 
-    let total: i64 = count_query
-        .count()
-        .get_result(conn)
+    let total = db
+        .query_one(
+            "SELECT COUNT(*)
+             FROM executions e
+             LEFT JOIN issues i ON i.id = e.issue_id
+             LEFT JOIN projects p ON p.id = e.project_id
+             WHERE (?1 IS NULL OR e.status = ?1)
+               AND (?2 IS NULL OR e.project_id = ?2 OR i.project_id = ?2)
+               AND (
+                 ?3 IS NULL
+                 OR (?3 = 'issue' AND e.issue_id IS NOT NULL)
+                 OR (?3 <> 'issue' AND e.issue_id IS NULL)
+               )",
+            params![
+                status.as_deref(),
+                project_id.as_deref(),
+                triggered_by.as_deref()
+            ],
+            |row| row.i64(0),
+        )
+        .await
         .map_err(|e| e.to_string())?;
 
-    #[allow(clippy::type_complexity)]
-    let results: Vec<(
-        DbExecution,
-        Option<i32>,    // issue number
-        Option<String>, // issue project_id
-        Option<String>, // project name from direct link
-    )> = query
-        .select((
-            executions::all_columns,
-            issues::number.nullable(),
-            issues::project_id.nullable(),
-            projects::name.nullable(),
-        ))
-        .order(executions::started_at.desc())
-        .limit(limit)
-        .offset(offset)
-        .load(conn)
+    let rows = db
+        .query_all(
+            format!(
+                "SELECT {prefixed_execution_columns}, i.number, i.project_id, p.name
+                 FROM executions e
+                 LEFT JOIN issues i ON i.id = e.issue_id
+                 LEFT JOIN projects p ON p.id = e.project_id
+                 WHERE (?1 IS NULL OR e.status = ?1)
+                   AND (?2 IS NULL OR e.project_id = ?2 OR i.project_id = ?2)
+                   AND (
+                     ?3 IS NULL
+                     OR (?3 = 'issue' AND e.issue_id IS NOT NULL)
+                     OR (?3 <> 'issue' AND e.issue_id IS NULL)
+                   )
+                 ORDER BY e.started_at DESC
+                 LIMIT ?4 OFFSET ?5",
+                prefixed_execution_columns = prefixed_execution_columns("e")
+            ),
+            params![
+                status.as_deref(),
+                project_id.as_deref(),
+                triggered_by.as_deref(),
+                limit,
+                offset
+            ],
+            |row| {
+                Ok((
+                    db_execution_from_row(row)?,
+                    row.opt_i64(13)?.map(|value| value as i32),
+                    row.opt_text(14)?,
+                    row.opt_text(15)?,
+                ))
+            },
+        )
+        .await
         .map_err(|e| e.to_string())?;
 
-    let exec_ids: Vec<String> = results.iter().map(|(e, _, _, _)| e.id.clone()).collect();
+    let mut items = Vec::new();
+    for (db_exec, issue_number, issue_project_id, project_name) in rows {
+        let (jobs_total, jobs_complete) = execution_job_counts(db, &db_exec.id).await?;
+        let status: ExecutionStatus = db_exec.status.parse().unwrap_or_default();
+        let triggered_by: TriggerType = db_exec.triggered_by.parse().unwrap_or_default();
+        let project_id = db_exec.project_id.clone().or(issue_project_id);
+        let recipe_name = extract_recipe_name_from_snapshot(db_exec.snapshot.as_deref());
 
-    let job_counts: Vec<(String, i64, i64)> = if !exec_ids.is_empty() {
-        jobs::table
-            .filter(jobs::execution_id.eq_any(&exec_ids))
-            .group_by(jobs::execution_id)
-            .select((
-                jobs::execution_id.assume_not_null(),
-                diesel::dsl::count(jobs::id),
-                diesel::dsl::count(diesel::dsl::sql::<
-                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
-                >(
-                    "CASE WHEN jobs.status = 'complete' THEN 1 END"
-                )),
-            ))
-            .load(conn)
-            .map_err(|e| e.to_string())?
-    } else {
-        vec![]
-    };
-
-    let job_counts_map: HashMap<String, (i64, i64)> = job_counts
-        .into_iter()
-        .map(|(exec_id, total, complete)| (exec_id, (total, complete)))
-        .collect();
-
-    let items: Vec<ExecutionListItem> = results
-        .into_iter()
-        .map(|(db_exec, issue_number, issue_project_id, project_name)| {
-            let (jobs_total, jobs_complete) =
-                job_counts_map.get(&db_exec.id).copied().unwrap_or((0, 0));
-
-            let status: ExecutionStatus = db_exec.status.parse().unwrap_or_default();
-            let triggered_by: TriggerType = db_exec.triggered_by.parse().unwrap_or_default();
-
-            let project_id = db_exec.project_id.clone().or(issue_project_id);
-            let recipe_name = extract_recipe_name_from_snapshot(db_exec.snapshot.as_deref());
-
-            ExecutionListItem {
-                id: db_exec.id,
-                recipe_name,
-                issue_id: db_exec.issue_id,
-                issue_number,
-                project_id,
-                project_name,
-                triggered_by,
-                status,
-                started_at: db_exec.started_at as i64,
-                completed_at: db_exec.completed_at.map(|t| t as i64),
-                jobs_total,
-                jobs_complete,
-                seq: db_exec.seq,
-            }
-        })
-        .collect();
-
-    let has_more = (offset + limit) < total;
+        items.push(ExecutionListItem {
+            id: db_exec.id,
+            recipe_name,
+            issue_id: db_exec.issue_id,
+            issue_number,
+            project_id,
+            project_name,
+            triggered_by,
+            status,
+            started_at: db_exec.started_at as i64,
+            completed_at: db_exec.completed_at.map(|t| t as i64),
+            jobs_total,
+            jobs_complete,
+            seq: db_exec.seq,
+        });
+    }
 
     Ok(ExecutionListResult {
         items,
         total,
-        has_more,
+        has_more: (offset + limit) < total,
     })
 }
 
-/// Get full execution detail with related data.
-pub fn get_execution_detail(
-    conn: &mut diesel::sqlite::SqliteConnection,
+async fn get_execution_detail_async(
+    db: &LocalDb,
     execution_id: &str,
 ) -> Result<ExecutionDetail, String> {
-    let db_exec: DbExecution = executions::table
-        .filter(executions::id.eq(execution_id))
-        .first(conn)
-        .map_err(|e| format!("Execution not found: {}", e))?;
+    let execution_id = execution_id.to_string();
+    let db_exec = db
+        .query_one(
+            format!(
+                "SELECT {EXECUTION_COLUMNS}
+                 FROM executions
+                 WHERE id = ?1"
+            ),
+            params![execution_id.as_str()],
+            db_execution_from_row,
+        )
+        .await
+        .map_err(|e| format!("Execution not found: {e}"))?;
 
     let recipe_name = extract_recipe_name_from_snapshot(db_exec.snapshot.as_deref());
-
     let execution: Execution = db_exec.try_into()?;
 
-    let (issue_number, issue_title): (Option<i32>, Option<String>) =
-        if let Some(issue_id) = &execution.issue_id {
-            issues::table
-                .filter(issues::id.eq(issue_id))
-                .select((issues::number, issues::title))
-                .first::<(i32, String)>(conn)
-                .optional()
-                .map_err(|e| e.to_string())?
-                .map(|(n, t)| (Some(n), Some(t)))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
+    let (issue_number, issue_title) = if let Some(issue_id) = execution.issue_id.clone() {
+        issue_summary(db, &issue_id).await?
+    } else {
+        (None, None)
+    };
 
-    let (project_id, project_name): (Option<String>, Option<String>) =
-        if let Some(pid) = &execution.project_id {
-            projects::table
-                .filter(projects::id.eq(pid))
-                .select((projects::id, projects::name))
-                .first::<(String, String)>(conn)
-                .optional()
-                .map_err(|e| e.to_string())?
-                .map(|(id, name)| (Some(id), Some(name)))
-                .unwrap_or((None, None))
-        } else if let Some(issue_id) = &execution.issue_id {
-            issues::table
-                .inner_join(projects::table.on(projects::id.eq(issues::project_id)))
-                .filter(issues::id.eq(issue_id))
-                .select((projects::id, projects::name))
-                .first::<(String, String)>(conn)
-                .optional()
-                .map_err(|e| e.to_string())?
-                .map(|(id, name)| (Some(id), Some(name)))
-                .unwrap_or((None, None))
-        } else {
-            (None, None)
-        };
+    let (project_id, project_name) = if let Some(project_id) = execution.project_id.clone() {
+        project_summary(db, &project_id).await?
+    } else if let Some(issue_id) = execution.issue_id.clone() {
+        issue_project_summary(db, &issue_id).await?
+    } else {
+        (None, None)
+    };
 
-    let db_jobs: Vec<DbJob> = jobs::table
-        .filter(jobs::execution_id.eq(execution_id))
-        .order(jobs::created_at.asc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    let exec_jobs: Vec<Job> = db_jobs
+    let jobs = load_jobs(db, "execution_id", &execution_id)
+        .await?
         .into_iter()
         .map(Job::try_from)
         .collect::<Result<Vec<_>, _>>()?;
-
-    let db_action_runs: Vec<DbActionRun> = action_runs::table
-        .filter(action_runs::execution_id.eq(execution_id))
-        .order(action_runs::created_at.asc())
-        .load(conn)
-        .map_err(|e| e.to_string())?;
-
-    let exec_action_runs: Vec<ActionRun> = db_action_runs
-        .into_iter()
-        .map(ActionRun::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let exec_issue_id = execution.issue_id.clone();
+    let action_runs = load_action_runs_for_execution(db, &execution_id).await?;
+    let issue_id = execution.issue_id.clone();
 
     Ok(ExecutionDetail {
         execution,
         recipe_name,
-        issue_id: exec_issue_id,
+        issue_id,
         issue_number,
         issue_title,
         project_id,
         project_name,
-        jobs: exec_jobs,
-        action_runs: exec_action_runs,
+        jobs,
+        action_runs,
     })
-}
-
-// ── Trigger source queries ──────────────────────────────────────
-
-/// Find all review executions triggered by jobs in a given execution.
-///
-/// Returns pairs of `(source_job_id, TriggeredExecution)` so the frontend
-/// can map indicators to specific job rows in the execution panel.
-pub fn list_triggered_executions_for_execution(
-    conn: &mut diesel::sqlite::SqliteConnection,
-    execution_id: &str,
-) -> Result<Vec<(String, crate::models::TriggeredExecution)>, String> {
-    use crate::schema::execution_trigger_sources;
-
-    // Find all trigger source rows where the source job belongs to this execution
-    #[allow(clippy::type_complexity)]
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        i32,
-        String,
-        Option<String>,
-        Option<i32>,
-    )> = execution_trigger_sources::table
-        .inner_join(jobs::table.on(jobs::id.eq(execution_trigger_sources::source_job_id)))
-        .inner_join(
-            executions::table
-                .on(executions::id.eq(execution_trigger_sources::triggered_execution_id)),
-        )
-        .filter(jobs::execution_id.eq(execution_id))
-        .select((
-            execution_trigger_sources::source_job_id,
-            executions::id,
-            executions::status,
-            executions::started_at,
-            executions::triggered_by,
-            executions::snapshot,
-            executions::completed_at,
-        ))
-        .load(conn)
-        .map_err(|e| format!("Failed to query trigger sources: {}", e))?;
-
-    let mut results = Vec::new();
-    for (
-        source_job_id,
-        exec_id,
-        status_str,
-        started_at,
-        triggered_by_str,
-        snapshot_json,
-        completed_at,
-    ) in rows
-    {
-        let status: ExecutionStatus = status_str.parse().unwrap_or_default();
-        let triggered_by: TriggerType = triggered_by_str.parse().unwrap_or_default();
-        let recipe_name = extract_recipe_name_from_snapshot(snapshot_json.as_deref());
-
-        results.push((
-            source_job_id,
-            crate::models::TriggeredExecution {
-                id: exec_id,
-                recipe_name,
-                status,
-                triggered_by,
-                started_at: started_at as i64,
-                completed_at: completed_at.map(|t| t as i64),
-            },
-        ));
-    }
-
-    Ok(results)
 }
 
 // ── Job queries ──────────────────────────────────────────────────
 
-/// Tab computation result for a job.
 pub struct JobTabs {
-    /// Available tabs: `["chat"]` or `["chat", "artifact"]`
     pub available_tabs: Vec<String>,
-    /// Initial tab to show: `"chat"` or `"artifact"`
     pub initial_tab: String,
 }
 
-/// Compute tabs for a batch of jobs.
-/// Returns a `HashMap` of `job_id -> JobTabs`.
-///
-/// Logic:
-/// - `available_tabs`: `["chat"]` if has_downstream_action OR no artifact,
-///   `["chat", "artifact"]` otherwise.
-/// - `initial_tab`: `"chat"` if running, `"artifact"` if available_tabs
-///   includes artifact, `"chat"` otherwise.
 pub fn compute_tabs_for_jobs(
-    conn: &mut diesel::sqlite::SqliteConnection,
+    db: Arc<LocalDb>,
+    job_ids: &[String],
+) -> Result<HashMap<String, JobTabs>, String> {
+    let job_ids = job_ids.to_vec();
+    run_query_db(async move { compute_tabs_for_jobs_async(&db, &job_ids).await })
+}
+
+pub fn list_jobs_for_issue_impl(orch: &Orchestrator, issue_id: &str) -> Result<Vec<Job>, String> {
+    run_query_db(list_jobs_for_issue(
+        orch.db.local.clone(),
+        issue_id.to_string(),
+    ))
+}
+
+pub fn get_job_impl(orch: &Orchestrator, job_id: &str) -> Result<Job, String> {
+    run_query_db(get_job(orch.db.local.clone(), job_id.to_string()))
+}
+
+pub fn list_child_jobs_impl(
+    orch: &Orchestrator,
+    parent_tool_use_id: &str,
+) -> Result<Vec<Job>, String> {
+    run_query_db(list_jobs_by_column(
+        orch.db.local.clone(),
+        "parent_tool_use_id",
+        parent_tool_use_id.to_string(),
+    ))
+}
+
+pub fn list_child_jobs_by_parent_impl(
+    orch: &Orchestrator,
+    parent_job_id: &str,
+) -> Result<Vec<Job>, String> {
+    run_query_db(list_jobs_by_column(
+        orch.db.local.clone(),
+        "parent_job_id",
+        parent_job_id.to_string(),
+    ))
+}
+
+fn run_query_db<T, Fut>(future: Fut) -> Result<T, String>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to start query database runtime: {}", e))?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| "Query database task panicked".to_string())?
+}
+
+async fn list_jobs_for_issue(db: Arc<LocalDb>, issue_id: String) -> Result<Vec<Job>, String> {
+    let db_jobs = load_jobs(&db, "issue_id", &issue_id).await?;
+    jobs_from_db(&db, db_jobs).await
+}
+
+async fn get_job(db: Arc<LocalDb>, job_id: String) -> Result<Job, String> {
+    let db_jobs = load_jobs(&db, "id", &job_id).await?;
+    let mut jobs = jobs_from_db(&db, db_jobs).await?;
+    jobs.pop().ok_or_else(|| "Job not found".to_string())
+}
+
+async fn list_jobs_by_column(
+    db: Arc<LocalDb>,
+    column: &'static str,
+    value: String,
+) -> Result<Vec<Job>, String> {
+    let db_jobs = load_jobs(&db, column, &value).await?;
+    jobs_from_db(&db, db_jobs).await
+}
+
+async fn load_jobs(db: &LocalDb, column: &'static str, value: &str) -> Result<Vec<DbJob>, String> {
+    let value = value.to_string();
+    let sql = match column {
+        "id" => format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
+        "issue_id" => {
+            format!("SELECT {JOB_COLUMNS} FROM jobs WHERE issue_id = ?1 ORDER BY created_at ASC")
+        }
+        "execution_id" => format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE execution_id = ?1 ORDER BY created_at ASC"
+        ),
+        "parent_tool_use_id" => format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE parent_tool_use_id = ?1 ORDER BY task_index ASC"
+        ),
+        "parent_job_id" => format!(
+            "SELECT {JOB_COLUMNS}
+             FROM jobs
+             WHERE parent_job_id = ?1
+             ORDER BY task_index ASC, created_at ASC"
+        ),
+        _ => return Err("unsupported job query".to_string()),
+    };
+    db.query_all(sql, params![value.as_str()], db_job_from_row)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn jobs_from_db(db: &LocalDb, db_jobs: Vec<DbJob>) -> Result<Vec<Job>, String> {
+    let mut jobs = Vec::new();
+    for db_job in db_jobs {
+        let mut job = Job::try_from(db_job)?;
+        if let Some(execution_id) = job.execution_id.as_deref() {
+            job.exec_seq = execution_seq(db, execution_id).await?;
+        }
+        let tabs = tabs_for_job(db, &job).await?;
+        job.available_tabs = tabs.available_tabs;
+        job.initial_tab = tabs.initial_tab;
+        jobs.push(job);
+    }
+    Ok(jobs)
+}
+
+async fn compute_tabs_for_jobs_async(
+    db: &LocalDb,
     job_ids: &[String],
 ) -> Result<HashMap<String, JobTabs>, String> {
     if job_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    // Get job statuses and recipe info
-    let jobs_info: Vec<(String, String, Option<String>, Option<String>)> = jobs::table
-        .filter(jobs::id.eq_any(job_ids))
-        .select((
-            jobs::id,
-            jobs::status,
-            jobs::recipe_node_id,
-            jobs::execution_id,
-        ))
-        .load(conn)
-        .map_err(|e| format!("Failed to query jobs: {}", e))?;
-
-    // Get jobs that have artifacts
-    let jobs_with_artifacts: HashSet<String> = artifacts::table
-        .filter(artifacts::job_id.eq_any(job_ids))
-        .select(artifacts::job_id)
-        .distinct()
-        .load::<Option<String>>(conn)
-        .map_err(|e| format!("Failed to query artifacts: {}", e))?
-        .into_iter()
-        .flatten()
-        .collect();
-
-    // Compute tabs for each job
     let mut result = HashMap::new();
-    for (job_id, status, recipe_node_id, execution_id) in jobs_info {
-        let has_artifact = jobs_with_artifacts.contains(&job_id);
-
-        // Check if output feeds into downstream action (hide artifact tab)
-        let has_downstream_action = match (recipe_node_id, execution_id) {
-            (Some(node_id), Some(exec_id)) => {
-                has_single_downstream_action(conn, &node_id, &exec_id)?
-            }
-            _ => false,
+    for job_id in job_ids {
+        let db_jobs = load_jobs(db, "id", job_id).await?;
+        let Some(db_job) = db_jobs.into_iter().next() else {
+            continue;
         };
-
-        // Determine available_tabs
-        let available_tabs = if has_downstream_action || !has_artifact {
-            vec!["chat".to_string()]
-        } else {
-            vec!["chat".to_string(), "artifact".to_string()]
-        };
-
-        // Determine initial_tab
-        let initial_tab = if status == "running" {
-            "chat".to_string()
-        } else if available_tabs.contains(&"artifact".to_string()) {
-            "artifact".to_string()
-        } else {
-            "chat".to_string()
-        };
-
-        result.insert(
-            job_id,
-            JobTabs {
-                available_tabs,
-                initial_tab,
-            },
-        );
+        let job = Job::try_from(db_job)?;
+        result.insert(job_id.clone(), tabs_for_job(db, &job).await?);
     }
-
     Ok(result)
 }
 
-/// Check if a job's output feeds into exactly one downstream ActionNode via context edge.
-fn has_single_downstream_action(
-    conn: &mut diesel::sqlite::SqliteConnection,
+async fn execution_seq(db: &LocalDb, execution_id: &str) -> Result<Option<i32>, String> {
+    let execution_id = execution_id.to_string();
+    db.query_opt(
+        "SELECT seq FROM executions WHERE id = ?1",
+        params![execution_id.as_str()],
+        |row| row.opt_i64(0).map(|seq| seq.map(|value| value as i32)),
+    )
+    .await
+    .map(Option::flatten)
+    .map_err(|e| e.to_string())
+}
+
+async fn tabs_for_job(db: &LocalDb, job: &Job) -> Result<JobTabs, String> {
+    let has_artifact = job_has_artifact(db, &job.id).await?;
+    let has_downstream_action = match (job.recipe_node_id.as_deref(), job.execution_id.as_deref()) {
+        (Some(node_id), Some(execution_id)) => {
+            has_single_downstream_action(db, node_id, execution_id).await?
+        }
+        _ => false,
+    };
+    // An artifact that feeds a single downstream action is normally surfaced on
+    // that action's node, not here. But an *unconfirmed* artifact under a `user`
+    // confirm policy is pending human review on this node — it must be visible
+    // here so the human can review and confirm it.
+    let artifact_unconfirmed = has_artifact && latest_artifact_unconfirmed(db, &job.id).await?;
+    let show_artifact = has_artifact && (!has_downstream_action || artifact_unconfirmed);
+    let available_tabs = if show_artifact {
+        vec!["chat".to_string(), "artifact".to_string()]
+    } else {
+        vec!["chat".to_string()]
+    };
+    let initial_tab = if job.status.to_string() == "running" {
+        "chat".to_string()
+    } else if available_tabs.iter().any(|tab| tab == "artifact") {
+        "artifact".to_string()
+    } else {
+        "chat".to_string()
+    };
+    Ok(JobTabs {
+        available_tabs,
+        initial_tab,
+    })
+}
+
+async fn job_has_artifact(db: &LocalDb, job_id: &str) -> Result<bool, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM artifacts WHERE job_id = ?1 LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// True when the job's latest artifact version is unconfirmed (`confirmed = 0`),
+/// i.e. it is pending human confirmation under a `user` confirm policy.
+async fn latest_artifact_unconfirmed(db: &LocalDb, job_id: &str) -> Result<bool, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            Ok(match rows.next().await? {
+                Some(row) => row.opt_i64(0)?.unwrap_or(0) == 0,
+                None => false,
+            })
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+async fn has_single_downstream_action(
+    db: &LocalDb,
     node_id: &str,
     execution_id: &str,
 ) -> Result<bool, String> {
-    // Load execution snapshot
-    let snapshot_json: Option<String> = executions::table
-        .find(execution_id)
-        .select(executions::snapshot)
-        .first(conn)
-        .ok()
-        .flatten();
-
-    let snapshot_json = match snapshot_json {
-        Some(s) => s,
-        None => return Ok(false),
+    let Some(snapshot) = get_execution_snapshot_async(db, execution_id).await? else {
+        return Ok(false);
     };
 
-    let snapshot: ExecutionSnapshot = match serde_json::from_str(&snapshot_json) {
-        Ok(s) => s,
-        Err(_) => return Ok(false),
-    };
-
-    // Build node lookup map
     let node_map: HashMap<&str, &RecipeNode> = snapshot
         .recipe
         .nodes
         .iter()
         .map(|n| (n.id.as_str(), n))
         .collect();
-
-    // Find outgoing context edges from this node
     let target_node_ids: Vec<&str> = snapshot
         .recipe
         .edges
@@ -547,544 +680,196 @@ fn has_single_downstream_action(
         .map(|e| e.target_node_id.as_str())
         .collect();
 
-    // Must be exactly one downstream context edge
     if target_node_ids.len() != 1 {
         return Ok(false);
     }
 
-    // Check if that single target is an action node
-    let is_action = node_map
+    Ok(node_map
         .get(target_node_ids[0])
         .map(|n| n.node_type.to_string() == "action")
-        .unwrap_or(false);
-
-    Ok(is_action)
+        .unwrap_or(false))
 }
 
-/// Get all jobs for an issue.
-pub fn list_jobs_for_issue_impl(orch: &Orchestrator, issue_id: &str) -> Result<Vec<Job>, String> {
-    let mut conn = orch
-        .db
-        .conn
-        .lock()
-        .map_err(|e| format!("Failed to lock database: {}", e))?;
-
-    let db_jobs: Vec<DbJob> = jobs::table
-        .filter(jobs::issue_id.eq(issue_id))
-        .order(jobs::created_at.asc())
-        .load(&mut *conn)
-        .map_err(|e| format!("Failed to load jobs: {}", e))?;
-
-    let job_ids: Vec<String> = db_jobs.iter().map(|j| j.id.clone()).collect();
-    let tabs = compute_tabs_for_jobs(&mut conn, &job_ids)?;
-
-    // Collect unique execution IDs and fetch their seq values
-    let execution_ids: Vec<String> = db_jobs
-        .iter()
-        .filter_map(|j| j.execution_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    let exec_seqs: HashMap<String, i32> = if !execution_ids.is_empty() {
-        executions::table
-            .filter(executions::id.eq_any(&execution_ids))
-            .select((executions::id, executions::seq))
-            .load::<(String, Option<i32>)>(&mut *conn)
-            .map_err(|e| format!("Failed to load execution seqs: {}", e))?
-            .into_iter()
-            .filter_map(|(id, seq)| seq.map(|s| (id, s)))
-            .collect()
-    } else {
-        HashMap::new()
-    };
-
-    db_jobs
-        .into_iter()
-        .map(|db_job| {
-            let job_id = db_job.id.clone();
-            let execution_id = db_job.execution_id.clone();
-            let mut job = Job::try_from(db_job)?;
-            if let Some(job_tabs) = tabs.get(&job_id) {
-                job.available_tabs = job_tabs.available_tabs.clone();
-                job.initial_tab = job_tabs.initial_tab.clone();
-            }
-            if let Some(exec_id) = execution_id {
-                job.exec_seq = exec_seqs.get(&exec_id).copied();
-            }
-            Ok(job)
+async fn execution_job_counts(db: &LocalDb, execution_id: &str) -> Result<(i64, i64), String> {
+    let execution_id = execution_id.to_string();
+    db.read(|conn| {
+        let execution_id = execution_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*), SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END)
+                     FROM jobs
+                     WHERE execution_id = ?1",
+                    params![execution_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok((row.i64(0)?, row.opt_i64(1)?.unwrap_or(0))))
+                .transpose()
+                .map(|value| value.unwrap_or((0, 0)))
         })
-        .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
-/// Get a single job by ID.
-pub fn get_job_impl(orch: &Orchestrator, job_id: &str) -> Result<Job, String> {
-    let mut conn = orch
-        .db
-        .conn
-        .lock()
-        .map_err(|e| format!("Failed to lock database: {}", e))?;
-
-    let db_job: DbJob = jobs::table
-        .find(job_id)
-        .first(&mut *conn)
-        .map_err(|e| format!("Job not found: {}", e))?;
-
-    let execution_id = db_job.execution_id.clone();
-    let mut job = Job::try_from(db_job)?;
-    let tabs = compute_tabs_for_jobs(&mut conn, std::slice::from_ref(&job_id.to_string()))?;
-    if let Some(job_tabs) = tabs.get(job_id) {
-        job.available_tabs = job_tabs.available_tabs.clone();
-        job.initial_tab = job_tabs.initial_tab.clone();
-    }
-    if let Some(exec_id) = execution_id {
-        job.exec_seq = executions::table
-            .filter(executions::id.eq(&exec_id))
-            .select(executions::seq)
-            .first(&mut *conn)
-            .ok()
-            .flatten();
-    }
-    Ok(job)
-}
-
-/// List child jobs for a batch_tasks call by `parent_tool_use_id`.
-pub fn list_child_jobs_impl(
-    orch: &Orchestrator,
-    parent_tool_use_id: &str,
-) -> Result<Vec<Job>, String> {
-    let mut conn = orch
-        .db
-        .conn
-        .lock()
-        .map_err(|e| format!("Failed to lock database: {}", e))?;
-
-    let db_jobs: Vec<DbJob> = jobs::table
-        .filter(jobs::parent_tool_use_id.eq(parent_tool_use_id))
-        .order(jobs::task_index.asc())
-        .load(&mut *conn)
-        .map_err(|e| format!("Failed to list child jobs: {}", e))?;
-
-    let job_ids: Vec<String> = db_jobs.iter().map(|j| j.id.clone()).collect();
-    let tabs = compute_tabs_for_jobs(&mut conn, &job_ids)?;
-
-    db_jobs
-        .into_iter()
-        .map(|db_job| {
-            let job_id = db_job.id.clone();
-            let mut job = Job::try_from(db_job)?;
-            if let Some(job_tabs) = tabs.get(&job_id) {
-                job.available_tabs = job_tabs.available_tabs.clone();
-                job.initial_tab = job_tabs.initial_tab.clone();
-            }
-            Ok(job)
+async fn issue_summary(
+    db: &LocalDb,
+    issue_id: &str,
+) -> Result<(Option<i32>, Option<String>), String> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT number, title FROM issues WHERE id = ?1",
+                    params![issue_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok((Some(row.i64(0)? as i32), Some(row.text(1)?))))
+                .transpose()
+                .map(|value| value.unwrap_or((None, None)))
         })
-        .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
-/// List child jobs by `parent_job_id` (for querying subagent children).
-pub fn list_child_jobs_by_parent_impl(
-    orch: &Orchestrator,
-    parent_job_id: &str,
-) -> Result<Vec<Job>, String> {
-    let mut conn = orch
-        .db
-        .conn
-        .lock()
-        .map_err(|e| format!("Failed to lock database: {}", e))?;
-
-    let db_jobs: Vec<DbJob> = jobs::table
-        .filter(jobs::parent_job_id.eq(parent_job_id))
-        .order(jobs::task_index.asc())
-        .then_order_by(jobs::created_at.asc())
-        .load(&mut *conn)
-        .map_err(|e| format!("Failed to list child jobs: {}", e))?;
-
-    let job_ids: Vec<String> = db_jobs.iter().map(|j| j.id.clone()).collect();
-    let tabs = compute_tabs_for_jobs(&mut conn, &job_ids)?;
-
-    db_jobs
-        .into_iter()
-        .map(|db_job| {
-            let job_id = db_job.id.clone();
-            let mut job = Job::try_from(db_job)?;
-            if let Some(job_tabs) = tabs.get(&job_id) {
-                job.available_tabs = job_tabs.available_tabs.clone();
-                job.initial_tab = job_tabs.initial_tab.clone();
-            }
-            Ok(job)
+async fn project_summary(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, name FROM projects WHERE id = ?1",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok((Some(row.text(0)?), Some(row.text(1)?))))
+                .transpose()
+                .map(|value| value.unwrap_or((None, None)))
         })
-        .collect()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::diesel_models::{NewExecution, NewJob};
-    use crate::models::{
-        NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
-        RecipeTrigger, TriggerContext, TriggerType,
-    };
-    use crate::schema::executions;
-    use crate::test_utils::{create_test_project, test_diesel_conn};
-    use uuid::Uuid;
+async fn issue_project_summary(
+    db: &LocalDb,
+    issue_id: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT p.id, p.name
+                     FROM issues i
+                     INNER JOIN projects p ON p.id = i.project_id
+                     WHERE i.id = ?1",
+                    params![issue_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok((Some(row.text(0)?), Some(row.text(1)?))))
+                .transpose()
+                .map(|value| value.unwrap_or((None, None)))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
 
-    fn create_test_execution_with_snapshot(
-        conn: &mut SqliteConnection,
-        project_id: &str,
-        nodes: Vec<RecipeNode>,
-        edges: Vec<RecipeEdge>,
-    ) -> String {
-        let recipe_id = Uuid::new_v4().to_string();
-        let execution_id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().timestamp() as i32;
-
-        let recipe_snapshot = RecipeSnapshot {
-            id: recipe_id.clone(),
-            name: "Test Recipe".to_string(),
-            description: None,
-            trigger: RecipeTrigger::Manual,
-
-            nodes,
-            edges,
-        };
-
-        let snapshot = ExecutionSnapshot::new(
-            recipe_snapshot,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            TriggerContext {
-                issue_id: None,
-                project_id: project_id.to_string(),
-                trigger_type: TriggerType::Manual,
-
-                event_payload: None,
-            },
-        );
-
-        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
-
-        diesel::insert_into(executions::table)
-            .values(&NewExecution {
-                id: &execution_id,
-                recipe_id: &recipe_id,
-                issue_id: None,
-                project_id: Some(project_id),
-                status: "running",
-                started_at: now,
-                completed_at: None,
-                snapshot: Some(&snapshot_json),
-                seq: None,
-                initiator_sub: None,
-                initiator_auth_mode: None,
-                initiator_org_id: None,
-                triggered_by: "manual",
+async fn load_action_runs_for_execution(
+    db: &LocalDb,
+    execution_id: &str,
+) -> Result<Vec<ActionRun>, String> {
+    let execution_id = execution_id.to_string();
+    let db_runs = db
+        .read(|conn| {
+            let execution_id = execution_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        &format!(
+                            "SELECT {ACTION_RUN_COLUMNS}
+                             FROM action_runs
+                             WHERE execution_id = ?1
+                             ORDER BY created_at ASC"
+                        ),
+                        params![execution_id.as_str()],
+                    )
+                    .await?;
+                let mut runs = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    runs.push(db_action_run_from_row(&row)?);
+                }
+                Ok(runs)
             })
-            .execute(conn)
-            .unwrap();
+        })
+        .await
+        .map_err(|e| e.to_string())?;
 
-        execution_id
-    }
+    db_runs
+        .into_iter()
+        .map(ActionRun::try_from)
+        .collect::<Result<Vec<_>, _>>()
+}
 
-    fn make_node(id: &str, node_type: RecipeNodeType, name: &str) -> RecipeNode {
-        RecipeNode {
-            id: id.to_string(),
-            node_type,
-            name: name.to_string(),
-            position: NodePosition { x: 0.0, y: 0.0 },
-            trigger_config: None,
-            agent_config: None,
-            action_config: None,
-            checkpoint_config: None,
-            artifact_config: None,
-            condition_config: None,
-            context_config: None,
-            parent_id: None,
-        }
-    }
+fn prefixed_execution_columns(prefix: &str) -> String {
+    EXECUTION_COLUMNS
+        .split(',')
+        .map(|column| format!("{prefix}.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
-    fn make_edge(source_id: &str, target_id: &str, edge_type: RecipeEdgeType) -> RecipeEdge {
-        RecipeEdge {
-            id: Uuid::new_v4().to_string(),
-            source_node_id: source_id.to_string(),
-            target_node_id: target_id.to_string(),
-            source_handle: "context".to_string(),
-            target_handle: "context".to_string(),
-            edge_type,
-        }
-    }
+fn db_execution_from_row(row: &turso::Row) -> DbResult<DbExecution> {
+    Ok(DbExecution {
+        id: row.text(0)?,
+        recipe_id: row.text(1)?,
+        issue_id: row.opt_text(2)?,
+        project_id: row.opt_text(3)?,
+        status: row.text(4)?,
+        started_at: row.i64(5)? as i32,
+        completed_at: row.opt_i64(6)?.map(|value| value as i32),
+        snapshot: row.opt_text(7)?,
+        seq: row.opt_i64(8)?.map(|value| value as i32),
+        initiator_sub: row.opt_text(9)?,
+        initiator_auth_mode: row.opt_text(10)?,
+        initiator_org_id: row.opt_text(11)?,
+        triggered_by: row.text(12)?,
+    })
+}
 
-    fn create_test_job(
-        conn: &mut SqliteConnection,
-        project_id: &str,
-        execution_id: Option<&str>,
-        recipe_node_id: Option<&str>,
-    ) -> String {
-        let job_id = Uuid::new_v4().to_string();
-        let session_id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().timestamp() as i32;
-
-        diesel::insert_into(jobs::table)
-            .values(&NewJob {
-                id: &job_id,
-                execution_id,
-                manager_id: None,
-                recipe_node_id,
-                parent_job_id: None,
-                worktree_path: None,
-                branch: None,
-                base_commit: None,
-                current_session_id: Some(&session_id),
-                resume_session_id: None,
-                status: "pending",
-                agent_config_id: None,
-                issue_id: None,
-                project_id,
-                task_description: None,
-                created_at: now,
-                updated_at: now,
-                completed_at: None,
-                parent_tool_use_id: None,
-                task_index: None,
-                started_at: None,
-                model: None,
-                node_name: None,
-                base_branch: None,
-                current_turn_id: None,
-            })
-            .execute(conn)
-            .unwrap();
-
-        job_id
-    }
-
-    #[test]
-    fn test_tabs_single_downstream_action() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-
-        let agent_node_id = "agent-1";
-        let action_node_id = "action-1";
-
-        let nodes = vec![
-            make_node(agent_node_id, RecipeNodeType::Agent, "Build"),
-            make_node(action_node_id, RecipeNodeType::Action, "create_pr"),
-        ];
-        let edges = vec![make_edge(
-            agent_node_id,
-            action_node_id,
-            RecipeEdgeType::Context,
-        )];
-
-        let execution_id =
-            create_test_execution_with_snapshot(&mut conn, &project_id, nodes, edges);
-        let job_id = create_test_job(
-            &mut conn,
-            &project_id,
-            Some(&execution_id),
-            Some(agent_node_id),
-        );
-
-        let result = compute_tabs_for_jobs(&mut conn, std::slice::from_ref(&job_id)).unwrap();
-        let tabs = result.get(&job_id).unwrap();
-
-        assert_eq!(tabs.available_tabs, vec!["chat"]);
-        assert_eq!(tabs.initial_tab, "chat");
-    }
-
-    #[test]
-    fn test_tabs_standalone_job() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-
-        let job_id = create_test_job(&mut conn, &project_id, None, None);
-
-        let result = compute_tabs_for_jobs(&mut conn, std::slice::from_ref(&job_id)).unwrap();
-        let tabs = result.get(&job_id).unwrap();
-
-        assert_eq!(tabs.available_tabs, vec!["chat"]);
-        assert_eq!(tabs.initial_tab, "chat");
-    }
-
-    #[test]
-    fn test_tabs_no_downstream() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-
-        let agent_node_id = "agent-1";
-        let nodes = vec![make_node(agent_node_id, RecipeNodeType::Agent, "Plan")];
-        let edges = vec![];
-
-        let execution_id =
-            create_test_execution_with_snapshot(&mut conn, &project_id, nodes, edges);
-        let job_id = create_test_job(
-            &mut conn,
-            &project_id,
-            Some(&execution_id),
-            Some(agent_node_id),
-        );
-
-        let result = compute_tabs_for_jobs(&mut conn, std::slice::from_ref(&job_id)).unwrap();
-        let tabs = result.get(&job_id).unwrap();
-
-        assert_eq!(tabs.available_tabs, vec!["chat"]);
-        assert_eq!(tabs.initial_tab, "chat");
-    }
-
-    #[test]
-    fn test_tabs_multiple_downstream() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-
-        let agent_node_id = "agent-1";
-        let action_node_id = "action-1";
-        let checkpoint_node_id = "checkpoint-1";
-
-        let nodes = vec![
-            make_node(agent_node_id, RecipeNodeType::Agent, "Build"),
-            make_node(action_node_id, RecipeNodeType::Action, "create_pr"),
-            make_node(checkpoint_node_id, RecipeNodeType::Checkpoint, "Review"),
-        ];
-        let edges = vec![
-            make_edge(agent_node_id, action_node_id, RecipeEdgeType::Context),
-            make_edge(agent_node_id, checkpoint_node_id, RecipeEdgeType::Context),
-        ];
-
-        let execution_id =
-            create_test_execution_with_snapshot(&mut conn, &project_id, nodes, edges);
-        let job_id = create_test_job(
-            &mut conn,
-            &project_id,
-            Some(&execution_id),
-            Some(agent_node_id),
-        );
-
-        let result = compute_tabs_for_jobs(&mut conn, std::slice::from_ref(&job_id)).unwrap();
-        let tabs = result.get(&job_id).unwrap();
-
-        assert_eq!(tabs.available_tabs, vec!["chat"]);
-        assert_eq!(tabs.initial_tab, "chat");
-    }
-
-    #[test]
-    fn test_tabs_single_downstream_agent() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-
-        let agent_node_1 = "agent-1";
-        let agent_node_2 = "agent-2";
-
-        let nodes = vec![
-            make_node(agent_node_1, RecipeNodeType::Agent, "Plan"),
-            make_node(agent_node_2, RecipeNodeType::Agent, "Build"),
-        ];
-        let edges = vec![make_edge(
-            agent_node_1,
-            agent_node_2,
-            RecipeEdgeType::Context,
-        )];
-
-        let execution_id =
-            create_test_execution_with_snapshot(&mut conn, &project_id, nodes, edges);
-        let job_id = create_test_job(
-            &mut conn,
-            &project_id,
-            Some(&execution_id),
-            Some(agent_node_1),
-        );
-
-        let result = compute_tabs_for_jobs(&mut conn, std::slice::from_ref(&job_id)).unwrap();
-        let tabs = result.get(&job_id).unwrap();
-
-        assert_eq!(tabs.available_tabs, vec!["chat"]);
-        assert_eq!(tabs.initial_tab, "chat");
-    }
-
-    #[test]
-    fn test_tabs_single_downstream_checkpoint() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-
-        let agent_node_id = "agent-1";
-        let checkpoint_node_id = "checkpoint-1";
-
-        let nodes = vec![
-            make_node(agent_node_id, RecipeNodeType::Agent, "Build"),
-            make_node(checkpoint_node_id, RecipeNodeType::Checkpoint, "Review"),
-        ];
-        let edges = vec![make_edge(
-            agent_node_id,
-            checkpoint_node_id,
-            RecipeEdgeType::Context,
-        )];
-
-        let execution_id =
-            create_test_execution_with_snapshot(&mut conn, &project_id, nodes, edges);
-        let job_id = create_test_job(
-            &mut conn,
-            &project_id,
-            Some(&execution_id),
-            Some(agent_node_id),
-        );
-
-        let result = compute_tabs_for_jobs(&mut conn, std::slice::from_ref(&job_id)).unwrap();
-        let tabs = result.get(&job_id).unwrap();
-
-        assert_eq!(tabs.available_tabs, vec!["chat"]);
-        assert_eq!(tabs.initial_tab, "chat");
-    }
-
-    #[test]
-    fn test_tabs_batch_jobs() {
-        let mut conn = test_diesel_conn();
-        let project_id = create_test_project(&mut conn, "Test Project", "TEST");
-
-        let agent_node_1 = "agent-1";
-        let agent_node_2 = "agent-2";
-        let action_node = "action-1";
-
-        let nodes = vec![
-            make_node(agent_node_1, RecipeNodeType::Agent, "Build"),
-            make_node(agent_node_2, RecipeNodeType::Agent, "Plan"),
-            make_node(action_node, RecipeNodeType::Action, "create_pr"),
-        ];
-        let edges = vec![make_edge(
-            agent_node_1,
-            action_node,
-            RecipeEdgeType::Context,
-        )];
-
-        let execution_id =
-            create_test_execution_with_snapshot(&mut conn, &project_id, nodes, edges);
-
-        let job_id_1 = create_test_job(
-            &mut conn,
-            &project_id,
-            Some(&execution_id),
-            Some(agent_node_1),
-        );
-        let job_id_2 = create_test_job(
-            &mut conn,
-            &project_id,
-            Some(&execution_id),
-            Some(agent_node_2),
-        );
-        let job_id_3 = create_test_job(&mut conn, &project_id, None, None);
-
-        let result = compute_tabs_for_jobs(
-            &mut conn,
-            &[job_id_1.clone(), job_id_2.clone(), job_id_3.clone()],
-        )
-        .unwrap();
-
-        let tabs_1 = result.get(&job_id_1).unwrap();
-        assert_eq!(tabs_1.available_tabs, vec!["chat"]);
-
-        let tabs_2 = result.get(&job_id_2).unwrap();
-        assert_eq!(tabs_2.available_tabs, vec!["chat"]);
-
-        let tabs_3 = result.get(&job_id_3).unwrap();
-        assert_eq!(tabs_3.available_tabs, vec!["chat"]);
-    }
+fn db_action_run_from_row(row: &turso::Row) -> Result<DbActionRun, DbError> {
+    Ok(DbActionRun {
+        id: row.text(0)?,
+        execution_id: row.text(1)?,
+        recipe_node_id: row.text(2)?,
+        action_config_id: row.text(3)?,
+        issue_id: row.opt_text(4)?,
+        project_id: row.text(5)?,
+        status: row.text(6)?,
+        inputs: row.opt_text(7)?,
+        output: row.opt_text(8)?,
+        error_message: row.opt_text(9)?,
+        started_at: row.opt_i64(10)?.map(|value| value as i32),
+        completed_at: row.opt_i64(11)?.map(|value| value as i32),
+        created_at: row.i64(12)? as i32,
+        parent_job_id: row.opt_text(13)?,
+        uri_segment: row.opt_text(14)?,
+    })
 }

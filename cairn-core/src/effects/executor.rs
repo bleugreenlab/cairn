@@ -3,7 +3,7 @@
 //! Only receives effects that require host resources: process spawning,
 //! filesystem operations, external commands, LLM calls.
 //!
-//! Core-internal effects (AdvanceDag, EmitLifecycleMessage, WakeManager,
+//! Core-internal effects (AdvanceDag, EmitLifecycleMessage,
 //! StoreConditionEvaluation, etc.) are handled by the effect loop directly
 //! and never reach this trait.
 

@@ -10,6 +10,7 @@
 
 use crate::agent_process::stream::TranscriptEvent;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Tracks conversation state to detect safe injection boundaries
 #[derive(Debug, Default)]
@@ -97,11 +98,31 @@ impl TurnBoundaryChecker {
     }
 }
 
+/// Return true exactly once when a terminal artifact/tool flag is armed and the
+/// reader has reached a safe turn boundary. The caller performs the actual
+/// backend interrupt after this returns true.
+pub fn should_interrupt_terminal_tool_at_boundary(
+    terminal_tool_called: &AtomicBool,
+    at_boundary: bool,
+    already_suspended: &mut bool,
+) -> bool {
+    if *already_suspended || !at_boundary {
+        return false;
+    }
+    if terminal_tool_called.load(Ordering::Acquire) {
+        *already_suspended = true;
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent_process::stream::ToolUseInfo;
     use serde_json::json;
+    use std::sync::atomic::AtomicBool;
 
     fn make_assistant_event(
         content: Option<&str>,
@@ -129,7 +150,7 @@ mod tests {
             tool_use_id: None,
             tool_result: None,
             is_error: false,
-            usage: None,
+            thinking_ms: None,
             raw: None,
         }
     }
@@ -147,7 +168,7 @@ mod tests {
             tool_use_id: Some(tool_use_id.to_string()),
             tool_result: Some("result".to_string()),
             is_error: false,
-            usage: None,
+            thinking_ms: None,
             raw: None,
         }
     }
@@ -170,7 +191,7 @@ mod tests {
             tool_use_id: None,
             tool_result: None,
             is_error: !success,
-            usage: None,
+            thinking_ms: None,
             raw: None,
         }
     }
@@ -235,5 +256,41 @@ mod tests {
         let assistant2 = make_assistant_event(Some("Just text"), None);
         assert!(checker.update(&assistant2));
         assert_eq!(checker.pending_tool_count(), 0);
+    }
+
+    #[test]
+    fn terminal_tool_boundary_helper_fires_once_after_all_results() {
+        let flag = AtomicBool::new(true);
+        let mut suspended = false;
+        assert!(!should_interrupt_terminal_tool_at_boundary(
+            &flag,
+            false,
+            &mut suspended
+        ));
+        assert!(!suspended);
+
+        assert!(should_interrupt_terminal_tool_at_boundary(
+            &flag,
+            true,
+            &mut suspended
+        ));
+        assert!(suspended);
+        assert!(!should_interrupt_terminal_tool_at_boundary(
+            &flag,
+            true,
+            &mut suspended
+        ));
+    }
+
+    #[test]
+    fn terminal_tool_boundary_helper_ignores_unarmed_flag() {
+        let flag = AtomicBool::new(false);
+        let mut suspended = false;
+        assert!(!should_interrupt_terminal_tool_at_boundary(
+            &flag,
+            true,
+            &mut suspended
+        ));
+        assert!(!suspended);
     }
 }

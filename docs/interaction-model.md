@@ -2,7 +2,7 @@
 
 > Historical note: parts of this document describe an older session model. The current `cairn-core` implementation uses `idle` runs plus warm-process retention rather than the older `paused`/kill-first framing. For the current code shape, see `docs/cairn-core-shape-map.md`, `docs/state-machines.md`, and `docs/execution-lifecycle-map.md`.
 
-This document describes how cairn-core, Claude CLI, and cairn-mcp work together — the session lifecycle, callback architecture, tool resolution, and process management.
+This document describes how cairn-core, Claude CLI, and cairn-cli work together — the session lifecycle, callback architecture, tool resolution, and process management.
 
 ## Architecture
 
@@ -18,13 +18,13 @@ This document describes how cairn-core, Claude CLI, and cairn-mcp work together 
          │                                  │
          ▼                                  │
 ┌──────────────────┐                 ┌──────┴───────────┐
-│   Claude CLI     │── stdio MCP ──►│   cairn-mcp       │
+│   Claude CLI     │── stdio MCP ──►│   cairn-cli       │
 │   (subprocess)   │                │   (MCP server)    │
 │                  │◄── stdio MCP ──│   stateless proxy │
 └──────────────────┘                └───────────────────┘
 ```
 
-The host process builds an `Orchestrator` and owns all state: the database, file system, git operations, and active processes. cairn-mcp is a stateless proxy — it receives tool calls from Claude via stdio-based MCP, translates them into HTTP callbacks to the host, and returns the results.
+The host process builds an `Orchestrator` and owns all state: the database, file system, git operations, and active processes. cairn-cli is a stateless proxy — it receives tool calls from Claude via stdio-based MCP, translates them into HTTP callbacks to the host, and returns the results.
 
 ## Session Startup
 
@@ -32,15 +32,15 @@ The host process builds an `Orchestrator` and owns all state: the database, file
 
 1. **Resolve output schema** — if the agent has a structured output requirement, resolve the schema reference, write it to a temp file, and extract the tool name and description.
 
-2. **Generate MCP config** — `ensure_mcp_config()` serializes available agents, skills, and tools to JSON arguments, resolves the cairn-mcp binary path, and writes an `mcp-config.json` that tells Claude CLI how to start the MCP server:
+2. **Generate MCP config** — `ensure_mcp_config()` serializes available agents and tools to JSON arguments, resolves the cairn-cli binary path, and writes an `mcp-config.json` that tells Claude CLI how to start the MCP server (skills are read on demand via `cairn://skills` resources):
 
    ```json
    {
      "mcpServers": {
        "cairn": {
          "type": "stdio",
-         "command": "/path/to/cairn-mcp",
-         "args": ["--agents", "[...]", "--skills", "[...]", "--tools", "[...]"],
+         "command": "/path/to/cairn-cli",
+         "args": ["--agents", "[...]", "--tools", "[...]"],
          "env": {
            "CAIRN_CALLBACK_URL": "http://127.0.0.1:3847/api/mcp",
            "CAIRN_MCP_SECRET": "<base64-encoded-secret>"
@@ -62,7 +62,7 @@ For bidirectional mode (`--input-format stream-json`), the prompt is written to 
 
 When Claude calls a tool, the request flows through three layers:
 
-1. **Claude → cairn-mcp** (stdio MCP): Claude CLI invokes a tool like `mcp__cairn__read`. cairn-mcp's handler constructs a `CallbackRequest`:
+1. **Claude → cairn-cli** (stdio MCP): Claude CLI invokes a tool like `mcp__cairn__read`. cairn-cli's handler constructs a `CallbackRequest`:
 
    ```rust
    CallbackRequest {
@@ -74,35 +74,35 @@ When Claude calls a tool, the request flows through three layers:
    }
    ```
 
-2. **cairn-mcp → host** (HTTP POST): the request is sent to the callback URL with bearer token authentication. The host validates the token, extracts the run ID and tool name, and dispatches to the appropriate handler.
+2. **cairn-cli → host** (HTTP POST): the request is sent to the callback URL with bearer token authentication. The host validates the token, extracts the run ID and tool name, and dispatches to the appropriate handler.
 
-3. **Host → cairn-mcp** (HTTP response): the handler executes (DB query, file I/O, process spawn, git operation) using the `Orchestrator`'s services, and returns a `CallbackResponse { result: String }`. cairn-mcp parses the result and returns it to Claude as the tool output.
+3. **Host → cairn-cli** (HTTP response): the handler executes (DB query, file I/O, process spawn, git operation) using the `Orchestrator`'s services, and returns a `CallbackResponse { result: String }`. cairn-cli parses the result and returns it to Claude as the tool output.
 
-This design means cairn-mcp never touches the database or filesystem directly. All state mutations go through the host, which maintains consistency and emits events for downstream consumers.
+This design means cairn-cli never touches the database or filesystem directly. All state mutations go through the host, which maintains consistency and emits events for downstream consumers.
 
 ## Authentication
 
-The host generates a 32-byte random secret at startup, base64-encodes it, and stores it in `McpAuthState`. The same value is passed to cairn-mcp via the `CAIRN_MCP_SECRET` environment variable in the MCP config.
+The host generates a 32-byte random secret at startup, base64-encodes it, and stores it in `McpAuthState`. The same value is passed to cairn-cli via the `CAIRN_MCP_SECRET` environment variable in the MCP config.
 
-On every callback, cairn-mcp sends the secret as a bearer token in the `Authorization` header. The host validates it against the stored value. Failed authentication returns 401.
+On every callback, cairn-cli sends the secret as a bearer token in the `Authorization` header. The host validates it against the stored value. Failed authentication returns 401.
 
 ## Tool Resolution
 
-Claude CLI has native tools (Read, Write, Edit, Bash, Task, etc.) and cairn-mcp provides Cairn-specific versions of the same operations (mcp\_\_cairn\_\_read, mcp\_\_cairn\_\_write, etc.). The Cairn versions go through the callback loop, which gives the host control over file I/O, git commits, and process management.
+Native provider tools are fully off. Cairn exposes exactly three working verbs — `mcp__cairn__read`, `mcp__cairn__write`, `mcp__cairn__run` — plus the corpus tools (`create_pr`, `return`, read-only issue/plan access; memories are managed via `write` on node-scoped memory URIs). All operations route through the callback loop, which gives the host control over file I/O, git commits, and process management.
 
-`resolve_tools()` handles the overlap:
+`resolve_tools()` is a small alias map:
 
-- For each overlapping tool pack (read, write, edit, bash, task, ask_user), if the agent's tool list includes it, the Cairn MCP version is added to the allowed list and the native version is added to the disallowed list.
-- Non-overlapping tools (Glob, Grep, WebSearch, LSP) pass through to Claude CLI's native implementations.
-- Some tools are always disallowed (e.g., `EnterPlanMode`) regardless of agent config.
+- Friendly verbs map to their canonical Cairn verb: `Read → mcp__cairn__read`, `Write`/`Edit` → `mcp__cairn__write`, `Bash → mcp__cairn__run`.
+- Every native provider tool (`Task`, `Glob`, `Grep`, `WebFetch`, `WebSearch`, `LSP`, `Skill`, `NotebookEdit`, …) and every dead Cairn name (`mcp__cairn__task`, `batch_tasks`, `ask_user`, `web_fetch`, `web_search`) is dropped from the allow-list.
+- For Claude, the disallow list is the union of all native tools, `EnterPlanMode`/`ExitPlanMode`/`TodoWrite`, and the agent's own disallowed list. Codex ignores disallow lists and enforces native-off by simply not allowing native tools.
 
-This ensures all file and process operations route through Cairn's callback infrastructure while preserving access to Claude CLI's built-in search and navigation tools.
+Needs that native tools used to cover are served by Cairn: sub-agents and user questions go through `write` appends (`…/tasks`, `…/questions`); skills arrive via `cairn://skills` + the slash-command hook; web and local-PDF reads route through `read` → the `bmd` CLI.
 
 ## Process Lifecycle
 
 Claude processes have three states:
 
-**Active** — executing a turn. The host is streaming events from stdout, and the process may make tool calls via cairn-mcp callbacks.
+**Active** — executing a turn. The host is streaming events from stdout, and the process may make tool calls via cairn-cli callbacks.
 
 **Warm** — idle after completing a turn. The process is still alive with stdin open and the conversation cache preserved in memory. This avoids the cost of re-establishing context when a follow-up message arrives. Warm processes can be resumed by writing a new prompt to stdin, which transitions them back to Active.
 

@@ -1,68 +1,88 @@
 //! Unified cairn:// URI scheme parser.
 //!
-//! URI hierarchy:
-//! ```text
-//! cairn://PROJECT                            # Project overview
-//!   ├── /messages                            # Project-channel messages (paginated)
-//!   ├── /NUMBER                              # Issue (includes comments, PR data)
-//!   │   ├── /files                           # All files changed for this issue
-//!   │   ├── /messages                        # Issue-channel messages (paginated)
-//!   │   └── /NODE                            # Job (e.g., planner-1, includes PR data)
-//!   │       ├── /chat                        # Job transcript
-//!   │       ├── /chat/full                   # Full transcript (untruncated)
-//!   │       ├── /chat/turn/N                 # Turn-scoped transcript slice
-//!   │       ├── /artifact                    # Job output
-//!   │       ├── /files                       # Files changed by this node
-//!   │       ├── /terminal/SLUG               # Job-scoped terminal
-//!   │       └── /task/NAME                   # Nested task
-//!   │           ├── /chat
-//!   │           ├── /chat/full
-//!   │           └── /artifact
-//!   ├── /terminal/SLUG                       # Project-scoped terminal
-//!   └── /chat/NAME                           # Project chat (named)
-//! ```
-//!
-//! All identifiers are human-readable (no UUIDs in URIs).
+//! Canonical project-scoped URIs use an explicit namespace token:
+//! `cairn://p/PROJECT/...`
 
-/// Parsed cairn:// resource URI
-#[derive(Debug, Clone, PartialEq)]
+use crate::contract::ResourceKind;
+use crate::query::{encode_query_params, parse_query_params, QueryParam};
+
+pub const PROJECT_SCOPE: &str = "p";
+
+/// Reserved trailing segments under a node (or task) that name a specific
+/// resource rather than an artifact type. A trailing segment NOT in this set is
+/// interpreted as a type-named artifact (`.../{node}/plan`). This is the single
+/// source of truth shared by the URI parser and cairn-cli's `cairn:~/<name>`
+/// resolution so e.g. `cairn:~/chat` can never be misread as an artifact write.
+pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
+    "chat",
+    "artifact",
+    "changed",
+    "todos",
+    "memories",
+    "tasks",
+    "wakes",
+    "questions",
+    "question",
+    "terminal",
+    "task",
+    "messages",
+    "annotations",
+    "lsp",
+];
+
+/// True when `segment` is a reserved node/task sub-resource keyword (see
+/// [`RESERVED_NODE_SEGMENTS`]) and therefore not a valid artifact type-name.
+pub fn is_reserved_node_segment(segment: &str) -> bool {
+    RESERVED_NODE_SEGMENTS.contains(&segment)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CairnResourceUri {
+    pub resource: CairnResource,
+    pub params: Vec<QueryParam>,
+}
+
+impl CairnResourceUri {
+    pub fn to_uri(&self) -> String {
+        let mut uri = self.resource.to_uri();
+        if !self.params.is_empty() {
+            uri.push('?');
+            uri.push_str(&encode_query_params(&self.params));
+        }
+        uri
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CairnResource {
-    // === Project-level resources ===
-    /// Project overview: `cairn://PROJECT`
-    Project { project: String },
-
-    // === Issue-level resources ===
-    /// Issue overview: `cairn://PROJECT/NUMBER`
-    /// Includes inlined comments and PR data.
-    Issue { project: String, number: i32 },
-
-    // === Node-level resources ===
-    /// Node summary: `cairn://PROJECT/NUMBER/EXEC/NODE`
-    /// exec_seq is required for all node-scoped URIs.
+    Project {
+        project: String,
+    },
+    ProjectIssues {
+        project: String,
+    },
+    Issue {
+        project: String,
+        number: i32,
+    },
     Node {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
     },
-
-    /// Node chat transcript: `cairn://PROJECT/NUMBER/EXEC/NODE/chat`
     NodeChat {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
     },
-
-    /// Full node chat transcript: `cairn://PROJECT/NUMBER/EXEC/NODE/chat/full`
-    NodeChatFull {
+    NodeChatRaw {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
     },
-
-    /// Turn-scoped transcript: `cairn://PROJECT/NUMBER/EXEC/NODE/chat/turn/N`
     NodeChatTurn {
         project: String,
         number: i32,
@@ -70,8 +90,6 @@ pub enum CairnResource {
         node_id: String,
         turn_seq: i32,
     },
-
-    /// Single event in node chat: `cairn://PROJECT/NUMBER/EXEC/NODE/chat/RUN_SEQ/EVENT_SEQ`
     NodeChatEvent {
         project: String,
         number: i32,
@@ -80,16 +98,26 @@ pub enum CairnResource {
         run_seq: i32,
         event_seq: i32,
     },
-
-    /// Node artifact: `cairn://PROJECT/NUMBER/EXEC/NODE/artifact`
     NodeArtifact {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
+        /// The artifact's type-name segment (`.../{node}/plan`). `None` is the
+        /// generic `.../{node}/artifact` alias, kept for back-compat reads.
+        name: Option<String>,
     },
-
-    /// Node-scoped terminal: `cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG`
+    NodeLsp {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        symbol: Option<String>,
+    },
+    ProjectLsp {
+        project: String,
+        symbol: Option<String>,
+    },
     NodeTerminal {
         project: String,
         number: i32,
@@ -97,9 +125,24 @@ pub enum CairnResource {
         node_id: String,
         slug: String,
     },
-
-    // === Task-level resources (nested under nodes) ===
-    /// Task chat: `cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat`
+    TaskTerminal {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+        slug: String,
+    },
+    /// A sub-agent task job's base (`.../{node}/task/{name}`). The task analogue
+    /// of `Node` — a job is a job. `node_id` is the parent node; `task_name` is
+    /// the task's own segment.
+    Task {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+    },
     TaskChat {
         project: String,
         number: i32,
@@ -107,17 +150,13 @@ pub enum CairnResource {
         node_id: String,
         task_name: String,
     },
-
-    /// Full task chat: `cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/full`
-    TaskChatFull {
+    TaskChatRaw {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
         task_name: String,
     },
-
-    /// Turn-scoped task transcript: `cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/turn/N`
     TaskChatTurn {
         project: String,
         number: i32,
@@ -126,8 +165,6 @@ pub enum CairnResource {
         task_name: String,
         turn_seq: i32,
     },
-
-    /// Single event in task chat: `cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/RUN_SEQ/EVENT_SEQ`
     TaskChatEvent {
         project: String,
         number: i32,
@@ -137,790 +174,447 @@ pub enum CairnResource {
         run_seq: i32,
         event_seq: i32,
     },
-
-    /// Task artifact: `cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/artifact`
     TaskArtifact {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
         task_name: String,
+        /// The artifact's type-name segment. `None` is the generic
+        /// `.../task/{name}/artifact` alias, kept for back-compat reads.
+        name: Option<String>,
     },
-
-    // === Message resources ===
-    /// Project messages: `cairn://PROJECT/messages`
-    ProjectMessages { project: String },
-
-    /// Issue messages: `cairn://PROJECT/NUMBER/messages`
-    IssueMessages { project: String, number: i32 },
-
-    // === Issue-level file changes ===
-    /// All files changed for an issue: `cairn://PROJECT/NUMBER/files`
-    Files { project: String, number: i32 },
-
-    /// Files changed for a specific node: `cairn://PROJECT/NUMBER/EXEC/NODE/files`
-    NodeFiles {
+    /// Todos owned by a job (node or sub-agent task).
+    ///
+    /// `task_name: None` addresses a node job's todos; `Some(name)` addresses a
+    /// sub-agent task job's todos. A job is a job — both URI shapes resolve here.
+    JobTodos {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: Option<String>,
+    },
+    /// Delegated sub-agent tasks owned by a node job (collection).
+    NodeTasks {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
     },
-
-    // === Project-level resources ===
-    /// Project-scoped terminal: `cairn://PROJECT/terminal/SLUG`
-    ProjectTerminal { project: String, slug: String },
-
-    /// Project chat session: `cairn://PROJECT/chat/NAME`
-    ProjectChat { project: String, name: String },
-}
-
-impl CairnResource {
-    /// Convert this resource to its canonical URI string.
-    pub fn to_uri(&self) -> String {
-        match self {
-            // Project-level overview
-            CairnResource::Project { project } => {
-                format!("cairn://{}", project)
-            }
-
-            // Issue-level
-            CairnResource::Issue { project, number } => {
-                format!("cairn://{}/{}", project, number)
-            }
-
-            // Node-level (exec_seq is always required)
-            CairnResource::Node {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!("cairn://{}/{}/{}/{}", project, number, exec_seq, node_id)
-            }
-            CairnResource::NodeChat {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/chat",
-                    project, number, exec_seq, node_id
-                )
-            }
-            CairnResource::NodeChatFull {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/chat/full",
-                    project, number, exec_seq, node_id
-                )
-            }
-            CairnResource::NodeChatTurn {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                turn_seq,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/chat/turn/{}",
-                    project, number, exec_seq, node_id, turn_seq
-                )
-            }
-            CairnResource::NodeChatEvent {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                run_seq,
-                event_seq,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/chat/{}/{}",
-                    project, number, exec_seq, node_id, run_seq, event_seq
-                )
-            }
-            CairnResource::NodeArtifact {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/artifact",
-                    project, number, exec_seq, node_id
-                )
-            }
-            CairnResource::NodeTerminal {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                slug,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/terminal/{}",
-                    project, number, exec_seq, node_id, slug
-                )
-            }
-
-            // Task-level (exec_seq is always required)
-            CairnResource::TaskChat {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/task/{}/chat",
-                    project, number, exec_seq, node_id, task_name
-                )
-            }
-            CairnResource::TaskChatFull {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/task/{}/chat/full",
-                    project, number, exec_seq, node_id, task_name
-                )
-            }
-            CairnResource::TaskChatTurn {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-                turn_seq,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/task/{}/chat/turn/{}",
-                    project, number, exec_seq, node_id, task_name, turn_seq
-                )
-            }
-            CairnResource::TaskChatEvent {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-                run_seq,
-                event_seq,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/task/{}/chat/{}/{}",
-                    project, number, exec_seq, node_id, task_name, run_seq, event_seq
-                )
-            }
-            CairnResource::TaskArtifact {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/task/{}/artifact",
-                    project, number, exec_seq, node_id, task_name
-                )
-            }
-
-            // Messages
-            CairnResource::ProjectMessages { project } => {
-                format!("cairn://{}/messages", project)
-            }
-            CairnResource::IssueMessages { project, number } => {
-                format!("cairn://{}/{}/messages", project, number)
-            }
-
-            // File changes
-            CairnResource::Files { project, number } => {
-                format!("cairn://{}/{}/files", project, number)
-            }
-            CairnResource::NodeFiles {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!(
-                    "cairn://{}/{}/{}/{}/files",
-                    project, number, exec_seq, node_id
-                )
-            }
-
-            // Project-level
-            CairnResource::ProjectTerminal { project, slug } => {
-                format!("cairn://{}/terminal/{}", project, slug)
-            }
-            CairnResource::ProjectChat { project, name } => {
-                format!("cairn://{}/chat/{}", project, name)
-            }
-        }
-    }
-
-    /// Convert this resource to a frontend route path.
+    /// Wake subscriptions owned by a node job (collection).
+    NodeWakes {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// User questions asked by a node job (collection).
+    NodeQuestions {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// A single user question addressed by its stored segment (e.g. `q-1`).
+    NodeQuestion {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        segment: String,
+    },
+    /// Permission requests raised by a node job (collection): pending fence
+    /// crossings and tool prompts plus their resolutions.
+    NodePermissions {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// A single permission request addressed by its stored segment (e.g.
+    /// `perm-1`); answerable with `{decision, scope}`.
+    NodePermission {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        segment: String,
+    },
+    /// Messages addressed to a node job (collection). The canonical messaging
+    /// target for a node, symmetric with project/issue `/messages`: append
+    /// delivers a direct message to the node agent; read returns the node's
+    /// direct-message stream. The bare-node append (`Node` + append) is kept
+    /// as a backward-compatible alias.
+    NodeMessages {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// Messages addressed to a sub-agent task job (collection). The task
+    /// analogue of `NodeMessages`; `node_id` is the parent node.
+    TaskMessages {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+    },
+    ProjectMessages {
+        project: String,
+    },
+    IssueMessages {
+        project: String,
+        number: i32,
+    },
+    Changed {
+        project: String,
+        number: i32,
+    },
+    /// Collection of executions for an issue. Appending starts a new execution.
+    IssueExecutions {
+        project: String,
+        number: i32,
+    },
+    /// Collection of stored comments for an issue. Read-only here: posting a new
+    /// comment stays on the issue-URI append (`cairn://p/PROJECT/NUMBER`). Each
+    /// member is individually addressable for edit/delete via `IssueComment`.
+    IssueComments {
+        project: String,
+        number: i32,
+    },
+    /// A single issue comment addressed by its stable, 1-based per-issue
+    /// sequence (`/comments/N`). Supports `patch` (edit content) and `delete`.
+    IssueComment {
+        project: String,
+        number: i32,
+        comment_seq: i32,
+    },
+    /// A single execution's frozen snapshot (recipe + agent snapshots + skills).
+    /// Read renders it; patch edits a named agent snapshot.
+    IssueExecution {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+    },
+    NodeChanged {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    ProjectTerminal {
+        project: String,
+        slug: String,
+    },
+    /// Contextual skills collection (workspace + current project).
+    Skills,
+    /// Contextual skill package (resolves project-first, then workspace).
+    Skill {
+        skill_id: String,
+        /// Remaining path segments under the skill package (e.g. ["SKILL.md"]).
+        path: Vec<String>,
+    },
+    /// Explicit project skills collection.
+    ProjectSkills {
+        project: String,
+    },
+    /// Explicit project-scoped skill package.
+    ProjectSkill {
+        project: String,
+        skill_id: String,
+        path: Vec<String>,
+    },
+    /// Workspace labels collection.
+    Labels,
+    /// A single workspace label addressed by id.
+    Label {
+        label_id: String,
+    },
+    /// Memories captured by a specific node job (collection).
+    NodeMemories {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// A single node-captured memory addressed by node-local sequence.
+    NodeMemory {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        memory_seq: i32,
+    },
+    /// Contextual recipes collection (workspace + current project).
+    Recipes,
+    /// A single recipe addressed by id (resolves project-first, then workspace).
+    Recipe {
+        recipe_id: String,
+    },
+    /// Explicit project recipes collection.
+    ProjectRecipes {
+        project: String,
+    },
+    /// Explicit project-scoped recipe.
+    ProjectRecipe {
+        project: String,
+        recipe_id: String,
+    },
+    /// Contextual agents collection (workspace + current project).
+    Agents,
+    /// A single agent addressed by id (resolves project-first, then workspace).
+    Agent {
+        agent_id: String,
+    },
+    /// Explicit project agents collection.
+    ProjectAgents {
+        project: String,
+    },
+    /// Explicit project-scoped agent.
+    ProjectAgent {
+        project: String,
+        agent_id: String,
+    },
+    /// Contextual actions collection (workspace + current project).
+    Actions,
+    /// A single action addressed by id (resolves project-first, then workspace).
+    Action {
+        action_id: String,
+    },
+    /// Explicit project actions collection.
+    ProjectActions {
+        project: String,
+    },
+    /// Explicit project-scoped action.
+    ProjectAction {
+        project: String,
+        action_id: String,
+    },
+    /// Project-wide pull-request (merge request) collection — a read-only list
+    /// of the project's PRs. Per-PR actions (merge/close/refresh) live on the
+    /// `pr` action node; each row links to that canonical URI.
+    ProjectPrs {
+        project: String,
+    },
+    /// Workspace-global settings document. One resource with every section:
+    /// app prefs, backends (+ read-only catalog/usage), git identities, provider
+    /// accounts, keybinds, build services, and read-only GitHub status. Patch
+    /// routes each present section key to its existing store.
+    Settings,
+    /// Projects collection: list all projects (read) and create one (write).
+    Projects,
+    /// Project-scoped configuration (commands, worktree populate, default
+    /// branch, identity overrides, references).
+    ProjectSettings {
+        project: String,
+    },
+    /// Live local database read projection.
+    Db,
+    /// Read-only projection of the running app's JSONL log entries
+    /// (URI parity with the in-app Logs viewer).
+    Logs,
+    /// Global bug report sink.
+    Bug,
+    /// Self-describing help page: URI grammar + read catalog + mutation matrix.
+    Help,
+    /// External MCP gateway family.
     ///
-    /// Transformation rules:
-    /// - `cairn://` → `/p/`
-    /// - Project uppercase → lowercase
-    /// - Issue number gets `/i/` prefix
-    /// - exec_seq is always included for node-scoped routes
-    pub fn to_route(&self) -> String {
-        match self {
-            // Project-level overview
-            CairnResource::Project { project } => {
-                format!("/p/{}", project.to_lowercase())
-            }
+    /// - `cairn://mcp` → `{ server: None, resource: None }` (list servers)
+    /// - `cairn://mcp/<server>` → `{ server: Some, resource: None }` (list tools/resources)
+    /// - `cairn://mcp/<server>/<tool-or-resource>` → `{ server: Some, resource: Some }`
+    ///
+    /// `resource` is the raw tail (a tool name for `run`, or an external
+    /// resource URI for `read`) kept intact — it may contain `/` and `://`.
+    Mcp {
+        server: Option<String>,
+        resource: Option<String>,
+    },
+}
 
-            // Issue-level
-            CairnResource::Issue { project, number } => {
-                format!("/p/{}/i/{}", project.to_lowercase(), number)
-            }
+fn canonical_project(project: &str) -> String {
+    project.to_uppercase()
+}
 
-            // Node-level (exec_seq is always required)
-            CairnResource::Node {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                // Bare node routes redirect to chat
-                format!(
-                    "/p/{}/i/{}/{}/{}/chat",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id
-                )
-            }
-            CairnResource::NodeChat {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/chat",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id
-                )
-            }
-            CairnResource::NodeChatFull {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/chat/full",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id
-                )
-            }
-            CairnResource::NodeChatTurn {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                turn_seq,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/chat/turn/{}",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    turn_seq
-                )
-            }
-            CairnResource::NodeChatEvent {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                run_seq,
-                event_seq,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/chat/{}/{}",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    run_seq,
-                    event_seq
-                )
-            }
-            CairnResource::NodeArtifact {
-                project,
-                number,
-                exec_seq,
-                node_id,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/artifact",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id
-                )
-            }
-            CairnResource::NodeTerminal {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                slug,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/terminal/{}",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    slug
-                )
-            }
+fn parse_positive_i32(value: &str) -> Option<i32> {
+    value.parse::<i32>().ok().filter(|value| *value > 0)
+}
 
-            // Task-level (exec_seq is always required)
-            CairnResource::TaskChat {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/task/{}/chat",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name
-                )
-            }
-            CairnResource::TaskChatFull {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/task/{}/chat/full",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name
-                )
-            }
-            CairnResource::TaskChatTurn {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-                turn_seq,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/task/{}/chat/turn/{}",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name,
-                    turn_seq
-                )
-            }
-            CairnResource::TaskChatEvent {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-                run_seq,
-                event_seq,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/task/{}/chat/{}/{}",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name,
-                    run_seq,
-                    event_seq
-                )
-            }
-            CairnResource::TaskArtifact {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                task_name,
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}/task/{}/artifact",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name
-                )
-            }
+fn parse_non_negative_i32(value: &str) -> Option<i32> {
+    value.parse::<i32>().ok().filter(|value| *value >= 0)
+}
 
-            // Messages (route to issue/project view)
-            CairnResource::ProjectMessages { project } => {
-                format!("/p/{}", project.to_lowercase())
-            }
-            CairnResource::IssueMessages { project, number } => {
-                format!("/p/{}/i/{}", project.to_lowercase(), number)
-            }
+pub fn build_project_uri(project: &str) -> String {
+    format!("cairn://{}/{}", PROJECT_SCOPE, canonical_project(project))
+}
 
-            // File changes (route to issue view)
-            CairnResource::Files { project, number } => {
-                format!("/p/{}/i/{}", project.to_lowercase(), number)
-            }
-            CairnResource::NodeFiles {
-                project,
-                number,
-                exec_seq,
-                node_id,
-                ..
-            } => {
-                format!(
-                    "/p/{}/i/{}/{}/{}",
-                    project.to_lowercase(),
-                    number,
-                    exec_seq,
-                    node_id
-                )
-            }
+pub fn build_project_issues_uri(project: &str) -> String {
+    format!("{}/issues", build_project_uri(project))
+}
 
-            // Project-level
-            CairnResource::ProjectTerminal { project, slug } => {
-                format!("/p/{}/terminal/{}", project.to_lowercase(), slug)
-            }
-            CairnResource::ProjectChat { project, name } => {
-                format!("/p/{}/chat/{}", project.to_lowercase(), name)
-            }
-        }
-    }
+pub fn build_issue_uri(project: &str, number: i32) -> String {
+    format!("{}/{}", build_project_uri(project), number)
+}
 
-    /// Get the project key for this resource.
-    pub fn project(&self) -> &str {
-        match self {
-            CairnResource::Project { project }
-            | CairnResource::Issue { project, .. }
-            | CairnResource::Node { project, .. }
-            | CairnResource::NodeChat { project, .. }
-            | CairnResource::NodeChatFull { project, .. }
-            | CairnResource::NodeChatTurn { project, .. }
-            | CairnResource::NodeChatEvent { project, .. }
-            | CairnResource::NodeArtifact { project, .. }
-            | CairnResource::NodeTerminal { project, .. }
-            | CairnResource::TaskChat { project, .. }
-            | CairnResource::TaskChatFull { project, .. }
-            | CairnResource::TaskChatTurn { project, .. }
-            | CairnResource::TaskChatEvent { project, .. }
-            | CairnResource::TaskArtifact { project, .. }
-            | CairnResource::ProjectMessages { project, .. }
-            | CairnResource::IssueMessages { project, .. }
-            | CairnResource::Files { project, .. }
-            | CairnResource::NodeFiles { project, .. }
-            | CairnResource::ProjectTerminal { project, .. }
-            | CairnResource::ProjectChat { project, .. } => project,
-        }
-    }
+pub fn build_project_messages_uri(project: &str) -> String {
+    format!("{}/messages", build_project_uri(project))
+}
 
-    /// Get the issue number if this resource is issue-scoped.
-    pub fn issue_number(&self) -> Option<i32> {
-        match self {
-            CairnResource::Issue { number, .. }
-            | CairnResource::Node { number, .. }
-            | CairnResource::NodeChat { number, .. }
-            | CairnResource::NodeChatFull { number, .. }
-            | CairnResource::NodeChatTurn { number, .. }
-            | CairnResource::NodeChatEvent { number, .. }
-            | CairnResource::NodeArtifact { number, .. }
-            | CairnResource::NodeTerminal { number, .. }
-            | CairnResource::TaskChat { number, .. }
-            | CairnResource::TaskChatFull { number, .. }
-            | CairnResource::TaskChatTurn { number, .. }
-            | CairnResource::TaskChatEvent { number, .. }
-            | CairnResource::TaskArtifact { number, .. }
-            | CairnResource::IssueMessages { number, .. }
-            | CairnResource::Files { number, .. }
-            | CairnResource::NodeFiles { number, .. } => Some(*number),
+pub fn build_issue_messages_uri(project: &str, number: i32) -> String {
+    format!("{}/messages", build_issue_uri(project, number))
+}
 
-            CairnResource::Project { .. }
-            | CairnResource::ProjectMessages { .. }
-            | CairnResource::ProjectTerminal { .. }
-            | CairnResource::ProjectChat { .. } => None,
-        }
-    }
+pub fn build_issue_comments_uri(project: &str, number: i32) -> String {
+    format!("{}/comments", build_issue_uri(project, number))
+}
 
-    /// Get the node ID if this resource is node-scoped.
-    pub fn node_id(&self) -> Option<&str> {
-        match self {
-            CairnResource::Node { node_id, .. }
-            | CairnResource::NodeChat { node_id, .. }
-            | CairnResource::NodeChatFull { node_id, .. }
-            | CairnResource::NodeChatTurn { node_id, .. }
-            | CairnResource::NodeChatEvent { node_id, .. }
-            | CairnResource::NodeArtifact { node_id, .. }
-            | CairnResource::NodeTerminal { node_id, .. }
-            | CairnResource::TaskChat { node_id, .. }
-            | CairnResource::TaskChatFull { node_id, .. }
-            | CairnResource::TaskChatTurn { node_id, .. }
-            | CairnResource::TaskChatEvent { node_id, .. }
-            | CairnResource::TaskArtifact { node_id, .. }
-            | CairnResource::NodeFiles { node_id, .. } => Some(node_id),
+pub fn build_issue_comment_uri(project: &str, number: i32, comment_seq: i32) -> String {
+    format!(
+        "{}/{}",
+        build_issue_comments_uri(project, number),
+        comment_seq
+    )
+}
 
-            _ => None,
-        }
+pub fn build_node_messages_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "messages")
+}
+
+pub fn build_task_messages_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+) -> String {
+    build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "messages")
+}
+
+pub fn build_issue_changed_uri(project: &str, number: i32) -> String {
+    format!("{}/changed", build_issue_uri(project, number))
+}
+
+pub fn build_issue_executions_uri(project: &str, number: i32) -> String {
+    format!("{}/executions", build_issue_uri(project, number))
+}
+
+pub fn build_issue_execution_uri(project: &str, number: i32, exec_seq: i32) -> String {
+    format!(
+        "{}/{}",
+        build_issue_executions_uri(project, number),
+        exec_seq
+    )
+}
+
+pub fn build_node_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    format!(
+        "{}/{}/{}",
+        build_issue_uri(project, number),
+        exec_seq,
+        node_id
+    )
+}
+
+fn build_node_subresource_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    resource: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        build_node_uri(project, number, exec_seq, node_id),
+        resource
+    )
+}
+
+fn build_node_segmented_resource_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    resource: &str,
+    segment: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        build_node_subresource_uri(project, number, exec_seq, node_id, resource),
+        segment
+    )
+}
+
+fn build_task_subresource_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    resource: &str,
+) -> String {
+    format!(
+        "{}/task/{}/{}",
+        build_node_uri(project, number, exec_seq, node_id),
+        task_name,
+        resource
+    )
+}
+
+/// Canonical base URI for a job, used as its run home (`cairn:~`).
+///
+/// A top-level node job is `.../{seq}/{segment}`. A sub-agent task job nests
+/// under its parent node as `.../{seq}/{parent}/task/{segment}` — matching the
+/// shape every task sub-resource builder uses (artifact/chat/todos). Pass the
+/// task's own `uri_segment` as `segment` and the parent node's `uri_segment` as
+/// `parent_segment`; `None` parent means a top-level node.
+pub fn build_job_base_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    segment: &str,
+    parent_segment: Option<&str>,
+) -> String {
+    match parent_segment {
+        Some(parent) => format!(
+            "{}/task/{}",
+            build_node_uri(project, number, exec_seq, parent),
+            segment
+        ),
+        None => build_node_uri(project, number, exec_seq, segment),
     }
 }
 
-/// Parse a cairn:// URI string into a CairnResource.
-///
-/// Returns `None` if the URI is invalid or doesn't match the expected format.
-pub fn parse_uri(uri: &str) -> Option<CairnResource> {
-    let uri = uri.strip_prefix("cairn://")?;
-
-    // Strip query string if present
-    let path = if let Some(idx) = uri.find('?') {
-        &uri[..idx]
-    } else {
-        uri
-    };
-
-    let parts: Vec<&str> = path.split('/').collect();
-
-    if parts.is_empty() {
-        return None;
-    }
-
-    let project = parts[0].to_uppercase();
-
-    match parts.as_slice() {
-        // Empty path - invalid
-        [] => None,
-
-        // cairn://PROJECT - project overview
-        [_project] => Some(CairnResource::Project { project }),
-
-        // cairn://PROJECT/terminal/SLUG - project-scoped terminal
-        [_project, "terminal", slug] => Some(CairnResource::ProjectTerminal {
-            project,
-            slug: slug.to_string(),
-        }),
-
-        // cairn://PROJECT/messages - project messages
-        [_project, "messages"] => Some(CairnResource::ProjectMessages { project }),
-
-        // cairn://PROJECT/chat/NAME - project chat session
-        [_project, "chat", name] => Some(CairnResource::ProjectChat {
-            project,
-            name: name.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER - issue overview
-        [_project, number_str] => {
-            let number = number_str.parse().ok()?;
-            Some(CairnResource::Issue { project, number })
-        }
-
-        // cairn://PROJECT/NUMBER/... (issue-scoped resources)
-        [_project, number_str, rest @ ..] => {
-            let number = number_str.parse().ok()?;
-            parse_issue_scoped(&project, number, rest)
-        }
-    }
+pub fn build_node_chat_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "chat")
 }
 
-/// Parse issue-scoped resources (everything after PROJECT/NUMBER)
-///
-/// Node-scoped URIs require exec_seq:
-/// - `cairn://PROJECT/NUMBER/EXEC/NODE` - exec_seq is required
-///
-/// Old format URIs without exec_seq are rejected.
-fn parse_issue_scoped(project: &str, number: i32, parts: &[&str]) -> Option<CairnResource> {
-    let project = project.to_string();
-
-    // cairn://PROJECT/NUMBER/files — issue-level file changes
-    if parts == ["files"] {
-        return Some(CairnResource::Files { project, number });
-    }
-
-    // cairn://PROJECT/NUMBER/messages — issue-level messages
-    if parts == ["messages"] {
-        return Some(CairnResource::IssueMessages { project, number });
-    }
-
-    // Node routes require exec_seq as the first part
-    // Must have at least 2 parts: exec_seq and node_id
-    if parts.len() < 2 {
-        return None;
-    }
-
-    // First part must be a positive integer (exec_seq)
-    let exec_seq: i32 = parts[0].parse::<i32>().ok().filter(|&seq| seq > 0)?;
-    let node_parts = &parts[1..];
-
-    match node_parts {
-        // cairn://PROJECT/NUMBER/EXEC/NODE
-        [node_id] => Some(CairnResource::Node {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/chat
-        [node_id, "chat"] => Some(CairnResource::NodeChat {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/chat/full
-        [node_id, "chat", "full"] => Some(CairnResource::NodeChatFull {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/chat/turn/N
-        [node_id, "chat", "turn", turn_seq_str] => {
-            let turn_seq = turn_seq_str.parse().ok()?;
-            Some(CairnResource::NodeChatTurn {
-                project,
-                number,
-                exec_seq,
-                node_id: node_id.to_string(),
-                turn_seq,
-            })
-        }
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/chat/RUN_SEQ/EVENT_SEQ
-        [node_id, "chat", run_seq_str, event_seq_str] => {
-            let run_seq = run_seq_str.parse().ok()?;
-            let event_seq = event_seq_str.parse().ok()?;
-            Some(CairnResource::NodeChatEvent {
-                project,
-                number,
-                exec_seq,
-                node_id: node_id.to_string(),
-                run_seq,
-                event_seq,
-            })
-        }
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/artifact
-        [node_id, "artifact"] => Some(CairnResource::NodeArtifact {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/files
-        [node_id, "files"] => Some(CairnResource::NodeFiles {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG
-        [node_id, "terminal", slug] => Some(CairnResource::NodeTerminal {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-            slug: slug.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat
-        [node_id, "task", task_name, "chat"] => Some(CairnResource::TaskChat {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-            task_name: task_name.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/full
-        [node_id, "task", task_name, "chat", "full"] => Some(CairnResource::TaskChatFull {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-            task_name: task_name.to_string(),
-        }),
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/turn/N
-        [node_id, "task", task_name, "chat", "turn", turn_seq_str] => {
-            let turn_seq = turn_seq_str.parse().ok()?;
-            Some(CairnResource::TaskChatTurn {
-                project,
-                number,
-                exec_seq,
-                node_id: node_id.to_string(),
-                task_name: task_name.to_string(),
-                turn_seq,
-            })
-        }
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/chat/RUN_SEQ/EVENT_SEQ
-        [node_id, "task", task_name, "chat", run_seq_str, event_seq_str] => {
-            let run_seq = run_seq_str.parse().ok()?;
-            let event_seq = event_seq_str.parse().ok()?;
-            Some(CairnResource::TaskChatEvent {
-                project,
-                number,
-                exec_seq,
-                node_id: node_id.to_string(),
-                task_name: task_name.to_string(),
-                run_seq,
-                event_seq,
-            })
-        }
-
-        // cairn://PROJECT/NUMBER/EXEC/NODE/task/NAME/artifact
-        [node_id, "task", task_name, "artifact"] => Some(CairnResource::TaskArtifact {
-            project,
-            number,
-            exec_seq,
-            node_id: node_id.to_string(),
-            task_name: task_name.to_string(),
-        }),
-
-        _ => None,
-    }
+pub fn build_node_artifact_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_artifact_uri_named(project, number, exec_seq, node_id, None)
 }
 
-/// Build a terminal URI for a job-scoped terminal.
-///
-/// Format: `cairn://PROJECT/NUMBER/EXEC/NODE/terminal/SLUG`
-/// exec_seq is required for all node-scoped URIs.
+/// Build a node artifact URI. `name: Some("plan")` emits `.../{node}/plan`;
+/// `None` emits the generic `.../{node}/artifact` alias.
+pub fn build_node_artifact_uri_named(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    name: Option<&str>,
+) -> String {
+    build_node_subresource_uri(
+        project,
+        number,
+        exec_seq,
+        node_id,
+        name.unwrap_or("artifact"),
+    )
+}
+
+pub fn build_node_changed_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "changed")
+}
+
 pub fn build_node_terminal_uri(
     project: &str,
     number: i32,
@@ -928,810 +622,2618 @@ pub fn build_node_terminal_uri(
     node_id: &str,
     slug: &str,
 ) -> String {
-    CairnResource::NodeTerminal {
-        project: project.to_uppercase(),
-        number,
-        exec_seq,
-        node_id: node_id.to_string(),
-        slug: slug.to_string(),
-    }
-    .to_uri()
+    build_node_segmented_resource_uri(project, number, exec_seq, node_id, "terminal", slug)
 }
 
-/// Build a terminal URI for a project-scoped terminal.
-///
-/// Format: `cairn://PROJECT/terminal/SLUG`
-pub fn build_project_terminal_uri(project: &str, slug: &str) -> String {
-    CairnResource::ProjectTerminal {
-        project: project.to_uppercase(),
-        slug: slug.to_string(),
+pub fn build_task_terminal_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    slug: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "terminal"),
+        slug
+    )
+}
+
+pub fn build_task_chat_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+) -> String {
+    build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "chat")
+}
+
+pub fn build_task_artifact_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+) -> String {
+    build_task_artifact_uri_named(project, number, exec_seq, node_id, task_name, None)
+}
+
+/// Build a task artifact URI. `name: Some("plan")` emits
+/// `.../task/{task}/plan`; `None` emits the generic `.../task/{task}/artifact`.
+pub fn build_task_artifact_uri_named(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    name: Option<&str>,
+) -> String {
+    build_task_subresource_uri(
+        project,
+        number,
+        exec_seq,
+        node_id,
+        task_name,
+        name.unwrap_or("artifact"),
+    )
+}
+
+pub fn build_job_todos_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: Option<&str>,
+) -> String {
+    match task_name {
+        Some(task_name) => {
+            build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "todos")
+        }
+        None => build_node_subresource_uri(project, number, exec_seq, node_id, "todos"),
     }
-    .to_uri()
+}
+
+pub fn build_node_tasks_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "tasks")
+}
+
+pub fn build_node_wakes_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "wakes")
+}
+
+pub fn build_node_questions_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "questions")
+}
+
+pub fn build_node_question_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    segment: &str,
+) -> String {
+    build_node_segmented_resource_uri(project, number, exec_seq, node_id, "questions", segment)
+}
+
+pub fn build_node_permissions_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "permissions")
+}
+
+pub fn build_node_permission_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    segment: &str,
+) -> String {
+    build_node_segmented_resource_uri(project, number, exec_seq, node_id, "permissions", segment)
+}
+
+pub fn build_project_terminal_uri(project: &str, slug: &str) -> String {
+    format!("{}/terminal/{}", build_project_uri(project), slug)
+}
+
+fn append_path(base: String, path: &[String]) -> String {
+    if path.is_empty() {
+        base
+    } else {
+        format!("{}/{}", base, path.join("/"))
+    }
+}
+
+pub fn build_bug_uri() -> String {
+    "cairn://bug".to_string()
+}
+
+pub fn build_skills_uri() -> String {
+    "cairn://skills".to_string()
+}
+
+pub fn build_skill_uri(skill_id: &str, path: &[String]) -> String {
+    append_path(format!("cairn://skills/{}", skill_id), path)
+}
+
+pub fn build_project_skills_uri(project: &str) -> String {
+    format!("{}/skills", build_project_uri(project))
+}
+
+pub fn build_project_skill_uri(project: &str, skill_id: &str, path: &[String]) -> String {
+    append_path(
+        format!("{}/skills/{}", build_project_uri(project), skill_id),
+        path,
+    )
+}
+
+pub fn build_labels_uri() -> String {
+    "cairn://labels".to_string()
+}
+
+pub fn build_label_uri(label_id: &str) -> String {
+    format!("cairn://labels/{}", label_id)
+}
+
+pub fn build_node_memories_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "memories")
+}
+
+pub fn build_node_lsp_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    symbol: Option<&str>,
+) -> String {
+    let base = build_node_subresource_uri(project, number, exec_seq, node_id, "lsp");
+    match symbol {
+        Some(symbol) => format!("{base}/{symbol}"),
+        None => base,
+    }
+}
+
+pub fn build_project_lsp_uri(project: &str, symbol: Option<&str>) -> String {
+    let base = format!("{}/lsp", build_project_uri(project));
+    match symbol {
+        Some(symbol) => format!("{base}/{symbol}"),
+        None => base,
+    }
+}
+
+pub fn build_node_memory_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    memory_seq: i32,
+) -> String {
+    format!(
+        "{}/{}",
+        build_node_memories_uri(project, number, exec_seq, node_id),
+        memory_seq
+    )
+}
+
+pub fn build_recipes_uri() -> String {
+    "cairn://recipes".to_string()
+}
+
+pub fn build_recipe_uri(recipe_id: &str) -> String {
+    format!("cairn://recipes/{}", recipe_id)
+}
+
+pub fn build_project_recipes_uri(project: &str) -> String {
+    format!("{}/recipes", build_project_uri(project))
+}
+
+pub fn build_project_recipe_uri(project: &str, recipe_id: &str) -> String {
+    format!("{}/recipes/{}", build_project_uri(project), recipe_id)
+}
+
+pub fn build_agents_uri() -> String {
+    "cairn://agents".to_string()
+}
+
+pub fn build_agent_uri(agent_id: &str) -> String {
+    format!("cairn://agents/{}", agent_id)
+}
+
+pub fn build_project_agents_uri(project: &str) -> String {
+    format!("{}/agents", build_project_uri(project))
+}
+
+pub fn build_project_agent_uri(project: &str, agent_id: &str) -> String {
+    format!("{}/agents/{}", build_project_uri(project), agent_id)
+}
+
+pub fn build_actions_uri() -> String {
+    "cairn://actions".to_string()
+}
+
+pub fn build_action_uri(action_id: &str) -> String {
+    format!("cairn://actions/{}", action_id)
+}
+
+pub fn build_project_actions_uri(project: &str) -> String {
+    format!("{}/actions", build_project_uri(project))
+}
+
+pub fn build_project_action_uri(project: &str, action_id: &str) -> String {
+    format!("{}/actions/{}", build_project_uri(project), action_id)
+}
+
+pub fn build_project_prs_uri(project: &str) -> String {
+    format!("{}/prs", build_project_uri(project))
+}
+
+pub fn build_settings_uri() -> String {
+    "cairn://settings".to_string()
+}
+
+pub fn build_projects_uri() -> String {
+    "cairn://projects".to_string()
+}
+
+pub fn build_project_settings_uri(project: &str) -> String {
+    format!("{}/settings", build_project_uri(project))
+}
+
+impl CairnResource {
+    pub fn to_uri(&self) -> String {
+        match self {
+            Self::Project { project } => build_project_uri(project),
+            Self::ProjectIssues { project } => build_project_issues_uri(project),
+            Self::Issue { project, number } => build_issue_uri(project, *number),
+            Self::Node {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_uri(project, *number, *exec_seq, node_id),
+            Self::NodeChat {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_chat_uri(project, *number, *exec_seq, node_id),
+            Self::NodeChatRaw {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => format!(
+                "{}/raw",
+                build_node_chat_uri(project, *number, *exec_seq, node_id)
+            ),
+            Self::NodeChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                turn_seq,
+            } => format!(
+                "{}/turn/{}",
+                build_node_chat_uri(project, *number, *exec_seq, node_id),
+                turn_seq
+            ),
+            Self::NodeChatEvent {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                run_seq,
+                event_seq,
+            } => format!(
+                "{}/{}/{}",
+                build_node_chat_uri(project, *number, *exec_seq, node_id),
+                run_seq,
+                event_seq
+            ),
+            Self::NodeArtifact {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                name,
+            } => {
+                build_node_artifact_uri_named(project, *number, *exec_seq, node_id, name.as_deref())
+            }
+            Self::NodeTerminal {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                slug,
+            } => build_node_terminal_uri(project, *number, *exec_seq, node_id, slug),
+            Self::TaskTerminal {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                slug,
+            } => build_task_terminal_uri(project, *number, *exec_seq, node_id, task_name, slug),
+            Self::Task {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_job_base_uri(project, *number, *exec_seq, task_name, Some(node_id)),
+            Self::TaskChat {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_task_chat_uri(project, *number, *exec_seq, node_id, task_name),
+            Self::TaskChatRaw {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => format!(
+                "{}/raw",
+                build_task_chat_uri(project, *number, *exec_seq, node_id, task_name)
+            ),
+            Self::TaskChatTurn {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                turn_seq,
+            } => format!(
+                "{}/turn/{}",
+                build_task_chat_uri(project, *number, *exec_seq, node_id, task_name),
+                turn_seq
+            ),
+            Self::TaskChatEvent {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                run_seq,
+                event_seq,
+            } => format!(
+                "{}/{}/{}",
+                build_task_chat_uri(project, *number, *exec_seq, node_id, task_name),
+                run_seq,
+                event_seq
+            ),
+            Self::TaskArtifact {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                name,
+            } => build_task_artifact_uri_named(
+                project,
+                *number,
+                *exec_seq,
+                node_id,
+                task_name,
+                name.as_deref(),
+            ),
+            Self::JobTodos {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_job_todos_uri(project, *number, *exec_seq, node_id, task_name.as_deref()),
+            Self::NodeTasks {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_tasks_uri(project, *number, *exec_seq, node_id),
+            Self::NodeWakes {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_wakes_uri(project, *number, *exec_seq, node_id),
+            Self::NodeQuestions {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_questions_uri(project, *number, *exec_seq, node_id),
+            Self::NodeQuestion {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                segment,
+            } => build_node_question_uri(project, *number, *exec_seq, node_id, segment),
+            Self::NodePermissions {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_permissions_uri(project, *number, *exec_seq, node_id),
+            Self::NodePermission {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                segment,
+            } => build_node_permission_uri(project, *number, *exec_seq, node_id, segment),
+            Self::NodeMessages {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_messages_uri(project, *number, *exec_seq, node_id),
+            Self::TaskMessages {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_task_messages_uri(project, *number, *exec_seq, node_id, task_name),
+            Self::ProjectMessages { project } => build_project_messages_uri(project),
+            Self::IssueMessages { project, number } => build_issue_messages_uri(project, *number),
+            Self::Changed { project, number } => build_issue_changed_uri(project, *number),
+            Self::IssueExecutions { project, number } => {
+                build_issue_executions_uri(project, *number)
+            }
+            Self::IssueComments { project, number } => build_issue_comments_uri(project, *number),
+            Self::IssueComment {
+                project,
+                number,
+                comment_seq,
+            } => build_issue_comment_uri(project, *number, *comment_seq),
+            Self::IssueExecution {
+                project,
+                number,
+                exec_seq,
+            } => build_issue_execution_uri(project, *number, *exec_seq),
+            Self::NodeChanged {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_changed_uri(project, *number, *exec_seq, node_id),
+            Self::ProjectTerminal { project, slug } => build_project_terminal_uri(project, slug),
+            Self::NodeLsp {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                symbol,
+            } => build_node_lsp_uri(project, *number, *exec_seq, node_id, symbol.as_deref()),
+            Self::ProjectLsp { project, symbol } => {
+                build_project_lsp_uri(project, symbol.as_deref())
+            }
+            Self::Db => "cairn://db".to_string(),
+            Self::Logs => "cairn://logs".to_string(),
+            Self::Bug => "cairn://bug".to_string(),
+            Self::Help => "cairn://help".to_string(),
+            Self::Mcp { server, resource } => {
+                let mut s = "cairn://mcp".to_string();
+                if let Some(server) = server {
+                    s.push('/');
+                    s.push_str(server);
+                    if let Some(resource) = resource {
+                        s.push('/');
+                        s.push_str(resource);
+                    }
+                }
+                s
+            }
+            Self::Skills => build_skills_uri(),
+            Self::Skill { skill_id, path } => build_skill_uri(skill_id, path),
+            Self::ProjectSkills { project } => build_project_skills_uri(project),
+            Self::ProjectSkill {
+                project,
+                skill_id,
+                path,
+            } => build_project_skill_uri(project, skill_id, path),
+            Self::Labels => build_labels_uri(),
+            Self::Label { label_id } => build_label_uri(label_id),
+            Self::NodeMemories {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_memories_uri(project, *number, *exec_seq, node_id),
+            Self::NodeMemory {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                memory_seq,
+            } => build_node_memory_uri(project, *number, *exec_seq, node_id, *memory_seq),
+            Self::Recipes => build_recipes_uri(),
+            Self::Recipe { recipe_id } => build_recipe_uri(recipe_id),
+            Self::ProjectRecipes { project } => build_project_recipes_uri(project),
+            Self::ProjectRecipe { project, recipe_id } => {
+                build_project_recipe_uri(project, recipe_id)
+            }
+            Self::Agents => build_agents_uri(),
+            Self::Agent { agent_id } => build_agent_uri(agent_id),
+            Self::ProjectAgents { project } => build_project_agents_uri(project),
+            Self::ProjectAgent { project, agent_id } => build_project_agent_uri(project, agent_id),
+            Self::Actions => build_actions_uri(),
+            Self::Action { action_id } => build_action_uri(action_id),
+            Self::ProjectActions { project } => build_project_actions_uri(project),
+            Self::ProjectAction { project, action_id } => {
+                build_project_action_uri(project, action_id)
+            }
+            Self::ProjectPrs { project } => build_project_prs_uri(project),
+            Self::Settings => build_settings_uri(),
+            Self::Projects => build_projects_uri(),
+            Self::ProjectSettings { project } => build_project_settings_uri(project),
+        }
+    }
+
+    pub fn to_route(&self) -> Option<String> {
+        // Settings/Projects have no project; ProjectSettings has no dedicated UI
+        // route. None for all three (the `?` below short-circuits the first two).
+        if matches!(
+            self,
+            Self::Settings | Self::Projects | Self::ProjectSettings { .. }
+        ) {
+            return None;
+        }
+        let project = self.project()?.to_lowercase();
+        match self {
+            Self::Settings | Self::Projects | Self::ProjectSettings { .. } => None,
+            Self::Project { .. } => Some(format!("/p/{}/issues", project)),
+            Self::Issue { number, .. } => Some(format!("/p/{}/i/{}", project, number)),
+            Self::Node {
+                number,
+                exec_seq,
+                node_id,
+                ..
+            }
+            | Self::NodeChat {
+                number,
+                exec_seq,
+                node_id,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}/chat",
+                project, number, exec_seq, node_id
+            )),
+            Self::NodeArtifact {
+                number,
+                exec_seq,
+                node_id,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}/artifact",
+                project, number, exec_seq, node_id
+            )),
+            Self::NodeTerminal {
+                number,
+                exec_seq,
+                node_id,
+                slug,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}?terminalId={}",
+                project, number, exec_seq, node_id, slug
+            )),
+            Self::TaskTerminal {
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                slug,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}/task/{}?terminalId={}",
+                project, number, exec_seq, node_id, task_name, slug
+            )),
+            Self::NodeMemories {
+                number,
+                exec_seq,
+                node_id,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}/memories",
+                project, number, exec_seq, node_id
+            )),
+            Self::NodeMemory {
+                number,
+                exec_seq,
+                node_id,
+                memory_seq,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}/memories/{}",
+                project, number, exec_seq, node_id, memory_seq
+            )),
+            Self::Task {
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                ..
+            }
+            | Self::TaskChat {
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}/task/{}/chat",
+                project, number, exec_seq, node_id, task_name
+            )),
+            Self::ProjectTerminal { slug, .. } => {
+                Some(format!("/p/{}/terminal?terminalId={}", project, slug))
+            }
+            Self::NodeChatRaw { .. }
+            | Self::NodeChatTurn { .. }
+            | Self::NodeChatEvent { .. }
+            | Self::TaskChatRaw { .. }
+            | Self::TaskChatTurn { .. }
+            | Self::TaskChatEvent { .. }
+            | Self::TaskArtifact { .. }
+            | Self::JobTodos { .. }
+            | Self::NodeTasks { .. }
+            | Self::NodeWakes { .. }
+            | Self::NodeQuestions { .. }
+            | Self::NodeQuestion { .. }
+            | Self::NodePermissions { .. }
+            | Self::NodePermission { .. }
+            | Self::NodeMessages { .. }
+            | Self::TaskMessages { .. }
+            | Self::ProjectIssues { .. }
+            | Self::ProjectMessages { .. }
+            | Self::IssueMessages { .. }
+            | Self::Changed { .. }
+            | Self::IssueExecutions { .. }
+            | Self::IssueComments { .. }
+            | Self::IssueComment { .. }
+            | Self::IssueExecution { .. }
+            | Self::NodeChanged { .. }
+            | Self::Skills
+            | Self::Skill { .. }
+            | Self::ProjectSkills { .. }
+            | Self::ProjectSkill { .. }
+            | Self::Labels
+            | Self::Label { .. }
+            | Self::Recipes
+            | Self::Recipe { .. }
+            | Self::ProjectRecipes { .. }
+            | Self::ProjectRecipe { .. }
+            | Self::Agents
+            | Self::Agent { .. }
+            | Self::ProjectAgents { .. }
+            | Self::ProjectAgent { .. }
+            | Self::Actions
+            | Self::Action { .. }
+            | Self::ProjectActions { .. }
+            | Self::ProjectAction { .. }
+            | Self::ProjectPrs { .. }
+            | Self::NodeLsp { .. }
+            | Self::ProjectLsp { .. }
+            | Self::Db
+            | Self::Logs
+            | Self::Bug
+            | Self::Help
+            | Self::Mcp { .. } => None,
+        }
+    }
+
+    pub fn project(&self) -> Option<&str> {
+        match self {
+            Self::ProjectSettings { project } => Some(project),
+            Self::Settings | Self::Projects => None,
+            Self::Project { project }
+            | Self::ProjectIssues { project }
+            | Self::Issue { project, .. }
+            | Self::Node { project, .. }
+            | Self::NodeChat { project, .. }
+            | Self::NodeChatRaw { project, .. }
+            | Self::NodeChatTurn { project, .. }
+            | Self::NodeChatEvent { project, .. }
+            | Self::NodeArtifact { project, .. }
+            | Self::NodeTerminal { project, .. }
+            | Self::TaskTerminal { project, .. }
+            | Self::Task { project, .. }
+            | Self::TaskChat { project, .. }
+            | Self::TaskChatRaw { project, .. }
+            | Self::TaskChatTurn { project, .. }
+            | Self::TaskChatEvent { project, .. }
+            | Self::TaskArtifact { project, .. }
+            | Self::JobTodos { project, .. }
+            | Self::NodeTasks { project, .. }
+            | Self::NodeWakes { project, .. }
+            | Self::NodeQuestions { project, .. }
+            | Self::NodeQuestion { project, .. }
+            | Self::NodePermissions { project, .. }
+            | Self::NodePermission { project, .. }
+            | Self::NodeMessages { project, .. }
+            | Self::TaskMessages { project, .. }
+            | Self::ProjectMessages { project }
+            | Self::IssueMessages { project, .. }
+            | Self::IssueComments { project, .. }
+            | Self::IssueComment { project, .. }
+            | Self::Changed { project, .. }
+            | Self::IssueExecutions { project, .. }
+            | Self::IssueExecution { project, .. }
+            | Self::NodeChanged { project, .. }
+            | Self::ProjectTerminal { project, .. }
+            | Self::ProjectSkills { project }
+            | Self::ProjectSkill { project, .. }
+            | Self::NodeMemories { project, .. }
+            | Self::NodeMemory { project, .. }
+            | Self::ProjectRecipes { project }
+            | Self::ProjectRecipe { project, .. }
+            | Self::ProjectAgents { project }
+            | Self::ProjectAgent { project, .. }
+            | Self::ProjectActions { project }
+            | Self::ProjectAction { project, .. }
+            | Self::NodeLsp { project, .. }
+            | Self::ProjectLsp { project, .. }
+            | Self::ProjectPrs { project } => Some(project),
+            Self::Skills
+            | Self::Skill { .. }
+            | Self::Labels
+            | Self::Label { .. }
+            | Self::Recipes
+            | Self::Recipe { .. }
+            | Self::Agents
+            | Self::Agent { .. }
+            | Self::Actions
+            | Self::Action { .. }
+            | Self::Db
+            | Self::Logs
+            | Self::Bug
+            | Self::Help
+            | Self::Mcp { .. } => None,
+        }
+    }
+
+    pub fn issue_number(&self) -> Option<i32> {
+        match self {
+            Self::Settings | Self::Projects | Self::ProjectSettings { .. } => None,
+            Self::Issue { number, .. }
+            | Self::Node { number, .. }
+            | Self::NodeChat { number, .. }
+            | Self::NodeChatRaw { number, .. }
+            | Self::NodeChatTurn { number, .. }
+            | Self::NodeChatEvent { number, .. }
+            | Self::NodeArtifact { number, .. }
+            | Self::NodeTerminal { number, .. }
+            | Self::TaskTerminal { number, .. }
+            | Self::Task { number, .. }
+            | Self::TaskChat { number, .. }
+            | Self::TaskChatRaw { number, .. }
+            | Self::TaskChatTurn { number, .. }
+            | Self::TaskChatEvent { number, .. }
+            | Self::TaskArtifact { number, .. }
+            | Self::JobTodos { number, .. }
+            | Self::NodeTasks { number, .. }
+            | Self::NodeWakes { number, .. }
+            | Self::NodeQuestions { number, .. }
+            | Self::NodeQuestion { number, .. }
+            | Self::NodePermissions { number, .. }
+            | Self::NodePermission { number, .. }
+            | Self::NodeMessages { number, .. }
+            | Self::TaskMessages { number, .. }
+            | Self::IssueMessages { number, .. }
+            | Self::IssueComments { number, .. }
+            | Self::IssueComment { number, .. }
+            | Self::Changed { number, .. }
+            | Self::IssueExecutions { number, .. }
+            | Self::IssueExecution { number, .. }
+            | Self::NodeChanged { number, .. }
+            | Self::NodeMemories { number, .. }
+            | Self::NodeMemory { number, .. }
+            | Self::NodeLsp { number, .. } => Some(*number),
+            Self::Project { .. }
+            | Self::ProjectIssues { .. }
+            | Self::ProjectMessages { .. }
+            | Self::ProjectTerminal { .. }
+            | Self::Skills
+            | Self::Skill { .. }
+            | Self::ProjectSkills { .. }
+            | Self::ProjectSkill { .. }
+            | Self::Labels
+            | Self::Label { .. }
+            | Self::Recipes
+            | Self::Recipe { .. }
+            | Self::ProjectRecipes { .. }
+            | Self::ProjectRecipe { .. }
+            | Self::Agents
+            | Self::Agent { .. }
+            | Self::ProjectAgents { .. }
+            | Self::ProjectAgent { .. }
+            | Self::Actions
+            | Self::Action { .. }
+            | Self::ProjectActions { .. }
+            | Self::ProjectAction { .. }
+            | Self::ProjectPrs { .. }
+            | Self::ProjectLsp { .. }
+            | Self::Db
+            | Self::Logs
+            | Self::Bug
+            | Self::Help
+            | Self::Mcp { .. } => None,
+        }
+    }
+
+    pub fn node_id(&self) -> Option<&str> {
+        match self {
+            Self::Node { node_id, .. }
+            | Self::NodeChat { node_id, .. }
+            | Self::NodeChatRaw { node_id, .. }
+            | Self::NodeChatTurn { node_id, .. }
+            | Self::NodeChatEvent { node_id, .. }
+            | Self::NodeArtifact { node_id, .. }
+            | Self::NodeTerminal { node_id, .. }
+            | Self::TaskTerminal { node_id, .. }
+            | Self::Task { node_id, .. }
+            | Self::TaskChat { node_id, .. }
+            | Self::TaskChatRaw { node_id, .. }
+            | Self::TaskChatTurn { node_id, .. }
+            | Self::TaskChatEvent { node_id, .. }
+            | Self::TaskArtifact { node_id, .. }
+            | Self::JobTodos { node_id, .. }
+            | Self::NodeTasks { node_id, .. }
+            | Self::NodeQuestions { node_id, .. }
+            | Self::NodeQuestion { node_id, .. }
+            | Self::NodePermissions { node_id, .. }
+            | Self::NodePermission { node_id, .. }
+            | Self::NodeMessages { node_id, .. }
+            | Self::TaskMessages { node_id, .. }
+            | Self::NodeChanged { node_id, .. }
+            | Self::NodeMemories { node_id, .. }
+            | Self::NodeMemory { node_id, .. }
+            | Self::NodeLsp { node_id, .. } => Some(node_id),
+            _ => None,
+        }
+    }
+
+    /// Data-free discriminant used to key the resource contract table
+    /// (gate dispatch + affordance rendering).
+    pub fn kind(&self) -> ResourceKind {
+        match self {
+            Self::Settings => ResourceKind::Settings,
+            Self::Projects => ResourceKind::Projects,
+            Self::ProjectSettings { .. } => ResourceKind::ProjectSettings,
+            Self::Project { .. } => ResourceKind::Project,
+            Self::ProjectIssues { .. } => ResourceKind::ProjectIssues,
+            Self::ProjectMessages { .. } => ResourceKind::ProjectMessages,
+            Self::ProjectTerminal { .. } => ResourceKind::ProjectTerminal,
+            Self::Issue { .. } => ResourceKind::Issue,
+            Self::Changed { .. } => ResourceKind::Changed,
+            Self::IssueExecutions { .. } => ResourceKind::IssueExecutions,
+            Self::IssueExecution { .. } => ResourceKind::IssueExecution,
+            Self::IssueMessages { .. } => ResourceKind::IssueMessages,
+            Self::IssueComments { .. } => ResourceKind::IssueComments,
+            Self::IssueComment { .. } => ResourceKind::IssueComment,
+            Self::NodeMessages { .. } => ResourceKind::NodeMessages,
+            Self::TaskMessages { .. } => ResourceKind::TaskMessages,
+            Self::Node { .. } => ResourceKind::Node,
+            Self::NodeChat { .. } => ResourceKind::NodeChat,
+            Self::NodeChatRaw { .. } => ResourceKind::NodeChatRaw,
+            Self::NodeChatTurn { .. } => ResourceKind::NodeChatTurn,
+            Self::NodeChatEvent { .. } => ResourceKind::NodeChatEvent,
+            Self::NodeArtifact { .. } => ResourceKind::NodeArtifact,
+            Self::NodeChanged { .. } => ResourceKind::NodeChanged,
+            Self::NodeTerminal { .. } => ResourceKind::NodeTerminal,
+            Self::TaskTerminal { .. } => ResourceKind::TaskTerminal,
+            Self::Task { .. } => ResourceKind::Task,
+            Self::TaskChat { .. } => ResourceKind::TaskChat,
+            Self::TaskChatRaw { .. } => ResourceKind::TaskChatRaw,
+            Self::TaskChatTurn { .. } => ResourceKind::TaskChatTurn,
+            Self::TaskChatEvent { .. } => ResourceKind::TaskChatEvent,
+            Self::TaskArtifact { .. } => ResourceKind::TaskArtifact,
+            Self::JobTodos { .. } => ResourceKind::JobTodos,
+            Self::NodeTasks { .. } => ResourceKind::NodeTasks,
+            Self::NodeWakes { .. } => ResourceKind::NodeWakes,
+            Self::NodeQuestions { .. } => ResourceKind::NodeQuestions,
+            Self::NodeQuestion { .. } => ResourceKind::NodeQuestion,
+            Self::NodePermissions { .. } => ResourceKind::NodePermissions,
+            Self::NodePermission { .. } => ResourceKind::NodePermission,
+            Self::Db => ResourceKind::Db,
+            Self::Logs => ResourceKind::Logs,
+            Self::Bug => ResourceKind::Bug,
+            Self::Help => ResourceKind::Help,
+            Self::Mcp { .. } => ResourceKind::Mcp,
+            Self::Skills => ResourceKind::Skills,
+            Self::Skill { .. } => ResourceKind::Skill,
+            Self::ProjectSkills { .. } => ResourceKind::ProjectSkills,
+            Self::ProjectSkill { .. } => ResourceKind::ProjectSkill,
+            Self::Labels => ResourceKind::Labels,
+            Self::Label { .. } => ResourceKind::Label,
+            Self::NodeMemories { .. } => ResourceKind::NodeMemories,
+            Self::NodeMemory { .. } => ResourceKind::NodeMemory,
+            Self::Recipes => ResourceKind::Recipes,
+            Self::Recipe { .. } => ResourceKind::Recipe,
+            Self::ProjectRecipes { .. } => ResourceKind::ProjectRecipes,
+            Self::ProjectRecipe { .. } => ResourceKind::ProjectRecipe,
+            Self::Agents => ResourceKind::Agents,
+            Self::Agent { .. } => ResourceKind::Agent,
+            Self::ProjectAgents { .. } => ResourceKind::ProjectAgents,
+            Self::ProjectAgent { .. } => ResourceKind::ProjectAgent,
+            Self::Actions => ResourceKind::Actions,
+            Self::Action { .. } => ResourceKind::Action,
+            Self::ProjectActions { .. } => ResourceKind::ProjectActions,
+            Self::ProjectAction { .. } => ResourceKind::ProjectAction,
+            Self::ProjectPrs { .. } => ResourceKind::ProjectPrs,
+            Self::NodeLsp { .. } => ResourceKind::NodeLsp,
+            Self::ProjectLsp { .. } => ResourceKind::ProjectLsp,
+        }
+    }
+}
+
+pub fn parse_resource_uri(uri: &str) -> Result<Option<CairnResourceUri>, String> {
+    let (identity, raw_query) = match uri.split_once('?') {
+        Some((identity, query)) => (identity, Some(query)),
+        None => (uri, None),
+    };
+    let Some(resource) = parse_uri(identity) else {
+        return Ok(None);
+    };
+    let params = raw_query
+        .map(parse_query_params)
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Some(CairnResourceUri { resource, params }))
+}
+
+pub fn parse_uri(uri: &str) -> Option<CairnResource> {
+    let uri = uri.strip_prefix("cairn://")?;
+
+    // External MCP gateway family. Handled before the '?'-split and the generic
+    // '/'-split so the external resource tail survives intact — it may contain
+    // '/', '://', AND its own '?query', none of which are Cairn-side syntax
+    // (the family advertises no read projections). A server name itself never
+    // contains '?' or '/'.
+    if uri == "mcp" {
+        return Some(CairnResource::Mcp {
+            server: None,
+            resource: None,
+        });
+    }
+    if let Some(rest) = uri.strip_prefix("mcp/") {
+        let mut segs = rest.splitn(2, '/');
+        let server = segs.next()?;
+        if server.is_empty() || server.contains('?') {
+            return None;
+        }
+        let resource = segs.next().filter(|s| !s.is_empty()).map(|s| s.to_string());
+        return Some(CairnResource::Mcp {
+            server: Some(server.to_string()),
+            resource,
+        });
+    }
+
+    let path = uri.split('?').next()?;
+    if path.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+
+    match parts.as_slice() {
+        ["db"] => Some(CairnResource::Db),
+        ["logs"] => Some(CairnResource::Logs),
+        ["bug"] => Some(CairnResource::Bug),
+        ["help"] => Some(CairnResource::Help),
+        ["skills"] => Some(CairnResource::Skills),
+        ["skills", skill_id, rest @ ..] => Some(CairnResource::Skill {
+            skill_id: (*skill_id).to_string(),
+            path: rest.iter().map(|segment| (*segment).to_string()).collect(),
+        }),
+        [PROJECT_SCOPE, project, "skills"] => Some(CairnResource::ProjectSkills {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "skills", skill_id, rest @ ..] => {
+            Some(CairnResource::ProjectSkill {
+                project: canonical_project(project),
+                skill_id: (*skill_id).to_string(),
+                path: rest.iter().map(|segment| (*segment).to_string()).collect(),
+            })
+        }
+        ["settings"] => Some(CairnResource::Settings),
+        ["projects"] => Some(CairnResource::Projects),
+        ["labels"] => Some(CairnResource::Labels),
+        ["labels", label_id] => Some(CairnResource::Label {
+            label_id: (*label_id).to_string(),
+        }),
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "memories"] => {
+            Some(CairnResource::NodeMemories {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "memories", memory_seq] => {
+            Some(CairnResource::NodeMemory {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                memory_seq: parse_positive_i32(memory_seq)?,
+            })
+        }
+        ["recipes"] => Some(CairnResource::Recipes),
+        ["recipes", recipe_id] => Some(CairnResource::Recipe {
+            recipe_id: (*recipe_id).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "recipes"] => Some(CairnResource::ProjectRecipes {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "recipes", recipe_id] => Some(CairnResource::ProjectRecipe {
+            project: canonical_project(project),
+            recipe_id: (*recipe_id).to_string(),
+        }),
+        ["agents"] => Some(CairnResource::Agents),
+        ["agents", agent_id] => Some(CairnResource::Agent {
+            agent_id: (*agent_id).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "agents"] => Some(CairnResource::ProjectAgents {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "agents", agent_id] => Some(CairnResource::ProjectAgent {
+            project: canonical_project(project),
+            agent_id: (*agent_id).to_string(),
+        }),
+        ["actions"] => Some(CairnResource::Actions),
+        ["actions", action_id] => Some(CairnResource::Action {
+            action_id: (*action_id).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "actions"] => Some(CairnResource::ProjectActions {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "actions", action_id] => Some(CairnResource::ProjectAction {
+            project: canonical_project(project),
+            action_id: (*action_id).to_string(),
+        }),
+        // Read-only project-wide PR list. Literal `prs` segment; must precede the
+        // numeric `[PROJECT_SCOPE, project, number]` issue arm below.
+        [PROJECT_SCOPE, project, "prs"] => Some(CairnResource::ProjectPrs {
+            project: canonical_project(project),
+        }),
+        // Literal `lsp` segment(s); must precede the numeric issue arm below so a
+        // project-scoped lsp URI is never misread as an issue id.
+        [PROJECT_SCOPE, project, "lsp"] => Some(CairnResource::ProjectLsp {
+            project: canonical_project(project),
+            symbol: None,
+        }),
+        [PROJECT_SCOPE, project, "lsp", symbol] => Some(CairnResource::ProjectLsp {
+            project: canonical_project(project),
+            symbol: Some((*symbol).to_string()),
+        }),
+        [PROJECT_SCOPE, project] => Some(CairnResource::Project {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "issues"] => Some(CairnResource::ProjectIssues {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "messages"] => Some(CairnResource::ProjectMessages {
+            project: canonical_project(project),
+        }),
+        // Must precede the `[PROJECT_SCOPE, project, number]` issue arm: a
+        // literal `settings` segment is not a numeric issue id.
+        [PROJECT_SCOPE, project, "settings"] => Some(CairnResource::ProjectSettings {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "terminal", slug] => Some(CairnResource::ProjectTerminal {
+            project: canonical_project(project),
+            slug: (*slug).to_string(),
+        }),
+        [PROJECT_SCOPE, project, number] => Some(CairnResource::Issue {
+            project: canonical_project(project),
+            number: parse_positive_i32(number)?,
+        }),
+        [PROJECT_SCOPE, project, number, "changed"] => Some(CairnResource::Changed {
+            project: canonical_project(project),
+            number: parse_positive_i32(number)?,
+        }),
+        [PROJECT_SCOPE, project, number, "messages"] => Some(CairnResource::IssueMessages {
+            project: canonical_project(project),
+            number: parse_positive_i32(number)?,
+        }),
+        [PROJECT_SCOPE, project, number, "executions"] => Some(CairnResource::IssueExecutions {
+            project: canonical_project(project),
+            number: parse_positive_i32(number)?,
+        }),
+        [PROJECT_SCOPE, project, number, "comments"] => Some(CairnResource::IssueComments {
+            project: canonical_project(project),
+            number: parse_positive_i32(number)?,
+        }),
+        // Must precede the `[PROJECT_SCOPE, project, number, exec_seq, node_id]`
+        // node arm: that arm binds `exec_seq`/`node_id` to any segments, so a
+        // literal `comments` member URI would otherwise be misread as a node.
+        [PROJECT_SCOPE, project, number, "comments", comment_seq] => {
+            Some(CairnResource::IssueComment {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                comment_seq: parse_positive_i32(comment_seq)?,
+            })
+        }
+        // MUST precede the Node arm: both are 5-segment shapes, but a literal
+        // `executions` in the 4th position names a single execution snapshot,
+        // not a node whose exec_seq happens to parse here.
+        [PROJECT_SCOPE, project, number, "executions", exec_seq] => {
+            Some(CairnResource::IssueExecution {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id] => Some(CairnResource::Node {
+            project: canonical_project(project),
+            number: parse_positive_i32(number)?,
+            exec_seq: parse_positive_i32(exec_seq)?,
+            node_id: (*node_id).to_string(),
+        }),
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "chat"] => {
+            Some(CairnResource::NodeChat {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "chat", "raw"] => {
+            Some(CairnResource::NodeChatRaw {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "chat", "turn", turn_seq] => {
+            Some(CairnResource::NodeChatTurn {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                turn_seq: parse_non_negative_i32(turn_seq)?,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "chat", run_seq, event_seq] => {
+            Some(CairnResource::NodeChatEvent {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                run_seq: parse_positive_i32(run_seq)?,
+                event_seq: parse_non_negative_i32(event_seq)?,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "artifact"] => {
+            Some(CairnResource::NodeArtifact {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                name: None,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "changed"] => {
+            Some(CairnResource::NodeChanged {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "lsp"] => {
+            Some(CairnResource::NodeLsp {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                symbol: None,
+            })
+        }
+        // A `::`/`.`-qualified symbol stays one path segment, so a
+        // container-qualified name (`Foo::bar`) passes through intact.
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "lsp", symbol] => {
+            Some(CairnResource::NodeLsp {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                symbol: Some((*symbol).to_string()),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "todos"] => {
+            Some(CairnResource::JobTodos {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: None,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "tasks"] => {
+            Some(CairnResource::NodeTasks {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "wakes"] => {
+            Some(CairnResource::NodeWakes {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "questions"] => {
+            Some(CairnResource::NodeQuestions {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "questions", segment] => {
+            Some(CairnResource::NodeQuestion {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                segment: (*segment).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "permissions"] => {
+            Some(CairnResource::NodePermissions {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "permissions", segment] => {
+            Some(CairnResource::NodePermission {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                segment: (*segment).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "messages"] => {
+            Some(CairnResource::NodeMessages {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "todos"] => {
+            Some(CairnResource::JobTodos {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: Some((*task_name).to_string()),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "terminal", slug] => {
+            Some(CairnResource::NodeTerminal {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                slug: (*slug).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "terminal", slug] => {
+            Some(CairnResource::TaskTerminal {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                slug: (*slug).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name] => {
+            Some(CairnResource::Task {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "chat"] => {
+            Some(CairnResource::TaskChat {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "chat", "raw"] => {
+            Some(CairnResource::TaskChatRaw {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "chat", "turn", turn_seq] => {
+            Some(CairnResource::TaskChatTurn {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                turn_seq: parse_non_negative_i32(turn_seq)?,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "chat", run_seq, event_seq] => {
+            Some(CairnResource::TaskChatEvent {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                run_seq: parse_positive_i32(run_seq)?,
+                event_seq: parse_non_negative_i32(event_seq)?,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "artifact"] => {
+            Some(CairnResource::TaskArtifact {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                name: None,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "messages"] => {
+            Some(CairnResource::TaskMessages {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
+        // Type-named artifact under a task: a trailing non-reserved segment.
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, name]
+            if !is_reserved_node_segment(name) =>
+        {
+            Some(CairnResource::TaskArtifact {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                name: Some((*name).to_string()),
+            })
+        }
+        // Type-named artifact under a node: a trailing non-reserved segment
+        // (`.../{node}/plan`). Reserved keywords are handled by the arms above.
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, name]
+            if !is_reserved_node_segment(name) =>
+        {
+            Some(CairnResource::NodeArtifact {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                name: Some((*name).to_string()),
+            })
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // === Issue-level parsing ===
-
     #[test]
-    fn test_parse_issue() {
-        let result = parse_uri("cairn://CAIRN/123").unwrap();
+    fn parses_lsp_resources_all_forms() {
         assert_eq!(
-            result,
-            CairnResource::Issue {
+            parse_uri("cairn://p/cairn/12/1/builder/lsp"),
+            Some(CairnResource::NodeLsp {
                 project: "CAIRN".to_string(),
-                number: 123,
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_issue_lowercase_project() {
-        let result = parse_uri("cairn://cairn/123").unwrap();
-        assert_eq!(
-            result,
-            CairnResource::Issue {
-                project: "CAIRN".to_string(),
-                number: 123,
-            }
-        );
-    }
-
-    // === Node-level parsing (exec_seq required) ===
-
-    #[test]
-    fn test_parse_node() {
-        let result = parse_uri("cairn://CAIRN/123/1/planner-1").unwrap();
-        assert_eq!(
-            result,
-            CairnResource::Node {
-                project: "CAIRN".to_string(),
-                number: 123,
+                number: 12,
                 exec_seq: 1,
-                node_id: "planner-1".to_string(),
-            }
+                node_id: "builder".to_string(),
+                symbol: None,
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/12/1/builder/lsp/build_widget"),
+            Some(CairnResource::NodeLsp {
+                project: "CAIRN".to_string(),
+                number: 12,
+                exec_seq: 1,
+                node_id: "builder".to_string(),
+                symbol: Some("build_widget".to_string()),
+            })
+        );
+        // A `::`-qualified symbol survives as one segment.
+        assert_eq!(
+            parse_uri("cairn://p/cairn/12/1/builder/lsp/Foo::bar"),
+            Some(CairnResource::NodeLsp {
+                project: "CAIRN".to_string(),
+                number: 12,
+                exec_seq: 1,
+                node_id: "builder".to_string(),
+                symbol: Some("Foo::bar".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/lsp"),
+            Some(CairnResource::ProjectLsp {
+                project: "CAIRN".to_string(),
+                symbol: None,
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/lsp/build_widget"),
+            Some(CairnResource::ProjectLsp {
+                project: "CAIRN".to_string(),
+                symbol: Some("build_widget".to_string()),
+            })
         );
     }
 
     #[test]
-    fn test_parse_node_chat() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/chat").unwrap();
+    fn lsp_segment_is_reserved_not_an_artifact() {
+        assert!(is_reserved_node_segment("lsp"));
+        // `.../node/lsp` must parse as NodeLsp, never a NodeArtifact named "lsp".
+        assert!(matches!(
+            parse_uri("cairn://p/cairn/12/1/builder/lsp"),
+            Some(CairnResource::NodeLsp { .. })
+        ));
+    }
+
+    #[test]
+    fn lsp_uris_round_trip() {
+        for uri in [
+            "cairn://p/CAIRN/12/1/builder/lsp",
+            "cairn://p/CAIRN/12/1/builder/lsp/build_widget",
+            "cairn://p/CAIRN/lsp",
+            "cairn://p/CAIRN/lsp/build_widget",
+        ] {
+            assert_eq!(parse_uri(uri).unwrap().to_uri(), uri, "round-trip {uri}");
+        }
+    }
+
+    #[test]
+    fn parses_canonical_project_resources() {
         assert_eq!(
-            result,
-            CairnResource::NodeChat {
+            parse_uri("cairn://p/cairn/123/changed"),
+            Some(CairnResource::Changed {
                 project: "CAIRN".to_string(),
                 number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-            }
+            })
         );
-    }
-
-    #[test]
-    fn test_parse_node_chat_full() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/chat/full").unwrap();
         assert_eq!(
-            result,
-            CairnResource::NodeChatFull {
+            parse_uri("cairn://p/CAIRN/issues"),
+            Some(CairnResource::ProjectIssues {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-            }
+            })
         );
-    }
-
-    #[test]
-    fn test_parse_node_chat_turn() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/chat/turn/3").unwrap();
         assert_eq!(
-            result,
-            CairnResource::NodeChatTurn {
+            parse_uri("cairn://p/CAIRN/messages"),
+            Some(CairnResource::ProjectMessages {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                turn_seq: 3,
-            }
+            })
         );
     }
 
     #[test]
-    fn test_parse_node_chat_turn_does_not_collide_with_event() {
-        // "turn" is a literal, not an integer — should not parse as NodeChatEvent
-        let turn = parse_uri("cairn://CAIRN/123/1/builder-1/chat/turn/3").unwrap();
-        assert!(matches!(turn, CairnResource::NodeChatTurn { .. }));
-
-        // Integer pair should still parse as NodeChatEvent
-        let event = parse_uri("cairn://CAIRN/123/1/builder-1/chat/1/5").unwrap();
-        assert!(matches!(event, CairnResource::NodeChatEvent { .. }));
-    }
-
-    #[test]
-    fn test_parse_node_chat_event() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/chat/1/5").unwrap();
+    fn parses_and_roundtrips_node_and_task_messages() {
+        // Node `/messages` is the canonical node messaging target.
+        let node = parse_uri("cairn://p/cairn/42/2/builder/messages");
         assert_eq!(
-            result,
-            CairnResource::NodeChatEvent {
+            node,
+            Some(CairnResource::NodeMessages {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                run_seq: 1,
-                event_seq: 5,
-            }
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+            })
+        );
+        assert_eq!(
+            node.unwrap().to_uri(),
+            "cairn://p/CAIRN/42/2/builder/messages"
+        );
+
+        // Task `/messages` is the sub-agent analogue.
+        let task = parse_uri("cairn://p/cairn/42/2/builder/task/review/messages");
+        assert_eq!(
+            task,
+            Some(CairnResource::TaskMessages {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "review".to_string(),
+            })
+        );
+        assert_eq!(
+            task.unwrap().to_uri(),
+            "cairn://p/CAIRN/42/2/builder/task/review/messages"
+        );
+
+        // `/messages` is not mistaken for a type-named artifact.
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/messages").map(|r| r.kind()),
+            Some(ResourceKind::NodeMessages)
         );
     }
 
     #[test]
-    fn test_parse_node_artifact() {
-        let result = parse_uri("cairn://CAIRN/123/1/planner-1/artifact").unwrap();
+    fn parses_and_roundtrips_settings_family() {
+        assert_eq!(parse_uri("cairn://settings"), Some(CairnResource::Settings));
+        assert_eq!(CairnResource::Settings.to_uri(), "cairn://settings");
+        assert_eq!(CairnResource::Settings.kind(), ResourceKind::Settings);
+        assert_eq!(CairnResource::Settings.project(), None);
+        assert_eq!(CairnResource::Settings.to_route(), None);
+
+        assert_eq!(parse_uri("cairn://projects"), Some(CairnResource::Projects));
+        assert_eq!(CairnResource::Projects.to_uri(), "cairn://projects");
+        assert_eq!(CairnResource::Projects.kind(), ResourceKind::Projects);
+
+        let ps = parse_uri("cairn://p/cairn/settings");
         assert_eq!(
-            result,
+            ps,
+            Some(CairnResource::ProjectSettings {
+                project: "CAIRN".to_string(),
+            })
+        );
+        let ps = ps.unwrap();
+        assert_eq!(ps.to_uri(), "cairn://p/CAIRN/settings");
+        assert_eq!(ps.kind(), ResourceKind::ProjectSettings);
+        assert_eq!(ps.project(), Some("CAIRN"));
+        assert_eq!(ps.issue_number(), None);
+        assert_eq!(ps.to_route(), None);
+
+        // `settings` is not parsed as an issue number.
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/settings").map(|r| r.kind()),
+            Some(ResourceKind::ProjectSettings)
+        );
+    }
+
+    #[test]
+    fn parses_and_roundtrips_help() {
+        assert_eq!(parse_uri("cairn://help"), Some(CairnResource::Help));
+        assert_eq!(CairnResource::Help.to_uri(), "cairn://help");
+        assert_eq!(CairnResource::Help.kind(), ResourceKind::Help);
+        assert_eq!(CairnResource::Help.project(), None);
+    }
+
+    #[test]
+    fn parses_and_roundtrips_logs() {
+        assert_eq!(parse_uri("cairn://logs"), Some(CairnResource::Logs));
+        assert_eq!(CairnResource::Logs.to_uri(), "cairn://logs");
+        assert_eq!(CairnResource::Logs.kind(), ResourceKind::Logs);
+        assert_eq!(CairnResource::Logs.project(), None);
+        // Read-only logical resource: not a UI deep-link.
+        assert_eq!(CairnResource::Logs.to_route(), None);
+        // Query strings do not affect resource identity.
+        assert_eq!(
+            parse_uri("cairn://logs?process=mcp&grep=ERROR"),
+            Some(CairnResource::Logs)
+        );
+    }
+
+    #[test]
+    fn parses_type_named_node_artifact() {
+        // A trailing non-reserved segment is a type-named artifact.
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/plan"),
+            Some(CairnResource::NodeArtifact {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                name: Some("plan".to_string()),
+            })
+        );
+        // Round-trips back to the same type-named URI.
+        assert_eq!(
             CairnResource::NodeArtifact {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "planner-1".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                name: Some("plan".to_string()),
             }
+            .to_uri(),
+            "cairn://p/CAIRN/42/2/builder/plan"
+        );
+        // The literal `artifact` keyword is the generic (name: None) alias.
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/artifact"),
+            Some(CairnResource::NodeArtifact {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                name: None,
+            })
         );
     }
 
     #[test]
-    fn test_parse_node_terminal() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/terminal/dev-server").unwrap();
+    fn reserved_segments_are_not_artifacts() {
+        // `chat` is reserved and must parse as NodeChat, never an artifact named "chat".
         assert_eq!(
-            result,
-            CairnResource::NodeTerminal {
+            parse_uri("cairn://p/CAIRN/42/2/builder/chat"),
+            Some(CairnResource::NodeChat {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                slug: "dev-server".to_string(),
-            }
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+            })
         );
+        assert!(is_reserved_node_segment("chat"));
+        assert!(is_reserved_node_segment("todos"));
+        assert!(!is_reserved_node_segment("plan"));
+        assert!(!is_reserved_node_segment("pr"));
     }
 
-    // === Task-level parsing (exec_seq required) ===
-
     #[test]
-    fn test_parse_task_chat() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat").unwrap();
+    fn parses_type_named_task_artifact() {
         assert_eq!(
-            result,
-            CairnResource::TaskChat {
+            parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/result"),
+            Some(CairnResource::TaskArtifact {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
                 task_name: "Explore".to_string(),
-            }
+                name: Some("result".to_string()),
+            })
         );
     }
 
     #[test]
-    fn test_parse_task_chat_full() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/full").unwrap();
+    fn parses_and_roundtrips_task_base() {
+        // The task job base — the analogue of a node base. Regression: this used
+        // to fall through to `None`, so a sub-agent's home URI was rejected and
+        // `cairn:~/...` shorthand could not resolve.
+        let uri = "cairn://p/CAIRN/1174/1/planner/task/cairn-1171";
+        let parsed = parse_uri(uri);
         assert_eq!(
-            result,
-            CairnResource::TaskChatFull {
+            parsed,
+            Some(CairnResource::Task {
                 project: "CAIRN".to_string(),
-                number: 123,
+                number: 1174,
                 exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                task_name: "Explore".to_string(),
-            }
+                node_id: "planner".to_string(),
+                task_name: "cairn-1171".to_string(),
+            })
+        );
+        // Round-trips back to the same string (distinct from the artifact form).
+        assert_eq!(parsed.unwrap().to_uri(), uri);
+    }
+
+    #[test]
+    fn task_base_built_by_build_job_base_uri_parses() {
+        // The exact path the orchestrator uses to stamp CAIRN_HOME_URI for a task.
+        let built = build_job_base_uri("CAIRN", 1174, 1, "cairn-1171", Some("planner"));
+        assert!(
+            parse_uri(&built).is_some(),
+            "task home URI must parse: {built}"
         );
     }
 
     #[test]
-    fn test_parse_task_chat_turn() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/turn/3").unwrap();
+    fn chat_full_uri_no_longer_parses() {
+        // The `full` segment was renamed to `raw`; the old spelling must 404 so
+        // the removal is deliberate rather than a silent dual-name.
+        assert!(parse_uri("cairn://p/CAIRN/42/2/builder/chat/full").is_none());
+        assert!(parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/chat/full").is_none());
+    }
+
+    #[test]
+    fn parses_node_and_task_resources() {
         assert_eq!(
-            result,
-            CairnResource::TaskChatTurn {
+            parse_uri("cairn://p/CAIRN/42/2/builder/chat/raw"),
+            Some(CairnResource::NodeChatRaw {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/chat/turn/3"),
+            Some(CairnResource::TaskChatTurn {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
                 task_name: "Explore".to_string(),
                 turn_seq: 3,
-            }
+            })
         );
-    }
-
-    #[test]
-    fn test_parse_task_chat_turn_does_not_collide_with_event() {
-        let turn = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/turn/3").unwrap();
-        assert!(matches!(turn, CairnResource::TaskChatTurn { .. }));
-
-        let event = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/2/10").unwrap();
-        assert!(matches!(event, CairnResource::TaskChatEvent { .. }));
-    }
-
-    #[test]
-    fn test_parse_task_chat_event() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/chat/2/10").unwrap();
         assert_eq!(
-            result,
-            CairnResource::TaskChatEvent {
+            parse_uri("cairn://p/CAIRN/42/2/builder/chat/1/0"),
+            Some(CairnResource::NodeChatEvent {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                run_seq: 1,
+                event_seq: 0,
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/chat/1/0"),
+            Some(CairnResource::TaskChatEvent {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
                 task_name: "Explore".to_string(),
-                run_seq: 2,
-                event_seq: 10,
-            }
+                run_seq: 1,
+                event_seq: 0,
+            })
         );
     }
 
     #[test]
-    fn test_parse_task_artifact() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/task/Explore/artifact").unwrap();
+    fn parses_and_roundtrips_node_tasks_and_questions() {
+        let cases = [
+            (
+                "cairn://p/CAIRN/42/2/builder/tasks",
+                CairnResource::NodeTasks {
+                    project: "CAIRN".to_string(),
+                    number: 42,
+                    exec_seq: 2,
+                    node_id: "builder".to_string(),
+                },
+            ),
+            (
+                "cairn://p/CAIRN/42/2/builder/questions",
+                CairnResource::NodeQuestions {
+                    project: "CAIRN".to_string(),
+                    number: 42,
+                    exec_seq: 2,
+                    node_id: "builder".to_string(),
+                },
+            ),
+            (
+                "cairn://p/CAIRN/42/2/builder/questions/q-1",
+                CairnResource::NodeQuestion {
+                    project: "CAIRN".to_string(),
+                    number: 42,
+                    exec_seq: 2,
+                    node_id: "builder".to_string(),
+                    segment: "q-1".to_string(),
+                },
+            ),
+            (
+                "cairn://p/CAIRN/42/2/builder/permissions",
+                CairnResource::NodePermissions {
+                    project: "CAIRN".to_string(),
+                    number: 42,
+                    exec_seq: 2,
+                    node_id: "builder".to_string(),
+                },
+            ),
+            (
+                "cairn://p/CAIRN/42/2/builder/permissions/perm-1",
+                CairnResource::NodePermission {
+                    project: "CAIRN".to_string(),
+                    number: 42,
+                    exec_seq: 2,
+                    node_id: "builder".to_string(),
+                    segment: "perm-1".to_string(),
+                },
+            ),
+        ];
+        for (uri, expected) in cases {
+            assert_eq!(parse_uri(uri), Some(expected.clone()));
+            assert_eq!(expected.to_uri(), uri);
+        }
+    }
+
+    #[test]
+    fn parse_uri_keeps_path_only_compatibility_with_queries() {
         assert_eq!(
-            result,
-            CairnResource::TaskArtifact {
+            parse_uri("cairn://p/CAIRN/42/2/builder/terminal/dev?full=true"),
+            Some(CairnResource::NodeTerminal {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                slug: "dev".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci?new=true"),
+            Some(CairnResource::TaskTerminal {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
                 task_name: "Explore".to_string(),
-            }
+                slug: "ci".to_string(),
+            })
         );
     }
 
-    // === Old format URIs (without exec_seq) should fail ===
-
     #[test]
-    fn test_parse_old_format_node_fails() {
-        // Old format without exec_seq should return None
-        assert!(parse_uri("cairn://CAIRN/123/planner-1").is_none());
-        assert!(parse_uri("cairn://CAIRN/123/builder-1/chat").is_none());
-        assert!(parse_uri("cairn://CAIRN/123/builder-1/artifact").is_none());
-        assert!(parse_uri("cairn://CAIRN/123/builder-1/terminal/dev-server").is_none());
-        assert!(parse_uri("cairn://CAIRN/123/builder-1/task/Explore/chat").is_none());
-    }
-
-    // === Project-level parsing ===
-
-    #[test]
-    fn test_parse_project_terminal() {
-        let result = parse_uri("cairn://CAIRN/terminal/build").unwrap();
+    fn parses_and_roundtrips_task_terminal() {
+        let uri = "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci";
+        let parsed = parse_uri(uri);
         assert_eq!(
-            result,
-            CairnResource::ProjectTerminal {
+            parsed,
+            Some(CairnResource::TaskTerminal {
                 project: "CAIRN".to_string(),
-                slug: "build".to_string(),
-            }
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+                slug: "ci".to_string(),
+            })
         );
-    }
-
-    #[test]
-    fn test_parse_project_chat() {
-        let result = parse_uri("cairn://CAIRN/chat/api-design").unwrap();
+        let resource = parsed.unwrap();
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.kind(), ResourceKind::TaskTerminal);
+        assert_eq!(resource.project(), Some("CAIRN"));
         assert_eq!(
-            result,
-            CairnResource::ProjectChat {
-                project: "CAIRN".to_string(),
-                name: "api-design".to_string(),
-            }
+            resource.to_route(),
+            Some("/p/cairn/i/42/2/builder/task/Explore?terminalId=ci".to_string())
         );
     }
 
     #[test]
-    fn test_parse_issue_files() {
-        let result = parse_uri("cairn://CAIRN/123/files").unwrap();
+    fn parse_resource_uri_preserves_ordered_query_params() {
+        let parsed = parse_resource_uri("cairn://p/cairn/issues?limit=10&status=backlog").unwrap();
         assert_eq!(
-            result,
-            CairnResource::Files {
-                project: "CAIRN".to_string(),
-                number: 123,
-            }
+            parsed,
+            Some(CairnResourceUri {
+                resource: CairnResource::ProjectIssues {
+                    project: "CAIRN".to_string(),
+                },
+                params: vec![
+                    QueryParam {
+                        key: "limit".to_string(),
+                        value: "10".to_string(),
+                    },
+                    QueryParam {
+                        key: "status".to_string(),
+                        value: "backlog".to_string(),
+                    },
+                ],
+            })
         );
-    }
-
-    #[test]
-    fn test_parse_node_files() {
-        let result = parse_uri("cairn://CAIRN/123/1/builder-1/files").unwrap();
         assert_eq!(
-            result,
-            CairnResource::NodeFiles {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-            }
+            parsed.unwrap().to_uri(),
+            "cairn://p/CAIRN/issues?limit=10&status=backlog"
         );
     }
 
-    // === Invalid URIs ===
-
     #[test]
-    fn test_parse_invalid_scheme() {
-        assert!(parse_uri("issue://CAIRN/123").is_none());
-        assert!(parse_uri("terminal://CAIRN/main/dev").is_none());
-        assert!(parse_uri("file:///test.txt").is_none());
-    }
-
-    #[test]
-    fn test_parse_invalid_number() {
-        assert!(parse_uri("cairn://CAIRN/abc").is_none());
-        assert!(parse_uri("cairn://CAIRN/").is_none());
-    }
-
-    #[test]
-    fn test_parse_project() {
-        let result = parse_uri("cairn://CAIRN").unwrap();
+    fn parse_resource_uri_encodes_canonical_query_params() {
+        // `+` is literal in a value (not form-decoded to a space), so it
+        // canonicalizes to `%2B`; a space encodes as `%20`. `&status=` still
+        // splits because `status` is a recognized key.
+        let parsed =
+            parse_resource_uri("cairn://p/cairn/issues?label=needs+review&status=backlog%2Cactive")
+                .unwrap()
+                .unwrap();
         assert_eq!(
-            result,
-            CairnResource::Project {
-                project: "CAIRN".to_string(),
-            }
+            parsed.to_uri(),
+            "cairn://p/CAIRN/issues?label=needs%2Breview&status=backlog%2Cactive"
         );
     }
 
     #[test]
-    fn test_parse_project_lowercase() {
-        let result = parse_uri("cairn://cairn").unwrap();
+    fn parse_resource_uri_rejects_invalid_query_encoding() {
+        let err = parse_resource_uri("cairn://p/CAIRN/issues?status=%ZZ").unwrap_err();
+        assert!(err.contains("Invalid percent escape"));
+    }
+
+    #[test]
+    fn rejects_legacy_roots_and_invalid_paths() {
+        assert!(parse_uri("cairn://CAIRN/42").is_none());
+        assert!(parse_uri("cairn://ws/skills").is_none());
+        assert!(parse_uri("cairn://p").is_none());
+        assert!(parse_uri("cairn://p/CAIRN/comments").is_none());
+        assert!(parse_uri("cairn://p/CAIRN/42/pr").is_none());
+        // Note: a trailing non-reserved segment like `.../builder/diff` is now a
+        // valid type-named artifact (see parses_type_named_node_artifact), not an error.
+        assert!(parse_uri("cairn://p/CAIRN/42/0/builder").is_none());
+        assert!(parse_uri("cairn://").is_none());
+    }
+
+    #[test]
+    fn serializes_canonical_uris() {
+        assert_eq!(build_project_uri("cairn"), "cairn://p/CAIRN");
+        assert_eq!(build_project_issues_uri("cairn"), "cairn://p/CAIRN/issues");
+        assert_eq!(build_issue_uri("cairn", 42), "cairn://p/CAIRN/42");
         assert_eq!(
-            result,
-            CairnResource::Project {
-                project: "CAIRN".to_string(),
-            }
+            build_node_terminal_uri("cairn", 42, 2, "builder", "dev"),
+            "cairn://p/CAIRN/42/2/builder/terminal/dev"
         );
-    }
-
-    #[test]
-    fn test_parse_with_query_string() {
-        let result = parse_uri("cairn://CAIRN/123?foo=bar").unwrap();
         assert_eq!(
-            result,
-            CairnResource::Issue {
-                project: "CAIRN".to_string(),
-                number: 123,
-            }
+            build_task_terminal_uri("cairn", 42, 2, "builder", "Explore", "ci"),
+            "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci"
+        );
+        assert_eq!(
+            build_task_artifact_uri("cairn", 42, 2, "builder", "Explore"),
+            "cairn://p/CAIRN/42/2/builder/task/Explore/artifact"
         );
     }
 
-    // === Roundtrip tests ===
+    #[test]
+    fn parses_issue_executions_collection() {
+        assert_eq!(
+            parse_uri("cairn://p/cairn/42/executions"),
+            Some(CairnResource::IssueExecutions {
+                project: "CAIRN".to_string(),
+                number: 42,
+            })
+        );
+        assert_eq!(
+            build_issue_executions_uri("CAIRN", 42),
+            "cairn://p/CAIRN/42/executions"
+        );
+    }
 
     #[test]
-    fn test_roundtrip_all_variants() {
+    fn parses_issue_comments_collection_and_member() {
+        assert_eq!(
+            parse_uri("cairn://p/cairn/12/comments"),
+            Some(CairnResource::IssueComments {
+                project: "CAIRN".to_string(),
+                number: 12,
+            })
+        );
+        assert_eq!(
+            build_issue_comments_uri("CAIRN", 12),
+            "cairn://p/CAIRN/12/comments"
+        );
+
+        let member = parse_uri("cairn://p/cairn/12/comments/3").unwrap();
+        assert_eq!(
+            member,
+            CairnResource::IssueComment {
+                project: "CAIRN".to_string(),
+                number: 12,
+                comment_seq: 3,
+            }
+        );
+        assert_eq!(member.kind(), ResourceKind::IssueComment);
+        assert_eq!(member.project(), Some("CAIRN"));
+        assert_eq!(member.issue_number(), Some(12));
+        assert_eq!(member.to_uri(), "cairn://p/CAIRN/12/comments/3");
+        // A non-numeric comment tail is not a valid member URI.
+        assert_eq!(parse_uri("cairn://p/CAIRN/12/comments/not-a-number"), None);
+
+        let collection = parse_uri("cairn://p/CAIRN/12/comments").unwrap();
+        assert_eq!(collection.kind(), ResourceKind::IssueComments);
+        assert_eq!(collection.issue_number(), Some(12));
+    }
+
+    #[test]
+    fn parses_single_execution_snapshot() {
+        let resource = parse_uri("cairn://p/cairn/42/executions/2").unwrap();
+        assert_eq!(
+            resource,
+            CairnResource::IssueExecution {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+            }
+        );
+        assert_eq!(resource.kind(), ResourceKind::IssueExecution);
+        assert_eq!(resource.project(), Some("CAIRN"));
+        assert_eq!(resource.issue_number(), Some(42));
+        assert_eq!(resource.to_route(), None);
+        assert_eq!(
+            build_issue_execution_uri("CAIRN", 42, 2),
+            "cairn://p/CAIRN/42/executions/2"
+        );
+        assert_eq!(resource.to_uri(), "cairn://p/CAIRN/42/executions/2");
+    }
+
+    /// `.../42/executions/2` and the node shape `.../42/2/builder` are both
+    /// 5-segment URIs; the literal `executions` in the 4th slot must resolve to
+    /// a single execution, never a node whose exec_seq parsed there.
+    #[test]
+    fn single_execution_does_not_shadow_node() {
+        assert_eq!(
+            parse_uri("cairn://p/cairn/42/executions/2"),
+            Some(CairnResource::IssueExecution {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/42/2/builder"),
+            Some(CairnResource::Node {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+            })
+        );
+        // A non-numeric exec_seq under `executions` is malformed, not a node.
+        assert_eq!(parse_uri("cairn://p/cairn/42/executions/abc"), None);
+    }
+
+    #[test]
+    fn round_trips_every_resource_family() {
         let resources = vec![
             CairnResource::Project {
                 project: "CAIRN".to_string(),
             },
+            CairnResource::ProjectIssues {
+                project: "CAIRN".to_string(),
+            },
             CairnResource::Issue {
                 project: "CAIRN".to_string(),
-                number: 123,
-            },
-            CairnResource::Node {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "planner-1".to_string(),
-            },
-            CairnResource::NodeChat {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-            },
-            CairnResource::NodeChatFull {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-            },
-            CairnResource::NodeChatTurn {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                turn_seq: 3,
-            },
-            CairnResource::NodeChatEvent {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                run_seq: 1,
-                event_seq: 5,
-            },
-            CairnResource::NodeArtifact {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "planner-1".to_string(),
-            },
-            CairnResource::NodeTerminal {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                slug: "dev-server".to_string(),
-            },
-            CairnResource::TaskChat {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                task_name: "Explore".to_string(),
-            },
-            CairnResource::TaskChatFull {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                task_name: "Explore".to_string(),
-            },
-            CairnResource::TaskChatTurn {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                task_name: "Explore".to_string(),
-                turn_seq: 3,
-            },
-            CairnResource::TaskChatEvent {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                task_name: "Explore".to_string(),
-                run_seq: 2,
-                event_seq: 10,
-            },
-            CairnResource::TaskArtifact {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-                task_name: "Explore".to_string(),
+                number: 1,
             },
             CairnResource::ProjectMessages {
                 project: "CAIRN".to_string(),
             },
-            CairnResource::IssueMessages {
-                project: "CAIRN".to_string(),
-                number: 123,
-            },
-            CairnResource::Files {
-                project: "CAIRN".to_string(),
-                number: 123,
-            },
-            CairnResource::NodeFiles {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
-            },
             CairnResource::ProjectTerminal {
                 project: "CAIRN".to_string(),
                 slug: "build".to_string(),
             },
-            CairnResource::ProjectChat {
+            CairnResource::IssueMessages {
                 project: "CAIRN".to_string(),
-                name: "api-design".to_string(),
+                number: 1,
             },
-        ];
-
-        for resource in resources {
-            let uri = resource.to_uri();
-            let parsed = parse_uri(&uri).expect(&format!("Failed to parse: {}", uri));
-            assert_eq!(resource, parsed, "Roundtrip failed for {}", uri);
-        }
-    }
-
-    // === Route conversion tests ===
-
-    #[test]
-    fn test_to_route_project() {
-        let resource = CairnResource::Project {
-            project: "CAIRN".to_string(),
-        };
-        assert_eq!(resource.to_route(), "/p/cairn");
-    }
-
-    #[test]
-    fn test_to_route_issue() {
-        let resource = CairnResource::Issue {
-            project: "CAIRN".to_string(),
-            number: 123,
-        };
-        assert_eq!(resource.to_route(), "/p/cairn/i/123");
-    }
-
-    #[test]
-    fn test_to_route_node_chat() {
-        let resource = CairnResource::NodeChat {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 1,
-            node_id: "planner-1".to_string(),
-        };
-        assert_eq!(resource.to_route(), "/p/cairn/i/123/1/planner-1/chat");
-    }
-
-    #[test]
-    fn test_to_route_node_redirects_to_chat() {
-        let resource = CairnResource::Node {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 1,
-            node_id: "planner-1".to_string(),
-        };
-        // Bare node routes should redirect to chat
-        assert_eq!(resource.to_route(), "/p/cairn/i/123/1/planner-1/chat");
-    }
-
-    #[test]
-    fn test_to_route_node_terminal() {
-        let resource = CairnResource::NodeTerminal {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 1,
-            node_id: "builder-1".to_string(),
-            slug: "dev-server".to_string(),
-        };
-        assert_eq!(
-            resource.to_route(),
-            "/p/cairn/i/123/1/builder-1/terminal/dev-server"
-        );
-    }
-
-    #[test]
-    fn test_to_route_task_chat() {
-        let resource = CairnResource::TaskChat {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 1,
-            node_id: "builder-1".to_string(),
-            task_name: "Explore".to_string(),
-        };
-        assert_eq!(
-            resource.to_route(),
-            "/p/cairn/i/123/1/builder-1/task/Explore/chat"
-        );
-    }
-
-    #[test]
-    fn test_to_route_task_chat_turn() {
-        let resource = CairnResource::TaskChatTurn {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 1,
-            node_id: "builder-1".to_string(),
-            task_name: "Explore".to_string(),
-            turn_seq: 3,
-        };
-        assert_eq!(
-            resource.to_route(),
-            "/p/cairn/i/123/1/builder-1/task/Explore/chat/turn/3"
-        );
-    }
-
-    #[test]
-    fn test_to_route_project_terminal() {
-        let resource = CairnResource::ProjectTerminal {
-            project: "CAIRN".to_string(),
-            slug: "build".to_string(),
-        };
-        assert_eq!(resource.to_route(), "/p/cairn/terminal/build");
-    }
-
-    #[test]
-    fn test_to_route_project_chat() {
-        let resource = CairnResource::ProjectChat {
-            project: "CAIRN".to_string(),
-            name: "api-design".to_string(),
-        };
-        assert_eq!(resource.to_route(), "/p/cairn/chat/api-design");
-    }
-
-    // === Route tests with exec_seq (various values) ===
-
-    #[test]
-    fn test_to_route_node_chat_exec_seq_3() {
-        let resource = CairnResource::NodeChat {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 3,
-            node_id: "planner-1".to_string(),
-        };
-        assert_eq!(resource.to_route(), "/p/cairn/i/123/3/planner-1/chat");
-    }
-
-    #[test]
-    fn test_to_route_node_terminal_exec_seq_5() {
-        let resource = CairnResource::NodeTerminal {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 5,
-            node_id: "builder-1".to_string(),
-            slug: "dev-server".to_string(),
-        };
-        assert_eq!(
-            resource.to_route(),
-            "/p/cairn/i/123/5/builder-1/terminal/dev-server"
-        );
-    }
-
-    #[test]
-    fn test_to_route_node_artifact_exec_seq_2() {
-        let resource = CairnResource::NodeArtifact {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 2,
-            node_id: "planner-1".to_string(),
-        };
-        assert_eq!(resource.to_route(), "/p/cairn/i/123/2/planner-1/artifact");
-    }
-
-    // === Helper function tests ===
-
-    #[test]
-    fn test_build_node_terminal_uri() {
-        let uri = build_node_terminal_uri("cairn", 123, 1, "builder-1", "dev-server");
-        assert_eq!(uri, "cairn://CAIRN/123/1/builder-1/terminal/dev-server");
-    }
-
-    #[test]
-    fn test_build_node_terminal_uri_exec_seq_5() {
-        let uri = build_node_terminal_uri("cairn", 123, 5, "builder-1", "dev-server");
-        assert_eq!(uri, "cairn://CAIRN/123/5/builder-1/terminal/dev-server");
-    }
-
-    #[test]
-    fn test_build_project_terminal_uri() {
-        let uri = build_project_terminal_uri("cairn", "build");
-        assert_eq!(uri, "cairn://CAIRN/terminal/build");
-    }
-
-    #[test]
-    fn test_accessor_methods() {
-        let resource = CairnResource::NodeTerminal {
-            project: "CAIRN".to_string(),
-            number: 123,
-            exec_seq: 1,
-            node_id: "builder-1".to_string(),
-            slug: "dev-server".to_string(),
-        };
-
-        assert_eq!(resource.project(), "CAIRN");
-        assert_eq!(resource.issue_number(), Some(123));
-        assert_eq!(resource.node_id(), Some("builder-1"));
-    }
-
-    #[test]
-    fn test_accessor_methods_project_level() {
-        let resource = CairnResource::ProjectTerminal {
-            project: "CAIRN".to_string(),
-            slug: "build".to_string(),
-        };
-
-        assert_eq!(resource.project(), "CAIRN");
-        assert_eq!(resource.issue_number(), None);
-        assert_eq!(resource.node_id(), None);
-    }
-
-    // === URI parsing tests with various exec_seq values ===
-
-    #[test]
-    fn test_parse_node_exec_seq_3() {
-        let result = parse_uri("cairn://CAIRN/123/3/planner-1").unwrap();
-        assert_eq!(
-            result,
+            CairnResource::Changed {
+                project: "CAIRN".to_string(),
+                number: 1,
+            },
+            CairnResource::IssueExecutions {
+                project: "CAIRN".to_string(),
+                number: 1,
+            },
+            CairnResource::IssueComments {
+                project: "CAIRN".to_string(),
+                number: 1,
+            },
+            CairnResource::IssueComment {
+                project: "CAIRN".to_string(),
+                number: 1,
+                comment_seq: 1,
+            },
+            CairnResource::IssueExecution {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+            },
             CairnResource::Node {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 3,
-                node_id: "planner-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_node_chat_exec_seq_5() {
-        let result = parse_uri("cairn://CAIRN/123/5/builder-1/chat").unwrap();
-        assert_eq!(
-            result,
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+            },
             CairnResource::NodeChat {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 5,
-                node_id: "builder-1".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_node_terminal_exec_seq_2() {
-        let result = parse_uri("cairn://CAIRN/123/2/builder-1/terminal/dev-server").unwrap();
-        assert_eq!(
-            result,
-            CairnResource::NodeTerminal {
-                project: "CAIRN".to_string(),
-                number: 123,
+                number: 1,
                 exec_seq: 2,
-                node_id: "builder-1".to_string(),
-                slug: "dev-server".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_parse_node_artifact_exec_seq_7() {
-        let result = parse_uri("cairn://CAIRN/123/7/planner-1/artifact").unwrap();
-        assert_eq!(
-            result,
+                node_id: "builder".to_string(),
+            },
+            CairnResource::NodeChatRaw {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+            },
+            CairnResource::NodeChatTurn {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                turn_seq: 0,
+            },
+            CairnResource::NodeChatEvent {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                run_seq: 1,
+                event_seq: 5,
+            },
             CairnResource::NodeArtifact {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 7,
-                node_id: "planner-1".to_string(),
-            }
-        );
-    }
-
-    // === Invalid exec_seq values should fail ===
-
-    #[test]
-    fn test_exec_seq_zero_fails() {
-        // exec_seq must be positive, so 0 should fail to parse
-        assert!(parse_uri("cairn://CAIRN/123/0/chat").is_none());
-    }
-
-    #[test]
-    fn test_exec_seq_negative_fails() {
-        // exec_seq must be positive, so negative numbers should fail to parse
-        assert!(parse_uri("cairn://CAIRN/123/-1/chat").is_none());
-    }
-
-    #[test]
-    fn test_roundtrip_various_exec_seq() {
-        let resources = vec![
-            CairnResource::Node {
-                project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 3,
-                node_id: "planner-1".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                name: None,
             },
-            CairnResource::NodeChat {
+            CairnResource::NodeChanged {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 5,
-                node_id: "builder-1".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
             },
             CairnResource::NodeTerminal {
                 project: "CAIRN".to_string(),
-                number: 123,
+                number: 1,
                 exec_seq: 2,
-                node_id: "builder-1".to_string(),
-                slug: "dev-server".to_string(),
+                node_id: "builder".to_string(),
+                slug: "dev".to_string(),
+            },
+            CairnResource::TaskTerminal {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+                slug: "ci".to_string(),
             },
             CairnResource::TaskChat {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 1,
-                node_id: "builder-1".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
                 task_name: "Explore".to_string(),
             },
-            CairnResource::NodeFiles {
+            CairnResource::TaskChatRaw {
                 project: "CAIRN".to_string(),
-                number: 123,
-                exec_seq: 4,
-                node_id: "builder-1".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
             },
+            CairnResource::TaskChatTurn {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+                turn_seq: 2,
+            },
+            CairnResource::TaskChatEvent {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+                run_seq: 1,
+                event_seq: 3,
+            },
+            CairnResource::TaskArtifact {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+                name: None,
+            },
+            CairnResource::JobTodos {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: None,
+            },
+            CairnResource::JobTodos {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: Some("Explore".to_string()),
+            },
+            CairnResource::Bug,
         ];
 
         for resource in resources {
-            let uri = resource.to_uri();
-            let parsed = parse_uri(&uri).expect(&format!("Failed to parse: {}", uri));
-            assert_eq!(resource, parsed, "Roundtrip failed for {}", uri);
+            assert_eq!(parse_uri(&resource.to_uri()), Some(resource.clone()));
         }
+    }
+
+    #[test]
+    fn parses_job_todos_node_and_task_forms() {
+        assert_eq!(
+            parse_uri("cairn://p/cairn/42/2/builder/todos"),
+            Some(CairnResource::JobTodos {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: None,
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/todos"),
+            Some(CairnResource::JobTodos {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: Some("Explore".to_string()),
+            })
+        );
+        assert_eq!(
+            build_job_todos_uri("cairn", 42, 2, "builder", None),
+            "cairn://p/CAIRN/42/2/builder/todos"
+        );
+        assert_eq!(
+            build_job_todos_uri("cairn", 42, 2, "builder", Some("Explore")),
+            "cairn://p/CAIRN/42/2/builder/task/Explore/todos"
+        );
+    }
+
+    #[test]
+    fn job_todos_uri_keeps_path_only_compatibility_with_queries() {
+        // parse_uri strips the query; query rejection is enforced at the handler.
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/todos?limit=3"),
+            Some(CairnResource::JobTodos {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_bug_resource() {
+        assert_eq!(parse_uri("cairn://bug"), Some(CairnResource::Bug));
+        assert_eq!(build_bug_uri(), "cairn://bug");
+        assert_eq!(CairnResource::Bug.project(), None);
+        assert_eq!(CairnResource::Bug.to_route(), None);
+    }
+
+    #[test]
+    fn parses_and_round_trips_mcp_resources() {
+        // Top-level: list servers.
+        assert_eq!(
+            parse_uri("cairn://mcp"),
+            Some(CairnResource::Mcp {
+                server: None,
+                resource: None,
+            })
+        );
+        // Server scope: list tools/resources.
+        assert_eq!(
+            parse_uri("cairn://mcp/playwright"),
+            Some(CairnResource::Mcp {
+                server: Some("playwright".to_string()),
+                resource: None,
+            })
+        );
+        // Tool target (for run).
+        assert_eq!(
+            parse_uri("cairn://mcp/playwright/browser_navigate"),
+            Some(CairnResource::Mcp {
+                server: Some("playwright".to_string()),
+                resource: Some("browser_navigate".to_string()),
+            })
+        );
+        // External resource URI tail kept intact, including '/' and '://'.
+        let r = parse_uri("cairn://mcp/linear/issue://ABC-1/sub").unwrap();
+        assert_eq!(
+            r,
+            CairnResource::Mcp {
+                server: Some("linear".to_string()),
+                resource: Some("issue://ABC-1/sub".to_string()),
+            }
+        );
+        assert_eq!(r.to_uri(), "cairn://mcp/linear/issue://ABC-1/sub");
+        // The external resource tail may carry its own '?query', which must NOT
+        // be consumed as Cairn-side query params.
+        let q = parse_uri("cairn://mcp/linear/https://api.example.com/items?limit=10").unwrap();
+        assert_eq!(
+            q,
+            CairnResource::Mcp {
+                server: Some("linear".to_string()),
+                resource: Some("https://api.example.com/items?limit=10".to_string()),
+            }
+        );
+        assert_eq!(
+            q.to_uri(),
+            "cairn://mcp/linear/https://api.example.com/items?limit=10"
+        );
+        // Round-trip the simpler forms.
+        for uri in [
+            "cairn://mcp",
+            "cairn://mcp/playwright",
+            "cairn://mcp/playwright/browser_navigate",
+        ] {
+            assert_eq!(parse_uri(uri).unwrap().to_uri(), uri);
+        }
+        assert_eq!(parse_uri("cairn://mcp").unwrap().project(), None);
+        assert_eq!(parse_uri("cairn://mcp").unwrap().kind(), ResourceKind::Mcp);
+    }
+
+    #[test]
+    fn parses_skill_resources() {
+        assert_eq!(parse_uri("cairn://skills"), Some(CairnResource::Skills));
+        assert_eq!(
+            parse_uri("cairn://skills/ui"),
+            Some(CairnResource::Skill {
+                skill_id: "ui".to_string(),
+                path: vec![],
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://skills/ui/SKILL.md"),
+            Some(CairnResource::Skill {
+                skill_id: "ui".to_string(),
+                path: vec!["SKILL.md".to_string()],
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://skills/ui/references/a/b.md"),
+            Some(CairnResource::Skill {
+                skill_id: "ui".to_string(),
+                path: vec![
+                    "references".to_string(),
+                    "a".to_string(),
+                    "b.md".to_string()
+                ],
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/skills"),
+            Some(CairnResource::ProjectSkills {
+                project: "CAIRN".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/skills/ui/scripts/run.sh"),
+            Some(CairnResource::ProjectSkill {
+                project: "CAIRN".to_string(),
+                skill_id: "ui".to_string(),
+                path: vec!["scripts".to_string(), "run.sh".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn round_trips_skill_resources() {
+        let resources = vec![
+            CairnResource::Skills,
+            CairnResource::Skill {
+                skill_id: "ui".to_string(),
+                path: vec![],
+            },
+            CairnResource::Skill {
+                skill_id: "ui".to_string(),
+                path: vec!["SKILL.md".to_string()],
+            },
+            CairnResource::Skill {
+                skill_id: "ui".to_string(),
+                path: vec![
+                    "references".to_string(),
+                    "a".to_string(),
+                    "b.md".to_string(),
+                ],
+            },
+            CairnResource::ProjectSkills {
+                project: "CAIRN".to_string(),
+            },
+            CairnResource::ProjectSkill {
+                project: "CAIRN".to_string(),
+                skill_id: "ui".to_string(),
+                path: vec!["scripts".to_string(), "run.sh".to_string()],
+            },
+        ];
+        for resource in resources {
+            assert_eq!(parse_uri(&resource.to_uri()), Some(resource.clone()));
+        }
+    }
+
+    #[test]
+    fn parses_only_node_memory_resources() {
+        assert_eq!(parse_uri("cairn://memories"), None);
+        assert_eq!(parse_uri("cairn://memories/abc-123"), None);
+        assert_eq!(parse_uri("cairn://p/CAIRN/memories"), None);
+        assert_eq!(parse_uri("cairn://p/CAIRN/memories/abc-123"), None);
+
+        let resource = CairnResource::NodeMemory {
+            project: "CAIRN".to_string(),
+            number: 1498,
+            exec_seq: 1,
+            node_id: "builder".to_string(),
+            memory_seq: 2,
+        };
+        let uri = "cairn://p/CAIRN/1498/1/builder/memories/2";
+        assert_eq!(parse_uri(uri), Some(resource.clone()));
+        assert_eq!(resource.to_uri(), uri);
+        assert_eq!(resource.project(), Some("CAIRN"));
+        assert_eq!(
+            resource.to_route(),
+            Some("/p/cairn/i/1498/1/builder/memories/2".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_and_round_trips_recipe_resources() {
+        let cases = [
+            ("cairn://recipes", CairnResource::Recipes),
+            (
+                "cairn://recipes/default-flow",
+                CairnResource::Recipe {
+                    recipe_id: "default-flow".to_string(),
+                },
+            ),
+            (
+                "cairn://p/CAIRN/recipes",
+                CairnResource::ProjectRecipes {
+                    project: "CAIRN".to_string(),
+                },
+            ),
+            (
+                "cairn://p/CAIRN/recipes/default-flow",
+                CairnResource::ProjectRecipe {
+                    project: "CAIRN".to_string(),
+                    recipe_id: "default-flow".to_string(),
+                },
+            ),
+        ];
+        for (uri, expected) in cases {
+            assert_eq!(parse_uri(uri), Some(expected.clone()));
+            assert_eq!(expected.to_uri(), uri);
+            assert_eq!(expected.kind(), expected.clone().kind());
+        }
+        // Project canonicalization on parse.
+        assert_eq!(
+            parse_uri("cairn://p/cairn/recipes"),
+            Some(CairnResource::ProjectRecipes {
+                project: "CAIRN".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/recipes/default-flow"),
+            Some(CairnResource::ProjectRecipe {
+                project: "CAIRN".to_string(),
+                recipe_id: "default-flow".to_string(),
+            })
+        );
+        assert_eq!(CairnResource::Recipes.project(), None);
+        assert_eq!(CairnResource::Recipes.issue_number(), None);
+        assert_eq!(
+            CairnResource::ProjectRecipe {
+                project: "CAIRN".to_string(),
+                recipe_id: "x".to_string(),
+            }
+            .project(),
+            Some("CAIRN")
+        );
+        assert_eq!(CairnResource::Recipes.to_route(), None);
+        assert_eq!(CairnResource::Recipes.kind(), ResourceKind::Recipes);
+    }
+
+    #[test]
+    fn parses_and_round_trips_project_prs() {
+        let prs = CairnResource::ProjectPrs {
+            project: "CAIRN".to_string(),
+        };
+        assert_eq!(parse_uri("cairn://p/CAIRN/prs"), Some(prs.clone()));
+        assert_eq!(prs.to_uri(), "cairn://p/CAIRN/prs");
+        // Project key is canonicalized (uppercased) on parse.
+        assert_eq!(parse_uri("cairn://p/cairn/prs"), Some(prs.clone()));
+        // Accessors: project-scoped collection with no issue number and no route.
+        assert_eq!(prs.kind(), ResourceKind::ProjectPrs);
+        assert_eq!(prs.project(), Some("CAIRN"));
+        assert_eq!(prs.issue_number(), None);
+        assert_eq!(prs.node_id(), None);
+        assert_eq!(prs.to_route(), None);
+    }
+
+    #[test]
+    fn skill_resources_have_no_project_or_route() {
+        assert_eq!(CairnResource::Skills.project(), None);
+        assert_eq!(CairnResource::Skills.to_route(), None);
+        assert_eq!(
+            CairnResource::ProjectSkills {
+                project: "CAIRN".to_string(),
+            }
+            .project(),
+            Some("CAIRN")
+        );
+        assert_eq!(
+            CairnResource::ProjectSkill {
+                project: "CAIRN".to_string(),
+                skill_id: "ui".to_string(),
+                path: vec![],
+            }
+            .to_route(),
+            None
+        );
+    }
+
+    #[test]
+    fn resource_contracts_include_project_issue_collection() {
+        use crate::contract::RESOURCE_CONTRACTS;
+        assert!(RESOURCE_CONTRACTS
+            .iter()
+            .any(|contract| contract.uri_template == "cairn://p/{project}/issues"));
+    }
+
+    #[test]
+    fn every_resource_kind_round_trips_through_kind() {
+        use crate::contract::ResourceKind;
+        // kind() must agree with the table: every kind a resource reports has a contract.
+        for resource in [
+            CairnResource::Project {
+                project: "CAIRN".to_string(),
+            },
+            CairnResource::Bug,
+            CairnResource::Skills,
+        ] {
+            assert!(crate::contract::contract_for(resource.kind()).is_some());
+        }
+        assert_eq!(
+            CairnResource::Issue {
+                project: "CAIRN".to_string(),
+                number: 1,
+            }
+            .kind(),
+            ResourceKind::Issue
+        );
+    }
+
+    #[test]
+    fn routes_only_navigate_supported_resources() {
+        assert_eq!(
+            CairnResource::Project {
+                project: "CAIRN".to_string(),
+            }
+            .to_route(),
+            Some("/p/cairn/issues".to_string())
+        );
+        assert_eq!(
+            CairnResource::ProjectIssues {
+                project: "CAIRN".to_string(),
+            }
+            .to_route(),
+            None
+        );
+        assert_eq!(
+            CairnResource::ProjectTerminal {
+                project: "CAIRN".to_string(),
+                slug: "build".to_string(),
+            }
+            .to_route(),
+            Some("/p/cairn/terminal?terminalId=build".to_string())
+        );
+        assert_eq!(
+            CairnResource::NodeChatRaw {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+            }
+            .to_route(),
+            None
+        );
     }
 }

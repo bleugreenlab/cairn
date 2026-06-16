@@ -321,6 +321,11 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn parse_buffer(buffer: Cursor<Vec<u8>>) -> serde_json::Value {
+        let output = String::from_utf8(buffer.into_inner()).unwrap();
+        serde_json::from_str(output.trim()).unwrap()
+    }
+
     #[test]
     fn test_send_user_message() {
         let mut buffer = Cursor::new(Vec::new());
@@ -335,8 +340,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = String::from_utf8(buffer.into_inner()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let parsed = parse_buffer(buffer);
 
         assert_eq!(parsed["type"], "user");
         assert_eq!(parsed["session_id"], "session-123");
@@ -359,8 +363,7 @@ mod tests {
         )
         .unwrap();
 
-        let output = String::from_utf8(buffer.into_inner()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let parsed = parse_buffer(buffer);
 
         assert_eq!(parsed["type"], "user");
         assert_eq!(parsed["parent_tool_use_id"], "toolu_abc123");
@@ -372,8 +375,7 @@ mod tests {
 
         send_control_response(&mut buffer, "req-789", true, Some("Approved by user")).unwrap();
 
-        let output = String::from_utf8(buffer.into_inner()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let parsed = parse_buffer(buffer);
 
         assert_eq!(parsed["type"], "control_response");
         assert_eq!(parsed["request_id"], "req-789");
@@ -391,8 +393,7 @@ mod tests {
 
         send_control_response(&mut buffer, "req-abc", false, None).unwrap();
 
-        let output = String::from_utf8(buffer.into_inner()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let parsed = parse_buffer(buffer);
 
         assert_eq!(parsed["type"], "control_response");
         assert_eq!(parsed["response"]["response"]["behavior"], "deny");
@@ -405,8 +406,7 @@ mod tests {
 
         send_interrupt_request(&mut buffer, "req-int-1").unwrap();
 
-        let output = String::from_utf8(buffer.into_inner()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let parsed = parse_buffer(buffer);
 
         assert_eq!(parsed["type"], "control_request");
         assert_eq!(parsed["request_id"], "req-int-1");
@@ -419,8 +419,7 @@ mod tests {
 
         send_set_model_request(&mut buffer, "req-model-1", "claude-sonnet-4-20250514").unwrap();
 
-        let output = String::from_utf8(buffer.into_inner()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let parsed = parse_buffer(buffer);
 
         assert_eq!(parsed["type"], "control_request");
         assert_eq!(parsed["request_id"], "req-model-1");
@@ -434,8 +433,7 @@ mod tests {
 
         send_set_permission_mode_request(&mut buffer, "req-perm-1", "bypassPermissions").unwrap();
 
-        let output = String::from_utf8(buffer.into_inner()).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        let parsed = parse_buffer(buffer);
 
         assert_eq!(parsed["type"], "control_request");
         assert_eq!(parsed["request_id"], "req-perm-1");

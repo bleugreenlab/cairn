@@ -3,16 +3,16 @@
 //! Handles device code auth flow, JWT storage/refresh, and connection lifecycle.
 //! Replaces TeamManager for the single-account model.
 
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 use tokio::sync::{watch, Mutex};
 
 use super::jwt::{decrypt_jwt_from_storage, encrypt_jwt_for_storage};
 use super::org_tokens::OrgTokenCache;
 use crate::db::DbState;
 use crate::services::EventEmitter;
+use crate::storage::{DbError, RowExt};
 
 use super::connection::{AccountConnection, DbAccount, OrgMembership};
-use super::queries;
 
 const CHECK_INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
 const REFRESH_THRESHOLD_SECS: i64 = 15 * 60; // 15 minutes before expiry
@@ -88,10 +88,7 @@ impl AccountManager {
             updated_at: now,
         };
 
-        {
-            let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
-            queries::upsert(&mut conn, &db_account)?;
-        }
+        upsert_account(&self.db, db_account).await?;
 
         let connection = AccountConnection {
             user_id: claims.sub,
@@ -121,8 +118,8 @@ impl AccountManager {
         *handle = None;
 
         // Attempt API deactivation (best-effort — local state clears regardless)
-        if let Ok(Some(jwt)) = self.get_jwt() {
-            if let Ok(Some(connection)) = self.get_connection() {
+        if let Ok(Some(jwt)) = get_jwt_from_db(&self.db).await {
+            if let Ok(Some(connection)) = get_account_connection(&self.db).await {
                 let url = self.api_config.device_url(&connection.device_id);
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(5))
@@ -142,7 +139,10 @@ impl AccountManager {
                             );
                         }
                         Err(e) => {
-                            log::warn!("Device deactivation request failed (proceeding with local disconnect): {}", e);
+                            log::warn!(
+                                "Device deactivation request failed (proceeding with local disconnect): {}",
+                                e
+                            );
                         }
                     }
                 }
@@ -152,9 +152,7 @@ impl AccountManager {
         // Clear org token cache
         self.org_token_cache.lock().await.clear();
 
-        // Delete from DB
-        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
-        queries::delete(&mut conn)?;
+        delete_account(&self.db).await?;
 
         let _ = self.emitter.emit(
             "db-change",
@@ -169,20 +167,14 @@ impl AccountManager {
 
     /// Get current connection (if any).
     pub fn get_connection(&self) -> Result<Option<AccountConnection>, String> {
-        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
-        queries::get(&mut conn)
+        let db = self.db.clone();
+        block_on_account_db(async move { get_account_connection(&db).await })
     }
 
     /// Get the decrypted JWT for API calls.
     pub fn get_jwt(&self) -> Result<Option<String>, String> {
-        let mut conn = self.db.conn.lock().map_err(|e| e.to_string())?;
-        match queries::get_jwt_data(&mut conn)? {
-            Some((encrypted, _)) => {
-                let jwt = decrypt_jwt_from_storage(&encrypted)?;
-                Ok(Some(jwt))
-            }
-            None => Ok(None),
-        }
+        let db = self.db.clone();
+        block_on_account_db(async move { get_jwt_from_db(&db).await })
     }
 
     /// Get a cached org JWT, or fetch a new one by exchanging the device JWT.
@@ -196,7 +188,7 @@ impl AccountManager {
         }
 
         // Need to fetch — get device JWT
-        let device_jwt = match self.get_jwt()? {
+        let device_jwt = match get_jwt_from_db(&self.db).await? {
             Some(jwt) => jwt,
             None => return Ok(None),
         };
@@ -247,15 +239,12 @@ impl AccountManager {
 
     /// Start refresh if an account exists. Called on app startup.
     pub async fn start_refresh_if_connected(&self) {
-        let has_account = {
-            let mut conn = match self.db.conn.lock() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::error!("Failed to lock DB to check account: {}", e);
-                    return;
-                }
-            };
-            queries::get(&mut conn).ok().flatten().is_some()
+        let has_account = match get_account_connection(&self.db).await {
+            Ok(account) => account.is_some(),
+            Err(error) => {
+                log::error!("Failed to load account connection: {}", error);
+                return;
+            }
         };
 
         if has_account {
@@ -294,25 +283,7 @@ async fn refresh_loop(
         }
 
         // Load JWT from DB
-        let jwt_data = {
-            let mut conn = match db.conn.lock() {
-                Ok(c) => c,
-                Err(e) => {
-                    log::warn!("Account refresh: failed to lock DB: {}", e);
-                    consecutive_failures += 1;
-                    if consecutive_failures >= MAX_FAILURES {
-                        log::error!(
-                            "Account refresh: {} consecutive failures, emitting disconnect",
-                            consecutive_failures
-                        );
-                        let _ = emitter.emit("account-disconnected", serde_json::json!({}));
-                        consecutive_failures = 0;
-                    }
-                    continue;
-                }
-            };
-            queries::get_jwt_data(&mut conn)
-        };
+        let jwt_data = get_jwt_data(&db).await;
 
         let (encrypted_jwt, expires_at_opt) = match jwt_data {
             Ok(Some(data)) => data,
@@ -377,20 +348,7 @@ async fn refresh_loop(
 
                             match encrypt_jwt_for_storage(new_token) {
                                 Ok(enc) => {
-                                    let mut conn = match db.conn.lock() {
-                                        Ok(c) => c,
-                                        Err(e) => {
-                                            log::error!(
-                                                "Account refresh: failed to lock DB to save JWT: {}",
-                                                e
-                                            );
-                                            consecutive_failures += 1;
-                                            continue;
-                                        }
-                                    };
-                                    if let Err(e) =
-                                        queries::update_jwt(&mut conn, &enc, new_expires_at)
-                                    {
+                                    if let Err(e) = update_jwt(&db, enc, new_expires_at).await {
                                         log::error!("Account refresh: failed to save JWT: {}", e);
                                         consecutive_failures += 1;
                                     } else {
@@ -435,6 +393,171 @@ async fn refresh_loop(
             consecutive_failures = 0;
         }
     }
+}
+
+async fn upsert_account(db: &DbState, account: DbAccount) -> Result<(), String> {
+    db.local
+        .write(|conn| {
+            let account = account.clone();
+            Box::pin(async move {
+                conn.execute("DELETE FROM account", ()).await?;
+                conn.execute(
+                    "INSERT INTO account (
+                        user_id,
+                        email,
+                        name,
+                        device_id,
+                        plan,
+                        jwt_encrypted,
+                        jwt_expires_at,
+                        org_memberships,
+                        connected_at,
+                        updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    (
+                        account.user_id.as_str(),
+                        account.email.as_str(),
+                        account.name.as_str(),
+                        account.device_id.as_str(),
+                        account.plan.as_str(),
+                        account.jwt_encrypted.as_deref(),
+                        account.jwt_expires_at.map(i64::from),
+                        account.org_memberships.as_deref(),
+                        i64::from(account.connected_at),
+                        i64::from(account.updated_at),
+                    ),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| account_db_error("Failed to upsert account", error))
+}
+
+async fn delete_account(db: &DbState) -> Result<(), String> {
+    db.local
+        .write(|conn| {
+            Box::pin(async move {
+                conn.execute("DELETE FROM account", ()).await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| account_db_error("Failed to delete account", error))
+}
+
+async fn get_account_connection(db: &DbState) -> Result<Option<AccountConnection>, String> {
+    db.local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT
+                            user_id,
+                            email,
+                            name,
+                            device_id,
+                            plan,
+                            jwt_encrypted,
+                            jwt_expires_at,
+                            org_memberships,
+                            connected_at,
+                            updated_at
+                         FROM account
+                         LIMIT 1",
+                        (),
+                    )
+                    .await?;
+
+                rows.next()
+                    .await?
+                    .map(|row| DbAccount::from_row(&row).map(AccountConnection::from))
+                    .transpose()
+            })
+        })
+        .await
+        .map_err(|error| account_db_error("Failed to get account", error))
+}
+
+async fn get_jwt_data(db: &DbState) -> Result<Option<(String, Option<i64>)>, String> {
+    db.local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT jwt_encrypted, jwt_expires_at
+                         FROM account
+                         LIMIT 1",
+                        (),
+                    )
+                    .await?;
+
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+
+                let Some(jwt) = row.opt_text(0)? else {
+                    return Ok(None);
+                };
+                Ok(Some((jwt, row.opt_i64(1)?)))
+            })
+        })
+        .await
+        .map_err(|error| account_db_error("Failed to get account JWT data", error))
+}
+
+async fn get_jwt_from_db(db: &DbState) -> Result<Option<String>, String> {
+    match get_jwt_data(db).await? {
+        Some((encrypted, _)) => decrypt_jwt_from_storage(&encrypted).map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn update_jwt(db: &DbState, encrypted_jwt: String, expires_at: i64) -> Result<(), String> {
+    db.local
+        .write(|conn| {
+            let encrypted_jwt = encrypted_jwt.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE account
+                     SET jwt_encrypted = ?1,
+                         jwt_expires_at = ?2",
+                    (encrypted_jwt.as_str(), expires_at),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| account_db_error("Failed to update account JWT", error))
+}
+
+fn account_db_error(context: &str, error: DbError) -> String {
+    format!("{context}: {error}")
+}
+
+fn block_on_account_db<T>(
+    future: impl Future<Output = Result<T, String>> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || run_account_db_future(future))
+            .join()
+            .map_err(|_| "Account DB runtime thread panicked".to_string())?
+    } else {
+        run_account_db_future(future)
+    }
+}
+
+fn run_account_db_future<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("Failed to create account DB runtime: {error}"))?
+        .block_on(future)
 }
 
 /// Decode JWT claims for device tokens (no org_id/org_role required).

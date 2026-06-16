@@ -184,6 +184,21 @@ impl AppServerClient {
         }))
     }
 
+    /// Force the app-server transport closed. This is intentionally stronger
+    /// than `turn/interrupt`: Codex can acknowledge an interrupt while its
+    /// upstream response stream continues producing deltas, so callers that are
+    /// aborting a turn use this to tear down stdout/stdin and the child process.
+    pub fn shutdown(&self) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.take();
+        }
+        if let Ok(mut child_guard) = self.child.lock() {
+            if let Some(child) = child_guard.as_mut() {
+                let _ = child.kill();
+            }
+        }
+    }
+
     fn send_message(&self, msg: Value) -> Result<(), String> {
         let mut guard = self
             .writer

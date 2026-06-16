@@ -10,16 +10,20 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::agents::FileAgent;
 use crate::config::project_settings::load_project_settings;
 use crate::config::settings::load_settings;
-use crate::models::{AgentSnapshot, Model, Preset, RuntimeExtras, SnapshotPresets};
+use crate::models::{
+    AgentSnapshot, Model, ModelSelection, Preset, PresetOptionValue, RuntimeExtras, SnapshotPresets,
+};
 
 /// Effective presets config (workspace + project merged).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PresetsConfig {
     pub active_backend: String,
-    pub default_tier: String,
     pub tiers: Vec<String>,
     pub backends: HashMap<String, HashMap<String, Preset>>,
 }
@@ -39,68 +43,106 @@ pub struct AuthoredSelection {
     pub backend: Option<String>,
 }
 
-impl From<&PresetsConfig> for SnapshotPresets {
-    fn from(value: &PresetsConfig) -> Self {
-        Self {
-            active_backend: value.active_backend.clone(),
-            default_tier: value.default_tier.clone(),
-            tiers: value.tiers.clone(),
-            backends: value.backends.clone(),
-        }
-    }
+/// Which level decided the resolved backend. Display/audit only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResolutionSource {
+    /// A per-issue / per-execution backend override chose the backend.
+    ExecutionOverride,
+    /// The agent's authored backend preference chose the backend.
+    AgentDefault,
+    /// A single-provider tier pinned the backend.
+    TierDefault,
+    /// The workspace/project active backend chose among a multi-provider tier.
+    ActiveBackend,
+    /// A concrete (non-tier) model carried its own backend.
+    ExplicitModel,
 }
 
-impl From<PresetsConfig> for SnapshotPresets {
-    fn from(value: PresetsConfig) -> Self {
-        SnapshotPresets::from(&value)
-    }
+/// Resolution output: one atomic backend+model [`ModelSelection`], orthogonal
+/// runtime [`RuntimeExtras`], and the provenance of the backend decision.
+#[derive(Debug, Clone)]
+pub struct ResolvedSelection {
+    pub selection: ModelSelection,
+    pub extras: RuntimeExtras,
+    pub source: ResolutionSource,
 }
 
+/// A launch-time override for one agent node: a tier reference that resolves to
+/// a selection, a backend-only override that keeps the agent's authored tier, or
+/// a fully concrete atomic pin (composer output stored verbatim).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+pub enum LaunchSelectionOverride {
+    /// Tier ref: "lg" or qualified "codex/lg".
+    Tier(String),
+    /// Override only the backend; keep the agent's authored tier.
+    Backend(String),
+    /// A fully concrete atomic backend+model pin.
+    Concrete(ModelSelection),
+}
+
+// Migration-only conversion: a frozen `SnapshotPresets` (read off an old
+// snapshot) is rehydrated into a `PresetsConfig` so `migrate_on_read` can
+// recover `extras`. The write direction (freezing presets into a snapshot) is
+// gone — nothing produces a fresh `SnapshotPresets` anymore.
 impl From<&SnapshotPresets> for PresetsConfig {
     fn from(value: &SnapshotPresets) -> Self {
         Self {
             active_backend: value.active_backend.clone(),
-            default_tier: value.default_tier.clone(),
             tiers: value.tiers.clone(),
             backends: value.backends.clone(),
         }
-    }
-}
-
-impl From<SnapshotPresets> for PresetsConfig {
-    fn from(value: SnapshotPresets) -> Self {
-        PresetsConfig::from(&value)
     }
 }
 
 /// Default tier names.
 pub const DEFAULT_TIERS: &[&str] = &["sm", "md", "lg"];
+pub const DEFAULT_TIER: &str = "md";
 
 /// Build default Claude backend presets.
-pub fn default_claude_presets(max_thinking: Option<i32>) -> HashMap<String, Preset> {
+///
+/// `legacy_thinking_enabled` reflects the deprecated workspace `max_thinking_tokens`
+/// setting: when present (the historical default), reasoning models default to
+/// "high" effort; otherwise effort is left to the CLI default.
+fn reasoning_options(effort: Option<&str>) -> HashMap<String, PresetOptionValue> {
+    effort
+        .map(|value| {
+            HashMap::from([(
+                "reasoningEffort".to_string(),
+                PresetOptionValue::Str(value.to_string()),
+            )])
+        })
+        .unwrap_or_default()
+}
+
+/// Build default Claude backend presets.
+///
+/// `legacy_thinking_enabled` reflects the deprecated workspace `max_thinking_tokens`
+/// setting: when present (the historical default), reasoning models default to
+/// "high" effort; otherwise effort is left to the CLI default.
+pub fn default_claude_presets(legacy_thinking_enabled: Option<i32>) -> HashMap<String, Preset> {
+    let reasoning_default = legacy_thinking_enabled.map(|_| "high".to_string());
     let mut map = HashMap::new();
     map.insert(
         "sm".to_string(),
         Preset {
             model: Model::new(Model::HAIKU),
-            max_thinking_tokens: None,
-            reasoning_effort: None,
+            options: HashMap::new(),
         },
     );
     map.insert(
         "md".to_string(),
         Preset {
             model: Model::new(Model::SONNET),
-            max_thinking_tokens: max_thinking,
-            reasoning_effort: None,
+            options: reasoning_options(reasoning_default.as_deref()),
         },
     );
     map.insert(
         "lg".to_string(),
         Preset {
             model: Model::new(Model::OPUS),
-            max_thinking_tokens: max_thinking,
-            reasoning_effort: None,
+            options: reasoning_options(reasoning_default.as_deref()),
         },
     );
     map
@@ -113,24 +155,21 @@ pub fn default_codex_presets() -> HashMap<String, Preset> {
         "sm".to_string(),
         Preset {
             model: Model::new(Model::GPT_5_4_MINI),
-            max_thinking_tokens: None,
-            reasoning_effort: Some("low".to_string()),
+            options: reasoning_options(Some("low")),
         },
     );
     map.insert(
         "md".to_string(),
         Preset {
             model: Model::new("gpt-5.3-codex"),
-            max_thinking_tokens: None,
-            reasoning_effort: Some("medium".to_string()),
+            options: reasoning_options(Some("medium")),
         },
     );
     map.insert(
         "lg".to_string(),
         Preset {
-            model: Model::new("gpt-5.4"),
-            max_thinking_tokens: None,
-            reasoning_effort: Some("high".to_string()),
+            model: Model::new("gpt-5.5"),
+            options: reasoning_options(Some("high")),
         },
     );
     map
@@ -144,7 +183,6 @@ pub fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig {
 
     PresetsConfig {
         active_backend: "claude".to_string(),
-        default_tier: "md".to_string(),
         tiers: DEFAULT_TIERS.iter().map(|s| s.to_string()).collect(),
         backends,
     }
@@ -167,14 +205,110 @@ pub fn is_tier_ref(s: &str, config: &PresetsConfig) -> bool {
     config.tiers.contains(&s.to_string())
 }
 
+/// Ordered list of providers (backends) that define a preset for `tier`.
+///
+/// Ordering is active-backend-first then alphabetical, so the first element is a
+/// deterministic "first defined provider" for the multi-provider fallbacks.
+fn providers_for_tier(tier: &str, config: &PresetsConfig) -> Vec<String> {
+    let mut names: Vec<String> = config
+        .backends
+        .iter()
+        .filter(|(_, presets)| presets.contains_key(tier))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.sort_by(|a, b| {
+        if *a == config.active_backend {
+            return if *b == config.active_backend {
+                std::cmp::Ordering::Equal
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+        if *b == config.active_backend {
+            return std::cmp::Ordering::Greater;
+        }
+        a.cmp(b)
+    });
+    names
+}
+
+/// Choose the backend that serves `tier`, applying the tier-resolution semantics:
+///
+/// - **Single-provider tier** (defined on exactly one backend): always pins to that
+///   backend; `override_backend`/`preferred_backend` are silent no-ops. Never errors.
+/// - **Multi-provider tier**: `override` → `preferred` → active, restricted to the
+///   providers the tier actually defines. An override/preference naming a backend the
+///   tier does NOT define falls to the agent's preferred backend if the tier defines
+///   it, else the tier's first defined provider.
+///
+/// Returns `None` only when the tier is defined on no backend (a genuinely undefined
+/// tier name).
+fn resolve_tier_backend(
+    tier: &str,
+    override_backend: Option<&str>,
+    preferred_backend: Option<&str>,
+    config: &PresetsConfig,
+) -> Option<String> {
+    let providers = providers_for_tier(tier, config);
+    let first = providers.first()?.clone();
+
+    // Single-provider tier: nothing to select; the override is a no-op.
+    if providers.len() == 1 {
+        return Some(first);
+    }
+
+    let defines = |backend: &str| providers.iter().any(|p| p == backend);
+
+    if let Some(backend) = override_backend {
+        if defines(backend) {
+            return Some(backend.to_string());
+        }
+        // Override names a backend the tier doesn't define: prefer the agent's
+        // preferred backend if the tier defines it, else the first defined provider.
+        if let Some(preferred) = preferred_backend {
+            if defines(preferred) {
+                return Some(preferred.to_string());
+            }
+        }
+        return Some(first);
+    }
+
+    if let Some(preferred) = preferred_backend {
+        if defines(preferred) {
+            return Some(preferred.to_string());
+        }
+        return Some(first);
+    }
+
+    if defines(&config.active_backend) {
+        return Some(config.active_backend.clone());
+    }
+    Some(first)
+}
+
 /// Resolve a tier reference to a concrete preset.
 ///
-/// - `"md"` → active backend's medium tier
-/// - `"codex/lg"` → codex backend's large tier
+/// - `"md"` → resolved against the tier's providers (active backend among them, or
+///   its single provider when the tier is single-provider).
+/// - `"codex/lg"` → the explicit backend acts as an override among the tier's providers.
+///
+/// A tier defined on >=1 backend always resolves; `'Unknown tier'` is reachable only
+/// for a genuinely undefined tier name.
 pub fn resolve_preset(tier_ref: &str, config: &PresetsConfig) -> Result<ResolvedPreset, String> {
     let (explicit_backend, tier) = parse_tier_ref(tier_ref);
-    let backend_name = explicit_backend.unwrap_or(&config.active_backend);
 
+    if let Some(backend_name) = resolve_tier_backend(tier, explicit_backend, None, config) {
+        if let Some(preset) = config.backends.get(&backend_name).and_then(|m| m.get(tier)) {
+            return Ok(ResolvedPreset {
+                model: preset.model.clone(),
+                extras: preset.to_extras(),
+                backend: backend_name,
+            });
+        }
+    }
+
+    // Genuinely-undefined tier name: preserve the explicit-backend error semantics.
+    let backend_name = explicit_backend.unwrap_or(&config.active_backend);
     let backend_presets = config
         .backends
         .get(backend_name)
@@ -240,7 +374,7 @@ pub fn normalize_authored_selection(
     backend: Option<&str>,
     config: &PresetsConfig,
 ) -> AuthoredSelection {
-    let requested = tier_selection.unwrap_or(config.default_tier.as_str());
+    let requested = tier_selection.unwrap_or(DEFAULT_TIER);
     let normalized = normalize_tier_selection(requested, config);
     let (explicit_backend, tier) = parse_tier_ref(&normalized);
 
@@ -256,45 +390,99 @@ pub fn normalize_authored_selection(
     }
 }
 
-/// Resolve authored tier/backend inputs to concrete runtime values.
+/// Resolve authored tier/backend inputs to a concrete atomic selection.
+///
+/// The single `backend` argument is treated as the backend **override** (per-issue /
+/// per-execution selection, or a qualified tier ref). For callers that also carry a
+/// distinct agent-preferred backend, or that need provenance, use
+/// [`resolve_selection_with_provenance`].
+///
+/// Loud by design: an unresolvable tier or an unrecognized model returns a
+/// descriptive `Err` instead of silently degrading to a bare model name.
 pub fn resolve_runtime_selection(
     tier_selection: Option<&str>,
     backend: Option<&str>,
     config: &PresetsConfig,
-) -> Result<(Model, String, RuntimeExtras), String> {
-    let authored = normalize_authored_selection(tier_selection, backend, config);
+) -> Result<(ModelSelection, RuntimeExtras), String> {
+    let resolved = resolve_selection_with_provenance(tier_selection, backend, None, config)?;
+    Ok((resolved.selection, resolved.extras))
+}
+
+/// Canonical resolution authority: maps authored tier/backend inputs to one
+/// atomic [`ModelSelection`] plus orthogonal [`RuntimeExtras`], carrying the
+/// provenance of which level decided the backend.
+///
+/// `override_backend` is the per-issue / per-execution override; it stays
+/// distinct from `preferred_backend` (the agent's authored preference) so
+/// single-provider auto-pin and the multi-provider fallbacks resolve per the
+/// tier-resolution semantics.
+///
+/// Loud: a token that is neither a known tier ref nor a recognizable concrete
+/// model (no `backend_for_model` match and no explicit backend) is an `Err`,
+/// never a fabricated `Model::new(token)` against the active backend.
+pub fn resolve_selection_with_provenance(
+    tier_selection: Option<&str>,
+    override_backend: Option<&str>,
+    preferred_backend: Option<&str>,
+    config: &PresetsConfig,
+) -> Result<ResolvedSelection, String> {
+    let authored = normalize_authored_selection(tier_selection, override_backend, config);
     let tier = authored.tier.as_str();
 
     if is_tier_ref(tier, config) {
-        let effective_backend = authored
-            .backend
-            .as_deref()
-            .unwrap_or(config.active_backend.as_str());
-        let resolved = resolve_preset_for_backend(effective_backend, tier, config)?;
-        return Ok((resolved.model, resolved.backend, resolved.extras));
+        let backend =
+            resolve_tier_backend(tier, authored.backend.as_deref(), preferred_backend, config)
+                .ok_or_else(|| format!("Unknown tier '{}'", tier))?;
+        let preset = config
+            .backends
+            .get(&backend)
+            .and_then(|m| m.get(tier))
+            .ok_or_else(|| format!("Unknown tier '{}' for backend '{}'", tier, backend))?;
+        let source = if override_backend.is_some() {
+            ResolutionSource::ExecutionOverride
+        } else if preferred_backend.is_some() {
+            ResolutionSource::AgentDefault
+        } else if providers_for_tier(tier, config).len() == 1 {
+            ResolutionSource::TierDefault
+        } else {
+            ResolutionSource::ActiveBackend
+        };
+        return Ok(ResolvedSelection {
+            selection: ModelSelection {
+                backend,
+                model: preset.model.clone(),
+            },
+            extras: preset.to_extras(),
+            source,
+        });
     }
 
-    let backend = authored
+    // Not a tier ref: accept a concrete model only if it is recognizable — either
+    // a backend resolves it (`backend_for_model`) or an explicit backend was
+    // given (the legacy custom-model-with-backend case). Otherwise fail loudly.
+    let explicit_backend = authored
         .backend
-        .or_else(|| crate::backends::backend_for_model(tier).map(str::to_string))
-        .unwrap_or_else(|| config.active_backend.clone());
-
-    Ok((Model::new(tier), backend, RuntimeExtras::default()))
-}
-
-pub fn resolve_snapshot_agent_runtime(
-    agent: &mut AgentSnapshot,
-    config: &PresetsConfig,
-) -> Result<(), String> {
-    let (model, backend, extras) = resolve_runtime_selection(
-        agent.tier.as_ref().map(Model::as_str),
-        agent.backend_preference.as_deref(),
-        config,
-    )?;
-    agent.model = Some(model);
-    agent.resolved_backend = Some(backend);
-    agent.extras = Some(extras);
-    Ok(())
+        .clone()
+        .or_else(|| preferred_backend.map(str::to_string));
+    let backend = match explicit_backend {
+        Some(backend) => backend,
+        None => crate::backends::backend_for_model(tier)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                format!(
+                    "Unrecognized tier or model '{}' — not a configured tier and no backend resolves it",
+                    tier
+                )
+            })?,
+    };
+    Ok(ResolvedSelection {
+        selection: ModelSelection {
+            backend,
+            model: Model::new(tier),
+        },
+        extras: RuntimeExtras::default(),
+        source: ResolutionSource::ExplicitModel,
+    })
 }
 
 /// Load effective presets config (workspace + optional project overrides merged).
@@ -303,7 +491,6 @@ pub fn load_effective_presets(config_dir: &Path, project_path: Option<&Path>) ->
 
     let mut config = PresetsConfig {
         active_backend: settings.active_backend.clone(),
-        default_tier: settings.default_tier.clone(),
         tiers: settings.tiers.clone(),
         backends: settings.backends.clone(),
     };
@@ -313,9 +500,6 @@ pub fn load_effective_presets(config_dir: &Path, project_path: Option<&Path>) ->
         let proj_settings = load_project_settings(proj_path);
         if let Some(ab) = proj_settings.active_backend {
             config.active_backend = ab;
-        }
-        if let Some(dt) = proj_settings.default_tier {
-            config.default_tier = dt;
         }
         if let Some(proj_backends) = proj_settings.backends {
             for (backend_name, tier_overrides) in proj_backends {
@@ -330,38 +514,86 @@ pub fn load_effective_presets(config_dir: &Path, project_path: Option<&Path>) ->
     config
 }
 
-/// Build a resolved AgentSnapshot from a FileAgent + optional tier override.
+/// Enumerate the atomic backend+model selections offered for a launch composer.
 ///
-/// **Central function** — ALL AgentSnapshot construction must go through this.
-///
-/// Resolution order:
-/// 1. tier from `tier_override`, then agent `tier`, then workspace `default_tier`
-/// 2. backend seed (execution quickstart), then qualified tier backend, then agent `backend`
-/// 3. concrete runtime model/extras are derived from the selected backend's preset matrix
-pub fn resolve_agent_snapshot(
-    file_agent: &FileAgent,
-    tier_override: Option<&str>,
-    config: &PresetsConfig,
-) -> Result<AgentSnapshot, String> {
-    resolve_agent_snapshot_with_seed_backend(file_agent, tier_override, None, config)
+/// For each configured tier, in each backend that defines that tier (active-backend
+/// first via [`providers_for_tier`]), yields one `ModelSelection { backend, model }`.
+/// Deduplicated by `(backend, model)` so a model shared across tiers appears once.
+/// This is the MVP option set: there is no canonical concrete-model registry beyond
+/// tiers, so the launch composer offers exactly the tier-resolved selections (the
+/// caller unions in a row's own concrete custom selection when needed).
+pub fn available_selections(config: &PresetsConfig) -> Vec<ModelSelection> {
+    let mut out: Vec<ModelSelection> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for tier in &config.tiers {
+        for backend in providers_for_tier(tier, config) {
+            let Some(preset) = config.backends.get(&backend).and_then(|m| m.get(tier)) else {
+                continue;
+            };
+            let model = preset.model.clone();
+            if seen.insert((backend.clone(), model.as_str().to_string())) {
+                out.push(ModelSelection { backend, model });
+            }
+        }
+    }
+    out
 }
 
-pub fn resolve_agent_snapshot_with_seed_backend(
+/// Build a resolved AgentSnapshot from a FileAgent + optional launch override.
+///
+/// **Central function** — ALL AgentSnapshot construction must go through this.
+/// Resolution is loud: an unresolvable tier/backend or unrecognized model
+/// returns `Err`. The resulting snapshot stores one atomic `selection`; the
+/// authored `tier`/`backend_preference` are preserved as edit pre-fill only.
+pub fn resolve_agent_snapshot(
     file_agent: &FileAgent,
-    tier_override: Option<&str>,
-    backend_seed: Option<&str>,
+    override_selection: Option<&LaunchSelectionOverride>,
     config: &PresetsConfig,
 ) -> Result<AgentSnapshot, String> {
-    let authored = normalize_authored_selection(
-        tier_override.or_else(|| file_agent.tier.as_ref().map(Model::as_str)),
-        backend_seed.or(file_agent.backend_preference.as_deref()),
-        config,
-    );
-    let (resolved_model, resolved_backend, resolved_extras) = resolve_runtime_selection(
-        Some(authored.tier.as_str()),
-        authored.backend.as_deref(),
-        config,
-    )?;
+    // Effective inputs that produced the resolution — also used to compute the
+    // authored pre-fill so a Tier/Backend override stays sticky for later edits.
+    let (eff_tier, eff_backend): (Option<&str>, Option<&str>) = match override_selection {
+        Some(LaunchSelectionOverride::Tier(tier)) => (
+            Some(tier.as_str()),
+            file_agent.backend_preference.as_deref(),
+        ),
+        Some(LaunchSelectionOverride::Backend(backend)) => (
+            file_agent.tier.as_ref().map(Model::as_str),
+            Some(backend.as_str()),
+        ),
+        Some(LaunchSelectionOverride::Concrete(_)) | None => (
+            file_agent.tier.as_ref().map(Model::as_str),
+            file_agent.backend_preference.as_deref(),
+        ),
+    };
+
+    let resolved = match override_selection {
+        Some(LaunchSelectionOverride::Concrete(selection)) => ResolvedSelection {
+            selection: selection.clone(),
+            extras: RuntimeExtras::default(),
+            source: ResolutionSource::ExecutionOverride,
+        },
+        Some(LaunchSelectionOverride::Tier(tier)) => resolve_selection_with_provenance(
+            Some(tier),
+            None,
+            file_agent.backend_preference.as_deref(),
+            config,
+        )?,
+        Some(LaunchSelectionOverride::Backend(backend)) => resolve_selection_with_provenance(
+            file_agent.tier.as_ref().map(Model::as_str),
+            Some(backend),
+            file_agent.backend_preference.as_deref(),
+            config,
+        )?,
+        None => resolve_selection_with_provenance(
+            file_agent.tier.as_ref().map(Model::as_str),
+            None,
+            file_agent.backend_preference.as_deref(),
+            config,
+        )?,
+    };
+
+    let authored = normalize_authored_selection(eff_tier, eff_backend, config);
 
     Ok(AgentSnapshot {
         id: file_agent.id.clone(),
@@ -371,13 +603,15 @@ pub fn resolve_agent_snapshot_with_seed_backend(
         tools: file_agent.tools.clone(),
         tier: Some(authored.tier),
         backend_preference: authored.backend,
-        model: Some(resolved_model),
+        selection: Some(resolved.selection),
         disallowed_tools: file_agent.disallowed_tools.clone(),
         skills: file_agent.skills.clone(),
-        approval_policy: file_agent.approval_policy,
-        filesystem_scope: file_agent.filesystem_scope,
-        resolved_backend: Some(resolved_backend),
-        extras: Some(resolved_extras),
+        fence: file_agent.fence,
+        sandbox: None,
+        on_escape: None,
+        extras: Some(resolved.extras),
+        model: None,
+        resolved_backend: None,
     })
 }
 
@@ -407,14 +641,15 @@ mod tests {
         let resolved = resolve_preset("md", &config).unwrap();
         assert_eq!(resolved.model.as_str(), "sonnet");
         assert_eq!(resolved.backend, "claude");
-        assert_eq!(resolved.extras.max_thinking_tokens, Some(31999));
+        assert_eq!(resolved.extras.reasoning_effort, Some("high".to_string()));
+        assert_eq!(resolved.extras.max_thinking_tokens, None);
     }
 
     #[test]
     fn resolve_qualified_tier() {
         let config = test_config();
         let resolved = resolve_preset("codex/lg", &config).unwrap();
-        assert_eq!(resolved.model.as_str(), "gpt-5.4");
+        assert_eq!(resolved.model.as_str(), "gpt-5.5");
         assert_eq!(resolved.backend, "codex");
         assert_eq!(resolved.extras.reasoning_effort, Some("high".to_string()));
     }
@@ -428,10 +663,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_unknown_backend() {
+    fn resolve_nonmatching_explicit_backend_falls_to_first_defined() {
+        // 'md' is defined on >=1 backend, so a non-defining explicit backend no longer
+        // errors — it resolves to the tier's first defined provider (active claude).
         let config = test_config();
-        let result = resolve_preset("unknown/md", &config);
-        assert!(result.is_err());
+        let resolved = resolve_preset("unknown/md", &config).unwrap();
+        assert_eq!(resolved.backend, "claude");
+        assert_eq!(resolved.model.as_str(), "sonnet");
     }
 
     #[test]
@@ -439,6 +677,45 @@ mod tests {
         let config = test_config();
         let result = resolve_preset("xl", &config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn available_selections_default_config() {
+        let config = test_config();
+        let avail = available_selections(&config);
+        // Every default tier on both backends is represented.
+        assert!(avail
+            .iter()
+            .any(|s| s.backend == "claude" && s.model.as_str() == "haiku"));
+        assert!(avail
+            .iter()
+            .any(|s| s.backend == "claude" && s.model.as_str() == "sonnet"));
+        assert!(avail
+            .iter()
+            .any(|s| s.backend == "claude" && s.model.as_str() == "opus"));
+        assert!(avail
+            .iter()
+            .any(|s| s.backend == "codex" && s.model.as_str() == "gpt-5.3-codex"));
+        assert!(avail
+            .iter()
+            .any(|s| s.backend == "codex" && s.model.as_str() == "gpt-5.5"));
+    }
+
+    #[test]
+    fn available_selections_dedup_and_active_first() {
+        let config = test_config();
+        let avail = available_selections(&config);
+        // No duplicate (backend, model) pairs.
+        let mut keys: Vec<(String, String)> = avail
+            .iter()
+            .map(|s| (s.backend.clone(), s.model.as_str().to_string()))
+            .collect();
+        let len = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), len, "available_selections must be deduped");
+        // Active backend (claude) leads, since the first tier (sm) is multi-provider.
+        assert_eq!(avail.first().unwrap().backend, "claude");
     }
 
     #[test]
@@ -457,9 +734,15 @@ mod tests {
         let config = test_config();
         let file_agent = make_test_agent(Some("md"));
 
-        let snapshot = resolve_agent_snapshot(&file_agent, Some("lg"), &config).unwrap();
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "opus");
-        assert_eq!(snapshot.resolved_backend.unwrap(), "claude");
+        let snapshot = resolve_agent_snapshot(
+            &file_agent,
+            Some(&LaunchSelectionOverride::Tier("lg".to_string())),
+            &config,
+        )
+        .unwrap();
+        let selection = snapshot.selection.as_ref().unwrap();
+        assert_eq!(selection.model.as_str(), "opus");
+        assert_eq!(selection.backend, "claude");
     }
 
     #[test]
@@ -468,17 +751,20 @@ mod tests {
         let file_agent = make_test_agent(Some("sm"));
 
         let snapshot = resolve_agent_snapshot(&file_agent, None, &config).unwrap();
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "haiku");
+        assert_eq!(snapshot.selection.as_ref().unwrap().model.as_str(), "haiku");
     }
 
     #[test]
-    fn resolve_agent_snapshot_falls_to_default_tier() {
+    fn resolve_agent_snapshot_falls_to_md() {
         let config = test_config();
         let file_agent = make_test_agent(None);
 
         let snapshot = resolve_agent_snapshot(&file_agent, None, &config).unwrap();
-        // default_tier is "md" → sonnet
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "sonnet");
+        // DEFAULT_TIER is "md" → sonnet
+        assert_eq!(
+            snapshot.selection.as_ref().unwrap().model.as_str(),
+            "sonnet"
+        );
     }
 
     #[test]
@@ -488,7 +774,10 @@ mod tests {
 
         let snapshot = resolve_agent_snapshot(&file_agent, None, &config).unwrap();
         // Legacy concrete selections normalize to the matching tier on read.
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "sonnet");
+        assert_eq!(
+            snapshot.selection.as_ref().unwrap().model.as_str(),
+            "sonnet"
+        );
     }
 
     #[test]
@@ -496,9 +785,15 @@ mod tests {
         let config = test_config();
         let file_agent = make_test_agent(None);
 
-        let snapshot = resolve_agent_snapshot(&file_agent, Some("codex/lg"), &config).unwrap();
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "gpt-5.4");
-        assert_eq!(snapshot.resolved_backend.unwrap(), "codex");
+        let snapshot = resolve_agent_snapshot(
+            &file_agent,
+            Some(&LaunchSelectionOverride::Tier("codex/lg".to_string())),
+            &config,
+        )
+        .unwrap();
+        let selection = snapshot.selection.as_ref().unwrap();
+        assert_eq!(selection.model.as_str(), "gpt-5.5");
+        assert_eq!(selection.backend, "codex");
     }
 
     #[test]
@@ -508,8 +803,9 @@ mod tests {
         file_agent.backend_preference = Some("codex".to_string());
 
         let snapshot = resolve_agent_snapshot(&file_agent, None, &config).unwrap();
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "gpt-5.3-codex");
-        assert_eq!(snapshot.resolved_backend.unwrap(), "codex");
+        let selection = snapshot.selection.as_ref().unwrap();
+        assert_eq!(selection.model.as_str(), "gpt-5.3-codex");
+        assert_eq!(selection.backend, "codex");
     }
 
     #[test]
@@ -518,8 +814,16 @@ mod tests {
         let config = test_config();
         let file_agent = make_test_agent(Some("md"));
 
-        let snapshot = resolve_agent_snapshot(&file_agent, Some("gpt-5.4"), &config).unwrap();
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "gpt-5.4");
+        let snapshot = resolve_agent_snapshot(
+            &file_agent,
+            Some(&LaunchSelectionOverride::Tier("gpt-5.5".to_string())),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.selection.as_ref().unwrap().model.as_str(),
+            "gpt-5.5"
+        );
         let extras = snapshot.extras.unwrap();
         assert_eq!(extras.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(snapshot.backend_preference.as_deref(), Some("codex"));
@@ -533,8 +837,9 @@ mod tests {
         file_agent.backend_preference = Some("custom-backend".to_string());
 
         let snapshot = resolve_agent_snapshot(&file_agent, None, &config).unwrap();
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "my-custom-model");
-        assert_eq!(snapshot.resolved_backend.unwrap(), "custom-backend");
+        let selection = snapshot.selection.as_ref().unwrap();
+        assert_eq!(selection.model.as_str(), "my-custom-model");
+        assert_eq!(selection.backend, "custom-backend");
     }
 
     #[test]
@@ -560,16 +865,22 @@ mod tests {
         let config = test_config();
         let file_agent = make_test_agent(Some("md"));
 
-        let snapshot =
-            resolve_agent_snapshot_with_seed_backend(&file_agent, None, Some("codex"), &config)
-                .unwrap();
+        let snapshot = resolve_agent_snapshot(
+            &file_agent,
+            Some(&LaunchSelectionOverride::Backend("codex".to_string())),
+            &config,
+        )
+        .unwrap();
         assert_eq!(snapshot.backend_preference.as_deref(), Some("codex"));
-        assert_eq!(snapshot.model.as_ref().unwrap().as_str(), "gpt-5.3-codex");
-        assert_eq!(snapshot.resolved_backend.as_deref(), Some("codex"));
+        let selection = snapshot.selection.as_ref().unwrap();
+        assert_eq!(selection.model.as_str(), "gpt-5.3-codex");
+        assert_eq!(selection.backend, "codex");
     }
 
     #[test]
-    fn resolve_runtime_selection_errors_for_unsupported_backend_tier() {
+    fn resolve_runtime_selection_single_provider_tier_ignores_override() {
+        // With codex's 'lg' removed, 'lg' is single-provider (claude only). An override
+        // pointing at codex is a silent no-op — it auto-pins to claude/opus, never errors.
         let mut config = test_config();
         config
             .backends
@@ -577,28 +888,384 @@ mod tests {
             .expect("codex presets")
             .remove("lg");
 
-        let err = resolve_runtime_selection(Some("lg"), Some("codex"), &config).unwrap_err();
-        assert!(err.contains("Unknown tier 'lg'"));
+        let (selection, _) = resolve_runtime_selection(Some("lg"), Some("codex"), &config).unwrap();
+        assert_eq!(selection.backend, "claude");
+        assert_eq!(selection.model.as_str(), "opus");
     }
 
     #[test]
     fn default_claude_presets_without_thinking() {
         let presets = default_claude_presets(None);
         assert_eq!(presets["sm"].model.as_str(), "haiku");
-        assert_eq!(presets["sm"].max_thinking_tokens, None);
-        assert_eq!(presets["md"].max_thinking_tokens, None);
-        assert_eq!(presets["lg"].max_thinking_tokens, None);
+        // No legacy budget → no effort default, no thinking tokens anywhere.
+        assert_eq!(
+            presets["sm"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            None
+        );
+        assert_eq!(
+            presets["md"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            None
+        );
+        assert_eq!(
+            presets["lg"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            None
+        );
+    }
+
+    #[test]
+    fn default_claude_presets_with_legacy_thinking_map_to_high_effort() {
+        let presets = default_claude_presets(Some(31999));
+        assert_eq!(
+            presets["sm"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            None
+        ); // haiku stays default
+        assert_eq!(
+            presets["md"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            presets["lg"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            Some("high".to_string())
+        );
+        // The legacy budget is mapped to effort, never stored as a token count.
     }
 
     #[test]
     fn default_codex_presets_have_reasoning_effort() {
         let presets = default_codex_presets();
         assert_eq!(presets["sm"].model.as_str(), Model::GPT_5_4_MINI);
-        assert_eq!(presets["sm"].reasoning_effort, Some("low".to_string()));
-        assert_eq!(presets["md"].reasoning_effort, Some("medium".to_string()));
-        assert_eq!(presets["lg"].reasoning_effort, Some("high".to_string()));
-        // Codex presets should not have max_thinking_tokens
-        assert_eq!(presets["sm"].max_thinking_tokens, None);
+        assert_eq!(
+            presets["sm"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            Some("low".to_string())
+        );
+        assert_eq!(
+            presets["md"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            Some("medium".to_string())
+        );
+        assert_eq!(
+            presets["lg"]
+                .options
+                .get("reasoningEffort")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string),
+            Some("high".to_string())
+        );
+    }
+
+    /// Config whose active backend is codex, with an extra single-provider tier
+    /// `big` defined only on claude.
+    fn single_provider_config() -> PresetsConfig {
+        let mut config = default_presets_config(Some(31999));
+        config.active_backend = "codex".to_string();
+        config.tiers.push("big".to_string());
+        config.backends.get_mut("claude").unwrap().insert(
+            "big".to_string(),
+            Preset {
+                model: Model::new(Model::OPUS),
+                options: HashMap::new(),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn single_provider_tier_pins_backend_ignoring_active() {
+        // active backend is codex, but 'big' is defined only on claude.
+        let config = single_provider_config();
+        let resolved = resolve_preset("big", &config).unwrap();
+        assert_eq!(resolved.backend, "claude");
+        assert_eq!(resolved.model.as_str(), "opus");
+    }
+
+    #[test]
+    fn single_provider_tier_pins_backend_ignoring_override() {
+        let config = single_provider_config();
+        // An override pointing at codex is a no-op for a single-provider tier.
+        let (selection, _) =
+            resolve_runtime_selection(Some("big"), Some("codex"), &config).unwrap();
+        assert_eq!(selection.backend, "claude");
+        assert_eq!(selection.model.as_str(), "opus");
+    }
+
+    #[test]
+    fn single_provider_tier_pins_via_agent_snapshot_seed_override() {
+        let config = single_provider_config();
+        let mut file_agent = make_test_agent(Some("big"));
+        file_agent.backend_preference = Some("codex".to_string());
+        // Even an execution backend override pointing at codex is ignored.
+        let snapshot = resolve_agent_snapshot(
+            &file_agent,
+            Some(&LaunchSelectionOverride::Backend("codex".to_string())),
+            &config,
+        )
+        .unwrap();
+        let selection = snapshot.selection.as_ref().unwrap();
+        assert_eq!(selection.backend, "claude");
+        assert_eq!(selection.model.as_str(), "opus");
+    }
+
+    #[test]
+    fn multi_provider_tier_override_preferred_active_priority() {
+        // active claude; sm/md/lg defined on both claude and codex.
+        let config = test_config();
+        // override wins among defined providers.
+        assert_eq!(
+            resolve_tier_backend("md", Some("codex"), Some("claude"), &config).unwrap(),
+            "codex"
+        );
+        // no override: preferred wins.
+        assert_eq!(
+            resolve_tier_backend("md", None, Some("codex"), &config).unwrap(),
+            "codex"
+        );
+        // neither: active backend.
+        assert_eq!(
+            resolve_tier_backend("md", None, None, &config).unwrap(),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn multi_provider_nonmatching_override_falls_to_preferred_then_first() {
+        let config = test_config(); // active claude
+                                    // override not defined; preferred codex is defined → codex.
+        assert_eq!(
+            resolve_tier_backend("md", Some("ghost"), Some("codex"), &config).unwrap(),
+            "codex"
+        );
+        // override not defined; preferred not defined → first defined (active claude).
+        assert_eq!(
+            resolve_tier_backend("md", Some("ghost"), Some("phantom"), &config).unwrap(),
+            "claude"
+        );
+        // override not defined; no preferred → first defined (active claude).
+        assert_eq!(
+            resolve_tier_backend("md", Some("ghost"), None, &config).unwrap(),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn multi_provider_first_defined_excludes_undefined_active() {
+        // active claude no longer defines 'md'; md stays multi-provider via codex + gemini.
+        let mut config = test_config();
+        config.backends.get_mut("claude").unwrap().remove("md");
+        let mut gem = HashMap::new();
+        gem.insert(
+            "md".to_string(),
+            Preset {
+                model: Model::new("gemini-pro"),
+                options: HashMap::new(),
+            },
+        );
+        config.backends.insert("gemini".to_string(), gem);
+
+        // No override/preference, active not among providers → first defined (codex, alpha).
+        assert_eq!(
+            resolve_tier_backend("md", None, None, &config).unwrap(),
+            "codex"
+        );
+        // Override names the (now non-defining) active backend → first defined.
+        assert_eq!(
+            resolve_tier_backend("md", Some("claude"), None, &config).unwrap(),
+            "codex"
+        );
+    }
+
+    #[test]
+    fn existing_default_tiers_resolve_unchanged() {
+        // sm/md/lg are all multi-provider today; resolution must be identical to before.
+        let config = test_config();
+        assert_eq!(
+            resolve_preset("sm", &config).unwrap().model.as_str(),
+            "haiku"
+        );
+        assert_eq!(
+            resolve_preset("md", &config).unwrap().model.as_str(),
+            "sonnet"
+        );
+        assert_eq!(
+            resolve_preset("lg", &config).unwrap().model.as_str(),
+            "opus"
+        );
+        assert_eq!(
+            resolve_preset("codex/sm", &config).unwrap().model.as_str(),
+            Model::GPT_5_4_MINI
+        );
+        assert_eq!(
+            resolve_preset("codex/lg", &config).unwrap().model.as_str(),
+            "gpt-5.5"
+        );
+    }
+
+    #[test]
+    fn no_unknown_tier_error_for_defined_tier() {
+        let config = test_config();
+        // Every defined tier resolves with any backend prefix — defined or not.
+        for tier in ["sm", "md", "lg"] {
+            assert!(resolve_preset(tier, &config).is_ok());
+            assert!(resolve_preset(&format!("codex/{}", tier), &config).is_ok());
+            assert!(resolve_preset(&format!("ghost/{}", tier), &config).is_ok());
+            assert!(resolve_runtime_selection(Some(tier), Some("ghost"), &config).is_ok());
+        }
+        // A genuinely undefined tier name still errors.
+        assert!(resolve_preset("xl", &config).is_err());
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TierResolutionCase {
+        name: String,
+        config: PresetsConfig,
+        tier: String,
+        #[serde(default, rename = "override")]
+        override_backend: Option<String>,
+        #[serde(default)]
+        preferred: Option<String>,
+        expected: TierResolutionExpected,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TierResolutionExpected {
+        backend: String,
+        model: String,
+    }
+
+    #[test]
+    fn shared_tier_resolution_fixture() {
+        let cases: Vec<TierResolutionCase> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../test-fixtures/tier-resolution.json"
+        )))
+        .unwrap();
+
+        for case in cases {
+            let backend = resolve_tier_backend(
+                &case.tier,
+                case.override_backend.as_deref(),
+                case.preferred.as_deref(),
+                &case.config,
+            )
+            .unwrap_or_else(|| panic!("{}: expected backend", case.name));
+            assert_eq!(backend, case.expected.backend, "{}", case.name);
+            let model = case
+                .config
+                .backends
+                .get(&backend)
+                .and_then(|tiers| tiers.get(&case.tier))
+                .map(|preset| preset.model.as_str());
+            assert_eq!(model, Some(case.expected.model.as_str()), "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn undefined_tier_is_loud_not_a_model_name_fallback() {
+        // A custom 'xl' tier that is NOT defined in settings must error with a
+        // descriptive message — never silently become Model::new("xl").
+        let config = test_config();
+        let err = resolve_runtime_selection(Some("xl"), None, &config).unwrap_err();
+        assert!(
+            err.contains("xl"),
+            "error should name the unresolved token: {err}"
+        );
+        let file_agent = make_test_agent(Some("xl"));
+        assert!(resolve_agent_snapshot(&file_agent, None, &config).is_err());
+    }
+
+    #[test]
+    fn custom_tier_resolves_to_one_atomic_selection() {
+        // A custom 'xl' tier defined in settings resolves to one selection whose
+        // backend serves its model.
+        let mut config = test_config();
+        config.tiers.push("xl".to_string());
+        config.backends.get_mut("claude").unwrap().insert(
+            "xl".to_string(),
+            Preset {
+                model: Model::new("opus-xl"),
+                options: HashMap::new(),
+            },
+        );
+        let (selection, _) = resolve_runtime_selection(Some("xl"), None, &config).unwrap();
+        assert_eq!(selection.backend, "claude");
+        assert_eq!(selection.model.as_str(), "opus-xl");
+        // The backend serves the model per the active config (atomicity).
+        assert_eq!(
+            config.backends[&selection.backend]["xl"].model.as_str(),
+            selection.model.as_str()
+        );
+    }
+
+    #[test]
+    fn provenance_reports_each_decision_level() {
+        let config = test_config();
+        // Execution override (override_backend supplied).
+        assert_eq!(
+            resolve_selection_with_provenance(Some("md"), Some("codex"), None, &config)
+                .unwrap()
+                .source,
+            ResolutionSource::ExecutionOverride
+        );
+        // Agent default (preferred_backend supplied, no override).
+        assert_eq!(
+            resolve_selection_with_provenance(Some("md"), None, Some("codex"), &config)
+                .unwrap()
+                .source,
+            ResolutionSource::AgentDefault
+        );
+        // Active backend (multi-provider tier, neither override nor preference).
+        assert_eq!(
+            resolve_selection_with_provenance(Some("md"), None, None, &config)
+                .unwrap()
+                .source,
+            ResolutionSource::ActiveBackend
+        );
+        // Tier default (single-provider tier pins the backend).
+        let single = single_provider_config();
+        assert_eq!(
+            resolve_selection_with_provenance(Some("big"), None, None, &single)
+                .unwrap()
+                .source,
+            ResolutionSource::TierDefault
+        );
+        // Explicit model (concrete model + explicit backend).
+        assert_eq!(
+            resolve_selection_with_provenance(Some("my-model"), Some("custom"), None, &config)
+                .unwrap()
+                .source,
+            ResolutionSource::ExplicitModel
+        );
     }
 
     fn make_test_agent(tier: Option<&str>) -> FileAgent {
@@ -609,8 +1276,7 @@ mod tests {
             prompt: "You are a test agent.".to_string(),
             tools: vec!["Read".to_string()],
             tier: tier.map(Model::new),
-            approval_policy: None,
-            filesystem_scope: None,
+            fence: None,
             disallowed_tools: None,
             skills: None,
             hooks: None,

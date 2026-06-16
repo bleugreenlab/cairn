@@ -4,7 +4,7 @@
 //! executing side effects inline. The effect loop in `run.rs` drives a
 //! reduce→execute→reduce cycle until quiescent:
 //!
-//! - **Core effects** (DAG advancement, lifecycle messages, manager wake)
+//! - **Core effects** (DAG advancement, lifecycle messages)
 //!   are handled by the loop directly.
 //! - **Host effects** (process spawn, worktree creation, shell commands)
 //!   are dispatched to an `EffectExecutor` trait implemented by each host.

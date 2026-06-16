@@ -4,28 +4,184 @@
 //! plus a factory trait for creating PTY pairs in a testable way.
 
 use super::process::ChildProcess;
+use super::pty_osc::Osc133Event;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 pub type SharedInlineChild = Arc<Mutex<Box<dyn ChildProcess>>>;
 
+/// Per-session record of the most recent OSC 133 command lifecycle.
+///
+/// Folds the `C` (command start) / `D` (command end, with exit code) markers
+/// into a single shared object: whether a command is currently running, the
+/// exit code of the last finished command, and its wall-clock duration. The
+/// markers carry no timestamps, so duration is measured on the backend as the
+/// elapsed time between observing `C` and `D`. One `apply` call centralizes the
+/// transition that both interactive read loops drive.
+#[derive(Debug, Default)]
+pub struct CommandState {
+    /// True while a command runs (between `C` and `D`), false at the prompt.
+    pub busy: bool,
+    /// Exit code of the most recently finished command, if any has finished.
+    pub last_exit_code: Option<i32>,
+    /// Wall-clock duration of the most recently finished command, in ms.
+    pub last_duration_ms: Option<u64>,
+    /// When the in-flight command started, used to compute `last_duration_ms`.
+    started_at: Option<std::time::Instant>,
+}
+
+impl CommandState {
+    /// Apply an OSC 133 transition; returns `(busy, exit_code, duration_ms)` to
+    /// emit on the `pty-command-state` event. `exit_code`/`duration_ms` are only
+    /// `Some` on the command-end (`busy:false`) transition.
+    pub fn apply(&mut self, event: Osc133Event) -> (bool, Option<i32>, Option<u64>) {
+        match event {
+            Osc133Event::CommandStart => {
+                self.busy = true;
+                self.started_at = Some(std::time::Instant::now());
+                (true, None, None)
+            }
+            Osc133Event::CommandEnd { exit } => {
+                self.busy = false;
+                self.last_exit_code = Some(exit);
+                let dur = self
+                    .started_at
+                    .take()
+                    .map(|t| t.elapsed().as_millis() as u64);
+                self.last_duration_ms = dur;
+                (false, Some(exit), dur)
+            }
+        }
+    }
+}
+
 // ============================================================================
 // PtyState — Runtime PTY session tracking (shared by Tauri + cairn-server)
 // ============================================================================
 
-/// A single PTY session
+/// A running process handle backing a terminal session.
+///
+/// Abstracts over the two process kinds that can live in `pty_state.sessions`:
+/// a `portable_pty::Child` (interactive PTY terminals) and an inline
+/// `ChildProcess` promoted from a timed-out `run` command. This keeps one
+/// session registry and one buffer-read path for both attachment modes.
+pub trait TerminalChild: Send + Sync {
+    /// SIGKILL the process (group, for inline children).
+    fn kill(&mut self) -> std::io::Result<()>;
+    /// Block until the process exits, reaping it.
+    fn wait(&mut self) -> std::io::Result<()>;
+    /// Return the exit code if the process has already exited (non-blocking).
+    fn try_wait_exit(&mut self) -> Option<i32>;
+    /// The OS process id, if known.
+    fn process_id(&self) -> Option<u32>;
+}
+
+/// `TerminalChild` over a `portable_pty::Child` (interactive PTY terminals).
+pub struct PortableTerminalChild {
+    child: Box<dyn Child + Send + Sync>,
+}
+
+impl PortableTerminalChild {
+    pub fn new(child: Box<dyn Child + Send + Sync>) -> Self {
+        Self { child }
+    }
+}
+
+impl TerminalChild for PortableTerminalChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        self.child.kill()
+    }
+    fn wait(&mut self) -> std::io::Result<()> {
+        self.child.wait().map(|_| ())
+    }
+    fn try_wait_exit(&mut self) -> Option<i32> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(status.exit_code() as i32),
+            _ => None,
+        }
+    }
+    fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+}
+
+/// `TerminalChild` over an inline `ChildProcess` promoted from a `run` command.
+///
+/// `ChildProcess` exposes no blocking wait, so `wait` polls `try_wait`. `kill`
+/// already SIGKILLs the whole process group (see `RealChildProcess::kill`).
+pub struct InlineTerminalChild {
+    inner: SharedInlineChild,
+}
+
+impl InlineTerminalChild {
+    pub fn new(inner: SharedInlineChild) -> Self {
+        Self { inner }
+    }
+}
+
+impl TerminalChild for InlineTerminalChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self.inner.lock() {
+            Ok(mut c) => c.kill(),
+            Err(_) => Ok(()),
+        }
+    }
+    fn wait(&mut self) -> std::io::Result<()> {
+        loop {
+            let exited = match self.inner.lock() {
+                Ok(mut c) => matches!(c.try_wait(), Ok(Some(_))),
+                Err(_) => return Ok(()),
+            };
+            if exited {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    fn try_wait_exit(&mut self) -> Option<i32> {
+        match self.inner.lock() {
+            Ok(mut c) => match c.try_wait() {
+                Ok(Some(status)) => Some(status.code().unwrap_or(0)),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+    fn process_id(&self) -> Option<u32> {
+        self.inner.lock().ok().map(|c| c.id())
+    }
+}
+
+/// A single terminal session.
+///
+/// Two attachment modes share this type: a PTY-backed interactive terminal
+/// (`master`/`writer` present) and a promoted pipe-backed run command
+/// (`master`/`writer` `None`). Buffer reads and exit tracking work identically
+/// for both; input and resize are unavailable-but-harmless for promoted ones.
 pub struct PtySession {
-    pub master: Box<dyn MasterPty + Send>,
-    pub writer: Box<dyn Write + Send>,
-    /// Child process handle for cleanup
-    pub child: Box<dyn Child + Send + Sync>,
+    /// PTY master for resize/foreground queries. `None` for promoted runs.
+    pub master: Option<Box<dyn MasterPty + Send>>,
+    /// PTY writer for input. `None` for promoted runs (no stdin attachment).
+    pub writer: Option<Box<dyn Write + Send>>,
+    /// Process handle for cleanup and exit tracking.
+    pub child: Box<dyn TerminalChild>,
     /// Output buffer for late attachment (agent terminals only)
     pub output_buffer: Option<Arc<Mutex<VecDeque<u8>>>>,
     /// Whether this session was spawned by an agent (vs user)
     #[allow(dead_code)]
     pub is_agent_spawned: bool,
+    /// Wall-clock time of the most recent output chunk, used for the "age of
+    /// last output" signal in agent terminal status reads. `None` for user
+    /// terminals, which are not polled through the resource read path.
+    pub last_output_at: Option<Arc<Mutex<std::time::SystemTime>>>,
+    /// Per-command record (busy + last exit code + last duration), driven by OSC
+    /// 133 `C`/`D` markers parsed in the interactive read loops. `None` for
+    /// agent/promoted sessions, which are non-interactive and detect completion
+    /// via EOF rather than prompt markers.
+    pub command_state: Option<Arc<Mutex<CommandState>>>,
 }
 
 /// Manages all active PTY sessions
@@ -83,6 +239,28 @@ impl PtyState {
 
 /// Maximum output buffer size (64KB) - same as commands.rs
 pub const MAX_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Ensure terminal input submits as a line: append `\n` unless already present.
+pub fn ensure_submitted_line(content: &str) -> Cow<'_, str> {
+    if content.ends_with('\n') {
+        Cow::Borrowed(content)
+    } else {
+        Cow::Owned(format!("{content}\n"))
+    }
+}
+
+/// Submit `command` so the shell exits with the command's status: EOF then
+/// coincides with command completion and the shell's own exit code equals the
+/// command's. The trailing newline separates the command from `exit $?` so a
+/// multiline command completes first; nothing between them resets `$?`, and
+/// `exit $?` preserves an interrupt's `128+signal` code through the shell.
+///
+/// Used only for agent-monitored terminals, whose shell is a one-shot host for
+/// the command — not a post-command scratch shell. User scratch terminals keep
+/// `ensure_submitted_line` so their shell stays interactive.
+pub fn submit_command_exiting_shell(command: &str) -> String {
+    format!("{}\nexit $?\n", command.trim_end_matches('\n'))
+}
 
 // ============================================================================
 // PtyFactory Trait - Enables testable PTY creation
@@ -244,6 +422,38 @@ mod tests {
     use std::io::Cursor;
 
     // =========================================================================
+    // ensure_submitted_line tests
+    // =========================================================================
+
+    #[test]
+    fn ensure_submitted_line_appends_missing_newline() {
+        assert_eq!(ensure_submitted_line("rs"), "rs\n");
+    }
+
+    #[test]
+    fn ensure_submitted_line_keeps_existing_newline() {
+        let content = "rs\n";
+        assert!(matches!(
+            ensure_submitted_line(content),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert_eq!(ensure_submitted_line(content), content);
+    }
+
+    #[test]
+    fn ensure_submitted_line_submits_empty_line() {
+        assert_eq!(ensure_submitted_line(""), "\n");
+    }
+
+    #[test]
+    fn ensure_submitted_line_appends_after_multiline_content() {
+        assert_eq!(
+            ensure_submitted_line("echo one\necho two"),
+            "echo one\necho two\n"
+        );
+    }
+
+    // =========================================================================
     // update_output_buffer tests
     // =========================================================================
 
@@ -308,6 +518,86 @@ mod tests {
         update_output_buffer(&mut buffer, b"hello", 100);
         update_output_buffer(&mut buffer, b"", 100);
         assert_eq!(buffer.len(), 5);
+    }
+
+    // =========================================================================
+    // submit_command_exiting_shell tests
+    // =========================================================================
+
+    #[test]
+    fn submit_command_exiting_shell_appends_exit() {
+        assert_eq!(
+            submit_command_exiting_shell("echo hi"),
+            "echo hi\nexit $?\n"
+        );
+    }
+
+    #[test]
+    fn submit_command_exiting_shell_empty_command() {
+        // An empty command runs nothing; the shell exits 0.
+        assert_eq!(submit_command_exiting_shell(""), "\nexit $?\n");
+    }
+
+    #[test]
+    fn submit_command_exiting_shell_trims_trailing_newlines() {
+        // A single `exit $?` is appended regardless of trailing newlines on the
+        // command, so `$?` reflects the command (not a blank line).
+        assert_eq!(
+            submit_command_exiting_shell("make build\n"),
+            "make build\nexit $?\n"
+        );
+        assert_eq!(
+            submit_command_exiting_shell("make build\n\n"),
+            "make build\nexit $?\n"
+        );
+    }
+
+    #[test]
+    fn submit_command_exiting_shell_multiline_command() {
+        // The command's own newlines are preserved; `exit $?` follows the last
+        // line so it carries that line's status.
+        assert_eq!(
+            submit_command_exiting_shell("a=1\necho $a"),
+            "a=1\necho $a\nexit $?\n"
+        );
+    }
+
+    // =========================================================================
+    // TerminalChild tests
+    // =========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn inline_terminal_child_normalizes_exit_code() {
+        use crate::services::{ProcessSpawner, RealProcessSpawner, SpawnConfig};
+        let child = RealProcessSpawner
+            .spawn(SpawnConfig::new("/bin/sh").args(["-c".to_string(), "exit 3".to_string()]))
+            .unwrap();
+        let shared = Arc::new(Mutex::new(child));
+        let mut tc = InlineTerminalChild::new(shared);
+        tc.wait().unwrap();
+        assert_eq!(tc.try_wait_exit(), Some(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_terminal_child_reports_exit_code() {
+        let pair = RealPtyFactory
+            .create_pty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-c");
+        cmd.arg("exit 7");
+        let components = pair.spawn_and_split(cmd).unwrap();
+        let mut tc = PortableTerminalChild::new(components.child);
+        assert!(tc.process_id().is_some());
+        tc.wait().unwrap();
+        assert_eq!(tc.try_wait_exit(), Some(7));
     }
 
     // =========================================================================
@@ -414,6 +704,48 @@ mod tests {
         );
 
         assert!(exit_called);
+    }
+
+    // =========================================================================
+    // CommandState::apply tests
+    // =========================================================================
+
+    #[test]
+    fn command_state_start_sets_busy_no_exit() {
+        let mut state = CommandState::default();
+        let (busy, exit, dur) = state.apply(Osc133Event::CommandStart);
+        assert!(busy);
+        assert_eq!(exit, None);
+        assert_eq!(dur, None);
+        assert!(state.busy);
+        assert!(state.last_exit_code.is_none());
+    }
+
+    #[test]
+    fn command_state_end_clears_busy_and_records_exit_and_duration() {
+        let mut state = CommandState::default();
+        state.apply(Osc133Event::CommandStart);
+        let (busy, exit, dur) = state.apply(Osc133Event::CommandEnd { exit: 3 });
+        assert!(!busy);
+        assert_eq!(exit, Some(3));
+        // A start preceded the end, so a duration is recorded (>= 0ms).
+        assert!(dur.is_some());
+        assert!(!state.busy);
+        assert_eq!(state.last_exit_code, Some(3));
+        assert_eq!(state.last_duration_ms, dur);
+    }
+
+    #[test]
+    fn command_state_end_without_start_has_no_duration() {
+        // A `D` with no preceding `C` (e.g. reattach mid-prompt) records the exit
+        // code but cannot compute a duration.
+        let mut state = CommandState::default();
+        let (busy, exit, dur) = state.apply(Osc133Event::CommandEnd { exit: 0 });
+        assert!(!busy);
+        assert_eq!(exit, Some(0));
+        assert_eq!(dur, None);
+        assert_eq!(state.last_exit_code, Some(0));
+        assert_eq!(state.last_duration_ms, None);
     }
 
     // =========================================================================

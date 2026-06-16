@@ -1,64 +1,146 @@
-//! Integration tests for the transitions module.
-//!
-//! These tests exercise cascade_failure and the full transition_job cascade
-//! with realistic DAG setups (execution + snapshot + jobs).
+//! Integration tests for job outcome transitions and failure cascades.
 
 mod common;
 
-use cairn_core::internal::schema::{executions, jobs};
-use cairn_core::internal::services::testing::CapturingEmitter;
-use cairn_core::models::JobStatus;
-use diesel::prelude::*;
-use serde_json::json;
+use std::sync::Arc;
 
-fn insert_execution_with_snapshot(
-    conn: &mut diesel::sqlite::SqliteConnection,
+use cairn_core::internal::db::DbState;
+use cairn_core::internal::orchestrator::Orchestrator;
+use cairn_core::internal::services::testing::{CapturingEmitter, TestServicesBuilder};
+use cairn_core::internal::services::EventEmitter;
+use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use serde_json::{json, Value};
+use tempfile::{tempdir, TempDir};
+use turso::params;
+
+#[derive(Clone)]
+struct SharedEmitter(Arc<CapturingEmitter>);
+
+impl EventEmitter for SharedEmitter {
+    fn emit(&self, event: &str, payload: Value) -> Result<(), String> {
+        self.0.emit(event, payload)
+    }
+
+    fn emit_empty(&self, event: &str) -> Result<(), String> {
+        self.0.emit_empty(event)
+    }
+}
+
+struct TransitionContext {
+    orch: Orchestrator,
+    db: Arc<LocalDb>,
+    emitter: Arc<CapturingEmitter>,
+    _db_temp: TempDir,
+    _temp: TempDir,
+}
+
+async fn transition_context() -> TransitionContext {
+    let temp = tempdir().unwrap();
+    let (db_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(db.clone(), search_index));
+    let emitter = Arc::new(CapturingEmitter::new());
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_emitter(SharedEmitter(emitter.clone()))
+            .build(),
+    );
+    let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+
+    TransitionContext {
+        orch,
+        db,
+        emitter,
+        _db_temp: db_temp,
+        _temp: temp,
+    }
+}
+
+async fn insert_execution_with_snapshot(
+    db: &LocalDb,
     exec_id: &str,
     issue_id: Option<&str>,
-    snapshot: &serde_json::Value,
+    snapshot: &Value,
 ) {
-    let now = chrono::Utc::now().timestamp() as i32;
-    let snapshot_str = serde_json::to_string(snapshot).unwrap();
-    diesel::sql_query(
-        "INSERT INTO executions (id, recipe_id, issue_id, status, started_at, seq, snapshot) \
-         VALUES (?, 'recipe-1', ?, 'running', ?, 1, ?)",
+    let exec_id = exec_id.to_string();
+    let issue_id = issue_id.map(str::to_string);
+    let snapshot = serde_json::to_string(snapshot).unwrap();
+    let now = chrono::Utc::now().timestamp();
+
+    db.execute(
+        "
+        INSERT INTO executions (
+            id, recipe_id, issue_id, status, started_at, seq, snapshot
+        )
+        VALUES (?1, 'recipe-1', ?2, 'running', ?3, 1, ?4)
+        ",
+        params![
+            exec_id.as_str(),
+            issue_id.as_deref(),
+            now,
+            snapshot.as_str()
+        ],
     )
-    .bind::<diesel::sql_types::Text, _>(exec_id)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(issue_id)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Text, _>(&snapshot_str)
-    .execute(conn)
+    .await
     .unwrap();
 }
 
-fn insert_job(
-    conn: &mut diesel::sqlite::SqliteConnection,
+async fn insert_issue(db: &LocalDb, issue_id: &str, project_id: &str) {
+    let issue_id = issue_id.to_string();
+    let project_id = project_id.to_string();
+    let now = chrono::Utc::now().timestamp();
+
+    db.execute(
+        "
+        INSERT INTO issues (
+            id, project_id, number, title, status, priority, created_at, updated_at
+        )
+        VALUES (?1, ?2, 1, 'Test', 'active', 0, ?3, ?4)
+        ",
+        params![issue_id.as_str(), project_id.as_str(), now, now],
+    )
+    .await
+    .unwrap();
+}
+
+async fn insert_job(
+    db: &LocalDb,
     id: &str,
     status: &str,
     project_id: &str,
-    execution_id: &str,
-    recipe_node_id: &str,
+    execution_id: Option<&str>,
+    recipe_node_id: Option<&str>,
 ) {
-    let now = chrono::Utc::now().timestamp() as i32;
-    diesel::sql_query(
-        "INSERT INTO jobs (id, execution_id, recipe_node_id, status, project_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    let id = id.to_string();
+    let status = status.to_string();
+    let project_id = project_id.to_string();
+    let execution_id = execution_id.map(str::to_string);
+    let recipe_node_id = recipe_node_id.map(str::to_string);
+    let now = chrono::Utc::now().timestamp();
+
+    db.execute(
+        "
+        INSERT INTO jobs (
+            id, execution_id, recipe_node_id, status, project_id, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ",
+        params![
+            id.as_str(),
+            execution_id.as_deref(),
+            recipe_node_id.as_deref(),
+            status.as_str(),
+            project_id.as_str(),
+            now,
+            now
+        ],
     )
-    .bind::<diesel::sql_types::Text, _>(id)
-    .bind::<diesel::sql_types::Text, _>(execution_id)
-    .bind::<diesel::sql_types::Text, _>(recipe_node_id)
-    .bind::<diesel::sql_types::Text, _>(status)
-    .bind::<diesel::sql_types::Text, _>(project_id)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(conn)
+    .await
     .unwrap();
 }
 
-/// Build a minimal execution snapshot with the given edges.
-/// Nodes are auto-generated from unique node IDs in edges.
-fn build_snapshot(edges: Vec<(&str, &str, &str)>) -> serde_json::Value {
-    // Collect unique node IDs
+fn build_snapshot(edges: Vec<(&str, &str, &str)>) -> Value {
     let mut node_ids = std::collections::HashSet::new();
     let mut edge_list = Vec::new();
 
@@ -66,7 +148,7 @@ fn build_snapshot(edges: Vec<(&str, &str, &str)>) -> serde_json::Value {
         node_ids.insert(*source);
         node_ids.insert(*target);
         edge_list.push(json!({
-            "id": format!("edge-{}", id_suffix),
+            "id": format!("edge-{id_suffix}"),
             "edgeType": "control",
             "sourceNodeId": source,
             "sourceHandle": "out",
@@ -75,17 +157,15 @@ fn build_snapshot(edges: Vec<(&str, &str, &str)>) -> serde_json::Value {
         }));
     }
 
-    let nodes: Vec<serde_json::Value> = node_ids
+    let nodes: Vec<Value> = node_ids
         .into_iter()
-        .map(|nid| {
+        .map(|node_id| {
             json!({
-                "id": nid,
-                "name": nid,
+                "id": node_id,
+                "name": node_id,
                 "nodeType": "agent",
                 "position": { "x": 0.0, "y": 0.0 },
-                "agentConfig": {
-                    "agentConfigId": "test-agent"
-                }
+                "agentConfig": { "agentConfigId": "test-agent" }
             })
         })
         .collect();
@@ -95,7 +175,6 @@ fn build_snapshot(edges: Vec<(&str, &str, &str)>) -> serde_json::Value {
             "id": "recipe-1",
             "name": "test-recipe",
             "trigger": "issue",
-            "context": "issue",
             "nodes": nodes,
             "edges": edge_list
         },
@@ -110,528 +189,477 @@ fn build_snapshot(edges: Vec<(&str, &str, &str)>) -> serde_json::Value {
     })
 }
 
-// === cascade_failure tests ===
+/// Fail a job the way the runtime now does: record the failure as a turn fact,
+/// then let the projection derive Failed and cascade to downstream jobs.
+fn apply_failure(orch: &Orchestrator, job_id: &str) {
+    cairn_core::internal::execution::advancement::mark_job_failed(orch, job_id, "test failure")
+        .expect("mark_job_failed");
+}
 
-/// DAG: A → B → C (linear chain)
-/// Fail A → B and C should be cascade-failed.
-#[test]
-fn test_cascade_failure_linear_chain() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCFL");
-    let emitter = CapturingEmitter::new();
+/// Attach a live (running) turn to a job so the projection derives Running.
+async fn insert_running_turn(db: &LocalDb, turn_id: &str, job_id: &str) {
+    let turn_id = turn_id.to_string();
+    let job_id = job_id.to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.write(|conn| {
+        let turn_id = turn_id.clone();
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason,
+                                    created_at, started_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, 'running', 'initial', ?4, ?4, ?4)",
+                params![
+                    turn_id.as_str(),
+                    format!("session-{job_id}").as_str(),
+                    job_id.as_str(),
+                    now
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
 
+/// Attach an interrupted turn to a job — the state a user-initiated stop leaves
+/// the latest turn in. An interrupt is a pause, not a failure.
+async fn insert_interrupted_turn(db: &LocalDb, turn_id: &str, job_id: &str) {
+    let turn_id = turn_id.to_string();
+    let job_id = job_id.to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.write(|conn| {
+        let turn_id = turn_id.clone();
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason,
+                                    created_at, started_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, 'interrupted', 'initial', ?4, ?4, ?4)",
+                params![
+                    turn_id.as_str(),
+                    format!("session-{job_id}").as_str(),
+                    job_id.as_str(),
+                    now
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn status(db: &LocalDb, table: &'static str, id: &str) -> String {
+    let id = id.to_string();
+    let sql = format!("SELECT status FROM {table} WHERE id = ?1");
+    db.read(|conn| {
+        let id = id.clone();
+        let sql = sql.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(&sql, params![id.as_str()]).await?;
+            let row = rows.next().await?.expect("status row");
+            row.text(0)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+async fn completed_at(db: &LocalDb, job_id: &str) -> Option<i64> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT completed_at FROM jobs WHERE id = ?1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let row = rows.next().await?.expect("job row");
+            row.opt_i64(0)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cascade_failure_linear_chain() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCFL").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-b", "node-c")]);
-    insert_execution_with_snapshot(&mut conn, "exec-cascade-1", None, &snapshot);
-
-    // A is running, B and C are pending
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-1", None, &snapshot).await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-a",
         "running",
         &project_id,
-        "exec-cascade-1",
-        "node-a",
-    );
+        Some("exec-cascade-1"),
+        Some("node-a"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-b",
         "pending",
         &project_id,
-        "exec-cascade-1",
-        "node-b",
-    );
+        Some("exec-cascade-1"),
+        Some("node-b"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-c",
         "pending",
         &project_id,
-        "exec-cascade-1",
-        "node-c",
-    );
-
-    // Fail job A — should cascade to B and C
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-a",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
+        Some("exec-cascade-1"),
+        Some("node-c"),
     )
-    .unwrap();
+    .await;
 
-    let b_status: String = jobs::table
-        .find("job-b")
-        .select(jobs::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(b_status, "failed", "downstream B should be cascade-failed");
+    apply_failure(&ctx.orch, "job-a");
 
-    let c_status: String = jobs::table
-        .find("job-c")
-        .select(jobs::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(
-        c_status, "failed",
-        "transitive downstream C should be cascade-failed"
-    );
+    assert_eq!(status(&ctx.db, "jobs", "job-b").await, "failed");
+    assert_eq!(status(&ctx.db, "jobs", "job-c").await, "failed");
 }
 
-/// DAG: A → B, A → C (fan-out)
-/// Fail A → both B and C should be cascade-failed.
-#[test]
-fn test_cascade_failure_fan_out() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCFO");
-    let emitter = CapturingEmitter::new();
-
-    let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-a", "node-c")]);
-    insert_execution_with_snapshot(&mut conn, "exec-cascade-2", None, &snapshot);
-
+#[tokio::test]
+async fn interrupt_does_not_cascade_to_downstream() {
+    // Regression: interrupting an upstream job (e.g. stopping a planner mid-run)
+    // must NOT fail it or cascade to downstream builder/reviewer jobs. An
+    // interrupt is a resumable pause — downstream stay pending so that continuing
+    // the job and approving its plan can still start them.
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TINT").await;
+    let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-b", "node-c")]);
+    insert_execution_with_snapshot(&ctx.db, "exec-interrupt-1", None, &snapshot).await;
     insert_job(
-        &mut conn,
+        &ctx.db,
+        "job-ia",
+        "running",
+        &project_id,
+        Some("exec-interrupt-1"),
+        Some("node-a"),
+    )
+    .await;
+    insert_job(
+        &ctx.db,
+        "job-ib",
+        "pending",
+        &project_id,
+        Some("exec-interrupt-1"),
+        Some("node-b"),
+    )
+    .await;
+    insert_job(
+        &ctx.db,
+        "job-ic",
+        "pending",
+        &project_id,
+        Some("exec-interrupt-1"),
+        Some("node-c"),
+    )
+    .await;
+
+    // The upstream job's latest turn was interrupted, then recompute runs.
+    insert_interrupted_turn(&ctx.db, "turn-ia", "job-ia").await;
+    cairn_core::internal::execution::advancement::recompute_execution_jobs(
+        &ctx.orch,
+        "exec-interrupt-1",
+    )
+    .expect("recompute");
+
+    // Upstream is not failed (resumable), and the interrupt never cascaded.
+    assert_ne!(status(&ctx.db, "jobs", "job-ia").await, "failed");
+    assert_eq!(status(&ctx.db, "jobs", "job-ib").await, "pending");
+    assert_eq!(status(&ctx.db, "jobs", "job-ic").await, "pending");
+}
+
+#[tokio::test]
+async fn cascade_failure_fan_out() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCFO").await;
+    let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-a", "node-c")]);
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-2", None, &snapshot).await;
+    insert_job(
+        &ctx.db,
         "job-a2",
         "running",
         &project_id,
-        "exec-cascade-2",
-        "node-a",
-    );
+        Some("exec-cascade-2"),
+        Some("node-a"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-b2",
         "pending",
         &project_id,
-        "exec-cascade-2",
-        "node-b",
-    );
-    insert_job(
-        &mut conn,
-        "job-c2",
-        "ready",
-        &project_id,
-        "exec-cascade-2",
-        "node-c",
-    );
-
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-a2",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
+        Some("exec-cascade-2"),
+        Some("node-b"),
     )
-    .unwrap();
+    .await;
+    insert_job(
+        &ctx.db,
+        "job-c2",
+        "pending",
+        &project_id,
+        Some("exec-cascade-2"),
+        Some("node-c"),
+    )
+    .await;
 
-    let b_status: String = jobs::table
-        .find("job-b2")
-        .select(jobs::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(b_status, "failed");
+    apply_failure(&ctx.orch, "job-a2");
 
-    let c_status: String = jobs::table
-        .find("job-c2")
-        .select(jobs::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(
-        c_status, "failed",
-        "ready jobs should also be cascade-failed"
-    );
+    assert_eq!(status(&ctx.db, "jobs", "job-b2").await, "failed");
+    assert_eq!(status(&ctx.db, "jobs", "job-c2").await, "failed");
 }
 
-/// DAG: A → C, B → C (fan-in)
-/// Fail A → C should be cascade-failed (even though B could still succeed).
-/// This matches the implementation: downstream of the failed node is failed.
-#[test]
-fn test_cascade_failure_fan_in() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCFI");
-    let emitter = CapturingEmitter::new();
-
+#[tokio::test]
+async fn cascade_failure_fan_in_only_affects_downstream_of_failed_job() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCFI").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-c"), ("2", "node-b", "node-c")]);
-    insert_execution_with_snapshot(&mut conn, "exec-cascade-3", None, &snapshot);
-
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-3", None, &snapshot).await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-a3",
         "running",
         &project_id,
-        "exec-cascade-3",
-        "node-a",
-    );
+        Some("exec-cascade-3"),
+        Some("node-a"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-b3",
         "running",
         &project_id,
-        "exec-cascade-3",
-        "node-b",
-    );
+        Some("exec-cascade-3"),
+        Some("node-b"),
+    )
+    .await;
+    // node-b3 is genuinely running (live turn) and is not downstream of the
+    // failed node-a3, so it must stay Running.
+    insert_running_turn(&ctx.db, "turn-b3", "job-b3").await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-c3",
         "pending",
         &project_id,
-        "exec-cascade-3",
-        "node-c",
-    );
-
-    // Fail A — C is downstream of A, so it gets cascade-failed
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-a3",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
+        Some("exec-cascade-3"),
+        Some("node-c"),
     )
-    .unwrap();
+    .await;
 
-    let c_status: String = jobs::table
-        .find("job-c3")
-        .select(jobs::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(c_status, "failed", "C is downstream of failed A");
+    apply_failure(&ctx.orch, "job-a3");
 
-    // B should be unaffected (not downstream of A)
-    let b_status: String = jobs::table
-        .find("job-b3")
-        .select(jobs::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(b_status, "running", "B is not downstream of A");
+    assert_eq!(status(&ctx.db, "jobs", "job-c3").await, "failed");
+    assert_eq!(status(&ctx.db, "jobs", "job-b3").await, "running");
 }
 
-/// Cascade should only affect pending/ready jobs, not running ones.
-#[test]
-fn test_cascade_failure_skips_running_downstream() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCSR");
-    let emitter = CapturingEmitter::new();
-
+#[tokio::test]
+async fn cascade_failure_skips_running_downstream() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCSR").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
-    insert_execution_with_snapshot(&mut conn, "exec-cascade-4", None, &snapshot);
-
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-4", None, &snapshot).await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-a4",
         "running",
         &project_id,
-        "exec-cascade-4",
-        "node-a",
-    );
+        Some("exec-cascade-4"),
+        Some("node-a"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-b4",
         "running",
         &project_id,
-        "exec-cascade-4",
-        "node-b",
-    );
-
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-a4",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
+        Some("exec-cascade-4"),
+        Some("node-b"),
     )
-    .unwrap();
+    .await;
+    // A genuinely running downstream job has a live turn; the projection keeps it
+    // Running rather than cascade-failing active work.
+    insert_running_turn(&ctx.db, "turn-b4", "job-b4").await;
 
-    // B is already running, cascade should not touch it
-    let b_status: String = jobs::table
-        .find("job-b4")
-        .select(jobs::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(
-        b_status, "running",
-        "running downstream should not be cascade-failed"
-    );
+    apply_failure(&ctx.orch, "job-a4");
+
+    assert_eq!(status(&ctx.db, "jobs", "job-b4").await, "running");
 }
 
-/// Standalone job (no execution_id) — cascade is a no-op.
-#[test]
-fn test_cascade_failure_standalone_job_no_execution() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCSJ");
-    let emitter = CapturingEmitter::new();
-
-    let now = chrono::Utc::now().timestamp() as i32;
-    diesel::sql_query(
-        "INSERT INTO jobs (id, status, project_id, created_at, updated_at) VALUES (?, 'running', ?, ?, ?)",
-    )
-    .bind::<diesel::sql_types::Text, _>("job-standalone")
-    .bind::<diesel::sql_types::Text, _>(&project_id)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(&mut conn)
-    .unwrap();
-
-    // Should succeed without errors (no cascade since no execution)
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-standalone",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
-    )
-    .unwrap();
-}
-
-/// Full cascade: failing a job cascades to downstream, recomputes execution to failed,
-/// and recomputes issue to failed.
-#[test]
-fn test_cascade_failure_recomputes_execution_and_issue() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCRE");
-    let emitter = CapturingEmitter::new();
-
-    let now = chrono::Utc::now().timestamp() as i32;
-
-    // Insert issue
-    diesel::sql_query(
-        "INSERT INTO issues (id, project_id, number, title, status, priority, created_at, updated_at) \
-         VALUES ('issue-cascade', ?, 1, 'Test', 'active', 0, ?, ?)",
-    )
-    .bind::<diesel::sql_types::Text, _>(&project_id)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(&mut conn)
-    .unwrap();
-
-    let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
-    insert_execution_with_snapshot(
-        &mut conn,
-        "exec-cascade-5",
-        Some("issue-cascade"),
-        &snapshot,
-    );
-
+#[tokio::test]
+async fn cascade_failure_standalone_job_no_execution() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCSJ").await;
     insert_job(
-        &mut conn,
+        &ctx.db,
+        "job-standalone",
+        "running",
+        &project_id,
+        None,
+        None,
+    )
+    .await;
+
+    apply_failure(&ctx.orch, "job-standalone");
+
+    assert_eq!(status(&ctx.db, "jobs", "job-standalone").await, "failed");
+}
+
+#[tokio::test]
+async fn cascade_failure_recomputes_execution_and_issue() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCRE").await;
+    insert_issue(&ctx.db, "issue-cascade", &project_id).await;
+    let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-5", Some("issue-cascade"), &snapshot)
+        .await;
+    insert_job(
+        &ctx.db,
         "job-a5",
         "running",
         &project_id,
-        "exec-cascade-5",
-        "node-a",
-    );
+        Some("exec-cascade-5"),
+        Some("node-a"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-b5",
         "pending",
         &project_id,
-        "exec-cascade-5",
-        "node-b",
-    );
-
-    // Fail A → B cascaded, execution becomes failed, issue becomes failed
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-a5",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
+        Some("exec-cascade-5"),
+        Some("node-b"),
     )
-    .unwrap();
+    .await;
 
-    let exec_status: String = executions::table
-        .find("exec-cascade-5")
-        .select(executions::status)
-        .first(&mut conn)
-        .unwrap();
-    assert_eq!(
-        exec_status, "failed",
-        "execution should be failed after all jobs failed"
-    );
+    apply_failure(&ctx.orch, "job-a5");
 
-    let issue_status: String = cairn_core::internal::schema::issues::table
-        .find("issue-cascade")
-        .select(cairn_core::internal::schema::issues::status)
-        .first(&mut conn)
-        .unwrap();
     assert_eq!(
-        issue_status, "failed",
-        "issue should be failed after execution failed"
+        status(&ctx.db, "executions", "exec-cascade-5").await,
+        "failed"
     );
+    assert_eq!(status(&ctx.db, "issues", "issue-cascade").await, "failed");
 }
 
-/// Cascade failure sets completed_at on downstream jobs (via transition_job).
-#[test]
-fn test_cascade_failure_sets_completed_at() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCCA");
-    let emitter = CapturingEmitter::new();
-
+#[tokio::test]
+async fn cascade_failure_sets_completed_at_on_downstream_jobs() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCCA").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
-    insert_execution_with_snapshot(&mut conn, "exec-cascade-ca", None, &snapshot);
-
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-ca", None, &snapshot).await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-ca-a",
         "running",
         &project_id,
-        "exec-cascade-ca",
-        "node-a",
-    );
+        Some("exec-cascade-ca"),
+        Some("node-a"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-ca-b",
         "pending",
         &project_id,
-        "exec-cascade-ca",
-        "node-b",
-    );
-
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-ca-a",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
+        Some("exec-cascade-ca"),
+        Some("node-b"),
     )
-    .unwrap();
+    .await;
 
-    // Cascaded job should have completed_at set (via transition_job, not bulk update)
-    let completed_at: Option<i32> = jobs::table
-        .find("job-ca-b")
-        .select(jobs::completed_at)
-        .first(&mut conn)
-        .unwrap();
-    assert!(
-        completed_at.is_some(),
-        "cascade-failed job should have completed_at set"
-    );
+    apply_failure(&ctx.orch, "job-ca-a");
+
+    assert!(completed_at(&ctx.db, "job-ca-b").await.is_some());
 }
 
-/// Cascade emits db-change events for each downstream job (via transition_job).
-#[test]
-fn test_cascade_failure_emits_db_change_events() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCDE");
-    let emitter = CapturingEmitter::new();
-
+#[tokio::test]
+async fn cascade_failure_emits_core_db_change_events() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCDE").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-b", "node-c")]);
-    insert_execution_with_snapshot(&mut conn, "exec-cascade-ev", None, &snapshot);
-
+    insert_execution_with_snapshot(&ctx.db, "exec-cascade-ev", None, &snapshot).await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-ev-a",
         "running",
         &project_id,
-        "exec-cascade-ev",
-        "node-a",
-    );
+        Some("exec-cascade-ev"),
+        Some("node-a"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-ev-b",
         "pending",
         &project_id,
-        "exec-cascade-ev",
-        "node-b",
-    );
+        Some("exec-cascade-ev"),
+        Some("node-b"),
+    )
+    .await;
     insert_job(
-        &mut conn,
+        &ctx.db,
         "job-ev-c",
         "pending",
         &project_id,
-        "exec-cascade-ev",
-        "node-c",
-    );
-
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-ev-a",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
+        Some("exec-cascade-ev"),
+        Some("node-c"),
     )
-    .unwrap();
+    .await;
 
-    // Should have multiple db-change events (one per transition: A, B via cascade, C via cascade)
-    let db_changes = emitter.events_named("db-change");
-    let job_changes: Vec<_> = db_changes
+    apply_failure(&ctx.orch, "job-ev-a");
+
+    let db_changes = ctx.emitter.events_named("db-change");
+    assert!(db_changes
         .iter()
-        .filter(|p| p.get("table").and_then(|v| v.as_str()) == Some("jobs"))
-        .collect();
-    // A's transition + B's cascade transition + C's cascade transition = 3
-    assert!(
-        job_changes.len() >= 3,
-        "expected at least 3 jobs db-change events, got {}",
-        job_changes.len()
-    );
+        .any(|payload| payload.get("table").and_then(|value| value.as_str()) == Some("jobs")));
+    assert!(db_changes.iter().any(
+        |payload| payload.get("table").and_then(|value| value.as_str()) == Some("executions")
+    ));
+    assert!(db_changes
+        .iter()
+        .any(|payload| payload.get("table").and_then(|value| value.as_str()) == Some("issues")));
 }
 
-/// Diamond pattern: A → B, A → C, B → D, C → D.
-/// Failing A should cascade to B, C, and D without errors.
-#[test]
-fn test_cascade_failure_diamond_pattern() {
-    let mut conn = common::test_conn();
-    let project_id = common::create_test_project(&mut conn, "Test", "TCDP");
-    let emitter = CapturingEmitter::new();
-
+#[tokio::test]
+async fn cascade_failure_diamond_pattern() {
+    let ctx = transition_context().await;
+    let project_id = common::create_project(&ctx.db, "TCDP").await;
     let snapshot = build_snapshot(vec![
         ("1", "node-a", "node-b"),
         ("2", "node-a", "node-c"),
         ("3", "node-b", "node-d"),
         ("4", "node-c", "node-d"),
     ]);
-    insert_execution_with_snapshot(&mut conn, "exec-diamond", None, &snapshot);
+    insert_execution_with_snapshot(&ctx.db, "exec-diamond", None, &snapshot).await;
+    for (job_id, node_id, status) in [
+        ("job-dia-a", "node-a", "running"),
+        ("job-dia-b", "node-b", "pending"),
+        ("job-dia-c", "node-c", "pending"),
+        ("job-dia-d", "node-d", "pending"),
+    ] {
+        insert_job(
+            &ctx.db,
+            job_id,
+            status,
+            &project_id,
+            Some("exec-diamond"),
+            Some(node_id),
+        )
+        .await;
+    }
 
-    insert_job(
-        &mut conn,
-        "job-dia-a",
-        "running",
-        &project_id,
-        "exec-diamond",
-        "node-a",
-    );
-    insert_job(
-        &mut conn,
-        "job-dia-b",
-        "pending",
-        &project_id,
-        "exec-diamond",
-        "node-b",
-    );
-    insert_job(
-        &mut conn,
-        "job-dia-c",
-        "pending",
-        &project_id,
-        "exec-diamond",
-        "node-c",
-    );
-    insert_job(
-        &mut conn,
-        "job-dia-d",
-        "pending",
-        &project_id,
-        "exec-diamond",
-        "node-d",
-    );
+    apply_failure(&ctx.orch, "job-dia-a");
 
-    // Fail A — all downstream should be cascade-failed without errors
-    cairn_core::transitions::transition_job(
-        &mut conn,
-        &emitter,
-        "job-dia-a",
-        JobStatus::Failed,
-        &cairn_core::transitions::job::test_trigger_tx(),
-    )
-    .unwrap();
-
-    for job_id in &["job-dia-b", "job-dia-c", "job-dia-d"] {
-        let status: String = jobs::table
-            .find(*job_id)
-            .select(jobs::status)
-            .first(&mut conn)
-            .unwrap();
-        assert_eq!(
-            status, "failed",
-            "job {} should be cascade-failed in diamond pattern",
-            job_id
-        );
+    for job_id in ["job-dia-b", "job-dia-c", "job-dia-d"] {
+        assert_eq!(status(&ctx.db, "jobs", job_id).await, "failed");
     }
 }

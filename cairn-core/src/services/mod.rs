@@ -25,6 +25,9 @@ mod git;
 mod http;
 mod process;
 mod pty;
+pub mod pty_osc;
+pub mod sandbox;
+pub mod shell_integration;
 
 pub use clock::{Clock, RealClock};
 pub use completion::{
@@ -36,12 +39,18 @@ pub use fs::{FileSystem, RealFileSystem};
 pub use git::{GitClient, GitOutput, RealGitClient};
 pub use http::{HttpClient, HttpConfig, HttpResponse, RealHttpClient};
 pub use process::{
-    ChildProcess, CommandOutput, ProcessSpawner, RealChildProcess, RealProcessSpawner, SpawnConfig,
+    ChildProcess, CommandOutput, KillOnDrop, ProcessSpawner, RealChildProcess, RealProcessSpawner,
+    SpawnConfig,
 };
 pub use pty::{
-    get_default_shell, read_pty_loop, update_output_buffer, PtyComponents, PtyFactory, PtyPair,
-    PtyResult, PtySession, PtyState, RealPtyFactory, MAX_BUFFER_SIZE,
+    ensure_submitted_line, get_default_shell, read_pty_loop, submit_command_exiting_shell,
+    update_output_buffer, CommandState, InlineTerminalChild, PortableTerminalChild, PtyComponents,
+    PtyFactory, PtyPair, PtyResult, PtySession, PtyState, RealPtyFactory, TerminalChild,
+    MAX_BUFFER_SIZE,
 };
+pub use pty_osc::{Osc133Event, Osc133Parser};
+pub use sandbox::SandboxPolicy;
+pub use shell_integration::{apply_shell_integration, integration_dir};
 
 use std::sync::Arc;
 
@@ -73,10 +82,20 @@ pub mod testing {
     pub use super::fs::MockFileSystem;
     pub use super::git::MockGitClient;
     pub use super::http::MockHttpClient;
-    pub use super::process::{MockChildProcess, MockProcessSpawner};
+    pub use super::process::{MockChildProcess, MockProcessSpawner, RecordingProcessSpawner};
     pub use super::pty::MockPtyFactory;
 
     use super::*;
+
+    macro_rules! service_setter {
+        ($name:ident, $field:ident, $trait:path, $arg:ident) => {
+            #[doc = concat!("Set a custom ", stringify!($trait), " implementation.")]
+            pub fn $name<S: $trait + 'static>(mut self, $arg: S) -> Self {
+                self.$field = Some(Arc::new($arg));
+                self
+            }
+        };
+    }
 
     /// Builder for creating test Services with mock implementations.
     ///
@@ -117,53 +136,14 @@ pub mod testing {
             }
         }
 
-        /// Set a custom CompletionService implementation.
-        pub fn with_completion<C: CompletionService + 'static>(mut self, completion: C) -> Self {
-            self.completion = Some(Arc::new(completion));
-            self
-        }
-
-        /// Set a custom Clock implementation.
-        pub fn with_clock<C: Clock + 'static>(mut self, clock: C) -> Self {
-            self.clock = Some(Arc::new(clock));
-            self
-        }
-
-        /// Set a custom FileSystem implementation.
-        pub fn with_fs<F: FileSystem + 'static>(mut self, fs: F) -> Self {
-            self.fs = Some(Arc::new(fs));
-            self
-        }
-
-        /// Set a custom GitClient implementation.
-        pub fn with_git<G: GitClient + 'static>(mut self, git: G) -> Self {
-            self.git = Some(Arc::new(git));
-            self
-        }
-
-        /// Set a custom HttpClient implementation.
-        pub fn with_http<H: HttpClient + 'static>(mut self, http: H) -> Self {
-            self.http = Some(Arc::new(http));
-            self
-        }
-
-        /// Set a custom ProcessSpawner implementation.
-        pub fn with_process<P: ProcessSpawner + 'static>(mut self, process: P) -> Self {
-            self.process = Some(Arc::new(process));
-            self
-        }
-
-        /// Set a custom EventEmitter implementation.
-        pub fn with_emitter<E: EventEmitter + 'static>(mut self, emitter: E) -> Self {
-            self.emitter = Some(Arc::new(emitter));
-            self
-        }
-
-        /// Set a custom PtyFactory implementation.
-        pub fn with_pty_factory<P: PtyFactory + 'static>(mut self, pty_factory: P) -> Self {
-            self.pty_factory = Some(Arc::new(pty_factory));
-            self
-        }
+        service_setter!(with_completion, completion, CompletionService, completion);
+        service_setter!(with_clock, clock, Clock, clock);
+        service_setter!(with_fs, fs, FileSystem, fs);
+        service_setter!(with_git, git, GitClient, git);
+        service_setter!(with_http, http, HttpClient, http);
+        service_setter!(with_process, process, ProcessSpawner, process);
+        service_setter!(with_emitter, emitter, EventEmitter, emitter);
+        service_setter!(with_pty_factory, pty_factory, PtyFactory, pty_factory);
 
         /// Build the Services with mocks for any unspecified services.
         ///

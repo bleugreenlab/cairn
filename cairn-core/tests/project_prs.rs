@@ -1,187 +1,404 @@
-//! Tests for the get_project_merge_requests query.
+//! Integration tests for cairn_core::merge_requests::queries.
 
 mod common;
 
-use diesel::prelude::*;
+use cairn_core::internal::storage::{DbResult, LocalDb};
+use cairn_core::merge_requests::queries;
+use turso::params;
 
-/// Create a test issue. Returns the issue ID.
-fn create_issue(conn: &mut SqliteConnection, project_id: &str, title: &str) -> String {
+async fn create_issue(db: &LocalDb, project_id: &str, number: i64, title: &str) -> String {
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
+    let project_id = project_id.to_string();
+    let title = title.to_string();
+    let now = chrono::Utc::now().timestamp();
 
-    // Use a unique number per call
-    static COUNTER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
-    let number = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-    diesel::sql_query(
-        "INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'active', 'idle', 'none', ?, ?)",
+    db.execute(
+        "
+        INSERT INTO issues (
+            id, project_id, number, title, status, progress,
+            attention, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, 'active', 'idle', 'none', ?5, ?6)
+        ",
+        params![
+            id.as_str(),
+            project_id.as_str(),
+            number,
+            title.as_str(),
+            now,
+            now
+        ],
     )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .bind::<diesel::sql_types::Text, _>(project_id)
-    .bind::<diesel::sql_types::Integer, _>(number)
-    .bind::<diesel::sql_types::Text, _>(title)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(conn)
-    .expect("Failed to create issue");
+    .await
+    .unwrap();
 
     id
 }
 
-/// Create a job for testing. Returns the job_id.
-fn create_test_job(
-    conn: &mut SqliteConnection,
-    issue_id: Option<&str>,
+async fn create_execution(db: &LocalDb, project_id: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let project_id = project_id.to_string();
+    let now = chrono::Utc::now().timestamp();
+
+    db.execute(
+        "
+        INSERT INTO executions (
+            id, recipe_id, project_id, status, started_at
+        )
+        VALUES (?1, 'recipe-1', ?2, 'running', ?3)
+        ",
+        params![id.as_str(), project_id.as_str(), now],
+    )
+    .await
+    .unwrap();
+
+    id
+}
+
+async fn create_job(
+    db: &LocalDb,
     project_id: &str,
+    issue_id: Option<&str>,
+    execution_id: Option<&str>,
     branch: Option<&str>,
 ) -> String {
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
+    let project_id = project_id.to_string();
+    let issue_id = issue_id.map(str::to_string);
+    let execution_id = execution_id.map(str::to_string);
+    let branch = branch.map(str::to_string);
+    let now = chrono::Utc::now().timestamp();
 
-    diesel::sql_query(
-        "INSERT INTO jobs (id, project_id, issue_id, status, branch, created_at, updated_at)
-         VALUES (?, ?, ?, 'complete', ?, ?, ?)",
+    db.execute(
+        "
+        INSERT INTO jobs (
+            id, project_id, issue_id, execution_id, status,
+            branch, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, 'complete', ?5, ?6, ?7)
+        ",
+        params![
+            id.as_str(),
+            project_id.as_str(),
+            issue_id.as_deref(),
+            execution_id.as_deref(),
+            branch.as_deref(),
+            now,
+            now
+        ],
     )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .bind::<diesel::sql_types::Text, _>(project_id)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(issue_id)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(branch)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(conn)
-    .expect("Failed to create job");
+    .await
+    .unwrap();
 
     id
 }
 
-/// Insert a merge_request. Returns the merge_request ID.
-fn create_merge_request(
-    conn: &mut SqliteConnection,
+#[allow(clippy::too_many_arguments)]
+async fn create_merge_request(
+    db: &LocalDb,
     job_id: &str,
     project_id: &str,
     issue_id: Option<&str>,
-    manager_id: Option<&str>,
     title: &str,
     status: &str,
-    github_pr_number: Option<i32>,
+    github_pr_number: Option<i64>,
     github_pr_url: Option<&str>,
 ) -> String {
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
+    let job_id = job_id.to_string();
+    let project_id = project_id.to_string();
+    let issue_id = issue_id.map(str::to_string);
+    let title = title.to_string();
+    let status = status.to_string();
+    let github_pr_url = github_pr_url.map(str::to_string);
+    let now = chrono::Utc::now().timestamp();
 
-    diesel::sql_query(
-        "INSERT INTO merge_requests (id, job_id, project_id, issue_id, manager_id, title, source_branch, target_branch, status, merge_method, opened_at, updated_at, github_pr_number, github_pr_url)
-         VALUES (?, ?, ?, ?, ?, ?, 'feature', 'main', ?, 'squash', ?, ?, ?, ?)",
+    db.execute(
+        "
+        INSERT INTO merge_requests (
+            id, job_id, project_id, issue_id, title,
+            source_branch, target_branch, status, merge_method,
+            opened_at, updated_at, github_pr_number, github_pr_url
+        )
+        VALUES (
+            ?1, ?2, ?3, ?4, ?5,
+            'feature', 'main', ?6, 'squash',
+            ?7, ?8, ?9, ?10
+        )
+        ",
+        params![
+            id.as_str(),
+            job_id.as_str(),
+            project_id.as_str(),
+            issue_id.as_deref(),
+            title.as_str(),
+            status.as_str(),
+            now,
+            now,
+            github_pr_number,
+            github_pr_url.as_deref()
+        ],
     )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .bind::<diesel::sql_types::Text, _>(job_id)
-    .bind::<diesel::sql_types::Text, _>(project_id)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(issue_id)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(manager_id)
-    .bind::<diesel::sql_types::Text, _>(title)
-    .bind::<diesel::sql_types::Text, _>(status)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, _>(github_pr_number)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(github_pr_url)
-    .execute(conn)
-    .expect("Failed to create merge_request");
+    .await
+    .unwrap();
 
     id
 }
 
-#[test]
-fn get_project_merge_requests_returns_results_for_project() {
-    let mut conn = common::test_conn();
-    let project_a = common::create_test_project(&mut conn, "Project A", "PA");
-    let project_b = common::create_test_project(&mut conn, "Project B", "PB");
+async fn create_action_run(
+    db: &LocalDb,
+    project_id: &str,
+    execution_id: &str,
+    job_id: &str,
+) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let project_id = project_id.to_string();
+    let execution_id = execution_id.to_string();
+    let job_id = job_id.to_string();
+    let now = chrono::Utc::now().timestamp();
 
-    let issue = create_issue(&mut conn, &project_a, "Test Issue");
+    db.execute(
+        "
+        INSERT INTO action_runs (
+            id, execution_id, recipe_node_id, action_config_id, project_id,
+            status, created_at, parent_job_id
+        )
+        VALUES (?1, ?2, 'node-create-pr', 'builtin:create_pr', ?3, 'complete', ?4, ?5)
+        ",
+        params![
+            id.as_str(),
+            execution_id.as_str(),
+            project_id.as_str(),
+            now,
+            job_id.as_str()
+        ],
+    )
+    .await
+    .unwrap();
 
-    let job_a = create_test_job(&mut conn, Some(&issue), &project_a, Some("feature-a"));
-    let _job_b = create_test_job(&mut conn, None, &project_b, Some("feature-b"));
+    id
+}
+
+async fn insert_webhook_event(db: &LocalDb, pr_number: i64, processed_at: i64) -> DbResult<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    db.execute(
+        "
+        INSERT INTO webhook_events (
+            id, event_type, action, repo_full_name, pr_number,
+            payload_summary, processed_at
+        )
+        VALUES (?1, 'pull_request', 'opened', 'owner/repo', ?2, 'opened PR', ?3)
+        ",
+        params![id.as_str(), pr_number, processed_at],
+    )
+    .await
+    .map(|_| id)
+}
+
+#[tokio::test]
+async fn get_project_merge_requests_returns_results_for_project() {
+    let (_temp, db) = common::migrated_db().await;
+    let project_a = common::create_project(&db, "PRA").await;
+    let project_b = common::create_project(&db, "PRB").await;
+    let execution = create_execution(&db, &project_a).await;
+    let issue = create_issue(&db, &project_a, 1, "Test Issue").await;
+    let job_a = create_job(
+        &db,
+        &project_a,
+        Some(&issue),
+        Some(&execution),
+        Some("feature-a"),
+    )
+    .await;
+    let _job_b = create_job(&db, &project_b, None, None, Some("feature-b")).await;
 
     create_merge_request(
-        &mut conn,
+        &db,
         &job_a,
         &project_a,
         Some(&issue),
-        None,
         "Test PR",
         "open",
         Some(1),
         Some("https://github.com/test/test/pull/1"),
-    );
+    )
+    .await;
 
-    let result =
-        cairn_core::merge_requests::queries::get_project_merge_requests(&mut conn, &project_a)
-            .unwrap();
+    let result = queries::get_project_merge_requests(&db, &project_a)
+        .await
+        .unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].title, Some("Test PR".to_string()));
     assert_eq!(result[0].pr_number, 1);
 
-    // Project B should have no merge requests
-    let result_b =
-        cairn_core::merge_requests::queries::get_project_merge_requests(&mut conn, &project_b)
-            .unwrap();
+    let result_b = queries::get_project_merge_requests(&db, &project_b)
+        .await
+        .unwrap();
     assert!(result_b.is_empty());
 }
 
-#[test]
-fn get_project_merge_requests_includes_issue_info() {
-    let mut conn = common::test_conn();
-    let project = common::create_test_project(&mut conn, "Test Project", "TP");
-    let issue = create_issue(&mut conn, &project, "My Issue");
-
-    let job = create_test_job(&mut conn, Some(&issue), &project, Some("feature"));
+#[tokio::test]
+async fn get_project_merge_requests_includes_issue_and_execution_info() {
+    let (_temp, db) = common::migrated_db().await;
+    let project = common::create_project(&db, "PRI").await;
+    let execution = create_execution(&db, &project).await;
+    let issue = create_issue(&db, &project, 42, "My Issue").await;
+    let job = create_job(
+        &db,
+        &project,
+        Some(&issue),
+        Some(&execution),
+        Some("feature"),
+    )
+    .await;
 
     create_merge_request(
-        &mut conn,
+        &db,
         &job,
         &project,
         Some(&issue),
-        None,
         "Fix bug",
         "open",
         Some(42),
         Some("https://github.com/test/test/pull/42"),
-    );
+    )
+    .await;
 
-    let result =
-        cairn_core::merge_requests::queries::get_project_merge_requests(&mut conn, &project)
-            .unwrap();
+    let result = queries::get_project_merge_requests(&db, &project)
+        .await
+        .unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].issue_id, Some(issue));
+    assert_eq!(result[0].issue_number, Some(42));
     assert_eq!(result[0].issue_title, Some("My Issue".to_string()));
+    assert_eq!(result[0].execution_id, execution);
 }
 
-#[test]
-fn get_project_merge_requests_without_github() {
-    let mut conn = common::test_conn();
-    let project = common::create_test_project(&mut conn, "Test Project", "TP");
-    let issue = create_issue(&mut conn, &project, "Local Issue");
+#[tokio::test]
+async fn get_project_merge_requests_without_github_uses_compat_defaults() {
+    let (_temp, db) = common::migrated_db().await;
+    let project = common::create_project(&db, "PRL").await;
+    let execution = create_execution(&db, &project).await;
+    let issue = create_issue(&db, &project, 7, "Local Issue").await;
+    let job = create_job(
+        &db,
+        &project,
+        Some(&issue),
+        Some(&execution),
+        Some("feature"),
+    )
+    .await;
 
-    let job = create_test_job(&mut conn, Some(&issue), &project, Some("feature"));
-
-    // Create a merge request without GitHub info
     create_merge_request(
-        &mut conn,
+        &db,
         &job,
         &project,
         Some(&issue),
-        None,
         "Local PR",
         "open",
         None,
         None,
-    );
+    )
+    .await;
 
-    let result =
-        cairn_core::merge_requests::queries::get_project_merge_requests(&mut conn, &project)
-            .unwrap();
+    let result = queries::get_project_merge_requests(&db, &project)
+        .await
+        .unwrap();
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].title, Some("Local PR".to_string()));
     assert_eq!(result[0].pr_number, 0);
     assert!(result[0].pr_url.is_empty());
+}
+
+#[tokio::test]
+async fn summaries_for_action_runs_preserve_action_run_id() {
+    let (_temp, db) = common::migrated_db().await;
+    let project = common::create_project(&db, "PRS").await;
+    let execution = create_execution(&db, &project).await;
+    let job = create_job(&db, &project, None, Some(&execution), Some("feature")).await;
+    let action_run = create_action_run(&db, &project, &execution, &job).await;
+    let merge_request = create_merge_request(
+        &db,
+        &job,
+        &project,
+        None,
+        "Action PR",
+        "open",
+        Some(12),
+        Some("https://github.com/test/test/pull/12"),
+    )
+    .await;
+
+    let summaries = queries::get_summaries_for_action_runs(&db, &[action_run.clone()])
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, merge_request);
+    assert_eq!(summaries[0].action_run_id, Some(action_run));
+    assert_eq!(summaries[0].pr_number, 12);
+}
+
+#[tokio::test]
+async fn get_by_action_run_id_accepts_action_run_or_job_id() {
+    let (_temp, db) = common::migrated_db().await;
+    let project = common::create_project(&db, "PRD").await;
+    let execution = create_execution(&db, &project).await;
+    let job = create_job(&db, &project, None, Some(&execution), Some("feature")).await;
+    let action_run = create_action_run(&db, &project, &execution, &job).await;
+    let merge_request = create_merge_request(
+        &db,
+        &job,
+        &project,
+        None,
+        "Details PR",
+        "open",
+        Some(33),
+        Some("https://github.com/test/test/pull/33"),
+    )
+    .await;
+
+    let via_action = queries::get_by_action_run_id(&db, &action_run)
+        .await
+        .unwrap()
+        .unwrap();
+    let via_job = queries::get_by_action_run_id(&db, &job)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(via_action.id, merge_request);
+    assert_eq!(via_job.id, via_action.id);
+    assert_eq!(via_action.pr_number, 33);
+}
+
+#[tokio::test]
+async fn webhook_events_can_load_by_number_or_job() {
+    let (_temp, db) = common::migrated_db().await;
+    let project = common::create_project(&db, "PRW").await;
+    let execution = create_execution(&db, &project).await;
+    let job = create_job(&db, &project, None, Some(&execution), Some("feature")).await;
+    create_merge_request(
+        &db,
+        &job,
+        &project,
+        None,
+        "Webhook PR",
+        "open",
+        Some(51),
+        Some("https://github.com/test/test/pull/51"),
+    )
+    .await;
+    let older = insert_webhook_event(&db, 51, 10).await.unwrap();
+    let newer = insert_webhook_event(&db, 51, 20).await.unwrap();
+
+    let by_number = queries::get_webhook_events(&db, 51).await.unwrap();
+    assert_eq!(by_number.len(), 2);
+    assert_eq!(by_number[0].id, newer);
+    assert_eq!(by_number[1].id, older);
+
+    let by_job = queries::get_webhook_events_for_job(&db, &job)
+        .await
+        .unwrap();
+    assert_eq!(by_job.len(), 2);
+    assert_eq!(by_job[0].processed_at, 20);
 }

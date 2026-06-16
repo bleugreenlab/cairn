@@ -1,5 +1,4 @@
-//! Background sync task — consumes SyncMessages, batches durable ones via HTTP,
-//! sends StreamDelta over WebSocket for low-latency streaming.
+//! Background sync task — consumes SyncMessages and batches durable ones via HTTP.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -16,8 +15,7 @@ use super::message::SyncMessage;
 type WsSink =
     SplitSink<tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, WsMessage>;
 
-/// Background task: consumes SyncMessages from the mpsc channel, batches durable
-/// ones and sends them via HTTP, sends StreamDelta over WebSocket.
+/// Background task: consumes SyncMessages and batches durable ones via HTTP.
 pub struct SyncTask {
     rx: mpsc::UnboundedReceiver<SyncMessage>,
     api_url: String,
@@ -101,25 +99,11 @@ impl SyncTask {
             tokio::select! {
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(SyncMessage::StreamDelta(delta)) => {
-                            // Send over WS if connected, else drop (ephemeral)
-                            if let Some(ref mut sink) = ws {
-                                let payload = serde_json::json!({
-                                    "type": "stream_delta",
-                                    "run_id": delta.run_id,
-                                    "event_id": delta.event_id,
-                                    "tokens": delta.tokens,
-                                });
-                                if sink.send(WsMessage::Text(payload.to_string().into())).await.is_err() {
-                                    log::debug!("Sync WS send failed, will reconnect");
-                                    ws = None;
-                                }
-                            }
-                        }
+                        Some(SyncMessage::StreamDelta(_)) => {}
                         Some(msg) if msg.is_durable() => {
                             batch.push(msg);
                         }
-                        Some(_) => {} // Unknown non-durable, drop
+                        Some(_) => {} // Local-only non-durable, drop
                         None => {
                             // Channel closed — flush remaining batch and exit
                             if !batch.is_empty() {
@@ -381,9 +365,14 @@ mod tests {
     #[tokio::test]
     async fn sync_task_exits_on_channel_close() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // No JWT: both try_connect_ws and send_batch_http short-circuit before any
+        // network call, so the test exercises only the channel-close exit path and
+        // never touches the network. ApiConfig::default() targets the real prod API,
+        // so the previous fake-JWT form hit the network and flaked past the 5s
+        // timeout under parallel load.
         let task = SyncTask::new(
             rx,
-            Arc::new(|| Some("fake-jwt".to_string())),
+            Arc::new(|| None),
             "device-1".to_string(),
             crate::api::ApiConfig::default(),
         );

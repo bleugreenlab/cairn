@@ -455,26 +455,7 @@ fn collect_files_recursive(dir: &Path, base: &Path) -> Result<Vec<FetchedFile>, 
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Fetch a skill from a URL, returning all files and parsed metadata.
-pub fn fetch_skill(source: &SkillSource, source_url: &str) -> Result<FetchedSkill, String> {
-    let files = match source {
-        SkillSource::GitHub {
-            owner,
-            repo,
-            ref_and_path,
-            is_blob_skill_md,
-        } => {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
-
-            resolve_and_fetch_github(&client, owner, repo, ref_and_path, *is_blob_skill_md)?
-        }
-        SkillSource::Git { url, path } => fetch_from_git(url, path.as_deref())?,
-    };
-
-    // Find and parse SKILL.md
+fn build_fetched_skill(files: Vec<FetchedFile>, source_url: &str) -> Result<FetchedSkill, String> {
     let skill_md = files
         .iter()
         .find(|f| f.relative_path == "SKILL.md")
@@ -499,6 +480,28 @@ pub fn fetch_skill(source: &SkillSource, source_url: &str) -> Result<FetchedSkil
         files,
         has_scripts,
     })
+}
+
+/// Fetch a skill from a URL, returning all files and parsed metadata.
+pub fn fetch_skill(source: &SkillSource, source_url: &str) -> Result<FetchedSkill, String> {
+    let files = match source {
+        SkillSource::GitHub {
+            owner,
+            repo,
+            ref_and_path,
+            is_blob_skill_md,
+        } => {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+            resolve_and_fetch_github(&client, owner, repo, ref_and_path, *is_blob_skill_md)?
+        }
+        SkillSource::Git { url, path } => fetch_from_git(url, path.as_deref())?,
+    };
+
+    build_fetched_skill(files, source_url)
 }
 
 /// Install fetched skill files to the target directory.
@@ -580,10 +583,74 @@ fn truncate_str(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_github_tree_url() {
-        let source =
-            parse_skill_url("https://github.com/anthropics/skills/tree/main/skills/docx").unwrap();
+    fn write_skill_md(dir: &std::path::Path, markdown: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), markdown).unwrap();
+    }
+
+    fn fetched_file(relative_path: &str, content: impl AsRef<[u8]>) -> FetchedFile {
+        FetchedFile {
+            relative_path: relative_path.to_string(),
+            content: content.as_ref().to_vec(),
+            is_binary: false,
+        }
+    }
+
+    fn skill_md_content(skill_id: &str, description: &str, prompt: &str) -> Vec<u8> {
+        format!("---\nname: {skill_id}\ndescription: {description}\n---\n\n{prompt}\n").into_bytes()
+    }
+
+    fn fetched_skill(
+        source_url: &str,
+        skill_id: &str,
+        name: &str,
+        description: &str,
+        prompt: &str,
+        files: Vec<FetchedFile>,
+    ) -> FetchedSkill {
+        let has_scripts = files
+            .iter()
+            .any(|file| file.relative_path.starts_with("scripts/"));
+        FetchedSkill {
+            source_url: source_url.to_string(),
+            skill_id: skill_id.to_string(),
+            name: name.to_string(),
+            description: description.to_string(),
+            prompt: prompt.to_string(),
+            allowed_tools: None,
+            files,
+            has_scripts,
+        }
+    }
+
+    fn fetched_markdown_skill(
+        source_url: &str,
+        skill_id: &str,
+        name: &str,
+        description: &str,
+        prompt: &str,
+    ) -> FetchedSkill {
+        fetched_skill(
+            source_url,
+            skill_id,
+            name,
+            description,
+            prompt,
+            vec![fetched_file(
+                "SKILL.md",
+                skill_md_content(skill_id, description, prompt),
+            )],
+        )
+    }
+
+    fn assert_github_url(
+        url: &str,
+        expected_owner: &str,
+        expected_repo: &str,
+        expected_ref_and_path: &str,
+        expected_blob_skill_md: Option<bool>,
+    ) {
+        let source = parse_skill_url(url).unwrap();
         match source {
             SkillSource::GitHub {
                 owner,
@@ -591,70 +658,59 @@ mod tests {
                 ref_and_path,
                 is_blob_skill_md,
             } => {
-                assert_eq!(owner, "anthropics");
-                assert_eq!(repo, "skills");
-                assert_eq!(ref_and_path, "main/skills/docx");
-                assert!(!is_blob_skill_md);
+                assert_eq!(owner, expected_owner);
+                assert_eq!(repo, expected_repo);
+                assert_eq!(ref_and_path, expected_ref_and_path);
+                if let Some(expected) = expected_blob_skill_md {
+                    assert_eq!(is_blob_skill_md, expected);
+                }
             }
             _ => panic!("Expected GitHub source"),
         }
+    }
+
+    #[test]
+    fn test_parse_github_tree_url() {
+        assert_github_url(
+            "https://github.com/anthropics/skills/tree/main/skills/docx",
+            "anthropics",
+            "skills",
+            "main/skills/docx",
+            Some(false),
+        );
     }
 
     #[test]
     fn test_parse_github_blob_skill_md() {
-        let source =
-            parse_skill_url("https://github.com/owner/repo/blob/develop/my-skill/SKILL.md")
-                .unwrap();
-        match source {
-            SkillSource::GitHub {
-                owner,
-                repo,
-                ref_and_path,
-                is_blob_skill_md,
-            } => {
-                assert_eq!(owner, "owner");
-                assert_eq!(repo, "repo");
-                assert_eq!(ref_and_path, "develop/my-skill/SKILL.md");
-                assert!(is_blob_skill_md);
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url(
+            "https://github.com/owner/repo/blob/develop/my-skill/SKILL.md",
+            "owner",
+            "repo",
+            "develop/my-skill/SKILL.md",
+            Some(true),
+        );
     }
 
     #[test]
     fn test_parse_github_repo_only() {
-        let source = parse_skill_url("https://github.com/owner/repo").unwrap();
-        match source {
-            SkillSource::GitHub {
-                owner,
-                repo,
-                ref_and_path,
-                ..
-            } => {
-                assert_eq!(owner, "owner");
-                assert_eq!(repo, "repo");
-                assert_eq!(ref_and_path, "main");
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url(
+            "https://github.com/owner/repo",
+            "owner",
+            "repo",
+            "main",
+            None,
+        );
     }
 
     #[test]
     fn test_parse_shorthand() {
-        let source = parse_skill_url("anthropics/skills/skills/docx").unwrap();
-        match source {
-            SkillSource::GitHub {
-                owner,
-                repo,
-                ref_and_path,
-                ..
-            } => {
-                assert_eq!(owner, "anthropics");
-                assert_eq!(repo, "skills");
-                assert_eq!(ref_and_path, "main/skills/docx");
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url(
+            "anthropics/skills/skills/docx",
+            "anthropics",
+            "skills",
+            "main/skills/docx",
+            None,
+        );
     }
 
     #[test]
@@ -688,35 +744,25 @@ mod tests {
 
     #[test]
     fn test_parse_github_tree_with_trailing_slash() {
-        let source =
-            parse_skill_url("https://github.com/anthropics/skills/tree/main/skills/docx/").unwrap();
-        match source {
-            SkillSource::GitHub { ref_and_path, .. } => {
-                assert_eq!(ref_and_path, "main/skills/docx");
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url(
+            "https://github.com/anthropics/skills/tree/main/skills/docx/",
+            "anthropics",
+            "skills",
+            "main/skills/docx",
+            None,
+        );
     }
 
     #[test]
     fn test_parse_github_branch_with_slashes() {
-        let source =
-            parse_skill_url("https://github.com/org/repo/tree/feature/import-skills/skills/docx")
-                .unwrap();
-        match source {
-            SkillSource::GitHub {
-                owner,
-                repo,
-                ref_and_path,
-                ..
-            } => {
-                assert_eq!(owner, "org");
-                assert_eq!(repo, "repo");
-                // The raw ref_and_path preserves the ambiguity — resolution happens at fetch time
-                assert_eq!(ref_and_path, "feature/import-skills/skills/docx");
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        // The raw ref_and_path preserves the ambiguity; resolution happens at fetch time.
+        assert_github_url(
+            "https://github.com/org/repo/tree/feature/import-skills/skills/docx",
+            "org",
+            "repo",
+            "feature/import-skills/skills/docx",
+            None,
+        );
     }
 
     #[test]
@@ -725,33 +771,21 @@ mod tests {
         let config_dir = temp.path();
         std::fs::create_dir_all(config_dir.join("skills")).unwrap();
 
-        let skill = FetchedSkill {
-            source_url: "https://github.com/test/repo/tree/main/my-skill".to_string(),
-            skill_id: "my-skill".to_string(),
-            name: "My Skill".to_string(),
-            description: "A test skill".to_string(),
-            prompt: "Do stuff.".to_string(),
-            allowed_tools: None,
-            files: vec![
-                FetchedFile {
-                    relative_path: "SKILL.md".to_string(),
-                    content: b"---\nname: my-skill\ndescription: A test skill\n---\n\nDo stuff.\n"
-                        .to_vec(),
-                    is_binary: false,
-                },
-                FetchedFile {
-                    relative_path: "scripts/run.py".to_string(),
-                    content: b"print('hello')".to_vec(),
-                    is_binary: false,
-                },
-                FetchedFile {
-                    relative_path: "references/guide.md".to_string(),
-                    content: b"# Guide\nSome docs.".to_vec(),
-                    is_binary: false,
-                },
+        let skill = fetched_skill(
+            "https://github.com/test/repo/tree/main/my-skill",
+            "my-skill",
+            "My Skill",
+            "A test skill",
+            "Do stuff.",
+            vec![
+                fetched_file(
+                    "SKILL.md",
+                    skill_md_content("my-skill", "A test skill", "Do stuff."),
+                ),
+                fetched_file("scripts/run.py", b"print('hello')"),
+                fetched_file("references/guide.md", b"# Guide\nSome docs."),
             ],
-            has_scripts: true,
-        };
+        );
 
         let result = install_fetched_skill(&skill, config_dir, None).unwrap();
         assert!(result.join("SKILL.md").exists());
@@ -777,27 +811,18 @@ mod tests {
 
         // Create existing skill
         let existing = skills_dir.join("my-skill");
-        std::fs::create_dir_all(&existing).unwrap();
-        std::fs::write(
-            existing.join("SKILL.md"),
+        write_skill_md(
+            &existing,
             "---\nname: my-skill\ndescription: Existing\n---\n\nOld.",
-        )
-        .unwrap();
+        );
 
-        let skill = FetchedSkill {
-            source_url: "https://github.com/test/repo".to_string(),
-            skill_id: "my-skill".to_string(),
-            name: "My Skill".to_string(),
-            description: "New one".to_string(),
-            prompt: "Do stuff.".to_string(),
-            allowed_tools: None,
-            files: vec![FetchedFile {
-                relative_path: "SKILL.md".to_string(),
-                content: b"---\nname: my-skill\ndescription: New one\n---\n\nDo stuff.\n".to_vec(),
-                is_binary: false,
-            }],
-            has_scripts: false,
-        };
+        let skill = fetched_markdown_skill(
+            "https://github.com/test/repo",
+            "my-skill",
+            "My Skill",
+            "New one",
+            "Do stuff.",
+        );
 
         let result = install_fetched_skill(&skill, config_dir, None).unwrap();
         // Should be installed as my-skill-1
@@ -815,20 +840,13 @@ mod tests {
         std::fs::create_dir_all(config_dir.join("skills")).unwrap();
         std::fs::create_dir_all(project_path.join(".cairn/skills")).unwrap();
 
-        let skill = FetchedSkill {
-            source_url: "https://github.com/test/repo".to_string(),
-            skill_id: "test-skill".to_string(),
-            name: "Test".to_string(),
-            description: "Test".to_string(),
-            prompt: "Test.".to_string(),
-            allowed_tools: None,
-            files: vec![FetchedFile {
-                relative_path: "SKILL.md".to_string(),
-                content: b"---\nname: test-skill\ndescription: Test\n---\n\nTest.\n".to_vec(),
-                is_binary: false,
-            }],
-            has_scripts: false,
-        };
+        let skill = fetched_markdown_skill(
+            "https://github.com/test/repo",
+            "test-skill",
+            "Test",
+            "Test",
+            "Test.",
+        );
 
         let result = install_fetched_skill(&skill, &config_dir, Some(&project_path)).unwrap();
         assert!(result.starts_with(
@@ -854,73 +872,40 @@ mod tests {
 
     #[test]
     fn test_parse_url_trims_whitespace() {
-        let source = parse_skill_url("  https://github.com/owner/repo/tree/main/skill  ").unwrap();
-        match source {
-            SkillSource::GitHub {
-                owner,
-                ref_and_path,
-                ..
-            } => {
-                assert_eq!(owner, "owner");
-                assert_eq!(ref_and_path, "main/skill");
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url(
+            "  https://github.com/owner/repo/tree/main/skill  ",
+            "owner",
+            "repo",
+            "main/skill",
+            None,
+        );
     }
 
     #[test]
     fn test_parse_shorthand_two_segments() {
-        // owner/repo with no path
-        let source = parse_skill_url("anthropics/skills").unwrap();
-        match source {
-            SkillSource::GitHub {
-                owner,
-                repo,
-                ref_and_path,
-                ..
-            } => {
-                assert_eq!(owner, "anthropics");
-                assert_eq!(repo, "skills");
-                assert_eq!(ref_and_path, "main");
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url("anthropics/skills", "anthropics", "skills", "main", None);
     }
 
     #[test]
     fn test_parse_http_github_url() {
-        // http:// (not https) should still parse
-        let source = parse_skill_url("http://github.com/owner/repo/tree/main/skill").unwrap();
-        match source {
-            SkillSource::GitHub {
-                owner,
-                repo,
-                ref_and_path,
-                ..
-            } => {
-                assert_eq!(owner, "owner");
-                assert_eq!(repo, "repo");
-                assert_eq!(ref_and_path, "main/skill");
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url(
+            "http://github.com/owner/repo/tree/main/skill",
+            "owner",
+            "repo",
+            "main/skill",
+            None,
+        );
     }
 
     #[test]
     fn test_parse_blob_root_skill_md() {
-        // blob link to SKILL.md at repo root
-        let source = parse_skill_url("https://github.com/owner/repo/blob/main/SKILL.md").unwrap();
-        match source {
-            SkillSource::GitHub {
-                ref_and_path,
-                is_blob_skill_md,
-                ..
-            } => {
-                assert_eq!(ref_and_path, "main/SKILL.md");
-                assert!(is_blob_skill_md);
-            }
-            _ => panic!("Expected GitHub source"),
-        }
+        assert_github_url(
+            "https://github.com/owner/repo/blob/main/SKILL.md",
+            "owner",
+            "repo",
+            "main/SKILL.md",
+            Some(true),
+        );
     }
 
     #[test]
@@ -933,56 +918,16 @@ mod tests {
     // fetch_skill logic (with synthetic file data)
     // -----------------------------------------------------------------------
 
-    /// Helper: build a FetchedSkill from raw file data to test post-fetch logic
-    /// without network calls. Mirrors what `fetch_skill` does after fetching.
-    fn build_fetched_skill(
-        files: Vec<FetchedFile>,
-        source_url: &str,
-    ) -> Result<FetchedSkill, String> {
-        let skill_md = files
-            .iter()
-            .find(|f| f.relative_path == "SKILL.md")
-            .ok_or_else(|| "No SKILL.md found in the fetched directory".to_string())?;
-
-        let content_str = String::from_utf8(skill_md.content.clone())
-            .map_err(|_| "SKILL.md is not valid UTF-8".to_string())?;
-
-        let parsed = parse_skill_markdown(&content_str)?;
-
-        let has_scripts = files
-            .iter()
-            .any(|f| f.relative_path.starts_with("scripts/"));
-
-        Ok(FetchedSkill {
-            source_url: source_url.to_string(),
-            skill_id: parsed.id,
-            name: parsed.name,
-            description: parsed.description,
-            prompt: parsed.prompt,
-            allowed_tools: parsed.allowed_tools,
-            files,
-            has_scripts,
-        })
-    }
-
     #[test]
     fn test_fetch_skill_no_skill_md() {
-        let files = vec![FetchedFile {
-            relative_path: "README.md".to_string(),
-            content: b"# Hello".to_vec(),
-            is_binary: false,
-        }];
+        let files = vec![fetched_file("README.md", b"# Hello")];
         let err = build_fetched_skill(files, "https://example.com").unwrap_err();
         assert!(err.contains("No SKILL.md found"));
     }
 
     #[test]
     fn test_fetch_skill_invalid_utf8() {
-        let files = vec![FetchedFile {
-            relative_path: "SKILL.md".to_string(),
-            content: vec![0xFF, 0xFE, 0x00, 0x01], // invalid UTF-8
-            is_binary: false,
-        }];
+        let files = vec![fetched_file("SKILL.md", vec![0xFF, 0xFE, 0x00, 0x01])];
         let err = build_fetched_skill(files, "https://example.com").unwrap_err();
         assert!(err.contains("not valid UTF-8"));
     }
@@ -993,26 +938,14 @@ mod tests {
             b"---\nname: test\ndescription: A test\n---\n\nDo things.\n".to_vec();
 
         // No scripts directory
-        let files = vec![FetchedFile {
-            relative_path: "SKILL.md".to_string(),
-            content: skill_md_content.clone(),
-            is_binary: false,
-        }];
+        let files = vec![fetched_file("SKILL.md", skill_md_content.clone())];
         let result = build_fetched_skill(files, "url").unwrap();
         assert!(!result.has_scripts);
 
         // With scripts directory
         let files = vec![
-            FetchedFile {
-                relative_path: "SKILL.md".to_string(),
-                content: skill_md_content,
-                is_binary: false,
-            },
-            FetchedFile {
-                relative_path: "scripts/run.sh".to_string(),
-                content: b"#!/bin/bash".to_vec(),
-                is_binary: false,
-            },
+            fetched_file("SKILL.md", skill_md_content),
+            fetched_file("scripts/run.sh", b"#!/bin/bash"),
         ];
         let result = build_fetched_skill(files, "url").unwrap();
         assert!(result.has_scripts);
@@ -1046,28 +979,20 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path();
 
-        let skill = FetchedSkill {
-            source_url: "https://example.com".to_string(),
-            skill_id: "nested".to_string(),
-            name: "Nested".to_string(),
-            description: "Has deep paths".to_string(),
-            prompt: "Do stuff.".to_string(),
-            allowed_tools: None,
-            files: vec![
-                FetchedFile {
-                    relative_path: "SKILL.md".to_string(),
-                    content: b"---\nname: nested\ndescription: Has deep paths\n---\n\nDo stuff.\n"
-                        .to_vec(),
-                    is_binary: false,
-                },
-                FetchedFile {
-                    relative_path: "scripts/tools/deep/run.py".to_string(),
-                    content: b"print('deep')".to_vec(),
-                    is_binary: false,
-                },
+        let skill = fetched_skill(
+            "https://example.com",
+            "nested",
+            "Nested",
+            "Has deep paths",
+            "Do stuff.",
+            vec![
+                fetched_file(
+                    "SKILL.md",
+                    skill_md_content("nested", "Has deep paths", "Do stuff."),
+                ),
+                fetched_file("scripts/tools/deep/run.py", b"print('deep')"),
             ],
-            has_scripts: true,
-        };
+        );
 
         let result = install_fetched_skill(&skill, config_dir, None).unwrap();
         assert!(result.join("scripts/tools/deep/run.py").exists());
@@ -1082,28 +1007,19 @@ mod tests {
         // Create existing skill and skill-1
         for name in &["my-skill", "my-skill-1"] {
             let dir = skills_dir.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("SKILL.md"),
+            write_skill_md(
+                &dir,
                 "---\nname: my-skill\ndescription: Existing\n---\n\nOld.",
-            )
-            .unwrap();
+            );
         }
 
-        let skill = FetchedSkill {
-            source_url: "https://example.com".to_string(),
-            skill_id: "my-skill".to_string(),
-            name: "My Skill".to_string(),
-            description: "New".to_string(),
-            prompt: "Do stuff.".to_string(),
-            allowed_tools: None,
-            files: vec![FetchedFile {
-                relative_path: "SKILL.md".to_string(),
-                content: b"---\nname: my-skill\ndescription: New\n---\n\nDo stuff.\n".to_vec(),
-                is_binary: false,
-            }],
-            has_scripts: false,
-        };
+        let skill = fetched_markdown_skill(
+            "https://example.com",
+            "my-skill",
+            "My Skill",
+            "New",
+            "Do stuff.",
+        );
 
         let result = install_fetched_skill(&skill, config_dir, None).unwrap();
         // Should skip my-skill and my-skill-1, land on my-skill-2

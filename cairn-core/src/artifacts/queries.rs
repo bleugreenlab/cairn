@@ -1,89 +1,125 @@
-//! Read-only artifact queries.
+//! Artifact query operations.
 
-use diesel::prelude::*;
-use diesel::sqlite::SqliteConnection;
+use serde_json::Value;
+use turso::params;
 
-use crate::diesel_models::DbArtifact;
 use crate::models::Artifact;
-use crate::schema::{artifacts, jobs};
+use crate::storage::{DbError, LocalDb, RowExt};
 
-/// Get a specific artifact by ID.
-pub fn get(conn: &mut SqliteConnection, artifact_id: &str) -> Result<Artifact, String> {
-    let db_artifact: DbArtifact = artifacts::table
-        .find(artifact_id)
-        .first(conn)
-        .map_err(|e| format!("Artifact not found: {}", e))?;
+pub(crate) const ARTIFACT_COLUMNS: &str =
+    "id, job_id, artifact_type, schema_version, data, version,
+    parent_version_id, output_name, created_at, updated_at, seen_at, confirmed";
 
-    Artifact::try_from(db_artifact).map_err(|e| format!("Failed to parse artifact: {}", e))
+fn db_error(context: &str, error: DbError) -> String {
+    format!("{context}: {error}")
 }
 
-/// Get all artifacts for a job, ordered by version (newest first).
-pub fn list(conn: &mut SqliteConnection, job_id: &str) -> Result<Vec<Artifact>, String> {
-    let db_artifacts: Vec<DbArtifact> = artifacts::table
-        .filter(artifacts::job_id.eq(job_id))
-        .order(artifacts::version.desc())
-        .load(conn)
-        .map_err(|e| format!("Failed to query artifacts: {}", e))?;
+pub(crate) fn artifact_from_row(row: &turso::Row) -> Result<Artifact, DbError> {
+    let data: Value = serde_json::from_str(&row.text(4)?)
+        .map_err(|e| DbError::internal(format!("Invalid artifact data JSON: {e}")))?;
 
-    db_artifacts
-        .into_iter()
-        .map(|db| Artifact::try_from(db).map_err(|e| format!("Failed to parse artifact: {}", e)))
-        .collect()
+    Ok(Artifact {
+        id: row.text(0)?,
+        job_id: row.opt_text(1)?,
+        artifact_type: row.text(2)?,
+        schema_version: row.i64(3)? as i32,
+        data,
+        version: row.i64(5)? as i32,
+        parent_version_id: row.opt_text(6)?,
+        output_name: row.opt_text(7)?,
+        created_at: row.i64(8)?,
+        updated_at: row.i64(9)?,
+        seen_at: row.opt_i64(10)?,
+        confirmed: row.i64(11)? != 0,
+    })
 }
 
-/// Get the latest artifact for a job.
-pub fn get_latest(conn: &mut SqliteConnection, job_id: &str) -> Result<Option<Artifact>, String> {
-    let db_artifact: Option<DbArtifact> = artifacts::table
-        .filter(artifacts::job_id.eq(job_id))
-        .order(artifacts::version.desc())
-        .first(conn)
-        .optional()
-        .map_err(|e| format!("Failed to query artifact: {}", e))?;
-
-    match db_artifact {
-        Some(db) => Artifact::try_from(db)
-            .map(Some)
-            .map_err(|e| format!("Failed to parse artifact: {}", e)),
-        None => Ok(None),
-    }
+pub async fn get(db: &LocalDb, artifact_id: &str) -> Result<Artifact, String> {
+    let artifact_id = artifact_id.to_string();
+    db.query_opt(
+        format!("SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE id = ?1"),
+        params![artifact_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .and_then(|artifact| {
+        artifact.ok_or_else(|| DbError::internal(format!("Artifact not found: {artifact_id}")))
+    })
+    .map_err(|e| db_error("Failed to get artifact", e))
 }
 
-/// Mark an artifact as seen (sets seen_at timestamp).
-pub fn mark_seen(conn: &mut SqliteConnection, artifact_id: &str) -> Result<(), String> {
-    let now = chrono::Utc::now().timestamp() as i32;
-    diesel::update(artifacts::table.find(artifact_id))
-        .set(artifacts::seen_at.eq(now))
-        .execute(conn)
-        .map_err(|e| format!("Failed to mark artifact seen: {}", e))?;
-    Ok(())
+pub async fn list(db: &LocalDb, job_id: &str) -> Result<Vec<Artifact>, String> {
+    let job_id = job_id.to_string();
+    db.query_all(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM artifacts
+             WHERE job_id = ?1
+             ORDER BY version DESC"
+        ),
+        params![job_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to list artifacts", e))
 }
 
-/// Get the latest artifact for each job in an issue.
-pub fn list_for_issue(
-    conn: &mut SqliteConnection,
-    issue_id: &str,
-) -> Result<Vec<Artifact>, String> {
-    let job_ids: Vec<String> = jobs::table
-        .filter(jobs::issue_id.eq(issue_id))
-        .select(jobs::id)
-        .load(conn)
-        .map_err(|e| format!("Failed to query jobs: {}", e))?;
+pub async fn get_latest(db: &LocalDb, job_id: &str) -> Result<Option<Artifact>, String> {
+    let job_id = job_id.to_string();
+    db.query_opt(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM artifacts
+             WHERE job_id = ?1
+             ORDER BY version DESC
+             LIMIT 1"
+        ),
+        params![job_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to get latest artifact", e))
+}
 
-    let mut result = Vec::new();
-    for job_id in job_ids {
-        let db_artifact: Option<DbArtifact> = artifacts::table
-            .filter(artifacts::job_id.eq(&job_id))
-            .order(artifacts::version.desc())
-            .first(conn)
-            .optional()
-            .map_err(|e| format!("Failed to query artifact: {}", e))?;
+pub async fn mark_seen(db: &LocalDb, artifact_id: &str) -> Result<(), String> {
+    let seen_at = chrono::Utc::now().timestamp();
+    mark_seen_at(db, artifact_id, seen_at).await
+}
 
-        if let Some(db) = db_artifact {
-            let artifact =
-                Artifact::try_from(db).map_err(|e| format!("Failed to parse artifact: {}", e))?;
-            result.push(artifact);
-        }
-    }
+pub async fn mark_seen_at(db: &LocalDb, artifact_id: &str, seen_at: i64) -> Result<(), String> {
+    let artifact_id = artifact_id.to_string();
+    db.execute(
+        "UPDATE artifacts SET seen_at = ?1 WHERE id = ?2",
+        params![seen_at, artifact_id.as_str()],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| db_error("Failed to mark artifact seen", e))
+}
 
-    Ok(result)
+pub async fn list_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<Artifact>, String> {
+    let issue_id = issue_id.to_string();
+    db.query_all(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM (
+                SELECT
+                    a.id, a.job_id, a.artifact_type, a.schema_version, a.data,
+                    a.version, a.parent_version_id, a.output_name, a.created_at,
+                    a.updated_at, a.seen_at, a.confirmed,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY a.job_id
+                        ORDER BY a.version DESC
+                    ) AS artifact_rank
+                FROM artifacts a
+                INNER JOIN jobs j ON j.id = a.job_id
+                WHERE j.issue_id = ?1
+             ) ranked_artifacts
+             WHERE artifact_rank = 1"
+        ),
+        params![issue_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to list artifacts for issue", e))
 }

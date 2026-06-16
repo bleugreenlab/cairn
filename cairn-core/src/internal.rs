@@ -1,20 +1,42 @@
 //! Unstable host-facing runtime surface for Cairn's first-party apps.
 //!
 //! This module is gated behind the non-default `internal-api` feature and is not
-//! part of the intended semver contract for third-party consumers.
+//! part of the intended semver contract for third-party consumers. The host
+//! crates (the Tauri app in `src-tauri/src` and `cairn-server`) reach the
+//! crate's implementation modules through `cairn_core::internal::<module>::...`.
+//!
+//! ## Maintenance: this list must stay complete
+//!
+//! Each entry re-exports an entire top-level crate module wholesale via
+//! `pub mod <name> { pub use crate::<name>::*; }`. The glob re-export carries
+//! every public item and every public submodule along with it, so the host
+//! crates can reach the full public depth of a module
+//! (`internal::workspace::bundle::...`, `internal::mcp::handlers::...`) without
+//! any per-item edit here. Adding a function to `jobs/queries.rs`, or an
+//! entirely new submodule under one of these modules, needs no change to this
+//! file.
+//!
+//! The wrapper module is required, not stylistic: the implementation modules are
+//! declared `mod <name>;` (private) in `lib.rs`, and Rust forbids re-exporting a
+//! private module by name (`pub use crate::<name>;` fails with E0365). Wrapping
+//! the glob in a fresh `pub mod` is the legal way to surface a private module's
+//! public contents to another crate.
+//!
+//! The one change that DOES require an edit here is introducing a brand-new
+//! top-level module in `lib.rs` that a host crate needs to call. A top-level
+//! module absent from this list is invisible to the host crates, and the symptom
+//! is a confusing unresolved-path error at the call site rather than anything
+//! pointing back here. When a host crate cannot resolve
+//! `cairn_core::internal::<module>`, add a matching wrapper entry below.
+//! Over-exposing is harmless: this whole surface is unstable and feature-gated,
+//! so the safe default is to add the module.
+//!
+//! Only modules the host crates actually consume belong here. Modules that are
+//! purely internal to `cairn-core` (their submodules are private, with no host
+//! caller) are intentionally omitted.
 
 pub mod agent_process {
-    pub mod gc {
-        pub use crate::agent_process::gc::*;
-    }
-
-    pub mod process {
-        pub use crate::agent_process::process::*;
-    }
-
-    pub mod stream {
-        pub use crate::agent_process::stream::*;
-    }
+    pub use crate::agent_process::*;
 }
 
 pub mod api {
@@ -22,60 +44,27 @@ pub mod api {
 }
 
 pub mod backends {
-    pub use crate::backends::{
-        backend_for_model, backend_for_name, AgentBackend, AgentPermissions, ProviderModelCatalog,
-        ResolvedTools, SessionConfig,
-    };
-
-    pub mod codex {
-        pub mod app_server {
-            pub use crate::backends::codex::app_server::*;
-        }
-    }
-
-    pub mod stdin {
-        pub use crate::backends::stdin::*;
-    }
+    pub use crate::backends::*;
 }
 
 pub mod db {
     pub use crate::db::*;
 }
 
-pub mod diesel_models {
-    pub use crate::diesel_models::*;
+pub mod db_records {
+    pub use crate::db_records::*;
+}
+
+pub mod dispatch {
+    pub use crate::dispatch::*;
 }
 
 pub mod effects {
-    pub mod executor {
-        pub use crate::effects::executor::*;
-    }
-
-    pub mod outbox {
-        pub use crate::effects::outbox::*;
-    }
-
-    pub mod run {
-        pub use crate::effects::run::*;
-    }
-
-    pub mod types {
-        pub use crate::effects::types::*;
-    }
+    pub use crate::effects::*;
 }
 
 pub mod embeddings {
-    pub use crate::embeddings::{
-        backfill_session, extract_embeddable_text, init_blocking, EmbeddingEngine, VibeState,
-    };
-
-    pub mod queries {
-        pub use crate::embeddings::queries::*;
-    }
-
-    pub mod vibes {
-        pub use crate::embeddings::vibes::*;
-    }
+    pub use crate::embeddings::*;
 }
 
 pub mod env {
@@ -83,159 +72,27 @@ pub mod env {
 }
 
 pub mod execution {
-    pub use crate::execution::Initiator;
-
-    pub mod actions {
-        pub use crate::execution::actions::*;
-    }
-
-    pub mod advancement {
-        pub use crate::execution::advancement::*;
-    }
-
-    pub mod cache {
-        pub use crate::execution::cache::*;
-    }
-
-    pub mod checkpoints {
-        pub use crate::execution::checkpoints::*;
-    }
-
-    pub mod conditions {
-        pub use crate::execution::conditions::*;
-    }
-
-    pub mod creation {
-        pub use crate::execution::creation::*;
-    }
-
-    pub mod dag {
-        pub use crate::execution::dag::*;
-    }
-
-    pub mod dispatch {
-        pub use crate::execution::dispatch::*;
-    }
-
-    pub mod jobs {
-        pub use crate::execution::jobs::*;
-    }
-
-    pub mod queries {
-        pub use crate::execution::queries::*;
-    }
-
-    pub mod recipe {
-        pub use crate::execution::recipe::*;
-    }
+    pub use crate::execution::*;
 }
 
 pub mod git {
-    pub mod worktree {
-        pub use crate::git::worktree::*;
-    }
+    pub use crate::git::*;
 }
 
 pub mod identity {
     pub use crate::identity::*;
+}
 
-    pub mod local {
-        pub use crate::identity::local::*;
-    }
+pub mod jobs {
+    pub use crate::jobs::*;
 }
 
 pub mod mcp {
-    pub use crate::mcp::McpAuthState;
+    pub use crate::mcp::*;
+}
 
-    pub mod auth {
-        pub use crate::mcp::auth::*;
-    }
-
-    pub mod git {
-        pub use crate::mcp::git::*;
-    }
-
-    pub mod handlers {
-        pub mod agents {
-            pub use crate::mcp::handlers::agents::*;
-        }
-
-        pub mod bash {
-            pub use crate::mcp::handlers::bash::*;
-        }
-
-        pub mod bug_report {
-            pub use crate::mcp::handlers::bug_report::*;
-        }
-
-        pub mod custom_tool {
-            pub use crate::mcp::handlers::custom_tool::*;
-        }
-
-        pub mod execute {
-            pub use crate::mcp::handlers::execute::*;
-        }
-
-        pub mod external {
-            pub use crate::mcp::handlers::external::*;
-        }
-
-        pub mod files {
-            pub use crate::mcp::handlers::files::*;
-        }
-
-        pub mod implementation {
-            pub use crate::mcp::handlers::implementation::*;
-        }
-
-        pub mod issue_resources {
-            pub use crate::mcp::handlers::issue_resources::*;
-        }
-
-        pub mod issues {
-            pub use crate::mcp::handlers::issues::*;
-        }
-
-        pub mod memories {
-            pub use crate::mcp::handlers::memories::*;
-        }
-
-        pub mod messages {
-            pub use crate::mcp::handlers::messages::*;
-        }
-
-        pub mod permission {
-            pub use crate::mcp::handlers::permission::*;
-        }
-
-        pub mod planning {
-            pub use crate::mcp::handlers::planning::*;
-        }
-
-        pub mod resources {
-            pub use crate::mcp::handlers::resources::*;
-        }
-
-        pub mod search {
-            pub use crate::mcp::handlers::search::*;
-        }
-
-        pub mod skills {
-            pub use crate::mcp::handlers::skills::*;
-        }
-
-        pub mod slug {
-            pub use crate::mcp::handlers::slug::*;
-        }
-
-        pub mod todos {
-            pub use crate::mcp::handlers::todos::*;
-        }
-    }
-
-    pub mod types {
-        pub use crate::mcp::types::*;
-    }
+pub mod node_segments {
+    pub use crate::node_segments::*;
 }
 
 pub mod notify {
@@ -243,38 +100,21 @@ pub mod notify {
 }
 
 pub mod orchestrator {
-    pub use crate::orchestrator::{AccountManager, Orchestrator, OrchestratorBuilder};
-
-    pub mod conflict_resolution {
-        pub use crate::orchestrator::conflict_resolution::*;
-    }
-
-    pub mod lifecycle {
-        pub use crate::orchestrator::lifecycle::*;
-    }
-
-    pub mod session {
-        pub use crate::orchestrator::session::*;
-    }
-}
-
-pub mod schema {
-    pub use crate::schema::*;
+    pub use crate::orchestrator::*;
 }
 
 pub mod services {
     pub use crate::services::*;
+}
 
-    #[cfg(any(test, feature = "test-utils"))]
-    pub mod testing {
-        pub use crate::services::testing::*;
-    }
+pub mod storage {
+    pub use crate::storage::*;
 }
 
 pub mod sync {
     pub use crate::sync::*;
+}
 
-    pub mod initial {
-        pub use crate::sync::initial::*;
-    }
+pub mod workspace {
+    pub use crate::workspace::*;
 }

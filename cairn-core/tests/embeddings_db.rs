@@ -1,459 +1,440 @@
-//! Integration tests for embedding database queries.
-//!
-//! Tests the CRUD operations in `cairn_core::internal::embeddings::queries`
-//! against an in-memory SQLite database with migrations applied.
+//! Integration tests for the Cohere embedding storage model
+//! (resource_embeddings + event_vibes).
 
 mod common;
 
-use cairn_core::internal::embeddings::queries;
+use cairn_core::internal::embeddings::{queries, vector, EmbedJob};
+use cairn_core::internal::storage::LocalDb;
+use turso::params;
 
-/// Helper: create a test run and return its ID.
-fn create_test_run(conn: &mut diesel::SqliteConnection) -> String {
+async fn create_test_run(db: &LocalDb) -> String {
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
-
-    diesel::sql_query(
-        "INSERT INTO runs (id, status, created_at, updated_at) VALUES (?, 'running', ?, ?)",
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "INSERT INTO runs (id, status, created_at, updated_at)
+         VALUES (?1, 'running', ?2, ?3)",
+        params![id.as_str(), now, now],
     )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(conn)
-    .expect("Failed to create test run");
-
+    .await
+    .unwrap();
     id
 }
 
-/// Helper: create a test event and return its ID.
-fn create_test_event(
-    conn: &mut diesel::SqliteConnection,
+async fn create_test_event_with_session(
+    db: &LocalDb,
     run_id: &str,
     event_type: &str,
-    sequence: i32,
-    data: &str,
-) -> String {
-    create_test_event_with_session(conn, run_id, event_type, sequence, data, None)
-}
-
-/// Helper: create a test event with optional session_id and return its ID.
-fn create_test_event_with_session(
-    conn: &mut diesel::SqliteConnection,
-    run_id: &str,
-    event_type: &str,
-    sequence: i32,
+    sequence: i64,
     data: &str,
     session_id: Option<&str>,
 ) -> String {
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
-
-    diesel::sql_query(
-        "INSERT INTO events (id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind::<diesel::sql_types::Text, _>(&id)
-    .bind::<diesel::sql_types::Text, _>(run_id)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(session_id)
-    .bind::<diesel::sql_types::Integer, _>(sequence)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .bind::<diesel::sql_types::Text, _>(event_type)
-    .bind::<diesel::sql_types::Text, _>(data)
-    .bind::<diesel::sql_types::Integer, _>(now)
-    .execute(conn)
-    .expect("Failed to create test event");
-
+    let run_id = run_id.to_string();
+    let event_type = event_type.to_string();
+    let data = data.to_string();
+    let session_id = session_id.map(str::to_string);
+    let now = chrono::Utc::now().timestamp();
+    db.write(|conn| {
+        let id = id.clone();
+        let run_id = run_id.clone();
+        let event_type = event_type.clone();
+        let data = data.clone();
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO events (
+                    id, run_id, session_id, sequence, timestamp, event_type, data, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    id.as_str(),
+                    run_id.as_str(),
+                    session_id.as_deref(),
+                    sequence,
+                    now,
+                    event_type.as_str(),
+                    data.as_str(),
+                    now
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
     id
 }
 
-use diesel::prelude::*;
-
-#[test]
-fn upsert_and_get_embedding() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-    let event_id = create_test_event(
-        &mut conn,
-        &run_id,
-        "assistant",
-        1,
-        r#"{"content": "hello"}"#,
-    );
-
-    let embedding_data = vec![1.0_f32, 2.0, 3.0];
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&embedding_data);
-
-    // Insert
-    queries::upsert_embedding(&mut conn, &event_id, &bytes, "test-model", 3).unwrap();
-
-    // Retrieve
-    let result = queries::get_embedding(&mut conn, &event_id).unwrap();
-    assert!(result.is_some());
-    let emb = result.unwrap();
-    assert_eq!(emb.event_id, event_id);
-    assert_eq!(emb.model_name, "test-model");
-    assert_eq!(emb.dimensions, 3);
-
-    // Verify the bytes roundtrip
-    let recovered = cairn_core::internal::embeddings::EmbeddingEngine::from_bytes(&emb.embedding);
-    assert_eq!(recovered, embedding_data);
+async fn create_test_event(
+    db: &LocalDb,
+    run_id: &str,
+    event_type: &str,
+    sequence: i64,
+    data: &str,
+) -> String {
+    create_test_event_with_session(db, run_id, event_type, sequence, data, None).await
 }
 
-#[test]
-fn upsert_replaces_existing_embedding() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-    let event_id = create_test_event(
-        &mut conn,
-        &run_id,
-        "assistant",
-        1,
-        r#"{"content": "hello"}"#,
-    );
+// ===== resource_embeddings =====
 
-    let bytes_v1 = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0, 2.0, 3.0]);
-    let bytes_v2 = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[4.0, 5.0, 6.0]);
-
-    queries::upsert_embedding(&mut conn, &event_id, &bytes_v1, "model-v1", 3).unwrap();
-    queries::upsert_embedding(&mut conn, &event_id, &bytes_v2, "model-v2", 3).unwrap();
-
-    let result = queries::get_embedding(&mut conn, &event_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(result.model_name, "model-v2");
-    let recovered =
-        cairn_core::internal::embeddings::EmbeddingEngine::from_bytes(&result.embedding);
-    assert_eq!(recovered, vec![4.0, 5.0, 6.0]);
-
-    // Should still be only one row
-    let count = queries::count_embeddings(&mut conn).unwrap();
-    assert_eq!(count, 1);
-}
-
-#[test]
-fn get_embedding_returns_none_for_missing() {
-    let mut conn = common::test_conn();
-    let result = queries::get_embedding(&mut conn, "nonexistent").unwrap();
-    assert!(result.is_none());
-}
-
-#[test]
-fn get_embeddings_for_events_batch() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-
-    let id1 = create_test_event(&mut conn, &run_id, "assistant", 1, r#"{"content": "a"}"#);
-    let id2 = create_test_event(&mut conn, &run_id, "assistant", 2, r#"{"content": "b"}"#);
-    let id3 = create_test_event(&mut conn, &run_id, "assistant", 3, r#"{"content": "c"}"#);
-
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0, 2.0]);
-    queries::upsert_embedding(&mut conn, &id1, &bytes, "test", 2).unwrap();
-    queries::upsert_embedding(&mut conn, &id2, &bytes, "test", 2).unwrap();
-    // id3 intentionally not embedded
-
-    let results =
-        queries::get_embeddings_for_events(&mut conn, &[id1.clone(), id2.clone(), id3.clone()])
-            .unwrap();
-    assert_eq!(results.len(), 2);
-
-    let ids: Vec<&str> = results.iter().map(|e| e.event_id.as_str()).collect();
-    assert!(ids.contains(&id1.as_str()));
-    assert!(ids.contains(&id2.as_str()));
-}
-
-#[test]
-fn get_embeddings_for_run_orders_by_sequence() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-
-    // Insert events out of order
-    let id2 = create_test_event(
-        &mut conn,
-        &run_id,
-        "assistant",
-        2,
-        r#"{"content": "second"}"#,
-    );
-    let id1 = create_test_event(
-        &mut conn,
-        &run_id,
-        "assistant",
-        1,
-        r#"{"content": "first"}"#,
-    );
-    let id3 = create_test_event(
-        &mut conn,
-        &run_id,
-        "assistant",
-        3,
-        r#"{"content": "third"}"#,
-    );
-
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0]);
-    queries::upsert_embedding(&mut conn, &id1, &bytes, "test", 1).unwrap();
-    queries::upsert_embedding(&mut conn, &id2, &bytes, "test", 1).unwrap();
-    queries::upsert_embedding(&mut conn, &id3, &bytes, "test", 1).unwrap();
-
-    let results = queries::get_embeddings_for_run(&mut conn, &run_id).unwrap();
-    assert_eq!(results.len(), 3);
-
-    // Verify ordering by sequence
-    let sequences: Vec<i32> = results.iter().map(|(_, seq)| *seq).collect();
-    assert_eq!(sequences, vec![1, 2, 3]);
-
-    // Verify event IDs match sequence order
-    assert_eq!(results[0].0.event_id, id1);
-    assert_eq!(results[1].0.event_id, id2);
-    assert_eq!(results[2].0.event_id, id3);
-}
-
-#[test]
-fn find_unembedded_events_only_returns_assistant_events_without_embeddings() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-
-    // assistant event with embedding
-    let id1 = create_test_event(&mut conn, &run_id, "assistant", 1, r#"{"content": "a"}"#);
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0]);
-    queries::upsert_embedding(&mut conn, &id1, &bytes, "test", 1).unwrap();
-
-    // assistant event without embedding (should be found)
-    let id2 = create_test_event(&mut conn, &run_id, "assistant", 2, r#"{"content": "b"}"#);
-
-    // tool_use event without embedding (should NOT be found — not assistant)
-    let _id3 = create_test_event(
-        &mut conn,
-        &run_id,
-        "tool_use",
-        3,
-        r#"{"tool": "read", "input": {}}"#,
-    );
-
-    // system event without embedding (should NOT be found)
-    let _id4 = create_test_event(
-        &mut conn,
-        &run_id,
-        "system",
-        4,
-        r#"{"content": "system msg"}"#,
-    );
-
-    let unembedded = queries::find_unembedded_events(&mut conn, 100).unwrap();
-    assert_eq!(unembedded.len(), 1);
-    assert_eq!(unembedded[0].0, id2);
-}
-
-#[test]
-fn find_unembedded_events_respects_limit() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-
-    for i in 0..5 {
-        create_test_event(
-            &mut conn,
-            &run_id,
-            "assistant",
-            i,
-            &format!(r#"{{"content": "msg {}"}}"#, i),
-        );
-    }
-
-    let unembedded = queries::find_unembedded_events(&mut conn, 3).unwrap();
-    assert_eq!(unembedded.len(), 3);
-}
-
-#[test]
-fn count_embeddings_and_embeddable_events() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-
-    // 3 assistant events, 1 tool_use event
-    let id1 = create_test_event(&mut conn, &run_id, "assistant", 1, r#"{"content": "a"}"#);
-    let _id2 = create_test_event(&mut conn, &run_id, "assistant", 2, r#"{"content": "b"}"#);
-    let _id3 = create_test_event(&mut conn, &run_id, "assistant", 3, r#"{"content": "c"}"#);
-    let _id4 = create_test_event(&mut conn, &run_id, "tool_use", 4, r#"{"tool": "read"}"#);
-
-    // Only 1 embedded so far
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0]);
-    queries::upsert_embedding(&mut conn, &id1, &bytes, "test", 1).unwrap();
-
-    assert_eq!(queries::count_embeddings(&mut conn).unwrap(), 1);
-    assert_eq!(queries::count_embeddable_events(&mut conn).unwrap(), 3);
-}
-
-#[test]
-fn embedding_deleted_on_event_cascade() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-    let event_id = create_test_event(
-        &mut conn,
-        &run_id,
-        "assistant",
-        1,
-        r#"{"content": "hello"}"#,
-    );
-
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0, 2.0]);
-    queries::upsert_embedding(&mut conn, &event_id, &bytes, "test", 2).unwrap();
-
-    // Verify embedding exists
-    assert!(queries::get_embedding(&mut conn, &event_id)
-        .unwrap()
-        .is_some());
-
-    // Delete the event
-    diesel::sql_query("DELETE FROM events WHERE id = ?")
-        .bind::<diesel::sql_types::Text, _>(&event_id)
-        .execute(&mut conn)
+#[tokio::test]
+async fn upsert_and_get_resource_embedding() {
+    let (_temp, db) = common::migrated_db().await;
+    let bytes = vector::to_bytes(&[1.0_f32, 2.0, 3.0]);
+    let uri = "cairn://p/PROJ/1";
+    queries::upsert_resource_embedding_async(&db, uri, &bytes, "cohere-embed-v4", 3)
+        .await
         .unwrap();
 
-    // Embedding should be cascade-deleted
-    assert!(queries::get_embedding(&mut conn, &event_id)
+    let got = queries::get_resource_embedding_async(&db, uri)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.uri, uri);
+    assert_eq!(got.model, "cohere-embed-v4");
+    assert_eq!(got.dims, 3);
+    assert_eq!(vector::from_bytes(&got.embedding), vec![1.0, 2.0, 3.0]);
+}
+
+#[tokio::test]
+async fn upsert_replaces_resource_embedding() {
+    let (_temp, db) = common::migrated_db().await;
+    let uri = "cairn://skills/abc";
+    queries::upsert_resource_embedding_async(&db, uri, &vector::to_bytes(&[1.0, 2.0]), "m1", 2)
+        .await
+        .unwrap();
+    queries::upsert_resource_embedding_async(&db, uri, &vector::to_bytes(&[4.0, 5.0]), "m2", 2)
+        .await
+        .unwrap();
+
+    let got = queries::get_resource_embedding_async(&db, uri)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.model, "m2");
+    assert_eq!(vector::from_bytes(&got.embedding), vec![4.0, 5.0]);
+    assert_eq!(
+        queries::count_resource_embeddings_async(&db).await.unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn get_resource_embedding_returns_none_for_missing() {
+    let (_temp, db) = common::migrated_db().await;
+    assert!(queries::get_resource_embedding_async(&db, "cairn://nope")
+        .await
         .unwrap()
         .is_none());
 }
 
-#[test]
-fn get_embeddings_for_session_filters_by_session_id() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
+#[tokio::test]
+async fn delete_resource_embedding_removes_row() {
+    let (_temp, db) = common::migrated_db().await;
+    let uri = "cairn://memory/x";
+    queries::upsert_resource_embedding_async(&db, uri, &vector::to_bytes(&[1.0]), "m", 1)
+        .await
+        .unwrap();
+    queries::delete_resource_embedding_async(&db, uri)
+        .await
+        .unwrap();
+    assert!(queries::get_resource_embedding_async(&db, uri)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        queries::count_resource_embeddings_async(&db).await.unwrap(),
+        0
+    );
+}
 
-    let session_a = "session-aaa";
-    let session_b = "session-bbb";
+/// The worker routes a blank-text resource job to a delete. Simulate the path:
+/// seed a row, then apply the job `EmbedJob::resource` produces for empty text
+/// and confirm the row is gone. This is what an issue updated to a blank
+/// description does end-to-end (minus the network embed call).
+#[tokio::test]
+async fn blank_resource_text_deletes_existing_row() {
+    let (_temp, db) = common::migrated_db().await;
+    let uri = "cairn://p/PROJ/7";
+    queries::upsert_resource_embedding_async(&db, uri, &vector::to_bytes(&[1.0, 2.0]), "m", 2)
+        .await
+        .unwrap();
 
-    // Events in session A
-    let id1 = create_test_event_with_session(
-        &mut conn,
+    match EmbedJob::resource(uri, "   ".to_string()) {
+        EmbedJob::ResourceDelete { uri } => {
+            queries::delete_resource_embedding_async(&db, &uri)
+                .await
+                .unwrap();
+        }
+        other => panic!("expected ResourceDelete, got {other:?}"),
+    }
+
+    assert!(queries::get_resource_embedding_async(&db, uri)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// A non-empty resource job upserts the vector under its URI.
+#[tokio::test]
+async fn nonempty_resource_text_upserts_row() {
+    let (_temp, db) = common::migrated_db().await;
+    let uri = "cairn://skills/demo";
+    match EmbedJob::resource(uri, "a real description".to_string()) {
+        EmbedJob::Resource { uri, text } => {
+            assert_eq!(text, "a real description");
+            // The worker would embed `text`; here we persist a stand-in vector.
+            queries::upsert_resource_embedding_async(&db, &uri, &vector::to_bytes(&[0.5]), "m", 1)
+                .await
+                .unwrap();
+        }
+        other => panic!("expected Resource, got {other:?}"),
+    }
+    assert!(queries::get_resource_embedding_async(&db, uri)
+        .await
+        .unwrap()
+        .is_some());
+}
+
+// ===== event_vibes =====
+
+#[tokio::test]
+async fn upsert_and_read_event_vibe() {
+    let (_temp, db) = common::migrated_db().await;
+    let run_id = create_test_run(&db).await;
+    let session = "sess-1";
+    let event_id = create_test_event_with_session(
+        &db,
         &run_id,
         "assistant",
         1,
-        r#"{"content": "a1"}"#,
-        Some(session_a),
-    );
-    let id2 = create_test_event_with_session(
-        &mut conn,
+        r#"{"content":"hi"}"#,
+        Some(session),
+    )
+    .await;
+
+    queries::upsert_event_vibe_async(
+        &db,
+        &event_id,
+        Some(session),
+        "oklch(0.65 0.250 250)",
+        0.42,
+        0.83,
+        "cohere-embed-v4",
+    )
+    .await
+    .unwrap();
+
+    let vibes = queries::get_event_vibes_for_session_async(&db, session)
+        .await
+        .unwrap();
+    assert_eq!(vibes.len(), 1);
+    assert_eq!(vibes[0].event_id, event_id);
+    assert_eq!(vibes[0].css_color, "oklch(0.65 0.250 250)");
+    assert!((vibes[0].phase - 0.42).abs() < 1e-4);
+    assert!((vibes[0].friction - 0.83).abs() < 1e-4);
+}
+
+#[tokio::test]
+async fn event_vibe_deleted_on_event_cascade() {
+    let (_temp, db) = common::migrated_db().await;
+    let run_id = create_test_run(&db).await;
+    let session = "sess-cascade";
+    let event_id = create_test_event_with_session(
+        &db,
+        &run_id,
+        "assistant",
+        1,
+        r#"{"content":"x"}"#,
+        Some(session),
+    )
+    .await;
+    queries::upsert_event_vibe_async(&db, &event_id, Some(session), "oklch(...)", 0.3, 0.7, "m")
+        .await
+        .unwrap();
+
+    db.write(|conn| {
+        let event_id = event_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "DELETE FROM events WHERE id = ?1",
+                params![event_id.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(queries::get_event_vibes_for_session_async(&db, session)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn get_event_vibes_for_session_filters_and_orders() {
+    let (_temp, db) = common::migrated_db().await;
+    let run_id = create_test_run(&db).await;
+    let session_a = "sa";
+    let session_b = "sb";
+
+    let e2 = create_test_event_with_session(
+        &db,
         &run_id,
         "assistant",
         2,
-        r#"{"content": "a2"}"#,
+        r#"{"content":"a2"}"#,
         Some(session_a),
-    );
-
-    // Event in session B
-    let id3 = create_test_event_with_session(
-        &mut conn,
+    )
+    .await;
+    let e1 = create_test_event_with_session(
+        &db,
         &run_id,
         "assistant",
-        3,
-        r#"{"content": "b1"}"#,
+        1,
+        r#"{"content":"a1"}"#,
+        Some(session_a),
+    )
+    .await;
+    let eb = create_test_event_with_session(
+        &db,
+        &run_id,
+        "assistant",
+        1,
+        r#"{"content":"b1"}"#,
         Some(session_b),
-    );
+    )
+    .await;
 
-    // Event with no session
-    let id4 = create_test_event(&mut conn, &run_id, "assistant", 4, r#"{"content": "none"}"#);
+    for id in [&e1, &e2, &eb] {
+        queries::upsert_event_vibe_async(&db, id, None, "oklch()", 0.5, 0.6, "m")
+            .await
+            .unwrap();
+    }
 
-    // Embed all four
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0, 2.0]);
-    queries::upsert_embedding(&mut conn, &id1, &bytes, "test", 2).unwrap();
-    queries::upsert_embedding(&mut conn, &id2, &bytes, "test", 2).unwrap();
-    queries::upsert_embedding(&mut conn, &id3, &bytes, "test", 2).unwrap();
-    queries::upsert_embedding(&mut conn, &id4, &bytes, "test", 2).unwrap();
+    let a = queries::get_event_vibes_for_session_async(&db, session_a)
+        .await
+        .unwrap();
+    assert_eq!(a.len(), 2);
+    // ordered by created_at then sequence; e1 (seq 1) before e2 (seq 2)
+    assert_eq!(a[0].event_id, e1);
+    assert_eq!(a[1].event_id, e2);
 
-    // Query session A — should only get id1 and id2
-    let results = queries::get_embeddings_for_session(&mut conn, session_a).unwrap();
-    assert_eq!(results.len(), 2);
-    let ids: Vec<&str> = results.iter().map(|e| e.event_id.as_str()).collect();
-    assert!(ids.contains(&id1.as_str()));
-    assert!(ids.contains(&id2.as_str()));
-
-    // Query session B — should only get id3
-    let results = queries::get_embeddings_for_session(&mut conn, session_b).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].event_id, id3);
+    let b = queries::get_event_vibes_for_session_async(&db, session_b)
+        .await
+        .unwrap();
+    assert_eq!(b.len(), 1);
+    assert_eq!(b[0].event_id, eb);
 }
 
-#[test]
-fn get_embeddings_for_session_orders_by_created_at_and_sequence() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-    let session = "session-ordered";
+#[tokio::test]
+async fn get_event_vibes_for_events_returns_only_requested_ids() {
+    let (_temp, db) = common::migrated_db().await;
+    let run_id = create_test_run(&db).await;
+    let session = "event-list";
 
-    // Insert events out of order (sequence 3, 1, 2)
-    let id3 = create_test_event_with_session(
-        &mut conn,
+    let e1 = create_test_event_with_session(
+        &db,
+        &run_id,
+        "assistant",
+        1,
+        r#"{"content":"a1"}"#,
+        Some(session),
+    )
+    .await;
+    let e2 = create_test_event_with_session(
+        &db,
+        &run_id,
+        "assistant",
+        2,
+        r#"{"content":"a2"}"#,
+        Some(session),
+    )
+    .await;
+    let e3 = create_test_event_with_session(
+        &db,
         &run_id,
         "assistant",
         3,
-        r#"{"content": "third"}"#,
+        r#"{"content":"a3"}"#,
         Some(session),
-    );
-    let id1 = create_test_event_with_session(
-        &mut conn,
-        &run_id,
-        "assistant",
-        1,
-        r#"{"content": "first"}"#,
-        Some(session),
-    );
-    let id2 = create_test_event_with_session(
-        &mut conn,
-        &run_id,
-        "assistant",
-        2,
-        r#"{"content": "second"}"#,
-        Some(session),
-    );
+    )
+    .await;
 
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0]);
-    queries::upsert_embedding(&mut conn, &id1, &bytes, "test", 1).unwrap();
-    queries::upsert_embedding(&mut conn, &id2, &bytes, "test", 1).unwrap();
-    queries::upsert_embedding(&mut conn, &id3, &bytes, "test", 1).unwrap();
+    for id in [&e1, &e2, &e3] {
+        queries::upsert_event_vibe_async(&db, id, None, "oklch()", 0.5, 0.6, "m")
+            .await
+            .unwrap();
+    }
 
-    let results = queries::get_embeddings_for_session(&mut conn, session).unwrap();
-    assert_eq!(results.len(), 3);
+    let requested = vec![e2.clone(), "missing-event".to_string(), e1.clone()];
+    let vibes = queries::get_event_vibes_for_events_async(&db, &requested)
+        .await
+        .unwrap();
 
-    // Should be ordered by (created_at, sequence) — since all have same created_at
-    // (same timestamp resolution), sequence should break the tie
-    // The events were inserted as seq 3, 1, 2 but should come back as 1, 2, 3
-    assert_eq!(results[0].event_id, id1);
-    assert_eq!(results[1].event_id, id2);
-    assert_eq!(results[2].event_id, id3);
+    assert_eq!(vibes.len(), 2);
+    assert_eq!(vibes[0].event_id, e2);
+    assert_eq!(vibes[1].event_id, e1);
 }
 
-#[test]
-fn get_embeddings_for_session_returns_empty_for_unknown_session() {
-    let mut conn = common::test_conn();
-    let results = queries::get_embeddings_for_session(&mut conn, "nonexistent").unwrap();
-    assert!(results.is_empty());
+// Silence unused-helper warning for the no-session constructor under some configs.
+#[tokio::test]
+async fn create_event_without_session_compiles() {
+    let (_temp, db) = common::migrated_db().await;
+    let run_id = create_test_run(&db).await;
+    let _ = create_test_event(&db, &run_id, "assistant", 1, r#"{"content":"x"}"#).await;
 }
 
-#[test]
-fn get_embeddings_for_session_excludes_events_without_embeddings() {
-    let mut conn = common::test_conn();
-    let run_id = create_test_run(&mut conn);
-    let session = "session-partial";
+/// Verify the recommender's query path: `vector_distance_cos` over plain f32
+/// BLOBs, with the query vector built by `vector32`, executes on the live Turso
+/// engine and ranks the nearest vector first.
+#[tokio::test]
+async fn vector_distance_cos_executes_and_ranks() {
+    use cairn_core::internal::storage::{DbError, RowExt};
 
-    let id1 = create_test_event_with_session(
-        &mut conn,
-        &run_id,
-        "assistant",
-        1,
-        r#"{"content": "embedded"}"#,
-        Some(session),
-    );
-    let _id2 = create_test_event_with_session(
-        &mut conn,
-        &run_id,
-        "assistant",
-        2,
-        r#"{"content": "not embedded"}"#,
-        Some(session),
-    );
+    let (_temp, db) = common::migrated_db().await;
+    queries::upsert_resource_embedding_async(
+        &db,
+        "cairn://a",
+        &vector::to_bytes(&[1.0, 0.0, 0.0]),
+        "cohere-embed-v4",
+        3,
+    )
+    .await
+    .unwrap();
+    queries::upsert_resource_embedding_async(
+        &db,
+        "cairn://b",
+        &vector::to_bytes(&[0.0, 1.0, 0.0]),
+        "cohere-embed-v4",
+        3,
+    )
+    .await
+    .unwrap();
 
-    // Only embed id1
-    let bytes = cairn_core::internal::embeddings::EmbeddingEngine::to_bytes(&[1.0]);
-    queries::upsert_embedding(&mut conn, &id1, &bytes, "test", 1).unwrap();
-
-    let results = queries::get_embeddings_for_session(&mut conn, session).unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].event_id, id1);
+    // Query vector closest to "cairn://a".
+    let q = vector::to_bytes(&[0.9, 0.1, 0.0]);
+    let nearest = db
+        .read(|conn| {
+            let q = q.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT uri, vector_distance_cos(embedding, vector32(?1)) AS d \
+                         FROM resource_embeddings ORDER BY d ASC LIMIT 1",
+                        params![q],
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| DbError::Row("no rows".to_string()))?;
+                row.text(0)
+            })
+        })
+        .await
+        .expect("vector_distance_cos query should execute");
+    assert_eq!(nearest, "cairn://a");
 }

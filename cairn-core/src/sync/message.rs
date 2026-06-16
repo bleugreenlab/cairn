@@ -5,7 +5,7 @@ use serde::Serialize;
 /// A message to sync to the cloud.
 ///
 /// Durable messages (entities) are batched and retried on failure.
-/// Ephemeral messages (StreamDelta) are fire-and-forget.
+/// Transcript events and streaming deltas remain local-only.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "table", content = "data")]
 pub enum SyncMessage {
@@ -14,11 +14,12 @@ pub enum SyncMessage {
     Issue(SyncIssue),
     Job(SyncJob),
     Run(SyncRun),
+    // Local-only transcript events (accepted but not forwarded)
     Event(SyncEvent),
     Artifact(SyncArtifact),
     Comment(SyncComment),
 
-    // Ephemeral (fire-and-forget)
+    // Local-only streaming deltas
     StreamDelta(StreamDelta),
 
     // Lifecycle
@@ -28,7 +29,7 @@ pub enum SyncMessage {
 impl SyncMessage {
     /// Whether this message should be retried on failure.
     pub fn is_durable(&self) -> bool {
-        !matches!(self, SyncMessage::StreamDelta(_))
+        !matches!(self, SyncMessage::Event(_) | SyncMessage::StreamDelta(_))
     }
 }
 
@@ -52,12 +53,13 @@ pub struct SyncIssue {
     pub status: String,
     pub priority: i32,
     pub model: Option<String>,
-    pub manager_id: Option<String>,
     pub created_at: Option<i64>,
     pub updated_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub merged_at: Option<i64>,
     pub closed_at: Option<i64>,
+    pub depends_on: Vec<String>,
+    pub parent_issue_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,8 +104,41 @@ pub struct SyncEvent {
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
     pub cache_read_tokens: Option<i32>,
+    pub cache_create_tokens: Option<i32>,
+    pub thinking_tokens: Option<i32>,
     pub created_at: Option<i64>,
     pub turn_id: Option<String>,
+}
+
+pub struct SyncTranscriptEvent {
+    pub id: String,
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub sequence: i32,
+    pub event_type: String,
+    pub data: String,
+    pub created_at: i64,
+    pub turn_id: Option<String>,
+}
+
+impl SyncEvent {
+    pub fn transcript(event: SyncTranscriptEvent) -> Self {
+        Self {
+            id: event.id,
+            run_id: event.run_id,
+            session_id: event.session_id,
+            sequence: Some(event.sequence),
+            event_type: event.event_type,
+            data: Some(event.data),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_create_tokens: None,
+            thinking_tokens: None,
+            created_at: Some(event.created_at),
+            turn_id: event.turn_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,12 +192,13 @@ impl From<&crate::models::Issue> for SyncIssue {
             status: i.status.to_string(),
             priority: i.priority,
             model: i.backend_override.clone(),
-            manager_id: i.manager_id.clone(),
             created_at: Some(i.created_at),
             updated_at: Some(i.updated_at),
             completed_at: i.completed_at,
             merged_at: i.merged_at,
             closed_at: i.closed_at,
+            depends_on: i.depends_on.clone(),
+            parent_issue_id: i.parent_issue_id.clone(),
         }
     }
 }
@@ -216,6 +252,8 @@ impl From<&crate::models::Event> for SyncEvent {
             input_tokens: e.input_tokens,
             output_tokens: e.output_tokens,
             cache_read_tokens: e.cache_read_tokens,
+            cache_create_tokens: e.cache_create_tokens,
+            thinking_tokens: e.thinking_tokens,
             created_at: Some(e.created_at),
             turn_id: e.turn_id.clone(),
         }
@@ -271,12 +309,13 @@ mod tests {
             status: "backlog".into(),
             priority: 0,
             model: None,
-            manager_id: None,
             created_at: None,
             updated_at: None,
             completed_at: None,
             merged_at: None,
             closed_at: None,
+            depends_on: Vec::new(),
+            parent_issue_id: None,
         });
         assert!(issue.is_durable());
 
@@ -288,7 +327,24 @@ mod tests {
     }
 
     #[test]
-    fn is_durable_false_for_stream_delta() {
+    fn is_durable_false_for_event_and_stream_delta() {
+        let event = SyncMessage::Event(SyncEvent {
+            id: "e1".into(),
+            run_id: "r1".into(),
+            session_id: None,
+            sequence: Some(1),
+            event_type: "assistant".into(),
+            data: Some("{}".into()),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_create_tokens: None,
+            thinking_tokens: None,
+            created_at: Some(1),
+            turn_id: None,
+        });
+        assert!(!event.is_durable());
+
         let delta = SyncMessage::StreamDelta(StreamDelta {
             run_id: "r1".into(),
             event_id: "e1".into(),
@@ -311,11 +367,13 @@ mod tests {
             next_issue_number: 5,
             setup_commands: None,
             terminal_commands: None,
+            worktree_populate: None,
             created_at: 1000,
             updated_at: 2000,
             remote_url: None,
             server_id: None,
             hidden: false,
+            is_workspace: false,
         };
 
         let sync = SyncProject::from(&project);
@@ -348,7 +406,11 @@ mod tests {
             backend_override: None,
             merged_at: None,
             closed_at: None,
-            manager_id: None,
+            parent_issue_id: None,
+            unmet_dependency_count: 0,
+            depends_on: Vec::new(),
+            unmet_depends_on: Vec::new(),
+            labels: Vec::new(),
         };
 
         let sync = SyncIssue::from(&issue);
@@ -367,6 +429,7 @@ mod tests {
             content: "Hello".into(),
             source: CommentSource::Agent,
             created_at: 5000,
+            seq: 1,
         };
 
         let sync = SyncComment::from(&comment);

@@ -1,0 +1,884 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use futures_util::future::BoxFuture;
+use tokio::time::sleep;
+use turso::{params::IntoParams, Builder, Connection, Row};
+
+use super::{DbError, DbResult, RowExt};
+
+#[derive(Debug, Clone)]
+pub struct RetryConfig {
+    pub max_attempts: usize,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+    pub busy_timeout: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: 32,
+            initial_backoff: Duration::from_millis(2),
+            max_backoff: Duration::from_millis(250),
+            busy_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct LocalDb {
+    path: PathBuf,
+    database: turso::Database,
+    retry: RetryConfig,
+}
+
+impl LocalDb {
+    pub async fn open(path: impl AsRef<Path>) -> DbResult<Self> {
+        Self::open_with_retry(path, RetryConfig::default()).await
+    }
+
+    pub async fn open_with_retry(path: impl AsRef<Path>, retry: RetryConfig) -> DbResult<Self> {
+        let path = path.as_ref().to_path_buf();
+        let path_string = path.to_string_lossy().to_string();
+        let database = Builder::new_local(&path_string).build().await?;
+        let db = Self {
+            path,
+            database,
+            retry,
+        };
+        db.configure().await?;
+        Ok(db)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub async fn connect(&self) -> DbResult<Connection> {
+        let conn = self.database.connect()?;
+        conn.busy_timeout(self.retry.busy_timeout)?;
+        conn.execute("PRAGMA foreign_keys = ON", ()).await?;
+        Ok(conn)
+    }
+
+    pub async fn read<T>(
+        &self,
+        f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+    ) -> DbResult<T> {
+        let conn = self.connect().await?;
+        run_read_tx(&conn, f).await
+    }
+
+    pub async fn write<T>(
+        &self,
+        mut f: impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+    ) -> DbResult<T> {
+        self.transaction_with_begin("BEGIN CONCURRENT", &mut f)
+            .await
+    }
+
+    pub async fn exclusive<T>(
+        &self,
+        mut f: impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+    ) -> DbResult<T> {
+        self.transaction_with_begin("BEGIN", &mut f).await
+    }
+
+    /// Runs a SELECT in a read transaction and collects every mapped row.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the read transaction, running the
+    /// query, fetching rows, or mapping each row. Read transactions are not
+    /// retried.
+    pub async fn query_all<T, F>(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams + Send + 'static,
+        map: F,
+    ) -> DbResult<Vec<T>>
+    where
+        F: Fn(&Row) -> DbResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let sql = sql.into();
+        self.read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, params).await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(map(&row)?);
+                }
+                Ok(out)
+            })
+        })
+        .await
+    }
+
+    /// Runs a SELECT in a read transaction and maps the first row, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the read transaction, running the
+    /// query, fetching the row, or mapping the row. Read transactions are not
+    /// retried.
+    pub async fn query_opt<T, F>(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams + Send + 'static,
+        map: F,
+    ) -> DbResult<Option<T>>
+    where
+        F: Fn(&Row) -> DbResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let sql = sql.into();
+        self.read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, params).await?;
+                rows.next().await?.map(|row| map(&row)).transpose()
+            })
+        })
+        .await
+    }
+
+    /// Runs a SELECT in a read transaction and returns the first column of the
+    /// first row as optional text.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the read transaction, running the
+    /// query, fetching the row, or reading column 0. Read transactions are not
+    /// retried.
+    pub async fn query_opt_text(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams + Send + 'static,
+    ) -> DbResult<Option<String>> {
+        self.query_opt(sql, params, |row| row.opt_text(0))
+            .await
+            .map(Option::flatten)
+    }
+
+    /// Runs a SELECT in a read transaction and returns the first column of the
+    /// first row as optional integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the read transaction, running the
+    /// query, fetching the row, or reading column 0. Read transactions are not
+    /// retried.
+    pub async fn query_opt_i64(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams + Send + 'static,
+    ) -> DbResult<Option<i64>> {
+        self.query_opt(sql, params, |row| row.opt_i64(0))
+            .await
+            .map(Option::flatten)
+    }
+
+    /// Runs a SELECT in a read transaction and returns the first column of the
+    /// first row as text, or `None` when the query returns no row.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the read transaction, running the
+    /// query, fetching the row, or reading column 0. Read transactions are not
+    /// retried.
+    pub async fn query_text(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams + Send + 'static,
+    ) -> DbResult<Option<String>> {
+        self.query_opt(sql, params, |row| row.text(0)).await
+    }
+
+    /// Runs a SELECT in a read transaction and requires one row.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the read transaction, running the
+    /// query, fetching the row, or mapping the row. Returns `DbError::Row` when
+    /// the query returns no rows. Read transactions are not retried.
+    pub async fn query_one<T, F>(
+        &self,
+        sql: impl Into<String>,
+        params: impl IntoParams + Send + 'static,
+        map: F,
+    ) -> DbResult<T>
+    where
+        F: Fn(&Row) -> DbResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.query_opt(sql, params, map)
+            .await?
+            .ok_or_else(|| DbError::Row("query_one returned no rows".to_string()))
+    }
+
+    /// Runs one statement through the retrying write transaction path.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the write transaction, executing the
+    /// statement, committing the transaction, or exhausting retry attempts.
+    pub async fn execute(&self, sql: impl Into<String>, params: impl IntoParams) -> DbResult<u64> {
+        let sql = sql.into();
+        let params = params.into_params()?;
+        self.write(move |conn| {
+            let sql = sql.clone();
+            let params = params.clone();
+            Box::pin(async move { Ok(conn.execute(&sql, params).await?) })
+        })
+        .await
+    }
+
+    /// Runs a semicolon-delimited SQL script through the retrying write
+    /// transaction path.
+    ///
+    /// # Errors
+    ///
+    /// Returns database errors from opening the write transaction, executing the
+    /// script, committing the transaction, or exhausting retry attempts.
+    pub async fn execute_script(&self, sql: impl Into<String>) -> DbResult<()> {
+        let sql = sql.into();
+        self.write(move |conn| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                conn.execute_batch(&sql).await?;
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    async fn transaction_with_begin<T>(
+        &self,
+        begin_sql: &str,
+        f: &mut impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+    ) -> DbResult<T> {
+        let started_at = Instant::now();
+        let mut backoff = self.retry.initial_backoff;
+        let mut last_retryable = None;
+
+        for attempt in 1..=self.retry.max_attempts {
+            let conn = self.connect().await?;
+            match run_tx(&conn, begin_sql, f).await {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is_retryable() && attempt < self.retry.max_attempts => {
+                    last_retryable = Some(error);
+                    let jitter = Duration::from_millis(rand::random::<u64>() % 5);
+                    sleep(backoff + jitter).await;
+                    backoff = (backoff * 2).min(self.retry.max_backoff);
+                }
+                Err(error) if error.is_retryable() => {
+                    return Err(DbError::RetryExhausted {
+                        attempts: attempt,
+                        elapsed: started_at.elapsed(),
+                        source: Box::new(error),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(DbError::RetryExhausted {
+            attempts: self.retry.max_attempts,
+            elapsed: started_at.elapsed(),
+            source: Box::new(
+                last_retryable.unwrap_or_else(|| DbError::internal("transaction retry exhausted")),
+            ),
+        })
+    }
+
+    pub async fn execute_batch(&self, sql: &str) -> DbResult<()> {
+        let conn = self.connect().await?;
+        conn.execute_batch(sql).await?;
+        Ok(())
+    }
+
+    pub async fn consume_query(&self, sql: &str) -> DbResult<()> {
+        let conn = self.connect().await?;
+        let mut rows = conn.query(sql, ()).await?;
+        while rows.next().await?.is_some() {}
+        Ok(())
+    }
+
+    async fn configure(&self) -> DbResult<()> {
+        self.consume_query("PRAGMA journal_mode = 'mvcc'").await?;
+        self.consume_query("PRAGMA foreign_keys = ON").await?;
+        Ok(())
+    }
+}
+
+async fn run_tx<T>(
+    conn: &Connection,
+    begin_sql: &str,
+    f: &mut impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+) -> DbResult<T> {
+    conn.execute(begin_sql, ()).await?;
+
+    let result = f(conn).await;
+    match result {
+        Ok(value) => match conn.execute("COMMIT", ()).await {
+            Ok(_) => Ok(value),
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(error.into())
+            }
+        },
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(error)
+        }
+    }
+}
+
+async fn run_read_tx<T>(
+    conn: &Connection,
+    f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
+) -> DbResult<T> {
+    conn.execute("BEGIN CONCURRENT", ()).await?;
+
+    let result = f(conn).await;
+    match result {
+        Ok(value) => {
+            conn.execute("ROLLBACK", ()).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+            Err(error)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::storage::{Migration, MigrationRunner, RowExt};
+
+    const TEST_SCHEMA: &[Migration] = &[Migration::new(
+        "0001",
+        "storage_kernel",
+        "
+            CREATE TABLE counters (
+                id TEXT PRIMARY KEY NOT NULL,
+                value INTEGER NOT NULL
+            );
+
+            CREATE TABLE unrelated_writes (
+                id TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE issues (
+                id TEXT PRIMARY KEY NOT NULL,
+                project_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE search_outbox (
+                id TEXT PRIMARY KEY NOT NULL,
+                source_table TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                op TEXT NOT NULL CHECK (op IN ('upsert', 'delete')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'applied')),
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX idx_search_outbox_status_created
+                ON search_outbox(status, created_at);
+
+            CREATE TRIGGER search_issues_insert AFTER INSERT ON issues BEGIN
+                INSERT INTO search_outbox(
+                    id, source_table, source_id, content_type, op, status, created_at
+                )
+                VALUES (
+                    'search:' || NEW.id || ':' || NEW.updated_at,
+                    'issues',
+                    NEW.id,
+                    'issue',
+                    'upsert',
+                    'pending',
+                    NEW.updated_at
+                );
+            END;
+        ",
+    )];
+
+    async fn test_db() -> DbResult<LocalDb> {
+        let temp = tempdir()?;
+        let path = temp.keep().join("cairn-turso-test.db");
+        let db = LocalDb::open(path).await?;
+        MigrationRunner::new(TEST_SCHEMA.to_vec()).run(&db).await?;
+        Ok(db)
+    }
+
+    async fn query_i64(db: &LocalDb, sql: &'static str) -> DbResult<i64> {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(sql, ()).await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| DbError::Row("missing integer row".to_string()))?;
+                row.i64(0)
+            })
+        })
+        .await
+    }
+
+    async fn query_text(db: &LocalDb, sql: &'static str) -> DbResult<String> {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(sql, ()).await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| DbError::Row("missing text row".to_string()))?;
+                row.text(0)
+            })
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn query_helpers_map_rows_and_missing_rows() {
+        let db = test_db().await.unwrap();
+        db.execute(
+            "INSERT INTO counters(id, value) VALUES (?1, ?2), (?3, ?4)",
+            ("a", 1_i64, "b", 2_i64),
+        )
+        .await
+        .unwrap();
+
+        let values = db
+            .query_all(
+                "SELECT value FROM counters WHERE value > ?1 ORDER BY value ASC",
+                (0_i64,),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(values, vec![1, 2]);
+
+        let empty = db
+            .query_all(
+                "SELECT value FROM counters WHERE value > ?1",
+                (10_i64,),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let found = db
+            .query_opt("SELECT value FROM counters WHERE id = ?1", ("a",), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(found, Some(1));
+
+        let missing = db
+            .query_opt(
+                "SELECT value FROM counters WHERE id = ?1",
+                ("missing",),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing, None);
+
+        let found_text = db
+            .query_opt_text("SELECT id FROM counters WHERE id = ?1", ("a",))
+            .await
+            .unwrap();
+        assert_eq!(found_text, Some("a".to_string()));
+
+        let missing_text = db
+            .query_opt_text("SELECT id FROM counters WHERE id = ?1", ("missing",))
+            .await
+            .unwrap();
+        assert_eq!(missing_text, None);
+
+        let found_integer = db
+            .query_opt_i64("SELECT value FROM counters WHERE id = ?1", ("a",))
+            .await
+            .unwrap();
+        assert_eq!(found_integer, Some(1));
+
+        let missing_integer = db
+            .query_opt_i64("SELECT value FROM counters WHERE id = ?1", ("missing",))
+            .await
+            .unwrap();
+        assert_eq!(missing_integer, None);
+
+        let required_text = db
+            .query_text("SELECT id FROM counters WHERE id = ?1", ("a",))
+            .await
+            .unwrap();
+        assert_eq!(required_text, Some("a".to_string()));
+
+        let one = db
+            .query_one("SELECT value FROM counters WHERE id = ?1", ("b",), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(one, 2);
+
+        let err = db
+            .query_one(
+                "SELECT value FROM counters WHERE id = ?1",
+                ("missing",),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::Row(message) if message == "query_one returned no rows"));
+    }
+
+    #[tokio::test]
+    async fn execute_script_runs_multiple_statements_in_write_transaction() {
+        let db = test_db().await.unwrap();
+        db.execute_script(
+            "
+            INSERT INTO counters(id, value) VALUES ('a', 1);
+            INSERT INTO counters(id, value) VALUES ('b', 2);
+            UPDATE counters SET value = value + 10 WHERE id = 'a';
+            ",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            query_i64(&db, "SELECT SUM(value) FROM counters")
+                .await
+                .unwrap(),
+            13
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_returns_rows_affected_and_updates_rows() {
+        let db = test_db().await.unwrap();
+        let inserted = db
+            .execute(
+                "INSERT INTO counters(id, value) VALUES (?1, ?2)",
+                ("exec", 1_i64),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        let updated = db
+            .execute(
+                "UPDATE counters SET value = ?1 WHERE id = ?2",
+                (5_i64, "exec"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+        assert_eq!(
+            query_i64(&db, "SELECT value FROM counters WHERE id = 'exec'")
+                .await
+                .unwrap(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_retries_conflicting_commits() {
+        let db = Arc::new(test_db().await.unwrap());
+        db.execute(
+            "INSERT INTO counters(id, value) VALUES ('shared-exec', 0)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                db.execute(
+                    "UPDATE counters SET value = value + 1 WHERE id = 'shared-exec'",
+                    (),
+                )
+                .await
+            }));
+        }
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap(), 1);
+        }
+        assert_eq!(
+            query_i64(&db, "SELECT value FROM counters WHERE id = 'shared-exec'")
+                .await
+                .unwrap(),
+            16
+        );
+    }
+
+    #[tokio::test]
+    async fn local_db_enables_mvcc_and_foreign_keys() {
+        let db = test_db().await.unwrap();
+
+        assert_eq!(
+            query_text(&db, "PRAGMA journal_mode").await.unwrap(),
+            "mvcc"
+        );
+        assert_eq!(query_i64(&db, "PRAGMA foreign_keys").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_runner_applies_each_migration_once() {
+        let db = test_db().await.unwrap();
+        let runner = MigrationRunner::new(TEST_SCHEMA.to_vec());
+
+        assert!(runner.run(&db).await.unwrap().is_empty());
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM cairn_schema_migrations")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_retry_conflicting_commits() {
+        let db = Arc::new(test_db().await.unwrap());
+        db.execute("INSERT INTO counters(id, value) VALUES ('shared', 0)", ())
+            .await
+            .unwrap();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let db = db.clone();
+            let attempts = attempts.clone();
+            tasks.push(tokio::spawn(async move {
+                db.write(|conn| {
+                    let attempts = attempts.clone();
+                    Box::pin(async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        let mut rows = conn
+                            .query("SELECT value FROM counters WHERE id = 'shared'", ())
+                            .await?;
+                        let row = rows
+                            .next()
+                            .await?
+                            .ok_or_else(|| DbError::Row("missing counter row".to_string()))?;
+                        let value = row.i64(0)?;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        conn.execute(
+                            "UPDATE counters SET value = ?1 WHERE id = 'shared'",
+                            (value + 1,),
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .await
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        assert_eq!(
+            query_i64(&db, "SELECT value FROM counters WHERE id = 'shared'")
+                .await
+                .unwrap(),
+            16
+        );
+        assert!(
+            attempts.load(Ordering::SeqCst) > 16,
+            "expected at least one optimistic retry under shared-row contention"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_reader_does_not_block_unrelated_writer() {
+        let db = test_db().await.unwrap();
+        let reader = db.connect().await.unwrap();
+        reader.execute("BEGIN CONCURRENT", ()).await.unwrap();
+        let mut rows = reader
+            .query("SELECT COUNT(*) FROM counters", ())
+            .await
+            .unwrap();
+        assert!(rows.next().await.unwrap().is_some());
+        drop(rows);
+
+        db.execute(
+            "INSERT INTO unrelated_writes(id, value) VALUES ('writer-1', 'ok')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM unrelated_writes")
+                .await
+                .unwrap(),
+            1
+        );
+        reader.execute("ROLLBACK", ()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn triggers_populate_search_outbox_only_for_committed_writes() {
+        let db = test_db().await.unwrap();
+
+        db.execute(
+            "INSERT INTO issues(id, project_id, title, body, created_at, updated_at)
+             VALUES ('issue-1', 'project-1', 'Turso search', 'Committed issue', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM search_outbox WHERE status = 'pending'"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+
+        let error = db
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO issues(id, project_id, title, body, created_at, updated_at)
+                         VALUES ('rolled-back', 'project-1', 'Rollback', 'Should not index', 2, 2)",
+                        (),
+                    )
+                    .await?;
+                    Err::<(), DbError>(DbError::internal("force rollback"))
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DbError::Internal(_)));
+
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM issues WHERE id = 'rolled-back'")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM search_outbox")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// CAIRN-1133 Phase 0 (in-process arm): two independent `LocalDb` instances
+    /// (separate `turso::Database` handles) pointed at the same file must
+    /// coordinate writes through busy_timeout + optimistic retry without losing
+    /// updates. The cross-process arm lives in `examples/concurrent_db_probe.rs`.
+    #[tokio::test]
+    async fn two_local_db_instances_share_one_file_without_lost_updates() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("shared-handles.turso.db");
+
+        // Instance A seeds the schema + shared row.
+        let db_a = LocalDb::open(&path).await.unwrap();
+        MigrationRunner::new(TEST_SCHEMA.to_vec())
+            .run(&db_a)
+            .await
+            .unwrap();
+        db_a.execute("INSERT INTO counters(id, value) VALUES ('shared', 0)", ())
+            .await
+            .unwrap();
+
+        // Instance B opens the *same file* via a fresh Database handle.
+        let db_b = LocalDb::open(&path).await.unwrap();
+
+        let db_a = Arc::new(db_a);
+        let db_b = Arc::new(db_b);
+        let per_handle = 25;
+        let mut tasks = Vec::new();
+        for handle in [db_a.clone(), db_b.clone()] {
+            for _ in 0..per_handle {
+                let handle = handle.clone();
+                tasks.push(tokio::spawn(async move {
+                    handle
+                        .write(|conn| {
+                            Box::pin(async move {
+                                let mut rows = conn
+                                    .query("SELECT value FROM counters WHERE id = 'shared'", ())
+                                    .await?;
+                                let row = rows.next().await?.ok_or_else(|| {
+                                    DbError::Row("missing counter row".to_string())
+                                })?;
+                                let value = row.i64(0)?;
+                                conn.execute(
+                                    "UPDATE counters SET value = ?1 WHERE id = 'shared'",
+                                    (value + 1,),
+                                )
+                                .await?;
+                                Ok(())
+                            })
+                        })
+                        .await
+                }));
+            }
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+
+        // Read back through the *other* handle to confirm cross-handle visibility.
+        let total = query_i64(&db_b, "SELECT value FROM counters WHERE id = 'shared'")
+            .await
+            .unwrap();
+        assert_eq!(
+            total,
+            (per_handle * 2) as i64,
+            "updates lost across handles"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_does_not_lose_committed_rows() {
+        let db = test_db().await.unwrap();
+        db.execute(
+            "INSERT INTO counters(id, value) VALUES ('checkpoint', 7)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        db.consume_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_i64(&db, "SELECT value FROM counters WHERE id = 'checkpoint'")
+                .await
+                .unwrap(),
+            7
+        );
+    }
+}

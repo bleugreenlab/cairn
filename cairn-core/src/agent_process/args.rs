@@ -1,7 +1,7 @@
 //! CLI argument building for Claude process
 //!
 //! This module handles the construction of command-line arguments for the Claude CLI,
-//! including model selection, tool permissions, session resumption, and thinking tokens.
+//! including model selection, tool permissions, session resumption, and reasoning effort.
 
 use crate::backends::SessionStart;
 use crate::models::Model;
@@ -10,15 +10,17 @@ use std::path::PathBuf;
 /// Configuration for building Claude CLI arguments.
 #[derive(Debug, Clone)]
 pub struct ClaudeArgsConfig {
-    pub mcp_config_path: String,
+    /// The `--mcp-config` value: a self-contained JSON string (Claude CLI accepts
+    /// the config inline, not just a file path).
+    pub mcp_config: String,
     pub skip_permissions: bool,
-    pub permission_prompt_tool: Option<String>, // MCP tool for permission prompts (replaces skip_permissions)
     pub model: Option<Model>,
     pub session_start: SessionStart,
     pub prompt: String,
-    pub max_thinking_tokens: Option<i32>, // None = disabled, Some(n) = enable with n tokens
+    pub effort: Option<String>, // Reasoning effort: low|medium|high|xhigh|max (None = CLI default)
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
+    pub system_prompt_file: Option<PathBuf>, // Path to file replacing Claude's default system prompt via --system-prompt-file
     pub append_system_prompt_file: Option<PathBuf>, // Path to file with system prompt content via --append-system-prompt-file
     pub settings_path: Option<PathBuf>, // Path to additional settings JSON via --settings
     pub bidirectional: bool,            // Enable stdin streaming with --input-format stream-json
@@ -31,7 +33,12 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--mcp-config".to_string(),
-        config.mcp_config_path.clone(),
+        config.mcp_config.clone(),
+        // Only the inline cairn server is configured. Without strict mode, Claude
+        // Code also loads the user's global ~/.claude.json and any project
+        // .mcp.json mcpServers, giving spawned agents native MCP servers. External
+        // MCP must flow through the cairn gateway, so suppress those native paths.
+        "--strict-mcp-config".to_string(),
     ];
 
     // Enable bidirectional stdin streaming
@@ -40,10 +47,10 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
         args.push("stream-json".to_string());
     }
 
-    // Add extended thinking if enabled
-    if let Some(tokens) = config.max_thinking_tokens {
-        args.push("--max-thinking-tokens".to_string());
-        args.push(tokens.to_string());
+    // Set reasoning effort if specified (replaces the removed --max-thinking-tokens flag)
+    if let Some(ref effort) = config.effort {
+        args.push("--effort".to_string());
+        args.push(effort.clone());
     }
 
     // Add model flag if specified
@@ -58,6 +65,13 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
         args.push(model_str);
     }
 
+    // Replace Claude's default system prompt entirely (must precede the
+    // --append-system-prompt-file, though order doesn't actually matter to the CLI).
+    if let Some(ref file_path) = config.system_prompt_file {
+        args.push("--system-prompt-file".to_string());
+        args.push(file_path.to_string_lossy().to_string());
+    }
+
     // Add system prompt file if specified (agent instructions go here)
     if let Some(ref file_path) = config.append_system_prompt_file {
         args.push("--append-system-prompt-file".to_string());
@@ -70,12 +84,10 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
         args.push(settings_path.to_string_lossy().to_string());
     }
 
-    // Permission handling: prefer --permission-prompt-tool for user approval,
-    // fall back to --dangerously-skip-permissions for auto-approval
-    if let Some(ref tool) = config.permission_prompt_tool {
-        args.push("--permission-prompt-tool".to_string());
-        args.push(tool.clone());
-    } else if config.skip_permissions {
+    // Permission handling: allow mode auto-approves with
+    // --dangerously-skip-permissions; ask/deny rely on the worktree fence inside
+    // the verb handlers, so no CLI permission flag is emitted.
+    if config.skip_permissions {
         args.push("--dangerously-skip-permissions".to_string());
     }
 
@@ -134,17 +146,17 @@ mod tests {
 
     fn base_config() -> ClaudeArgsConfig {
         ClaudeArgsConfig {
-            mcp_config_path: "/path/to/mcp.json".to_string(),
+            mcp_config: "{\"mcpServers\":{}}".to_string(),
             skip_permissions: false,
-            permission_prompt_tool: None,
             model: None,
             session_start: SessionStart::New {
                 session_id: "cairn-uuid".to_string(),
             },
             prompt: "Test".to_string(),
-            max_thinking_tokens: None,
+            effort: None,
             allowed_tools: vec!["Read".to_string()],
             disallowed_tools: vec![],
+            system_prompt_file: None,
             append_system_prompt_file: None,
             settings_path: None,
             bidirectional: false,
@@ -161,6 +173,14 @@ mod tests {
     }
 
     #[test]
+    fn test_strict_mcp_config_present() {
+        // Spawned agents must have exactly one MCP server (cairn). Strict mode
+        // prevents Claude Code from layering in native global/project servers.
+        let args = build_claude_args(&base_config());
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+    }
+
+    #[test]
     fn test_skip_permissions() {
         let config = ClaudeArgsConfig {
             skip_permissions: true,
@@ -168,18 +188,6 @@ mod tests {
         };
         let args = build_claude_args(&config);
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
-    }
-
-    #[test]
-    fn test_permission_prompt_tool_takes_precedence() {
-        let config = ClaudeArgsConfig {
-            skip_permissions: true,
-            permission_prompt_tool: Some("mcp__cairn__permission_prompt".to_string()),
-            ..base_config()
-        };
-        let args = build_claude_args(&config);
-        assert!(args.contains(&"--permission-prompt-tool".to_string()));
-        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
     }
 
     #[test]
@@ -194,14 +202,25 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_tokens() {
+    fn test_effort() {
         let config = ClaudeArgsConfig {
-            max_thinking_tokens: Some(31999),
+            effort: Some("high".to_string()),
             ..base_config()
         };
         let args = build_claude_args(&config);
-        assert!(args.contains(&"--max-thinking-tokens".to_string()));
-        assert!(args.contains(&"31999".to_string()));
+        let idx = args
+            .iter()
+            .position(|x| x == "--effort")
+            .expect("--effort flag missing");
+        assert_eq!(args[idx + 1], "high");
+    }
+
+    #[test]
+    fn test_effort_absent_by_default() {
+        let args = build_claude_args(&base_config());
+        assert!(!args.contains(&"--effort".to_string()));
+        // The removed --max-thinking-tokens flag must never be emitted.
+        assert!(!args.contains(&"--max-thinking-tokens".to_string()));
     }
 
     #[test]
@@ -269,6 +288,26 @@ mod tests {
         assert!(args.contains(&"--session-id".to_string()));
         assert!(args.contains(&"cairn-uuid".to_string()));
         assert!(!args.contains(&"--resume".to_string()));
+    }
+
+    #[test]
+    fn test_system_prompt_file_emitted() {
+        let config = ClaudeArgsConfig {
+            system_prompt_file: Some(PathBuf::from("/tmp/claude-system-prompt.md")),
+            ..base_config()
+        };
+        let args = build_claude_args(&config);
+        let flag_idx = args
+            .iter()
+            .position(|x| x == "--system-prompt-file")
+            .expect("--system-prompt-file flag missing");
+        assert_eq!(args[flag_idx + 1], "/tmp/claude-system-prompt.md");
+    }
+
+    #[test]
+    fn test_system_prompt_file_absent_by_default() {
+        let args = build_claude_args(&base_config());
+        assert!(!args.contains(&"--system-prompt-file".to_string()));
     }
 
     #[test]

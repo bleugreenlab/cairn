@@ -1,139 +1,209 @@
-//! Vibe coloring: semantic color assignment from embeddings.
+//! Vibe coloring: behavioral 2-axis color assignment from Cohere-space embeddings.
 //!
-//! Each assistant message gets a color reflecting its cognitive state —
-//! progress, discovery, success, uncertainty, struggle — based on
-//! proximity to predefined loci in embedding space.
+//! Each assistant message is projected onto two orthogonal, behaviorally-grounded
+//! contrast axes learned from the real event corpus (96k+ assistant events,
+//! embedded with the production `cohere.embed-v4:0`):
+//!
+//! - **PHASE** (run-phase explore → ship): low = exploration/investigation,
+//!   high = completion/shipping. Linear-probe CV-AUC 0.905.
+//! - **FRICTION** (post-error tool-use friction): low = smooth, high = recovering
+//!   from tool errors. CV-AUC 0.875, orthogonal to PHASE (cos −0.006).
+//!
+//! Each projection is **percentile-rank-normalized** against the empirical corpus
+//! distribution — the embedding cone makes absolute cosine useless for saturation
+//! — into `[0,1]`, then mapped to an OKLCH color: PHASE drives the base hue
+//! (indigo → green) and FRICTION bends the hue toward red while raising chroma and
+//! darkening lightness, so tool-use friction *pops* in the skyline. The axes and
+//! their percentile tables are computed offline and bundled as `vibe_axes.json`
+//! (regenerate with `examples/compute_vibe_axes.rs`).
 
-use super::engine::EmbeddingEngine;
+use serde::Deserialize;
 
-/// OKLCH color specification for a vibe locus.
+use super::vector::cosine_similarity;
+
+// ===== color ramp constants (provisional / tunable) =====
+//
+// PHASE sets the base hue along the indigo→green arc; FRICTION pulls it toward
+// red and raises chroma + darkens lightness so friction stands out.
+const H_EXPLORE: f32 = 265.0; // indigo/blue at phase01 = 0 (explore)
+const H_SHIP: f32 = 150.0; // green at phase01 = 1 (ship)
+const H_FRICTION: f32 = 28.0; // red target as friction rises
+const W_HUE: f32 = 0.85; // max fraction of the way to red at friction01 = 1
+const C_CALM: f32 = 0.06; // chroma at friction01 = 0 (muted phase hue)
+const C_HOT: f32 = 0.21; // chroma at friction01 = 1 (friction pops)
+const L_CALM: f32 = 0.72; // lightness at friction01 = 0
+const L_HOT: f32 = 0.62; // lightness at friction01 = 1 (slightly darker/alarming)
+
+/// A behaviorally-grounded contrast axis: a unit direction in embedding space
+/// plus the empirical percentile breakpoints of corpus projections onto it.
 #[derive(Debug, Clone)]
-pub struct VibeColor {
-    /// Lightness (0.0–1.0)
-    pub l: f32,
-    /// Maximum chroma (0.0–0.4) — modulated by similarity
-    pub c: f32,
-    /// Hue (0–360)
-    pub h: f32,
-}
-
-impl VibeColor {
-    /// Generate a CSS `oklch()` string with chroma scaled by similarity.
-    pub fn to_css(&self, similarity: f32) -> String {
-        let chroma = self.c * chroma_scale(similarity);
-        format!("oklch({:.2} {:.3} {:.0})", self.l, chroma, self.h)
-    }
-}
-
-/// Configuration for a single vibe locus before centroid computation.
-#[derive(Debug, Clone)]
-pub struct LocusConfig {
+pub struct VibeAxis {
+    /// Axis name (`"phase"` | `"friction"`).
     pub name: String,
-    pub color: VibeColor,
-    pub examples: Vec<String>,
+    /// 1536-d unit contrast vector (`norm(mean(pos) - mean(neg))`).
+    pub vector: Vec<f32>,
+    /// 101 sorted breakpoints `p0..=p100` of the empirical projection
+    /// distribution, used to percentile-rank a new projection into `[0,1]`.
+    pub percentiles: Vec<f32>,
 }
 
-/// A computed vibe locus with its centroid embedding.
-#[derive(Debug, Clone)]
-pub struct VibeLocus {
-    pub name: String,
-    pub color: VibeColor,
-    pub centroid: Vec<f32>,
-}
-
-/// The result of assigning a vibe to an event.
+/// The result of assigning a vibe to an event: a CSS color plus the two
+/// percentile-ranked axis coordinates (persisted alongside the color, so richer
+/// frontend rendering can use them later).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VibeAssignment {
     pub event_id: String,
-    pub locus: String,
     pub css_color: String,
-    pub similarity: f32,
+    /// PHASE coordinate in `[0,1]` (0 = explore, 1 = ship).
+    pub phase: f32,
+    /// FRICTION coordinate in `[0,1]` (0 = smooth, 1 = post-error friction).
+    pub friction: f32,
 }
 
-/// Holds computed loci with centroids, ready for assignment.
+/// Holds the loaded contrast axes, ready for assignment. Expects a `phase` and a
+/// `friction` axis; an empty set assigns no color (callers fall back to neutral).
 pub struct VibeState {
-    pub loci: Vec<VibeLocus>,
+    pub axes: Vec<VibeAxis>,
 }
+
+#[derive(Deserialize)]
+struct BundledAxes {
+    #[allow(dead_code)]
+    model: String,
+    #[allow(dead_code)]
+    dims: u32,
+    axes: Vec<BundledAxis>,
+}
+
+#[derive(Deserialize)]
+struct BundledAxis {
+    name: String,
+    vector: Vec<f32>,
+    percentiles: Vec<f32>,
+}
+
+/// Cohere-space contrast axes + percentile tables generated offline.
+/// Regenerate with `cargo run --example compute_vibe_axes --features internal-api`.
+const BUNDLED_AXES: &str = include_str!("vibe_axes.json");
 
 impl VibeState {
-    /// Build VibeState by embedding example texts and computing centroids.
-    pub fn new(engine: &mut EmbeddingEngine, configs: Vec<LocusConfig>) -> Result<Self, String> {
-        let mut loci = Vec::with_capacity(configs.len());
-
-        for config in configs {
-            if config.examples.is_empty() {
-                return Err(format!("Locus '{}' has no examples", config.name));
+    /// Load the bundled contrast axes. Returns an empty `VibeState` (which
+    /// assigns no colors — callers fall back to neutral) if the bundle can't be
+    /// parsed, so a bad bundle degrades gracefully rather than panicking.
+    pub fn from_bundled() -> Self {
+        match serde_json::from_str::<BundledAxes>(BUNDLED_AXES) {
+            Ok(bundle) => {
+                let axes = bundle
+                    .axes
+                    .into_iter()
+                    .map(|a| VibeAxis {
+                        name: a.name,
+                        vector: a.vector,
+                        percentiles: a.percentiles,
+                    })
+                    .collect::<Vec<_>>();
+                log::info!("VibeState loaded {} contrast axes", axes.len());
+                Self { axes }
             }
-
-            let embeddings = engine
-                .embed(config.examples.clone())
-                .map_err(|e| format!("Failed to embed examples for '{}': {}", config.name, e))?;
-
-            let centroid = average_vectors(&embeddings);
-
-            loci.push(VibeLocus {
-                name: config.name,
-                color: config.color,
-                centroid,
-            });
+            Err(e) => {
+                log::error!("Failed to parse bundled vibe axes: {e}");
+                Self { axes: Vec::new() }
+            }
         }
-
-        Ok(Self { loci })
     }
 
-    /// Assign vibe colors to a batch of embeddings.
-    ///
-    /// Each input is (event_id, embedding_vector). Returns one VibeAssignment per input.
-    pub fn assign(&self, embeddings: &[(String, Vec<f32>)]) -> Vec<VibeAssignment> {
-        embeddings
-            .iter()
-            .map(|(event_id, embedding)| {
-                let (best_locus, best_sim) = self.closest_locus(embedding);
-                VibeAssignment {
-                    event_id: event_id.clone(),
-                    locus: best_locus.name.clone(),
-                    css_color: best_locus.color.to_css(best_sim),
-                    similarity: best_sim,
-                }
-            })
-            .collect()
+    /// Find a loaded axis by name.
+    fn axis(&self, name: &str) -> Option<&VibeAxis> {
+        self.axes.iter().find(|a| a.name == name)
     }
 
-    /// Find the closest locus to an embedding vector.
-    fn closest_locus(&self, embedding: &[f32]) -> (&VibeLocus, f32) {
-        self.loci
-            .iter()
-            .map(|locus| {
-                let sim = EmbeddingEngine::cosine_similarity(embedding, &locus.centroid);
-                (locus, sim)
-            })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .expect("VibeState must have at least one locus")
+    /// Assign a vibe color to a single embedding. Returns `None` when the `phase`
+    /// or `friction` axis is missing (color falls back to neutral upstream).
+    pub fn assign_one(&self, event_id: &str, embedding: &[f32]) -> Option<VibeAssignment> {
+        let phase_axis = self.axis("phase")?;
+        let friction_axis = self.axis("friction")?;
+
+        // The axis is a unit vector and `cosine_similarity` normalizes the
+        // embedding, so this is the normalized projection the percentile tables
+        // were built from.
+        let phase = percentile_rank(
+            cosine_similarity(embedding, &phase_axis.vector),
+            &phase_axis.percentiles,
+        );
+        let friction = percentile_rank(
+            cosine_similarity(embedding, &friction_axis.vector),
+            &friction_axis.percentiles,
+        );
+
+        Some(VibeAssignment {
+            event_id: event_id.to_string(),
+            css_color: color_for(phase, friction),
+            phase,
+            friction,
+        })
     }
 }
 
-/// Chroma modulation based on similarity.
-///
-/// Thresholds calibrated against actual event similarity distribution
-/// (55K events, all-MiniLM-L6-v2): p15=0.185, p50=0.280, p75=0.363.
-///
-/// - similarity ≥ 0.35 → full chroma (1.0)  — top ~27% of events
-/// - similarity 0.18–0.35 → linear ramp      — middle ~58%
-/// - similarity < 0.18 → low chroma (0.15)   — bottom ~15%
-fn chroma_scale(similarity: f32) -> f32 {
-    if similarity >= 0.35 {
-        1.0
-    } else if similarity >= 0.18 {
-        let t = (similarity - 0.18) / 0.17; // 0.0 at 0.18, 1.0 at 0.35
-        0.15 + 0.85 * t
-    } else {
-        0.15
+/// Map a projection value to its rank in `[0,1]` within the empirical percentile
+/// breakpoints (`breaks[i]` is the i-th percentile, `i` in `0..=100`). Clamps to
+/// the observed range, then linearly interpolates between the two bracketing
+/// percentiles. Returns 0.0 for a degenerate (< 2 point) table.
+fn percentile_rank(x: f32, breaks: &[f32]) -> f32 {
+    if breaks.len() < 2 {
+        return 0.0;
     }
+    let last = breaks.len() - 1;
+    if x <= breaks[0] {
+        return 0.0;
+    }
+    if x >= breaks[last] {
+        return 1.0;
+    }
+    // `breaks` is sorted ascending. `partition_point` returns the count of
+    // elements strictly less than `x` = the index of the first element >= `x`.
+    // Since `breaks[0] < x < breaks[last]`, `i` is in `1..=last`.
+    let i = breaks.partition_point(|&b| b < x);
+    let b0 = breaks[i - 1];
+    let b1 = breaks[i];
+    let frac = if (b1 - b0).abs() < f32::EPSILON {
+        0.0
+    } else {
+        (x - b0) / (b1 - b0)
+    };
+    ((i - 1) as f32 + frac) / last as f32
+}
+
+/// Map percentile-ranked PHASE and FRICTION coordinates (both in `[0,1]`) to
+/// OKLCH `(lightness, chroma, hue)`. PHASE sets the base hue (explore indigo →
+/// ship green); FRICTION bends the hue toward red and raises chroma while
+/// darkening lightness so tool-use friction stands out.
+fn color_components(phase01: f32, friction01: f32) -> (f32, f32, f32) {
+    let phase01 = phase01.clamp(0.0, 1.0);
+    let friction01 = friction01.clamp(0.0, 1.0);
+    let hue_phase = H_EXPLORE + (H_SHIP - H_EXPLORE) * phase01;
+    let hue = shortarc_lerp(hue_phase, H_FRICTION, W_HUE * friction01);
+    let chroma = C_CALM + (C_HOT - C_CALM) * friction01;
+    let light = L_CALM + (L_HOT - L_CALM) * friction01;
+    (light, chroma, hue)
+}
+
+/// Generate a CSS `oklch()` string for the given axis coordinates.
+fn color_for(phase01: f32, friction01: f32) -> String {
+    let (light, chroma, hue) = color_components(phase01, friction01);
+    format!("oklch({:.2} {:.3} {:.0})", light, chroma, hue)
+}
+
+/// Interpolate between two hue angles along the shorter arc, returning a value in
+/// `[0,360)`.
+fn shortarc_lerp(a: f32, b: f32, t: f32) -> f32 {
+    let delta = ((b - a + 540.0) % 360.0) - 180.0;
+    (a + delta * t).rem_euclid(360.0)
 }
 
 /// Compute the element-wise average of a set of vectors.
-fn average_vectors(vectors: &[Vec<f32>]) -> Vec<f32> {
+/// Used by the offline axis generator.
+pub fn average_vectors(vectors: &[Vec<f32>]) -> Vec<f32> {
     if vectors.is_empty() {
         return vec![];
     }
@@ -151,344 +221,224 @@ fn average_vectors(vectors: &[Vec<f32>]) -> Vec<f32> {
     avg
 }
 
-/// Default loci with examples drawn from real assistant event data.
-///
-/// Each locus has ~15 examples: a mix of hand-crafted anchors and real
-/// high-confidence texts (similarity > 0.6, margin > 0.1) from 55K
-/// embedded events. More diverse examples → better centroids.
-pub fn default_loci() -> Vec<LocusConfig> {
-    vec![
-        // Progress: actively investigating, reading code, moving through tasks.
-        // The default state — forward motion without strong emotion.
-        LocusConfig {
-            name: "progress".into(),
-            color: VibeColor {
-                l: 0.65,
-                c: 0.25,
-                h: 250.0,
-            },
-            examples: vec![
-                "Let me read the issue first and understand the context.".into(),
-                "I'll explore the codebase to understand the structure.".into(),
-                "Now let me check the existing implementation.".into(),
-                "Moving to the second task now.".into(),
-                "Let me look at how this is currently handled.".into(),
-                "I need to understand the existing code before making changes.".into(),
-                // Real data — high confidence, high margin
-                "Let me explore the existing code to understand what I'm working with.".into(),
-                "Now let me read the files to understand the current implementation before making changes.".into(),
-                "Let me examine the current schema and code to understand the full picture.".into(),
-                "Let me start by understanding the current implementation and the issue.".into(),
-                "Let me read the relevant files to understand the current implementation.".into(),
-                "Let me start by reading the relevant files to understand the current implementation.".into(),
-                "Let me look at the existing code to understand the current structure.".into(),
-                "Now let me read the existing files to understand the current implementation.".into(),
-            ],
-        },
-        // Discovery: insight, synthesis, seeing the bigger picture, design moments.
-        // Rare but meaningful — "aha" moments and architectural understanding.
-        LocusConfig {
-            name: "discovery".into(),
-            color: VibeColor {
-                l: 0.72,
-                c: 0.22,
-                h: 190.0,
-            },
-            examples: vec![
-                "Interesting! The architecture here is quite elegant.".into(),
-                "I see — the system already handles this case through the event pipeline.".into(),
-                // Real data — synthesis, insight, design
-                "That's an interesting architectural shift! Let me explore the current implementation to understand the trade-offs.".into(),
-                "Excellent exploration results. Now I have a complete picture. Let me synthesize this into a unified design.".into(),
-                "This is an interesting architectural question. Let me explore the current state and think through the tradeoffs.".into(),
-                "Now I have a complete picture. Let me formulate the design approach.".into(),
-                "Excellent question! This is a critical architectural consideration.".into(),
-                "This is a great area to explore. Let me first ground myself in the current architecture.".into(),
-                "Now I have enough context. Let me write a comprehensive plan for this feature.".into(),
-                "Good exploration results. I now understand the architecture.".into(),
-                "Now I have a complete picture. Let me design the implementation plan.".into(),
-                "Let me think through the design carefully.".into(),
-            ],
-        },
-        // Success: completion, things working, tests passing, wrapping up.
-        // The payoff moments — green means "this worked".
-        LocusConfig {
-            name: "success".into(),
-            color: VibeColor {
-                l: 0.75,
-                c: 0.25,
-                h: 145.0,
-            },
-            examples: vec![
-                "Done! All changes have been committed.".into(),
-                "Perfect — that fixed it!".into(),
-                "All done! The feature is implemented and working.".into(),
-                "Successfully completed the implementation.".into(),
-                "Everything is working now, PR is ready.".into(),
-                "All tests passing, everything looks great.".into(),
-                // Real data — completion, verification, PR creation
-                "Done. All the requested fixes have been applied and the build passes.".into(),
-                "Perfect! The fix is complete. Now I'll create a PR.".into(),
-                "Excellent! The build succeeded. The fix is complete and ready.".into(),
-                "All fixes are done. Let me summarize the changes.".into(),
-                "Perfect! Both changes are complete. Now let me mark this task as completed.".into(),
-                "Perfect! All tests passed. Now let me create a PR for this fix.".into(),
-                "Perfect! Now let me mark the last task as completed and verify the changes look good.".into(),
-                "Great! The build succeeded. Now I should create a PR for the changes.".into(),
-            ],
-        },
-        // Uncertainty: doubt, not sure, debugging, trying variations.
-        // Distinct from progress (which is confident forward motion) —
-        // uncertainty means the path isn't clear.
-        LocusConfig {
-            name: "uncertainty".into(),
-            color: VibeColor {
-                l: 0.78,
-                c: 0.22,
-                h: 80.0,
-            },
-            examples: vec![
-                "Hmm, let me try some variations to see what works.".into(),
-                "Still not seeing the expected behavior here.".into(),
-                "Still testing — the output looks the same as before.".into(),
-                "I'm not entirely sure this is the right approach.".into(),
-                "Let me reconsider — there might be a better way.".into(),
-                "Let me add some debug output to see exactly what's happening.".into(),
-                // Real data — genuine doubt, retracing steps
-                "I see the issue. Let me trace through the logic more carefully.".into(),
-                "Let me try a different approach — just look at the output directly.".into(),
-                "You're right, sorry. Let me restore the tests and actually debug this.".into(),
-                "Let me check the test output one more time to see if it's done yet.".into(),
-                "Something is off here. Let me re-examine the assumptions.".into(),
-                "That didn't work as expected. Let me rethink this.".into(),
-                "Wait, I think I misread the code. Let me look again.".into(),
-            ],
-        },
-        // Struggle: errors, failures, broken builds, things going wrong.
-        // Red means "something is broken" — the strongest vibe signal.
-        LocusConfig {
-            name: "struggle".into(),
-            color: VibeColor {
-                l: 0.60,
-                c: 0.25,
-                h: 25.0,
-            },
-            examples: vec![
-                "Both tools are failing with the same error.".into(),
-                "Same error again — this approach isn't working.".into(),
-                "The build is broken and I can't figure out why.".into(),
-                "The tests are failing because of a missing dependency.".into(),
-                // Real data — errors, CI failures, repeated problems
-                "Still failing. Let me see what the actual error is now.".into(),
-                "The CI is still failing. Let me check what the error is now.".into(),
-                "Several issues to fix. Let me see the full error list first.".into(),
-                "Build failure — the merge resolution may have introduced issues.".into(),
-                "Let me run the migration to see the exact error.".into(),
-                "Another conflict in the documentation. Let me check and resolve it.".into(),
-                "The test is failing. Let me add better error reporting to see what the actual error is.".into(),
-                "I need to fix the failing tests. Let me check the issues.".into(),
-                "Let me run the build again to check for any remaining errors.".into(),
-            ],
-        },
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_chroma_scale_high_similarity() {
-        assert_eq!(chroma_scale(0.8), 1.0);
-        assert_eq!(chroma_scale(0.35), 1.0);
+    /// A 101-point linear ramp from `lo` to `hi`, like a percentile table whose
+    /// rank is `(x - lo) / (hi - lo)`.
+    fn ramp(lo: f32, hi: f32) -> Vec<f32> {
+        (0..=100)
+            .map(|i| lo + (hi - lo) * (i as f32 / 100.0))
+            .collect()
     }
 
     #[test]
-    fn test_chroma_scale_mid_similarity() {
-        let scale = chroma_scale(0.265);
+    fn percentile_rank_clamps_below_and_above() {
+        let b = ramp(-1.0, 1.0);
+        assert_eq!(percentile_rank(-5.0, &b), 0.0);
+        assert_eq!(percentile_rank(-1.0, &b), 0.0);
+        assert_eq!(percentile_rank(5.0, &b), 1.0);
+        assert_eq!(percentile_rank(1.0, &b), 1.0);
+    }
+
+    #[test]
+    fn percentile_rank_interpolates() {
+        let b = ramp(-1.0, 1.0);
+        // Midpoint of the distribution -> rank 0.5.
         assert!(
-            scale > 0.15 && scale < 1.0,
-            "Expected mid-range, got {}",
-            scale
+            (percentile_rank(0.0, &b) - 0.5).abs() < 1e-3,
+            "{}",
+            percentile_rank(0.0, &b)
         );
-        // At 0.265: t = (0.265 - 0.18) / 0.17 = 0.5, scale = 0.15 + 0.85 * 0.5 = 0.575
-        assert!((scale - 0.575).abs() < 1e-6);
+        // A quarter of the way -> rank ~0.25.
+        assert!((percentile_rank(-0.5, &b) - 0.25).abs() < 1e-3);
+        assert!((percentile_rank(0.5, &b) - 0.75).abs() < 1e-3);
     }
 
     #[test]
-    fn test_chroma_scale_low_similarity() {
-        assert_eq!(chroma_scale(0.1), 0.15);
-        assert_eq!(chroma_scale(0.0), 0.15);
+    fn percentile_rank_monotonic() {
+        let b = ramp(-0.2, 0.3);
+        let mut prev = -1.0_f32;
+        for k in 0..=20 {
+            let x = -0.3 + 0.05 * k as f32;
+            let r = percentile_rank(x, &b);
+            assert!(r >= prev - 1e-6, "rank decreased at x={x}: {r} < {prev}");
+            assert!((0.0..=1.0).contains(&r));
+            prev = r;
+        }
     }
 
     #[test]
-    fn test_vibe_color_to_css() {
-        let color = VibeColor {
-            l: 0.70,
-            c: 0.25,
-            h: 250.0,
-        };
-        // High similarity → full chroma
-        assert_eq!(color.to_css(0.8), "oklch(0.70 0.250 250)");
-        // Low similarity → reduced chroma (0.25 * 0.15 = 0.0375)
-        assert_eq!(color.to_css(0.1), "oklch(0.70 0.038 250)");
+    fn percentile_rank_degenerate_table() {
+        assert_eq!(percentile_rank(0.5, &[]), 0.0);
+        assert_eq!(percentile_rank(0.5, &[0.1]), 0.0);
     }
 
     #[test]
-    fn test_average_vectors() {
-        let vecs = vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]];
-        let avg = average_vectors(&vecs);
-        assert_eq!(avg, vec![2.0, 3.0, 4.0]);
+    fn color_components_friction_raises_chroma_and_darkens() {
+        let (l_calm, c_calm, _) = color_components(0.5, 0.0);
+        let (l_hot, c_hot, _) = color_components(0.5, 1.0);
+        assert!((c_calm - C_CALM).abs() < 1e-6);
+        assert!((c_hot - C_HOT).abs() < 1e-6);
+        assert!(c_hot > c_calm, "friction should raise chroma");
+        assert!(l_hot < l_calm, "friction should darken lightness");
     }
 
     #[test]
-    fn test_average_vectors_single() {
-        let vecs = vec![vec![1.0, 2.0, 3.0]];
-        let avg = average_vectors(&vecs);
-        assert_eq!(avg, vec![1.0, 2.0, 3.0]);
+    fn color_components_phase_runs_indigo_to_green() {
+        // At zero friction the hue is the phase hue, indigo (explore) -> green (ship).
+        let (_, _, hue_explore) = color_components(0.0, 0.0);
+        let (_, _, hue_ship) = color_components(1.0, 0.0);
+        assert!((hue_explore - H_EXPLORE).abs() < 1e-3);
+        assert!((hue_ship - H_SHIP).abs() < 1e-3);
+        // Ship is greener (lower hue) than explore.
+        assert!(hue_ship < hue_explore);
     }
 
     #[test]
-    fn test_average_vectors_empty() {
-        let vecs: Vec<Vec<f32>> = vec![];
-        let avg = average_vectors(&vecs);
-        assert!(avg.is_empty());
+    fn color_components_friction_bends_ship_hue_toward_red() {
+        // A ship-phase event (green ~150) under friction shifts warmward (toward
+        // red 28) along the short arc, i.e. to a smaller hue.
+        let (_, _, calm) = color_components(1.0, 0.0);
+        let (_, _, hot) = color_components(1.0, 1.0);
+        assert!(
+            hot < calm,
+            "friction should warm the ship hue: {hot} !< {calm}"
+        );
     }
 
     #[test]
-    fn test_default_loci_count() {
-        let loci = default_loci();
-        assert_eq!(loci.len(), 5);
-        let names: Vec<&str> = loci.iter().map(|l| l.name.as_str()).collect();
+    fn shortarc_lerp_takes_short_way_across_zero() {
+        // 10 -> 350 short arc goes down through 0; midpoint is 0.
+        assert!((shortarc_lerp(10.0, 350.0, 0.5)).abs() < 1e-3);
+        // 350 -> 10 short arc goes up through 0; midpoint is 0 (== 360).
+        let m = shortarc_lerp(350.0, 10.0, 0.5);
+        assert!(m < 1e-3 || (m - 360.0).abs() < 1e-3, "got {m}");
+        // Endpoints.
+        assert!((shortarc_lerp(40.0, 90.0, 0.0) - 40.0).abs() < 1e-3);
+        assert!((shortarc_lerp(40.0, 90.0, 1.0) - 90.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn color_for_formats_oklch() {
+        let s = color_for(0.0, 0.0);
         assert_eq!(
-            names,
-            vec![
-                "progress",
-                "discovery",
-                "success",
-                "uncertainty",
-                "struggle"
-            ]
+            s,
+            format!("oklch({:.2} {:.3} {:.0})", L_CALM, C_CALM, H_EXPLORE)
         );
     }
 
     #[test]
-    fn test_vibe_state_assign_winner_take_all() {
-        // Create a simple VibeState with 2 loci at known positions
-        let state = VibeState {
-            loci: vec![
-                VibeLocus {
-                    name: "alpha".into(),
-                    color: VibeColor {
-                        l: 0.7,
-                        c: 0.25,
-                        h: 250.0,
-                    },
-                    centroid: vec![1.0, 0.0, 0.0],
-                },
-                VibeLocus {
-                    name: "beta".into(),
-                    color: VibeColor {
-                        l: 0.7,
-                        c: 0.25,
-                        h: 145.0,
-                    },
-                    centroid: vec![0.0, 1.0, 0.0],
-                },
-            ],
-        };
-
-        // Vector close to alpha
-        let assignments = state.assign(&[
-            ("evt-1".into(), vec![0.9, 0.1, 0.0]),
-            ("evt-2".into(), vec![0.1, 0.9, 0.0]),
-        ]);
-
-        assert_eq!(assignments.len(), 2);
-        assert_eq!(assignments[0].locus, "alpha");
-        assert_eq!(assignments[1].locus, "beta");
-        assert!(assignments[0].similarity > 0.9);
-        assert!(assignments[1].similarity > 0.9);
+    fn average_vectors_basic() {
+        let vecs = vec![vec![1.0, 2.0, 3.0], vec![3.0, 4.0, 5.0]];
+        assert_eq!(average_vectors(&vecs), vec![2.0, 3.0, 4.0]);
     }
 
     #[test]
-    fn test_chroma_scale_at_boundary_018() {
-        // At exactly 0.18: t = 0, scale = 0.15
-        let scale = chroma_scale(0.18);
+    fn average_vectors_empty() {
+        let vecs: Vec<Vec<f32>> = vec![];
+        assert!(average_vectors(&vecs).is_empty());
+    }
+
+    #[test]
+    fn bundled_axes_load() {
+        let state = VibeState::from_bundled();
+        assert_eq!(state.axes.len(), 2, "expected phase + friction axes");
+        let names: Vec<&str> = state.axes.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"phase"));
+        assert!(names.contains(&"friction"));
+        for axis in &state.axes {
+            assert_eq!(axis.vector.len(), 1536, "axis {} wrong dims", axis.name);
+            assert_eq!(
+                axis.percentiles.len(),
+                101,
+                "axis {} wrong percentile count",
+                axis.name
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_phase_percentiles_match_findings() {
+        // The corpus-derived PHASE projection distribution should reproduce the
+        // validated research endpoints (FINDINGS: p05~-0.17, p50~+0.03, p95~+0.21).
+        let state = VibeState::from_bundled();
+        let phase = state.axis("phase").expect("phase axis");
         assert!(
-            (scale - 0.15).abs() < 1e-6,
-            "At 0.18 boundary, got {}",
-            scale
+            (phase.percentiles[5] - (-0.173)).abs() < 0.01,
+            "p05={}",
+            phase.percentiles[5]
+        );
+        assert!(
+            (phase.percentiles[50] - 0.027).abs() < 0.01,
+            "p50={}",
+            phase.percentiles[50]
+        );
+        assert!(
+            (phase.percentiles[95] - 0.214).abs() < 0.01,
+            "p95={}",
+            phase.percentiles[95]
         );
     }
 
     #[test]
-    fn test_chroma_scale_just_below_boundary_035() {
-        // At 0.34: should still be in the ramp region
-        let scale = chroma_scale(0.34);
-        assert!(scale < 1.0 && scale > 0.15, "Expected ramp, got {}", scale);
+    fn assign_one_none_without_axes() {
+        let state = VibeState { axes: Vec::new() };
+        assert!(state.assign_one("evt", &[1.0, 0.0]).is_none());
     }
 
     #[test]
-    fn test_closest_locus_picks_first_on_equal_similarity() {
-        // When two loci are equidistant, max_by picks the last one
-        // (or first depending on iterator behavior). The important thing
-        // is that it doesn't panic and returns a valid assignment.
+    fn assign_one_none_with_only_one_axis() {
         let state = VibeState {
-            loci: vec![
-                VibeLocus {
-                    name: "a".into(),
-                    color: VibeColor {
-                        l: 0.7,
-                        c: 0.25,
-                        h: 250.0,
-                    },
-                    centroid: vec![1.0, 0.0],
-                },
-                VibeLocus {
-                    name: "b".into(),
-                    color: VibeColor {
-                        l: 0.7,
-                        c: 0.25,
-                        h: 145.0,
-                    },
-                    centroid: vec![0.0, 1.0],
-                },
-            ],
-        };
-
-        // Vector equidistant from both (45 degrees)
-        let assignments = state.assign(&[("eq".into(), vec![1.0, 1.0])]);
-        assert_eq!(assignments.len(), 1);
-        // Should pick one of the two without panicking
-        assert!(assignments[0].locus == "a" || assignments[0].locus == "b");
-        // Similarity should be the same to both (~0.707)
-        assert!(assignments[0].similarity > 0.5);
-    }
-
-    #[test]
-    fn test_vibe_state_assign_css_color_varies_by_similarity() {
-        let state = VibeState {
-            loci: vec![VibeLocus {
-                name: "only".into(),
-                color: VibeColor {
-                    l: 0.7,
-                    c: 0.25,
-                    h: 250.0,
-                },
-                centroid: vec![1.0, 0.0, 0.0],
+            axes: vec![VibeAxis {
+                name: "phase".into(),
+                vector: vec![1.0, 0.0],
+                percentiles: ramp(-1.0, 1.0),
             }],
         };
+        assert!(state.assign_one("evt", &[1.0, 0.0]).is_none());
+    }
 
-        let assignments = state.assign(&[
-            ("close".into(), vec![1.0, 0.0, 0.0]), // identical → high sim
-            ("far".into(), vec![0.0, 0.0, 1.0]),   // orthogonal → low sim
-        ]);
+    #[test]
+    fn assign_one_orders_phase_and_friction() {
+        // Synthetic orthogonal axes: phase along x, friction along y, each with a
+        // symmetric [-1,1] percentile ramp so rank ~ (proj + 1) / 2.
+        let state = VibeState {
+            axes: vec![
+                VibeAxis {
+                    name: "phase".into(),
+                    vector: vec![1.0, 0.0],
+                    percentiles: ramp(-1.0, 1.0),
+                },
+                VibeAxis {
+                    name: "friction".into(),
+                    vector: vec![0.0, 1.0],
+                    percentiles: ramp(-1.0, 1.0),
+                },
+            ],
+        };
 
-        // Close should have higher chroma than far
-        assert!(assignments[0].similarity > assignments[1].similarity);
-        // Both assigned to "only" (winner-take-all with 1 locus)
-        assert_eq!(assignments[0].locus, "only");
-        assert_eq!(assignments[1].locus, "only");
+        // High phase (points along +x), neutral friction.
+        let ship = state.assign_one("ship", &[1.0, 0.0]).unwrap();
+        // Low phase (points along -x).
+        let explore = state.assign_one("explore", &[-1.0, 0.0]).unwrap();
+        assert!(ship.phase > explore.phase);
+        assert!((ship.phase - 1.0).abs() < 1e-3);
+        assert!(explore.phase < 1e-3);
+        // Neutral friction (orthogonal to y) ranks mid.
+        assert!((ship.friction - 0.5).abs() < 1e-2);
+
+        // High friction (points along +y) vs smooth (-y).
+        let stuck = state.assign_one("stuck", &[0.0, 1.0]).unwrap();
+        let smooth = state.assign_one("smooth", &[0.0, -1.0]).unwrap();
+        assert!(stuck.friction > smooth.friction);
+        assert!((stuck.friction - 1.0).abs() < 1e-3);
+        assert!(smooth.friction < 1e-3);
+
+        // Friction raises chroma: the stuck event's color is more saturated.
+        let (_, c_stuck, _) = color_components(stuck.phase, stuck.friction);
+        let (_, c_smooth, _) = color_components(smooth.phase, smooth.friction);
+        assert!(c_stuck > c_smooth);
     }
 }

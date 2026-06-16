@@ -10,6 +10,7 @@ use super::credentials::GitHubAppCredentials;
 use crate::services::{HttpClient, HttpResponse};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Command;
@@ -185,6 +186,37 @@ fn check_rate_limit(resp: &HttpResponse) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn github_api_error(resp: &HttpResponse) -> String {
+    format!("GitHub API error: {} - {}", resp.status, resp.text())
+}
+
+fn ensure_github_api_success(resp: &HttpResponse) -> Result<(), String> {
+    check_rate_limit(resp)?;
+    if !resp.is_success() {
+        return Err(github_api_error(resp));
+    }
+    Ok(())
+}
+
+async fn github_get_response(
+    http: &dyn HttpClient,
+    creds: &GitHubAppCredentials,
+    url: &str,
+) -> Result<HttpResponse, String> {
+    let headers = auth_headers(http, creds).await?;
+    let resp = http.get(url, headers).await?;
+    ensure_github_api_success(&resp)?;
+    Ok(resp)
+}
+
+async fn github_get_json<T: DeserializeOwned>(
+    http: &dyn HttpClient,
+    creds: &GitHubAppCredentials,
+    url: &str,
+) -> Result<T, String> {
+    github_get_response(http, creds, url).await?.json()
 }
 
 // ── API Response Types ──────────────────────────────────────────
@@ -396,24 +428,11 @@ pub async fn fetch_pr(
     repo: &str,
     pr_number: i32,
 ) -> Result<PullRequest, String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/pulls/{}",
         GITHUB_API_BASE, owner, repo, pr_number
     );
-
-    let resp = http.get(&url, headers).await?;
-    check_rate_limit(&resp)?;
-
-    if !resp.is_success() {
-        return Err(format!(
-            "GitHub API error: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    resp.json()
+    github_get_json(http, creds, &url).await
 }
 
 /// Fetch check runs for a commit via REST API.
@@ -424,24 +443,11 @@ pub async fn fetch_check_runs(
     repo: &str,
     sha: &str,
 ) -> Result<CheckRunsResponse, String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/commits/{}/check-runs",
         GITHUB_API_BASE, owner, repo, sha
     );
-
-    let resp = http.get(&url, headers).await?;
-    check_rate_limit(&resp)?;
-
-    if !resp.is_success() {
-        return Err(format!(
-            "GitHub API error: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    resp.json()
+    github_get_json(http, creds, &url).await
 }
 
 /// Fetch PR reviews via REST API.
@@ -452,24 +458,11 @@ pub async fn fetch_reviews(
     repo: &str,
     pr_number: i32,
 ) -> Result<Vec<Review>, String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/pulls/{}/reviews",
         GITHUB_API_BASE, owner, repo, pr_number
     );
-
-    let resp = http.get(&url, headers).await?;
-    check_rate_limit(&resp)?;
-
-    if !resp.is_success() {
-        return Err(format!(
-            "GitHub API error: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    resp.json()
+    github_get_json(http, creds, &url).await
 }
 
 /// Fetch PR files (changed files with diffs) via REST API.
@@ -480,9 +473,34 @@ pub async fn fetch_pr_files(
     repo: &str,
     pr_number: i32,
 ) -> Result<Vec<PrFile>, String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/pulls/{}/files",
+        GITHUB_API_BASE, owner, repo, pr_number
+    );
+    github_get_json(http, creds, &url).await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrCommit {
+    pub commit: PrCommitDetails,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrCommitDetails {
+    pub message: String,
+}
+
+/// Fetch PR commits via REST API.
+pub async fn fetch_pr_commits(
+    http: &dyn HttpClient,
+    creds: &GitHubAppCredentials,
+    owner: &str,
+    repo: &str,
+    pr_number: i32,
+) -> Result<Vec<PrCommit>, String> {
+    let headers = auth_headers(http, creds).await?;
+    let url = format!(
+        "{}/repos/{}/{}/pulls/{}/commits",
         GITHUB_API_BASE, owner, repo, pr_number
     );
 
@@ -537,24 +555,11 @@ pub async fn fetch_run_jobs(
     repo: &str,
     run_id: i64,
 ) -> Result<JobsResponse, String> {
-    let headers = auth_headers(http, creds).await?;
     let url = format!(
         "{}/repos/{}/{}/actions/runs/{}/jobs",
         GITHUB_API_BASE, owner, repo, run_id
     );
-
-    let resp = http.get(&url, headers).await?;
-    check_rate_limit(&resp)?;
-
-    if !resp.is_success() {
-        return Err(format!(
-            "GitHub API error: {} - {}",
-            resp.status,
-            resp.text()
-        ));
-    }
-
-    resp.json()
+    github_get_json(http, creds, &url).await
 }
 
 /// Fetch workflow run logs via REST API. Returns the raw log content as bytes.
