@@ -341,6 +341,11 @@ pub const TURSO_MIGRATIONS: &[Migration] = &[
         "config_disables",
         include_str!("../../../../turso_migrations/0066_config_disables.sql"),
     ),
+    Migration::new(
+        "0067",
+        "tool_invocations",
+        include_str!("../../../../turso_migrations/0067_tool_invocations.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -425,7 +430,8 @@ mod tests {
                 "0063_comment_seq".to_string(),
                 "0064_clear_skyline_cache_for_system_event_filter".to_string(),
                 "0065_merge_request_is_local".to_string(),
-                "0066_config_disables".to_string()
+                "0066_config_disables".to_string(),
+                "0067_tool_invocations".to_string()
             ]
         );
         Ok(db)

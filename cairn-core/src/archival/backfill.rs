@@ -51,7 +51,7 @@
 //! `archival_backfill_state`) immediately after its first pass and never
 //! re-scans.
 //!
-//! ## File-size reclamation is deliberately deferred
+//! ## File-size reclamation: the offline `vacuum_reclaim` utility
 //!
 //! Compressing events only moves pages onto the freelist; the database file does
 //! not shrink until it is rewritten. In-place reclamation is **not safely
@@ -64,16 +64,24 @@
 //!   `enable_autovacuum`, and `auto_vacuum` is silently ignored on a non-empty
 //!   database anyway.
 //! - The one working primitive, `VACUUM INTO`, writes a fresh self-contained
-//!   compacted image to a *separate* path. Reclaiming in place therefore means
-//!   atomically swapping a three-file MVCC set (`.db` + `-wal` + `-log`, where
-//!   committed data lives in the sidecars) while the database is closed — a
-//!   crash-safety-critical subsystem whose failure mode is whole-database loss.
+//!   compacted image to a *separate* path. Reclaiming therefore means swapping a
+//!   three-file MVCC set (`.db` + `-wal` + `-log`, where committed data lives in
+//!   the sidecars) while the database is closed — its blast radius is
+//!   whole-database loss, so the swap runs offline behind a retained backup.
 //!
-//! That swap is tracked as its own reviewed change; the reserved
-//! `archival_backfill_state.vacuum_completed_at` column is where it records
-//! completion. Backfilling is still the substantive win: it removes the ~2 GB of
-//! logical event bytes and frees those pages for reuse, so the file stops
-//! growing even before it is compacted.
+//! Because freed pages are reused, the file plateaus at its high-water mark
+//! rather than growing unbounded, so reclamation is a one-time, offline cleanup
+//! rather than in-app machinery. With the app quit the database is quiescent (no
+//! write-loss window), so the `vacuum_reclaim` cargo example
+//! (`examples/vacuum_reclaim.rs`) does the whole job: `VACUUM INTO` a staged
+//! image, gate on `integrity_check`, then swap the three-file set in place behind
+//! a `.vacuum-backup` set — no startup blocking and no crash-safe swap state
+//! machine. See docs/database.md. The reserved
+//! `archival_backfill_state.vacuum_completed_at` column (migration 0055) is now
+//! unused by app code; the offline utility does not touch it. Backfilling is
+//! still the substantive win: it removes the ~2 GB of logical event bytes and
+//! frees those pages for reuse, so the file stops growing even before it is
+//! compacted.
 
 use std::path::Path;
 
@@ -112,8 +120,8 @@ pub struct BackfillSummary {
 ///
 /// Best-effort and non-blocking: spawn it on a background task at startup. A
 /// single pass compresses every eligible-bucket event, then marks the backfill
-/// complete so it never re-scans. File-size reclamation is deferred (see the
-/// module docs).
+/// complete so it never re-scans. File-size reclamation is a separate one-time,
+/// offline step run via the `vacuum_reclaim` example (see the module docs).
 pub async fn run_archival_maintenance(db: &LocalDb) -> Result<(), String> {
     if backfill_complete(db)
         .await

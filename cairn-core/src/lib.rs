@@ -9,6 +9,7 @@
 pub mod action_configs;
 pub mod action_runs;
 pub mod config_disables;
+pub mod analytics;
 pub mod archival;
 pub mod artifacts;
 pub mod issues;

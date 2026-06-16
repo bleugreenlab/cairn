@@ -8,7 +8,7 @@ mod search_index;
 
 pub(crate) use blocking::run_db_blocking;
 pub use error::{DbError, DbResult};
-pub use local_db::{LocalDb, RetryConfig};
+pub use local_db::{db_set_paths, db_set_size, move_db_set, LocalDb, RetryConfig};
 pub use migration::{Migration, MigrationRunner};
 pub use migrations::TURSO_MIGRATIONS;
 pub use row::{

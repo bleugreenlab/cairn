@@ -691,8 +691,9 @@ impl Orchestrator {
     /// into their durable archival form, gated by `archival_backfill_state` so it
     /// runs once, never on every startup; the work is detached so it never blocks
     /// startup or the UI. This frees pages to the freelist but does NOT shrink the
-    /// database file: file-size reclamation is deferred (see the
-    /// `archival::backfill` module docs and CAIRN-1556).
+    /// database file: file-size reclamation is a separate one-time, offline step
+    /// run via the `vacuum_reclaim` cargo example (see the `archival::backfill`
+    /// module docs, docs/database.md, and CAIRN-1556).
     pub fn spawn_archival_maintenance(&self) {
         let db = self.db.local.clone();
         tokio::spawn(async move {

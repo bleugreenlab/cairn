@@ -305,11 +305,90 @@ impl LocalDb {
         Ok(())
     }
 
+    /// Reclaim freelist space by writing a self-contained, compacted image of
+    /// this database to `dest` via `VACUUM INTO`.
+    ///
+    /// Unlike an in-place `VACUUM`, this runs no checkpoint, so it sidesteps the
+    /// MVCC TRUNCATE-checkpoint corruption that makes in-place `VACUUM` unusable
+    /// on the migrated schema (see docs/database.md). `dest` is therefore itself
+    /// an MVCC three-file set (`{dest, dest-wal, dest-log}`) with committed data
+    /// living in the sidecars; move and validate it as a whole set, never the
+    /// `.db` file alone.
+    ///
+    /// Refuses to run if any member of `dest`'s file set already exists. `VACUUM`
+    /// cannot run inside a `BEGIN..COMMIT` transaction, so this issues the
+    /// statement on a raw connection (via `consume_query`) rather than the
+    /// transaction-wrapped `execute`/`write` path.
+    pub async fn vacuum_into(&self, dest: &Path) -> DbResult<()> {
+        for member in db_set_paths(dest) {
+            if member.exists() {
+                return Err(DbError::internal(format!(
+                    "vacuum_into destination already exists: {}",
+                    member.display()
+                )));
+            }
+        }
+        let target = dest.to_string_lossy().replace('\'', "''");
+        self.consume_query(&format!("VACUUM INTO '{target}'")).await
+    }
+
     async fn configure(&self) -> DbResult<()> {
         self.consume_query("PRAGMA journal_mode = 'mvcc'").await?;
         self.consume_query("PRAGMA foreign_keys = ON").await?;
         Ok(())
     }
+}
+
+/// The three files comprising one MVCC database set: the main `.db` plus its
+/// `-wal` and `-log` sidecars. Committed data lives in the sidecars, so any
+/// move, copy, backup, or snapshot of the database must treat all three as one
+/// unit (see docs/database.md). Returned in the order `[main, -wal, -log]`.
+pub fn db_set_paths(base: &Path) -> [PathBuf; 3] {
+    [
+        base.to_path_buf(),
+        sidecar_path(base, "-wal"),
+        sidecar_path(base, "-log"),
+    ]
+}
+
+fn sidecar_path(base: &Path, suffix: &str) -> PathBuf {
+    let mut name = base.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Total size in bytes of every member of `base`'s three-file set that exists on
+/// disk. Absent sidecars contribute zero, so the figure is meaningful both
+/// before and after a `VACUUM INTO` regardless of how many sidecars are present.
+pub fn db_set_size(base: &Path) -> u64 {
+    db_set_paths(base)
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Move an MVCC database set from `from_base` to `to_base`, relocating every
+/// member of the set that exists and skipping any absent sidecar. Refuses to
+/// clobber: if any destination member already exists, nothing is moved and an
+/// `AlreadyExists` error is returned.
+pub fn move_db_set(from_base: &Path, to_base: &Path) -> std::io::Result<()> {
+    let sources = db_set_paths(from_base);
+    let dests = db_set_paths(to_base);
+    for dest in &dests {
+        if dest.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("destination already exists: {}", dest.display()),
+            ));
+        }
+    }
+    for (src, dest) in sources.iter().zip(dests.iter()) {
+        if src.exists() {
+            std::fs::rename(src, dest)?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_tx<T>(
@@ -858,6 +937,127 @@ mod tests {
             (per_handle * 2) as i64,
             "updates lost across handles"
         );
+    }
+
+    #[tokio::test]
+    async fn vacuum_into_produces_valid_compacted_image_with_all_rows() {
+        let db = crate::storage::migrated_test_db("vacuum-src.turso.db").await;
+        // Seed rows but never checkpoint, so these committed bytes live only in
+        // the source -wal/-log sidecars — exercising three-file handling end to
+        // end through VACUUM INTO.
+        for i in 0..50 {
+            db.execute(
+                "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
+                (format!("w{i}"), format!("name-{i}")),
+            )
+            .await
+            .unwrap();
+        }
+
+        let dir = tempdir().unwrap();
+        let staged = dir.path().join("vacuum-staged.turso.db");
+        db.vacuum_into(&staged).await.unwrap();
+
+        // The staged image is a valid, self-contained database with every row.
+        let staged_db = LocalDb::open(&staged).await.unwrap();
+        assert_eq!(
+            query_text(&staged_db, "PRAGMA integrity_check")
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            query_i64(
+                &staged_db,
+                "SELECT COUNT(*) FROM workspaces WHERE id LIKE 'w%'"
+            )
+            .await
+            .unwrap(),
+            50
+        );
+        assert_eq!(
+            query_text(&staged_db, "SELECT name FROM workspaces WHERE id = 'w7'")
+                .await
+                .unwrap(),
+            "name-7"
+        );
+    }
+
+    #[tokio::test]
+    async fn vacuum_into_refuses_existing_destination() {
+        let db = crate::storage::migrated_test_db("vacuum-refuse.turso.db").await;
+        let dir = tempdir().unwrap();
+
+        // An existing main .db blocks it...
+        let dest = dir.path().join("occupied.turso.db");
+        std::fs::write(&dest, b"occupied").unwrap();
+        assert!(matches!(
+            db.vacuum_into(&dest).await.unwrap_err(),
+            DbError::Internal(_)
+        ));
+
+        // ...and so does an existing sidecar with no main .db file.
+        let sidecar_only = dir.path().join("sidecar-only.turso.db");
+        std::fs::write(dir.path().join("sidecar-only.turso.db-wal"), b"x").unwrap();
+        assert!(matches!(
+            db.vacuum_into(&sidecar_only).await.unwrap_err(),
+            DbError::Internal(_)
+        ));
+    }
+
+    #[test]
+    fn move_db_set_relocates_every_present_member_and_leaves_backup_intact() {
+        let dir = tempdir().unwrap();
+        let live = dir.path().join("live.turso.db");
+        let staged = dir.path().join("staged.turso.db");
+        let backup = dir.path().join("live.turso.db.vacuum-backup");
+
+        // A full live set; a staged set missing its -log sidecar.
+        std::fs::write(&live, b"live-db").unwrap();
+        std::fs::write(dir.path().join("live.turso.db-wal"), b"live-wal").unwrap();
+        std::fs::write(dir.path().join("live.turso.db-log"), b"live-log").unwrap();
+        std::fs::write(&staged, b"staged-db").unwrap();
+        std::fs::write(dir.path().join("staged.turso.db-wal"), b"staged-wal").unwrap();
+
+        // live -> backup moves all three present members.
+        move_db_set(&live, &backup).unwrap();
+        assert!(!live.exists());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"live-db");
+        assert_eq!(
+            std::fs::read(dir.path().join("live.turso.db.vacuum-backup-wal")).unwrap(),
+            b"live-wal"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("live.turso.db.vacuum-backup-log")).unwrap(),
+            b"live-log"
+        );
+
+        // staged -> live moves only the two present members; no -log appears.
+        move_db_set(&staged, &live).unwrap();
+        assert_eq!(std::fs::read(&live).unwrap(), b"staged-db");
+        assert_eq!(
+            std::fs::read(dir.path().join("live.turso.db-wal")).unwrap(),
+            b"staged-wal"
+        );
+        assert!(!dir.path().join("live.turso.db-log").exists());
+
+        // The backup set is untouched throughout.
+        assert!(backup.exists());
+    }
+
+    #[test]
+    fn move_db_set_refuses_to_clobber_existing_destination() {
+        let dir = tempdir().unwrap();
+        let from = dir.path().join("from.turso.db");
+        let to = dir.path().join("to.turso.db");
+        std::fs::write(&from, b"from").unwrap();
+        std::fs::write(&to, b"to").unwrap();
+
+        let err = move_db_set(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        // Nothing moved: source intact, destination unchanged.
+        assert_eq!(std::fs::read(&from).unwrap(), b"from");
+        assert_eq!(std::fs::read(&to).unwrap(), b"to");
     }
 
     #[tokio::test]
