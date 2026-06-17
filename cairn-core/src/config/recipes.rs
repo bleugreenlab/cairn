@@ -224,7 +224,7 @@ mod tests {
             trigger: RecipeTrigger::Manual,
             workspace_id: Some("default".to_string()),
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -412,5 +412,52 @@ edges: []
             .expect("should find workspace recipe");
         assert_eq!(loaded_ws.recipe.name, "Workspace Version");
         assert!(!loaded_ws.is_project_scoped);
+    }
+
+    /// A `system: true` recipe file loads with is_system set; the picker filter
+    /// (`list_recipes_for_context`) keys off this flag.
+    #[test]
+    fn load_recipe_reads_system_flag() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("system-recipe.yaml");
+        let content = r#"cairnVersion: 1
+name: System Recipe
+trigger: manual
+system: true
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+edges: []
+"#;
+        std::fs::write(&path, content).unwrap();
+        match load_recipe_file(&path, false) {
+            ConfigResult::Ok(fr) => assert!(fr.recipe.is_system),
+            ConfigResult::Err { error, .. } => panic!("Failed to load: {}", error),
+        }
+    }
+
+    /// A recipe file with no `system:` key defaults to is_system == false, so
+    /// ordinary recipes keep showing in the issue-create picker.
+    #[test]
+    fn load_recipe_without_system_key_defaults_false() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("plain-recipe.yaml");
+        let content = r#"cairnVersion: 1
+name: Plain Recipe
+trigger: manual
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+edges: []
+"#;
+        std::fs::write(&path, content).unwrap();
+        match load_recipe_file(&path, false) {
+            ConfigResult::Ok(fr) => assert!(!fr.recipe.is_system),
+            ConfigResult::Err { error, .. } => panic!("Failed to load: {}", error),
+        }
     }
 }

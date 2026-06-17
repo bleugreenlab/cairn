@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{recipes as config_recipes, slugify, ConfigResult};
 use crate::models::{
-    CreateRecipe, Recipe, RecipeFile, RecipeFileValidation, RecipeTrigger, RecipeVersionInfo,
+    CreateRecipe, Recipe, RecipeFile, RecipeFileValidation, RecipeVersionInfo,
     UpdateRecipe,
 };
 
@@ -110,7 +110,7 @@ impl ConfigResource for RecipeResource {
             trigger: input.trigger.unwrap_or_default(),
             workspace_id: input.workspace_id,
             project_id: input.project_id,
-            is_default: false,
+            is_system: input.is_system.unwrap_or(false),
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -215,9 +215,6 @@ impl ConfigResource for RecipeResource {
         recipe.id = id.to_string();
         recipe.workspace_id = workspace_id;
         recipe.project_id = project_id;
-        if is_project_scoped {
-            recipe.is_default = false;
-        }
         recipe.created_at = now;
         recipe.updated_at = now;
 
@@ -317,8 +314,22 @@ impl Orchestrator {
     }
 
     /// List recipes for a project context with workspace→project shadowing.
+    ///
+    /// Returns every recipe in scope, including system recipes — trigger
+    /// evaluation depends on seeing them. The issue-create picker uses
+    /// [`Self::list_picker_recipes`] instead, which drops system recipes.
     pub fn list_recipes_for_context(&self, project_id: &str) -> Result<Vec<Recipe>, String> {
         config_resource::list_for_context::<RecipeResource>(self, project_id)
+    }
+
+    /// Recipes offered in the issue-create picker: the project-context list
+    /// minus system recipes (backend/machinery workflows a human never picks).
+    pub fn list_picker_recipes(&self, project_id: &str) -> Result<Vec<Recipe>, String> {
+        Ok(self
+            .list_recipes_for_context(project_id)?
+            .into_iter()
+            .filter(|r| !r.is_system)
+            .collect())
     }
 
     /// Copy a recipe from any scope into a target scope under a chosen id.
@@ -366,7 +377,6 @@ impl Orchestrator {
         let mut new_recipe = existing.recipe.clone();
         new_recipe.id = new_id.clone();
         new_recipe.name = new_name.to_string();
-        new_recipe.is_default = false;
         new_recipe.version = 1;
         new_recipe.parent_recipe_id = None;
         new_recipe.child_recipe_id = None;
@@ -388,144 +398,6 @@ impl Orchestrator {
                 event_id: &new_id,
                 config_action: "created",
                 db_action: "insert",
-            },
-        )
-    }
-
-    /// Get the default recipe for an issue (project first, then workspace).
-    pub fn get_default_recipe_for_issue(&self, project_id: &str) -> Result<Option<Recipe>, String> {
-        let project_path = self.project_path(project_id)?;
-
-        // Project default first
-        let project_recipes = config_recipes::list_recipes(&self.config_dir, Some(&project_path))?;
-        for result in project_recipes {
-            if let ConfigResult::Ok(file_recipe) = result {
-                if file_recipe.recipe.is_default
-                    && file_recipe.recipe.trigger == RecipeTrigger::Manual
-                    && file_recipe.is_project_scoped
-                {
-                    return Ok(Some(file_recipe_to_model(
-                        file_recipe,
-                        None,
-                        Some(project_id.to_string()),
-                        chrono::Utc::now().timestamp(),
-                    )));
-                }
-            }
-        }
-
-        // Workspace default fallback
-        let workspace_recipes = config_recipes::list_recipes(&self.config_dir, None)?;
-        for result in workspace_recipes {
-            if let ConfigResult::Ok(file_recipe) = result {
-                if file_recipe.recipe.is_default
-                    && file_recipe.recipe.trigger == RecipeTrigger::Manual
-                    && !file_recipe.is_project_scoped
-                {
-                    return Ok(Some(file_recipe_to_model(
-                        file_recipe,
-                        Some("default".to_string()),
-                        None,
-                        chrono::Utc::now().timestamp(),
-                    )));
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Set a recipe as the default for its trigger type.
-    pub fn set_default_recipe(
-        &self,
-        recipe_id: &str,
-        project_id: Option<&str>,
-    ) -> Result<Recipe, String> {
-        let project_path: Option<PathBuf> = if let Some(pid) = project_id {
-            Some(self.project_path(pid)?)
-        } else {
-            None
-        };
-
-        let existing =
-            config_recipes::get_recipe(&self.config_dir, recipe_id, project_path.as_deref())?
-                .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
-
-        let trigger = existing.recipe.trigger.clone();
-
-        // Unset any other defaults with the same trigger
-        let all_recipes = config_recipes::list_recipes(&self.config_dir, project_path.as_deref())?;
-        for result in all_recipes {
-            if let ConfigResult::Ok(file_recipe) = result {
-                if file_recipe.recipe.is_default
-                    && file_recipe.recipe.trigger == trigger
-                    && file_recipe.recipe.id != recipe_id
-                    && file_recipe.is_project_scoped == existing.is_project_scoped
-                {
-                    let mut updated = file_recipe.recipe.clone();
-                    updated.is_default = false;
-                    updated.updated_at = chrono::Utc::now().timestamp();
-
-                    let updated_file = config_recipes::FileRecipe {
-                        recipe: updated,
-                        is_project_scoped: file_recipe.is_project_scoped,
-                        file_path: file_recipe.file_path,
-                    };
-                    config_recipes::save_recipe(
-                        &self.config_dir,
-                        &updated_file,
-                        project_path.as_deref(),
-                    )?;
-                }
-            }
-        }
-
-        let mut recipe = existing.recipe.clone();
-        recipe.is_default = true;
-        recipe.updated_at = chrono::Utc::now().timestamp();
-
-        self.save_recipe_change(
-            recipe,
-            existing.is_project_scoped,
-            existing.file_path,
-            project_path.as_deref(),
-            RecipeChangeEvent {
-                event_id: recipe_id,
-                config_action: "modified",
-                db_action: "update",
-            },
-        )
-    }
-
-    /// Unset a recipe as the default.
-    pub fn unset_default_recipe(
-        &self,
-        recipe_id: &str,
-        project_id: Option<&str>,
-    ) -> Result<Recipe, String> {
-        let project_path: Option<PathBuf> = if let Some(pid) = project_id {
-            Some(self.project_path(pid)?)
-        } else {
-            None
-        };
-
-        let existing =
-            config_recipes::get_recipe(&self.config_dir, recipe_id, project_path.as_deref())?
-                .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
-
-        let mut recipe = existing.recipe.clone();
-        recipe.is_default = false;
-        recipe.updated_at = chrono::Utc::now().timestamp();
-
-        self.save_recipe_change(
-            recipe,
-            existing.is_project_scoped,
-            existing.file_path,
-            project_path.as_deref(),
-            RecipeChangeEvent {
-                event_id: recipe_id,
-                config_action: "modified",
-                db_action: "update",
             },
         )
     }

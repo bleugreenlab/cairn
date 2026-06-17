@@ -40,14 +40,6 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
     ));
     out.push_str(&format!("- bugReports: {}\n", yes_no(settings.bug_reports)));
     out.push_str(&format!(
-        "- webSearchApiKey: {}\n",
-        if settings.web_search_api_key.is_some() {
-            "set"
-        } else {
-            "unset"
-        }
-    ));
-    out.push_str(&format!(
         "- thinkingDisplayMode: {:?}\n",
         settings.thinking_display_mode
     ));

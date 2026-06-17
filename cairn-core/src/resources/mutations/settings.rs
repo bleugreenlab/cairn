@@ -25,7 +25,6 @@ const PREF_KEYS: &[&str] = &[
     "pullOnMerge",
     "orphanCleanupDays",
     "bugReports",
-    "webSearchApiKey",
     "thinkingDisplayMode",
     "pendingMemoryThreshold",
     "externalReplies",

@@ -556,7 +556,7 @@ mod tests {
             trigger: RecipeTrigger::SkillCalled,
             workspace_id: None,
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,

@@ -63,8 +63,6 @@ pub struct Settings {
     pub orphan_cleanup_days: i32,
     /// Whether agent bug reports are enabled (default: true)
     pub bug_reports: bool,
-    /// API key for web search (Jina Search)
-    pub web_search_api_key: Option<String>,
     /// Thinking block display mode in chat transcripts
     pub thinking_display_mode: ThinkingDisplayMode,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
@@ -96,9 +94,6 @@ pub struct UpdateSettings {
     pub orphan_cleanup_days: Option<i32>,
     /// Whether agent bug reports are enabled
     pub bug_reports: Option<bool>,
-    /// API key for web search (Jina Search)
-    #[serde(default, deserialize_with = "deserialize_optional_nullable")]
-    pub web_search_api_key: Option<Option<String>>,
     /// Thinking block display mode in chat transcripts
     pub thinking_display_mode: Option<ThinkingDisplayMode>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.

@@ -47,6 +47,7 @@ pub mod secrets;
 pub mod settings;
 pub mod skill_fetch;
 pub mod skills;
+pub mod web_services;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

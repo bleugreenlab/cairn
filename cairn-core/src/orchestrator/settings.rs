@@ -49,9 +49,6 @@ impl Orchestrator {
         if let Some(days) = input.orphan_cleanup_days {
             current.orphan_cleanup_days = days.clamp(1, 30);
         }
-        if let Some(key) = input.web_search_api_key {
-            current.web_search_api_key = key;
-        }
         if let Some(mode) = input.thinking_display_mode {
             current.thinking_display_mode = mode;
         }

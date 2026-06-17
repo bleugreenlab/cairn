@@ -56,7 +56,8 @@ pub const ALWAYS_DISALLOWED_TOOLS: &[&str] = &[
 /// access). Native provider tools never run: `Read`/`Write`/`Edit`/`Bash` are
 /// aliased to the Cairn verbs in `agent_process::toolkits`, and the rest have
 /// no Cairn equivalent (skills arrive via `cairn://skills` + the slash-command
-/// hook; web/PDF reads route through `read` → bmd; sub-agents and user
+/// hook; web/PDF reads route through `read` → the active web-fetch provider;
+/// sub-agents and user
 /// questions go through `write` appends to the node's collections).
 ///
 /// This is the single source for Claude's `--disallowedTools`. Codex ignores

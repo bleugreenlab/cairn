@@ -152,6 +152,15 @@ pub struct TopTargetRow {
     pub error_count: i64,
 }
 
+/// One trend point of average tool calls per session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallsPerSessionPoint {
+    pub bucket_start: i64,
+    pub avg_calls: f64,
+    pub session_count: i64,
+}
+
 /// Tool/verb frequency for one time bucket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

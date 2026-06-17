@@ -76,9 +76,6 @@ pub struct SettingsFile {
     /// Whether agent bug reports are enabled (default: true)
     #[serde(default)]
     pub bug_reports: Option<bool>,
-    /// API key for web search (Jina Search)
-    #[serde(default)]
-    pub web_search_api_key: Option<String>,
     /// Thinking block display mode in chat transcripts
     #[serde(default)]
     pub thinking_display_mode: Option<ThinkingDisplayMode>,
@@ -107,6 +104,16 @@ pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language_servers:
         Option<HashMap<String, crate::config::language_servers::LanguageServerConfig>>,
+    /// Web-fetch provider registry: settings-configured providers that back
+    /// `read http(s)://…` and local `.pdf` reads, keyed by provider name.
+    /// Config-only (YAML, not in the Settings DTO). Absent = only the built-in
+    /// `regular` + `bmd` providers are offered. See `docs/mcp-server.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_services: Option<HashMap<String, crate::config::web_services::WebServiceConfig>>,
+    /// Which web-fetch provider backs fetch. Config-only (YAML, not in the
+    /// Settings DTO). Absent / `regular` = the built-in plain-HTTP fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_web_fetch: Option<String>,
 }
 
 /// Map legacy preferredModels to tier presets.
@@ -222,7 +229,6 @@ impl SettingsFile {
             auto_start_jobs: true, // Always true — setting removed
             orphan_cleanup_days: self.orphan_cleanup_days.unwrap_or(3),
             bug_reports: self.bug_reports.unwrap_or(true),
-            web_search_api_key: self.web_search_api_key.clone(),
             thinking_display_mode: self
                 .thinking_display_mode
                 .clone()
@@ -251,7 +257,6 @@ impl SettingsFile {
             auto_start_jobs: None, // No longer serialized
             orphan_cleanup_days: Some(settings.orphan_cleanup_days),
             bug_reports: Some(settings.bug_reports),
-            web_search_api_key: settings.web_search_api_key.clone(),
             thinking_display_mode: Some(settings.thinking_display_mode.clone()),
             pending_memory_threshold: Some(settings.pending_memory_threshold.max(1)),
             external_replies: Some(settings.external_replies.clone()),
@@ -259,6 +264,8 @@ impl SettingsFile {
             sandbox_deny_read: None,
             build_services: None,
             language_servers: None,
+            web_services: None,
+            active_web_fetch: None,
             pending_blocker_timeout_secs: None,
         }
     }
@@ -571,6 +578,15 @@ pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Resul
         .ok()
         .and_then(|existing| existing.language_servers);
 
+    // The web-fetch provider registry and its active selector are config-only
+    // too: carry the on-disk values forward rather than dropping them on save.
+    file.web_services = load_settings_file(config_dir)
+        .ok()
+        .and_then(|existing| existing.web_services);
+    file.active_web_fetch = load_settings_file(config_dir)
+        .ok()
+        .and_then(|existing| existing.active_web_fetch);
+
     // The pending-blocker escalation window is config-only (YAML, not in the
     // DTO): carry the on-disk value forward rather than dropping it on save.
     file.pending_blocker_timeout_secs = load_settings_file(config_dir)
@@ -836,6 +852,34 @@ buildServices:
         let services = load_build_services(temp.path());
         assert!(services.contains_key("sccache"));
         assert!(services["sccache"].enabled);
+    }
+
+    #[test]
+    fn web_services_and_active_fetch_persist_across_save() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        let yaml = r#"branchPrefix: agent
+webServices:
+  jina:
+    transport: http
+    url: "https://r.jina.ai/{url}"
+    headers:
+      Authorization: "Bearer ${JINA_API_KEY}"
+activeWebFetch: jina
+"#;
+        std::fs::write(get_settings_path(dir), yaml).unwrap();
+
+        // The config-only fields parse off the file.
+        let file = load_settings_file(dir).unwrap();
+        assert!(file.web_services.as_ref().unwrap().contains_key("jina"));
+        assert_eq!(file.active_web_fetch.as_deref(), Some("jina"));
+
+        // Saving settings (which never touches these) carries them forward.
+        let settings = load_settings(dir);
+        save_settings(dir, &settings).unwrap();
+        let after = load_settings_file(dir).unwrap();
+        assert!(after.web_services.as_ref().unwrap().contains_key("jina"));
+        assert_eq!(after.active_web_fetch.as_deref(), Some("jina"));
     }
 
     #[test]

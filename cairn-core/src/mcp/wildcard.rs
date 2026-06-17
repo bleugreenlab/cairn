@@ -6,20 +6,25 @@
 //! the first anchor's match through the end of the last anchor's match.
 //!
 //! For each gap (between an already-matched anchor and the next anchor to find)
-//! the marker-facing edges are whitespace-trimmed, then the gap is resolved one
-//! of two ways:
+//! the marker-facing edges are whitespace-trimmed for matching, and the gap is
+//! resolved one of two ways:
 //!
-//! - **Balanced** — when the preceding anchor's trimmed right edge ends with an
-//!   opener (`{`/`[`/`(`) and the next anchor's trimmed left edge begins with
-//!   the matching closer. The closer is located by local single-pair depth
-//!   matching (string/comment aware), so nested delimiters inside the hole are
-//!   skipped. `"const arr = [~~*~~]"` matches the outer `]`.
-//! - **Span** — otherwise. The next anchor is found at its first literal
-//!   occurrence after the cursor. No delimiter counting.
+//! - **Balanced** — opt-in, only when the marker is written as the contiguous
+//!   `{~~*~~}` token: an opener (`{`/`[`/`(`) sits immediately before the marker
+//!   and the matching closer immediately after it, with no intervening newline
+//!   or whitespace. The closer is located by local single-pair depth matching
+//!   (string/comment aware), so nested delimiters inside the hole are skipped.
+//!   `"const arr = [~~*~~]"` matches the outer `]`. (An empty trailing anchor —
+//!   `"fn f() {~~*~~"` — has no literal tail to span to, so it always balances.)
+//! - **Span** — every other form, including the own-line `"fn f() {\n~~*~~\n}"`.
+//!   The next anchor is found at its first literal occurrence after the cursor.
+//!   No delimiter counting; balanced mode is never inferred from the characters
+//!   the anchors happen to end and begin with.
 //!
 //! Whitespace at marker-facing edges is absorbed into the replaced region (and
-//! reproduced via `new_string`), so own-line (`"fn f() {\n~~*~~\n}"`) and tight
-//! (`"fn f() {~~*~~}"`) forms behave identically.
+//! reproduced via `new_string`), so the own-line (`"fn f() {\n~~*~~\n}"`) and
+//! tight (`"fn f() {~~*~~}"`) forms match the same anchor text — but the marker
+//! form selects the gap strategy: only the contiguous `{~~*~~}` balances.
 //!
 //! A `~~*~~` immediately preceded by a backslash (`\~~*~~`) is treated as
 //! literal content, not a marker; the backslash is stripped from the anchor.
@@ -243,13 +248,21 @@ pub fn apply_wildcard_edit<S: AsRef<str>>(
     let mut cursor = head_start + head.len();
 
     for i in 1..n {
-        let prev = eff[i - 1];
         let next = eff[i];
 
-        let opener = prev.as_bytes().last().copied();
+        // Balanced mode is opt-in via the contiguous `{~~*~~}` form: the raw
+        // (untrimmed) anchors must place an opener immediately before the marker
+        // and the matching closer immediately after it. A plain marker — notably
+        // the own-line `{\n~~*~~\n}` form, where a newline separates the marker
+        // from the delimiters — always spans, regardless of what characters the
+        // anchors happen to end and begin with. (An empty trailing anchor has no
+        // literal tail to span to, so it always balances.)
+        let raw_prev = anchors[i - 1].as_ref();
+        let raw_next = anchors[i].as_ref();
+        let opener = raw_prev.as_bytes().last().copied();
         let closer = opener.and_then(matching_closer);
         let is_balanced = match closer {
-            Some(c) => next.is_empty() || next.as_bytes().first() == Some(&c),
+            Some(c) => next.is_empty() || raw_next.as_bytes().first() == Some(&c),
             None => false,
         };
 
@@ -494,6 +507,10 @@ pub async fn handle_read_resource() {
 
     #[test]
     fn wildcard_whitespace_own_line_and_tight_forms_match() {
+        // No nested delimiters here, so the own-line (span) and tight (balanced)
+        // forms land on the same single `}` and produce the same result; they
+        // diverge only when the gap contains nested delimiters (see the own-line
+        // span tests below).
         let content = "fn main() {\n    let x = 1;\n}";
         let new = "fn main() {\n    let z = 42;\n}";
 
@@ -917,10 +934,73 @@ match cmd {
 
     #[test]
     fn wildcard_balanced_closer_not_found() {
-        // Head opens a brace, next anchor begins with the closer, but there is no
-        // balancing `}` in the content.
+        // Tight `{~~*~~}` opts into balance, but there is no balancing `}` in the
+        // content — a hard balance error (balance was explicitly requested).
         let result = apply_wildcard_edit("fn main() {\n    body();", &["fn main() {", "}"], "new");
         let err = result.unwrap_err();
         assert!(err.contains("Could not balance"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_balanced_empty_trailing_no_closer_errors() {
+        // With an empty trailing anchor there is no literal tail to span to, so a
+        // missing balancing closer is a hard balance error.
+        let anchors = parse_wildcard("fn main() {~~*~~").unwrap();
+        let result = apply_wildcard_edit("fn main() {\n    body();", &anchors, "new");
+        let err = result.unwrap_err();
+        assert!(err.contains("Could not balance"), "got: {err}");
+    }
+
+    #[test]
+    fn wildcard_tight_form_opts_into_balanced() {
+        // The contiguous `{~~*~~}` token balances and skips nested delimiters.
+        let content = "fn main() {\n    if true {\n        x\n    }\n    y\n}";
+        let anchors = parse_wildcard("fn main() {~~*~~}").unwrap();
+        assert_wildcard_result(content, &anchors, "fn main() {\n    z\n}", "fn main() {\n    z\n}");
+    }
+
+    #[test]
+    fn wildcard_own_line_form_spans_not_balances() {
+        // The own-line `{\n~~*~~\n}` form is a plain span: it stops at the FIRST
+        // `}` after the head, never inferring balance from the anchor edges. (Use
+        // the contiguous `{~~*~~}` to balance and skip nested delimiters.)
+        let content = "fn main() {\n    if true {\n        x\n    }\n    y\n}";
+        let anchors = parse_wildcard("fn main() {\n~~*~~\n}").unwrap();
+        let (result, replaced) = apply_wildcard_edit(content, &anchors, "REPL").unwrap();
+        assert_eq!(result, "REPL\n    y\n}");
+        assert_eq!(replaced, "fn main() {\n    if true {\n        x\n    }");
+    }
+
+    #[test]
+    fn wildcard_own_line_form_spans_past_unmodeled_braces() {
+        // The motivating repro: an own-line marker whose head ends in `{` and tail
+        // begins with `}` only incidentally. Because it is a plain span, the brace
+        // scanner (which does not model the `}` inside the template literal) never
+        // runs, and the edit resolves against the literal tail instead of failing
+        // with a balance error.
+        let content = "\
+const f = useCallback(() => {
+    const s = `pre } post`;
+    doThing();
+}, [dep]);
+after();";
+        let anchors =
+            parse_wildcard("const f = useCallback(() => {\n~~*~~\n}, [dep]);").unwrap();
+        let (result, replaced) = apply_wildcard_edit(
+            content,
+            &anchors,
+            "const f = useCallback(() => {\n    newBody();\n}, [dep]);",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "\
+const f = useCallback(() => {
+    newBody();
+}, [dep]);
+after();"
+        );
+        assert!(replaced.starts_with("const f = useCallback(() => {"));
+        assert!(replaced.ends_with("}, [dep]);"));
     }
 }

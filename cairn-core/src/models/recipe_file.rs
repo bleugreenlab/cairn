@@ -45,6 +45,11 @@ fn generate_readable_ids(nodes: &[RecipeNode]) -> HashMap<String, String> {
 /// Current format version for future compatibility
 pub const CURRENT_CAIRN_VERSION: u32 = 1;
 
+/// serde skip helper: omit a bool field from output when it is false.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// Recipe file format for export/import
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +63,10 @@ pub struct RecipeFile {
     pub description: Option<String>,
     /// When the recipe can be triggered
     pub trigger: RecipeTrigger,
+    /// Marks a backend/system recipe: hidden from the issue-create picker but
+    /// still listed in Settings. Only written to YAML when true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub system: bool,
     /// Legacy context field — read during deserialization for migration, never written.
     /// Value is migrated into the trigger node's scope during into_recipe().
     #[serde(default, skip_serializing)]
@@ -254,6 +263,7 @@ impl From<Recipe> for RecipeFile {
             name: recipe.name,
             description: recipe.description,
             trigger: recipe.trigger,
+            system: recipe.is_system,
             context: None,
             nodes,
             edges,
@@ -418,7 +428,7 @@ impl RecipeFile {
             trigger: self.trigger,
             workspace_id,
             project_id,
-            is_default: false,
+            is_system: self.system,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -779,7 +789,7 @@ mod tests {
             trigger: RecipeTrigger::Manual,
             workspace_id: Some("default".to_string()),
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -886,6 +896,35 @@ mod tests {
     }
 
     #[test]
+    fn system_flag_roundtrips_through_yaml() {
+        // A recipe marked system re-emits `system: true` and parses back as is_system.
+        let mut recipe = make_test_recipe();
+        recipe.is_system = true;
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(yaml.contains("system: true"));
+
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+        assert!(imported.is_system);
+    }
+
+    #[test]
+    fn system_flag_omitted_from_yaml_when_false() {
+        // The default (non-system) recipe must not write a `system:` key, and a
+        // file without the key loads as is_system == false.
+        let recipe = make_test_recipe();
+        assert!(!recipe.is_system);
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(!yaml.contains("system:"));
+
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+        assert!(!imported.is_system);
+    }
+
+    #[test]
     fn test_validation_valid_file() {
         let recipe = make_test_recipe();
         let file: RecipeFile = recipe.into();
@@ -905,6 +944,7 @@ mod tests {
             description: None,
             trigger: RecipeTrigger::Manual,
             context: None,
+            system: false,
             nodes: vec![RecipeFileNode {
                 id: "agent-1".to_string(),
                 node_type: RecipeNodeType::Agent,
@@ -929,6 +969,7 @@ mod tests {
             description: None,
             trigger: RecipeTrigger::Manual,
             context: None,
+            system: false,
             nodes: vec![RecipeFileNode {
                 id: "trigger-1".to_string(),
                 node_type: RecipeNodeType::Trigger,
@@ -1093,7 +1134,7 @@ edges: []
             trigger: RecipeTrigger::Manual,
             workspace_id: None,
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -1120,7 +1161,7 @@ edges: []
             trigger: RecipeTrigger::Manual,
             workspace_id: Some("default".to_string()),
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -1204,6 +1245,7 @@ edges: []
             description: None,
             trigger: RecipeTrigger::SkillCalled,
             context: None,
+            system: false,
             nodes: vec![RecipeFileNode {
                 id: "trigger-1".to_string(),
                 node_type: RecipeNodeType::Trigger,

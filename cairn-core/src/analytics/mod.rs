@@ -17,8 +17,8 @@ use crate::storage::{DbResult, LocalDb};
 
 pub use types::{
     Bucket, CostPoint, EconomicsRow, ModelRoleEconomics, Scope, TargetBreakdown, TargetShapeRow,
-    TimeRange, TokensPerLocPoint, TokensPerSessionPoint, ToolBackfillSummary, ToolMixPoint,
-    TopTargetRow,
+    TimeRange, TokensPerLocPoint, TokensPerSessionPoint, ToolBackfillSummary,
+    ToolCallsPerSessionPoint, ToolMixPoint, TopTargetRow,
 };
 
 /// Average billable tokens per session, bucketed by the session's first event.
@@ -125,8 +125,12 @@ pub async fn model_role_economics(
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| "unknown".to_string());
         by_model.entry(model_key).or_default().add(row, cost);
+        // Role groups on the job's agent identity (`agent_config_id`), not its
+        // free-form `node_name`. Delegated tasks and child issues set node_name
+        // to the task title, which would otherwise pollute the role breakdown
+        // with one row per task; the agent config id is the actual agent role.
         by_role
-            .entry(normalize_role(row.node_name.as_deref()))
+            .entry(normalize_role(row.agent_config_id.as_deref()))
             .or_default()
             .add(row, cost);
     }
@@ -172,6 +176,25 @@ pub async fn target_breakdown(
         top_targets,
         total,
     })
+}
+
+/// Average tool calls per session over time. Powered by the tool-invocation
+/// rollup (Tier B), so it returns empty until the index is built.
+pub async fn avg_tool_calls_per_session(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<ToolCallsPerSessionPoint>> {
+    let rows = queries::tool_calls_per_session(db, scope, range, bucket).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ToolCallsPerSessionPoint {
+            bucket_start: r.bucket_start,
+            avg_calls: r.avg_calls,
+            session_count: r.session_count,
+        })
+        .collect())
 }
 
 /// Tool-call frequency by verb over time.
@@ -314,10 +337,10 @@ mod tests {
             "
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
              VALUES ('proj', 'default', 'Proj', 'PRJ', '/tmp/prj', 1, 1);
-            INSERT INTO jobs(id, project_id, status, model, node_name, created_at, updated_at)
-             VALUES ('job-claude', 'proj', 'merged', 'sonnet', 'builder', 1, 1);
-            INSERT INTO jobs(id, project_id, status, model, node_name, created_at, updated_at)
-             VALUES ('job-codex', 'proj', 'running', 'gpt-5', 'planner-0', 1, 1);
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('job-claude', 'proj', 'merged', 'sonnet', 'builder', 'builder', 1, 1);
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('job-codex', 'proj', 'running', 'gpt-5', 'planner-0', 'planner-0', 1, 1);
             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
              VALUES ('sess-claude', 'job-claude', 'claude', 'open', 1, 1, 1);
             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
@@ -396,6 +419,40 @@ mod tests {
         // Both priced models produce a positive cost.
         assert!(econ(&out.by_model, "sonnet").cost_usd > 0.0);
         assert!(econ(&out.by_model, "gpt-5").cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn by_role_uses_agent_config_not_task_title() {
+        let db = fixture_db().await;
+        // A delegated task: node_name is a free-form task title, but the job's
+        // agent_config_id names the real agent. The role breakdown must show the
+        // agent ("Explore"), never the task title.
+        db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('job-task', 'proj', 'running', 'sonnet', 'Trace the parser flow', 'explore', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sess-task', 'job-task', 'claude', 'open', 1, 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
+             VALUES ('run-task', 'proj', 'job-task', 'exited', 'sess-task', 'claude', 1, 1);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                cache_create_tokens, output_tokens, thinking_tokens)
+             VALUES ('tk1', 'run-task', 'sess-task', 1, 1, 'assistant', '{}',
+                NULL, 90000, 10, 0, 0, 5, 0);
+            ",
+        )
+        .await
+        .unwrap();
+
+        let out = model_role_economics(&db, &Scope::default(), &TimeRange::default())
+            .await
+            .unwrap();
+        assert!(out.by_role.iter().any(|r| r.key == "Explore"));
+        assert!(!out
+            .by_role
+            .iter()
+            .any(|r| r.key == "Trace The Parser Flow"));
     }
 
     #[tokio::test]
@@ -493,6 +550,37 @@ mod tests {
             .top_targets
             .iter()
             .any(|t| t.target == "src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_per_session_averages_calls() {
+        let db = fixture_db().await;
+        // A run on sess-claude with two tool uses; backfill turns those into two
+        // tool_invocations rows, so the session has 2 tool calls.
+        db.execute_script(
+            "
+            INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
+             VALUES ('run-tools', 'proj', 'job-claude', 'exited', 'sess-claude', 'claude', 1, 1);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+             VALUES ('ev-a', 'run-tools', 'sess-claude', 1, 1, 'assistant',
+                '{\"eventType\":\"assistant\",\"isError\":false,\"toolUses\":[{\"id\":\"tu1\",\"name\":\"mcp__cairn__read\",\"input\":{\"paths\":[\"file:src/lib.rs\"]}},{\"id\":\"tu2\",\"name\":\"run\",\"input\":{\"commands\":[{\"command\":\"cargo test\"}]}}]}',
+                NULL, 90000);
+            ",
+        )
+        .await
+        .unwrap();
+        backfill_tool_invocations(&db).await.unwrap();
+
+        let rows =
+            avg_tool_calls_per_session(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_count, 1);
+        assert!((rows[0].avg_calls - 2.0).abs() < 1e-9);
+        // 90000s falls in the day bucket starting at 86400.
+        assert_eq!(rows[0].bucket_start, 86400);
     }
 
     #[test]

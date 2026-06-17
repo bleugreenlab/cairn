@@ -104,7 +104,7 @@ Use `mode:"unified_patch"` for multi-file patch envelopes that add, update, or d
       {target:"file:src/lib.rs", mode:"patch", payload:{old_string:"fn old()", new_string:"fn renamed()"}}
     ], commit_msg:"rename old"})
 
-The `old_string` form also accepts `~~*~~` as a wildcard between head and tail anchors; flanked by a matching delimiter pair (`{~~*~~}`, `[~~*~~]`, `(~~*~~)`), it depth-matches the closing delimiter so nested delimiters stay inside the replacement.
+The `old_string` form also accepts `~~*~~` as a wildcard between head and tail anchors; written as the contiguous token `{~~*~~}`, `[~~*~~]`, or `(~~*~~)` (delimiters immediately adjacent to the marker), it depth-matches the closing delimiter so nested delimiters stay inside the replacement. Any other form, including the own-line `{\n~~*~~\n}`, spans to the first literal occurrence of the tail.
 
 The unified-diff form applies hunks against one file:
 

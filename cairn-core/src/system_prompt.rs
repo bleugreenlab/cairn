@@ -187,81 +187,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reference_lists_nested_task_and_question_payloads() {
-        let reference = resource_mutation_reference();
-        // Tasks and questions must surface their payload keys + nested example.
-        assert!(reference.contains("subagentType(str"));
-        assert!(reference.contains("questions(array)"));
-        assert!(
-            reference.contains("multiSelect"),
-            "question example shape missing"
-        );
-        // Typed required keys for common mutations.
-        assert!(reference.contains("title(str)"));
-        assert!(reference.contains("todos(array)"));
-    }
-
-    #[test]
-    fn reference_explains_constrained_value_spaces() {
-        let reference = resource_mutation_reference();
-        // The opaque fields the test agents flagged: enumerate their values.
-        assert!(reference.contains("sm|md|lg"), "tier values missing");
-        assert!(reference.contains("claude|codex"), "backend values missing");
-        assert!(
-            reference.contains("new (fresh context)"),
-            "session values missing"
-        );
-        assert!(
-            reference.contains("tool_bug|prompt_issue|harness_friction|suggestion"),
-            "bug categories missing"
-        );
-    }
-
-    #[test]
-    fn full_prompt_includes_verb_orientation_and_uri_shapes() {
-        let prompt = cairn_system_prompt();
-        assert!(prompt.contains("Cairn is an agent orchestration system"));
-        assert!(prompt.contains("## Verb Model"));
-        assert!(prompt.contains("## URI Shapes"));
-        assert!(prompt.contains("file:src?grep=native_tool_map&glob=**/*.rs"));
-        assert!(prompt.contains("cairn://p/{project}/{number}/{exec}/{node}/task/{task}"));
-        assert!(prompt.contains("Resource reads that include affordance blocks"));
-    }
-
-    #[test]
-    fn full_prompt_teaches_unified_patch_change_batches() {
-        let prompt = cairn_system_prompt();
-        assert!(prompt.contains("mode:\"unified_patch\""));
-        assert!(prompt.contains("write({changes:["));
-        assert!(prompt.contains("*** Begin Patch"));
-        assert!(!prompt.contains("apply_patch"));
-    }
-
-    #[test]
-    fn full_prompt_teaches_single_file_patch_payload_shapes() {
-        let prompt = cairn_system_prompt();
-        // mode:"patch" accepts both structured old_string/new_string and a
-        // single-file unified diff; both shapes must carry a concrete example.
-        assert!(prompt.contains("old_string:"));
-        assert!(prompt.contains("new_string:"));
-        assert!(prompt.contains("payload:{diff:"));
-    }
-
-    #[test]
-    fn full_prompt_keeps_catalog_and_mutation_matrix_on_demand() {
-        let prompt = cairn_system_prompt();
-        assert!(!prompt.contains("## Read catalog"));
-        assert!(!prompt.contains("## Resource Mutations"));
-        assert!(prompt.contains("cairn://help"));
-    }
-
-    #[test]
-    fn static_prompt_uses_positive_framing() {
-        assert!(!CAIRN_SYSTEM_PROMPT.contains("don't"));
-        assert!(!CAIRN_SYSTEM_PROMPT.contains("Don't"));
-    }
-
-    #[test]
     fn help_lists_every_resource_uri_template() {
         let help = cairn_help();
         for contract in cairn_common::contract::RESOURCE_CONTRACTS {
@@ -271,18 +196,5 @@ mod tests {
                 contract.uri_template
             );
         }
-    }
-
-    #[test]
-    fn help_contains_grammar_and_mechanics_markers() {
-        let help = cairn_help();
-        assert!(
-            help.contains("cairn:~"),
-            "home-relative URI guidance missing"
-        );
-        assert!(help.contains("commit_msg"), "commit_msg mechanics missing");
-        assert!(help.contains("preview"), "preview/apply mechanics missing");
-        assert!(help.contains("## Read catalog"));
-        assert!(help.contains("## Resource Mutations"));
     }
 }

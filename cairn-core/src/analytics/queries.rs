@@ -30,6 +30,7 @@ token_events AS (
         j.id AS job_id,
         j.model AS model,
         j.node_name AS node_name,
+        j.agent_config_id AS agent_config_id,
         LOWER(COALESCE(r.backend, s.backend, 'claude')) AS backend,
         CASE
             WHEN LOWER(COALESCE(r.backend, s.backend, 'claude')) = 'codex'
@@ -132,6 +133,11 @@ pub(crate) async fn tokens_per_loc(
     scope: &Scope,
     range: &TimeRange,
 ) -> DbResult<Vec<LocRow>> {
+    // Lines shipped prefer GitHub-synced PR stats (`merge_requests.additions /
+    // deletions`), but those are only populated when GitHub integration is
+    // active and the PR has been fetched. Most local PR-producing jobs have NULL
+    // there, so fall back to the always-present local `file_changes` rollup —
+    // otherwise the metric silently drops every PR without fetched GH stats.
     let sql = format!(
         "WITH {cte},
         job_tokens AS (
@@ -143,16 +149,31 @@ pub(crate) async fn tokens_per_loc(
             WHERE te.job_id IS NOT NULL
               AND (?1 IS NULL OR te.project_id = ?1)
             GROUP BY te.job_id
+        ),
+        job_lines AS (
+            SELECT job_id,
+                   SUM(COALESCE(additions, 0) + COALESCE(deletions, 0)) AS lines
+            FROM file_changes
+            GROUP BY job_id
         )
         SELECT jt.job_id,
                mr.opened_at AS ts,
                jt.billable,
-               (COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)) AS lines_changed,
+               CASE
+                   WHEN (COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)) > 0
+                       THEN COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)
+                   ELSE COALESCE(jl.lines, 0)
+               END AS lines_changed,
                jt.model,
                jt.node_name
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
-        WHERE (COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)) > 0
+        LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
+        WHERE (CASE
+                   WHEN (COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)) > 0
+                       THEN COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)
+                   ELSE COALESCE(jl.lines, 0)
+               END) > 0
           AND (?2 IS NULL OR mr.opened_at >= ?2)
           AND (?3 IS NULL OR mr.opened_at < ?3)
         ORDER BY mr.opened_at",
@@ -227,7 +248,7 @@ pub(crate) async fn cost_components(
 /// one such group, so summing `runs` across groups never double-counts.
 pub(crate) struct GranularRow {
     pub model: Option<String>,
-    pub node_name: Option<String>,
+    pub agent_config_id: Option<String>,
     pub backend: String,
     pub input: i64,
     pub cache_read: i64,
@@ -246,7 +267,7 @@ pub(crate) async fn economics_granular(
     let sql = format!(
         "WITH {cte}
         SELECT te.model,
-               te.node_name,
+               te.agent_config_id,
                te.backend,
                SUM(te.input_tokens),
                SUM(te.cache_read_tokens),
@@ -257,14 +278,14 @@ pub(crate) async fn economics_granular(
                COUNT(DISTINCT te.run_id)
         FROM token_events te
         WHERE {filter}
-        GROUP BY te.model, te.node_name, te.backend",
+        GROUP BY te.model, te.agent_config_id, te.backend",
         cte = TOKEN_EVENTS_CTE,
         filter = SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(GranularRow {
             model: row.opt_text(0)?,
-            node_name: row.opt_text(1)?,
+            agent_config_id: row.opt_text(1)?,
             backend: row.text(2)?,
             input: row.i64(3)?,
             cache_read: row.i64(4)?,
@@ -458,6 +479,48 @@ pub(crate) async fn top_targets(
             scheme: row.text(1)?,
             count: row.i64(2)?,
             error_count: row.opt_i64(3)?.unwrap_or(0),
+        })
+    })
+    .await
+}
+
+/// Average tool calls per session, bucketed by the session's first tool call.
+pub(crate) struct ToolSessionBucketRow {
+    pub bucket_start: i64,
+    pub avg_calls: f64,
+    pub session_count: i64,
+}
+
+pub(crate) async fn tool_calls_per_session(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<ToolSessionBucketRow>> {
+    let secs = bucket.seconds();
+    let sql = format!(
+        "WITH session_calls AS (
+            SELECT r.session_id AS session_id,
+                   COUNT(*) AS calls,
+                   MIN(ti.ts) AS session_ts
+            {join}
+            WHERE r.session_id IS NOT NULL AND {filter}
+            GROUP BY r.session_id
+        )
+        SELECT (session_ts / {secs}) * {secs} AS bucket_start,
+               AVG(calls) AS avg_calls,
+               COUNT(*) AS session_count
+        FROM session_calls
+        GROUP BY bucket_start
+        ORDER BY bucket_start",
+        join = TOOL_JOIN,
+        filter = TOOL_SCOPE_RANGE,
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(ToolSessionBucketRow {
+            bucket_start: row.i64(0)?,
+            avg_calls: row.opt_f64(1)?.unwrap_or(0.0),
+            session_count: row.i64(2)?,
         })
     })
     .await

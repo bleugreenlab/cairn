@@ -180,7 +180,10 @@ pub struct Recipe {
     pub trigger: RecipeTrigger,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
-    pub is_default: bool,
+    /// System recipes are backend/machinery workflows hidden from the
+    /// issue-create picker; they stay listed and runnable in Settings.
+    #[serde(default)]
+    pub is_system: bool,
     pub version: i32,
     pub parent_recipe_id: Option<String>,
     pub child_recipe_id: Option<String>,
@@ -212,6 +215,8 @@ pub struct CreateRecipe {
     pub trigger: Option<RecipeTrigger>,
     pub workspace_id: Option<String>,
     pub project_id: Option<String>,
+    /// Marks the recipe as a system workflow (hidden from the issue-create picker).
+    pub is_system: Option<bool>,
     pub nodes: Option<Vec<RecipeNode>>,
     pub edges: Option<Vec<RecipeEdge>>,
 }
@@ -227,6 +232,8 @@ pub struct UpdateRecipe {
     pub workspace_id: Option<Option<String>>,
     #[allow(dead_code)]
     pub project_id: Option<Option<String>>,
+    /// When present, sets whether the recipe is a system workflow.
+    pub is_system: Option<bool>,
     pub nodes: Option<Vec<RecipeNode>>,
     pub edges: Option<Vec<RecipeEdge>>,
 }
@@ -1054,7 +1061,7 @@ mod tests {
             trigger: RecipeTrigger::Manual,
             workspace_id: None,
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -1093,7 +1100,7 @@ mod tests {
             trigger: RecipeTrigger::Manual,
             workspace_id: None,
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,
@@ -1114,7 +1121,7 @@ mod tests {
             trigger: RecipeTrigger::Manual,
             workspace_id: None,
             project_id: None,
-            is_default: false,
+            is_system: false,
             version: 1,
             parent_recipe_id: None,
             child_recipe_id: None,

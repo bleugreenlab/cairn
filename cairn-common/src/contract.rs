@@ -427,7 +427,7 @@ const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 const EXECUTION: KeySpec = KeySpec::new(
     "execution",
     KeyType::Object,
-    "{recipe?, backend?} to also start an execution once the issue is created; omit to create only",
+    "{recipe, backend?} to also start an execution once the issue is created (recipe required); omit to create only",
 );
 const PARENT: KeySpec = KeySpec::new(
     "parent",
@@ -955,7 +955,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         kind: ResourceKind::Settings,
         uri_template: "cairn://settings",
         name: "Workspace settings",
-        description: "The workspace-global settings document with every section: app prefs (branchPrefix, maxThinkingTokens, mergeType, pullOnMerge, orphanCleanupDays, bugReports, webSearchApiKey, thinkingDisplayMode, pendingMemoryThreshold, externalReplies), backends (activeBackend/tiers/backends plus a read-only model catalog and usage), git identities, provider accounts, keybinds, build services, and read-only GitHub status. patch routes each present key to its existing store; GitHub is read-only and OAuth account-add stays UI-only.",
+        description: "The workspace-global settings document with every section: app prefs (branchPrefix, maxThinkingTokens, mergeType, pullOnMerge, orphanCleanupDays, bugReports, thinkingDisplayMode, pendingMemoryThreshold, externalReplies), backends (activeBackend/tiers/backends plus a read-only model catalog and usage), git identities, provider accounts, keybinds, build services, and read-only GitHub status. patch routes each present key to its existing store; GitHub is read-only and OAuth account-add stays UI-only.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -1201,27 +1201,24 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe?, backend?} to start a new execution programmatically (recipe defaults to the project/workspace default).",
+        description: "Executions for an issue. Append {recipe, backend?} to start a new execution programmatically.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
-            required: &[],
-            optional: &[
-                KeySpec::new(
-                    "recipe",
-                    KeyType::Str,
-                    "recipe id; defaults to the manual default recipe",
-                ),
-                KeySpec::new(
-                    "backend",
-                    KeyType::Str,
-                    "claude|codex; defaults to the recipe/agent default",
-                ),
-            ],
+            required: &[KeySpec::new(
+                "recipe",
+                KeyType::Str,
+                "recipe id to run; discover ids via cairn://recipes",
+            )],
+            optional: &[KeySpec::new(
+                "backend",
+                KeyType::Str,
+                "claude|codex; defaults to the recipe/agent default",
+            )],
             label: "start execution",
-            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{backend:\"claude\"}}]})",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"build\",backend:\"claude\"}}]})",
         }],
     },
     ResourceContract {

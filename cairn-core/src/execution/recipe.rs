@@ -15,10 +15,8 @@ use crate::config::presets::{
     available_selections, load_effective_presets, resolve_agent_snapshot,
     resolve_selection_with_provenance, LaunchSelectionOverride, PresetsConfig, ResolutionSource,
 };
-use crate::config::{
-    agents as config_agents, recipes as config_recipes, skills as config_skills, ConfigResult,
-};
-use crate::config::{file_recipe_to_recipe, get_recipe_from_files};
+use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
+use crate::config::get_recipe_from_files;
 use crate::execution::Initiator;
 use crate::models::{
     Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, Model, ModelSelection, RecipeNode,
@@ -30,42 +28,6 @@ use crate::storage::{LocalDb, RowExt};
 use serde::Serialize;
 use std::collections::HashMap;
 use turso::params;
-
-/// Find a default recipe from files for a given trigger type.
-///
-/// If `project_path` is Some and `project_only` is true, only checks project-scoped recipes.
-/// If `project_path` is None, only checks workspace-scoped recipes.
-fn find_default_recipe_from_files(
-    config_dir: &Path,
-    project_path: Option<&Path>,
-    trigger: RecipeTrigger,
-    project_only: bool,
-) -> Result<Option<crate::models::Recipe>, String> {
-    let recipes = config_recipes::list_recipes(config_dir, project_path)?;
-
-    for result in recipes {
-        if let crate::config::ConfigResult::Ok(file_recipe) = result {
-            if file_recipe.recipe.is_default && file_recipe.recipe.trigger == trigger {
-                if project_only && !file_recipe.is_project_scoped {
-                    continue;
-                }
-                if project_path.is_none() && file_recipe.is_project_scoped {
-                    continue;
-                }
-
-                let (ws_id, proj_id) = if file_recipe.is_project_scoped {
-                    (None, None)
-                } else {
-                    (Some("default".to_string()), None)
-                };
-
-                return Ok(Some(file_recipe_to_recipe(file_recipe, ws_id, proj_id)));
-            }
-        }
-    }
-
-    Ok(None)
-}
 
 // Re-export execution queries with _impl aliases for backward compatibility.
 #[allow(unused_imports)]
@@ -146,22 +108,7 @@ pub fn start_recipe_execution_impl(
     // Get the recipe (use provided or find default)
     let recipe = match recipe_id {
         Some(id) => get_recipe_from_files(&orch.config_dir, Some(&project_path), id)?,
-        None => {
-            // Try project default first, then workspace default
-            find_default_recipe_from_files(
-                &orch.config_dir,
-                Some(&project_path),
-                RecipeTrigger::Manual,
-                true,
-            )?
-            .or(find_default_recipe_from_files(
-                &orch.config_dir,
-                None,
-                RecipeTrigger::Manual,
-                false,
-            )?)
-            .ok_or("No default recipe found")?
-        }
+        None => return Err("No recipe specified for execution".to_string()),
     };
 
     // Build execution snapshot. An execution-wide backend override (external

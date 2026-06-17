@@ -62,6 +62,10 @@ gix-hash = { version = "0.25", features = ["sha1"] }
 gix-odb = { version = "0.81.0", features = ["sha1"] }
 gix-features = { version = "0.48", features = ["zlib"] }
 lsp-types = "0.97"
+# HTML→markdown for the built-in "regular" web-fetch provider. A turndown.js
+# inspired pure-Rust converter; only `text/html` responses are converted, JSON
+# and text/markdown pass through unchanged.
+htmd = "0.5"
 
 # OS keychain access for MCP server secrets. Backend is selected per target so a
 # Finder-launched app (minimal process env) still resolves token-bearing
