@@ -413,6 +413,10 @@ pub enum CairnResource {
     Bug,
     /// Self-describing help page: URI grammar + read catalog + mutation matrix.
     Help,
+    /// Web search via the active typed web-search provider. The query rides in
+    /// the `?q=` projection (`cairn://websearch?q=...`); the read returns a
+    /// normalized ranked list of title · url · snippet rows.
+    WebSearch,
     /// External MCP gateway family.
     ///
     /// - `cairn://mcp` → `{ server: None, resource: None }` (list servers)
@@ -1114,6 +1118,7 @@ impl CairnResource {
             Self::Logs => "cairn://logs".to_string(),
             Self::Bug => "cairn://bug".to_string(),
             Self::Help => "cairn://help".to_string(),
+            Self::WebSearch => "cairn://websearch".to_string(),
             Self::Mcp { server, resource } => {
                 let mut s = "cairn://mcp".to_string();
                 if let Some(server) = server {
@@ -1318,6 +1323,7 @@ impl CairnResource {
             | Self::Logs
             | Self::Bug
             | Self::Help
+            | Self::WebSearch
             | Self::Mcp { .. } => None,
         }
     }
@@ -1387,6 +1393,7 @@ impl CairnResource {
             | Self::Logs
             | Self::Bug
             | Self::Help
+            | Self::WebSearch
             | Self::Mcp { .. } => None,
         }
     }
@@ -1455,6 +1462,7 @@ impl CairnResource {
             | Self::Logs
             | Self::Bug
             | Self::Help
+            | Self::WebSearch
             | Self::Mcp { .. } => None,
         }
     }
@@ -1537,6 +1545,7 @@ impl CairnResource {
             Self::Logs => ResourceKind::Logs,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
+            Self::WebSearch => ResourceKind::WebSearch,
             Self::Mcp { .. } => ResourceKind::Mcp,
             Self::Skills => ResourceKind::Skills,
             Self::Skill { .. } => ResourceKind::Skill,
@@ -1620,6 +1629,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["logs"] => Some(CairnResource::Logs),
         ["bug"] => Some(CairnResource::Bug),
         ["help"] => Some(CairnResource::Help),
+        ["websearch"] => Some(CairnResource::WebSearch),
         ["skills"] => Some(CairnResource::Skills),
         ["skills", skill_id, rest @ ..] => Some(CairnResource::Skill {
             skill_id: (*skill_id).to_string(),
@@ -2199,6 +2209,20 @@ mod tests {
         assert_eq!(
             parse_uri("cairn://p/CAIRN/settings").map(|r| r.kind()),
             Some(ResourceKind::ProjectSettings)
+        );
+    }
+
+    #[test]
+    fn parses_and_roundtrips_websearch() {
+        assert_eq!(parse_uri("cairn://websearch"), Some(CairnResource::WebSearch));
+        assert_eq!(CairnResource::WebSearch.to_uri(), "cairn://websearch");
+        assert_eq!(CairnResource::WebSearch.kind(), ResourceKind::WebSearch);
+        assert_eq!(CairnResource::WebSearch.project(), None);
+        assert_eq!(CairnResource::WebSearch.issue_number(), None);
+        // The query rides in ?q=; parse_uri ignores the query like every resource.
+        assert_eq!(
+            parse_uri("cairn://websearch?q=rust async"),
+            Some(CairnResource::WebSearch)
         );
     }
 

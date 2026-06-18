@@ -108,6 +108,16 @@ pub struct SettingsFile {
     /// Settings DTO). Absent / `regular` = the built-in plain-HTTP fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_web_fetch: Option<String>,
+    /// Typed web-search provider options, keyed by provider id
+    /// (`tavily`/`exa`/`brave`/`jina`) then option key. Config-only (YAML, not
+    /// in the Settings DTO). Validated against the per-provider descriptor in
+    /// `crate::config::web_search`. See `docs/settings.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
+    /// Which typed web-search provider backs `cairn://websearch`. Config-only
+    /// (YAML, not in the Settings DTO). Absent = web search is unconfigured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_web_search: Option<String>,
 }
 
 /// Map legacy preferredModels to tier presets.
@@ -259,6 +269,8 @@ impl SettingsFile {
             build_services: None,
             web_services: None,
             active_web_fetch: None,
+            web_search: None,
+            active_web_search: None,
             pending_blocker_timeout_secs: None,
         }
     }
@@ -486,6 +498,15 @@ pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Resul
     file.active_web_fetch = load_settings_file(config_dir)
         .ok()
         .and_then(|existing| existing.active_web_fetch);
+
+    // The typed web-search registry and its active selector are config-only too:
+    // carry the on-disk values forward rather than dropping them on save.
+    file.web_search = load_settings_file(config_dir)
+        .ok()
+        .and_then(|existing| existing.web_search);
+    file.active_web_search = load_settings_file(config_dir)
+        .ok()
+        .and_then(|existing| existing.active_web_search);
 
     // The pending-blocker escalation window is config-only (YAML, not in the
     // DTO): carry the on-disk value forward rather than dropping it on save.

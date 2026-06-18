@@ -18,6 +18,7 @@ pub mod read;
 pub mod resources;
 pub(crate) mod run_context;
 pub mod search;
+pub mod search_web;
 pub mod skills_resources;
 pub mod slug;
 pub mod watch;

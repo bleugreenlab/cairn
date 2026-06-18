@@ -1,0 +1,464 @@
+//! Typed web-search provider catalog.
+//!
+//! `read cairn://websearch?q=<query>` routes to a *typed* per-provider adapter
+//! (see [`crate::mcp::handlers::search_web`]). Unlike the generic web-**fetch**
+//! registry in [`super::web_services`] (a freeform url/method/headers/body map
+//! behind a JSON-guessing normalizer), web search is a closed catalog of
+//! providers Cairn ships a real adapter for. Each provider knows its own request
+//! and response shape; adding one means writing an adapter, not filling a form.
+//!
+//! Selection is a single workspace scalar `activeWebSearch`. Per-provider
+//! options live under `webSearch.<provider>` in `settings.yaml`, validated
+//! against a Rust-side descriptor at save time. The API key lives in the OS
+//! keychain keyed by provider id (never in `settings.yaml`). There is no
+//! built-in default: an unconfigured search returns a setup message rather than
+//! silently falling back.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// A shipped, typed web-search provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchProviderId {
+    Tavily,
+    Exa,
+    Brave,
+    Jina,
+}
+
+impl SearchProviderId {
+    /// Every shipped provider, in display order.
+    pub const ALL: [SearchProviderId; 4] = [
+        SearchProviderId::Tavily,
+        SearchProviderId::Exa,
+        SearchProviderId::Brave,
+        SearchProviderId::Jina,
+    ];
+
+    /// The stable lowercase id used in `settings.yaml`, the keychain, and the UI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchProviderId::Tavily => "tavily",
+            SearchProviderId::Exa => "exa",
+            SearchProviderId::Brave => "brave",
+            SearchProviderId::Jina => "jina",
+        }
+    }
+
+    /// Parse an id from its lowercase string form (case-insensitive).
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "tavily" => Some(SearchProviderId::Tavily),
+            "exa" => Some(SearchProviderId::Exa),
+            "brave" => Some(SearchProviderId::Brave),
+            "jina" => Some(SearchProviderId::Jina),
+            _ => None,
+        }
+    }
+
+    /// Human label for the settings UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchProviderId::Tavily => "Tavily",
+            SearchProviderId::Exa => "Exa",
+            SearchProviderId::Brave => "Brave",
+            SearchProviderId::Jina => "Jina",
+        }
+    }
+
+    /// Fixed env-var-style name the provider's API key is stored under in the
+    /// keychain (one key per provider; no `${VAR}` editing in the UI).
+    pub fn secret_var(self) -> &'static str {
+        match self {
+            SearchProviderId::Tavily => "TAVILY_API_KEY",
+            SearchProviderId::Exa => "EXA_API_KEY",
+            SearchProviderId::Brave => "BRAVE_API_KEY",
+            SearchProviderId::Jina => "JINA_API_KEY",
+        }
+    }
+
+    /// The per-provider option descriptors the settings UI renders generically.
+    pub fn options(self) -> Vec<ProviderOption> {
+        match self {
+            SearchProviderId::Tavily => vec![
+                ProviderOption::select(
+                    "searchDepth",
+                    "Search depth",
+                    &[("basic", "Basic"), ("advanced", "Advanced")],
+                    "basic",
+                ),
+                ProviderOption::number("maxResults", "Max results", 1.0, 20.0, 5.0),
+                ProviderOption::select(
+                    "topic",
+                    "Topic",
+                    &[("general", "General"), ("news", "News")],
+                    "general",
+                ),
+            ],
+            SearchProviderId::Exa => vec![
+                ProviderOption::number("numResults", "Number of results", 1.0, 25.0, 10.0),
+                ProviderOption::select(
+                    "type",
+                    "Search type",
+                    &[("auto", "Auto"), ("keyword", "Keyword"), ("neural", "Neural")],
+                    "auto",
+                ),
+            ],
+            SearchProviderId::Brave => vec![
+                ProviderOption::number("count", "Result count", 1.0, 20.0, 10.0),
+                ProviderOption::select(
+                    "safesearch",
+                    "Safe search",
+                    &[("off", "Off"), ("moderate", "Moderate"), ("strict", "Strict")],
+                    "moderate",
+                ),
+            ],
+            SearchProviderId::Jina => {
+                vec![ProviderOption::number("count", "Result count", 1.0, 20.0, 10.0)]
+            }
+        }
+    }
+
+    /// The full descriptor a Tauri command returns for the settings UI.
+    pub fn info(self) -> SearchProviderInfo {
+        SearchProviderInfo {
+            id: self,
+            label: self.label().to_string(),
+            secret_var: self.secret_var().to_string(),
+            options: self.options(),
+        }
+    }
+}
+
+/// One choice in a `Select` option control.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Choice {
+    pub value: String,
+    pub label: String,
+}
+
+/// The control type for a provider option, driving how the settings UI renders
+/// and validates it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum OptionControl {
+    Select { choices: Vec<Choice>, default: String },
+    Number { min: f64, max: f64, default: f64 },
+    Bool { default: bool },
+}
+
+/// A single configurable option for a provider, surfaced to the settings UI.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderOption {
+    pub key: String,
+    pub label: String,
+    pub control: OptionControl,
+}
+
+impl ProviderOption {
+    fn select(key: &str, label: &str, choices: &[(&str, &str)], default: &str) -> Self {
+        ProviderOption {
+            key: key.to_string(),
+            label: label.to_string(),
+            control: OptionControl::Select {
+                choices: choices
+                    .iter()
+                    .map(|(value, label)| Choice {
+                        value: (*value).to_string(),
+                        label: (*label).to_string(),
+                    })
+                    .collect(),
+                default: default.to_string(),
+            },
+        }
+    }
+
+    fn number(key: &str, label: &str, min: f64, max: f64, default: f64) -> Self {
+        ProviderOption {
+            key: key.to_string(),
+            label: label.to_string(),
+            control: OptionControl::Number { min, max, default },
+        }
+    }
+}
+
+/// The descriptor a Tauri command returns so the settings UI can render a
+/// provider's key field + options without hardcoding them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchProviderInfo {
+    pub id: SearchProviderId,
+    pub label: String,
+    pub secret_var: String,
+    pub options: Vec<ProviderOption>,
+}
+
+/// The resolved provider that backs a web search.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActiveSearch {
+    /// No provider configured (or the named one is unknown). The read returns a
+    /// setup message rather than failing.
+    Unconfigured,
+    /// A configured, known provider with its stored options.
+    Provider {
+        id: SearchProviderId,
+        options: HashMap<String, serde_yaml::Value>,
+    },
+}
+
+/// The configured `activeWebSearch` provider name, if any.
+pub fn active_web_search_name(config_dir: &Path) -> Option<String> {
+    super::settings::load_settings_file(config_dir)
+        .ok()
+        .and_then(|f| f.active_web_search)
+}
+
+/// The stored options for one provider (empty when none are saved).
+pub fn load_web_search_options(
+    config_dir: &Path,
+    id: SearchProviderId,
+) -> HashMap<String, serde_yaml::Value> {
+    super::settings::load_settings_file(config_dir)
+        .ok()
+        .and_then(|f| f.web_search)
+        .and_then(|mut m| m.remove(id.as_str()))
+        .unwrap_or_default()
+}
+
+/// Resolve which provider backs web search. Absent / empty / unknown name ⇒
+/// [`ActiveSearch::Unconfigured`] (no silent fallback).
+pub fn resolve_active_search(config_dir: &Path) -> ActiveSearch {
+    let name = match active_web_search_name(config_dir) {
+        Some(n) if !n.trim().is_empty() => n,
+        _ => return ActiveSearch::Unconfigured,
+    };
+    match SearchProviderId::from_id(&name) {
+        Some(id) => ActiveSearch::Provider {
+            id,
+            options: load_web_search_options(config_dir, id),
+        },
+        None => {
+            log::warn!("activeWebSearch '{name}' is not a known web-search provider");
+            ActiveSearch::Unconfigured
+        }
+    }
+}
+
+/// Validate a provider's submitted options against its descriptor. Unknown keys
+/// and type/range/choice mismatches are rejected so only well-formed options
+/// reach `settings.yaml`.
+pub fn validate_options(
+    id: SearchProviderId,
+    options: &HashMap<String, serde_yaml::Value>,
+) -> Result<(), String> {
+    let descriptors = id.options();
+    for (key, value) in options {
+        let opt = descriptors
+            .iter()
+            .find(|o| &o.key == key)
+            .ok_or_else(|| format!("Unknown option `{key}` for {} web search", id.label()))?;
+        match &opt.control {
+            OptionControl::Select { choices, .. } => {
+                let s = value
+                    .as_str()
+                    .ok_or_else(|| format!("Option `{key}` must be a string"))?;
+                if !choices.iter().any(|c| c.value == s) {
+                    let allowed = choices
+                        .iter()
+                        .map(|c| c.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!("Option `{key}` must be one of: {allowed}"));
+                }
+            }
+            OptionControl::Number { min, max, .. } => {
+                let n = value
+                    .as_f64()
+                    .or_else(|| value.as_i64().map(|i| i as f64))
+                    .or_else(|| value.as_u64().map(|u| u as f64))
+                    .ok_or_else(|| format!("Option `{key}` must be a number"))?;
+                if n < *min || n > *max {
+                    return Err(format!("Option `{key}` must be between {min} and {max}"));
+                }
+            }
+            OptionControl::Bool { .. } => {
+                value
+                    .as_bool()
+                    .ok_or_else(|| format!("Option `{key}` must be a boolean"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set (or clear) the active web-search provider scalar. `None` / empty clears
+/// it back to unconfigured.
+pub fn set_active_web_search(config_dir: &Path, name: Option<&str>) -> Result<(), String> {
+    let path = super::settings::get_settings_path(config_dir);
+    let mut root = super::web_services::load_settings_mapping(&path)?;
+    let key = serde_yaml::Value::String("activeWebSearch".to_string());
+    match name {
+        Some(n) if !n.trim().is_empty() => {
+            root.insert(key, serde_yaml::Value::String(n.to_string()));
+        }
+        _ => {
+            root.remove(&key);
+        }
+    }
+    super::web_services::write_settings_mapping(&path, &root)
+}
+
+/// Insert or replace the stored options for one provider, after validating them
+/// against the descriptor. Writes surgically through `serde_yaml::Value` so
+/// unrelated settings survive.
+pub fn upsert_web_search_options(
+    config_dir: &Path,
+    id: SearchProviderId,
+    options: &HashMap<String, serde_yaml::Value>,
+) -> Result<(), String> {
+    validate_options(id, options)?;
+    let path = super::settings::get_settings_path(config_dir);
+    let mut root = super::web_services::load_settings_mapping(&path)?;
+
+    let search = root
+        .entry(serde_yaml::Value::String("webSearch".to_string()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let search = search
+        .as_mapping_mut()
+        .ok_or_else(|| "`webSearch` in config is not a mapping".to_string())?;
+
+    let options_value =
+        serde_yaml::to_value(options).map_err(|e| format!("Failed to serialize options: {e}"))?;
+    search.insert(
+        serde_yaml::Value::String(id.as_str().to_string()),
+        options_value,
+    );
+
+    super::web_services::write_settings_mapping(&path, &root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn opts(pairs: &[(&str, serde_yaml::Value)]) -> HashMap<String, serde_yaml::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn id_string_roundtrip() {
+        for id in SearchProviderId::ALL {
+            assert_eq!(SearchProviderId::from_id(id.as_str()), Some(id));
+        }
+        assert_eq!(SearchProviderId::from_id("TAVILY"), Some(SearchProviderId::Tavily));
+        assert_eq!(SearchProviderId::from_id("ghost"), None);
+    }
+
+    #[test]
+    fn resolve_unconfigured_when_unset_or_unknown() {
+        let ws = TempDir::new().unwrap();
+        assert_eq!(resolve_active_search(ws.path()), ActiveSearch::Unconfigured);
+        set_active_web_search(ws.path(), Some("ghost")).unwrap();
+        assert_eq!(resolve_active_search(ws.path()), ActiveSearch::Unconfigured);
+    }
+
+    #[test]
+    fn resolve_picks_named_provider_with_options() {
+        let ws = TempDir::new().unwrap();
+        upsert_web_search_options(
+            ws.path(),
+            SearchProviderId::Tavily,
+            &opts(&[
+                ("searchDepth", serde_yaml::Value::from("advanced")),
+                ("maxResults", serde_yaml::Value::from(8)),
+            ]),
+        )
+        .unwrap();
+        set_active_web_search(ws.path(), Some("tavily")).unwrap();
+        match resolve_active_search(ws.path()) {
+            ActiveSearch::Provider { id, options } => {
+                assert_eq!(id, SearchProviderId::Tavily);
+                assert_eq!(
+                    options.get("searchDepth").and_then(|v| v.as_str()),
+                    Some("advanced")
+                );
+                assert_eq!(options.get("maxResults").and_then(|v| v.as_i64()), Some(8));
+            }
+            other => panic!("expected provider, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_key_and_bad_values() {
+        let id = SearchProviderId::Tavily;
+        assert!(validate_options(id, &opts(&[("nope", serde_yaml::Value::from(1))])).is_err());
+        assert!(
+            validate_options(id, &opts(&[("searchDepth", serde_yaml::Value::from("deep"))])).is_err()
+        );
+        assert!(
+            validate_options(id, &opts(&[("maxResults", serde_yaml::Value::from(99))])).is_err()
+        );
+        assert!(
+            validate_options(id, &opts(&[("maxResults", serde_yaml::Value::from(5))])).is_ok()
+        );
+        assert!(
+            validate_options(id, &opts(&[("searchDepth", serde_yaml::Value::from("advanced"))]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn upsert_preserves_unrelated_keys() {
+        let ws = TempDir::new().unwrap();
+        std::fs::write(
+            super::super::settings::get_settings_path(ws.path()),
+            "branchPrefix: custom\n",
+        )
+        .unwrap();
+        upsert_web_search_options(
+            ws.path(),
+            SearchProviderId::Brave,
+            &opts(&[("count", serde_yaml::Value::from(7))]),
+        )
+        .unwrap();
+        set_active_web_search(ws.path(), Some("brave")).unwrap();
+        let raw =
+            std::fs::read_to_string(super::super::settings::get_settings_path(ws.path())).unwrap();
+        assert!(raw.contains("branchPrefix: custom"), "{raw}");
+        assert!(raw.contains("webSearch"), "{raw}");
+        assert!(raw.contains("activeWebSearch: brave"), "{raw}");
+        assert_eq!(
+            load_web_search_options(ws.path(), SearchProviderId::Brave)
+                .get("count")
+                .and_then(|v| v.as_i64()),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn every_provider_has_options_and_secret_var() {
+        for id in SearchProviderId::ALL {
+            assert!(!id.secret_var().is_empty());
+            assert!(!id.options().is_empty());
+            // Select defaults must be a valid choice.
+            for opt in id.options() {
+                if let OptionControl::Select { choices, default } = &opt.control {
+                    assert!(
+                        choices.iter().any(|c| &c.value == default),
+                        "{}.{} default `{default}` not a choice",
+                        id.as_str(),
+                        opt.key
+                    );
+                }
+            }
+        }
+    }
+}

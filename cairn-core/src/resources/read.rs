@@ -1597,6 +1597,22 @@ async fn render_resource_body(
                 crate::system_prompt::cairn_help()
             }
         }
+        // Web search: the query rides in `?q=` as literal text (no URL-encoding).
+        // Results are normalized to a ranked title · url · snippet list by the
+        // active typed provider.
+        CairnResource::WebSearch => {
+            let query = find_query_value(&params, "q")
+                .map(str::trim)
+                .unwrap_or_default();
+            if query.is_empty() {
+                "Web search needs a query: read cairn://websearch?q=<your query> (the text after q= is the literal query; spaces are fine).".to_string()
+            } else {
+                match crate::mcp::handlers::search_web::search_web(orch, query).await {
+                    Ok(results) => results,
+                    Err(message) => message,
+                }
+            }
+        }
         CairnResource::Mcp { server, resource } => {
             crate::mcp::handlers::mcp_resources::handle_mcp_read(orch, request, server, resource)
                 .await

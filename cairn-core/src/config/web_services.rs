@@ -23,11 +23,14 @@
 //! then the process environment at fetch time — the same model as the external
 //! MCP registry. Secrets live in the keychain, never in `settings.yaml`.
 //!
-//! ## Forward-compatibility for search
+//! ## Web search is a separate, typed registry
 //!
-//! The same `webServices` map serves search providers later: a future
-//! `activeWebSearch` selector plus a `{query}` template placeholder reuse this
-//! schema unchanged.
+//! Web *search* does NOT reuse this freeform schema. It lives in
+//! [`super::web_search`] as a closed catalog of typed provider adapters
+//! (Tavily, Exa, Brave, Jina), selected by `activeWebSearch` with per-provider
+//! options under `webSearch.<provider>`. Each provider knows its own request and
+//! response shape rather than relying on a `{query}` template + JSON-guessing
+//! normalizer.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -280,7 +283,7 @@ pub fn resolve_active_fetch(config_dir: &Path) -> ActiveFetch {
     }
 }
 
-const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
+pub(crate) const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
 
 /// Insert or replace one workspace web-fetch provider, keyed by `name`.
 ///
@@ -356,8 +359,9 @@ pub fn set_active_web_fetch(config_dir: &Path, name: Option<&str>) -> Result<(),
 }
 
 /// Parse a settings file into a YAML mapping, or an empty mapping if the file is
-/// absent or holds only `null`.
-fn load_settings_mapping(path: &Path) -> Result<serde_yaml::Mapping, String> {
+/// absent or holds only `null`. Shared with the typed web-search registry
+/// (`super::web_search`) so both do surgical, comment-preserving writes.
+pub(crate) fn load_settings_mapping(path: &Path) -> Result<serde_yaml::Mapping, String> {
     if !path.exists() {
         return Ok(serde_yaml::Mapping::new());
     }
@@ -373,8 +377,9 @@ fn load_settings_mapping(path: &Path) -> Result<serde_yaml::Mapping, String> {
 }
 
 /// Serialize a YAML mapping back to `settings.yaml`, re-adding the leading
-/// header comment (serde_yaml does not preserve comments).
-fn write_settings_mapping(path: &Path, root: &serde_yaml::Mapping) -> Result<(), String> {
+/// header comment (serde_yaml does not preserve comments). Shared with the typed
+/// web-search registry (`super::web_search`).
+pub(crate) fn write_settings_mapping(path: &Path, root: &serde_yaml::Mapping) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create config directory: {e}"))?;
