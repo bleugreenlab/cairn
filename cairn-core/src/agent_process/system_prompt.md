@@ -30,7 +30,7 @@ Cairn resources use canonical project-scoped URIs under `cairn://p/{PROJECT}`. H
 - `cairn://skills`, `cairn://skills/{id}`, `cairn://recipes`, `cairn://recipes/{id}` — workspace contextual packages.
 - `cairn://p/{project}/skills`, `/skills/{id}`, `/recipes`, `/recipes/{id}` — explicit project packages.
 - `cairn://p/{project}/{number}/{exec}/{node}/memories`, `/memories/{seq}` — node-scoped memory capture and review resources (`cairn:~/memories` for self).
-- `cairn://p/{project}/{number}/{exec}/{node}/lsp`, `cairn:~/lsp` — node-scoped LSP / code intelligence resources 
+- `cairn://p/{project}/{number}/{exec}/{node}/symbols/{name}`, `cairn:~/symbols/{name}` — node-scoped structural code navigation (definition/references/callers/implementations).
 - `cairn://mcp/{server}/{tool-or-resource}` — external MCP gateway; invoke tools through `run`.
 - `cairn://bug` and `cairn://help` — global bug sink and complete resource reference.
 
@@ -76,15 +76,15 @@ Resource projections use the same query grammar:
 
     read({paths:["cairn://p/CAIRN/issues?status=active&limit=20"]})
 
-Semantic code navigation goes through LSP resources (`cairn:~/lsp` for this node's worktree). 
+Structural code navigation runs on the in-process ast-grep engine. Search by syntax with the `?ast=` read modifier (a code pattern with `$VAR`/`$$$` metavariables, sibling to `?grep=`), skim a file's shape with `?outline`, and navigate a known symbol on the `symbols` resource (`cairn:~/symbols/{name}` for this node's worktree):
 
     read({paths:[
-      "cairn:~/lsp/IssueStatus?op=references",
-      "cairn:~/lsp?search=build_widget",
-      "cairn:~/lsp?op=diagnostics"
+      "file:src?ast=fn $NAME($$$) { $$$ }&glob=**/*.rs",
+      "file:src/lib.rs?outline",
+      "cairn:~/symbols/IssueStatus?op=references"
     ]})
 
-Ops are `definition`, `references`, `hover`, `implementations`, `callers`, `subtypes` (no op = a definition + hover overview); resolve an ambiguous name by position with `?at=file:PATH:LINE`. 
+Symbol ops are `definition`, `references`, `callers`, `implementations` (no op = an overview: definition site + signature + reference count); scope with `?in=<glob>`. `?ast=` takes a code pattern, not a tree-sitter node-kind name.
 
 ## write
 
@@ -112,11 +112,11 @@ The unified-diff form applies hunks against one file:
       {target:"file:src/lib.rs", mode:"patch", payload:{diff:"@@ -1,3 +1,3 @@\n fn validate(x) {\n-  old(x)\n+  verify(x)\n }\n"}}
     ], commit_msg:"tighten validation"})
 
-`mode:"rename"` renames an identifier semantically across the worktree through the language server. Give `new_name` plus exactly one of `old_name` or `symbol_at` (a `file:PATH:LINE` position):
+`mode:"rename"` renames an identifier structurally across the worktree through the in-process ast-grep engine. Give `new_name` plus exactly one of `old_name` or `symbol_at` (a `file:PATH:LINE` position). It previews by default (returning an `apply_uri` to land with a `mode:"apply"` call that carries the `commit_msg`); pass `preview:false` to rename in one shot:
 
     write({changes:[
       {target:"file:src/models.rs", mode:"rename", payload:{old_name:"IssueStatus", new_name:"IssueState"}}
-    ], commit_msg:"rename IssueStatus to IssueState"})
+    ], preview:false, commit_msg:"rename IssueStatus to IssueState"})
 
 A rename returns a preview of every edit site before mutating; land it with `mode:"apply"`. It also moves a file when the symbol names one (renaming `mod foo` moves `foo.rs`).
 

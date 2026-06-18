@@ -445,12 +445,12 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
 
         // Rename is its own branch: its target is a file URI (so the contiguous
         // File slice below would otherwise swallow it), but the edit set is
-        // computed out of band by the LSP engine, not the textual file path.
+        // computed out of band by the structural engine, not the textual file path.
         if item.mode == ChangeMode::Rename {
             let worktree = std::path::Path::new(&request.cwd);
             let rename_result = match file_mutations::parse_rename_spec(worktree, item) {
                 Ok((route_file, spec, new_name)) => {
-                    orch.lsp_rename(worktree, &route_file, spec, &new_name)
+                    crate::symbols::rename::compute_plan(worktree, &route_file, spec, &new_name)
                 }
                 Err(error) => Err(error),
             };

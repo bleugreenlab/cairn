@@ -36,13 +36,17 @@ enum ReadProjection {
         output_mode: Option<String>,
     },
     Grep(crate::mcp::handlers::search::GrepPayload),
-    Lsp {
-        /// Resolved op name (empty = overview).
-        op: String,
-        symbol: Option<String>,
-        at: Option<String>,
-        #[allow(dead_code)]
-        in_scope: Option<String>,
+    /// `?ast=<pattern>` structural search over a file or directory tree
+    /// (composes with `?glob=`). Sibling to grep; backed by the in-process
+    /// ast-grep engine.
+    Ast {
+        pattern: String,
+        glob: Option<String>,
+    },
+    /// `?outline` signature-skeleton lens over a file or directory tree
+    /// (composes with `?glob=`). A flag projection — no pattern.
+    Outline {
+        glob: Option<String>,
     },
 }
 
@@ -252,10 +256,45 @@ pub(crate) fn produce_archived_file_segment(
             "archival read target uses a glob projection, which is never gitcoord-addressed"
                 .to_string(),
         ),
-        ReadProjection::Lsp { .. } => Err(
-            "archival read target uses an lsp projection, which depends on a live language server and is never gitcoord-addressed"
-                .to_string(),
-        ),
+        ReadProjection::Ast { pattern, glob } => {
+            // ast-grep is in-process and stateless: it parses source text with no
+            // live-server or whole-tree dependency, so a single-file structural
+            // search reconstructs identically from the blob bytes. Only the
+            // multi-file `glob` walk is unreproducible from one blob — mirror the
+            // grep arm and reject just that case.
+            if glob.is_some() {
+                return Err(
+                    "archival read target uses a multi-file ast search (glob), which is never gitcoord-addressed"
+                        .to_string(),
+                );
+            }
+            let src = String::from_utf8_lossy(bytes);
+            let lang = crate::symbols::engine::lang_for_path(path);
+            let rendered = crate::symbols::search::search_text(rel_path, &src, lang, &pattern);
+            let (matches, _files) = grep_counts(&rendered.body);
+            let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+            meta.match_count = Some(matches);
+            meta.file_count = None;
+            Ok(ReadSegment::text(rendered.body, meta))
+        }
+        ReadProjection::Outline { glob } => {
+            // Single-file outline reconstructs from blob bytes for the same
+            // reason ast search does; only the multi-file glob walk cannot.
+            if glob.is_some() {
+                return Err(
+                    "archival read target uses a multi-file outline (glob), which is never gitcoord-addressed"
+                        .to_string(),
+                );
+            }
+            let src = String::from_utf8_lossy(bytes);
+            let lang = crate::symbols::engine::lang_for_path(path);
+            let body = crate::symbols::outline::outline_text(rel_path, &src, lang);
+            let (matches, _files) = grep_counts(&body);
+            let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+            meta.match_count = Some(matches);
+            meta.file_count = None;
+            Ok(ReadSegment::text(body, meta))
+        }
         ReadProjection::Grep(mut grep_payload) => {
             // A single blob addresses exactly one file. A `glob`/`type` push-down
             // means the live read ran multi-file ripgrep over the tree, which a
@@ -339,39 +378,6 @@ pub(crate) fn slice_lines(output: String, offset: Option<i64>, limit: Option<usi
     sliced.join("\n")
 }
 
-/// Parse a file-projection `?at=` value into a 0-based LSP position. Accepts a
-/// bare `LINE[:COL]` (the file is the target) or a full `file:PATH:LINE[:COL]`;
-/// only the trailing line/column are used. 1-based input maps to 0-based.
-fn parse_at_position(raw: &str) -> Result<(u32, u32), String> {
-    let body = raw.strip_prefix("file:").unwrap_or(raw);
-    let parts: Vec<&str> = body.rsplitn(3, ':').collect();
-    let (line_str, col_str) = match parts.as_slice() {
-        [col, line, _path] if is_ascii_num(col) && is_ascii_num(line) => (*line, Some(*col)),
-        [col, line] if is_ascii_num(col) && is_ascii_num(line) => (*line, Some(*col)),
-        [line, _rest] if is_ascii_num(line) => (*line, None),
-        [line] if is_ascii_num(line) => (*line, None),
-        _ => {
-            return Err(format!(
-                "invalid 'at' position '{raw}'; expected LINE[:COL] or file:PATH:LINE[:COL]"
-            ))
-        }
-    };
-    let line: u32 = line_str
-        .parse()
-        .map_err(|_| format!("invalid line in 'at' '{raw}'"))?;
-    let col: u32 = match col_str {
-        Some(col) => col
-            .parse()
-            .map_err(|_| format!("invalid column in 'at' '{raw}'"))?,
-        None => 1,
-    };
-    Ok((line.saturating_sub(1), col.saturating_sub(1)))
-}
-
-fn is_ascii_num(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-}
-
 fn parse_file_projection(
     params: &[QueryParam],
     payload: &ReadFilePayload,
@@ -381,7 +387,8 @@ fn parse_file_projection(
     let query_limit = parse_optional_usize(find_query_value(params, "limit"), "limit")?;
     let grep = find_query_value(params, "grep");
     let glob = find_query_value(params, "glob");
-    let lsp = find_query_value(params, "lsp");
+    let ast = find_query_value(params, "ast");
+    let outline = find_query_value(params, "outline");
     let annotations_suppressed = find_query_value(params, "annotations") == Some("none");
 
     if find_query_value(params, "search").is_some() {
@@ -436,8 +443,10 @@ fn parse_file_projection(
             "multiline",
         ]
         .as_slice()
-    } else if lsp.is_some() {
-        ["lsp", "symbol", "op", "at", "in"].as_slice()
+    } else if ast.is_some() {
+        ["ast", "glob"].as_slice()
+    } else if outline.is_some() {
+        ["outline", "glob"].as_slice()
     } else if glob.is_some() {
         ["glob", "offset", "limit", "output_mode"].as_slice()
     } else {
@@ -473,19 +482,20 @@ fn parse_file_projection(
             None,
             limit.and_then(|value| u32::try_from(value).ok()),
         )?)
-    } else if let Some(lsp_value) = lsp {
-        // The `lsp=<op>` value names the op directly (e.g. `lsp=references`); an
-        // empty/`true` value falls back to a separate `op` key, else overview.
-        let op = if !lsp_value.is_empty() && lsp_value != "true" {
-            lsp_value.to_string()
-        } else {
-            find_query_value(params, "op").unwrap_or("").to_string()
-        };
-        ReadProjection::Lsp {
-            op,
-            symbol: find_query_value(params, "symbol").map(|value| value.to_string()),
-            at: find_query_value(params, "at").map(|value| value.to_string()),
-            in_scope: find_query_value(params, "in").map(|value| value.to_string()),
+    } else if let Some(pattern) = ast {
+        if pattern.is_empty() {
+            return Err(
+                "Empty 'ast' pattern; provide a structural pattern, e.g. ast=$RECV.unwrap()"
+                    .to_string(),
+            );
+        }
+        ReadProjection::Ast {
+            pattern: pattern.to_string(),
+            glob: glob.map(|value| value.to_string()),
+        }
+    } else if outline.is_some() {
+        ReadProjection::Outline {
+            glob: glob.map(|value| value.to_string()),
         }
     } else if let Some(pattern) = glob {
         let output_mode = find_query_value(params, "output_mode").map(|value| value.to_string());
@@ -839,39 +849,27 @@ pub(crate) async fn produce_file_segment(
             }
             Produced::Segment(ReadSegment::text(body, meta))
         }
-        ReadProjection::Lsp {
-            op,
-            symbol,
-            at,
-            in_scope: _,
-        } => {
-            let file = &resolved_target.full_path;
-            let op = if op.is_empty() {
-                None
-            } else {
-                match crate::lsp::LspOp::from_name(&op) {
-                    Some(op) => Some(op),
-                    None => {
-                        return Produced::Segment(error_segment(
-                            uri,
-                            format!(
-                                "Unknown lsp op '{op}' (definition|references|hover|implementations|callers|subtypes)"
-                            ),
-                        ))
-                    }
-                }
-            };
-            let at_position = match at.as_deref() {
-                Some(raw) => match parse_at_position(raw) {
-                    Ok(position) => Some(position),
-                    Err(error) => return Produced::Segment(error_segment(uri, error)),
-                },
-                None => None,
-            };
-            let rendered = orch.lsp_file_op(worktree, file, op, symbol.as_deref(), at_position);
-            let (matches, _files) = grep_counts(&rendered.body);
+        ReadProjection::Ast { pattern, glob } => {
+            let target = &resolved_target.full_path;
+            let rendered =
+                crate::symbols::search::search(worktree, target, &pattern, glob.as_deref());
+            let (matches, files) = grep_counts(&rendered.body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(matches);
+            if target.is_dir() {
+                meta.file_count = Some(files);
+            }
+            Produced::Segment(ReadSegment::text(rendered.body, meta))
+        }
+        ReadProjection::Outline { glob } => {
+            let target = &resolved_target.full_path;
+            let rendered = crate::symbols::outline::outline(worktree, target, glob.as_deref());
+            let (matches, files) = grep_counts(&rendered.body);
+            let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+            meta.match_count = Some(matches);
+            if target.is_dir() {
+                meta.file_count = Some(files);
+            }
             Produced::Segment(ReadSegment::text(rendered.body, meta))
         }
         ReadProjection::None => {
@@ -1137,54 +1135,6 @@ mod tests {
     fn grep_with_offset_is_rejected() {
         let err = project("grep=foo&offset=2").unwrap_err();
         assert!(err.contains("head_limit"), "{err}");
-    }
-
-    #[test]
-    fn lsp_projection_parses_op_and_symbol() {
-        let (projection, _, _, _, _) = project("lsp=references&symbol=build_widget").unwrap();
-        match projection {
-            ReadProjection::Lsp { op, symbol, at, .. } => {
-                assert_eq!(op, "references");
-                assert_eq!(symbol.as_deref(), Some("build_widget"));
-                assert_eq!(at, None);
-            }
-            other => panic!("expected lsp projection, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lsp_projection_rejects_disallowed_keys() {
-        // A recognized query key outside the lsp allow-set is rejected (an
-        // unrecognized token is absorbed as literal value content by the grammar).
-        let err = project("lsp=references&symbol=x&offset=2").unwrap_err();
-        assert!(err.contains("offset"), "{err}");
-    }
-
-    #[test]
-    fn lsp_empty_value_falls_back_to_op_key() {
-        let (projection, _, _, _, _) = project("lsp=&op=definition&symbol=x").unwrap();
-        match projection {
-            ReadProjection::Lsp { op, .. } => assert_eq!(op, "definition"),
-            other => panic!("expected lsp projection, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_at_position_handles_line_and_line_col() {
-        assert_eq!(parse_at_position("10").unwrap(), (9, 0));
-        assert_eq!(parse_at_position("10:5").unwrap(), (9, 4));
-        assert_eq!(parse_at_position("file:src/lib.rs:10:5").unwrap(), (9, 4));
-        assert!(parse_at_position("nope").is_err());
-    }
-
-    #[test]
-    fn archived_segment_rejects_lsp_projection() {
-        let err = produce_archived_file_segment(
-            "file:src/lib.rs?lsp=references&symbol=build_widget",
-            b"fn build_widget() {}\n",
-        )
-        .unwrap_err();
-        assert!(err.contains("lsp"), "{err}");
     }
 
     #[test]

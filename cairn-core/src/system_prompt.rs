@@ -131,9 +131,11 @@ spans resources rather than belonging to any single one:
 - While a worktree-bound agent tree is dirty, every tool result includes a
   `<system-reminder>` telling the agent to commit or discard the changes; it
   clears automatically once `git status --porcelain` is empty.
-- `preview: true` validates and computes the change report without side effects,
-  returning an `apply_uri`; re-submit a single item with `mode: "apply"` and that
-  URI to commit it. Apply is same-run only and rejects stale targets.
+- `preview: true` validates and computes the change report without side effects
+  and needs no `commit_msg`, returning an `apply_uri`; land it by re-submitting a
+  single item with `mode: "apply"`, that URI, and the `commit_msg` that commits
+  the edits (apply is the step that writes). A bare `mode: "rename"` is
+  preview-shaped the same way. Apply is same-run only and rejects stale targets.
 - Terminals are long-lived resources: `create` starts one, `append` sends input,
   `delete` stops it (see the terminal entries in the mutation matrix).
 - Appending to your node's `cairn:~/tasks` spawns sub-agents; appending to

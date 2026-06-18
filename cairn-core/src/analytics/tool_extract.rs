@@ -235,7 +235,7 @@ fn cairn_kind(path: &str) -> String {
     let lower = body.to_ascii_lowercase();
     let segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
     const KEYWORDS: &[&str] = &[
-        "lsp",
+        "symbols",
         "chat",
         "changed",
         "messages",
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(cairn_kind("cairn:~/memories"), "memories");
         assert_eq!(cairn_kind("cairn://p/CAIRN"), "project");
         assert_eq!(cairn_kind("cairn://p/CAIRN/1821"), "issue");
-        assert_eq!(cairn_kind("cairn:~/lsp/Foo"), "lsp");
+        assert_eq!(cairn_kind("cairn:~/symbols/Foo"), "symbols");
     }
 
     #[test]

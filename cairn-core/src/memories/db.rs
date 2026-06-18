@@ -252,6 +252,34 @@ pub async fn next_node_memory_seq(db: &LocalDb, job_id: &str) -> DbResult<i64> {
     .await
 }
 
+/// The role identity for a job: its `agent_config_id` — the agent prompt name
+/// that resolves to the canon file `{role}.md` and to `get_agent_config(role)`.
+/// Falls back to `node_name` when the job was not started from a named agent
+/// config. Returns `None` when the job row is missing.
+///
+/// This is the correct value for a `role`-scoped memory's `scope_value`: the
+/// recipe node name (e.g. `agent-1`) is a layout label, while the role
+/// (e.g. `builder`) is what canon promotion and the role memory pool key on.
+pub async fn role_for_job(db: &LocalDb, job_id: &str) -> DbResult<Option<String>> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT agent_config_id, node_name FROM jobs WHERE id = ?1 LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.opt_text(0)?.or(row.opt_text(1)?)),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+}
+
 pub async fn confirm_draft_memories_for_job(db: &LocalDb, job_id: &str) -> DbResult<Vec<Memory>> {
     let job_id = job_id.to_string();
     let now = chrono::Utc::now().timestamp();

@@ -15,7 +15,6 @@ pub mod config_resource;
 pub mod docs;
 pub mod identity;
 pub mod lifecycle;
-pub mod lsp;
 pub mod parent_wake;
 pub mod recipes;
 pub mod session;
@@ -52,7 +51,6 @@ use crate::services::{ChildProcess, PtyState, Services};
 use crate::sync::SyncMessage;
 
 pub use crate::account::AnonDeviceManager;
-pub use lsp::{RenamePlan, RenameSpec};
 pub use account_manager::AccountManager;
 pub use attention::{AttentionEvent, AttentionFact, AttentionFactKey};
 
@@ -287,7 +285,6 @@ impl OrchestratorBuilder {
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
             setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
-            lsp_manager: Arc::new(crate::lsp::manager::LspManager::new()),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             blocker_escalation_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -445,11 +442,6 @@ pub struct Orchestrator {
     /// daemon that detaches (e.g. an sccache server) outlives its launcher,
     /// which is acceptable for a shared cache. See `orchestrator::build_services`.
     pub build_service_children: Arc<Mutex<HashMap<String, Box<dyn ChildProcess>>>>,
-
-    /// Per-worktree LSP instance pool. Lazily spawns language servers and pools
-    /// them by `(language, indexing root)`; idle instances are swept on access
-    /// and via the warm-process eviction cadence. See `crate::lsp`.
-    pub lsp_manager: Arc<crate::lsp::manager::LspManager>,
 
     /// Wakes the blocker-escalation worker when a new pending question/permission
     /// item arms an escalation deadline, so the worker re-computes its next sleep
@@ -840,9 +832,6 @@ impl Orchestrator {
     /// Evict a warm process if needed to make room for a new one.
     /// Returns the run_id of the evicted process, if any.
     pub fn collect_warm_if_needed(&self) -> Option<String> {
-        // Eviction-cadence backstop to the LSP pool's access-time idle sweep:
-        // best-effort, never gated on warm-process state.
-        self.lsp_collect_idle();
         let gc = self.warm_gc.as_ref()?.clone();
         let process_state = self.process_state.clone();
         let db = self.db.local.clone();

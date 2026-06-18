@@ -807,7 +807,7 @@ pub(super) fn prepare_file_changes(
                 return Err(build_failure(
                     change.index,
                     item,
-                    "mode=rename is resolved through the LSP engine and must not reach the file-batch path",
+                    "mode=rename is resolved through the ast-grep rename engine and must not reach the file-batch path",
                 ));
             }
             ChangeMode::Delete => {
@@ -856,7 +856,7 @@ pub(super) fn apply_file_batch(
 /// record the in-worktree changes for the `changed` resource, and build the
 /// per-change `applied` report. Factored out of [`apply_file_batch`] so the
 /// rename mode reuses the exact disk-application + recording step with synthetic
-/// prepared changes computed from an LSP `WorkspaceEdit`.
+/// prepared changes computed from the ast-grep rename plan.
 pub(super) fn apply_prepared(
     changes: &[IndexedChange<'_>],
     prepared: &[PreparedChange],
@@ -1015,7 +1015,7 @@ pub(super) fn emit_worktree_changed(orch: &Orchestrator, cwd: &str) {
 pub(super) fn parse_rename_spec(
     worktree: &std::path::Path,
     item: &ChangeItem,
-) -> Result<(std::path::PathBuf, crate::orchestrator::RenameSpec, String), String> {
+) -> Result<(std::path::PathBuf, crate::symbols::rename::RenameSpec, String), String> {
     #[derive(Deserialize)]
     struct RenamePayload {
         #[serde(default)]
@@ -1056,15 +1056,15 @@ pub(super) fn parse_rename_spec(
                 .map_err(|e| format!("Invalid file target: {e}"))?;
             Ok((
                 full_path,
-                crate::orchestrator::RenameSpec::Name(old_name),
+                crate::symbols::rename::RenameSpec::Name(old_name),
                 new_name,
             ))
         }
         (None, Some(symbol_at)) => {
-            let (path, position) = crate::resources::lsp::parse_at(&symbol_at, worktree)?;
+            let (path, position) = crate::symbols::rename::parse_at(&symbol_at, worktree)?;
             Ok((
                 path.clone(),
-                crate::orchestrator::RenameSpec::At(path, position),
+                crate::symbols::rename::RenameSpec::At(path, position),
                 new_name,
             ))
         }
@@ -1081,7 +1081,7 @@ pub(super) fn parse_rename_spec(
 pub(super) fn prepare_rename_changes(
     worktree: &std::path::Path,
     rename_index: usize,
-    plan: &crate::orchestrator::RenamePlan,
+    plan: &crate::symbols::rename::RenamePlan,
 ) -> (Vec<PreparedChange>, Vec<AppliedChange>, Vec<String>) {
     let mut prepared: Vec<PreparedChange> = Vec::new();
     let mut applied: Vec<AppliedChange> = Vec::new();
@@ -1306,12 +1306,6 @@ pub(super) async fn finalize_file_commit(
             // File changes were already recorded above (on apply); committing
             // does not re-record them.
             emit_worktree_changed(orch, &request.cwd);
-            // A successful commit/amend changes the tree SHA, which may be the
-            // worktree's first divergence from main; warm the per-worktree LSP
-            // server in the background so it is ready before the agent's first
-            // query rather than spawned cold mid-query. Idempotent once warm.
-            orch.lsp_prewarm_detached(std::path::PathBuf::from(&request.cwd));
-
             Ok(Some(CommitReport {
                 status: if commit_msg == "^" {
                     "amended"

@@ -9,7 +9,7 @@ mod common;
 mod files;
 mod issue;
 mod labels;
-pub(crate) mod lsp;
+pub(crate) mod symbols;
 mod memories;
 mod messages;
 pub(crate) mod mutations;

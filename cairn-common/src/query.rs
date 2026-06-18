@@ -63,12 +63,11 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "full",
     "label",
     "content_types",
-    // lsp resource + file-projection keys.
-    "lsp",
-    "symbol",
+    // Symbol-resource keys (op/in) + structural file-projection keys (ast/outline).
     "op",
-    "at",
     "in",
+    "ast",
+    "outline",
 ];
 
 /// Return true when the start of `rest` (the text immediately after a `&`) is a

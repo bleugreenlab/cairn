@@ -48,6 +48,14 @@ turso = { git = "https://github.com/tursodatabase/turso", rev = "96781e3d007a9d4
 tantivy = "0.26.1"
 jsonschema = { version = "0.26", default-features = false }
 tiktoken-rs = "0.6"
+# In-process structural code intelligence (tree-sitter via ast-grep). Replaces
+# the external Language Server adapter: parses on demand, ships ~25 grammars
+# compiled in (no install, no per-worktree server/index). `ast-grep-language`
+# default `builtin-parser` feature compiles every bundled grammar.
+ast-grep-core = "0.43"
+ast-grep-language = "0.43"
+ast-grep-config = "0.43"
+ast-grep-outline = { path = "../ast-grep-outline" }
 
 # Optional: test utilities (mocking)
 mockall = { version = "0.13", optional = true }

@@ -401,7 +401,7 @@ pub(super) async fn preview_change(
         if item.mode == ChangeMode::Rename {
             let rename_result = match super::file_mutations::parse_rename_spec(worktree, item) {
                 Ok((route_file, spec, new_name)) => {
-                    orch.lsp_rename(worktree, &route_file, spec, &new_name)
+                    crate::symbols::rename::compute_plan(worktree, &route_file, spec, &new_name)
                 }
                 Err(error) => Err(error),
             };
@@ -676,6 +676,14 @@ pub(super) async fn handle_apply_change(
     let Some(run_id) = request.run_id.as_deref() else {
         return Some("Invalid payload: mode=apply requires current run_id".to_string());
     };
+    // Apply is the step that writes, so it — not the read-only preview — carries
+    // the commit_msg that commits the landed edits.
+    let Some(apply_commit_msg) = payload.commit_msg.clone() else {
+        return Some(
+            "Invalid payload: mode=apply requires a commit_msg so the landed edits are committed"
+                .to_string(),
+        );
+    };
     let event_seq = match extract_event_seq_from_apply_target(&payload.changes[0].target) {
         Ok(seq) => seq,
         Err(error) => return Some(error),
@@ -766,6 +774,9 @@ pub(super) async fn handle_apply_change(
         Err(error) => return Some(format!("Stored preview payload is invalid: {error}")),
     };
     original_payload.preview = Some(false);
+    // The apply call's commit_msg lands the edits; the stored preview carried
+    // none (a preview writes nothing).
+    original_payload.commit_msg = Some(apply_commit_msg);
 
     let mut stale = Vec::new();
     for expected in &preview_report.target_hashes {

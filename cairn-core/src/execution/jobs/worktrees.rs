@@ -143,14 +143,5 @@ pub(crate) fn prepare_worktree_for_job(
         }
     }
 
-    // 4. Pre-warm language servers in the background so indexing is under way
-    // before the agent's first `~/lsp` query. Best-effort and detached: cloning
-    // the orchestrator shares the pooled LSP manager, a worktree with no language
-    // markers (or no installed server) spawns nothing, and any failure is
-    // confined to this thread.
-    let prewarm = orch.clone();
-    let prewarm_worktree = worktree_path.to_path_buf();
-    std::thread::spawn(move || prewarm.lsp_prewarm(&prewarm_worktree));
-
     Ok(())
 }

@@ -35,7 +35,6 @@
 pub mod agents;
 pub mod build_services;
 pub mod keybinds;
-pub mod language_servers;
 pub mod mcp_import;
 pub mod mcp_servers;
 pub mod mcp_setup;

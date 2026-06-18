@@ -15,7 +15,7 @@ use super::issue::{
     read_issue_executions,
 };
 use super::labels::{read_label, read_labels};
-use super::lsp::{read_node_lsp, read_project_lsp};
+use super::symbols::{read_node_symbols, read_project_symbols};
 use super::memories::{read_node_memories_collection, read_node_memory};
 use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
 use super::node::{
@@ -1430,14 +1430,14 @@ async fn render_resource_body(
                 read_label(&orch.db.local, &label_id).await
             }
         }
-        CairnResource::NodeLsp {
+        CairnResource::NodeSymbols {
             project,
             number,
             exec_seq,
             node_id,
             symbol,
         } => {
-            read_node_lsp(
+            read_node_symbols(
                 orch,
                 &project,
                 number,
@@ -1448,8 +1448,8 @@ async fn render_resource_body(
             )
             .await
         }
-        CairnResource::ProjectLsp { project, symbol } => {
-            read_project_lsp(orch, &project, symbol.as_deref(), &params).await
+        CairnResource::ProjectSymbols { project, symbol } => {
+            read_project_symbols(orch, &project, symbol.as_deref(), &params).await
         }
         CairnResource::NodeMemories {
             project,

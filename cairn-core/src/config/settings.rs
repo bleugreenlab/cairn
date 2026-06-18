@@ -98,12 +98,6 @@ pub struct SettingsFile {
     /// `docs/worktree-fence.md` — Managed Build Services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_services: Option<HashMap<String, crate::config::build_services::BuildServiceConfig>>,
-    /// Language Server registry: settings-configured LSP servers Cairn can
-    /// spawn, keyed by language id. Config-only (YAML, not in the Settings DTO).
-    /// Absent = the built-in default set (rust/typescript/python/go).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language_servers:
-        Option<HashMap<String, crate::config::language_servers::LanguageServerConfig>>,
     /// Web-fetch provider registry: settings-configured providers that back
     /// `read http(s)://…` and local `.pdf` reads, keyed by provider name.
     /// Config-only (YAML, not in the Settings DTO). Absent = only the built-in
@@ -263,7 +257,6 @@ impl SettingsFile {
             // Config-only (YAML, not in the DTO); preserved across saves.
             sandbox_deny_read: None,
             build_services: None,
-            language_servers: None,
             web_services: None,
             active_web_fetch: None,
             pending_blocker_timeout_secs: None,
@@ -407,94 +400,6 @@ fn write_build_services_map(
         .map_err(|e| format!("Failed to write settings file: {e}"))
 }
 
-/// Load the configured Language Servers, or the built-in default set when none
-/// are configured. The launching consumer (a later phase) decides which to
-/// actually spawn (e.g. only when the server binary is on `PATH`).
-pub fn load_language_servers(
-    config_dir: &std::path::Path,
-) -> HashMap<String, crate::config::language_servers::LanguageServerConfig> {
-    let configured = load_settings_file(config_dir)
-        .ok()
-        .and_then(|f| f.language_servers);
-    match configured {
-        Some(map) => map,
-        None => crate::config::language_servers::default_language_servers(),
-    }
-}
-
-/// Persist the `enabled` flag for one language server into the `languageServers`
-/// mapping of `settings.yaml`, materializing the built-in defaults into the file
-/// first if it has no `languageServers` block yet. Surgical: only the
-/// `languageServers` key is touched, every other setting is preserved.
-pub fn set_language_server_enabled(
-    config_dir: &std::path::Path,
-    name: &str,
-    enabled: bool,
-) -> Result<(), String> {
-    let mut map = load_language_servers(config_dir);
-    let cfg = map
-        .get_mut(name)
-        .ok_or_else(|| format!("unknown language server: {name}"))?;
-    cfg.enabled = enabled;
-    write_language_servers_map(config_dir, &map)
-}
-
-/// Insert or replace one language server. Starts from the effective map
-/// (configured or built-in default) so adding a sibling preserves the defaults;
-/// writing materializes the whole map into the file.
-pub fn upsert_language_server(
-    config_dir: &std::path::Path,
-    name: &str,
-    config: &crate::config::language_servers::LanguageServerConfig,
-) -> Result<(), String> {
-    let mut map = load_language_servers(config_dir);
-    map.insert(name.to_string(), config.clone());
-    write_language_servers_map(config_dir, &map)
-}
-
-/// Remove one language server by name. Writes the remaining map verbatim — an
-/// empty result persists as `languageServers: {}` (explicitly none), distinct
-/// from an absent block (which yields the built-in defaults).
-pub fn delete_language_server(config_dir: &std::path::Path, name: &str) -> Result<(), String> {
-    let mut map = load_language_servers(config_dir);
-    map.remove(name);
-    write_language_servers_map(config_dir, &map)
-}
-
-/// Surgically write the `languageServers` mapping into `settings.yaml`, leaving
-/// every other key and the header comment intact.
-fn write_language_servers_map(
-    config_dir: &std::path::Path,
-    map: &HashMap<String, crate::config::language_servers::LanguageServerConfig>,
-) -> Result<(), String> {
-    let path = get_settings_path(config_dir);
-    let mut root = match std::fs::read_to_string(&path) {
-        Ok(content) => match serde_yaml::from_str::<serde_yaml::Value>(&content)
-            .map_err(|e| format!("Failed to parse settings file: {e}"))?
-        {
-            serde_yaml::Value::Mapping(m) => m,
-            serde_yaml::Value::Null => serde_yaml::Mapping::new(),
-            _ => return Err("settings file root is not a mapping".to_string()),
-        },
-        Err(_) => serde_yaml::Mapping::new(),
-    };
-    let value = serde_yaml::to_value(map)
-        .map_err(|e| format!("Failed to serialize language servers: {e}"))?;
-    root.insert(
-        serde_yaml::Value::String("languageServers".to_string()),
-        value,
-    );
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create config directory: {e}"))?;
-    }
-    let yaml =
-        serde_yaml::to_string(&root).map_err(|e| format!("Failed to serialize settings: {e}"))?;
-    std::fs::write(&path, format!("# Cairn Workspace Settings\n{yaml}"))
-        .map_err(|e| format!("Failed to write settings file: {e}"))
-}
-
 /// Resolve the template variables for build-service config expansion.
 ///
 /// `{worktrees}` is always `~/.cairn/worktrees` (the canonical worktree root,
@@ -572,11 +477,6 @@ pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Resul
     file.build_services = load_settings_file(config_dir)
         .ok()
         .and_then(|existing| existing.build_services);
-
-    // The language-server registry is config-only too: preserve the on-disk value.
-    file.language_servers = load_settings_file(config_dir)
-        .ok()
-        .and_then(|existing| existing.language_servers);
 
     // The web-fetch provider registry and its active selector are config-only
     // too: carry the on-disk values forward rather than dropping them on save.
@@ -880,104 +780,6 @@ activeWebFetch: jina
         let after = load_settings_file(dir).unwrap();
         assert!(after.web_services.as_ref().unwrap().contains_key("jina"));
         assert_eq!(after.active_web_fetch.as_deref(), Some("jina"));
-    }
-
-    #[test]
-    fn language_servers_defaults_when_unset() {
-        let temp = TempDir::new().unwrap();
-        // No settings file: the built-in default set is synthesized.
-        let servers = load_language_servers(temp.path());
-        for id in ["rust", "typescript", "python", "go"] {
-            assert!(servers.contains_key(id), "missing default {id}");
-        }
-    }
-
-    #[test]
-    fn language_servers_parse_and_persist_across_save() {
-        let temp = TempDir::new().unwrap();
-        let dir = temp.path();
-        let yaml = r#"branchPrefix: agent
-languageServers:
-  rust:
-    enabled: true
-    command: ["rust-analyzer"]
-    extensions: ["rs"]
-    rootMarkers: ["Cargo.toml"]
-    containerSeparator: "::"
-"#;
-        std::fs::write(get_settings_path(dir), yaml).unwrap();
-
-        let servers = load_language_servers(dir);
-        // Only the configured entry comes through (no default merge), proving
-        // the configured value — not the fallback set — was returned.
-        assert_eq!(servers.len(), 1);
-        assert!(servers["rust"].enabled);
-        assert_eq!(servers["rust"].extensions, vec!["rs"]);
-        assert_eq!(servers["rust"].container_separator, "::");
-
-        // Saving settings (which never touches languageServers) preserves it.
-        let settings = load_settings(dir);
-        save_settings(dir, &settings).unwrap();
-        let after = load_language_servers(dir);
-        assert_eq!(after.len(), 1);
-        assert_eq!(after["rust"].extensions, vec!["rs"]);
-    }
-
-    #[test]
-    fn set_language_server_enabled_materializes_default_and_preserves_other_settings() {
-        let temp = TempDir::new().unwrap();
-        let dir = temp.path();
-        std::fs::write(get_settings_path(dir), "branchPrefix: custom\n").unwrap();
-
-        // No languageServers block yet: toggling materializes the defaults.
-        set_language_server_enabled(dir, "rust", false).unwrap();
-        assert!(!load_language_servers(dir)["rust"].enabled);
-        assert!(
-            load_settings_file(dir).unwrap().language_servers.is_some(),
-            "toggle must write an explicit languageServers block"
-        );
-        // Unrelated settings survive the surgical write.
-        assert_eq!(load_settings(dir).branch_prefix, "custom");
-
-        // Toggle back on; unknown server errors.
-        set_language_server_enabled(dir, "rust", true).unwrap();
-        assert!(load_language_servers(dir)["rust"].enabled);
-        assert!(set_language_server_enabled(dir, "nope", true).is_err());
-    }
-
-    #[test]
-    fn upsert_and_delete_language_server_round_trip() {
-        use crate::config::language_servers::LanguageServerConfig;
-        let temp = TempDir::new().unwrap();
-        let dir = temp.path();
-
-        let mut env = HashMap::new();
-        env.insert("ZLS_LOG".to_string(), "debug".to_string());
-        let cfg = LanguageServerConfig {
-            enabled: true,
-            command: vec!["zls".into()],
-            extensions: vec!["zig".into()],
-            root_markers: vec!["build.zig".into()],
-            container_separator: ".".into(),
-            initialization_options: None,
-            env,
-        };
-        upsert_language_server(dir, "zig", &cfg).unwrap();
-
-        let map = load_language_servers(dir);
-        // The new server is present AND the built-in defaults survive.
-        assert!(map.contains_key("zig"));
-        assert!(map.contains_key("rust"));
-        assert_eq!(map["zig"].command, vec!["zls"]);
-        assert_eq!(
-            map["zig"].env.get("ZLS_LOG").map(String::as_str),
-            Some("debug")
-        );
-
-        delete_language_server(dir, "zig").unwrap();
-        let after = load_language_servers(dir);
-        assert!(!after.contains_key("zig"));
-        assert!(after.contains_key("rust"));
     }
 
     #[test]

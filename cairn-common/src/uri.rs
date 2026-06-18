@@ -27,7 +27,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "task",
     "messages",
     "annotations",
-    "lsp",
+    "symbols",
 ];
 
 /// True when `segment` is a reserved node/task sub-resource keyword (see
@@ -107,14 +107,14 @@ pub enum CairnResource {
         /// generic `.../{node}/artifact` alias, kept for back-compat reads.
         name: Option<String>,
     },
-    NodeLsp {
+    NodeSymbols {
         project: String,
         number: i32,
         exec_seq: i32,
         node_id: String,
         symbol: Option<String>,
     },
-    ProjectLsp {
+    ProjectSymbols {
         project: String,
         symbol: Option<String>,
     },
@@ -782,22 +782,22 @@ pub fn build_node_memories_uri(project: &str, number: i32, exec_seq: i32, node_i
     build_node_subresource_uri(project, number, exec_seq, node_id, "memories")
 }
 
-pub fn build_node_lsp_uri(
+pub fn build_node_symbols_uri(
     project: &str,
     number: i32,
     exec_seq: i32,
     node_id: &str,
     symbol: Option<&str>,
 ) -> String {
-    let base = build_node_subresource_uri(project, number, exec_seq, node_id, "lsp");
+    let base = build_node_subresource_uri(project, number, exec_seq, node_id, "symbols");
     match symbol {
         Some(symbol) => format!("{base}/{symbol}"),
         None => base,
     }
 }
 
-pub fn build_project_lsp_uri(project: &str, symbol: Option<&str>) -> String {
-    let base = format!("{}/lsp", build_project_uri(project));
+pub fn build_project_symbols_uri(project: &str, symbol: Option<&str>) -> String {
+    let base = format!("{}/symbols", build_project_uri(project));
     match symbol {
         Some(symbol) => format!("{base}/{symbol}"),
         None => base,
@@ -1100,15 +1100,15 @@ impl CairnResource {
                 node_id,
             } => build_node_changed_uri(project, *number, *exec_seq, node_id),
             Self::ProjectTerminal { project, slug } => build_project_terminal_uri(project, slug),
-            Self::NodeLsp {
+            Self::NodeSymbols {
                 project,
                 number,
                 exec_seq,
                 node_id,
                 symbol,
-            } => build_node_lsp_uri(project, *number, *exec_seq, node_id, symbol.as_deref()),
-            Self::ProjectLsp { project, symbol } => {
-                build_project_lsp_uri(project, symbol.as_deref())
+            } => build_node_symbols_uri(project, *number, *exec_seq, node_id, symbol.as_deref()),
+            Self::ProjectSymbols { project, symbol } => {
+                build_project_symbols_uri(project, symbol.as_deref())
             }
             Self::Db => "cairn://db".to_string(),
             Self::Logs => "cairn://logs".to_string(),
@@ -1312,8 +1312,8 @@ impl CairnResource {
             | Self::Action { .. }
             | Self::ProjectActions { .. }
             | Self::ProjectAction { .. }
-            | Self::NodeLsp { .. }
-            | Self::ProjectLsp { .. }
+            | Self::NodeSymbols { .. }
+            | Self::ProjectSymbols { .. }
             | Self::Db
             | Self::Logs
             | Self::Bug
@@ -1371,8 +1371,8 @@ impl CairnResource {
             | Self::ProjectAgent { project, .. }
             | Self::ProjectActions { project }
             | Self::ProjectAction { project, .. }
-            | Self::NodeLsp { project, .. }
-            | Self::ProjectLsp { project, .. } => Some(project),
+            | Self::NodeSymbols { project, .. }
+            | Self::ProjectSymbols { project, .. } => Some(project),
             Self::Skills
             | Self::Skill { .. }
             | Self::Labels
@@ -1427,7 +1427,7 @@ impl CairnResource {
             | Self::NodeChanged { number, .. }
             | Self::NodeMemories { number, .. }
             | Self::NodeMemory { number, .. }
-            | Self::NodeLsp { number, .. } => Some(*number),
+            | Self::NodeSymbols { number, .. } => Some(*number),
             Self::Project { .. }
             | Self::ProjectIssues { .. }
             | Self::ProjectMessages { .. }
@@ -1450,7 +1450,7 @@ impl CairnResource {
             | Self::Action { .. }
             | Self::ProjectActions { .. }
             | Self::ProjectAction { .. }
-            | Self::ProjectLsp { .. }
+            | Self::ProjectSymbols { .. }
             | Self::Db
             | Self::Logs
             | Self::Bug
@@ -1486,7 +1486,7 @@ impl CairnResource {
             | Self::NodeChanged { node_id, .. }
             | Self::NodeMemories { node_id, .. }
             | Self::NodeMemory { node_id, .. }
-            | Self::NodeLsp { node_id, .. } => Some(node_id),
+            | Self::NodeSymbols { node_id, .. } => Some(node_id),
             _ => None,
         }
     }
@@ -1558,8 +1558,8 @@ impl CairnResource {
             Self::Action { .. } => ResourceKind::Action,
             Self::ProjectActions { .. } => ResourceKind::ProjectActions,
             Self::ProjectAction { .. } => ResourceKind::ProjectAction,
-            Self::NodeLsp { .. } => ResourceKind::NodeLsp,
-            Self::ProjectLsp { .. } => ResourceKind::ProjectLsp,
+            Self::NodeSymbols { .. } => ResourceKind::NodeSymbols,
+            Self::ProjectSymbols { .. } => ResourceKind::ProjectSymbols,
         }
     }
 }
@@ -1691,13 +1691,13 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             project: canonical_project(project),
             action_id: (*action_id).to_string(),
         }),
-        // Literal `lsp` segment(s); must precede the numeric issue arm below so a
-        // project-scoped lsp URI is never misread as an issue id.
-        [PROJECT_SCOPE, project, "lsp"] => Some(CairnResource::ProjectLsp {
+        // Literal `symbols` segment(s); must precede the numeric issue arm below so a
+        // project-scoped symbols URI is never misread as an issue id.
+        [PROJECT_SCOPE, project, "symbols"] => Some(CairnResource::ProjectSymbols {
             project: canonical_project(project),
             symbol: None,
         }),
-        [PROJECT_SCOPE, project, "lsp", symbol] => Some(CairnResource::ProjectLsp {
+        [PROJECT_SCOPE, project, "symbols", symbol] => Some(CairnResource::ProjectSymbols {
             project: canonical_project(project),
             symbol: Some((*symbol).to_string()),
         }),
@@ -1817,8 +1817,8 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 node_id: (*node_id).to_string(),
             })
         }
-        [PROJECT_SCOPE, project, number, exec_seq, node_id, "lsp"] => {
-            Some(CairnResource::NodeLsp {
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "symbols"] => {
+            Some(CairnResource::NodeSymbols {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,
@@ -1828,8 +1828,8 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }
         // A `::`/`.`-qualified symbol stays one path segment, so a
         // container-qualified name (`Foo::bar`) passes through intact.
-        [PROJECT_SCOPE, project, number, exec_seq, node_id, "lsp", symbol] => {
-            Some(CairnResource::NodeLsp {
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "symbols", symbol] => {
+            Some(CairnResource::NodeSymbols {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,
@@ -2034,10 +2034,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_lsp_resources_all_forms() {
+    fn parses_symbol_resources_all_forms() {
         assert_eq!(
-            parse_uri("cairn://p/cairn/12/1/builder/lsp"),
-            Some(CairnResource::NodeLsp {
+            parse_uri("cairn://p/cairn/12/1/builder/symbols"),
+            Some(CairnResource::NodeSymbols {
                 project: "CAIRN".to_string(),
                 number: 12,
                 exec_seq: 1,
@@ -2046,8 +2046,8 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_uri("cairn://p/cairn/12/1/builder/lsp/build_widget"),
-            Some(CairnResource::NodeLsp {
+            parse_uri("cairn://p/cairn/12/1/builder/symbols/build_widget"),
+            Some(CairnResource::NodeSymbols {
                 project: "CAIRN".to_string(),
                 number: 12,
                 exec_seq: 1,
@@ -2057,8 +2057,8 @@ mod tests {
         );
         // A `::`-qualified symbol survives as one segment.
         assert_eq!(
-            parse_uri("cairn://p/cairn/12/1/builder/lsp/Foo::bar"),
-            Some(CairnResource::NodeLsp {
+            parse_uri("cairn://p/cairn/12/1/builder/symbols/Foo::bar"),
+            Some(CairnResource::NodeSymbols {
                 project: "CAIRN".to_string(),
                 number: 12,
                 exec_seq: 1,
@@ -2067,15 +2067,15 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_uri("cairn://p/cairn/lsp"),
-            Some(CairnResource::ProjectLsp {
+            parse_uri("cairn://p/cairn/symbols"),
+            Some(CairnResource::ProjectSymbols {
                 project: "CAIRN".to_string(),
                 symbol: None,
             })
         );
         assert_eq!(
-            parse_uri("cairn://p/cairn/lsp/build_widget"),
-            Some(CairnResource::ProjectLsp {
+            parse_uri("cairn://p/cairn/symbols/build_widget"),
+            Some(CairnResource::ProjectSymbols {
                 project: "CAIRN".to_string(),
                 symbol: Some("build_widget".to_string()),
             })
@@ -2083,22 +2083,22 @@ mod tests {
     }
 
     #[test]
-    fn lsp_segment_is_reserved_not_an_artifact() {
-        assert!(is_reserved_node_segment("lsp"));
-        // `.../node/lsp` must parse as NodeLsp, never a NodeArtifact named "lsp".
+    fn symbols_segment_is_reserved_not_an_artifact() {
+        assert!(is_reserved_node_segment("symbols"));
+        // `.../node/symbols` must parse as NodeSymbols, never a NodeArtifact named "symbols".
         assert!(matches!(
-            parse_uri("cairn://p/cairn/12/1/builder/lsp"),
-            Some(CairnResource::NodeLsp { .. })
+            parse_uri("cairn://p/cairn/12/1/builder/symbols"),
+            Some(CairnResource::NodeSymbols { .. })
         ));
     }
 
     #[test]
-    fn lsp_uris_round_trip() {
+    fn symbol_uris_round_trip() {
         for uri in [
-            "cairn://p/CAIRN/12/1/builder/lsp",
-            "cairn://p/CAIRN/12/1/builder/lsp/build_widget",
-            "cairn://p/CAIRN/lsp",
-            "cairn://p/CAIRN/lsp/build_widget",
+            "cairn://p/CAIRN/12/1/builder/symbols",
+            "cairn://p/CAIRN/12/1/builder/symbols/build_widget",
+            "cairn://p/CAIRN/symbols",
+            "cairn://p/CAIRN/symbols/build_widget",
         ] {
             assert_eq!(parse_uri(uri).unwrap().to_uri(), uri, "round-trip {uri}");
         }

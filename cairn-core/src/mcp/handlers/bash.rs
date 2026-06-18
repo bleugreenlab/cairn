@@ -474,13 +474,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             serde_json::json!({"worktree_path": cwd}),
         );
     }
-    // A successful commit may be the worktree's first divergence from main, which
-    // flips later LSP queries onto a per-worktree-keyed server that was never
-    // warmed. Warm it now, in the background, so indexing overlaps the agent's
-    // other work instead of blocking its first query. Idempotent once warm.
-    if barrier.committed {
-        orch.lsp_prewarm_detached(worktree_path.to_path_buf());
-    }
     if !barrier.message.is_empty() {
         if !result.is_empty() {
             result.push_str("\n\n");
@@ -503,8 +496,10 @@ pub(super) struct CommitBarrierOutcome {
     /// should emit a `worktree-changed` event.
     pub worktree_changed: bool,
     /// Whether a real commit (or amend) landed. True only when `git_commit_all`
-    /// succeeded; gates the divergence LSP prewarm so it never fires on a
-    /// NO_COMMIT, a restore, a clean no-op, or a missing commit_msg.
+    /// succeeded — not on a NO_COMMIT, a restore, a clean no-op, or a missing
+    /// commit_msg. Part of the barrier's result contract and asserted by the
+    /// commit-hygiene tests; no production reader consumes it today.
+    #[allow(dead_code)]
     pub committed: bool,
 }
 

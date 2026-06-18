@@ -156,7 +156,16 @@ pub(super) async fn apply_node_memory_append(
         .map_err(|e| e.to_string())?;
     let scope_value = match scope {
         crate::models::MemoryScope::Project => target_project_id.clone(),
-        crate::models::MemoryScope::Role => target.node_id.to_string(),
+        // Role memories key on the agent's role (e.g. `builder`), the name that
+        // resolves to the canon prompt `{role}.md` — not the recipe node name
+        // (e.g. `agent-1`), which is only a layout label. Fall back to the node
+        // id when the job carries no agent config id.
+        crate::models::MemoryScope::Role => {
+            crate::memories::db::role_for_job(&orch.db.local, &target_job_id)
+                .await
+                .map_err(|e| e.to_string())?
+                .unwrap_or_else(|| target.node_id.to_string())
+        }
         crate::models::MemoryScope::Workspace => "workspace".to_string(),
     };
     let owner_project_id = match scope {

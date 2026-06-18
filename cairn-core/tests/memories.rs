@@ -197,6 +197,60 @@ async fn append_creates_draft_memory_with_only_content_and_reads_by_uri() {
 }
 
 #[tokio::test]
+async fn append_role_memory_scopes_by_agent_role_not_node_name() {
+    let (temp, local_db) = common::migrated_db().await;
+    // A project whose repo defines the `builder` role canon, so the role home
+    // resolves to this project (and the memory's project_id FK is satisfied).
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".cairn/agents")).unwrap();
+    std::fs::write(repo.join(".cairn/agents/builder.md"), "Builder role prompt.").unwrap();
+    let project_id = common::insert_project_with_repo(&local_db, "ROLE", &repo).await;
+
+    // The recipe node segment is `agent-1`, but it runs the `builder` role.
+    local_db
+        .execute_script(&format!(
+            "\
+            INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)\
+             VALUES ('issue-ROLE', '{project_id}', 1, 'Memory issue', 'active', 1, 1);\
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)\
+             VALUES ('exec-ROLE', 'recipe', 'issue-ROLE', '{project_id}', 'running', 1, 1);\
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, recipe_node_id, node_name, uri_segment, agent_config_id, status, created_at, updated_at)\
+             VALUES ('job-ROLE', 'exec-ROLE', 'issue-ROLE', '{project_id}', 'agent-1', 'agent-1', 'agent-1', 'builder', 'running', 1, 1);"
+        ))
+        .await
+        .unwrap();
+    let db = Arc::new(local_db);
+    let orch = common::orchestrator(&temp, db.clone());
+
+    let report = common::change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/ROLE/1/1/agent-1/memories",
+            "mode": "append",
+            "payload": { "content": "Role-scoped insight", "scope": "role" }
+        }]),
+    )
+    .await;
+    let report: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(
+        report["failures"].as_array().map(Vec::len).unwrap_or(0),
+        0,
+        "{report:?}"
+    );
+
+    let memory_id = db::resolve_node_memory_id(&db, "ROLE", 1, 1, "agent-1", 1)
+        .await
+        .unwrap()
+        .expect("memory URI should resolve");
+    let memory = db::load_memory(&db, &memory_id).await.unwrap();
+    assert_eq!(memory.scope, MemoryScope::Role);
+    assert_eq!(
+        memory.scope_value, "builder",
+        "role memory must key on the agent role, not the recipe node name"
+    );
+}
+
+#[tokio::test]
 async fn node_memories_affordance_advertises_append_with_optional_name() {
     let (temp, local_db) = common::migrated_db().await;
     seed_node(&local_db, "AFF", 1, 1, "builder").await;

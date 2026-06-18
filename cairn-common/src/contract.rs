@@ -121,8 +121,8 @@ pub enum ResourceKind {
     Action,
     ProjectActions,
     ProjectAction,
-    NodeLsp,
-    ProjectLsp,
+    NodeSymbols,
+    ProjectSymbols,
     Help,
     Mcp,
     Settings,
@@ -191,8 +191,8 @@ impl ResourceKind {
         ResourceKind::Action,
         ResourceKind::ProjectActions,
         ResourceKind::ProjectAction,
-        ResourceKind::NodeLsp,
-        ResourceKind::ProjectLsp,
+        ResourceKind::NodeSymbols,
+        ResourceKind::ProjectSymbols,
         ResourceKind::Help,
         ResourceKind::Mcp,
         ResourceKind::Settings,
@@ -376,7 +376,7 @@ pub const GLOBAL_CONTRACT_NOTES: &[(&str, &str)] = &[
     ),
     (
         "preview -> apply",
-        "preview:true returns an apply_uri; re-submit one item with mode=apply and that URI to commit it.",
+        "preview:true (and a bare mode=rename) writes nothing and needs no commit_msg; it returns an apply_uri. Land it by re-submitting one item with mode=apply, that URI, and the commit_msg that commits the edits.",
     ),
     (
         "commit_msg amend",
@@ -635,23 +635,15 @@ const NO_MUTATIONS: &[MutationSpec] = &[];
 const NO_PROJECTIONS: &[ProjectionSpec] = &[];
 const NO_RELATED: &[RelatedSpec] = &[];
 const NO_CROSS_ACTIONS: &[CrossActionSpec] = &[];
-// Shared read-query projections for the lsp resources (node- and project-scoped).
-const LSP_PROJECTIONS: &[ProjectionSpec] = &[
+// Shared read-query projections for the symbol resources (node- and project-scoped).
+const SYMBOLS_PROJECTIONS: &[ProjectionSpec] = &[
     ProjectionSpec {
         key: "op",
-        values: "definition|references|hover|implementations|callers|subtypes|diagnostics (absent = overview)",
-    },
-    ProjectionSpec {
-        key: "search",
-        values: "QUERY — fuzzy workspace symbol search (discovery entry point)",
+        values: "definition|references|callers|implementations (absent = overview: definition site + signature + reference count)",
     },
     ProjectionSpec {
         key: "in",
-        values: "PATH — scope to a path (also pins the language when it has an extension)",
-    },
-    ProjectionSpec {
-        key: "at",
-        values: "file:PATH:LINE[:COL] — resolve by position, the disambiguation escape hatch",
+        values: "GLOB — scope navigation to a path subtree",
     },
 ];
 // A recipe is the `{recipe}` input to starting an execution; that `append`
@@ -1979,21 +1971,21 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         ],
     },
     ResourceContract {
-        kind: ResourceKind::NodeLsp,
-        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/lsp",
-        name: "Node LSP",
-        description: "Semantic code navigation over this node's worktree via language servers (definition/references/hover/implementations/callers/subtypes). Append a symbol (`/build_widget`) or use `?search=NAME` to discover; absent `op` is an overview (definition + hover). Honest fallback to text search when no server serves the language.",
-        read_projections: LSP_PROJECTIONS,
+        kind: ResourceKind::NodeSymbols,
+        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/symbols",
+        name: "Node Symbols",
+        description: "Structural code navigation over this node's worktree via the in-process ast-grep engine. Append a symbol (`/build_widget`) and pick an op with `?op=` (definition|references|callers|implementations); an absent op returns an overview (definition site, signature, and reference count). Scope with `?in=<glob>`. No language server, no index — files are parsed on demand.",
+        read_projections: SYMBOLS_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: NO_MUTATIONS,
     },
     ResourceContract {
-        kind: ResourceKind::ProjectLsp,
-        uri_template: "cairn://p/{project}/lsp",
-        name: "Project LSP",
-        description: "Semantic code navigation over the project's main checkout — the node-less fallback to the node-scoped lsp resource. Same projections; append a symbol or use `?search=NAME`.",
-        read_projections: LSP_PROJECTIONS,
+        kind: ResourceKind::ProjectSymbols,
+        uri_template: "cairn://p/{project}/symbols",
+        name: "Project Symbols",
+        description: "Structural code navigation over the project's main checkout — the node-less fallback to the node-scoped symbols resource. Same ops and projections; append a symbol and pick an op with `?op=`.",
+        read_projections: SYMBOLS_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: NO_MUTATIONS,

@@ -161,6 +161,16 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
         .get("commit_msg")
         .map(|value| !value.is_null())
         .unwrap_or(false);
+    // A preview-shaped call writes nothing — it computes the change report and
+    // returns it (an explicit `preview:true`, or a bare `mode:"rename"` which
+    // defaults to the preview path). The `commit_msg` is carried by the later
+    // `mode:"apply"` call that lands the edits, so a preview never needs one.
+    let preview_shaped = match obj.get("preview").and_then(|value| value.as_bool()) {
+        Some(explicit) => explicit,
+        None => array.iter().any(|item| {
+            item.get("mode").and_then(|value| value.as_str()) == Some("rename")
+        }),
+    };
     let mut first_file_without_commit: Option<usize> = None;
 
     for (index, item) in array.iter().enumerate() {
@@ -281,13 +291,16 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
     }
 
     // commit_msg is surfaced in the same pass as structural errors, keyed to the
-    // first file target that lacks it.
-    if let Some(index) = first_file_without_commit {
-        errors.push(ChangeValidationError {
-            index: Some(index),
-            field: "commit_msg",
-            message: COMMIT_MSG_GUIDANCE.to_string(),
-        });
+    // first file target that lacks it — unless the call is preview-shaped, in
+    // which case nothing is written and the message rides the later apply.
+    if !preview_shaped {
+        if let Some(index) = first_file_without_commit {
+            errors.push(ChangeValidationError {
+                index: Some(index),
+                field: "commit_msg",
+                message: COMMIT_MSG_GUIDANCE.to_string(),
+            });
+        }
     }
 
     errors
@@ -487,6 +500,43 @@ mod tests {
         assert!(rendered.contains("changes[0]"));
         assert!(rendered.contains("mode"));
         assert!(rendered.contains("commit_msg"));
+    }
+
+    #[test]
+    fn preview_file_change_needs_no_commit_msg() {
+        let errors = validate_change_value(&json!({
+            "changes": [{ "target": "file:src/lib.rs", "mode": "patch", "payload": { "old_string": "a", "new_string": "b" } }],
+            "preview": true
+        }));
+        assert!(
+            !errors.iter().any(|e| e.field == "commit_msg"),
+            "preview:true must not require commit_msg: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn bare_rename_needs_no_commit_msg() {
+        // A bare mode=rename defaults to the preview path (it writes nothing), so
+        // it is exempt even without an explicit preview flag.
+        let errors = validate_change_value(&json!({
+            "changes": [{ "target": "file:src/lib.rs", "mode": "rename", "payload": { "old_name": "a", "new_name": "b" } }]
+        }));
+        assert!(
+            !errors.iter().any(|e| e.field == "commit_msg"),
+            "bare rename must not require commit_msg: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_preview_false_write_still_needs_commit_msg() {
+        let errors = validate_change_value(&json!({
+            "changes": [{ "target": "file:src/lib.rs", "mode": "rename", "payload": { "old_name": "a", "new_name": "b" } }],
+            "preview": false
+        }));
+        assert!(
+            errors.iter().any(|e| e.field == "commit_msg"),
+            "preview:false write must still require commit_msg: {errors:?}"
+        );
     }
 
     #[test]
