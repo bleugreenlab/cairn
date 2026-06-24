@@ -38,12 +38,24 @@ pub struct ProjectRemoteStatus {
     pub is_workspace: bool,
 }
 
-/// Terminal shortcut command configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Terminal shortcut command configuration.
+///
+/// A blessed, named command for this project. An optional `write` carveout lets a
+/// fenced agent run this command with the out-of-worktree write scopes it needs
+/// (e.g. a dev launcher writing a per-instance state dir) without parking on a
+/// worktree-fence prompt. Because this lives in repo-committed `.cairn/config.yaml`,
+/// the scopes are bounded: they may never intersect the secret-store read
+/// denylist. See `crate::config::dev_commands` and `docs/worktree-fence.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalCommand {
     pub name: String,
     pub command: String,
+    /// Writable (and readable) glob scopes pre-approved for this command when it
+    /// runs under the worktree fence. `**` spans path segments, `*` stays within
+    /// one; `~`/`{home}`/`{cairnHome}`/`{worktrees}`/`{worktree}` expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]

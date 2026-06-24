@@ -8,31 +8,10 @@ use turso::params;
 
 const RESUME_FALLBACK_TRANSCRIPT_CHARS: usize = 24_000;
 
-pub(super) fn build_base_instructions(workspace_instructions: Option<&str>) -> String {
-    let mut combined = crate::system_prompt::CODEX_SYSTEM_PROMPT.to_string();
-    combined.push_str("\n\n");
-    combined.push_str(&crate::system_prompt::cairn_system_prompt());
-    if let Some(workspace_content) =
-        workspace_instructions.filter(|content| !content.trim().is_empty())
-    {
-        combined.push_str("\n\n## Workspace Instructions\n\n");
-        combined.push_str(workspace_content.trim());
-    }
-    combined
-}
-
-/// The developer-instructions payload sent to Codex. Deliberately NOT trimmed:
-/// the persisted `system:prompt` event records this exact content as labeled
-/// segments (`assemble_prompt_segments` uses it untrimmed), and archival's
-/// verify-then-discard depends on sent and persisted bytes being identical.
-/// Trimming here would silently diverge them the moment agent content carries
-/// edge whitespace, and the only symptom would be the prompt dedup quietly
-/// falling back to whole-event zstd at teardown.
-pub(super) fn build_developer_instructions(system_prompt: Option<&str>) -> Option<String> {
-    system_prompt
-        .filter(|sp| !sp.trim().is_empty())
-        .map(str::to_string)
-}
+// Codex's `baseInstructions` and `developerInstructions` payloads are derived by
+// slicing the assembled prompt segments in `backend_impl` (via
+// `base_instructions_from_segments` / `developer_instructions_from_segments`),
+// so sent bytes equal the persisted `system:prompt` segments by construction.
 
 pub(super) fn codex_sandbox_mode(fence: Fence) -> &'static str {
     match fence {
@@ -43,12 +22,17 @@ pub(super) fn codex_sandbox_mode(fence: Fence) -> &'static str {
     }
 }
 
+// Codex thread-start takes more parameters than clippy's default threshold;
+// they are distinct primitive knobs, so a params struct would add indirection
+// without improving clarity.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_thread_start_params(
     cwd: &str,
     approval_policy: &str,
     sandbox_mode: &str,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     base_instructions: &str,
     developer_instructions: Option<&str>,
 ) -> Value {
@@ -66,6 +50,9 @@ pub(super) fn build_thread_start_params(
     if let Some(effort) = reasoning_effort {
         params["reasoningEffort"] = serde_json::json!(effort);
     }
+    if let Some(tier) = service_tier {
+        params["serviceTier"] = serde_json::json!(tier);
+    }
     if let Some(instructions) = developer_instructions {
         params["developerInstructions"] = serde_json::json!(instructions);
     }
@@ -80,6 +67,7 @@ pub(super) fn build_thread_resume_params(
     sandbox_mode: &str,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     base_instructions: &str,
     developer_instructions: Option<&str>,
 ) -> Value {
@@ -97,6 +85,9 @@ pub(super) fn build_thread_resume_params(
     if let Some(effort) = reasoning_effort {
         params["reasoningEffort"] = serde_json::json!(effort);
     }
+    if let Some(tier) = service_tier {
+        params["serviceTier"] = serde_json::json!(tier);
+    }
     if let Some(instructions) = developer_instructions {
         params["developerInstructions"] = serde_json::json!(instructions);
     }
@@ -111,6 +102,7 @@ pub(super) fn build_thread_fork_params(
     sandbox_mode: &str,
     model: Option<&str>,
     reasoning_effort: Option<&str>,
+    service_tier: Option<&str>,
     base_instructions: &str,
     developer_instructions: Option<&str>,
 ) -> Value {
@@ -121,6 +113,7 @@ pub(super) fn build_thread_fork_params(
         sandbox_mode,
         model,
         reasoning_effort,
+        service_tier,
         base_instructions,
         developer_instructions,
     )
@@ -209,45 +202,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn base_instructions_include_codex_base_and_cairn_prompt() {
-        let base = build_base_instructions(None);
-
-        assert!(base.contains(crate::system_prompt::CODEX_SYSTEM_PROMPT));
-        assert!(base.contains(&crate::system_prompt::cairn_system_prompt()));
-        assert!(!base.contains("agent content"));
-        assert!(!base.contains("user request"));
-    }
-
-    #[test]
-    fn base_instructions_include_workspace_instructions() {
-        let base = build_base_instructions(Some("workspace doctrine"));
-
-        assert!(base.contains("\n\n## Workspace Instructions\n\nworkspace doctrine"));
-        assert!(!base.contains("agent content"));
-    }
-
-    #[test]
     fn thread_start_params_send_base_and_developer_instructions_separately() {
-        let base = build_base_instructions(None);
-        let developer = build_developer_instructions(Some("agent content"));
         let params = build_thread_start_params(
             "/tmp/worktree",
             "on-request",
             "workspace-write",
             Some("gpt-test"),
             Some("medium"),
-            &base,
-            developer.as_deref(),
+            Some("priority"),
+            "BASE",
+            Some("agent content"),
         );
 
-        assert_eq!(params["baseInstructions"], base);
+        assert_eq!(params["baseInstructions"], "BASE");
         assert_eq!(params["developerInstructions"], "agent content");
+        assert_eq!(params["serviceTier"], "priority");
     }
 
     #[test]
     fn thread_resume_params_send_base_and_developer_instructions_separately() {
-        let base = build_base_instructions(None);
-        let developer = build_developer_instructions(Some("agent content"));
         let params = build_thread_resume_params(
             "thread-1",
             "/tmp/worktree",
@@ -255,38 +228,30 @@ mod tests {
             "workspace-write",
             Some("gpt-test"),
             Some("medium"),
-            &base,
-            developer.as_deref(),
+            None,
+            "BASE",
+            Some("agent content"),
         );
 
-        assert_eq!(params["baseInstructions"], base);
+        assert_eq!(params["baseInstructions"], "BASE");
         assert_eq!(params["developerInstructions"], "agent content");
     }
 
     #[test]
     fn empty_developer_instructions_are_omitted() {
-        let base = build_base_instructions(None);
-        let developer = build_developer_instructions(Some("  \n  "));
+        let developer: Option<&str> = None;
         let params = build_thread_start_params(
             "/tmp/worktree",
             "on-request",
             "workspace-write",
             Some("gpt-test"),
             Some("medium"),
-            &base,
-            developer.as_deref(),
+            None,
+            "BASE",
+            developer,
         );
 
-        assert_eq!(params["baseInstructions"], base);
+        assert_eq!(params["baseInstructions"], "BASE");
         assert!(params.get("developerInstructions").is_none());
-    }
-
-    /// Sent bytes must equal persisted bytes: developer instructions pass
-    /// through untrimmed so they stay byte-identical to the recorded
-    /// `system:prompt` segments, which archival verifies at teardown.
-    #[test]
-    fn developer_instructions_preserve_edge_whitespace() {
-        let developer = build_developer_instructions(Some("\nagent content\n"));
-        assert_eq!(developer.as_deref(), Some("\nagent content\n"));
     }
 }

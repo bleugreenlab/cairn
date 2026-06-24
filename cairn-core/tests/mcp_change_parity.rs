@@ -59,6 +59,7 @@ fn payload_for(spec: &MutationSpec) -> serde_json::Value {
         let value = match key.ty {
             KeyType::Str => json!("x"),
             KeyType::Bool => json!(true),
+            KeyType::Int => json!(1),
             KeyType::Array => json!([]),
             KeyType::Object => json!({}),
         };

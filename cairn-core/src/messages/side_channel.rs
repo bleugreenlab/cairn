@@ -190,7 +190,7 @@ pub async fn record_user_child_side_channel_async(
     orch: &Orchestrator,
     child_issue_id: &str,
     child_uri: &str,
-    content: &str,
+    _content: &str,
 ) -> Result<Option<SideChannelNotice>, String> {
     let Some(parent_job_id) =
         crate::orchestrator::parent_wake::load_parent_job(&orch.db.local, child_issue_id)?
@@ -198,27 +198,21 @@ pub async fn record_user_child_side_channel_async(
         return Ok(None);
     };
 
-    let child_issue_uri = match issue_uri_for_issue_id(&orch.db.local, child_issue_id).await? {
-        Some(uri) => uri,
-        None => child_uri.to_string(),
-    };
-
-    // CAIRN-1647: the parent's copy of a user→child message is now a durable
-    // `message` attention item (request-response). It opens with
-    // `responded:false`, folds into the parent's next briefing carrying the
-    // current handling state, and bumps with the child's response at the
-    // child's turn end — so the coordinator never acts on a message-only copy
-    // the child already handled (the CAIRN-1663 phantom-issue fix). The child
-    // still receives the message live through its own delivery path.
-    let _ = parent_job_id; // presence already confirmed above
-    crate::orchestrator::attention_delivery::record_child_message(
-        orch,
-        &child_issue_uri,
-        child_issue_id,
+    // CAIRN-1894: the parent's copy of a user→child message is a passive
+    // `catchup:{child-job}` push, resolved at delivery against the parent's single
+    // read cursor (scoped to the addressed child node's job). It never wakes the
+    // parent; it rides along on the parent's next run and renders the child's chat
+    // from the message through the child's current tail. The child still receives
+    // the message live through its own delivery path.
+    if let Err(e) = crate::orchestrator::attention_delivery::create_catchup_push(
+        &orch.db.local,
+        &parent_job_id,
         child_uri,
-        "user",
-        content,
-    );
+    )
+    .await
+    {
+        log::warn!("catch-up push creation failed: {e}");
+    }
     Ok(None)
 }
 

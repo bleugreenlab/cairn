@@ -175,11 +175,39 @@ pub fn default_codex_presets() -> HashMap<String, Preset> {
     map
 }
 
+/// Build default OpenRouter backend presets.
+pub fn default_openrouter_presets() -> HashMap<String, Preset> {
+    let mut map = HashMap::new();
+    map.insert(
+        "sm".to_string(),
+        Preset {
+            model: Model::new("openrouter/auto"),
+            options: HashMap::new(),
+        },
+    );
+    map.insert(
+        "md".to_string(),
+        Preset {
+            model: Model::new("~anthropic/claude-sonnet-latest"),
+            options: reasoning_options(Some("medium")),
+        },
+    );
+    map.insert(
+        "lg".to_string(),
+        Preset {
+            model: Model::new("~openai/gpt-latest"),
+            options: reasoning_options(Some("high")),
+        },
+    );
+    map
+}
+
 /// Build a default PresetsConfig.
 pub fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig {
     let mut backends = HashMap::new();
     backends.insert("claude".to_string(), default_claude_presets(max_thinking));
     backends.insert("codex".to_string(), default_codex_presets());
+    backends.insert("openrouter".to_string(), default_openrouter_presets());
 
     PresetsConfig {
         active_backend: "claude".to_string(),

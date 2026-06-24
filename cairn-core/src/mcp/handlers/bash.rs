@@ -3,10 +3,7 @@
 //! Routes synchronous shell commands through inline execution and exposes
 //! terminal resource helpers for long-running PTY sessions.
 
-use super::{
-    get_current_head_sha, is_worktree_dirty, normalize_command, unwrap_shell_launcher,
-    worktree_status_porcelain,
-};
+use super::{normalize_command, unwrap_shell_launcher};
 use crate::services::{
     ensure_submitted_line, get_default_shell, sandbox, submit_command_exiting_shell, PtySession,
     SpawnConfig, TerminalChild,
@@ -64,8 +61,8 @@ pub struct RunPayload {
     pub stop_on_error: Option<bool>,
     /// Commit all worktree changes once after the whole batch succeeds. Required
     /// when a successful worktree-bound run dirties the worktree; `^` amends.
-    /// `NO_COMMIT` is valid only mid-merge/rebase; anywhere else the worktree is
-    /// restored to HEAD (see `run_commit_barrier`).
+    /// Without it, a run that dirties the worktree is restored to HEAD (see
+    /// `run_commit_barrier`).
     #[serde(default)]
     pub commit_msg: Option<String>,
 }
@@ -276,38 +273,6 @@ pub fn redact_command(command: &str) -> String {
     result
 }
 
-/// Check if a command includes a git commit operation
-fn is_git_commit_command(command: &str) -> bool {
-    // Match "git commit" but not "git commit --help" or similar non-committing variants
-    // Handles: git commit, git commit -m, git commit -am, git commit --amend, etc.
-    let cmd_lower = command.to_lowercase();
-
-    // Split by common command separators to check each part
-    for part in cmd_lower.split(['&', '|', ';', '\n']) {
-        let trimmed = part.trim();
-        // Remove leading shell constructs like "cd foo &&"
-        let git_part = trimmed
-            .rsplit("&&")
-            .next()
-            .or_else(|| trimmed.rsplit("||").next())
-            .unwrap_or(trimmed)
-            .trim();
-
-        if git_part.starts_with("git commit") || git_part.starts_with("git  commit") {
-            // Exclude help commands (--help or -h as a flag)
-            if git_part.contains("--help") {
-                continue;
-            }
-            // Check for -h flag: either "-h " with trailing space or "-h" at end of string
-            if git_part.contains("-h ") || git_part.ends_with("-h") {
-                continue;
-            }
-            return true;
-        }
-    }
-    false
-}
-
 /// Handle run tool call - an ordered batch of synchronous shell commands and
 /// skill-script invocations. Parallel by default; `sequential` runs in order.
 pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
@@ -327,6 +292,20 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let commit_present = payload.commit_msg.is_some();
 
+    // Changes can only happen in a worktree. A non-jj cwd is the project's live
+    // checkout behind a long-lived manager / triage / read-only agent (project
+    // chat included). A `commit_msg` means the caller intends to commit, which
+    // requires a worktree; reject the whole batch BEFORE running any command, so
+    // nothing executes against — or is left in — the user's live checkout. (The
+    // commit barrier itself cannot help here: NonWorktreeVcs is a read-only
+    // no-op that must never seal or revert the user's checkout.)
+    if commit_present && !crate::jj::is_jj_dir(std::path::Path::new(&cwd)) {
+        return "Commits require a worktree. This agent runs on the project's live checkout \
+                (no worktree), so a run carrying commit_msg cannot commit and no commands were \
+                executed. Changes can only be made in a worktree."
+            .to_string();
+    }
+
     // Look up streaming/run context once for the whole batch. Prefer the
     // callback's run_id when present: cwd lookups are only a fallback and can
     // miss or pick the wrong run when multiple runs share a repo/worktree path.
@@ -339,8 +318,21 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         super::fence::resolve_run_fence(orch, request).await,
         Some((_run_id, Fence::Ask | Fence::Deny))
     );
-    let status_before = if run_hygiene_applies && payload.commit_msg.is_none() {
-        worktree_status_porcelain(&cwd).ok()
+    // Resolve the worktree's VCS backend once (jj for a worktree; the read-only
+    // NonWorktreeVcs for the project's live checkout) and capture the pre-batch
+    // snapshot through it.
+    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&cwd));
+    // Capture the pre-batch snapshot whenever a no-`commit_msg` run could leave
+    // dirt the barrier must reconcile. For a worktree this is gated on the
+    // hygiene fence (Ask/Deny). For the project's LIVE checkout we capture
+    // regardless of fence — project chat carries no execution snapshot and is
+    // unconfined, yet a stray write there still violates the worktree boundary
+    // and must be flagged (read-only detection; never reverted). The commit_msg
+    // case on a non-worktree cwd already returned early above.
+    let non_worktree_cwd = !crate::jj::is_jj_dir(std::path::Path::new(&cwd));
+    let status_before = if payload.commit_msg.is_none() && (run_hygiene_applies || non_worktree_cwd)
+    {
+        vcs.snapshot(std::path::Path::new(&cwd)).ok()
     } else {
         None
     };
@@ -456,16 +448,17 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     let all_ok = outcomes.iter().all(|o| o.succeeded);
     let worktree_path = std::path::Path::new(&cwd);
     let author = match payload.commit_msg.as_deref() {
-        Some(msg) if msg != "NO_COMMIT" => run_context
+        Some(_) => run_context
             .and_then(|ctx| orch.resolve_git_identity_for_project(Some(&ctx.project_id)))
             .map(|(name, email)| GitAuthor::new(name, email)),
-        _ => None,
+        None => None,
     };
     let barrier = run_commit_barrier(
+        vcs.as_ref(),
         worktree_path,
         payload.commit_msg.as_deref(),
         all_ok,
-        status_before.as_deref(),
+        status_before.as_ref(),
         author.as_ref(),
     );
     if barrier.worktree_changed {
@@ -479,6 +472,17 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             result.push_str("\n\n");
         }
         result.push_str(&barrier.message);
+    }
+    // A commit_msg on a non-worktree cwd (the project's live checkout) cannot
+    // commit: changes only happen in worktrees. The commands already ran, so
+    // don't fail the run — just note that nothing was committed.
+    if payload.commit_msg.is_some() && !crate::jj::is_jj_dir(worktree_path) {
+        let note = "Note: commits require a worktree. This agent runs on the project's live \
+                    checkout (no worktree), so the commands ran but nothing was committed.";
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(note);
     }
 
     if result.is_empty() {
@@ -495,10 +499,10 @@ pub(super) struct CommitBarrierOutcome {
     /// Whether the worktree was mutated (committed or restored) so the caller
     /// should emit a `worktree-changed` event.
     pub worktree_changed: bool,
-    /// Whether a real commit (or amend) landed. True only when `git_commit_all`
-    /// succeeded — not on a NO_COMMIT, a restore, a clean no-op, or a missing
-    /// commit_msg. Part of the barrier's result contract and asserted by the
-    /// commit-hygiene tests; no production reader consumes it today.
+    /// Whether a real commit (or amend) landed. True only when the seal
+    /// succeeded — not on a restore, a clean no-op, or a missing commit_msg.
+    /// Part of the barrier's result contract and asserted by the commit-hygiene
+    /// tests; no production reader consumes it today.
     #[allow(dead_code)]
     pub committed: bool,
 }
@@ -510,48 +514,28 @@ pub(super) struct CommitBarrierOutcome {
 /// only inside `worktree_path` and returns the user-facing message plus whether
 /// the worktree changed, so it is testable without an `Orchestrator`.
 ///
-/// - `Some("NO_COMMIT")`: only legitimate mid-merge/mid-rebase; otherwise the
-///   worktree is restored to HEAD and an error is reported.
 /// - `Some(msg)`: commit the worktree if dirty, even on partial item failure;
 ///   a commit failure restores the worktree to HEAD.
 /// - `None`: when the batch fully succeeded and changed the worktree, restore
 ///   it to HEAD — no commit_msg means the new dirt must not persist.
 pub(super) fn run_commit_barrier(
+    vcs: &dyn crate::mcp::vcs::WorktreeVcs,
     worktree_path: &std::path::Path,
     commit_msg: Option<&str>,
     all_ok: bool,
-    status_before: Option<&str>,
+    before: Option<&crate::mcp::vcs::VcsSnapshot>,
     author: Option<&GitAuthor>,
 ) -> CommitBarrierOutcome {
-    let cwd = worktree_path.to_string_lossy();
     let mut message = String::new();
     let mut worktree_changed = false;
     let mut committed = false;
 
     match commit_msg {
-        Some("NO_COMMIT") => {
-            if crate::mcp::git::is_repo_mid_transition(worktree_path) {
-                // Mid-merge/mid-rebase: leaving the worktree dirty is expected.
-                worktree_changed = true;
-            } else {
-                let restore = crate::mcp::git::restore_worktree_to_head(worktree_path);
-                worktree_changed = true;
-                match restore {
-                    Ok(()) => message.push_str(
-                        "\u{26a0}\u{fe0f} NO_COMMIT is only valid while resolving an in-progress merge or rebase; the worktree was restored to HEAD. Pass a descriptive commit_msg to commit changes.",
-                    ),
-                    Err(e) => message.push_str(&format!(
-                        "\u{26a0}\u{fe0f} NO_COMMIT is only valid while resolving an in-progress merge or rebase. Failed to restore the worktree to HEAD: {}",
-                        e
-                    )),
-                }
-            }
-        }
         Some(commit_msg) => {
             // Commit the worktree even when some items failed: a partial-success
             // batch must not silently leave the successful items' dirt behind.
-            if !matches!(is_worktree_dirty(&cwd), Ok(false)) {
-                match crate::mcp::git::git_commit_all(worktree_path, commit_msg, author) {
+            if !matches!(vcs.is_dirty(worktree_path), Ok(false)) {
+                match vcs.seal_all(worktree_path, commit_msg, author) {
                     Ok(commit_result) => {
                         worktree_changed = true;
                         committed = true;
@@ -569,7 +553,7 @@ pub(super) fn run_commit_barrier(
                         log::info!("run commit_msg given but nothing to commit: {}", e);
                     }
                     Err(e) => {
-                        let restore = crate::mcp::git::restore_worktree_to_head(worktree_path);
+                        let restore = vcs.discard(worktree_path);
                         worktree_changed = true;
                         match restore {
                             Ok(()) => message.push_str(&format!(
@@ -591,10 +575,25 @@ pub(super) fn run_commit_barrier(
             // `all_ok` — a failed batch's own error is the headline, and the
             // hygiene gate must not mask it.
             if all_ok {
-                if let (Some(before), Ok(after)) = (status_before, worktree_status_porcelain(&cwd))
-                {
-                    if !after.is_empty() && after != before {
-                        let reset_ok = crate::mcp::git::restore_worktree_to_head(worktree_path);
+                if let Some(before) = before {
+                    if matches!(vcs.changed_since(worktree_path, before), Ok(true)) {
+                        // A non-worktree backend (the project's live checkout)
+                        // cannot revert: rolling it back would destroy the user's
+                        // own uncommitted work. Changes can only happen in a
+                        // worktree, so the stray dirt is left in place and the
+                        // agent is warned loudly instead of (falsely) told it was
+                        // reverted. See `docs/worktree-fence.md`.
+                        if !vcs.can_revert() {
+                            message.push_str(
+                                "\u{26a0}\u{fe0f} This run wrote into the project's live checkout, but changes can only be made in a worktree. The changes were left in place — the live checkout is not reverted, because that could destroy your own uncommitted work — so review and clean them up (`git status` / `git restore`). To make changes that persist, run inside a worktree.",
+                            );
+                            return CommitBarrierOutcome {
+                                message,
+                                worktree_changed,
+                                committed,
+                            };
+                        }
+                        let reset_ok = vcs.discard(worktree_path);
                         worktree_changed = true;
                         if let Err(e) = reset_ok {
                             message.push_str(&format!(
@@ -1502,6 +1501,9 @@ pub(crate) struct TerminalWakeRow {
     pub created_at: i64,
     pub exited_at: Option<i64>,
     pub output_tail: Option<String>,
+    /// The live PTY session id, used to reach the session's in-memory output
+    /// buffer and phrase-watcher registry when subscribing an output wake.
+    pub session_id: Option<String>,
 }
 
 /// Look up a terminal by job scope + slug for wake subscription.
@@ -1518,7 +1520,7 @@ pub(crate) async fn lookup_terminal_for_wake(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT status, exit_code, created_at, exited_at, output_tail
+                    "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
                      FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
                     params![job_id.as_str(), slug.as_str()],
                 )
@@ -1532,6 +1534,7 @@ pub(crate) async fn lookup_terminal_for_wake(
                 created_at: row.i64(2)?,
                 exited_at: row.opt_i64(3)?,
                 output_tail: row.opt_text(4)?,
+                session_id: row.opt_text(5)?,
             }))
         })
     })
@@ -1697,6 +1700,84 @@ fn capture_output_tail(buffer: &Arc<Mutex<VecDeque<u8>>>) -> Option<String> {
     }
 }
 
+/// Outcome of registering an output-phrase watcher on a live terminal session.
+pub(crate) enum OutputWatchRegistration {
+    /// The phrase is already present in the terminal's current buffer; the
+    /// caller should fire the wake immediately rather than register a watcher.
+    AlreadyPresent { excerpt: Option<String> },
+    /// A live watcher was registered; it fires when the phrase next appears.
+    Registered,
+    /// No live agent PTY session backs this terminal, so its output cannot be
+    /// watched (e.g. a promoted-run or already-finalized session).
+    NotLive,
+}
+
+/// Register a phrase watcher on a live terminal session, after first scanning
+/// the session's current output buffer so an already-printed phrase fires
+/// immediately instead of waiting for new output.
+pub(crate) fn register_terminal_output_watcher(
+    orch: &Orchestrator,
+    session_id: &str,
+    subscription_id: &str,
+    job_id: &str,
+    phrase: &str,
+    terminal_uri: &str,
+) -> OutputWatchRegistration {
+    let session_arc = {
+        let Ok(sessions) = orch.pty_state.sessions.lock() else {
+            return OutputWatchRegistration::NotLive;
+        };
+        match sessions.get(session_id) {
+            Some(arc) => arc.clone(),
+            None => return OutputWatchRegistration::NotLive,
+        }
+    };
+    let (watchers, buffer) = {
+        let Ok(session) = session_arc.lock() else {
+            return OutputWatchRegistration::NotLive;
+        };
+        let Some(watchers) = session.output_watchers.clone() else {
+            return OutputWatchRegistration::NotLive;
+        };
+        (watchers, session.output_buffer.clone())
+    };
+    if let Some(buffer) = buffer {
+        let bytes: Vec<u8> = buffer
+            .lock()
+            .map(|b| b.iter().copied().collect())
+            .unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes);
+        let scan = crate::services::scan_for_phrase("", &text, phrase);
+        if scan.matched_excerpt.is_some() {
+            return OutputWatchRegistration::AlreadyPresent {
+                excerpt: scan.matched_excerpt,
+            };
+        }
+    }
+    // Bind to a local so the lock-guard temporary drops here, before the
+    // function's `watchers`/`buffer` locals (a tail-position match would keep
+    // the guard's borrow alive past their drop — E0597).
+    let outcome = match watchers.lock() {
+        Ok(mut guard) => {
+            // Replace any existing watcher for this subscription (a re-subscribe
+            // may change the phrase) so the session never carries a stale one,
+            // and a subscribe that lands on a session already hydrated for this
+            // same row does not double-register it.
+            guard.retain(|w| w.subscription_id != subscription_id);
+            guard.push(crate::services::TerminalOutputWatcher {
+                subscription_id: subscription_id.to_string(),
+                job_id: job_id.to_string(),
+                phrase: phrase.to_string(),
+                carry: String::new(),
+                terminal_uri: terminal_uri.to_string(),
+            });
+            OutputWatchRegistration::Registered
+        }
+        Err(_) => OutputWatchRegistration::NotLive,
+    };
+    outcome
+}
+
 async fn lookup_terminal_session_id_for_target(
     db: &LocalDb,
     target: &TerminalResourceTarget,
@@ -1744,7 +1825,7 @@ async fn run_one(
     cwd: &str,
     tool_use_id: &str,
     run_context: Option<&super::RunContext>,
-    commit_present: bool,
+    _commit_present: bool,
     header: String,
     spec: Result<RunSpec, String>,
 ) -> ItemOutcome {
@@ -1821,6 +1902,21 @@ async fn run_one(
     // re-execute escalated (sandbox off) so the now-granted crossing proceeds.
     if let Some(denial) = exec.denial.take() {
         use crate::mcp::handlers::fence;
+        // The live checkout is read-only and non-negotiable: a non-worktree cwd
+        // routes a denial to a clear explanation, never a fence prompt. There is
+        // no run context to adjudicate and nothing the user can grant — changes
+        // can only be made in a worktree. This replaces the raw EPERM project
+        // chat would otherwise surface.
+        if !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
+            let _ = denial;
+            return ItemOutcome {
+                header,
+                body: "This command tried to write the project's live checkout, which is read-only for agents — the write was blocked by the kernel sandbox. Changes can only be made in a worktree; nothing was left in the checkout. Re-run inside a worktree to make changes that persist."
+                    .to_string(),
+                succeeded: false,
+                suspended: false,
+            };
+        }
         if let Some((run_id, fence_mode)) = fence::resolve_run_fence(orch, request).await {
             let crossing = match &denial {
                 sandbox::SandboxDenial::Path(p) => {
@@ -1920,16 +2016,6 @@ async fn run_one(
             if let Some(ctx) = run_context {
                 cache_checkpoint_result(orch, &ctx.job_id, command, cwd, exec.exit_code).await;
             }
-        }
-        // Auto-push after a successful `git commit`, but only when there is no
-        // top-level commit_msg (which commits + pushes once after the batch).
-        if !commit_present && is_git_commit_command(command) && succeeded {
-            let worktree_path = std::path::Path::new(cwd);
-            crate::mcp::git::push_to_origin(worktree_path);
-            let _ = orch.services.emitter.emit(
-                "worktree-changed",
-                serde_json::json!({"worktree_path": cwd}),
-            );
         }
     }
 
@@ -2048,16 +2134,24 @@ async fn execute_process(
             orch,
             cwd,
             run_context.map(|c| c.run_id.as_str()),
+            run_context.map(|c| c.project_id.as_str()),
             shell_command.or(Some(program)),
         )
         .await
     } else {
         None
     };
-    // Only Ask agents get a synthetic command-scoped macOS fallback when path
-    // recovery misses; Deny agents preserve their raw fail-fast output.
+    // Ask agents get a synthetic command-scoped macOS fallback when path recovery
+    // misses; Deny agents preserve their raw fail-fast output. Non-worktree (live
+    // checkout) runs ALSO enable fallback detection regardless of fence: the
+    // checkout is read-only, so a kernel block must be recognized even when macOS
+    // log recovery misses or a shell masks the exit (`... || true`). run_one
+    // routes such a denial to the hard read-only-checkout message, never a fence
+    // prompt — non-worktree is non-grantable, so enabling detection cannot
+    // synthesize a grant.
+    let non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
     let command_scoped_fallback =
-        matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
+        non_worktree || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
     let sandbox_policy = sandbox.map(|(policy, _)| policy);
     let sandboxed = sandbox_policy.is_some();
     let spawn_started = std::time::SystemTime::now();
@@ -2562,6 +2656,9 @@ async fn promote_to_terminal(
         last_output_at,
         // Agent/promoted sessions are non-interactive: no prompt markers, no busy signal.
         command_state: None,
+        // Promoted runs have no chunked read loop to scan; output phrase wakes
+        // are an agent-PTY-terminal feature only.
+        output_watchers: None,
     };
     {
         let mut sessions = orch
@@ -2980,22 +3077,81 @@ fn finalize_terminal_by_session_id_inner(
     Ok(())
 }
 
-/// Build the OS sandbox policy for a fenced run, or `None` when no confinement
-/// applies: fence allow, no run context (project chat / unknown cwd), a command
-/// whose normalized form already holds a session crossing grant, or a host with
-/// no sandbox primitive.
+/// Build the OS sandbox policy for a run, or `None` when no confinement applies.
+///
+/// Two regimes:
+/// - **Worktree cwd**: gated on the fence — `allow` (or no run context) runs
+///   unconfined; `ask`/`deny` confine writes to the worktree.
+/// - **Non-worktree cwd** (the project's live checkout — project chat / manager /
+///   triage): a read-only-checkout policy applies STRUCTURALLY, regardless of
+///   fence, so a stray write into the live checkout is kernel-denied while the
+///   checkout stays readable.
+///
+/// The unconfined escape hatches — an already-granted command and an accepted
+/// dev-command carveout with no declared scopes — are WORKTREE-ONLY: a
+/// non-worktree run never returns `None` for them, because the live checkout is
+/// read-only and non-grantable. The only `None` for a non-worktree cwd is a host
+/// with no sandbox primitive, where the restored dirt-detection warning covers
+/// the gap. Carveout write-globs still apply on a non-worktree cwd, but any glob
+/// that would write the checkout itself is dropped.
+///
+/// Whether a writable carveout scope `glob` would permit a write into `checkout`
+/// (the project's live checkout). Used to refuse a dev-command scope that would
+/// defeat the read-only-checkout guarantee on a non-worktree run.
+///
+/// A scope can only ever write at or below its **non-wildcard literal prefix**
+/// (everything from the first `*` on merely widens the match within that prefix).
+/// So the scope re-opens checkout writes iff that prefix sits inside the checkout
+/// — including a nested subtree like `{checkout}/target/**`, which a root/child
+/// regex probe would miss — or is an ancestor whose subpath grant would include
+/// the checkout. Concrete (wildcard-free) scopes fall out of the same check with
+/// the whole scope as the prefix. Fail-closed: an empty prefix (a leading-`*`
+/// glob) counts as covering.
+fn glob_covers_checkout(glob: &str, checkout: &std::path::Path) -> bool {
+    let checkout = checkout
+        .canonicalize()
+        .unwrap_or_else(|_| checkout.to_path_buf());
+    let literal_prefix = match glob.find('*') {
+        Some(i) => &glob[..i],
+        None => glob,
+    };
+    let prefix = std::path::Path::new(literal_prefix);
+    let prefix = prefix
+        .canonicalize()
+        .unwrap_or_else(|_| prefix.to_path_buf());
+    prefix.starts_with(&checkout) || checkout.starts_with(&prefix)
+}
+
+/// Build the OS sandbox policy for a run, or `None` when no confinement applies.
 async fn build_run_sandbox_policy(
     orch: &Orchestrator,
     cwd: &str,
     run_id: Option<&str>,
+    project_id: Option<&str>,
     command_for_grant: Option<&str>,
 ) -> Option<(sandbox::SandboxPolicy, Fence)> {
     use crate::mcp::handlers::permission::resolve_fence_policy;
 
-    let fence = resolve_fence_policy(orch, run_id).await?;
-    if !sandbox::sandbox_applies(fence) {
-        return None;
-    }
+    // The project's live checkout (a non-jj cwd: project chat / manager / triage)
+    // is read-only for agents, non-negotiable, so the read-only-checkout sandbox
+    // applies STRUCTURALLY regardless of fence — project chat carries no
+    // execution snapshot and would otherwise be fully unconfined. A real worktree
+    // keeps the fence gate (ask/deny confine; allow runs free).
+    let non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
+    let fence = if non_worktree {
+        // Read-only and non-grantable: `Deny` makes run_one never route a denial
+        // through the fence (no prompt, no session grant). Detection of the block
+        // itself is enabled separately in execute_process so the agent still gets
+        // the clear read-only-checkout message.
+        Fence::Deny
+    } else {
+        let fence = resolve_fence_policy(orch, run_id).await?;
+        if !sandbox::sandbox_applies(fence) {
+            return None;
+        }
+        fence
+    };
+
     if !sandbox::is_available() {
         log::warn!("OS sandbox unavailable on this host; running command unconfined (cwd={cwd})");
         return None;
@@ -3010,22 +3166,103 @@ async fn build_run_sandbox_policy(
 
     // A command-scoped session grant escalates: skip the sandbox so the approved
     // command (shell command, or a skill script's program) runs with full reach
-    // without re-tripping the fence. Keyed identically to the crossing
-    // descriptor raised in `run_one`.
-    if let Some(cmd) = command_for_grant {
-        if granted.contains(&normalize_command(cmd)) {
-            return None;
+    // without re-tripping the fence. Keyed identically to the crossing descriptor
+    // raised in `run_one`. WORKTREE-ONLY: the project's live checkout is read-only
+    // and non-negotiable, so a command grant (earned in some worktree run, since
+    // the session set is shared) must never re-open the checkout to writes.
+    if !non_worktree {
+        if let Some(cmd) = command_for_grant {
+            if granted.contains(&normalize_command(cmd)) {
+                return None;
+            }
         }
     }
 
-    Some((
-        sandbox::SandboxPolicy::for_run(
-            std::path::Path::new(cwd),
-            &granted,
-            orch.sandbox_deny_read(),
-        ),
-        fence,
-    ))
+    let deny_read = orch.sandbox_deny_read();
+
+    // Durable dev-command fence carveouts: a project terminal command the user
+    // has accepted as a fence-crosser pre-ordains the crossings it needs (e.g.
+    // Cairn's `bun run dev:instance` writing its per-instance home outside the
+    // worktree), so an approved launch does not park on a fence prompt. The
+    // declaration lives in repo config but only takes effect once the user has
+    // accepted that command (stored per project in workspace settings), so a
+    // cloned repo can declare a fence-crosser but cannot grant itself the
+    // crossing. See `crate::config::dev_commands` and `docs/worktree-fence.md`.
+    let carveouts = match (command_for_grant, project_id) {
+        (Some(cmd), Some(pid)) => {
+            let accepted = crate::config::settings::load_accepted_fence_commands(&orch.config_dir)
+                .remove(pid)
+                .unwrap_or_default();
+            if accepted.is_empty() {
+                Default::default()
+            } else {
+                let project_terminals = crate::config::project_settings::load_terminal_commands(
+                    std::path::Path::new(cwd),
+                );
+                let templates = crate::config::settings::build_service_templates(
+                    &orch.config_dir,
+                    Some(std::path::PathBuf::from(cwd)),
+                );
+                crate::config::dev_commands::resolve_carveouts(
+                    cmd,
+                    &project_terminals,
+                    &accepted,
+                    &deny_read,
+                    &templates,
+                )
+            }
+        }
+        _ => Default::default(),
+    };
+
+    // An accepted command with no declared scopes crosses fully: skip the sandbox
+    // like a command-scoped session grant does. WORKTREE-ONLY for the same reason
+    // — on the live checkout an unconfined carveout still resolves to a read-only
+    // checkout policy; nothing re-opens the checkout to writes.
+    if carveouts.unconfined && !non_worktree {
+        log::info!("dev-command carveout: running accepted command unconfined (cwd={cwd})");
+        return None;
+    }
+    if !carveouts.dropped_sensitive.is_empty() {
+        log::warn!(
+            "dev-command carveout dropped {} declared scope(s) that touch the read denylist \
+             (a repo-committed terminal command cannot grant a secret-store crossing): {:?}",
+            carveouts.dropped_sensitive.len(),
+            carveouts.dropped_sensitive,
+        );
+    }
+
+    // Non-worktree cwd: the live checkout is read-only (dropped from the writable
+    // set) but readable; a worktree cwd keeps the worktree writable. Session path
+    // grants flow into either policy, but `for_readonly_checkout` drops any grant
+    // that lies within (or contains) the checkout, so a grant can never re-open it.
+    let checkout = std::path::Path::new(cwd);
+    let mut policy = if non_worktree {
+        sandbox::SandboxPolicy::for_readonly_checkout(checkout, &granted, deny_read)
+    } else {
+        sandbox::SandboxPolicy::for_run(checkout, &granted, deny_read)
+    };
+    // Writable carveout scopes are globs: realize them as macOS SBPL regex grants
+    // (matching the build-service mechanism), and additionally as a concrete
+    // writable subpath for any wildcard-free scope so the Linux landlock path
+    // (which does not translate regex grants) still honors simple carveouts. On a
+    // non-worktree cwd, refuse any scope that would write the read-only live
+    // checkout — the read-only guarantee outranks a dev-command's declared scope.
+    for glob in &carveouts.write_globs {
+        if non_worktree && glob_covers_checkout(glob, checkout) {
+            log::warn!(
+                "dev-command carveout scope {glob:?} would write the read-only live checkout; \
+                 dropping it (cwd={cwd})"
+            );
+            continue;
+        }
+        policy.writable_regex.push(sandbox::glob_to_regex(glob));
+        if !glob.contains('*') {
+            policy.writable_extra.push(std::path::PathBuf::from(glob));
+        }
+    }
+
+    Some((policy, fence))
 }
 
 #[derive(Clone, Copy)]
@@ -3095,8 +3332,14 @@ async fn spawn_terminal_session(
     // under `sandbox-exec`; on Linux Landlock needs a `pre_exec` hook and the PTY
     // spawning backend does not expose one, so terminal async fence detection is
     // macOS-only until PTY spawning can apply Landlock before exec.
-    let sandbox =
-        build_run_sandbox_policy(orch, &target.cwd, target.run_id.as_deref(), Some(&command)).await;
+    let sandbox = build_run_sandbox_policy(
+        orch,
+        &target.cwd,
+        target.run_id.as_deref(),
+        Some(target.project_id.as_str()),
+        Some(&command),
+    )
+    .await;
     let fence_mode = sandbox.as_ref().map(|(_, fence)| *fence);
     let sandbox_applied = sandbox.is_some() && cfg!(target_os = "macos");
     let sandbox_policy = sandbox.map(|(policy, _)| policy);
@@ -3154,6 +3397,11 @@ async fn spawn_terminal_session(
     let session_id = Uuid::new_v4().to_string();
     let output_buffer: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
     let last_output_at: Arc<Mutex<SystemTime>> = Arc::new(Mutex::new(SystemTime::now()));
+    // Shared phrase-watcher registry: the read loop below scans output against it,
+    // and the wake-subscribe path registers watchers into the same `Arc` while the
+    // terminal runs.
+    let output_watchers: Arc<Mutex<Vec<crate::services::TerminalOutputWatcher>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let session = PtySession {
         master: Some(components.master),
         writer: Some(components.writer),
@@ -3165,6 +3413,7 @@ async fn spawn_terminal_session(
         last_output_at: Some(last_output_at.clone()),
         // Agent terminals are non-interactive: no prompt markers, no busy signal.
         command_state: None,
+        output_watchers: Some(output_watchers.clone()),
     };
     let session_arc = Arc::new(Mutex::new(session));
 
@@ -3174,6 +3423,37 @@ async fn spawn_terminal_session(
             .lock()
             .map_err(|e| format!("Failed to store session: {e}"))?;
         sessions.insert(session_id.clone(), session_arc.clone());
+    }
+
+    // Hydrate persisted output-phrase watchers for this terminal so an output
+    // wake is durable across sessions: a respawn (e.g. after a worktree-fence
+    // approval restarts the terminal) and a subscribe made while no session was
+    // live both re-attach their watchers here. The wake_subscriptions row is the
+    // source of truth; this in-memory list is only the per-session cache the
+    // read loop scans.
+    {
+        let detail_uri = resource.to_uri();
+        match crate::orchestrator::wakes::list_terminal_output_watchers(&orch.db.local, &detail_uri)
+            .await
+        {
+            Ok(persisted) if !persisted.is_empty() => {
+                if let Ok(mut guard) = output_watchers.lock() {
+                    for (subscription_id, watcher_job_id, phrase, terminal_uri) in persisted {
+                        guard.push(crate::services::TerminalOutputWatcher {
+                            subscription_id,
+                            job_id: watcher_job_id,
+                            phrase,
+                            carry: String::new(),
+                            terminal_uri,
+                        });
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                log::warn!("failed to hydrate terminal output watchers: {error}")
+            }
+        }
     }
 
     let db_result = match mode {
@@ -3217,6 +3497,7 @@ async fn spawn_terminal_session(
     let target_for_thread = target.clone();
     let resource_for_thread = resource.clone();
     let description_for_thread = description.clone();
+    let watchers_for_thread = output_watchers.clone();
     let fence_handled = Arc::new(AtomicBool::new(false));
     let suppress_cleanup = Arc::new(AtomicBool::new(false));
     let fence_handled_thread = fence_handled.clone();
@@ -3251,6 +3532,11 @@ async fn spawn_terminal_session(
                     if let Ok(mut last) = last_output_thread.lock() {
                         *last = SystemTime::now();
                     }
+                    crate::orchestrator::wakes::scan_and_route_terminal_output(
+                        &orch_t,
+                        &watchers_for_thread,
+                        &data,
+                    );
                     if should_handle_terminal_denial(sandbox_applied, fence_mode, &data)
                         && !fence_handled_thread.swap(true, Ordering::SeqCst)
                     {
@@ -3810,12 +4096,12 @@ async fn cache_checkpoint_result(
         return; // Command doesn't match checkpoint command
     }
 
-    // Get git state for cache validity checking
-    let commit_sha = match get_current_head_sha(cwd) {
+    // Capture jj worktree state for cache validity checking.
+    let commit_sha = match crate::execution::cache::get_current_head_sha(orch, cwd) {
         Ok(sha) => sha,
         Err(_) => return,
     };
-    let is_dirty = is_worktree_dirty(cwd).unwrap_or(true);
+    let is_dirty = crate::execution::cache::is_worktree_dirty(orch, cwd).unwrap_or(true);
     let now = chrono::Utc::now().timestamp() as i32;
 
     let cache_id = Uuid::new_v4().to_string();
@@ -3922,6 +4208,34 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_covers_checkout_drops_checkout_scopes_keeps_external() {
+        // A non-worktree run must drop any carveout scope that could write the
+        // read-only live checkout, while keeping scopes safely outside it.
+        let checkout = std::path::Path::new("/project/live");
+        // Wildcard scopes that reach into the checkout are covered.
+        assert!(glob_covers_checkout("/project/live/**", checkout));
+        // A broader ancestor wildcard that also matches the checkout.
+        assert!(glob_covers_checkout("/project/**", checkout));
+        // A nested subtree wildcard INSIDE the checkout (the case a root/child
+        // regex probe missed): `target/`, `node_modules/`, etc.
+        assert!(glob_covers_checkout("/project/live/target/**", checkout));
+        assert!(glob_covers_checkout(
+            "/project/live/node_modules/**",
+            checkout
+        ));
+        // Concrete scope inside the checkout.
+        assert!(glob_covers_checkout("/project/live/target", checkout));
+        // Concrete ancestor whose subpath grant would include the checkout.
+        assert!(glob_covers_checkout("/project", checkout));
+        // The checkout itself.
+        assert!(glob_covers_checkout("/project/live", checkout));
+        // Safely-outside scopes are not covered (they stay writable).
+        assert!(!glob_covers_checkout("/other/**", checkout));
+        assert!(!glob_covers_checkout("/home/u/.cairn-dev/**", checkout));
+        assert!(!glob_covers_checkout("/scratch/ok", checkout));
+    }
 
     // ── redact_command tests ───────────────────────────────────────────────
 
@@ -4044,32 +4358,6 @@ mod tests {
             unwrap_shell_launcher("bash -lc 'git status --short'"),
             "git status --short"
         );
-    }
-
-    #[test]
-    fn test_is_git_commit_command() {
-        // Basic git commit commands
-        assert!(is_git_commit_command("git commit -m 'msg'"));
-        assert!(is_git_commit_command("git commit --amend"));
-        assert!(is_git_commit_command("git commit -am 'msg'"));
-        assert!(is_git_commit_command("git commit"));
-
-        // Commands with leading operations
-        assert!(is_git_commit_command("cd foo && git commit -m 'msg'"));
-        assert!(is_git_commit_command("git add . && git commit -m 'msg'"));
-        assert!(is_git_commit_command("git add -A; git commit -m 'msg'"));
-
-        // Commands that should NOT match
-        assert!(!is_git_commit_command("git status"));
-        assert!(!is_git_commit_command("git push"));
-        assert!(!is_git_commit_command("git log"));
-        assert!(!is_git_commit_command("git diff"));
-        assert!(!is_git_commit_command("git add ."));
-
-        // Help commands should NOT match
-        assert!(!is_git_commit_command("git commit --help"));
-        assert!(!is_git_commit_command("git commit -h"));
-        assert!(!is_git_commit_command("git commit -h | less"));
     }
 
     // ── batch run composition + interpreter resolution ─────────────────────
@@ -4397,116 +4685,57 @@ mod tests {
             vec!["--fast".to_string()]
         );
     }
-
-    #[test]
-    fn test_is_git_commit_command_edge_cases() {
-        // Multiple spaces
-        assert!(is_git_commit_command("git  commit -m 'msg'"));
-
-        // Mixed case
-        assert!(is_git_commit_command("GIT COMMIT -m 'msg'"));
-        assert!(is_git_commit_command("Git Commit -m 'msg'"));
-
-        // Newline separated
-        assert!(is_git_commit_command("echo test\ngit commit -m 'msg'"));
-
-        // Complex command chains
-        assert!(is_git_commit_command(
-            "cd /path/to/repo && git add . && git commit -m 'message'"
-        ));
-    }
 }
 
 #[cfg(test)]
 mod commit_barrier_tests {
     use super::*;
+    use crate::mcp::vcs::{FakeVcs, VcsSnapshot};
     use std::path::Path;
-    use std::process::Output;
-    use tempfile::tempdir;
 
-    fn git(wt: &Path, args: &[&str]) -> Output {
-        crate::env::git()
-            .args(args)
-            .current_dir(wt)
-            .output()
-            .unwrap()
-    }
-
-    fn init_repo(wt: &Path) {
-        assert!(git(wt, &["init"]).status.success());
-        git(wt, &["config", "user.email", "t@e.com"]);
-        git(wt, &["config", "user.name", "Tester"]);
-        std::fs::write(wt.join("base.txt"), "base\n").unwrap();
-        git(wt, &["add", "-A"]);
-        git(wt, &["commit", "-m", "base"]);
-    }
-
-    fn porcelain(wt: &Path) -> String {
-        String::from_utf8_lossy(&git(wt, &["status", "--porcelain"]).stdout).to_string()
-    }
-
-    fn head_sha(wt: &Path) -> String {
-        String::from_utf8_lossy(&git(wt, &["rev-parse", "HEAD"]).stdout)
-            .trim()
-            .to_string()
+    // The barrier touches the VCS only through the `WorktreeVcs` seam, so a
+    // FakeVcs double covers its commit/restore/no-op control flow deterministically
+    // and without a VCS binary. The worktree path is never dereferenced.
+    fn wt() -> &'static Path {
+        Path::new("/tmp/fake-worktree")
     }
 
     #[test]
     fn commit_msg_commits_dirty_worktree_even_on_partial_failure() {
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        let before = head_sha(wt);
-        std::fs::write(wt.join("new.txt"), "content\n").unwrap();
-
-        // all_ok = false: a partial-success batch must still commit its dirt.
-        let out = run_commit_barrier(wt, Some("add file"), false, None, None);
-
+        // Some(msg) + dirty: a partial-success batch (all_ok=false) still seals
+        // its dirt rather than stranding the successful items' changes.
+        let vcs = FakeVcs::new().dirty(Ok(true));
+        let out = run_commit_barrier(&vcs, wt(), Some("add file"), false, None, None);
+        assert_eq!(vcs.seals(), 1, "a dirty worktree must be sealed");
+        assert_eq!(vcs.discards(), 0);
         assert!(out.worktree_changed);
         assert!(out.committed, "a real commit must set committed");
         assert!(out.message.contains("Committed"), "got: {}", out.message);
-        assert!(
-            porcelain(wt).is_empty(),
-            "worktree must equal HEAD after commit"
-        );
-        assert_ne!(head_sha(wt), before, "a new commit should exist");
     }
 
     #[test]
     fn commit_msg_with_clean_worktree_is_noop() {
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        let before = head_sha(wt);
-
-        let out = run_commit_barrier(wt, Some("nothing"), true, None, None);
-
+        let vcs = FakeVcs::new().dirty(Ok(false));
+        let out = run_commit_barrier(&vcs, wt(), Some("nothing"), true, None, None);
+        assert_eq!(vcs.seals(), 0, "a clean worktree is not sealed");
+        assert_eq!(vcs.discards(), 0);
         assert!(!out.worktree_changed);
         assert!(!out.committed, "a clean no-op must not set committed");
         assert!(out.message.is_empty());
-        assert_eq!(head_sha(wt), before);
-        assert!(porcelain(wt).is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn commit_failure_restores_worktree_to_head() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        let before = head_sha(wt);
-        std::fs::write(wt.join("new.txt"), "content\n").unwrap();
-
-        // A pre-commit hook that always fails forces `git commit` to fail.
-        let hooks = wt.join(".git/hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        let hook = hooks.join("pre-commit");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let out = run_commit_barrier(wt, Some("will fail"), true, None, None);
-
+        let vcs = FakeVcs::new()
+            .dirty(Ok(true))
+            .seal(Err("pre-commit hook failed".to_string()));
+        let out = run_commit_barrier(&vcs, wt(), Some("will fail"), true, None, None);
+        assert_eq!(vcs.seals(), 1);
+        assert_eq!(
+            vcs.discards(),
+            1,
+            "a failed seal restores the worktree to HEAD"
+        );
         assert!(!out.committed, "a failed commit must not set committed");
         assert!(
             out.message.contains("Failed to commit"),
@@ -4518,89 +4747,32 @@ mod commit_barrier_tests {
             "got: {}",
             out.message
         );
-        assert!(
-            porcelain(wt).is_empty(),
-            "worktree must equal HEAD after a failed commit"
-        );
-        assert_eq!(head_sha(wt), before, "no commit should have landed");
     }
 
     #[test]
-    fn no_commit_rejected_and_restored_outside_transition() {
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        let before = head_sha(wt);
-        std::fs::write(wt.join("new.txt"), "content\n").unwrap();
+    fn commit_msg_nothing_to_commit_is_clean_noop() {
+        // The seal reports "nothing to commit" when the tree became clean; that is
+        // already==HEAD, not a failure — no restore, no message.
+        let vcs = FakeVcs::new()
+            .dirty(Ok(true))
+            .seal(Err("nothing to commit, working tree clean".to_string()));
+        let out = run_commit_barrier(&vcs, wt(), Some("noop"), true, None, None);
+        assert_eq!(vcs.discards(), 0, "nothing-to-commit must not restore");
+        assert!(!out.committed);
+        assert!(out.message.is_empty(), "got: {}", out.message);
+    }
 
-        let out = run_commit_barrier(wt, Some("NO_COMMIT"), true, None, None);
-
+    #[test]
+    fn none_commit_msg_reverts_changed_worktree() {
+        // No commit_msg + a fully-successful batch that changed the worktree must
+        // restore to HEAD: new dirt must not persist across calls.
+        let before = VcsSnapshot("entry".to_string());
+        let vcs = FakeVcs::new().changed(Ok(true));
+        let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None);
+        assert_eq!(vcs.seals(), 0);
+        assert_eq!(vcs.discards(), 1, "new dirt without commit_msg is reverted");
         assert!(out.worktree_changed);
-        assert!(!out.committed, "NO_COMMIT must not set committed");
-        assert!(out.message.contains("NO_COMMIT"), "got: {}", out.message);
-        assert!(
-            porcelain(wt).is_empty(),
-            "NO_COMMIT outside a transition must restore to HEAD"
-        );
-        assert_eq!(head_sha(wt), before);
-    }
-
-    #[test]
-    fn no_commit_accepted_mid_merge_preserves_conflict_state() {
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        // Build a conflicting merge so the repo is mid-transition with a dirty
-        // (conflicted) worktree.
-        std::fs::write(wt.join("f.txt"), "base\n").unwrap();
-        git(wt, &["add", "-A"]);
-        git(wt, &["commit", "-m", "f base"]);
-        let base = String::from_utf8_lossy(&git(wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
-            .trim()
-            .to_string();
-        git(wt, &["checkout", "-b", "feature"]);
-        std::fs::write(wt.join("f.txt"), "feature\n").unwrap();
-        git(wt, &["add", "-A"]);
-        git(wt, &["commit", "-m", "feature"]);
-        git(wt, &["checkout", &base]);
-        std::fs::write(wt.join("f.txt"), "mainline\n").unwrap();
-        git(wt, &["add", "-A"]);
-        git(wt, &["commit", "-m", "mainline"]);
-        assert!(!git(wt, &["merge", "feature"]).status.success());
-        assert!(
-            !porcelain(wt).is_empty(),
-            "merge conflict leaves the tree dirty"
-        );
-
-        let out = run_commit_barrier(wt, Some("NO_COMMIT"), true, None, None);
-
-        assert!(
-            !out.committed,
-            "NO_COMMIT mid-merge must not set committed"
-        );
-        assert!(
-            out.message.is_empty(),
-            "NO_COMMIT should be accepted mid-merge; got: {}",
-            out.message
-        );
-        assert!(
-            !porcelain(wt).is_empty(),
-            "mid-merge conflict state must be preserved under NO_COMMIT"
-        );
-    }
-
-    #[test]
-    fn none_commit_msg_reverts_clean_entry_dirt() {
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        let status_before = porcelain(wt); // clean entry
-        std::fs::write(wt.join("scratch.txt"), "junk\n").unwrap();
-
-        let out = run_commit_barrier(wt, None, true, Some(&status_before), None);
-
-        assert!(out.worktree_changed);
-        assert!(!out.committed, "a restore (no commit_msg) must not set committed");
+        assert!(!out.committed, "a restore must not set committed");
         assert!(out.message.contains("reverted"), "got: {}", out.message);
         assert!(
             out.message
@@ -4608,53 +4780,68 @@ mod commit_barrier_tests {
             "got: {}",
             out.message
         );
-        assert!(
-            porcelain(wt).is_empty(),
-            "no commit_msg must restore the worktree to HEAD"
-        );
-        assert!(!wt.join("scratch.txt").exists());
     }
 
     #[test]
-    fn none_commit_msg_reverts_dirty_entry_too() {
-        // A skill script that mutates without commit_msg when the worktree was
-        // already dirty on entry must still restore to HEAD (fix #5).
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        std::fs::write(wt.join("pre.txt"), "pre\n").unwrap();
-        let status_before = porcelain(wt); // dirty entry
-        assert!(!status_before.is_empty());
-        std::fs::write(wt.join("more.txt"), "more\n").unwrap();
+    fn none_commit_msg_leaves_unchanged_worktree_alone() {
+        let before = VcsSnapshot("entry".to_string());
+        let vcs = FakeVcs::new().changed(Ok(false));
+        let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None);
+        assert_eq!(vcs.discards(), 0);
+        assert!(!out.worktree_changed);
+        assert!(out.message.is_empty());
+    }
 
-        let out = run_commit_barrier(wt, None, true, Some(&status_before), None);
-
-        assert!(out.worktree_changed);
+    #[test]
+    fn none_commit_msg_warns_without_reverting_when_backend_cannot_revert() {
+        // A backend that cannot revert (the project's live checkout) must NOT
+        // discard on a no-commit_msg run that left dirt: reverting the checkout
+        // would destroy the user's own uncommitted work. It warns instead.
+        let before = VcsSnapshot("entry".to_string());
+        let vcs = FakeVcs::new().changed(Ok(true)).can_revert(false);
+        let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None);
+        assert_eq!(vcs.discards(), 0, "the live checkout is never reverted");
+        assert_eq!(vcs.seals(), 0);
+        assert!(!out.worktree_changed, "Cairn mutated nothing");
+        assert!(!out.committed);
         assert!(
-            porcelain(wt).is_empty(),
-            "dirty-entry path must also restore to HEAD"
+            out.message.contains("live checkout") && out.message.contains("worktree"),
+            "the agent is warned it crossed the worktree boundary: {}",
+            out.message
         );
     }
 
     #[test]
     fn none_commit_msg_leaves_failed_batch_dirt_for_inspection() {
-        // Deliberate boundary: when the batch itself failed and gave no
-        // commit_msg, the hygiene gate stays out of the way so the failure's
-        // side effects remain visible. The `all_ok` guard lives only here.
-        let temp = tempdir().unwrap();
-        let wt = temp.path();
-        init_repo(wt);
-        let status_before = porcelain(wt);
-        std::fs::write(wt.join("scratch.txt"), "junk\n").unwrap();
-
-        let out = run_commit_barrier(wt, None, false, Some(&status_before), None);
-
+        // Deliberate boundary: a failed batch (all_ok=false) with no commit_msg
+        // keeps the hygiene gate out of the way so the failure's side effects stay
+        // visible. The `all_ok` guard lives only here.
+        let before = VcsSnapshot("entry".to_string());
+        let vcs = FakeVcs::new().changed(Ok(true));
+        let out = run_commit_barrier(&vcs, wt(), None, false, Some(&before), None);
+        assert_eq!(vcs.discards(), 0, "a failed batch's dirt is not reverted");
         assert!(!out.worktree_changed);
         assert!(out.message.is_empty());
-        assert!(
-            !porcelain(wt).is_empty(),
-            "a failed batch's dirt is not reverted by the hygiene gate"
-        );
+    }
+
+    /// Over the read-only non-worktree sentinel the barrier is a clean no-op in
+    /// both directions: with commit_msg it never seals (is_dirty=false), and
+    /// without commit_msg it never discards (changed_since=false) — so an agent
+    /// on the project's live checkout never has its working copy sealed or
+    /// reverted by Cairn.
+    #[test]
+    fn non_worktree_barrier_is_a_safe_noop_both_directions() {
+        use crate::mcp::vcs::NonWorktreeVcs;
+        let before = VcsSnapshot(String::new());
+
+        let with_msg = run_commit_barrier(&NonWorktreeVcs, wt(), Some("work"), true, None, None);
+        assert!(!with_msg.worktree_changed);
+        assert!(!with_msg.committed);
+        assert!(with_msg.message.is_empty());
+
+        let no_msg = run_commit_barrier(&NonWorktreeVcs, wt(), None, true, Some(&before), None);
+        assert!(!no_msg.worktree_changed);
+        assert!(no_msg.message.is_empty());
     }
 }
 

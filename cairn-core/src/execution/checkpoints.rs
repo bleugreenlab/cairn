@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::db_records::{db_job_from_row, DbJob, JOB_COLUMNS};
 use crate::models::{Artifact, Job};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbError, DbResult, LocalDb};
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use turso::params;
 
 /// Approve a blocked checkpoint job.
@@ -107,24 +107,47 @@ async fn load_job_by_id_conn(conn: &turso::Connection, job_id: &str) -> DbResult
         .transpose()
 }
 
-/// Confirm a job's latest artifact (the approve resolution fact). Creates a
+/// Confirm a job's terminal artifact (the approve resolution fact). Creates a
 /// minimal `checkpoint` artifact if the job has none (a standalone checkpoint
 /// node approved without ever producing an agent artifact).
+///
+/// The confirmation is scoped to the node's terminal (`context-out`) artifact
+/// name, matching the name-scoped gate read in advancement. With per-name
+/// version chains a frequently-patched `context-self` living doc can carry a
+/// higher version number than the terminal output; confirming "latest overall"
+/// (highest version across all names) would mark the living doc and leave the
+/// terminal gate permanently unresolvable. A job with no resolvable terminal
+/// name (task jobs, standalone checkpoint nodes, legacy/unnamed contracts) falls
+/// back to the latest artifact overall.
 pub(crate) async fn confirm_latest_artifact_conn(
     conn: &turso::Connection,
     job_id: &str,
 ) -> DbResult<Artifact> {
     let now = chrono::Utc::now().timestamp() as i32;
+    let terminal_name = resolve_terminal_artifact_name_conn(conn, job_id).await?;
     let existing = {
-        let mut rows = conn
-            .query(
-                format!(
-                    "SELECT {} FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
-                    crate::artifacts::queries::ARTIFACT_COLUMNS
-                ),
-                (job_id,),
-            )
-            .await?;
+        let mut rows = match terminal_name.as_deref() {
+            Some(name) => {
+                conn.query(
+                    format!(
+                        "SELECT {} FROM artifacts WHERE job_id = ?1 AND output_name = ?2 ORDER BY version DESC LIMIT 1",
+                        crate::artifacts::queries::ARTIFACT_COLUMNS
+                    ),
+                    params![job_id, name],
+                )
+                .await?
+            }
+            None => {
+                conn.query(
+                    format!(
+                        "SELECT {} FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
+                        crate::artifacts::queries::ARTIFACT_COLUMNS
+                    ),
+                    (job_id,),
+                )
+                .await?
+            }
+        };
         rows.next()
             .await?
             .map(|row| crate::artifacts::queries::artifact_from_row(&row))
@@ -166,6 +189,35 @@ pub(crate) async fn confirm_latest_artifact_conn(
             })
         }
     }
+}
+
+/// Resolve a job's terminal (`context-out`) artifact name from its execution
+/// snapshot, so confirmation can target that name's version chain. Returns
+/// `None` for jobs with no recipe node (task jobs), no `context-out` contract,
+/// or an unnamed/legacy contract.
+async fn resolve_terminal_artifact_name_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> DbResult<Option<String>> {
+    let (node_id, execution_id) = {
+        let mut rows = conn
+            .query(
+                "SELECT recipe_node_id, execution_id FROM jobs WHERE id = ?1",
+                (job_id,),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => (row.opt_text(0)?, row.opt_text(1)?),
+            None => return Ok(None),
+        }
+    };
+    let (Some(node_id), Some(execution_id)) = (node_id, execution_id) else {
+        return Ok(None);
+    };
+    let info =
+        crate::execution::jobs::find_downstream_artifact_schema_conn(conn, &node_id, &execution_id)
+            .await?;
+    Ok(info.and_then(|info| info.artifact_name))
 }
 
 /// Ensure a blockable checkpoint job has an (unconfirmed) artifact whose

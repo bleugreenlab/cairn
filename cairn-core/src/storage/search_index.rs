@@ -683,9 +683,12 @@ async fn load_event_documents(db: &LocalDb) -> DbResult<Vec<SearchDocument>> {
                 let mut rows = conn.query(&sql, ()).await?;
                 while let Some(row) = rows.next().await? {
                     let event = crate::runs::queries::event_from_row(&row)?;
-                    let project_id = row.opt_text(20)?;
-                    let issue_id = row.opt_text(21)?;
-                    let job_id = row.opt_text(22)?;
+                    // r.project_id/issue_id/job_id ride just past EVENT_COLUMNS;
+                    // key off EVENT_COLUMN_COUNT so adding an event column shifts
+                    // them in lockstep instead of silently reading the wrong slot.
+                    let project_id = row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT)?;
+                    let issue_id = row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 1)?;
+                    let job_id = row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 2)?;
                     out.push((event, project_id, issue_id, job_id));
                 }
                 Ok(out)
@@ -769,9 +772,9 @@ async fn load_archived_event_document(
                 let event = crate::runs::queries::event_from_row(&row)?;
                 Ok(Some((
                     event,
-                    row.opt_text(20)?,
-                    row.opt_text(21)?,
-                    row.opt_text(22)?,
+                    row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT)?,
+                    row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 1)?,
+                    row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 2)?,
                 )))
             })
         })

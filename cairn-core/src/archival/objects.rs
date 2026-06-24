@@ -283,10 +283,9 @@ mod tests {
         write_file(&clone, "a.txt", b"A-modified");
         let tip = commit_all(&clone, "modify a");
 
-        let (pack, idx, built_tip) = build_execution_pack(&clone, &anchor, "main")
+        let (pack, idx) = build_execution_pack(&clone, &tip, &anchor, "main")
             .unwrap()
             .unwrap();
-        assert_eq!(built_tip, tip);
 
         Fixture {
             _origin_dir: origin_dir,
@@ -353,7 +352,7 @@ mod tests {
         write_file(repo, "a.txt", b"A");
         let anchor = commit_all(repo, "base");
         // tip == anchor: the range is empty.
-        assert!(build_execution_pack(repo, &anchor, "main")
+        assert!(build_execution_pack(repo, &anchor, &anchor, "main")
             .unwrap()
             .is_none());
 

@@ -318,6 +318,17 @@ impl std::str::FromStr for RecipeEdgeType {
     }
 }
 
+/// Context port handles. Every agent node exposes three context ports:
+/// `context-in` (N inputs the run starts with), `context-out` (the single
+/// terminal artifact the run produces — writing it ends the turn and moves the
+/// DAG), and `context-self` (N living working-doc artifacts the node owns and
+/// patches across its whole life, which never end the turn or satisfy the output
+/// contract). All three ride the `context` edge type; the source handle
+/// distinguishes a terminal output edge from a self-owned living-doc edge.
+pub const CONTEXT_IN_HANDLE: &str = "context-in";
+pub const CONTEXT_OUT_HANDLE: &str = "context-out";
+pub const CONTEXT_SELF_HANDLE: &str = "context-self";
+
 /// Node position in the DAG editor
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodePosition {
@@ -368,11 +379,14 @@ pub struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
 
-    // Legacy artifact config (for standalone artifact nodes)
+    // Artifact-node config (the typed schema node on a context edge)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    /// Confirm policy for an ArtifactNode used as a producer's terminal target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_policy: Option<ConfirmPolicy>,
 
     // Condition config
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -620,12 +634,33 @@ pub struct CheckpointNodeConfig {
     pub prompt: Option<String>,
 }
 
+/// A typed artifact node — the first-class schema node on a context edge.
+///
+/// A producer's `context-out` edge targets it, which defines that producer's
+/// terminal output contract (name + schema + confirm gate); consumers read it via
+/// `context-in`. An ArtifactNode targeted by a node's `context-self` edge is a
+/// living working doc the node owns. An ArtifactNode carrying inline literal
+/// `content` with no upstream writer is the collapsed Context node — a static
+/// input document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactNodeConfig {
-    pub artifact_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Canonical artifact name and `cairn:~/<name>` URI segment. `artifactType`
+    /// is the legacy key, still accepted when deserializing old snapshots.
+    #[serde(alias = "artifactType")]
+    pub name: String,
+    /// Full JSON Schema for the artifact payload. `None` for a pure
+    /// literal-content node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    /// How this artifact's confirm gate resolves when it is a producer's terminal
+    /// (`context-out`) target. `context-self` living docs are always auto-confirm.
+    #[serde(default)]
+    pub confirm_policy: ConfirmPolicy,
+    /// Inline literal content (collapsed Context node): a static input document
+    /// with no upstream writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
 }
 
 /// Condition type - how the condition is evaluated
@@ -835,14 +870,26 @@ impl TryFrom<crate::db_records::DbRecipeNode> for RecipeNode {
                 } else {
                     None
                 },
-                // Legacy standalone artifact config
-                cfg.artifact_type.map(|at| ArtifactNodeConfig {
-                    artifact_type: at,
-                    schema: cfg.schema,
-                }),
+                // ArtifactNode config (the typed schema node on a context edge).
+                if node_type == RecipeNodeType::Artifact {
+                    Some(ArtifactNodeConfig {
+                        name: cfg.artifact_type.clone().unwrap_or_default(),
+                        schema: cfg.schema.clone(),
+                        confirm_policy: cfg.confirm_policy.unwrap_or_default(),
+                        content: cfg.content.clone(),
+                    })
+                } else {
+                    None
+                },
                 condition_config,
-                // Context config
-                cfg.content.map(|content| ContextNodeConfig { content }),
+                // Legacy Context node config (kept for old-snapshot tolerance).
+                if node_type == RecipeNodeType::Context {
+                    cfg.content
+                        .clone()
+                        .map(|content| ContextNodeConfig { content })
+                } else {
+                    None
+                },
             )
         } else {
             (None, None, None, None, None, None, None)
@@ -1460,7 +1507,10 @@ mod tests {
 
     #[test]
     fn try_from_db_recipe_node_artifact() {
-        let config = r#"{"artifactType": "plan", "schema": {"type": "object"}}"#;
+        // `artifactType` is the legacy key; it deserializes into the canonical
+        // `name` via the serde alias, and `confirmPolicy` carries the gate.
+        let config =
+            r#"{"artifactType": "plan", "confirmPolicy": "user", "schema": {"type": "object"}}"#;
         let db = make_db_recipe_node("artifact", Some(config));
 
         let node = RecipeNode::try_from(db).unwrap();
@@ -1468,7 +1518,8 @@ mod tests {
         assert_eq!(node.node_type, RecipeNodeType::Artifact);
         assert!(node.artifact_config.is_some());
         let artifact_config = node.artifact_config.unwrap();
-        assert_eq!(artifact_config.artifact_type, "plan");
+        assert_eq!(artifact_config.name, "plan");
+        assert_eq!(artifact_config.confirm_policy, ConfirmPolicy::User);
         assert!(artifact_config.schema.is_some());
     }
 

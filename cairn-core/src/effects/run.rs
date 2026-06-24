@@ -251,7 +251,7 @@ async fn run_checkpoint(
     }
 
     let worktree_str = worktree_path.to_string_lossy().to_string();
-    let commit_sha = crate::execution::cache::get_current_head_sha(&worktree_str).ok();
+    let commit_sha = crate::execution::cache::get_current_head_sha(orch, &worktree_str).ok();
     let output =
         match crate::execution::conditions::execute_programmatic_checkpoint(&worktree_str, command)
             .await

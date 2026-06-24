@@ -345,12 +345,12 @@ fn record_trigger_sources(
                             id, source_job_id, triggered_execution_id, created_at
                          )
                          VALUES (?1, ?2, ?3, ?4)",
-                        turso::params![
+                        (
                             id.as_str(),
                             source_job_id.as_str(),
                             execution_id.as_str(),
-                            now
-                        ],
+                            now,
+                        ),
                     )
                     .await?;
                 }

@@ -47,6 +47,18 @@ impl McpAuthState {
         Ok(base64_encode(&secret))
     }
 
+    /// Materialize the shared secret on disk if it is not present yet.
+    ///
+    /// The secret is otherwise created lazily on the first agent spawn or
+    /// inbound callback. Calling this when the callback server starts makes the
+    /// invariant "a running server has a readable `mcp_auth_secret`" hold, so
+    /// tooling that authenticates to a running instance by reading its secret
+    /// file (e.g. `cairn://dev/db`/`cairn://dev/pid` querying a `dev:instance`) works even before
+    /// the instance has done any MCP work. Idempotent.
+    pub fn ensure_secret(&self) -> Result<(), String> {
+        self.get_secret().map(|_| ())
+    }
+
     /// Validate a bearer token from an MCP callback request.
     ///
     /// Compares the token directly against the base64-encoded shared secret.

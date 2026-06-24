@@ -11,37 +11,41 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-/// A built execution range pack: packfile bytes, pack index bytes, and the
-/// worktree tip sha the range was built against.
-pub type ExecutionPack = (Vec<u8>, Vec<u8>, String);
+/// A built execution range pack: packfile bytes and pack index bytes.
+pub type ExecutionPack = (Vec<u8>, Vec<u8>);
 
-/// Build the execution range pack in `worktree_path`.
+/// Build the execution range pack for the range `pack_anchor..tip`.
 ///
-/// Returns `Ok(Some((pack, idx, tip_sha)))` with the packfile bytes, its index
-/// bytes, and the worktree HEAD the range was built against. Returns `Ok(None)`
-/// when the range is empty — everything reachable from the tip is already durable
-/// (a fast-forward or true merge into the default branch, or tip == anchor) — so
-/// reconstruction resolves entirely from the project repo's object database.
+/// `git_dir` is the git repository the range is computed and packed in, and
+/// `tip` is the worktree tip the range is built against — both resolved by the
+/// caller so this never assumes the worktree itself is a git repository. Under
+/// jj a production workspace is `.jj`-only (no `.git`), so the caller routes
+/// `git_dir` to the project repo, where `jj git export` has landed the
+/// execution's objects, and resolves `tip` from jj's `@-`; under plain git both
+/// are the worktree.
+///
+/// Returns `Ok(Some((pack, idx)))` with the packfile bytes and its index bytes.
+/// Returns `Ok(None)` when the range is empty — everything reachable from the tip
+/// is already durable (a fast-forward or true merge into the default branch, or
+/// tip == anchor) — so reconstruction resolves entirely from the project repo's
+/// object database.
 ///
 /// `pack_anchor` is the durable anchor the range is built against; both it and
 /// `default_branch_ref` are excluded so a default branch merged into the branch
 /// mid-flight never over-packs already-durable objects. Shelling out to git here
-/// is intentional: this runs at teardown where the worktree still exists.
+/// is intentional: this runs at teardown where the objects still exist.
 pub fn build_execution_pack(
-    worktree_path: &Path,
+    git_dir: &Path,
+    tip: &str,
     pack_anchor: &str,
     default_branch_ref: &str,
 ) -> Result<Option<ExecutionPack>, String> {
-    let tip = run_git(worktree_path, &["rev-parse", "HEAD"])?
-        .trim()
-        .to_string();
-
     let rev_list = run_git(
-        worktree_path,
+        git_dir,
         &[
             "rev-list",
             "--objects",
-            &tip,
+            tip,
             "--not",
             pack_anchor,
             default_branch_ref,
@@ -64,7 +68,7 @@ pub fn build_execution_pack(
 
     let scratch = tempfile::tempdir().map_err(|e| format!("creating pack scratch dir: {e}"))?;
     let base = scratch.path().join("range");
-    let hash = pack_objects(worktree_path, &base, &oids)?;
+    let hash = pack_objects(git_dir, &base, &oids)?;
 
     let pack_path = scratch.path().join(format!("range-{hash}.pack"));
     let idx_path = scratch.path().join(format!("range-{hash}.idx"));
@@ -73,14 +77,14 @@ pub fn build_execution_pack(
     let idx = std::fs::read(&idx_path)
         .map_err(|e| format!("reading pack index {}: {e}", idx_path.display()))?;
 
-    Ok(Some((pack, idx, tip)))
+    Ok(Some((pack, idx)))
 }
 
 /// Pipe `oids` into `git pack-objects <base>`, which writes `<base>-<hash>.pack`
 /// and `<base>-<hash>.idx` and prints `<hash>` to stdout.
-fn pack_objects(worktree_path: &Path, base: &Path, oids: &str) -> Result<String, String> {
+fn pack_objects(git_dir: &Path, base: &Path, oids: &str) -> Result<String, String> {
     let mut child = Command::new("git")
-        .current_dir(worktree_path)
+        .current_dir(git_dir)
         .arg("pack-objects")
         .arg("--quiet")
         .arg(base)
@@ -112,9 +116,9 @@ fn pack_objects(worktree_path: &Path, base: &Path, oids: &str) -> Result<String,
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn run_git(worktree_path: &Path, args: &[&str]) -> Result<String, String> {
+fn run_git(git_dir: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
-        .current_dir(worktree_path)
+        .current_dir(git_dir)
         .args(args)
         .output()
         .map_err(|e| format!("spawning git {args:?}: {e}"))?;
@@ -172,10 +176,9 @@ mod tests {
         write_file(repo, "c.txt", b"C");
         let tip = commit_all(repo, "work 2");
 
-        let (pack, idx, built_tip) = build_execution_pack(repo, &anchor, "main")
+        let (pack, idx) = build_execution_pack(repo, &tip, &anchor, "main")
             .unwrap()
             .unwrap();
-        assert_eq!(built_tip, tip);
         assert!(!pack.is_empty());
 
         let expected = range_oids(repo, &tip, &anchor, "main");
@@ -199,7 +202,7 @@ mod tests {
         write_file(repo, "ch.txt", b"CH");
         let tip = commit_all(repo, "child 1");
 
-        let (_pack, idx, _tip) = build_execution_pack(repo, &anchor, "main")
+        let (_pack, idx) = build_execution_pack(repo, &tip, &anchor, "main")
             .unwrap()
             .unwrap();
         let oids = pack_oids(&idx);
@@ -216,8 +219,8 @@ mod tests {
         init_repo(repo);
         write_file(repo, "a.txt", b"A");
         let anchor = commit_all(repo, "base");
-        // HEAD == anchor == main: nothing is at risk.
-        assert!(build_execution_pack(repo, &anchor, "main")
+        // tip == anchor == main: nothing is at risk.
+        assert!(build_execution_pack(repo, &anchor, &anchor, "main")
             .unwrap()
             .is_none());
     }
@@ -236,7 +239,7 @@ mod tests {
         // Fast-forward the default branch to the work tip: everything reachable
         // from tip is now durable on main, so the range is empty.
         git(repo, &["branch", "-f", "main", &tip]);
-        assert!(build_execution_pack(repo, &anchor, "main")
+        assert!(build_execution_pack(repo, &tip, &anchor, "main")
             .unwrap()
             .is_none());
     }

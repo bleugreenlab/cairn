@@ -3,8 +3,8 @@
 //! These tests pin the storage and dispatch-augmentation halves of the
 //! queue-on-active behavior. The active-turn message handler path is covered
 //! indirectly through the dispatch test below — if the recipient has a
-//! running head turn, the message must remain queued (delivered_at IS NULL)
-//! until a prompt boundary fires.
+//! running head turn, the message must remain queued as an undelivered direct
+//! push until a prompt boundary fires.
 
 mod common;
 
@@ -16,12 +16,9 @@ use cairn_core::internal::mcp::handlers::files::handle_change;
 use cairn_core::internal::mcp::handlers::issue_resources::handle_read_issue_resource;
 use cairn_core::internal::mcp::handlers::messages::append_direct_message;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
-use cairn_core::internal::orchestrator::wakes::{
-    self, WakeDelivery, WakeEvent, WakeRouteAction, WakeScope, WakeSource, WakeSubscriptionState,
-};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
-use cairn_core::messages::{db as msg_db, queued::DeliveryUrgency};
+use cairn_core::messages::db as msg_db;
 use cairn_core::models::ChannelType;
 use turso::params;
 
@@ -36,10 +33,6 @@ fn insert_pending_direct(orch: &Orchestrator, recipient: &str, content: &str) ->
         content,
     )
     .unwrap();
-    assert_eq!(
-        msg.delivered_at, None,
-        "new direct should start with delivered_at IS NULL"
-    );
     msg.id
 }
 
@@ -55,11 +48,28 @@ fn callback_request(tool: &str, run_id: Option<&str>) -> McpCallbackRequest {
 
 #[tokio::test(flavor = "current_thread")]
 async fn dispatch_tool_augments_result_with_queued_direct_messages() {
+    // A direct message to a busy recipient becomes an undelivered `direct:` push;
+    // the recipient's next tool boundary drains it as a reminder, exactly once
+    // (CAIRN-1900 replaced the raw-message pull with the push queue).
     let (_temp, orch) = common::test_orchestrator().await;
-    let recipient_run = "recipient-run";
-    let _ = insert_pending_direct(&orch, recipient_run, "hello mid-turn");
+    insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
 
-    let request = callback_request("bogus_tool", Some(recipient_run));
+    let send = callback_request("write", None);
+    append_direct_message(
+        &orch,
+        &send,
+        "PROJ",
+        42,
+        1,
+        "builder",
+        None,
+        "hello mid-turn",
+        false,
+    )
+    .await
+    .expect("external user DM should be accepted");
+
+    let request = callback_request("bogus_tool", Some("run-1"));
     let cursors = Mutex::new(HashMap::new());
     let result = dispatch_tool(&orch, &request, &cursors).await;
 
@@ -72,16 +82,17 @@ async fn dispatch_tool_augments_result_with_queued_direct_messages() {
         result
             .reminders
             .iter()
-            .any(|r| r.contains("[Direct message from planner] hello mid-turn")),
-        "augmentation should collect the rendered DM as a reminder: {:?}",
+            .any(|r| r.contains("hello mid-turn")),
+        "dispatch should surface the queued direct as a reminder: {:?}",
         result.reminders
     );
 
-    // Message is now marked delivered — a second dispatch does not re-deliver.
+    // The push is stamped delivered by its carrying event — a second dispatch
+    // does not re-deliver it.
     let again = dispatch_tool(&orch, &request, &cursors).await;
     assert!(
-        again.reminders.is_empty(),
-        "claim_pending_directs_for_run should be idempotent across dispatch calls: {:?}",
+        !again.reminders.iter().any(|r| r.contains("hello mid-turn")),
+        "delivered direct must not re-surface: {:?}",
         again.reminders
     );
 }
@@ -175,14 +186,14 @@ async fn turn_count(db: &LocalDb, job_id: &str) -> i64 {
 }
 
 /// Find the most recently inserted direct message addressed to the recipient.
-async fn latest_direct_to(db: &LocalDb, recipient_run_id: &str) -> Option<(String, Option<i64>)> {
+async fn latest_direct_to(db: &LocalDb, recipient_run_id: &str) -> Option<String> {
     let recipient_run_id = recipient_run_id.to_string();
     db.read(|conn| {
         let recipient_run_id = recipient_run_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, delivered_at FROM messages
+                    "SELECT id FROM messages
                      WHERE channel_type = 'direct' AND recipient_run_id = ?1
                      ORDER BY created_at DESC, id DESC LIMIT 1",
                     params![recipient_run_id.as_str()],
@@ -192,7 +203,7 @@ async fn latest_direct_to(db: &LocalDb, recipient_run_id: &str) -> Option<(Strin
                 .await?
                 .map(|row| {
                     use cairn_core::internal::storage::RowExt;
-                    Ok::<_, cairn_core::internal::storage::DbError>((row.text(0)?, row.opt_i64(1)?))
+                    Ok::<_, cairn_core::internal::storage::DbError>(row.text(0)?)
                 })
                 .transpose()
         })
@@ -219,8 +230,8 @@ async fn append_direct_message_queues_when_head_turn_is_running() {
     .unwrap();
 
     assert!(
-        result.starts_with("Queued for delivery to builder"),
-        "queue path should return a 'Queued for delivery' string, got: {result}"
+        result.starts_with("Sent direct message to builder"),
+        "direct message should be accepted as a push, got: {result}"
     );
 
     // No new turn created (no continue_job_impl on the active path).
@@ -233,13 +244,9 @@ async fn append_direct_message_queues_when_head_turn_is_running() {
     // Message persisted with delivered_at = NULL so the next prompt-boundary
     // injection path (hook additionalContext or dispatch augmentation) can
     // claim it.
-    let (_, delivered_at) = latest_direct_to(&orch.db.local, "run-1")
+    latest_direct_to(&orch.db.local, "run-1")
         .await
         .expect("queued message should be inserted");
-    assert_eq!(
-        delivered_at, None,
-        "queue path must leave delivered_at NULL until an injection path claims it"
-    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -258,15 +265,14 @@ async fn append_direct_message_queues_when_head_turn_is_pending() {
     .await
     .unwrap();
     assert!(
-        result.starts_with("Queued for delivery to builder"),
+        result.starts_with("Sent direct message to builder"),
         "{}",
         result
     );
 
-    let (_, delivered_at) = latest_direct_to(&orch.db.local, "run-1")
+    latest_direct_to(&orch.db.local, "run-1")
         .await
         .expect("queued message should be inserted");
-    assert_eq!(delivered_at, None);
 }
 
 /// Seed a top-level builder job and a `review` sub-task nested under it.
@@ -390,18 +396,14 @@ async fn append_direct_message_resolves_subtask_addressed_as_node_slash_task() {
     .expect("sub-task DM by canonical URI must resolve");
 
     assert!(
-        result.starts_with("Queued for delivery to builder/review"),
-        "sub-task DM should queue against the review job, got: {result}"
+        result.starts_with("Sent direct message to builder/review"),
+        "sub-task DM should target the review job, got: {result}"
     );
 
     // The message was persisted addressed to the review run, not the builder run.
-    let (_, delivered_at) = latest_direct_to(&orch.db.local, "run-review")
+    latest_direct_to(&orch.db.local, "run-review")
         .await
         .expect("sub-task DM should be inserted with recipient_run_id=run-review");
-    assert_eq!(
-        delivered_at, None,
-        "queue path leaves delivered_at NULL until an injection path claims it"
-    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -519,8 +521,8 @@ async fn sender_name_for_subtask_sender_is_canonical_task_uri() {
     .await
     .expect("sub-task should be able to DM its sibling builder");
     assert!(
-        result.starts_with("Queued for delivery to builder"),
-        "DM should queue (recipient turn is running), got: {result}"
+        result.starts_with("Sent direct message to builder"),
+        "DM to a running recipient should be accepted as a push, got: {result}"
     );
 
     let sender_name = latest_direct_sender(&orch.db.local, "run-builder")
@@ -595,58 +597,11 @@ async fn flush_pending_directs_on_idle_is_noop_without_pending() {
     );
 }
 
-/// Seed a recipient job with **no** `current_session_id` (and no session row),
-/// so `continue_job_impl` errors out ("Job has no current session to resume")
-/// before it ever tries to spawn an agent. Lets a test drive the flush's resume
-/// path to its failure branch without a live process.
-async fn insert_sessionless_recipient(db: &LocalDb, project_key: &str) {
-    let project_key = project_key.to_string();
-    db.write(|conn| {
-        let project_key = project_key.clone();
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('proj-1', 'default', 'Test Project', ?1, '/tmp/test-repo', 1, 1)",
-                params![project_key.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
-                 VALUES ('issue-1', 'proj-1', 42, 'test issue', 1, 1)",
-                (),
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
-                 VALUES ('exec-1', 'recipe-default', 'issue-1', 'proj-1', 'running', 1, 1)",
-                (),
-            )
-            .await?;
-            // No current_session_id -> continue_job_impl bails before spawn.
-            conn.execute(
-                "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
-                 VALUES ('job-1', 'exec-1', 'builder', 'issue-1', 'proj-1', 'builder', 'builder', 'running', 1, 1)",
-                (),
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
-                 VALUES ('run-1', 'proj-1', 'job-1', 'live', 1, 1)",
-                (),
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .unwrap();
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn node_messages_append_routes_like_bare_node() {
     // CAIRN-1329: appending to the canonical `.../NODE/messages` resource must
     // deliver identically to the bare-node append path. Recipient turn is running,
-    // so the message queues (delivered_at IS NULL) just like the bare-node path.
+    // so the message queues just like the bare-node path.
     let (_temp, orch) = common::test_orchestrator().await;
     insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
 
@@ -673,13 +628,9 @@ async fn node_messages_append_routes_like_bare_node() {
     );
 
     // The direct message was persisted against the builder run, pending.
-    let (_, delivered_at) = latest_direct_to(&orch.db.local, "run-1")
+    latest_direct_to(&orch.db.local, "run-1")
         .await
         .expect("append to /messages should insert a direct message");
-    assert_eq!(
-        delivered_at, None,
-        "queued direct from /messages must leave delivered_at NULL"
-    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -709,142 +660,7 @@ async fn node_messages_read_returns_directs() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn direct_message_resume_failure_keeps_suppressed_digest_and_mute_pending() {
-    let (_temp, orch) = common::test_orchestrator().await;
-    insert_sessionless_recipient(&orch.db.local, "PROJ").await;
-
-    let child_source = WakeSource::Issue {
-        reference: "cairn://p/PROJ/99".to_string(),
-    };
-    let muted = wakes::mute_scope(
-        &orch.db.local,
-        "job-1",
-        &WakeScope::new(child_source.clone(), None),
-        None,
-        "agent",
-    )
-    .await
-    .expect("mute should create the scoped wake subscription");
-
-    let action = wakes::route_wake(
-        &orch,
-        WakeEvent {
-            source: child_source,
-            fact_kind: "pr_state_change".to_string(),
-            detail_uri: Some("cairn://p/PROJ/99/1/pr".to_string()),
-            delivery: WakeDelivery::Targeted {
-                subscriber_job_id: "job-1".to_string(),
-                message: "child PR changed".to_string(),
-            },
-            urgency: DeliveryUrgency::Queue,
-        },
-    )
-    .await
-    .expect("muted child wake should route through the digest");
-    assert_eq!(action, WakeRouteAction::Suppressed);
-    assert_eq!(
-        wakes::peek_pending_suppressed_for_job(&orch.db.local, "job-1")
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
-
-    let request = callback_request("write", None);
-    let result = append_direct_message(
-        &orch,
-        &request,
-        "PROJ",
-        42,
-        1,
-        "builder",
-        None,
-        "live user re-engagement",
-        false,
-    )
-    .await
-    .expect("direct message should queue after resume failure");
-    assert!(
-        result.starts_with("Queued for delivery to builder"),
-        "resume failure should leave the direct queued, got: {result}"
-    );
-
-    let (_, delivered_at) = latest_direct_to(&orch.db.local, "run-1")
-        .await
-        .expect("direct message should still be persisted");
-    assert_eq!(
-        delivered_at, None,
-        "failed direct resume must not stamp the live message delivered"
-    );
-    assert_eq!(
-        wakes::peek_pending_suppressed_for_job(&orch.db.local, "job-1")
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "failed direct resume must not claim the rendered digest"
-    );
-    let subscription = wakes::list_subscriptions_for_job(&orch.db.local, "job-1")
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|candidate| candidate.id == muted.id)
-        .expect("muted subscription should still exist");
-    assert_eq!(
-        subscription.state,
-        WakeSubscriptionState::Muted,
-        "failed direct resume must not lift the muted child subscription"
-    );
-
-    let claimed = wakes::claim_pending_suppressed_for_job_with_live_source(
-        &orch.db.local,
-        "job-1",
-        Some(&WakeSource::User),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        claimed.len(),
-        1,
-        "a later successful live wake can still claim it"
-    );
-    let lifted = wakes::list_subscriptions_for_job(&orch.db.local, "job-1")
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|candidate| candidate.id == muted.id)
-        .unwrap();
-    assert_eq!(lifted.state, WakeSubscriptionState::Active);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn flush_pending_directs_on_idle_keeps_direct_pending_when_resume_fails() {
-    // CAIRN-1297: peek-then-resume-then-stamp. When continue_job_impl fails (here
-    // because the job has no session to resume), the flush must NOT stamp the
-    // direct delivered, so a later prompt boundary can still pick it up. This
-    // drives flush_pending_directs_on_idle through the real continue_job_impl
-    // call to its Err branch.
-    let (_temp, orch) = common::test_orchestrator().await;
-    insert_sessionless_recipient(&orch.db.local, "PROJ").await;
-    let id = insert_pending_direct(&orch, "run-1", "child is blocked on a question");
-
-    let before = turn_count(&orch.db.local, "job-1").await;
-    cairn_core::messages::delivery::flush_pending_directs_on_idle(&orch, "run-1");
-
-    // Resume failed -> no successor turn created.
-    assert_eq!(
-        turn_count(&orch.db.local, "job-1").await,
-        before,
-        "a failed resume must not create a successor turn"
-    );
-
-    // ...and the direct is NOT stamped -> still claimable at the next boundary.
-    let still_pending = msg_db::claim_pending_directs_for_run(&orch.db.local, "run-1").unwrap();
-    assert_eq!(
-        still_pending.len(),
-        1,
-        "a failed resume must leave the direct pending (not stamped)"
-    );
-    assert_eq!(still_pending[0].id, id);
-}
+// Tests for the retired direct-pull delivery (claim_pending_directs_for_run) and
+// the muted-wake digest claim (claim_pending_suppressed_for_job_with_live_source)
+// were removed with those paths: direct messages now ride the attention push
+// queue and mute downgrades pushes at creation (CAIRN-1900/1906).

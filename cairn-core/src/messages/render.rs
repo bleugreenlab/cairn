@@ -58,7 +58,6 @@ mod tests {
             recipient_run_id: Some("recipient-run".to_string()),
             content: content.to_string(),
             created_at: 1,
-            delivered_at: None,
             urgency: None,
         }
     }

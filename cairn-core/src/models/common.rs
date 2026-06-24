@@ -183,6 +183,7 @@ mod tests {
         let extras = RuntimeExtras::default();
         assert_eq!(extras.max_thinking_tokens, None);
         assert_eq!(extras.reasoning_effort, None);
+        assert_eq!(extras.service_tier, None);
     }
 
     #[test]
@@ -190,10 +191,12 @@ mod tests {
         let extras = RuntimeExtras {
             max_thinking_tokens: Some(32768),
             reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
         };
         let json = serde_json::to_string(&extras).unwrap();
         assert!(json.contains("maxThinkingTokens"));
         assert!(json.contains("reasoningEffort"));
+        assert!(json.contains("serviceTier"));
         let restored: RuntimeExtras = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, extras);
     }
@@ -203,6 +206,7 @@ mod tests {
         let extras = RuntimeExtras {
             max_thinking_tokens: Some(16384),
             reasoning_effort: None,
+            service_tier: None,
         };
         let json = serde_json::to_string(&extras).unwrap();
         assert!(json.contains("maxThinkingTokens"));
@@ -272,14 +276,18 @@ mod tests {
     fn preset_to_extras_maps_all_fields() {
         let preset = Preset {
             model: Model::new("sonnet"),
-            options: HashMap::from([(
-                "reasoningEffort".to_string(),
-                PresetOptionValue::Str("high".to_string()),
-            )]),
+            options: HashMap::from([
+                (
+                    "reasoningEffort".to_string(),
+                    PresetOptionValue::Str("high".to_string()),
+                ),
+                ("fastMode".to_string(), PresetOptionValue::Bool(true)),
+            ]),
         };
         let extras = preset.to_extras();
         assert_eq!(extras.max_thinking_tokens, None);
         assert_eq!(extras.reasoning_effort, Some("high".to_string()));
+        assert_eq!(extras.service_tier, Some("priority".to_string()));
     }
 
     #[test]
@@ -291,6 +299,7 @@ mod tests {
         let extras = preset.to_extras();
         assert_eq!(extras.max_thinking_tokens, None);
         assert_eq!(extras.reasoning_effort, None);
+        assert_eq!(extras.service_tier, None);
     }
 
     #[test]
@@ -357,6 +366,13 @@ impl PresetOptionValue {
             _ => None,
         }
     }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            PresetOptionValue::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -397,6 +413,18 @@ impl Preset {
                 .get("reasoningEffort")
                 .and_then(PresetOptionValue::as_str)
                 .map(str::to_string),
+            service_tier: self
+                .options
+                .get("serviceTier")
+                .and_then(PresetOptionValue::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    self.options
+                        .get("fastMode")
+                        .and_then(PresetOptionValue::as_bool)
+                        .filter(|enabled| *enabled)
+                        .map(|_| "priority".to_string())
+                }),
         }
     }
 }
@@ -417,6 +445,9 @@ pub struct RuntimeExtras {
     /// Reasoning effort ("low", "medium", "high", "xhigh", "max"; None = backend default)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Service tier request id. Codex fast mode uses "priority".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
 }
 
 /// Detail level for tool call display in chat transcripts

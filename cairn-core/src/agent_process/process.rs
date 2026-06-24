@@ -163,6 +163,24 @@ pub enum DedupOutcome {
 // RunHandle (replaces ActiveProcess)
 // ============================================================================
 
+/// Why an owned-loop backend's turn was suspended at a tool boundary.
+///
+/// OpenRouter owns its turn/tool loop in-process and has no warm process, so a
+/// foreground question or inline delegated-task append suspends the turn
+/// immediately rather than inline-waiting. The handler records the reason in the
+/// run's [`RunHandle::pending_suspend`] slot; the owned loop reads it back right
+/// after the tool dispatch returns and finalizes the run into a resumable
+/// waiting state. This is a structured side-channel keyed by `run_id`, the same
+/// per-run loop-control shape as the cancellation flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuspendKind {
+    /// A foreground question was asked; resume when the user answers.
+    Prompt,
+    /// An inline (non-background) delegated task was spawned; resume when the
+    /// child task(s) complete.
+    DelegatedTask,
+}
+
 /// A live process attachment with its stdin handle for bidirectional communication.
 pub struct RunHandle {
     /// The child process handle
@@ -200,6 +218,14 @@ pub struct RunHandle {
     /// Turn-scoped fingerprints of tool calls already made this turn, for
     /// flail dedup (CAIRN-1230). Self-resets on turn change.
     pub turn_seen_calls: Arc<Mutex<TurnSeenCalls>>,
+    /// Whether the backend driving this run owns its turn/tool loop in-process
+    /// (OpenRouter). Owned-loop runs suspend on a foreground question or inline
+    /// task instead of inline-waiting; warm-process backends (Claude/Codex)
+    /// leave this false and keep their existing blocking behavior.
+    pub owns_turn_loop: bool,
+    /// Structured suspend request for an owned-loop run, set by a blocking
+    /// handler and consumed by the owned loop after the tool dispatch returns.
+    pub pending_suspend: Arc<Mutex<Option<SuspendKind>>>,
 }
 
 /// Backwards-compatible alias.
@@ -229,6 +255,8 @@ impl RunHandle {
             consumed_seeded: Arc::new(AtomicBool::new(false)),
             last_recommend_pos: Arc::new(Mutex::new(None)),
             turn_seen_calls: Arc::new(Mutex::new(TurnSeenCalls::default())),
+            owns_turn_loop: false,
+            pending_suspend: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -514,6 +542,22 @@ impl AgentProcessState {
         false
     }
 
+    /// Whether the terminal-tool boundary flag is armed for a run. Owned-loop
+    /// backends (OpenRouter) read this after a tool boundary to end the turn once
+    /// the agent has written its output artifact, mirroring the boundary
+    /// interrupt the warm-process backends send at the same point.
+    pub fn terminal_tool_armed(&self, run_id: &str) -> bool {
+        self.processes
+            .lock()
+            .ok()
+            .and_then(|processes| {
+                processes
+                    .get(run_id)
+                    .map(|process| process.terminal_tool_called.load(Ordering::Acquire))
+            })
+            .unwrap_or(false)
+    }
+
     /// Whether the run currently has a live process attachment waiting on the host.
     pub fn is_awaiting_host(&self, run_id: &str, turn_id: Option<&str>) -> bool {
         let Ok(processes) = self.processes.lock() else {
@@ -750,6 +794,37 @@ impl AgentProcessState {
         }
     }
 
+    /// Whether the backend driving `run_id` owns its turn/tool loop in-process
+    /// (OpenRouter). Returns false for warm-process backends and unknown runs.
+    pub fn run_owns_turn_loop(&self, run_id: &str) -> bool {
+        self.processes
+            .lock()
+            .ok()
+            .and_then(|processes| processes.get(run_id).map(|process| process.owns_turn_loop))
+            .unwrap_or(false)
+    }
+
+    /// Record a structured suspend request for an owned-loop run. Runs
+    /// synchronously on the owned loop's tool-dispatch thread, so the loop reads
+    /// it back immediately via [`take_suspend`](Self::take_suspend) with no race.
+    pub fn request_suspend(&self, run_id: &str, kind: SuspendKind) {
+        if let Ok(processes) = self.processes.lock() {
+            if let Some(process) = processes.get(run_id) {
+                if let Ok(mut slot) = process.pending_suspend.lock() {
+                    *slot = Some(kind);
+                }
+            }
+        }
+    }
+
+    /// Consume any pending suspend request for an owned-loop run.
+    pub fn take_suspend(&self, run_id: &str) -> Option<SuspendKind> {
+        let processes = self.processes.lock().ok()?;
+        let process = processes.get(run_id)?;
+        let mut slot = process.pending_suspend.lock().ok()?;
+        slot.take()
+    }
+
     /// Find any process (active or warm) by session_id.
     pub fn find_process_by_session(&self, session_id: &str) -> Option<String> {
         let processes = self.processes.lock().ok()?;
@@ -888,6 +963,76 @@ mod tests {
         let state = AgentProcessState::default();
         let processes = state.processes.lock().unwrap();
         assert!(processes.is_empty());
+    }
+
+    #[test]
+    fn run_owns_turn_loop_defaults_false_and_reflects_flag() {
+        let state = AgentProcessState::default();
+        {
+            let mut processes = state.processes.lock().unwrap();
+            processes.register(
+                "run-plain".to_string(),
+                RunHandle::test_handle(Some("s-plain"), Some("j")),
+            );
+            let mut owned = RunHandle::test_handle(Some("s-owned"), Some("j"));
+            owned.owns_turn_loop = true;
+            processes.register("run-owned".to_string(), owned);
+        }
+        // Warm-process backends leave the flag false; OpenRouter sets it true.
+        assert!(!state.run_owns_turn_loop("run-plain"));
+        assert!(state.run_owns_turn_loop("run-owned"));
+        // An unknown run is never owned-loop.
+        assert!(!state.run_owns_turn_loop("missing"));
+    }
+
+    #[test]
+    fn suspend_slot_round_trips_and_is_one_shot() {
+        let state = AgentProcessState::default();
+        {
+            let mut processes = state.processes.lock().unwrap();
+            processes.register(
+                "run-1".to_string(),
+                RunHandle::test_handle(Some("s"), Some("j")),
+            );
+        }
+        // Nothing requested yet.
+        assert_eq!(state.take_suspend("run-1"), None);
+        // request_suspend then take_suspend round-trips the kind, and take is
+        // one-shot: a second take sees nothing.
+        state.request_suspend("run-1", SuspendKind::Prompt);
+        assert_eq!(state.take_suspend("run-1"), Some(SuspendKind::Prompt));
+        assert_eq!(state.take_suspend("run-1"), None);
+        // The delegated-task kind round-trips too.
+        state.request_suspend("run-1", SuspendKind::DelegatedTask);
+        assert_eq!(
+            state.take_suspend("run-1"),
+            Some(SuspendKind::DelegatedTask)
+        );
+    }
+
+    #[test]
+    fn suspend_request_for_unknown_run_is_noop() {
+        let state = AgentProcessState::default();
+        state.request_suspend("ghost", SuspendKind::Prompt);
+        assert_eq!(state.take_suspend("ghost"), None);
+    }
+
+    #[test]
+    fn terminal_tool_armed_reflects_arm_state() {
+        let state = AgentProcessState::default();
+        {
+            let mut processes = state.processes.lock().unwrap();
+            processes.register(
+                "run-1".to_string(),
+                RunHandle::test_handle(Some("s"), Some("j")),
+            );
+        }
+        // Unarmed by default; unknown runs read false.
+        assert!(!state.terminal_tool_armed("run-1"));
+        assert!(!state.terminal_tool_armed("missing"));
+        // After arming (an output-artifact write), the owned loop sees it.
+        assert!(state.arm_terminal_tool("run-1"));
+        assert!(state.terminal_tool_armed("run-1"));
     }
 
     #[test]

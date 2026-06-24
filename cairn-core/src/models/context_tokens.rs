@@ -43,7 +43,12 @@ impl ContextTokenEventSnapshot {
     pub(crate) fn into_state(self, context_window: Option<i64>) -> ContextTokenState {
         let input_tokens = self.input_tokens.unwrap_or(0);
         let output_tokens = self.output_tokens.unwrap_or(0);
-        let used_tokens = if self.backend.eq_ignore_ascii_case("codex") {
+        // Codex and OpenRouter report OpenAI-style usage where prompt/input already
+        // includes cached input, so occupancy is input + output. Claude reports
+        // cache tokens separately from input, so they add in.
+        let used_tokens = if self.backend.eq_ignore_ascii_case("codex")
+            || self.backend.eq_ignore_ascii_case("openrouter")
+        {
             input_tokens + output_tokens
         } else {
             input_tokens
@@ -140,4 +145,46 @@ fn extract_model_from_event_data(data: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(backend: &str) -> ContextTokenEventSnapshot {
+        ContextTokenEventSnapshot {
+            run_id: "run".to_string(),
+            session_id: "session".to_string(),
+            backend: backend.to_string(),
+            model: Some("model".to_string()),
+            input_tokens: Some(1000),
+            cache_read_tokens: Some(400),
+            cache_create_tokens: Some(50),
+            output_tokens: Some(200),
+            thinking_tokens: Some(20),
+            captured_at: 1,
+        }
+    }
+
+    #[test]
+    fn openrouter_occupancy_excludes_cache_to_avoid_double_count() {
+        // OpenAI-style: prompt_tokens (input) already includes cached input, so
+        // occupancy is input + output, not input + cache_read + output.
+        let state = snapshot("openrouter").into_state(Some(200_000));
+        assert_eq!(state.used_tokens, 1_200);
+        assert_eq!(state.context_window, Some(200_000));
+    }
+
+    #[test]
+    fn codex_occupancy_is_input_plus_output() {
+        let state = snapshot("codex").into_state(Some(258_400));
+        assert_eq!(state.used_tokens, 1_200);
+    }
+
+    #[test]
+    fn claude_occupancy_sums_separately_reported_cache() {
+        // Anthropic reports cache tokens separately from input, so they add in.
+        let state = snapshot("claude").into_state(Some(200_000));
+        assert_eq!(state.used_tokens, 1_000 + 50 + 400 + 200);
+    }
 }

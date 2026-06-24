@@ -269,6 +269,34 @@ pub(super) async fn count_existing_branched_jobs(
 /// `base_commit`. Failures (missing git, unborn/detached HEAD) leave it NULL
 /// rather than guessing a value.
 pub(super) fn worktree_head_commit(orch: &Orchestrator, worktree_path: &Path) -> Option<String> {
+    // A jj workspace is `.jj`-only — no git HEAD to read — so resolve the base
+    // jj-side from `@-` (the latest sealed commit, which is the base at job
+    // creation). Same `None`-on-failure contract as the git path.
+    if crate::jj::is_jj_dir(worktree_path) {
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        return match crate::jj::head_commit(&jj, worktree_path) {
+            Ok(sha) => {
+                let sha = sha.trim().to_string();
+                if sha.is_empty() {
+                    log::warn!(
+                        "Empty jj head commit for workspace {}; leaving base_commit NULL",
+                        worktree_path.display()
+                    );
+                    None
+                } else {
+                    Some(sha)
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "Failed to resolve jj head commit for workspace {}: {}; leaving base_commit NULL",
+                    worktree_path.display(),
+                    error
+                );
+                None
+            }
+        };
+    }
     match orch
         .services
         .git
@@ -434,7 +462,7 @@ pub(super) async fn take_needs_fresh_session(
             let mut rows = conn
                 .query(
                     "SELECT needs_fresh_session FROM jobs WHERE id = ?1",
-                    turso::params![job_id.as_str()],
+                    (job_id.as_str(),),
                 )
                 .await?;
             let needs = rows
@@ -447,7 +475,7 @@ pub(super) async fn take_needs_fresh_session(
             if needs {
                 conn.execute(
                     "UPDATE jobs SET needs_fresh_session = 0 WHERE id = ?1",
-                    turso::params![job_id.as_str()],
+                    (job_id.as_str(),),
                 )
                 .await?;
             }

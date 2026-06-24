@@ -43,10 +43,11 @@ pub use process::{
     SpawnConfig,
 };
 pub use pty::{
-    ensure_submitted_line, get_default_shell, read_pty_loop, submit_command_exiting_shell,
-    update_output_buffer, CommandState, InlineTerminalChild, PortableTerminalChild, PtyComponents,
-    PtyFactory, PtyPair, PtyResult, PtySession, PtyState, RealPtyFactory, TerminalChild,
-    MAX_BUFFER_SIZE,
+    ensure_submitted_line, get_default_shell, read_pty_loop, scan_for_phrase,
+    submit_command_exiting_shell, update_output_buffer, CommandState, InlineTerminalChild,
+    PhraseScan, PortableTerminalChild, PtyComponents, PtyFactory, PtyPair, PtyResult, PtySession,
+    PtyState, RealPtyFactory, TerminalChild, TerminalOutputWatcher, MAX_BUFFER_SIZE,
+    PHRASE_EXCERPT_MAX,
 };
 pub use pty_osc::{Osc133Event, Osc133Parser};
 pub use sandbox::SandboxPolicy;

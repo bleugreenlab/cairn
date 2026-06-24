@@ -21,6 +21,7 @@
 pub mod claude;
 pub mod codex;
 pub mod context_window;
+pub mod openrouter;
 mod run_state;
 pub mod stdin;
 
@@ -126,6 +127,29 @@ pub struct DiscoveredModel {
     pub supported_reasoning_efforts: Vec<DiscoveredReasoningEffort>,
     #[serde(default)]
     pub context_window: Option<i64>,
+    #[serde(default)]
+    pub canonical_slug: Option<String>,
+    #[serde(default)]
+    pub pricing: Option<DiscoveredModelPricing>,
+    #[serde(default)]
+    pub supported_parameters: Vec<String>,
+    #[serde(default)]
+    pub router: bool,
+    #[serde(default)]
+    pub architecture_modality: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredModelPricing {
+    pub prompt: Option<String>,
+    pub completion: Option<String>,
+    pub request: Option<String>,
+    pub image: Option<String>,
+    pub web_search: Option<String>,
+    pub internal_reasoning: Option<String>,
+    pub input_cache_read: Option<String>,
+    pub input_cache_write: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -152,6 +176,7 @@ pub struct OptionChoice {
 #[serde(rename_all = "camelCase")]
 pub enum ProviderOptionKey {
     ReasoningEffort,
+    FastMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -217,6 +242,8 @@ pub struct SessionConfig {
     pub max_thinking_tokens: Option<i32>,
     /// Codex: reasoning effort level ("low", "medium", "high", "xhigh")
     pub reasoning_effort: Option<String>,
+    /// Service tier request id, if the backend supports one.
+    pub service_tier: Option<String>,
     /// Canonical agent permissions (replaces opaque permission_mode string).
     pub permissions: AgentPermissions,
     /// Enable stdin streaming (bidirectional mode)
@@ -291,6 +318,7 @@ pub trait AgentBackend: Send + Sync {
 pub fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
     match name {
         Some("codex") => Box::new(codex::CodexBackend),
+        Some("openrouter") => Box::new(openrouter::OpenRouterBackend),
         _ => Box::new(claude::ClaudeBackend),
     }
 }
@@ -307,6 +335,9 @@ const CODEX_MODEL_PREFIXES: &[&str] = &["codex-mini", "gpt-5"];
 /// for legacy data (snapshots, concrete model strings not yet migrated to tiers).
 pub fn backend_for_model(model: &str) -> Option<&'static str> {
     let lower = model.to_lowercase();
+    if lower == "openrouter/auto" || lower.starts_with('~') || lower.contains('/') {
+        return Some("openrouter");
+    }
     for prefix in CODEX_MODEL_PREFIXES {
         if lower.starts_with(prefix) {
             return Some("codex");
@@ -334,6 +365,7 @@ pub(crate) mod tests {
             home_uri: "cairn://p/TEST/1/1/node".into(),
             max_thinking_tokens: None,
             reasoning_effort: None,
+            service_tier: None,
             permissions: AgentPermissions::new(Fence::default()),
             bidirectional: false,
             identity: None,

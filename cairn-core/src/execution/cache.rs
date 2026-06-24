@@ -22,28 +22,25 @@ pub(crate) fn normalize_command(cmd: &str) -> String {
     cmd.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(crate) fn get_current_head_sha(worktree_path: &str) -> Result<String, String> {
-    let output = crate::env::git()
-        .args(["rev-parse", "HEAD"])
-        .current_dir(worktree_path)
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {}", e))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err("Failed to get HEAD".to_string())
-    }
+/// Head commit of an agent worktree — the jj analogue of `git rev-parse HEAD`.
+/// An agent worktree is a `.jj` workspace with no `.git`, so this reads jj's
+/// `@-` (the base of the empty working-copy commit): the last sealed commit, or
+/// the worktree's base when nothing has been sealed yet.
+pub(crate) fn get_current_head_sha(
+    orch: &Orchestrator,
+    worktree_path: &str,
+) -> Result<String, String> {
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    crate::jj::head_commit(&jj, std::path::Path::new(worktree_path))
 }
 
-pub(crate) fn is_worktree_dirty(worktree_path: &str) -> Result<bool, String> {
-    let output = crate::env::git()
-        .args(["status", "--porcelain"])
-        .current_dir(worktree_path)
-        .output()
-        .map_err(|e| format!("git status failed: {}", e))?;
-
-    Ok(!output.stdout.is_empty())
+/// Whether an agent worktree has un-sealed changes. The in-progress change lives
+/// in jj's `@`, so this is the jj-aware dirty check (not `git status`, which
+/// fails in a `.jj`-only workspace and would force the checkpoint cache to treat
+/// every worktree as perpetually dirty).
+pub(crate) fn is_worktree_dirty(orch: &Orchestrator, worktree_path: &str) -> Result<bool, String> {
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    crate::jj::is_working_copy_dirty(&jj, std::path::Path::new(worktree_path))
 }
 
 /// Get the checkpoint cache result for a job.
@@ -54,7 +51,10 @@ pub fn get_checkpoint_cache_result_impl(
 ) -> Result<Option<CheckpointCacheResult>, String> {
     let db = orch.db.local.clone();
     let job_id = job_id.to_string();
-    run_checkpoint_cache_db(async move {
+    // Read the cache row first, then validate it against live worktree state
+    // outside the DB closure — the jj-aware head/dirty checks need `orch`, which
+    // can't be captured into the 'static DB future.
+    let row = run_checkpoint_cache_db(async move {
         db.read(|conn| {
             let job_id = job_id.clone();
             Box::pin(async move {
@@ -77,33 +77,39 @@ pub fn get_checkpoint_cache_result_impl(
                     return Ok(None);
                 };
 
-                let command = row.text(0)?;
-                let exit_code = row.i64(1)? as i32;
-                let commit_sha = row.text(2)?;
-                let is_dirty = row.i64(3)?;
-                let ran_at = row.i64(4)? as i32;
-                let worktree_path = row.opt_text(5)?;
-
-                let is_valid = if let Some(worktree) = &worktree_path {
-                    let current_sha = get_current_head_sha(worktree).unwrap_or_default();
-                    let currently_dirty = is_worktree_dirty(worktree).unwrap_or(true);
-                    commit_sha == current_sha && is_dirty == 0 && !currently_dirty
-                } else {
-                    false
-                };
-
-                Ok(Some(CheckpointCacheResult {
-                    command,
-                    exit_code,
-                    commit_sha: commit_sha[..7.min(commit_sha.len())].to_string(),
-                    is_valid,
-                    ran_at,
-                }))
+                Ok(Some((
+                    row.text(0)?,
+                    row.i64(1)? as i32,
+                    row.text(2)?,
+                    row.i64(3)?,
+                    row.i64(4)? as i32,
+                    row.opt_text(5)?,
+                )))
             })
         })
         .await
         .map_err(|e| e.to_string())
-    })
+    })?;
+
+    let Some((command, exit_code, commit_sha, is_dirty, ran_at, worktree_path)) = row else {
+        return Ok(None);
+    };
+
+    let is_valid = if let Some(worktree) = &worktree_path {
+        let current_sha = get_current_head_sha(orch, worktree).unwrap_or_default();
+        let currently_dirty = is_worktree_dirty(orch, worktree).unwrap_or(true);
+        commit_sha == current_sha && is_dirty == 0 && !currently_dirty
+    } else {
+        false
+    };
+
+    Ok(Some(CheckpointCacheResult {
+        command,
+        exit_code,
+        commit_sha: commit_sha[..7.min(commit_sha.len())].to_string(),
+        is_valid,
+        ran_at,
+    }))
 }
 
 fn run_checkpoint_cache_db<T>(

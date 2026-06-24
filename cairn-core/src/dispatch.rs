@@ -16,15 +16,13 @@ pub struct DispatchOutput {
 
 /// Dispatch a tool call to the appropriate cairn-core handler.
 ///
-/// On the way out, queued direct messages (CAIRN-1196) and the dirty-worktree
-/// notice are collected into [`DispatchOutput::reminders`] for the calling run.
-/// This is the Codex-side delivery path for queued DMs (Codex has no Claude-CLI
-/// hook surface) and a redundant belt-and-suspenders path for Claude.
-/// Per-message atomicity is guaranteed by
-/// [`crate::messages::db::claim_pending_directs_for_run`]'s single-txn
-/// SELECT-then-UPDATE: the Claude hook and this augmentation cannot both stamp
-/// the same message. Reminder order is preserved: queued DMs first, then the
-/// dirty-worktree notice.
+/// On the way out, queued user follow-ups, child side-channel notices, and this
+/// busy agent's rousing attention pushes (direct messages now ride the push
+/// queue — CAIRN-1900) plus the dirty-worktree notice are collected into
+/// [`DispatchOutput::reminders`] for the calling run. This is the Codex-side
+/// delivery path (Codex has no Claude-CLI hook surface) and a redundant
+/// belt-and-suspenders path for Claude. Push delivery is stamped atomically with
+/// its carrying event, so neither boundary double-delivers.
 pub async fn dispatch_tool(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
@@ -120,13 +118,19 @@ async fn execute_tool(
             crate::mcp::handlers::read::handle_read_batch(orch, request, read_cursors).await
         }
 
+        // Host process introspection: the answering server's own OS process id.
+        // `cairn://dev/pid` relays this to a dev instance over its callback
+        // channel to learn the instance's pid authoritatively (no `lsof`).
+        "process_info" => std::process::id().to_string(),
+
         // Bash tools
         "run" => crate::mcp::handlers::bash::handle_run(orch, request).await,
 
         // Externally-driven attention long-poll (no polling)
         "watch" => crate::mcp::handlers::watch::handle_watch(orch, request).await,
 
-        // Web + local-PDF reads (routed from `read` to the bmd CLI)
+        // Web + local-PDF reads (routed from `read` to the active web-fetch
+        // provider and PDF service)
         "read_web" => crate::mcp::handlers::web::handle_read_web(orch, request).await,
 
         // Resource tools
@@ -229,7 +233,12 @@ async fn augment_with_dirty_worktree_notice(
         return;
     }
 
-    if let Ok(true) = crate::mcp::handlers::is_worktree_dirty(&request.cwd) {
+    // Route the dirty check through the VCS seam so it is jj-aware: a `.jj`-only
+    // workspace has no `.git`, so a raw `git status` would error and fail open,
+    // never warning the agent about un-sealed `@` dirt.
+    let cwd = std::path::Path::new(&request.cwd);
+    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, cwd);
+    if let Ok(true) = vcs.is_dirty(cwd) {
         reminders.push(
             "The worktree has uncommitted changes. The tree must be clean between tool calls — commit them with a run/write commit_msg, or discard them. Uncommitted edits are lost if the worktree is cleaned up.".to_string(),
         );
@@ -328,23 +337,6 @@ async fn augment_with_queued_dms(
         return;
     };
 
-    let directs = match crate::messages::db::claim_pending_directs_for_run_async(
-        &orch.db.local,
-        run_id,
-    )
-    .await
-    {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            log::warn!(
-                "Failed to claim pending direct messages for {}: {}",
-                run_id,
-                e
-            );
-            Vec::new()
-        }
-    };
-
     let job_id = crate::messages::side_channel::job_id_for_run(&orch.db.local, run_id).await;
 
     let side_channel_notices = match job_id.as_deref() {
@@ -391,7 +383,30 @@ async fn augment_with_queued_dms(
         None => Vec::new(),
     };
 
-    if directs.is_empty() && side_channel_notices.is_empty() && queued_steer.is_empty() {
+    // CAIRN-1881: drain this busy agent's rousing pushes at the event boundary —
+    // the one new delivery site for `wake`/`interrupt` pushes that must land at
+    // the next tool-call return rather than wait for turn end. The running job is
+    // the recipient. Lazy-resolved so a push whose referent already resolved is
+    // skipped; `passive` pushes are excluded here (they ride along on resume).
+    let pushes = match job_id.as_deref() {
+        Some(job_id) => crate::orchestrator::attention_push::pending_waking_live(
+            &orch.db.local,
+            job_id,
+            crate::orchestrator::attention_push::Boundary::Event,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!(
+                "Failed to drain attention pushes for job {}: {}",
+                &job_id[..job_id.len().min(8)],
+                e
+            );
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
+    if side_channel_notices.is_empty() && queued_steer.is_empty() && pushes.is_empty() {
         return;
     }
 
@@ -400,15 +415,6 @@ async fn augment_with_queued_dms(
     // up in the transcript view whichever boundary delivered the message.
     let session_id =
         crate::messages::transcript::run_session_for_event(&orch.db.local, run_id).await;
-    if !directs.is_empty() {
-        crate::messages::transcript::insert_message_events(
-            orch,
-            run_id,
-            session_id.as_deref(),
-            &directs,
-        )
-        .await;
-    }
     if !side_channel_notices.is_empty() {
         crate::messages::transcript::insert_side_channel_events(
             orch,
@@ -441,11 +447,38 @@ async fn augment_with_queued_dms(
             msg.content
         ));
     }
-    for msg in &directs {
-        reminders.push(crate::messages::render::render_direct_message(msg));
-    }
     for notice in &side_channel_notices {
         reminders.push(notice.render());
+    }
+
+    // CAIRN-1881: persist a single carrying event for the drained pushes and
+    // stamp each delivered by it (atomic with the event INSERT), then render each
+    // into the reminders the CLI wraps in a `<system-reminder>` block.
+    // CAIRN-1891: the agent-facing reminder carries the push's referent content
+    // resolved inline (the PR summary/diff, plan, question, or permission) so it
+    // acts without a round-trip read; the persisted carrying event keeps the lean
+    // URI summary.
+    if !pushes.is_empty() {
+        // Resolve each push once: the same rendered content feeds both the
+        // persisted carrying event (for the detail modal) and the agent reminder.
+        let mut resolved_parts = Vec::with_capacity(pushes.len());
+        for push in &pushes {
+            resolved_parts.push(
+                crate::orchestrator::attention_delivery::render_push_resolved(orch, push).await,
+            );
+        }
+        let resolved = resolved_parts.join("\n\n");
+        crate::messages::transcript::insert_attention_push_events(
+            orch,
+            run_id,
+            session_id.as_deref(),
+            &pushes,
+            &resolved,
+        )
+        .await;
+        for part in resolved_parts {
+            reminders.push(part);
+        }
     }
 }
 

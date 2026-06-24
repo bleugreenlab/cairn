@@ -21,9 +21,8 @@ pub struct ClaudeArgsConfig {
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
     pub system_prompt_file: Option<PathBuf>, // Path to file replacing Claude's default system prompt via --system-prompt-file
-    pub append_system_prompt_file: Option<PathBuf>, // Path to file with system prompt content via --append-system-prompt-file
-    pub settings_path: Option<PathBuf>, // Path to additional settings JSON via --settings
-    pub bidirectional: bool,            // Enable stdin streaming with --input-format stream-json
+    pub settings_path: Option<PathBuf>,      // Path to additional settings JSON via --settings
+    pub bidirectional: bool, // Enable stdin streaming with --input-format stream-json
 }
 
 /// Build Claude CLI arguments from configuration.
@@ -39,6 +38,20 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
         // .mcp.json mcpServers, giving spawned agents native MCP servers. External
         // MCP must flow through the cairn gateway, so suppress those native paths.
         "--strict-mcp-config".to_string(),
+        // Restrict Claude Code's settings + memory auto-discovery to the user
+        // level: do NOT auto-load project/local settings.json or, crucially,
+        // project/local CLAUDE.md memory. That native memory is injected as
+        // context OUTSIDE the system prompt, so it would not appear in the
+        // persisted `system:prompt` segments and would double-feed the project
+        // instructions Cairn now assembles itself (the `project` segment). Cairn
+        // owns that layer and supplies hooks via --settings and MCP via
+        // --mcp-config, so project/local sources are pure redundancy. Verified
+        // against the Claude CLI: `--setting-sources user` suppresses a
+        // project-local CLAUDE.md while leaving --mcp-config attachment and
+        // user-level auth/settings intact (unlike --bare/--safe-mode, which also
+        // disable hooks, MCP, and keychain/OAuth that Cairn depends on).
+        "--setting-sources".to_string(),
+        "user".to_string(),
     ];
 
     // Enable bidirectional stdin streaming
@@ -65,16 +78,9 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
         args.push(model_str);
     }
 
-    // Replace Claude's default system prompt entirely (must precede the
-    // --append-system-prompt-file, though order doesn't actually matter to the CLI).
+    // Replace Claude's default system prompt entirely with the assembled stack.
     if let Some(ref file_path) = config.system_prompt_file {
         args.push("--system-prompt-file".to_string());
-        args.push(file_path.to_string_lossy().to_string());
-    }
-
-    // Add system prompt file if specified (agent instructions go here)
-    if let Some(ref file_path) = config.append_system_prompt_file {
-        args.push("--append-system-prompt-file".to_string());
         args.push(file_path.to_string_lossy().to_string());
     }
 
@@ -157,7 +163,6 @@ mod tests {
             allowed_tools: vec!["Read".to_string()],
             disallowed_tools: vec![],
             system_prompt_file: None,
-            append_system_prompt_file: None,
             settings_path: None,
             bidirectional: false,
         }
@@ -170,6 +175,19 @@ mod tests {
         assert!(args.contains(&"stream-json".to_string()));
         assert!(args.contains(&"--print".to_string()));
         assert!(args.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn test_setting_sources_restricted_to_user() {
+        // Project/local CLAUDE.md memory must not be natively auto-loaded: Cairn
+        // assembles the project segment itself, and native memory would be
+        // injected outside the persisted system-prompt segments.
+        let args = build_claude_args(&base_config());
+        let idx = args
+            .iter()
+            .position(|x| x == "--setting-sources")
+            .expect("--setting-sources flag missing");
+        assert_eq!(args[idx + 1], "user");
     }
 
     #[test]

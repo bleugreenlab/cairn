@@ -62,7 +62,7 @@ pub(crate) async fn project_path_by_key(
         .local
         .query_text(
             "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
-            turso::params![lookup_key.as_str()],
+            (lookup_key,),
         )
         .await
         .map_err(|e| format!("Failed to load project: {e}"))?
@@ -220,9 +220,7 @@ pub(crate) async fn read_skills_collection(
         if let Ok(disabled) =
             crate::config_disables::list_disabled_keys(&orch.db.local, pid, "skill").await
         {
-            by_id.retain(|_, skill| {
-                skill.is_project_scoped || !disabled.contains(&skill.id)
-            });
+            by_id.retain(|_, skill| skill.is_project_scoped || !disabled.contains(&skill.id));
         }
     }
 

@@ -11,12 +11,12 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::config::get_recipe_from_files;
 use crate::config::presets::{
     available_selections, load_effective_presets, resolve_agent_snapshot,
     resolve_selection_with_provenance, LaunchSelectionOverride, PresetsConfig, ResolutionSource,
 };
 use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
-use crate::config::get_recipe_from_files;
 use crate::execution::Initiator;
 use crate::models::{
     Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, Model, ModelSelection, RecipeNode,
@@ -793,7 +793,7 @@ async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<Stri
     let project_id = project_id.to_string();
     db.query_text(
         "SELECT repo_path FROM projects WHERE id = ?1",
-        turso::params![project_id.as_str()],
+        (project_id,),
     )
     .await
     .map_err(|e| e.to_string())

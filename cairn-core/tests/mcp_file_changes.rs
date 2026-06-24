@@ -1,8 +1,11 @@
 mod common;
 
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use cairn_core::internal::db::DbState;
+use cairn_core::internal::jj::{self, JjEnv};
 use cairn_core::internal::mcp::handlers::files::handle_change;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
@@ -11,6 +14,46 @@ use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use cairn_core::memories::db as memory_db;
 use serde_json::json;
 use turso::params;
+
+// The change/write path seals and discards through the jj VCS seam, so a
+// file-target test cwd must be a real `.jj` workspace over a shared store. These
+// tests resolve `jj` and self-skip with a note when it is unavailable, mirroring
+// `mcp::vcs`'s jj tests. Resource-only tests never touch the VCS and keep a
+// plain cwd.
+
+/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
+fn jj_bin() -> Option<String> {
+    let bin = std::env::var("CAIRN_JJ_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "jj".to_string());
+    Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        .then_some(bin)
+}
+
+fn head_sha(repo: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Provision a `.jj` workspace at `ws` over a shared store backed by
+/// `project_repo`, using `config_dir` (the orchestrator's config dir) so the
+/// change handler's `JjEnv` resolves the same store.
+fn provision_jj_workspace(config_dir: &Path, project_repo: &Path, ws: &Path, branch: &str) {
+    let jj = JjEnv::resolve("jj", config_dir);
+    let store = jj::project_store_dir(config_dir, project_repo);
+    jj::ensure_project_store(&jj, &store, project_repo).unwrap();
+    let base = head_sha(project_repo);
+    jj::add_workspace(&jj, &store, ws, branch, &base, None).unwrap();
+}
 
 fn make_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
@@ -60,25 +103,45 @@ async fn change_report(
 
 struct ChangeTestRepo {
     dir: tempfile::TempDir,
+    _project: tempfile::TempDir,
+    config: tempfile::TempDir,
     orch: Orchestrator,
 }
 
 impl ChangeTestRepo {
-    async fn new() -> Self {
+    /// Provision a jj-workspace-backed change test, or `None` to self-skip when
+    /// jj is unavailable. The cwd (`dir`) is a real `.jj` workspace over a shared
+    /// store backed by a throwaway project git repo.
+    async fn try_new() -> Option<Self> {
+        jj_bin()?;
         let dir = tempfile::tempdir().unwrap();
-        init_git_repo(dir.path());
-        Self {
+        let project = tempfile::tempdir().unwrap();
+        init_git_repo(project.path());
+        let config = tempfile::tempdir().unwrap();
+        let orch = orchestrator_with_config(config.path()).await;
+        provision_jj_workspace(
+            config.path(),
+            project.path(),
+            dir.path(),
+            "agent/CHG-1-builder-0",
+        );
+        Some(Self {
             dir,
-            orch: test_file_change_orchestrator().await,
-        }
+            _project: project,
+            config,
+            orch,
+        })
+    }
+
+    /// Seal the current working copy into a base commit, so a later delete or
+    /// edit operates against committed content rather than un-sealed `@` dirt.
+    fn seal_base(&self, msg: &str) {
+        let jj = JjEnv::resolve("jj", self.config.path());
+        jj::seal(&jj, self.dir.path(), msg, None).unwrap();
     }
 
     fn cwd(&self) -> &str {
         self.dir.path().to_str().unwrap()
-    }
-
-    fn root(&self) -> &std::path::Path {
-        self.dir.path()
     }
 
     fn path(&self, path: &str) -> std::path::PathBuf {
@@ -127,12 +190,16 @@ fn bad_good_patch_payload(commit_msg: &str, atomic: bool) -> serde_json::Value {
 
 async fn test_file_change_orchestrator() -> Orchestrator {
     let temp = tempfile::tempdir().unwrap();
+    orchestrator_with_config(&temp.keep()).await
+}
+
+async fn orchestrator_with_config(config_dir: &Path) -> Orchestrator {
     let (_db_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+    let search_index = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db, search_index));
     let services = Arc::new(TestServicesBuilder::new().build());
-    Orchestrator::builder(db_state, services, temp.path().join("config")).build()
+    Orchestrator::builder(db_state, services, config_dir.to_path_buf()).build()
 }
 
 async fn insert_issue(db: &LocalDb, project_id: &str, number: i64, title: &str) -> String {
@@ -223,44 +290,12 @@ fn init_git_repo(path: &std::path::Path) {
     }
 }
 
-fn git(path: &std::path::Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new("git")
-        .args(args)
-        .current_dir(path)
-        .output()
-        .unwrap()
-}
-
-fn porcelain(path: &std::path::Path) -> String {
-    let output = git(path, &["status", "--porcelain"]);
-    assert!(output.status.success(), "git status failed: {output:?}");
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// Drive `root` into a conflicted mid-merge state so `MERGE_HEAD` is present and
-/// `is_repo_mid_transition` reports true.
-fn start_merge_conflict(root: &std::path::Path) {
-    std::fs::write(root.join("conflict.txt"), "base\n").unwrap();
-    assert!(git(root, &["add", "-A"]).status.success());
-    assert!(git(root, &["commit", "-m", "base"]).status.success());
-    let base = String::from_utf8_lossy(&git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
-        .trim()
-        .to_string();
-    assert!(git(root, &["checkout", "-b", "feature"]).status.success());
-    std::fs::write(root.join("conflict.txt"), "feature\n").unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-m", "feature"]);
-    assert!(git(root, &["checkout", &base]).status.success());
-    std::fs::write(root.join("conflict.txt"), "mainline\n").unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-m", "mainline"]);
-    let merge = git(root, &["merge", "feature"]);
-    assert!(!merge.status.success(), "merge should conflict: {merge:?}");
-}
-
 #[tokio::test]
 async fn change_patches_file_with_codex_patch_envelope() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("lib.rs", "let x = 1;\n");
 
     let report = repo
@@ -289,7 +324,10 @@ async fn change_patches_file_with_codex_patch_envelope() {
 
 #[tokio::test]
 async fn change_unified_patch_adds_file_with_codex_envelope() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
     let report = repo
         .change_report(
@@ -314,7 +352,10 @@ async fn change_unified_patch_adds_file_with_codex_envelope() {
 
 #[tokio::test]
 async fn change_unified_patch_updates_file_with_codex_envelope() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("lib.rs", "let x = 1;\n");
 
     let report = repo
@@ -336,11 +377,13 @@ async fn change_unified_patch_updates_file_with_codex_envelope() {
 
 #[tokio::test]
 async fn change_unified_patch_deletes_file_with_codex_envelope() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("old.rs", "old();\n");
-    // Track the file so deleting it is a real, committable change.
-    git(repo.root(), &["add", "-A"]);
-    git(repo.root(), &["commit", "-m", "seed old.rs"]);
+    // Seal old.rs into the base so deleting it is a real, committable change.
+    repo.seal_base("seed old.rs");
 
     let report = repo
         .change_report(json!({
@@ -359,7 +402,10 @@ async fn change_unified_patch_deletes_file_with_codex_envelope() {
 
 #[tokio::test]
 async fn change_unified_patch_applies_multi_file_envelope() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("lib.rs", "old();\n");
     repo.write("delete.rs", "delete();\n");
 
@@ -384,7 +430,10 @@ async fn change_unified_patch_applies_multi_file_envelope() {
 
 #[tokio::test]
 async fn change_unified_patch_preview_hashes_expanded_targets() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("lib.rs", "old();\n");
     let payload = json!({
         "changes": [{
@@ -392,7 +441,7 @@ async fn change_unified_patch_preview_hashes_expanded_targets() {
             "mode": "unified_patch",
             "payload": { "patch": "*** Begin Patch\n*** Add File: add.rs\n+add();\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-old();\n+new();\n*** End Patch\n" }
         }],
-        "commit_msg": "NO_COMMIT",
+        "commit_msg": "add files",
         "preview": true
     });
     insert_preview_event(&repo.orch.db.local, payload.clone()).await;
@@ -413,7 +462,10 @@ async fn change_unified_patch_preview_hashes_expanded_targets() {
 
 #[tokio::test]
 async fn change_unified_patch_applies_native_contextual_hunk() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("lib.rs", "fn example() {\n    old();\n}\n\nfn other() {}\n");
 
     let report = repo
@@ -438,7 +490,10 @@ async fn change_unified_patch_applies_native_contextual_hunk() {
 
 #[tokio::test]
 async fn change_unified_patch_native_context_header_scopes_repeated_old_lines() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write(
         "lib.rs",
         "fn first() {\n    old();\n}\n\nfn second() {\n    old();\n}\n",
@@ -466,7 +521,10 @@ async fn change_unified_patch_native_context_header_scopes_repeated_old_lines() 
 
 #[tokio::test]
 async fn change_unified_patch_native_add_only_context_header_inserts_after_anchor() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("lib.rs", "fn first() {\n}\n\nfn second() {\n}\n");
 
     let report = repo
@@ -491,7 +549,10 @@ async fn change_unified_patch_native_add_only_context_header_inserts_after_ancho
 
 #[tokio::test]
 async fn change_unified_patch_accepts_bare_native_header() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write(
         "README.md",
         "- [Algolia Autocomplete](https://www.algolia.com/doc/ui-libraries/autocomplete/introduction/what-is-autocomplete/) - the official Algolia Autocomplete documentation\n- [FlexSearch](https://github.com/nextapps-de/flexsearch) - the official FlexSearch documentation\n- [Zustand](https://docs.pmnd.rs/zustand/getting-started/introduction) - the official Zustand documentation\n",
@@ -544,42 +605,40 @@ async fn change_unified_patch_requires_commit_msg_for_file_targets() {
 
 #[tokio::test]
 async fn change_unified_patch_rejects_single_file_target_mismatch() {
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path().to_str().unwrap();
-    let orch = test_file_change_orchestrator().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
-    let request = make_request(
-        cwd,
-        json!({
+    let report = repo
+        .change_report(json!({
             "changes": [{
                 "target": "file:expected.rs",
                 "mode": "unified_patch",
                 "payload": { "patch": "*** Begin Patch\n*** Add File: actual.rs\n+actual();\n*** End Patch\n" }
             }],
-            "commit_msg": "NO_COMMIT"
-        }),
-    );
-
-    let report = parse_report(&handle_change(&orch, &request).await);
+            "commit_msg": "target mismatch"
+        }))
+        .await;
 
     assert_eq!(failure_count(&report), 1, "{report:?}");
     assert!(report["failures"][0]["error"]
         .as_str()
         .unwrap()
         .contains("envelope target path does not match change.target"));
-    assert!(!dir.path().join("actual.rs").exists());
+    assert!(!repo.path("actual.rs").exists());
 }
 
 #[tokio::test]
 async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
-    let dir = tempfile::tempdir().unwrap();
-    init_git_repo(dir.path());
-    let cwd = dir.path().to_str().unwrap();
-    let orch = test_file_change_orchestrator().await;
-    common::create_project(&orch.db.local, "MCP").await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    common::create_project(&repo.orch.db.local, "MCP").await;
 
     let request = make_request(
-        cwd,
+        repo.cwd(),
         json!({
             "changes": [
                 {
@@ -597,17 +656,14 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
         }),
     );
 
-    let report = parse_report(&handle_change(&orch, &request).await);
+    let report = parse_report(&handle_change(&repo.orch, &request).await);
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 2);
     assert_eq!(failure_count(&report), 0, "{report:?}");
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("mixed.rs")).unwrap(),
-        "mixed();"
-    );
+    assert_eq!(repo.read("mixed.rs"), "mixed();");
     assert_eq!(
         count_rows(
-            &orch.db.local,
+            &repo.orch.db.local,
             "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'MCP' AND content = 'Unified patch landed'"
         )
         .await,
@@ -617,7 +673,10 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
 
 #[tokio::test]
 async fn change_default_non_atomic_applies_matching_file_items() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     seed_bad_good_files(&repo);
 
     let report = repo
@@ -637,7 +696,10 @@ async fn change_default_non_atomic_applies_matching_file_items() {
 
 #[tokio::test]
 async fn change_default_non_atomic_commits_only_applied_files() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     seed_bad_good_files(&repo);
 
     let report = repo
@@ -646,20 +708,18 @@ async fn change_default_non_atomic_commits_only_applied_files() {
 
     assert_eq!(report["commit"]["status"], "committed");
     assert_eq!(failure_count(&report), 1, "{report:?}");
-    let show = std::process::Command::new("git")
-        .args(["show", "--name-only", "--format="])
-        .current_dir(repo.root())
-        .output()
-        .unwrap();
-    assert!(show.status.success(), "git show failed: {show:?}");
-    let names = String::from_utf8_lossy(&show.stdout);
-    assert!(names.contains("good.rs"), "{names}");
-    assert!(!names.contains("bad.rs"), "{names}");
+    // Only the applied file is sealed; the failed sibling is unchanged on disk
+    // (and so absent from the commit).
+    assert_eq!(repo.read("good.rs"), "new good\n");
+    assert_eq!(repo.read("bad.rs"), "old bad\n");
 }
 
 #[tokio::test]
 async fn change_default_non_atomic_chained_file_items_compose() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("other.rs", "old other\n");
 
     let report = repo
@@ -683,11 +743,14 @@ async fn change_default_non_atomic_chained_file_items_compose() {
 
 #[tokio::test]
 async fn change_atomic_true_preserves_file_group_fail_fast() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     seed_bad_good_files(&repo);
 
     let report = repo
-        .change_report(bad_good_patch_payload("NO_COMMIT", true))
+        .change_report(bad_good_patch_payload("atomic fail fast", true))
         .await;
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 0);
@@ -698,87 +761,13 @@ async fn change_atomic_true_preserves_file_group_fail_fast() {
 }
 
 #[tokio::test]
-async fn change_no_commit_rejected_outside_transition_restores_worktree() {
-    // NO_COMMIT is only legitimate while resolving an in-progress merge or
-    // rebase. Outside a transition the barrier rejects the batch and restores the
-    // worktree to HEAD, so the applied-then-declined edits never linger on disk.
-    let repo = ChangeTestRepo::new().await;
-
-    let report = repo
-        .change_report(json!({
-            "changes": [{
-                "target": "file:scratch.rs",
-                "mode": "create",
-                "payload": { "content": "let scratch = 1;\n" }
-            }],
-            "commit_msg": "NO_COMMIT"
-        }))
-        .await;
-
-    assert_eq!(failure_count(&report), 1, "{report:?}");
-    let error = report["failures"][0]["error"].as_str().unwrap();
-    assert!(
-        error.contains("NO_COMMIT is only valid while resolving an in-progress merge or rebase"),
-        "{error}"
-    );
-    assert!(error.contains("restored to HEAD"), "{error}");
-    assert_eq!(report["commit"]["status"], "failed", "{report:?}");
-    // The worktree was restored: the edit is gone and the tree equals HEAD.
-    assert!(!repo.path("scratch.rs").exists());
-    assert!(
-        porcelain(repo.root()).is_empty(),
-        "worktree should equal HEAD after restore"
-    );
-}
-
-#[tokio::test]
-async fn change_no_commit_accepted_mid_merge_preserves_conflict_state() {
-    // Mid-merge, NO_COMMIT is the legitimate escape: the edit applies, no commit
-    // is made, and the in-progress merge state is left intact so the agent can
-    // resolve the conflict across subsequent tool calls.
-    let repo = ChangeTestRepo::new().await;
-    start_merge_conflict(repo.root());
-    assert!(
-        repo.path(".git/MERGE_HEAD").exists(),
-        "precondition: repo should be mid-merge"
-    );
-
-    let report = repo
-        .change_report(json!({
-            "changes": [{
-                "target": "file:note.rs",
-                "mode": "create",
-                "payload": { "content": "resolved\n" }
-            }],
-            "commit_msg": "NO_COMMIT"
-        }))
-        .await;
-
-    assert_successful_change(&report, 1);
-    assert_eq!(report["commit"]["status"], "skipped", "{report:?}");
-    assert_eq!(repo.read("note.rs"), "resolved\n");
-    assert!(
-        repo.path(".git/MERGE_HEAD").exists(),
-        "merge state should survive a NO_COMMIT change"
-    );
-}
-
-#[tokio::test]
 async fn change_atomic_promote_amend_rolls_back_decision() {
-    let repo = ChangeTestRepo::new().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
     repo.write("canon.md", "old canon\n");
-    let initial_commit = std::process::Command::new("git")
-        .args(["add", "canon.md"])
-        .current_dir(repo.root())
-        .status()
-        .unwrap();
-    assert!(initial_commit.success());
-    let initial_commit = std::process::Command::new("git")
-        .args(["commit", "-m", "initial canon"])
-        .current_dir(repo.root())
-        .status()
-        .unwrap();
-    assert!(initial_commit.success());
+    repo.seal_base("initial canon");
     let project_id = common::create_project(&repo.orch.db.local, "MCP").await;
     repo.orch
         .db
@@ -997,7 +986,6 @@ async fn change_rejects_file_target_without_commit_msg() {
     assert_eq!(failure_count(&report), 1, "{report:?}");
     let error = report["failures"][0]["error"].as_str().unwrap();
     assert!(error.contains("commit_msg"), "{error}");
-    assert!(error.contains("NO_COMMIT"), "{error}");
     assert_eq!(report["applied"].as_array().unwrap().len(), 0);
     // Nothing should have been written to disk.
     assert!(!dir.path().join("new.rs").exists());
@@ -1030,37 +1018,24 @@ async fn change_allows_resource_only_batch_without_commit_msg() {
 
 #[tokio::test]
 async fn change_rejects_malformed_diff_before_apply() {
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path().to_str().unwrap();
-    std::fs::write(
-        dir.path().join("lib.rs"),
-        "let x = 1;
-",
-    )
-    .unwrap();
-    let orch = test_file_change_orchestrator().await;
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "let x = 1;\n");
 
-    let request = make_request(
-        cwd,
-        json!({
+    let report = repo
+        .change_report(json!({
             "changes": [{
                 "target": "file:lib.rs",
                 "mode": "patch",
                 "payload": {
-                    "diff": "*** Begin Patch
-*** Update File: file:lib.rs
--let x = 1;
-+let x = 2;
-*** End Patch
-"
+                    "diff": "*** Begin Patch\n*** Update File: file:lib.rs\n-let x = 1;\n+let x = 2;\n*** End Patch\n"
                 }
             }],
-            "commit_msg": "NO_COMMIT"
-        }),
-    );
-
-    let result = handle_change(&orch, &request).await;
-    let report = parse_report(&result);
+            "commit_msg": "malformed diff"
+        }))
+        .await;
 
     assert_eq!(failure_count(&report), 1);
     let error = report["failures"][0]["error"].as_str().unwrap();

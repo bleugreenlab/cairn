@@ -1048,6 +1048,7 @@ mod tests {
             thinking_tokens: None,
             storage_mode: storage_mode.map(str::to_string),
             content_commit: content_commit.map(str::to_string),
+            content_change_id: None,
             content_render_sha: None,
             data_blob,
             codec: codec.map(str::to_string),
@@ -1094,10 +1095,9 @@ mod tests {
         write_file(&clone, "c.txt", b"new file\n");
         let tip = commit_all(&clone, "work");
 
-        let (pack, idx, built_tip) = build_execution_pack(&clone, &anchor, "main")
+        let (pack, idx) = build_execution_pack(&clone, &tip, &anchor, "main")
             .unwrap()
             .unwrap();
-        assert_eq!(built_tip, tip);
 
         Fixture {
             _origin_dir: origin_dir,

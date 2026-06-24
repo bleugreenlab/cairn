@@ -63,6 +63,10 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "full",
     "label",
     "content_types",
+    // Live-database (cairn://db) read-only SQL projection key.
+    "sql",
+    // Dev-instance selector (cairn://dev/db?at=..., cairn://dev/pid?at=...).
+    "at",
     // Symbol-resource keys (op/in) + structural file-projection keys (ast/outline).
     "op",
     "in",

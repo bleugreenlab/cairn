@@ -796,7 +796,13 @@ pub fn continue_job_impl(
     };
 
     // ---- Create successor turn for follow-up ----------------------------
-    let turn_id = create_followup_turn(orch, &session_id, job_id)?;
+    // A resume carrying user-authored content (an explicit message or a
+    // prompt/permission answer) is a work turn, never the post-completion
+    // memory-review reflection. The pending-queued-message case (a user steer
+    // that arrives without an explicit message) is detected inside
+    // `create_followup_turn` against the rows the claim below sweeps up.
+    let user_initiated = message.is_some() || prompt_resume.is_some();
+    let turn_id = create_followup_turn(orch, &session_id, job_id, user_initiated)?;
 
     // ---- Artifact schema ------------------------------------------------
     let artifact_schema_info = run_db(find_job_downstream_artifact_schema(
@@ -825,14 +831,56 @@ pub fn continue_job_impl(
     // the queued content *is* the user's prompt — don't lead with the generic
     // "Continue where you left off." placeholder (and don't store it as a "You"
     // event; each queued message is stored as its own event below).
-    // CAIRN-1647: claim the attention briefing once, up front, so it drives both
-    // the resume prompt and the visible event — otherwise the UI shows a bare
-    // "Continue where you left off." while the agent silently received the
-    // briefing in its prompt.
-    let briefing = crate::orchestrator::attention_delivery::claim_and_render_briefing(orch, job_id);
+    // CAIRN-1881: drain this job's pending attention pushes. Both rousing
+    // (`wake`/`interrupt`) and `passive` ride-along pushes deliver on a resume
+    // that is already happening; each is lazy-resolved so a push whose referent
+    // already resolved is skipped. They are stamped delivered atomically with
+    // their carrying event, persisted below once the prompt is assembled.
+    let drained_pushes = {
+        let db = orch.db.local.clone();
+        let recipient = job_id.to_string();
+        run_db(async move {
+            crate::orchestrator::attention_push::list_pending_live(&db, &recipient)
+                .await
+                .map_err(|e| e.to_string())
+        })
+        .unwrap_or_default()
+    };
+    let has_pushes = !drained_pushes.is_empty();
+    // CAIRN-1891: resolve each push's content_ref to its rendered resource content
+    // so the resumed agent acts without a round-trip read. Uses the same in-process
+    // backs `cairn read`; run on a scoped DB runtime so it can borrow orch.
+    let push_prompt = if has_pushes {
+        let pushes = drained_pushes.clone();
+        crate::storage::run_db_blocking(move || async move {
+            Ok::<_, String>(
+                crate::orchestrator::attention_delivery::render_pushes_resolved(orch, &pushes)
+                    .await,
+            )
+        })
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    // CAIRN-1891: the persisted carrying event is the wake-card payload
+    // (`{active, catchup}`) PLUS the `resolved` content the agent received, so the
+    // transcript renders a card and its detail modal shows the full content (not
+    // just the resource ref). The agent gets the same resolved content inline in
+    // the prompt below.
+    let push_summary = if has_pushes {
+        Some(
+            crate::orchestrator::attention_push::push_event_content_json(
+                &drained_pushes,
+                push_prompt.as_deref().unwrap_or_default(),
+            ),
+        )
+    } else {
+        None
+    };
     let user_message = match message {
         Some(m) => m.to_string(),
-        None if has_queued || briefing.is_some() => String::new(),
+        None if has_queued || has_pushes => String::new(),
         None => "Continue where you left off.".to_string(),
     };
     let base_prompt = resolve_skill_slash_command(orch, &user_message, project_path.as_deref());
@@ -860,10 +908,6 @@ pub fn continue_job_impl(
             &side_channel_notices,
         )?;
     }
-    // CAIRN-1647: the briefing (claimed above) is rendered from CURRENT ledger
-    // state; an empty set (all handled since the wake) yields None — the
-    // stale-wake drop. The agent gets the full resolved markdown here; the UI
-    // gets the compact structured event stored below.
     let queued_block = if has_queued {
         Some(
             queued_messages
@@ -878,15 +922,13 @@ pub fn continue_job_impl(
     let side_channel_block = if side_channel_notices.is_empty() {
         None
     } else {
-        Some(crate::messages::transcript::render_side_channel_prompt_block(
-            &side_channel_notices,
-        ))
+        Some(crate::messages::transcript::render_side_channel_prompt_block(&side_channel_notices))
     };
     let prompt = assemble_resume_prompt(
         queued_block,
         &base_prompt,
         side_channel_block,
-        briefing.as_ref().map(|b| b.prompt.as_str()),
+        push_prompt.as_deref(),
     );
 
     let job_model = job.model.as_ref().map(Model::new);
@@ -905,23 +947,22 @@ pub fn continue_job_impl(
     // Skip the default "You" event when the user supplied no explicit message and
     // the content is carried entirely by queued follow-ups (stored individually
     // below) — storing the empty placeholder would render a blank You block.
-    // CAIRN-1647: surface the attention briefing as its own structured event so
-    // an attention-driven resume isn't a mystery "Continue where you left off."
-    // in the UI, and isn't a giant markdown "You" block either — the frontend
-    // draws it as a compact wake card (active items bright, catch-up dim). It is
-    // display-only; the agent receives the resolved markdown via the prompt.
-    if let Some(b) = &briefing {
-        if !suppress_user_event && !b.items_json.is_empty() {
-            crate::execution::jobs::snapshots::store_attention_briefing_event_with_turn(
-                orch,
-                &run_id,
-                &session_id,
-                &b.items_json,
-                now,
-                -1,
-                Some(&turn_id),
-            )?;
-        }
+    // CAIRN-1881: persist the carrying event for the drained pushes and stamp each
+    // delivered by it, atomically (same transaction as the event INSERT). The
+    // pushes already ride in the resume prompt above, so they are delivered
+    // regardless of `suppress_user_event`; recovery redelivers only pushes whose
+    // carrying event never durably landed.
+    if let Some(text) = &push_summary {
+        let push_ids: Vec<String> = drained_pushes.iter().map(|p| p.id.clone()).collect();
+        crate::execution::jobs::snapshots::store_attention_push_event(
+            orch,
+            &run_id,
+            &session_id,
+            text,
+            &push_ids,
+            now,
+            Some(&turn_id),
+        )?;
     }
     // Queued follow-ups — including passive "quiet" notes that rode along without
     // waking the agent — were authored before the immediate resume message, so
@@ -946,7 +987,7 @@ pub fn continue_job_impl(
         );
     }
     let store_default_user_event =
-        !(suppress_user_event || (message.is_none() && (has_queued || briefing.is_some())));
+        !(suppress_user_event || (message.is_none() && (has_queued || has_pushes)));
     if store_default_user_event {
         let display_message = user_message.clone();
         store_user_event_with_turn(
@@ -1012,15 +1053,15 @@ pub fn continue_job_impl(
 /// without waking the agent — were authored before the message that triggers
 /// this resume, so they precede `base_prompt`. A quiet note "A" sent before a
 /// waking message "B" is therefore delivered as "A\n\nB", matching the order the
-/// user sent them rather than reversing it. Side-channel notices and the
-/// attention briefing keep their established position after the immediate
+/// user sent them rather than reversing it. Side-channel notices and resolved
+/// attention pushes keep their established position after the immediate
 /// message. Falls back to the generic continue placeholder when every part is
 /// empty.
 fn assemble_resume_prompt(
     queued_block: Option<String>,
     base_prompt: &str,
     side_channel_block: Option<String>,
-    briefing_prompt: Option<&str>,
+    push_prompt: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(q) = queued_block {
@@ -1036,9 +1077,9 @@ fn assemble_resume_prompt(
             parts.push(s);
         }
     }
-    if let Some(b) = briefing_prompt {
-        if !b.is_empty() {
-            parts.push(b.to_string());
+    if let Some(p) = push_prompt {
+        if !p.is_empty() {
+            parts.push(p.to_string());
         }
     }
     if parts.is_empty() {
@@ -1303,16 +1344,17 @@ mod tests {
     }
 
     #[test]
-    fn side_channel_and_briefing_follow_the_immediate_message() {
-        // Queued notes lead; the immediate message, then side-channel and
-        // briefing context, follow — the established position for those blocks.
+    fn side_channel_and_push_follow_the_immediate_message() {
+        // Queued notes lead; the immediate message, then side-channel notices and
+        // resolved attention pushes, follow — the established position for those
+        // blocks.
         let prompt = assemble_resume_prompt(
             Some("A".to_string()),
             "B",
             Some("side".to_string()),
-            Some("brief"),
+            Some("push"),
         );
-        assert_eq!(prompt, "A\n\nB\n\nside\n\nbrief");
+        assert_eq!(prompt, "A\n\nB\n\nside\n\npush");
     }
 
     /// Register a warm process with a recorded model and backend. The stdin is an

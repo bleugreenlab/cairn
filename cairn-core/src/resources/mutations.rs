@@ -3,6 +3,7 @@
 mod actions;
 mod agents;
 mod blocking;
+mod browsers;
 mod dispatch;
 mod hash;
 mod labels;

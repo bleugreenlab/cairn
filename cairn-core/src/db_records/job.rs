@@ -103,9 +103,7 @@ pub async fn load_live_job_by_execution_node_conn(
          ORDER BY created_at DESC
          LIMIT 1"
     );
-    let mut rows = conn
-        .query(&sql, turso::params![execution_id, recipe_node_id])
-        .await?;
+    let mut rows = conn.query(&sql, (execution_id, recipe_node_id)).await?;
     rows.next()
         .await?
         .map(|row| db_job_from_row(&row))

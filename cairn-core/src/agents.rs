@@ -144,19 +144,7 @@ fn slugify(name: &str) -> String {
 ///
 /// Also supports legacy Cairn format with YAML array tools.
 pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
-    // Check for frontmatter delimiters
-    if !content.starts_with("---\n") {
-        return Err("Missing frontmatter start delimiter".to_string());
-    }
-
-    // Find the end of frontmatter
-    let content_after_start = &content[4..]; // Skip first "---\n"
-    let end_idx = content_after_start
-        .find("\n---\n")
-        .ok_or("Missing frontmatter end delimiter")?;
-
-    let frontmatter_str = &content_after_start[..end_idx];
-    let prompt = content_after_start[end_idx + 5..].trim().to_string(); // Skip "\n---\n"
+    let (frontmatter_str, prompt) = crate::markdown_frontmatter::split_yaml_frontmatter(content)?;
 
     // Parse YAML frontmatter
     let frontmatter: AgentFrontmatter = serde_yaml::from_str(frontmatter_str)
@@ -365,6 +353,15 @@ mod tests {
         let content = "---\nname: NoTools\ndescription: no tools field\n---\n\nprompt";
         let parsed = parse_agent_markdown(content).expect("missing tools must parse");
         assert!(parsed.tools.is_empty());
+    }
+
+    #[test]
+    fn parses_crlf_frontmatter() {
+        let content = "---\r\nname: Windows Agent\r\ndescription: A bundled agent with CRLF line endings\r\ntools: Read, Grep\r\n---\r\n\r\nPrompt";
+        let parsed = parse_agent_markdown(content).expect("CRLF frontmatter must parse");
+        assert_eq!(parsed.name, "Windows Agent");
+        assert_eq!(parsed.tools, vec!["Read", "Grep"]);
+        assert_eq!(parsed.prompt, "Prompt");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use ast_grep_language::SupportLang;
 
 use super::engine::{parse, SymbolNode};
 use super::grammar::{self, LangSpec};
-use super::render::{render_locations, LocationHit, Rendered};
+use super::render::{render_locations, render_locations_with_context, LocationHit, Rendered};
 use super::walk::{build_globset, relative, source_files};
 
 /// The structural navigation operations the symbols resource exposes.
@@ -52,14 +52,26 @@ impl SymbolOp {
     }
 }
 
+/// Read projections for symbol navigation: a context window around each
+/// location row plus an optional cap on the number of rows. Mirrors the grep
+/// modifier vocabulary (`-A`/`-B`/`-C`/`context`, `head_limit`/`limit`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NavProjection {
+    pub before: usize,
+    pub after: usize,
+    pub limit: Option<usize>,
+}
+
 /// Run a symbol navigation query over `dir` (rooted at `root` for output paths).
-/// `op = None` returns the overview (definition sites + reference count).
+/// `op = None` returns the overview (definition sites + reference count); the
+/// projection applies only to the location-list ops, not the overview.
 pub fn query(
     root: &Path,
     dir: &Path,
     op: Option<SymbolOp>,
     name: &str,
     glob: Option<&str>,
+    proj: &NavProjection,
 ) -> Rendered {
     if name.trim().is_empty() {
         return Rendered::message(
@@ -76,7 +88,17 @@ pub fn query(
     };
     let files = source_files(root, dir, globset.as_ref());
     match op {
-        Some(op) => render_locations(&collect(root, &files, op, name)),
+        Some(op) => {
+            let mut hits = collect(root, &files, op, name);
+            if let Some(limit) = proj.limit {
+                hits.truncate(limit);
+            }
+            if proj.before == 0 && proj.after == 0 {
+                render_locations(&hits)
+            } else {
+                render_locations_with_context(root, &hits, proj.before, proj.after)
+            }
+        }
         None => overview(root, &files, name),
     }
 }
@@ -200,9 +222,9 @@ fn implementation_line(node: &SymbolNode, name: &str) -> Option<usize> {
         "class_declaration" | "abstract_class_declaration" | "interface_declaration" => {
             let hit = node.children().any(|child| {
                 child.kind().as_ref() == "class_heritage"
-                    && child.dfs().any(|n| {
-                        n.kind().ends_with("identifier") && n.text().as_ref() == name
-                    })
+                    && child
+                        .dfs()
+                        .any(|n| n.kind().ends_with("identifier") && n.text().as_ref() == name)
             });
             hit.then(|| node.start_pos().line())
         }
@@ -272,7 +294,12 @@ mod tests {
     #[test]
     fn finds_typescript_implements() {
         let src = "interface Shape {}\nclass Circle implements Shape {}\n";
-        let lines = lines_for(src, SupportLang::TypeScript, SymbolOp::Implementations, "Shape");
+        let lines = lines_for(
+            src,
+            SupportLang::TypeScript,
+            SymbolOp::Implementations,
+            "Shape",
+        );
         assert_eq!(lines, vec![1]);
     }
 
@@ -293,10 +320,88 @@ mod tests {
             "fn alpha() {}\nfn beta() { alpha(); alpha(); }\n",
         )
         .unwrap();
-        let r = query(dir.path(), dir.path(), None, "alpha", None);
+        let r = query(
+            dir.path(),
+            dir.path(),
+            None,
+            "alpha",
+            None,
+            &NavProjection::default(),
+        );
         assert!(r.body.contains("definition:"));
         assert!(r.body.contains("a.rs:1:"));
         // Three occurrences across two lines: decl line + the call line.
         assert!(r.body.contains("references: 2"));
+    }
+
+    #[test]
+    fn limit_caps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() { alpha(); }\nfn gamma() { alpha(); }\n",
+        )
+        .unwrap();
+        // References span three lines; cap to a single row.
+        let proj = NavProjection {
+            limit: Some(1),
+            ..Default::default()
+        };
+        let r = query(
+            dir.path(),
+            dir.path(),
+            Some(SymbolOp::References),
+            "alpha",
+            None,
+            &proj,
+        );
+        assert_eq!(r.body.lines().count(), 1, "body: {}", r.body);
+    }
+
+    #[test]
+    fn context_includes_surrounding_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() {\n    alpha();\n}\n",
+        )
+        .unwrap();
+        let proj = NavProjection {
+            before: 1,
+            after: 1,
+            limit: None,
+        };
+        let r = query(
+            dir.path(),
+            dir.path(),
+            Some(SymbolOp::Callers),
+            "alpha",
+            None,
+            &proj,
+        );
+        // Caller is `beta`, declared on 1-based line 2 (the match), with line 1
+        // and line 3 as context rows rendered with `-` separators.
+        assert!(r.body.contains("a.rs:2:"), "body: {}", r.body);
+        assert!(r.body.contains("a.rs:1-"), "body: {}", r.body);
+        assert!(r.body.contains("a.rs:3-    alpha();"), "body: {}", r.body);
+    }
+
+    #[test]
+    fn default_projection_matches_bare_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() { alpha(); }\n",
+        )
+        .unwrap();
+        let r = query(
+            dir.path(),
+            dir.path(),
+            Some(SymbolOp::Definition),
+            "alpha",
+            None,
+            &NavProjection::default(),
+        );
+        assert_eq!(r.body, "a.rs:1:fn alpha() {}");
     }
 }

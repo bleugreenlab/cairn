@@ -956,7 +956,12 @@ match cmd {
         // The contiguous `{~~*~~}` token balances and skips nested delimiters.
         let content = "fn main() {\n    if true {\n        x\n    }\n    y\n}";
         let anchors = parse_wildcard("fn main() {~~*~~}").unwrap();
-        assert_wildcard_result(content, &anchors, "fn main() {\n    z\n}", "fn main() {\n    z\n}");
+        assert_wildcard_result(
+            content,
+            &anchors,
+            "fn main() {\n    z\n}",
+            "fn main() {\n    z\n}",
+        );
     }
 
     #[test]
@@ -984,8 +989,7 @@ const f = useCallback(() => {
     doThing();
 }, [dep]);
 after();";
-        let anchors =
-            parse_wildcard("const f = useCallback(() => {\n~~*~~\n}, [dep]);").unwrap();
+        let anchors = parse_wildcard("const f = useCallback(() => {\n~~*~~\n}, [dep]);").unwrap();
         let (result, replaced) = apply_wildcard_edit(
             content,
             &anchors,

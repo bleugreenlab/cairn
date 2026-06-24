@@ -87,7 +87,7 @@ pub fn mark_job_failed(orch: &Orchestrator, job_id: &str, error: &str) -> Result
              WHERE job_id = ?1
              ORDER BY created_at DESC
              LIMIT 1",
-            turso::params![job_id_owned.as_str()],
+            (job_id_owned,),
         )
         .await
         .map_err(|e| format!("Failed to load latest run: {e}"))
@@ -407,7 +407,7 @@ pub fn rearm_blocked_checkpoints(orch: &Orchestrator, execution_id: &str) -> Res
             resolve_checkpoint_worktree(orch, execution_id, job.parent_job_id.as_deref())?;
         let head_sha = worktree
             .as_deref()
-            .and_then(|w| crate::execution::cache::get_current_head_sha(w).ok());
+            .and_then(|w| crate::execution::cache::get_current_head_sha(orch, w).ok());
         let last_run = latest_checkpoint_run(orch, &job.id)?;
         let last_run_sha = last_run.as_ref().and_then(|r| r.commit_sha.clone());
         let attempts = checkpoint_attempt_count(orch, &job.id)?;

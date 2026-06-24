@@ -8,6 +8,11 @@ use crate::query::{encode_query_params, parse_query_params, QueryParam};
 
 pub const PROJECT_SCOPE: &str = "p";
 
+/// Default browser slug when a browser URI omits an explicit `/SLUG` (e.g. the
+/// agent's `cairn:~/browser`). Keeps the shared browser a single canonical
+/// session; explicit slugs address additional browsers.
+pub const DEFAULT_BROWSER_SLUG: &str = "default";
+
 /// Reserved trailing segments under a node (or task) that name a specific
 /// resource rather than an artifact type. A trailing segment NOT in this set is
 /// interpreted as a type-named artifact (`.../{node}/plan`). This is the single
@@ -24,6 +29,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "questions",
     "question",
     "terminal",
+    "browser",
     "task",
     "messages",
     "annotations",
@@ -126,6 +132,21 @@ pub enum CairnResource {
         slug: String,
     },
     TaskTerminal {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+        slug: String,
+    },
+    NodeBrowser {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        slug: String,
+    },
+    TaskBrowser {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -308,6 +329,10 @@ pub enum CairnResource {
         project: String,
         slug: String,
     },
+    ProjectBrowser {
+        project: String,
+        slug: String,
+    },
     /// Contextual skills collection (workspace + current project).
     Skills,
     /// Contextual skill package (resolves project-first, then workspace).
@@ -406,6 +431,17 @@ pub enum CairnResource {
     },
     /// Live local database read projection.
     Db,
+    /// `cairn://dev` collection entrypoint: process-introspection tools for a
+    /// running `dev:instance` you launched (lists running instances + sub-tools).
+    Dev,
+    /// `cairn://dev/db` — read-only SQL projection into a running `dev:instance`
+    /// database, queried over that instance's own MCP callback server (it holds a
+    /// process lock on its database file, so the host cannot open it directly).
+    DevDb,
+    /// `cairn://dev/pid` — the OS process id(s) of running `dev:instance`(s), each
+    /// reported by the instance over its MCP callback server so a caller can
+    /// target the process (e.g. with Axon) without shelling out.
+    DevPid,
     /// Read-only projection of the running app's JSONL log entries
     /// (URI parity with the in-app Logs viewer).
     Logs,
@@ -743,6 +779,35 @@ pub fn build_project_terminal_uri(project: &str, slug: &str) -> String {
     format!("{}/terminal/{}", build_project_uri(project), slug)
 }
 
+pub fn build_node_browser_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    slug: &str,
+) -> String {
+    build_node_segmented_resource_uri(project, number, exec_seq, node_id, "browser", slug)
+}
+
+pub fn build_task_browser_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    slug: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "browser"),
+        slug
+    )
+}
+
+pub fn build_project_browser_uri(project: &str, slug: &str) -> String {
+    format!("{}/browser/{}", build_project_uri(project), slug)
+}
+
 fn append_path(base: String, path: &[String]) -> String {
     if path.is_empty() {
         base
@@ -957,6 +1022,21 @@ impl CairnResource {
                 task_name,
                 slug,
             } => build_task_terminal_uri(project, *number, *exec_seq, node_id, task_name, slug),
+            Self::NodeBrowser {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                slug,
+            } => build_node_browser_uri(project, *number, *exec_seq, node_id, slug),
+            Self::TaskBrowser {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                slug,
+            } => build_task_browser_uri(project, *number, *exec_seq, node_id, task_name, slug),
             Self::Task {
                 project,
                 number,
@@ -1104,6 +1184,7 @@ impl CairnResource {
                 node_id,
             } => build_node_changed_uri(project, *number, *exec_seq, node_id),
             Self::ProjectTerminal { project, slug } => build_project_terminal_uri(project, slug),
+            Self::ProjectBrowser { project, slug } => build_project_browser_uri(project, slug),
             Self::NodeSymbols {
                 project,
                 number,
@@ -1115,6 +1196,9 @@ impl CairnResource {
                 build_project_symbols_uri(project, symbol.as_deref())
             }
             Self::Db => "cairn://db".to_string(),
+            Self::Dev => "cairn://dev".to_string(),
+            Self::DevDb => "cairn://dev/db".to_string(),
+            Self::DevPid => "cairn://dev/pid".to_string(),
             Self::Logs => "cairn://logs".to_string(),
             Self::Bug => "cairn://bug".to_string(),
             Self::Help => "cairn://help".to_string(),
@@ -1235,6 +1319,27 @@ impl CairnResource {
                 "/p/{}/i/{}/{}/{}/task/{}?terminalId={}",
                 project, number, exec_seq, node_id, task_name, slug
             )),
+            Self::NodeBrowser {
+                number,
+                exec_seq,
+                node_id,
+                slug,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}?browserId={}",
+                project, number, exec_seq, node_id, slug
+            )),
+            Self::TaskBrowser {
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                slug,
+                ..
+            } => Some(format!(
+                "/p/{}/i/{}/{}/{}/task/{}?browserId={}",
+                project, number, exec_seq, node_id, task_name, slug
+            )),
             Self::NodeMemories {
                 number,
                 exec_seq,
@@ -1273,6 +1378,9 @@ impl CairnResource {
             )),
             Self::ProjectTerminal { slug, .. } => {
                 Some(format!("/p/{}/terminal?terminalId={}", project, slug))
+            }
+            Self::ProjectBrowser { slug, .. } => {
+                Some(format!("/p/{}/browser?browserId={}", project, slug))
             }
             Self::NodeChatRaw { .. }
             | Self::NodeChatTurn { .. }
@@ -1320,6 +1428,9 @@ impl CairnResource {
             | Self::NodeSymbols { .. }
             | Self::ProjectSymbols { .. }
             | Self::Db
+            | Self::Dev
+            | Self::DevDb
+            | Self::DevPid
             | Self::Logs
             | Self::Bug
             | Self::Help
@@ -1343,6 +1454,8 @@ impl CairnResource {
             | Self::NodeArtifact { project, .. }
             | Self::NodeTerminal { project, .. }
             | Self::TaskTerminal { project, .. }
+            | Self::NodeBrowser { project, .. }
+            | Self::TaskBrowser { project, .. }
             | Self::Task { project, .. }
             | Self::TaskChat { project, .. }
             | Self::TaskChatRaw { project, .. }
@@ -1367,6 +1480,7 @@ impl CairnResource {
             | Self::IssueExecution { project, .. }
             | Self::NodeChanged { project, .. }
             | Self::ProjectTerminal { project, .. }
+            | Self::ProjectBrowser { project, .. }
             | Self::ProjectSkills { project }
             | Self::ProjectSkill { project, .. }
             | Self::NodeMemories { project, .. }
@@ -1390,6 +1504,9 @@ impl CairnResource {
             | Self::Actions
             | Self::Action { .. }
             | Self::Db
+            | Self::Dev
+            | Self::DevDb
+            | Self::DevPid
             | Self::Logs
             | Self::Bug
             | Self::Help
@@ -1410,6 +1527,8 @@ impl CairnResource {
             | Self::NodeArtifact { number, .. }
             | Self::NodeTerminal { number, .. }
             | Self::TaskTerminal { number, .. }
+            | Self::NodeBrowser { number, .. }
+            | Self::TaskBrowser { number, .. }
             | Self::Task { number, .. }
             | Self::TaskChat { number, .. }
             | Self::TaskChatRaw { number, .. }
@@ -1439,6 +1558,7 @@ impl CairnResource {
             | Self::ProjectIssues { .. }
             | Self::ProjectMessages { .. }
             | Self::ProjectTerminal { .. }
+            | Self::ProjectBrowser { .. }
             | Self::Skills
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
@@ -1459,6 +1579,9 @@ impl CairnResource {
             | Self::ProjectAction { .. }
             | Self::ProjectSymbols { .. }
             | Self::Db
+            | Self::Dev
+            | Self::DevDb
+            | Self::DevPid
             | Self::Logs
             | Self::Bug
             | Self::Help
@@ -1477,6 +1600,8 @@ impl CairnResource {
             | Self::NodeArtifact { node_id, .. }
             | Self::NodeTerminal { node_id, .. }
             | Self::TaskTerminal { node_id, .. }
+            | Self::NodeBrowser { node_id, .. }
+            | Self::TaskBrowser { node_id, .. }
             | Self::Task { node_id, .. }
             | Self::TaskChat { node_id, .. }
             | Self::TaskChatRaw { node_id, .. }
@@ -1510,6 +1635,7 @@ impl CairnResource {
             Self::ProjectIssues { .. } => ResourceKind::ProjectIssues,
             Self::ProjectMessages { .. } => ResourceKind::ProjectMessages,
             Self::ProjectTerminal { .. } => ResourceKind::ProjectTerminal,
+            Self::ProjectBrowser { .. } => ResourceKind::ProjectBrowser,
             Self::Issue { .. } => ResourceKind::Issue,
             Self::Changed { .. } => ResourceKind::Changed,
             Self::IssueExecutions { .. } => ResourceKind::IssueExecutions,
@@ -1528,6 +1654,8 @@ impl CairnResource {
             Self::NodeChanged { .. } => ResourceKind::NodeChanged,
             Self::NodeTerminal { .. } => ResourceKind::NodeTerminal,
             Self::TaskTerminal { .. } => ResourceKind::TaskTerminal,
+            Self::NodeBrowser { .. } => ResourceKind::NodeBrowser,
+            Self::TaskBrowser { .. } => ResourceKind::TaskBrowser,
             Self::Task { .. } => ResourceKind::Task,
             Self::TaskChat { .. } => ResourceKind::TaskChat,
             Self::TaskChatRaw { .. } => ResourceKind::TaskChatRaw,
@@ -1542,6 +1670,9 @@ impl CairnResource {
             Self::NodePermissions { .. } => ResourceKind::NodePermissions,
             Self::NodePermission { .. } => ResourceKind::NodePermission,
             Self::Db => ResourceKind::Db,
+            Self::Dev => ResourceKind::Dev,
+            Self::DevDb => ResourceKind::DevDb,
+            Self::DevPid => ResourceKind::DevPid,
             Self::Logs => ResourceKind::Logs,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
@@ -1626,6 +1757,9 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
 
     match parts.as_slice() {
         ["db"] => Some(CairnResource::Db),
+        ["dev"] => Some(CairnResource::Dev),
+        ["dev", "db"] => Some(CairnResource::DevDb),
+        ["dev", "pid"] => Some(CairnResource::DevPid),
         ["logs"] => Some(CairnResource::Logs),
         ["bug"] => Some(CairnResource::Bug),
         ["help"] => Some(CairnResource::Help),
@@ -1728,6 +1862,14 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "terminal", slug] => Some(CairnResource::ProjectTerminal {
             project: canonical_project(project),
             slug: (*slug).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "browser", slug] => Some(CairnResource::ProjectBrowser {
+            project: canonical_project(project),
+            slug: (*slug).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "browser"] => Some(CairnResource::ProjectBrowser {
+            project: canonical_project(project),
+            slug: DEFAULT_BROWSER_SLUG.to_string(),
         }),
         [PROJECT_SCOPE, project, number] => Some(CairnResource::Issue {
             project: canonical_project(project),
@@ -1940,6 +2082,44 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 node_id: (*node_id).to_string(),
                 task_name: (*task_name).to_string(),
                 slug: (*slug).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "browser", slug] => {
+            Some(CairnResource::NodeBrowser {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                slug: (*slug).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "browser"] => {
+            Some(CairnResource::NodeBrowser {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                slug: DEFAULT_BROWSER_SLUG.to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "browser", slug] => {
+            Some(CairnResource::TaskBrowser {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                slug: (*slug).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "browser"] => {
+            Some(CairnResource::TaskBrowser {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                slug: DEFAULT_BROWSER_SLUG.to_string(),
             })
         }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name] => {
@@ -2214,7 +2394,10 @@ mod tests {
 
     #[test]
     fn parses_and_roundtrips_websearch() {
-        assert_eq!(parse_uri("cairn://websearch"), Some(CairnResource::WebSearch));
+        assert_eq!(
+            parse_uri("cairn://websearch"),
+            Some(CairnResource::WebSearch)
+        );
         assert_eq!(CairnResource::WebSearch.to_uri(), "cairn://websearch");
         assert_eq!(CairnResource::WebSearch.kind(), ResourceKind::WebSearch);
         assert_eq!(CairnResource::WebSearch.project(), None);
@@ -2357,6 +2540,105 @@ mod tests {
         // the removal is deliberate rather than a silent dual-name.
         assert!(parse_uri("cairn://p/CAIRN/42/2/builder/chat/full").is_none());
         assert!(parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/chat/full").is_none());
+    }
+
+    #[test]
+    fn parses_and_roundtrips_browsers() {
+        let node = CairnResource::NodeBrowser {
+            project: "CAIRN".to_string(),
+            number: 42,
+            exec_seq: 2,
+            node_id: "builder".to_string(),
+            slug: "main".to_string(),
+        };
+        assert_eq!(node.to_uri(), "cairn://p/CAIRN/42/2/builder/browser/main");
+        assert_eq!(parse_uri(&node.to_uri()), Some(node.clone()));
+        assert_eq!(node.kind(), ResourceKind::NodeBrowser);
+        assert_eq!(
+            node.to_route(),
+            Some("/p/cairn/i/42/2/builder?browserId=main".to_string())
+        );
+
+        let task = CairnResource::TaskBrowser {
+            project: "CAIRN".to_string(),
+            number: 42,
+            exec_seq: 2,
+            node_id: "builder".to_string(),
+            task_name: "Explore".to_string(),
+            slug: "main".to_string(),
+        };
+        assert_eq!(
+            task.to_uri(),
+            "cairn://p/CAIRN/42/2/builder/task/Explore/browser/main"
+        );
+        assert_eq!(parse_uri(&task.to_uri()), Some(task.clone()));
+        assert_eq!(task.kind(), ResourceKind::TaskBrowser);
+
+        let project = CairnResource::ProjectBrowser {
+            project: "CAIRN".to_string(),
+            slug: "main".to_string(),
+        };
+        assert_eq!(project.to_uri(), "cairn://p/CAIRN/browser/main");
+        assert_eq!(parse_uri(&project.to_uri()), Some(project.clone()));
+        assert_eq!(project.kind(), ResourceKind::ProjectBrowser);
+        assert_eq!(
+            project.to_route(),
+            Some("/p/cairn/browser?browserId=main".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_browser_defaults_slug() {
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/browser"),
+            Some(CairnResource::NodeBrowser {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                slug: "default".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/browser"),
+            Some(CairnResource::TaskBrowser {
+                project: "CAIRN".to_string(),
+                number: 42,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+                slug: "default".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/browser"),
+            Some(CairnResource::ProjectBrowser {
+                project: "CAIRN".to_string(),
+                slug: "default".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn project_browser_arm_precedes_issue_arm() {
+        // A numeric project-browser slug must resolve as ProjectBrowser, not as
+        // an issue: the `[p, project, "browser", slug]` arm must precede the
+        // `[p, project, number]` issue arm.
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/browser/123"),
+            Some(CairnResource::ProjectBrowser {
+                project: "CAIRN".to_string(),
+                slug: "123".to_string(),
+            })
+        );
+        // And a bare numeric segment is still an issue.
+        assert_eq!(
+            parse_uri("cairn://p/CAIRN/123"),
+            Some(CairnResource::Issue {
+                project: "CAIRN".to_string(),
+                number: 123,
+            })
+        );
     }
 
     #[test]
@@ -2912,6 +3194,30 @@ mod tests {
         assert_eq!(build_bug_uri(), "cairn://bug");
         assert_eq!(CairnResource::Bug.project(), None);
         assert_eq!(CairnResource::Bug.to_route(), None);
+    }
+
+    #[test]
+    fn parses_and_round_trips_dev_resources() {
+        // The collection entrypoint and its two sub-tools parse and round-trip.
+        assert_eq!(parse_uri("cairn://dev"), Some(CairnResource::Dev));
+        assert_eq!(parse_uri("cairn://dev/db"), Some(CairnResource::DevDb));
+        assert_eq!(parse_uri("cairn://dev/pid"), Some(CairnResource::DevPid));
+        assert_eq!(CairnResource::Dev.to_uri(), "cairn://dev");
+        assert_eq!(CairnResource::DevDb.to_uri(), "cairn://dev/db");
+        assert_eq!(CairnResource::DevPid.to_uri(), "cairn://dev/pid");
+        // The flat legacy name is replaced outright, not aliased.
+        assert_eq!(parse_uri("cairn://dev-db"), None);
+        // An unknown sub-tool does not parse.
+        assert_eq!(parse_uri("cairn://dev/bogus"), None);
+        // None of them carry project or navigation scope.
+        for resource in [
+            CairnResource::Dev,
+            CairnResource::DevDb,
+            CairnResource::DevPid,
+        ] {
+            assert_eq!(resource.project(), None);
+            assert_eq!(resource.to_route(), None);
+        }
     }
 
     #[test]

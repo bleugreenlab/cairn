@@ -8,7 +8,7 @@ pub mod account_manager;
 pub mod agents;
 pub mod attention;
 pub mod attention_delivery;
-pub mod attention_ledger;
+pub mod attention_push;
 pub mod base_advance;
 pub mod build_services;
 pub mod config_resource;
@@ -64,12 +64,15 @@ pub struct OrchestratorBuilder {
     permission_responses: broadcast::Sender<(String, String)>,
     run_completions: broadcast::Sender<String>,
     prompt_responses: broadcast::Sender<(String, String)>,
+    browser_bridge_responses: broadcast::Sender<(String, String)>,
+    browser_nav_events: broadcast::Sender<crate::browsers::BrowserNavEvent>,
     trigger_events: broadcast::Sender<TriggerEvent>,
     attention_changed: broadcast::Sender<AttentionEvent>,
     session_allowed_tools: Arc<Mutex<HashSet<String>>>,
     session_allowed_crossings: Arc<Mutex<HashSet<String>>>,
     identity_store: Arc<Mutex<Option<IdentityStore>>>,
     mcp_binary_path: String,
+    jj_binary_path: String,
     config_dir: PathBuf,
     schema_dir: Option<PathBuf>,
     mcp_callback_port: u16,
@@ -79,6 +82,7 @@ pub struct OrchestratorBuilder {
     notifier: Notifier,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
+    browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     provider_usage_snapshots: Arc<RwLock<HashMap<String, ProviderUsageSnapshot>>>,
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
@@ -92,6 +96,8 @@ impl OrchestratorBuilder {
         let permission_responses = broadcast::channel(16).0;
         let run_completions = broadcast::channel(64).0;
         let prompt_responses = broadcast::channel(16).0;
+        let browser_bridge_responses = broadcast::channel(16).0;
+        let browser_nav_events = broadcast::channel(64).0;
         let trigger_events = broadcast::channel(256).0;
         let attention_changed = broadcast::channel(64).0;
         let session_allowed_tools = Arc::new(Mutex::new(HashSet::new()));
@@ -111,12 +117,15 @@ impl OrchestratorBuilder {
             permission_responses,
             run_completions,
             prompt_responses,
+            browser_bridge_responses,
+            browser_nav_events,
             trigger_events,
             attention_changed,
             session_allowed_tools,
             session_allowed_crossings,
             identity_store,
             mcp_binary_path: "cairn-cli".to_string(),
+            jj_binary_path: "jj".to_string(),
             config_dir,
             schema_dir: None,
             mcp_callback_port: 0,
@@ -126,6 +135,7 @@ impl OrchestratorBuilder {
             notifier,
             api_config: ApiConfig::default(),
             effect_tx: None,
+            browser_command_tx: None,
             model_catalog: Arc::new(RwLock::new(HashMap::new())),
             provider_usage_snapshots: Arc::new(RwLock::new(HashMap::new())),
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
@@ -199,6 +209,11 @@ impl OrchestratorBuilder {
         self
     }
 
+    pub fn jj_binary_path(mut self, jj_binary_path: impl Into<String>) -> Self {
+        self.jj_binary_path = jj_binary_path.into();
+        self
+    }
+
     pub fn schema_dir(mut self, schema_dir: Option<PathBuf>) -> Self {
         self.schema_dir = schema_dir;
         self
@@ -245,6 +260,14 @@ impl OrchestratorBuilder {
         self
     }
 
+    pub fn browser_command_tx(
+        mut self,
+        browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
+    ) -> Self {
+        self.browser_command_tx = browser_command_tx;
+        self
+    }
+
     pub fn build(self) -> Orchestrator {
         let anon_device_manager = Arc::new(AnonDeviceManager::new(
             self.db.clone(),
@@ -260,12 +283,15 @@ impl OrchestratorBuilder {
             permission_responses: self.permission_responses,
             run_completions: self.run_completions,
             prompt_responses: self.prompt_responses,
+            browser_bridge_responses: self.browser_bridge_responses,
+            browser_nav_events: self.browser_nav_events,
             trigger_events: self.trigger_events,
             attention_changed: self.attention_changed,
             session_allowed_tools: self.session_allowed_tools,
             session_allowed_crossings: self.session_allowed_crossings,
             identity_store: self.identity_store,
             mcp_binary_path: self.mcp_binary_path,
+            jj_binary_path: self.jj_binary_path,
             config_dir: self.config_dir,
             schema_dir: self.schema_dir,
             mcp_callback_port: self.mcp_callback_port,
@@ -277,6 +303,7 @@ impl OrchestratorBuilder {
             notifier: self.notifier,
             api_config: self.api_config,
             effect_tx: self.effect_tx,
+            browser_command_tx: self.browser_command_tx,
             executor: Arc::new(OnceLock::new()),
             mcp_gateway: Arc::new(OnceLock::new()),
             model_catalog: self.model_catalog,
@@ -286,7 +313,6 @@ impl OrchestratorBuilder {
             setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
-            blocker_escalation_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -327,6 +353,21 @@ pub struct Orchestrator {
     /// Hosts send on this channel when a user responds to an ask_user prompt.
     pub prompt_responses: broadcast::Sender<(String, String)>,
 
+    /// Inline-browser bridge response broadcast: (request_id, payload_json).
+    /// The app-side `browser_bridge_message` command sends on this channel when
+    /// a webview's content script posts back an extract/interaction result; the
+    /// synchronous read/write awaiter filters by `request_id`. Lives in the
+    /// orchestrator default; hosts without a webview never publish on it.
+    pub browser_bridge_responses: broadcast::Sender<(String, String)>,
+
+    /// Inline-browser navigation lifecycle broadcast. The app's `on_navigation`
+    /// and `on_page_load` handlers publish a [`BrowserNavEvent`](crate::browsers::BrowserNavEvent)
+    /// on nav start / load finish; the interaction path subscribes BEFORE a
+    /// click (or submit-typing) to confirm whether it navigated, and the
+    /// `waitForNavigation`/`waitForLoad` actions await the next event. Hosts
+    /// without a webview never publish on it.
+    pub browser_nav_events: broadcast::Sender<crate::browsers::BrowserNavEvent>,
+
     /// Trigger event channel for event-driven recipe dispatch.
     /// Emission sites send lean `TriggerEvent` values; each host subscribes
     /// and dispatches through `process_trigger_event`.
@@ -364,6 +405,8 @@ pub struct Orchestrator {
     // === Host-specific paths (set by Tauri or cairn-server) ===
     /// Path to the cairn-cli binary
     pub mcp_binary_path: String,
+    /// Path to the jj binary (bundled sidecar; falls back to PATH `jj`).
+    pub jj_binary_path: String,
     /// Directory for writing MCP config files
     pub config_dir: PathBuf,
     /// Directory containing bundled preset schemas (None if not available)
@@ -409,6 +452,13 @@ pub struct Orchestrator {
     /// `None` when the host hasn't set up an effect drainer yet (backward compat).
     pub effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
 
+    /// Sender into the app-side browser drain task. Core dispatch and execution
+    /// teardown push [`BrowserCommand`](crate::browsers::BrowserCommand)s here;
+    /// the app applies them to its `BrowserRegistry` (which holds the live
+    /// `Webview` handles — a Tauri type cairn-core cannot name). `None` on hosts
+    /// without a webview layer (headless/server).
+    pub browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
+
     /// Host-specific effect executor for `StartAgentJobs` and `ExecuteAction`.
     ///
     /// Wrapped in `Arc<OnceLock<...>>` so it's Clone-compatible (Orchestrator
@@ -442,11 +492,6 @@ pub struct Orchestrator {
     /// daemon that detaches (e.g. an sccache server) outlives its launcher,
     /// which is acceptable for a shared cache. See `orchestrator::build_services`.
     pub build_service_children: Arc<Mutex<HashMap<String, Box<dyn ChildProcess>>>>,
-
-    /// Wakes the blocker-escalation worker when a new pending question/permission
-    /// item arms an escalation deadline, so the worker re-computes its next sleep
-    /// instead of polling (CAIRN-1647).
-    pub blocker_escalation_notify: Arc<tokio::sync::Notify>,
 
     /// Per-run dedupe for legacy `agent-attention` terminal toasts.
     ///
@@ -540,7 +585,7 @@ impl Orchestrator {
                 );
             }
             _ => {
-                crate::orchestrator::attention_delivery::open_and_schedule_for_fact(self, &event);
+                crate::orchestrator::attention_delivery::create_resolved_push(self, &event);
             }
         }
         let _ = self.attention_changed.send(event);
@@ -695,53 +740,6 @@ impl Orchestrator {
         });
     }
 
-    /// Spawn the pending-blocker escalation worker (CAIRN-1647).
-    ///
-    /// A question/permission attention item opens passive and arms an absolute
-    /// deadline (`attention_items.escalate_at`). This worker sleeps until the
-    /// soonest deadline — woken early via `blocker_escalation_notify` when a new
-    /// blocker arms a nearer one — then escalates any blocker still open at its
-    /// deadline to a steering wake. It is a timer, not a poll: it sleeps exactly
-    /// until the next deadline and otherwise blocks on the notify. Durable:
-    /// deadlines live in the ledger, so a restart re-arms every timer on the
-    /// first pass and fires anything already overdue immediately.
-    pub fn spawn_blocker_escalation_worker(&self) {
-        // Floor on the immediate-fire path so a transient clear failure can't
-        // spin the loop hot.
-        const IMMEDIATE_FIRE_FLOOR: std::time::Duration = std::time::Duration::from_millis(200);
-        let orch = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let next =
-                    crate::orchestrator::attention_ledger::min_pending_escalation(&orch.db.local)
-                        .await
-                        .ok()
-                        .flatten();
-                match next {
-                    None => orch.blocker_escalation_notify.notified().await,
-                    Some(due_at) => {
-                        let now = chrono::Utc::now().timestamp();
-                        if due_at <= now {
-                            crate::orchestrator::attention_delivery::fire_due_blocker_escalations(
-                                &orch,
-                            )
-                            .await;
-                            tokio::time::sleep(IMMEDIATE_FIRE_FLOOR).await;
-                        } else {
-                            let dur = std::time::Duration::from_secs((due_at - now) as u64);
-                            tokio::select! {
-                                _ = tokio::time::sleep(dur) => {
-                                    crate::orchestrator::attention_delivery::fire_due_blocker_escalations(&orch).await;
-                                }
-                                _ = orch.blocker_escalation_notify.notified() => {}
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     /// Spawn the memory-triage reconciliation sweep: once immediately at
     /// startup, then on a periodic timer. The sweep is driven entirely by DB
     /// state and guarantees every at-threshold pending pool has a triage issue
@@ -767,6 +765,35 @@ impl Orchestrator {
                 {
                     log::warn!("memory triage reconcile failed: {error}");
                 }
+            }
+        });
+    }
+
+    /// Periodically reconcile in-flight default-branch workspaces against a
+    /// **non-webhook** default-branch advance — a local-only project (no GitHub
+    /// remote/webhook) or a manual `git pull` on the default branch, neither of
+    /// which delivers a GitHub `push` event. The push webhook covers the
+    /// remote-push case; this timer is the only trigger for those local cases
+    /// (and is idempotent with the webhook when both fire). The first tick fires
+    /// immediately so an advance that landed while the app was closed is picked
+    /// up at startup. Each sweep gates on in-flight siblings before touching jj,
+    /// so idle projects cost only a cheap query. Errors are logged, never fatal.
+    /// Must be called from within a tokio runtime context.
+    pub fn spawn_default_advance_reconcile(&self) {
+        /// Sweep cadence after the immediate startup pass. The GitHub `push`
+        /// webhook is the fast path for remote pushes; this timer backstops the
+        /// no-webhook cases, so a minute's latency before an in-flight agent
+        /// picks up a locally advanced default branch is fine.
+        const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+            loop {
+                // The first tick fires immediately, so the sweep runs once at
+                // startup, then every SWEEP_INTERVAL.
+                interval.tick().await;
+                crate::orchestrator::base_advance::reconcile_all_local_default_advances(&orch)
+                    .await;
             }
         });
     }
@@ -972,7 +999,11 @@ impl Orchestrator {
         Some(state)
     }
 
-    fn context_window_for_context_tokens(&self, backend: &str, model: Option<&str>) -> Option<i64> {
+    pub(crate) fn context_window_for_context_tokens(
+        &self,
+        backend: &str,
+        model: Option<&str>,
+    ) -> Option<i64> {
         if backend.eq_ignore_ascii_case("claude") {
             return Some(claude_context_window(
                 model.unwrap_or("unknown"),
@@ -980,12 +1011,12 @@ impl Orchestrator {
             ));
         }
 
-        if backend.eq_ignore_ascii_case("codex") {
+        if backend.eq_ignore_ascii_case("codex") || backend.eq_ignore_ascii_case("openrouter") {
             return model.and_then(|model| {
                 self.model_catalog
                     .read()
                     .ok()
-                    .and_then(|catalog| catalog.get("codex").cloned())
+                    .and_then(|catalog| catalog.get(&backend.to_lowercase()).cloned())
                     .and_then(|catalog| context_window_from_catalog(&catalog.models, model))
             });
         }
@@ -994,7 +1025,7 @@ impl Orchestrator {
     }
 
     pub fn refresh_model_catalog(&self) {
-        for backend_name in ["claude", "codex"] {
+        for backend_name in ["claude", "codex", "openrouter"] {
             let backend = backend_for_name(Some(backend_name));
             let entry = match backend.discover_models() {
                 Ok(models) => ProviderModelCatalog {
@@ -1210,6 +1241,11 @@ mod tests {
                     default_reasoning_effort: None,
                     supported_reasoning_efforts: Vec::new(),
                     context_window: Some(258_400),
+                    canonical_slug: None,
+                    pricing: None,
+                    supported_parameters: Vec::new(),
+                    router: false,
+                    architecture_modality: None,
                 }],
                 options: Vec::new(),
                 refreshed_at: Some(20),
@@ -1276,6 +1312,71 @@ mod tests {
         assert_eq!(state.reasoning_tokens, Some(12));
         assert_eq!(state.last_output_tokens, Some(38));
         assert_eq!(state.captured_at, 10);
+    }
+
+    #[tokio::test]
+    async fn openrouter_context_window_sourced_from_catalog_not_hardcoded() {
+        let db = test_db().await;
+        db.local
+            .execute_script(
+                "
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('project-or', 'default', 'OR Project', 'ORP', '/tmp/orp', 1, 1);
+                INSERT INTO jobs(id, project_id, status, model, created_at, updated_at)
+                 VALUES ('job-or', 'project-or', 'running', 'anthropic/claude-sonnet-4.5', 1, 1);
+                INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+                 VALUES ('session-or', 'job-or', 'openrouter', 'open', 1, 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
+                 VALUES ('run-or', 'project-or', 'job-or', 'exited', 'session-or', 'openrouter', 1, 1);
+                INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                    parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                    cache_create_tokens, output_tokens, thinking_tokens)
+                 VALUES ('event-or', 'run-or', 'session-or', 1, 10, 'assistant', '{}',
+                    NULL, 10, 10, 0, 0, 40, 5);
+                ",
+            )
+            .await
+            .unwrap();
+
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        orch.model_catalog.write().unwrap().insert(
+            "openrouter".to_string(),
+            ProviderModelCatalog {
+                backend: "openrouter".to_string(),
+                models: vec![DiscoveredModel {
+                    id: "anthropic/claude-sonnet-4.5".to_string(),
+                    model: "anthropic/claude-sonnet-4.5".to_string(),
+                    display_name: "Claude Sonnet 4.5".to_string(),
+                    description: None,
+                    hidden: false,
+                    is_default: false,
+                    default_reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
+                    context_window: Some(200_000),
+                    canonical_slug: None,
+                    pricing: None,
+                    supported_parameters: Vec::new(),
+                    router: false,
+                    architecture_modality: None,
+                }],
+                options: Vec::new(),
+                refreshed_at: Some(10),
+                error: None,
+            },
+        );
+
+        let state = orch.get_context_token_state("session-or").await.unwrap();
+        assert_eq!(state.backend, "openrouter");
+        assert_eq!(state.model, Some("anthropic/claude-sonnet-4.5".to_string()));
+        // The selected model's real catalog window flows into ContextTokenState,
+        // not a hardcoded 1M assumption.
+        assert_eq!(state.context_window, Some(200_000));
+        assert_ne!(state.context_window, Some(1_000_000));
     }
 
     #[tokio::test]

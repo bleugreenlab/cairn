@@ -341,7 +341,7 @@ async fn apply(
                 conn.execute(
                     "INSERT OR IGNORE INTO archival_blobs(hash, content, created_at)
                      VALUES (?1, ?2, unixepoch())",
-                    turso::params![hash.as_str(), turso::Value::Blob(content.clone())],
+                    (hash.as_str(), turso::Value::Blob(content.clone())),
                 )
                 .await?;
             }
@@ -355,15 +355,15 @@ async fn apply(
                     "UPDATE events SET storage_mode = ?1, content_commit = ?2,
                          content_render_sha = ?3, data = ?4, data_blob = ?5, codec = ?6
                      WHERE id = ?7",
-                    turso::params![
+                    (
                         cols.storage_mode.as_deref(),
                         cols.content_commit.as_deref(),
                         cols.content_render_sha.as_deref(),
                         cols.data.as_str(),
                         blob_value,
                         cols.codec.as_deref(),
-                        id.as_str()
-                    ],
+                        id.as_str(),
+                    ),
                 )
                 .await?;
             }
@@ -423,13 +423,9 @@ async fn load_bucket_batch(
     match worktree_path {
         Some(path) => {
             let path = path.to_string();
-            db.query_all(sql, turso::params![path, limit], event_from_row)
-                .await
+            db.query_all(sql, (path, limit), event_from_row).await
         }
-        None => {
-            db.query_all(sql, turso::params![limit], event_from_row)
-                .await
-        }
+        None => db.query_all(sql, (limit,), event_from_row).await,
     }
 }
 
@@ -450,7 +446,7 @@ async fn mark_backfill_complete(db: &LocalDb) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp();
     db.execute(
         "UPDATE archival_backfill_state SET backfill_completed_at = ?1 WHERE id = 1",
-        turso::params![now],
+        (now,),
     )
     .await
     .map(|_| ())
@@ -529,6 +525,7 @@ mod tests {
             thinking_tokens: None,
             storage_mode: None,
             content_commit: None,
+            content_change_id: None,
             content_render_sha: None,
             data_blob: None,
             codec: None,

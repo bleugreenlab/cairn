@@ -47,6 +47,49 @@ async fn insert_project_job_run_turn(db: &LocalDb, turn_state: &str) {
     .unwrap();
 }
 
+async fn insert_pending_run_tool_event(db: &LocalDb) {
+    let data = serde_json::json!({
+        "eventType": "assistant",
+        "sessionId": "session-1",
+        "parentToolUseId": null,
+        "content": null,
+        "thinking": null,
+        "toolName": null,
+        "toolInput": null,
+        "toolUses": [
+            {
+                "id": "tool-run-1",
+                "name": "mcp__cairn__run",
+                "input": { "commands": [{ "command": "sleep 60" }] }
+            },
+            {
+                "id": "tool-read-1",
+                "name": "mcp__cairn__read",
+                "input": { "paths": ["file:README.md"] }
+            }
+        ],
+        "toolUseId": null,
+        "toolResult": null,
+        "isError": false,
+        "raw": null
+    })
+    .to_string();
+    db.write(|conn| {
+        let data = data.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at, turn_id)
+                 VALUES ('event-assistant-1', 'run-1', 'session-1', 1, 1, 'assistant', ?1, 1, 'turn-1')",
+                params![data.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
 async fn insert_issue_job_run_turn(db: &LocalDb, project_id: &str) {
     let project_id = project_id.to_string();
     db.write(|conn| {
@@ -259,5 +302,45 @@ async fn stop_session_cancels_pending_turn_missing_from_process_map() {
         )
         .await,
         Some("exited".to_string())
+    );
+}
+
+#[tokio::test]
+async fn stop_session_fails_pending_run_tool_result() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "running").await;
+    insert_pending_run_tool_event(&orch.db.local).await;
+
+    lifecycle::stop_session(&orch, "run-1").unwrap();
+
+    let data = common::scalar_text_by_id(
+        &orch.db.local,
+        "SELECT data FROM events WHERE run_id = ?1 AND event_type = 'tool_result'",
+        "run-1",
+    )
+    .await
+    .expect("stop should synthesize a tool_result for the pending run call");
+    let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        parsed.get("toolUseId").and_then(|value| value.as_str()),
+        Some("tool-run-1")
+    );
+    assert_eq!(
+        parsed.get("isError").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        parsed.get("toolResult").and_then(|value| value.as_str()),
+        Some("Run interrupted by user stop.")
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'tool_result'",
+            "run-1",
+        )
+        .await,
+        1,
+        "non-run pending tools should not get synthetic run failure results"
     );
 }

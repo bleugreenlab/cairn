@@ -648,6 +648,7 @@ pub async fn update_issue_by_project_number(
 
     let embed_description = patch.description.clone();
     let labels_changed = patch.labels.is_some();
+    let parent_changed = patch.parent.is_some();
     let status = patch.status.clone();
     let issue = update_issue_row(
         &orch.db.local,
@@ -662,9 +663,26 @@ pub async fn update_issue_by_project_number(
 
     // Re-embed only when the description was part of this update; a title-only
     // or dependency-only patch leaves the stored description untouched.
+    let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
     if let Some(description) = embed_description {
-        let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
         orch.enqueue_resource_embed(&issue_uri, description);
+    }
+
+    if parent_changed {
+        if let Err(error) =
+            crate::orchestrator::wakes::reconcile_default_child_subscription_for_issue(
+                &orch.db.local,
+                &issue.id,
+                &issue_uri,
+            )
+            .await
+        {
+            log::warn!(
+                "failed to reconcile wake subscription for patched child issue {}: {}",
+                issue_uri,
+                error
+            );
+        }
     }
 
     orch.sync(crate::sync::SyncMessage::Issue((&issue).into()));
@@ -789,6 +807,12 @@ async fn load_issue_by_id(conn: &turso::Connection, issue_id: &str) -> DbResult<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::SearchIndex;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("issues-handler.db").await
@@ -816,6 +840,28 @@ mod tests {
         .unwrap();
     }
 
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    fn request(run_id: Option<&str>) -> McpCallbackRequest {
+        McpCallbackRequest {
+            cwd: "/tmp/repo".to_string(),
+            run_id: run_id.map(ToString::to_string),
+            tool: "write".to_string(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+        }
+    }
+
     async fn root_job(db: &LocalDb, run_id: &str) -> Option<String> {
         let run_id = run_id.to_string();
         db.read(|conn| {
@@ -824,6 +870,92 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parent_patch_reconciles_default_child_subscription() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w2', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES('p2', 'w2', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('parent', 'p2', 1, 'Parent', 'active', 'active', 'none', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+             VALUES('child', 'p2', 2, 'Child', 'active', 'active', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+             VALUES('coord', 'p2', 'parent', 'running', 's-coord', 1, 1);
+            INSERT INTO runs(id, job_id, status, created_at, updated_at)
+             VALUES('run-coord', 'coord', 'running', 1, 1);
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+             VALUES('manual', 'p2', 'parent', 'running', 's-manual', 1, 1);
+            INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state, created_by, created_at, updated_at, one_shot)
+             VALUES('manual-sub', 'manual', 'issue', 'cairn://p/PROJ/2', 'active', 'agent', 1, 1, 0);
+            ",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        update_issue_by_project_number(
+            &orch,
+            &request(Some("run-coord")),
+            "PROJ",
+            2,
+            IssuePatchFields {
+                title: None,
+                description: None,
+                depends_on: None,
+                labels: None,
+                status: None,
+                parent: Some(Some("cairn://p/PROJ/1".to_string())),
+            },
+        )
+        .await
+        .unwrap();
+
+        let coord_subs =
+            crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "coord")
+                .await
+                .unwrap();
+        assert_eq!(coord_subs.len(), 1);
+        assert_eq!(
+            coord_subs[0].source_ref.as_deref(),
+            Some("cairn://p/PROJ/2")
+        );
+
+        update_issue_by_project_number(
+            &orch,
+            &request(Some("run-coord")),
+            "PROJ",
+            2,
+            IssuePatchFields {
+                title: None,
+                description: None,
+                depends_on: None,
+                labels: None,
+                status: None,
+                parent: Some(None),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "coord")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::orchestrator::wakes::list_subscriptions_for_job(&orch.db.local, "manual")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "orphaning must not remove manual watchers"
+        );
     }
 
     #[tokio::test]

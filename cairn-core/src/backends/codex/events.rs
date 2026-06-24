@@ -9,7 +9,8 @@ use crate::models::{
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::transcripts::stream_store::{
-    append_chunks, finalize_stream, open_stream, process_post_commit_outbox, EmitDelta, EventInsert,
+    append_chunks, finalize_stream_emit, open_stream, process_post_commit_outbox, EmitDelta,
+    EventInsert,
 };
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
@@ -80,6 +81,7 @@ pub(super) fn store_event(
     let event_id = Uuid::new_v4().to_string();
     store_event_with_id(
         orch,
+        emitter,
         run_id,
         session_id,
         sequence,
@@ -87,22 +89,6 @@ pub(super) fn store_event(
         event,
         TokenCounts::default(),
     );
-    let _ = emitter.emit("db-change", event_db_change(run_id, session_id, "insert"));
-}
-
-pub(super) fn event_db_change(
-    run_id: &str,
-    session_id: Option<&str>,
-    action: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "table": "events",
-        "action": action,
-        "runId": run_id,
-        "run_id": run_id,
-        "sessionId": session_id,
-        "session_id": session_id,
-    })
 }
 
 /// Emit a true-delta `streaming-update`: only the newly-produced scalar tail
@@ -163,8 +149,11 @@ pub(super) fn ensure_stream_open(
         "codex",
         Some(sequence),
     )?;
-    *streaming_state = Some(StreamingState::new(&stream, run_id, session_id));
-    let _ = emitter.emit("db-change", event_db_change(run_id, session_id, "insert"));
+    *streaming_state = Some(StreamingState::new(&stream, run_id));
+    let _ = emitter.emit(
+        "db-change",
+        crate::notify::event_db_change(run_id, session_id, "insert"),
+    );
     Ok(())
 }
 
@@ -327,6 +316,7 @@ pub(super) fn handle_turn_completed(
             let event_id = Uuid::new_v4().to_string();
             store_event_with_id(
                 orch,
+                emitter,
                 run_id,
                 session_id,
                 *sequence,
@@ -334,7 +324,6 @@ pub(super) fn handle_turn_completed(
                 &result_event,
                 counts,
             );
-            let _ = emitter.emit("db-change", event_db_change(run_id, session_id, "insert"));
             *sequence += 1;
 
             let is_task = is_task_spawned_run(CODEX_BACKEND_NAME, orch, run_id);
@@ -497,6 +486,7 @@ pub(super) fn codex_rate_limit_snapshot_from_value(raw: Value) -> Option<Provide
         error: None,
         unsupported_reason: None,
         raw: Some(raw),
+        model_breakdown: None,
     })
 }
 
@@ -521,8 +511,10 @@ pub(super) fn codex_rate_limit_window_label(id: &str, window_duration_mins: Opti
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn store_event_with_id(
     orch: &Orchestrator,
+    emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
     sequence: i32,
@@ -534,8 +526,9 @@ pub(super) fn store_event_with_id(
     let data = serde_json::to_string(event).unwrap_or_default();
 
     let current_turn = orch.process_state.get_current_turn_id(run_id);
-    if crate::transcripts::stream_store::insert_event(
+    if crate::transcripts::stream_store::insert_event_emit(
         orch.db.local.clone(),
+        emitter,
         EventInsert {
             id: event_id.to_string(),
             run_id: run_id.to_string(),
@@ -552,6 +545,7 @@ pub(super) fn store_event_with_id(
             output_tokens: counts.output,
             thinking_tokens: counts.thinking,
             turn_id: current_turn.clone(),
+            cost_usd: None,
         },
     )
     .unwrap_or(false)
@@ -645,18 +639,15 @@ pub(super) fn finalize_streaming_with_event(
         let d = state.acc.take_emit_delta();
         emit_streaming_delta(emitter, &state.run_id, &state.stream_id, &d);
     }
-    match finalize_stream(
+    match finalize_stream_emit(
         orch.db.local.clone(),
+        emitter,
         &state.stream_id,
         state.version,
         final_event,
         TokenCounts::default(),
     ) {
         Ok(finalized) => {
-            let _ = emitter.emit(
-                "db-change",
-                event_db_change(&state.run_id, state.session_id.as_deref(), "insert"),
-            );
             process_post_commit_outbox(orch, &finalized.outbox_entries);
             *sequence += 1;
         }

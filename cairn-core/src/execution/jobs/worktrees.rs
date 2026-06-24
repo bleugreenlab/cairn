@@ -28,8 +28,14 @@ pub(crate) fn prepare_worktree_for_job(
     let repo = Path::new(repo_path);
 
     let cleanup = || {
-        let _ =
-            crate::git::worktree::remove_worktree_with_services(git, fs, repo, worktree_path, true);
+        // A jj workspace is .jj-only and not registered as a git worktree, so
+        // `git worktree remove` would fail and strand both the directory and the
+        // shared-store registration. Forget it from the store (handles a
+        // partially-created workspace too) and remove the dir.
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, repo);
+        let _ = crate::jj::forget_workspace(&jj, &store, branch);
+        let _ = std::fs::remove_dir_all(worktree_path);
     };
 
     // 1. Create worktree
@@ -45,18 +51,31 @@ pub(crate) fn prepare_worktree_for_job(
             worktree_path.display()
         )),
     );
-    crate::git::worktree::create_worktree_with_services(
-        git,
-        fs,
-        repo,
-        worktree_path,
-        branch,
-        base_ref,
-    )
-    .map_err(|message| crate::git::worktree::SetupError::Spawn {
-        command: "git worktree add".to_string(),
-        message,
+    // Provision one shared jj store (a Cairn-managed jj repo backed by the
+    // project's existing .git, so the user's checkout is never touched) and add
+    // this job's working dir as a jj workspace off it. jj is the only substrate.
+    // See docs/jj-migration.md.
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo);
+    crate::jj::ensure_project_store(&jj, &store, repo).map_err(|message| {
+        crate::git::worktree::SetupError::Spawn {
+            command: "jj git init --git-repo".to_string(),
+            message,
+        }
     })?;
+    // Resolve the base to a commit id so jj always finds it in the shared
+    // backing object db, regardless of how the base ref is named.
+    let base_rev = git
+        .rev_parse(repo, vec![base_ref.to_string()])
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| base_ref.to_string());
+    crate::jj::add_workspace(&jj, &store, worktree_path, branch, &base_rev, None).map_err(
+        |message| crate::git::worktree::SetupError::Spawn {
+            command: "jj workspace add".to_string(),
+            message,
+        },
+    )?;
     setup_progress::emit(
         sink,
         job_id,
@@ -82,6 +101,16 @@ pub(crate) fn prepare_worktree_for_job(
             None,
             Some("[info] Populating gitignored content".to_string()),
         );
+        // Establish the jj-native exclude BEFORE populate copies files in: jj
+        // auto-tracks a new file on the first snapshot after it appears, and a
+        // later rule cannot un-track it, so explicitly-populated gitignored
+        // content (e.g. .env, node_modules) must be kept out of
+        // snapshot.auto-track up front. Best-effort here — the post-populate
+        // backstop below is the real guarantee and fails setup loudly if any
+        // populated path is still snapshot-visible.
+        if let Err(e) = crate::jj::set_populate_auto_track(&jj, &store, &populate_config, &[]) {
+            log::warn!("Failed to set snapshot.auto-track for populate excludes: {e}");
+        }
         match crate::git::worktree::populate_worktree(
             git,
             fs,
@@ -117,6 +146,49 @@ pub(crate) fn prepare_worktree_for_job(
                     None,
                     Some(line),
                 );
+            }
+        }
+        // Security backstop: explicitly-populated gitignored content must stay
+        // UNCOMMITTED so a later run/write seal can never commit secrets or
+        // build artifacts. At this point only populate has run (no setup
+        // commands, no agent edits), so ANY path visible in `@` is populated
+        // content that leaked past the auto-track exclude. Self-heal a
+        // conservative glob-translation miss by adding the exact leaked paths to
+        // auto-track and un-tracking them; fail setup loudly if anything still
+        // leaks rather than provision a worktree where populated content could
+        // be sealed.
+        match crate::jj::working_copy_dirty_paths(&jj, worktree_path) {
+            Ok(leaked) if !leaked.is_empty() => {
+                log::warn!(
+                    "populate exclude missed {} path(s); self-healing: {:?}",
+                    leaked.len(),
+                    leaked
+                );
+                let _ = crate::jj::set_populate_auto_track(&jj, &store, &populate_config, &leaked);
+                let _ = crate::jj::untrack_paths(&jj, worktree_path, &leaked);
+                let still = crate::jj::working_copy_dirty_paths(&jj, worktree_path)
+                    .unwrap_or_else(|_| leaked.clone());
+                if !still.is_empty() {
+                    cleanup();
+                    return Err(crate::git::worktree::SetupError::Spawn {
+                        command: "populate exclude verification".to_string(),
+                        message: format!(
+                            "explicitly-populated gitignored content is still snapshot-visible \
+                             and could be committed: {}. Refusing to provision the worktree.",
+                            still.join(", ")
+                        ),
+                    });
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // Can't verify the security invariant — fail loud rather than
+                // provision a worktree where populated content might be sealed.
+                cleanup();
+                return Err(crate::git::worktree::SetupError::Spawn {
+                    command: "populate exclude verification".to_string(),
+                    message: format!("could not verify populate excludes: {e}"),
+                });
             }
         }
         if cancel.load(Ordering::SeqCst) {

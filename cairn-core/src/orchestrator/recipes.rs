@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{recipes as config_recipes, slugify, ConfigResult};
 use crate::models::{
-    CreateRecipe, Recipe, RecipeFile, RecipeFileValidation, RecipeVersionInfo,
-    UpdateRecipe,
+    CreateRecipe, Recipe, RecipeFile, RecipeFileValidation, RecipeVersionInfo, UpdateRecipe,
 };
 
 use super::config_resource::{self, merge_optional, ConfigResource};

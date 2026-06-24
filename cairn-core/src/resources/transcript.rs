@@ -166,9 +166,17 @@ pub(super) async fn get_single_event(
     let Ok(Some(row)) = rows.next().await else {
         return format!("Event with sequence {} not found", event_seq);
     };
-    // change_preview_* ride just past EVENT_COLUMNS (20 columns, indices 0–19).
-    let preview_status = row.opt_text(20).ok().flatten();
-    let preview_applied = row.opt_i64(21).ok().flatten();
+    // change_preview_* ride just past EVENT_COLUMNS; key off EVENT_COLUMN_COUNT so
+    // adding an event column shifts them in lockstep rather than reading the wrong
+    // slot.
+    let preview_status = row
+        .opt_text(crate::runs::queries::EVENT_COLUMN_COUNT)
+        .ok()
+        .flatten();
+    let preview_applied = row
+        .opt_i64(crate::runs::queries::EVENT_COLUMN_COUNT + 1)
+        .ok()
+        .flatten();
     let Ok(event) = crate::runs::queries::event_from_row(&row) else {
         return format!("Event with sequence {} not found", event_seq);
     };
@@ -1209,6 +1217,8 @@ pub(super) fn format_transcript_digest(
     meta: &DigestMeta,
     turn_sequences: &HashMap<String, i32>,
     latest: bool,
+    turn_offset: Option<i64>,
+    turn_limit: Option<usize>,
 ) -> String {
     if events.is_empty() {
         return "No runs found for this node.".to_string();
@@ -1269,7 +1279,15 @@ pub(super) fn format_transcript_digest(
     if latest {
         order.reverse();
     }
-    for block_index in order {
+    let start = match turn_offset.unwrap_or(0) {
+        raw if raw < 0 => blocks.len().saturating_sub(raw.unsigned_abs() as usize),
+        raw => (raw as usize).min(blocks.len()),
+    };
+    let end = turn_limit
+        .map(|limit| (start + limit).min(order.len()))
+        .unwrap_or(order.len());
+    let order = &order[start..end];
+    for &block_index in order {
         let block = &blocks[block_index];
         let (turn_label, linkable) = match block.turn_id.and_then(|id| turn_sequences.get(id)) {
             Some(seq) => (seq.to_string(), true),
@@ -1473,7 +1491,7 @@ mod tests {
                 conn.execute(
                     "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id, storage_mode, data_blob, codec)
                      VALUES ('ev','run',1,1,'user','{\"_archived\":true}',1,'turn-1','zstd',?1,'zstd_v1')",
-                    turso::params![blob],
+                    (blob,),
                 )
                 .await?;
                 Ok(())
@@ -1667,6 +1685,8 @@ mod tests {
             &digest_meta(),
             &turns,
             false,
+            None,
+            None,
         );
         assert!(out.contains("# builder — CAIRN-1666/1 · 1 run · 1 turn · 3 events · complete"));
         assert!(out.contains("raw stream: cairn://p/CAIRN/1666/1/builder/chat/raw"));
@@ -1710,7 +1730,8 @@ mod tests {
             ),
         ];
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
-        let out = format_transcript_digest(&events, "base", &digest_meta(), &turns, false);
+        let out =
+            format_transcript_digest(&events, "base", &digest_meta(), &turns, false, None, None);
         assert!(out.contains("· write src/app.rs (+2 −1)"));
         assert!(out.contains("[committed 6102407]"));
         assert!(out.contains("· write todos — Replaced 3 todos for builder (0 completed)"));
@@ -1735,7 +1756,8 @@ mod tests {
             ),
         ];
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
-        let out = format_transcript_digest(&events, "base", &digest_meta(), &turns, false);
+        let out =
+            format_transcript_digest(&events, "base", &digest_meta(), &turns, false, None, None);
         assert!(out.contains("· run cargo test [exit 0]"));
     }
 
@@ -1758,7 +1780,8 @@ mod tests {
             ),
         ];
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
-        let out = format_transcript_digest(&events, "base", &digest_meta(), &turns, false);
+        let out =
+            format_transcript_digest(&events, "base", &digest_meta(), &turns, false, None, None);
         assert!(out.contains(
             "✗ run git rebase origin/main — Failed to spawn process: No such file or directory"
         ));
@@ -1783,6 +1806,8 @@ mod tests {
             &digest_meta(),
             &turns,
             false,
+            None,
+            None,
         );
         assert!(out.contains("**User:**"));
         assert!(out.contains("→ cairn://p/CAIRN/1666/1/builder/chat/turn/1]"));
@@ -1796,10 +1821,41 @@ mod tests {
         ];
         let turns =
             std::collections::HashMap::from([("t1".to_string(), 1i32), ("t2".to_string(), 2i32)]);
-        let normal = format_transcript_digest(&events, "base", &digest_meta(), &turns, false);
-        let latest = format_transcript_digest(&events, "base", &digest_meta(), &turns, true);
+        let normal =
+            format_transcript_digest(&events, "base", &digest_meta(), &turns, false, None, None);
+        let latest =
+            format_transcript_digest(&events, "base", &digest_meta(), &turns, true, None, None);
         assert!(normal.find("## Turn 1").unwrap() < normal.find("## Turn 2").unwrap());
         assert!(latest.find("## Turn 2").unwrap() < latest.find("## Turn 1").unwrap());
+    }
+
+    #[test]
+    fn digest_offset_and_limit_page_whole_turns() {
+        let events = vec![
+            digest_ev(0, "t1", "user", serde_json::json!({ "content": "first" })),
+            digest_ev(1, "t2", "user", serde_json::json!({ "content": "second" })),
+            digest_ev(2, "t3", "user", serde_json::json!({ "content": "third" })),
+        ];
+        let turns = std::collections::HashMap::from([
+            ("t1".to_string(), 1i32),
+            ("t2".to_string(), 2i32),
+            ("t3".to_string(), 3i32),
+        ]);
+
+        let out = format_transcript_digest(
+            &events,
+            "base",
+            &digest_meta(),
+            &turns,
+            false,
+            Some(1),
+            Some(1),
+        );
+
+        assert!(!out.contains("## Turn 1"));
+        assert!(out.contains("## Turn 2"));
+        assert!(!out.contains("## Turn 3"));
+        assert!(out.contains("3 turns"));
     }
 
     #[test]
@@ -1813,7 +1869,8 @@ mod tests {
             }),
         )];
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
-        let out = format_transcript_digest(&events, "base", &digest_meta(), &turns, false);
+        let out =
+            format_transcript_digest(&events, "base", &digest_meta(), &turns, false, None, None);
         assert!(out.contains("· read src/x.rs [pending]"));
     }
 }

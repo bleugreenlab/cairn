@@ -16,8 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 /// The unit a segment windows by: a file/web read pages by line, a grep pages by
-/// match, a glob `files_with_matches` read pages by file, and a pushdown
-/// collection (`/issues`, `/messages`) pages by record.
+/// match, a glob `files_with_matches` read pages by file, a pushdown collection
+/// (`/issues`, `/messages`) pages by record, and chat digests page by turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NaturalUnit {
@@ -25,6 +25,7 @@ pub enum NaturalUnit {
     Match,
     File,
     Record,
+    Turn,
 }
 
 /// The producer family a segment came from. Drives header-suffix shape and
@@ -69,7 +70,7 @@ pub struct SegmentMeta {
     pub uri: String,
     pub kind: SegmentKind,
     pub natural_unit: NaturalUnit,
-    /// Total lines / total matches / total files, when known.
+    /// Total lines / total matches / total files / total turns, when known.
     pub total_units: Option<usize>,
     pub shown_units: usize,
     pub offset: usize,
@@ -78,8 +79,8 @@ pub struct SegmentMeta {
     pub match_count: Option<usize>,
     /// grep/glob: files.
     pub file_count: Option<usize>,
-    /// `Record` unit: the plural noun for the header suffix (`"issues"`,
-    /// `"messages"`). `None` for non-record segments.
+    /// `Record`/`Turn` unit: the plural noun for the header suffix (`"issues"`,
+    /// `"messages"`, `"turns"`). `None` for other segments.
     pub unit_noun: Option<String>,
     pub truncated: bool,
     /// True when a sub-line character fallback was used (single-huge-line case).

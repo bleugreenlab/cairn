@@ -71,6 +71,7 @@ pub(crate) fn store_user_event(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn store_transcript_event_with_turn(
     orch: &Orchestrator,
     run_id: &str,
@@ -79,32 +80,38 @@ fn store_transcript_event_with_turn(
     now: i32,
     turn_id: Option<&str>,
     transcript_event: TranscriptEvent,
+    push_ids: &[String],
 ) -> Result<(), String> {
     let event_id = Uuid::new_v4().to_string();
     let event_type = transcript_event.event_type.clone();
     let event_data = serde_json::to_string(&transcript_event).unwrap_or_default();
     let turn_id = turn_id.map(str::to_string);
 
-    insert_event(
-        orch.db.local.clone(),
-        EventInsert {
-            id: event_id.clone(),
-            run_id: run_id.to_string(),
-            session_id: Some(session_id.to_string()),
-            sequence,
-            timestamp: now,
-            event_type: event_type.clone(),
-            data: event_data.clone(),
-            parent_tool_use_id: None,
-            created_at: now,
-            input_tokens: None,
-            cache_read_tokens: None,
-            cache_create_tokens: None,
-            output_tokens: None,
-            thinking_tokens: None,
-            turn_id: turn_id.clone(),
-        },
-    )?;
+    let event = EventInsert {
+        id: event_id.clone(),
+        run_id: run_id.to_string(),
+        session_id: Some(session_id.to_string()),
+        sequence,
+        timestamp: now,
+        event_type: event_type.clone(),
+        data: event_data.clone(),
+        parent_tool_use_id: None,
+        created_at: now,
+        input_tokens: None,
+        cache_read_tokens: None,
+        cache_create_tokens: None,
+        output_tokens: None,
+        thinking_tokens: None,
+        turn_id: turn_id.clone(),
+        cost_usd: None,
+    };
+    // CAIRN-1881: when this event carries attention pushes, stamp them delivered
+    // in the same transaction as the event INSERT (atomic delivery seam).
+    if push_ids.is_empty() {
+        insert_event(orch.db.local.clone(), event)?;
+    } else {
+        insert_event_stamping_pushes(orch.db.local.clone(), event, push_ids.to_vec())?;
+    }
 
     orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
         id: event_id,
@@ -124,7 +131,7 @@ fn store_transcript_event_with_turn(
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "events", "action": "insert"}),
+        crate::notify::event_db_change(run_id, Some(session_id), "insert"),
     );
 
     Ok(())
@@ -168,51 +175,7 @@ pub(crate) fn store_user_event_with_turn(
         now,
         turn_id,
         transcript_event,
-    )
-}
-
-/// Store an attention briefing as its own `attention:briefing` event. The
-/// `items_json` payload (a `{active, catchup}` list) rides in `content`; the
-/// frontend renders it as a compact wake card rather than a markdown "You"
-/// block. The agent receives the resolved markdown via the prompt, not this
-/// event — this is display-only (CAIRN-1647).
-pub(crate) fn store_attention_briefing_event_with_turn(
-    orch: &Orchestrator,
-    run_id: &str,
-    session_id: &str,
-    items_json: &str,
-    now: i32,
-    sequence: i32,
-    turn_id: Option<&str>,
-) -> Result<(), String> {
-    let sequence = if sequence >= 0 {
-        sequence
-    } else {
-        get_next_sequence(orch.db.local.clone(), run_id)?
-    };
-    let transcript_event = TranscriptEvent {
-        event_type: "attention:briefing".to_string(),
-        session_id: Some(session_id.to_string()),
-        parent_tool_use_id: None,
-        content: Some(items_json.to_string()),
-        thinking: None,
-        tool_name: None,
-        tool_input: None,
-        tool_uses: None,
-        tool_use_id: None,
-        tool_result: None,
-        is_error: false,
-        thinking_ms: None,
-        raw: None,
-    };
-    store_transcript_event_with_turn(
-        orch,
-        run_id,
-        session_id,
-        sequence,
-        now,
-        turn_id,
-        transcript_event,
+        &[],
     )
 }
 
@@ -258,5 +221,49 @@ pub fn store_tool_result_event_with_turn(
         now,
         turn_id,
         transcript_event,
+        &[],
+    )
+}
+
+/// Persist a single carrying event for drained attention pushes and stamp each
+/// push delivered by it, atomically in the event-insert transaction
+/// (CAIRN-1881). The rendered push text rides in `content`; recovery redelivers
+/// only pushes whose carrying event never durably landed.
+pub(crate) fn store_attention_push_event(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    content: &str,
+    push_ids: &[String],
+    now: i32,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    let sequence = get_next_sequence(orch.db.local.clone(), run_id)?;
+    // CAIRN-1891: the carrying event for a resumed-into wake renders through the
+    // wake-card formatter; `content` is the structured `{active, catchup}` JSON.
+    let transcript_event = TranscriptEvent {
+        event_type: "attention:briefing".to_string(),
+        session_id: Some(session_id.to_string()),
+        parent_tool_use_id: None,
+        content: Some(content.to_string()),
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error: false,
+        thinking_ms: None,
+        raw: None,
+    };
+    store_transcript_event_with_turn(
+        orch,
+        run_id,
+        session_id,
+        sequence,
+        now,
+        turn_id,
+        transcript_event,
+        push_ids,
     )
 }

@@ -212,19 +212,7 @@ pub fn validate_skill_name(name: &str) -> Result<(), String> {
 /// # Skill prompt content
 /// ```
 pub fn parse_skill_markdown(content: &str) -> Result<ParsedSkill, String> {
-    // Check for frontmatter delimiters
-    if !content.starts_with("---\n") {
-        return Err("Missing frontmatter start delimiter".to_string());
-    }
-
-    // Find the end of frontmatter
-    let content_after_start = &content[4..]; // Skip first "---\n"
-    let end_idx = content_after_start
-        .find("\n---\n")
-        .ok_or("Missing frontmatter end delimiter")?;
-
-    let frontmatter_str = &content_after_start[..end_idx];
-    let prompt = content_after_start[end_idx + 5..].trim().to_string(); // Skip "\n---\n"
+    let (frontmatter_str, prompt) = crate::markdown_frontmatter::split_yaml_frontmatter(content)?;
 
     // Parse YAML frontmatter
     let frontmatter: SkillFrontmatter = serde_yaml::from_str(frontmatter_str)
@@ -529,6 +517,15 @@ Prompt here.
             result.allowed_tools,
             Some(vec!["Read".to_string(), "Glob".to_string()])
         );
+    }
+
+    #[test]
+    fn parses_crlf_frontmatter() {
+        let content = "---\r\nname: windows-skill\r\ndescription: A bundled skill with CRLF line endings\r\n---\r\n\r\nPrompt";
+        let parsed = parse_skill_markdown(content).expect("CRLF frontmatter must parse");
+        assert_eq!(parsed.id, "windows-skill");
+        assert_eq!(parsed.name, "windows-skill");
+        assert_eq!(parsed.prompt, "Prompt");
     }
 
     #[test]

@@ -88,6 +88,30 @@ pub fn run_db_change(run: &models::Run, action: &str) -> Value {
     run_db_change_ids(action, &run.id, run.job_id.as_deref())
 }
 
+/// Build a fully-scoped `events` db-change payload.
+///
+/// LOAD-BEARING INVARIANT: the live chat transcript's incremental delta cache
+/// (`useSessionEvents(sessionId)`) is invalidated ONLY by the `events` resolver,
+/// which scopes by `sessionId`. An events insert that emits the wrong
+/// `session_id` — or skips the emit entirely — strands the transcript until a
+/// manual reload, while the issue-overview job row survives on sibling
+/// invalidations and masks the freeze (CAIRN-1916). So every live/finalize
+/// events insert must emit through this one builder and always carry both
+/// `run_id` and `session_id`. Route durable inserts through
+/// [`crate::transcripts::stream_store::insert_event_emit`] so the scoped emit
+/// can't be forgotten. Both camel- and snake-cased keys are emitted because the
+/// frontend `parseScopeIds` reads either.
+pub fn event_db_change(run_id: &str, session_id: Option<&str>, action: &str) -> Value {
+    json!({
+        "table": "events",
+        "action": action,
+        "runId": run_id,
+        "run_id": run_id,
+        "sessionId": session_id,
+        "session_id": session_id,
+    })
+}
+
 /// Combines cloud sync and frontend event emission into a single call.
 ///
 /// Created once during Orchestrator construction; shared via `Arc` clone.
@@ -373,6 +397,28 @@ mod tests {
         assert_eq!(payload["runId"], "run-1");
         assert!(payload.get("jobId").is_some());
         assert!(payload["jobId"].is_null());
+    }
+
+    #[test]
+    fn event_db_change_carries_both_cased_scope_keys() {
+        let payload = event_db_change("run-1", Some("session-1"), "insert");
+        assert_eq!(payload["table"], "events");
+        assert_eq!(payload["action"], "insert");
+        // The events resolver scopes the chat transcript by sessionId; both
+        // casings must be present so parseScopeIds resolves the precise key.
+        assert_eq!(payload["runId"], "run-1");
+        assert_eq!(payload["run_id"], "run-1");
+        assert_eq!(payload["sessionId"], "session-1");
+        assert_eq!(payload["session_id"], "session-1");
+    }
+
+    #[test]
+    fn event_db_change_serializes_absent_session_as_null() {
+        let payload = event_db_change("run-1", None, "insert");
+        assert_eq!(payload["runId"], "run-1");
+        assert!(payload.get("sessionId").is_some());
+        assert!(payload["sessionId"].is_null());
+        assert!(payload["session_id"].is_null());
     }
 
     fn test_job() -> models::Job {

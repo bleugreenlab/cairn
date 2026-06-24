@@ -69,7 +69,12 @@ fn empty_ast_result() -> Rendered {
     }
 }
 
-fn hits_for_file(root: &Path, path: &Path, compiled: &Pattern, lang: SupportLang) -> Vec<LocationHit> {
+fn hits_for_file(
+    root: &Path,
+    path: &Path,
+    compiled: &Pattern,
+    lang: SupportLang,
+) -> Vec<LocationHit> {
     let Ok(src) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
@@ -132,15 +137,16 @@ fn search_dir(root: &Path, dir: &Path, pattern: &str, glob: Option<&str>) -> Ren
     let mut hits: Vec<LocationHit> = Vec::new();
 
     for (path, lang) in source_files(root, dir, globset.as_ref()) {
-        let pattern_for_lang = compiled
-            .entry(lang)
-            .or_insert_with(|| match compile_pattern(pattern, lang) {
-                Ok(compiled) => Some(compiled),
-                Err(err) => {
-                    compile_err.get_or_insert(err);
-                    None
-                }
-            });
+        let pattern_for_lang =
+            compiled
+                .entry(lang)
+                .or_insert_with(|| match compile_pattern(pattern, lang) {
+                    Ok(compiled) => Some(compiled),
+                    Err(err) => {
+                        compile_err.get_or_insert(err);
+                        None
+                    }
+                });
         let Some(pattern_for_lang) = pattern_for_lang else {
             continue;
         };
@@ -226,7 +232,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a.rs", "fn one() {}\nfn two() {}\n");
         let disk = search(dir.path(), &dir.path().join("a.rs"), "fn $N() {}", None);
-        let blob = search_text("a.rs", "fn one() {}\nfn two() {}\n", Some(SupportLang::Rust), "fn $N() {}");
+        let blob = search_text(
+            "a.rs",
+            "fn one() {}\nfn two() {}\n",
+            Some(SupportLang::Rust),
+            "fn $N() {}",
+        );
         assert_eq!(disk.body, blob.body);
         assert_eq!(disk.suffix, blob.suffix);
     }
@@ -248,7 +259,11 @@ mod tests {
         // source line, like grep.
         write(dir.path(), "a.rs", "fn beta() { alpha(); }\n");
         let r = search(dir.path(), &dir.path().join("a.rs"), "alpha()", None);
-        assert!(r.body.contains("a.rs:1:fn beta() { alpha(); }"), "body: {}", r.body);
+        assert!(
+            r.body.contains("a.rs:1:fn beta() { alpha(); }"),
+            "body: {}",
+            r.body
+        );
     }
 
     #[test]

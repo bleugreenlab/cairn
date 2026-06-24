@@ -181,7 +181,7 @@ pub(crate) async fn project_id_by_key(db: &LocalDb, key: &str) -> Result<String,
     let key = key.to_uppercase();
     db.query_text(
         "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
-        turso::params![key.as_str()],
+        (key.clone(),),
     )
     .await
     .map_err(|e| format!("Failed to load project: {e}"))?
@@ -192,7 +192,7 @@ pub(crate) async fn project_path(db: &LocalDb, project_id: &str) -> Result<Optio
     let project_id = project_id.to_string();
     db.query_text(
         "SELECT repo_path FROM projects WHERE id = ?1",
-        turso::params![project_id.as_str()],
+        (project_id,),
     )
     .await
     .map_err(|e| format!("Failed to load project path: {}", e))

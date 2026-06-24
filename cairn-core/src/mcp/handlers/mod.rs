@@ -6,12 +6,14 @@ pub mod bash;
 pub mod bug_report; // retained: used by files.rs change dispatch
 pub mod executions;
 pub mod fence;
+pub mod fetch_web;
 pub mod files;
 pub mod implementation;
 pub mod issue_resources;
 pub mod issues;
 pub mod mcp_resources;
 pub mod messages;
+pub mod pdf;
 pub mod permission;
 pub mod planning;
 pub mod read;
@@ -196,44 +198,4 @@ pub fn normalize_command(cmd: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// Get current HEAD SHA for a worktree.
-pub fn get_current_head_sha(worktree_path: &str) -> Result<String, String> {
-    let output = crate::env::git()
-        .args(["rev-parse", "HEAD"])
-        .current_dir(worktree_path)
-        .output()
-        .map_err(|e| format!("git rev-parse failed: {}", e))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        Err("Failed to get HEAD".to_string())
-    }
-}
-
-/// Check if worktree has uncommitted changes.
-pub fn is_worktree_dirty(worktree_path: &str) -> Result<bool, String> {
-    Ok(!worktree_status_porcelain(worktree_path)?.is_empty())
-}
-
-/// Raw `git status --porcelain` output for the worktree (empty == clean).
-/// Used to compare worktree state before/after a `run` batch so the
-/// commit-hygiene gate attributes new dirt to the run that caused it.
-pub fn worktree_status_porcelain(worktree_path: &str) -> Result<String, String> {
-    let output = crate::env::git()
-        .args(["status", "--porcelain"])
-        .current_dir(worktree_path)
-        .output()
-        .map_err(|e| format!("git status failed: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }

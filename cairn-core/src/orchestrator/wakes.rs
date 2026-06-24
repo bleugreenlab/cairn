@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use turso::params;
 
 use crate::messages::queued::DeliveryUrgency;
+use crate::orchestrator::attention_push::Wake;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
@@ -15,12 +16,13 @@ const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
 const FACT_KIND_MESSAGE: &str = "message";
 pub const FACT_KIND_TERMINAL_EXIT: &str = "terminal_exit";
+pub const FACT_KIND_TERMINAL_OUTPUT: &str = "terminal_output";
 
 // CAIRN-1647: the attention ledger collapses the old `agent_idle_with_work` +
 // `pr_state_change` fan-out into a single `review` item kind. Default child
 // subscriptions carry the new vocabulary; legacy `agent_idle_with_work` /
-// `pr_state_change` subscription rows still match `review` items via the alias
-// map in attention_delivery::kind_aliases, so old rows keep working.
+// `pr_state_change` subscription rows still match `review` items via
+// `fact_kind_matches` and `REVIEW_LEGACY_FACT_KINDS`, so old rows keep working.
 const DEFAULT_CHILD_FACT_KINDS: &[&str] = &[
     "question",
     "permission",
@@ -28,6 +30,7 @@ const DEFAULT_CHILD_FACT_KINDS: &[&str] = &[
     "resolved",
     FACT_KIND_MESSAGE,
 ];
+const REVIEW_LEGACY_FACT_KINDS: &[&str] = &["agent_idle_with_work", "pr_state_change"];
 
 /// Typed source taxonomy for every external wake a job can subscribe to.
 ///
@@ -184,6 +187,9 @@ pub struct WakeSubscription {
     /// Consumed (row deleted) the first time a matching wake routes to it, so a
     /// one-time fact like a terminal exit can never wake the subscriber twice.
     pub one_shot: bool,
+    /// Literal substring an output-phrase terminal subscription watches for in
+    /// the terminal's output. `None` for every other subscription kind.
+    pub match_phrase: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -296,6 +302,7 @@ fn subscription_from_row(row: &turso::Row) -> DbResult<WakeSubscription> {
         created_at: row.i64(9)?,
         updated_at: row.i64(10)?,
         one_shot: row.i64(11)? != 0,
+        match_phrase: row.opt_text(12)?,
     })
 }
 
@@ -328,7 +335,7 @@ pub async fn list_subscriptions_for_job(
                 .query(
                     "SELECT id, job_id, source_kind, source_ref, fact_kinds_json, state,
                             mute_until_kind, mute_until_ref, created_by, created_at, updated_at,
-                            one_shot
+                            one_shot, match_phrase
                      FROM wake_subscriptions
                      WHERE job_id = ?1
                      ORDER BY created_at ASC, id ASC",
@@ -367,7 +374,7 @@ async fn exact_subscription(
                 .query(
                     "SELECT id, job_id, source_kind, source_ref, fact_kinds_json, state,
                             mute_until_kind, mute_until_ref, created_by, created_at, updated_at,
-                            one_shot
+                            one_shot, match_phrase
                      FROM wake_subscriptions
                      WHERE job_id = ?1 AND source_kind = ?2
                        AND COALESCE(source_ref, '') = COALESCE(?3, '')
@@ -402,218 +409,6 @@ pub async fn peek_pending_suppressed_for_job(
     })
     .await
     .map_err(|error| format!("Failed to peek suppressed wakes: {error}"))
-}
-
-pub async fn peek_claimable_suppressed_for_job_with_live_source(
-    db: &LocalDb,
-    job_id: &str,
-    live_source: Option<&WakeSource>,
-) -> Result<Vec<SuppressedWake>, String> {
-    let job_id = job_id.to_string();
-    let live_kind = live_source.map(WakeSource::kind).map(ToString::to_string);
-    let live_ref = live_source
-        .and_then(WakeSource::reference)
-        .map(ToString::to_string);
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        let live_kind = live_kind.clone();
-        let live_ref = live_ref.clone();
-        Box::pin(async move {
-            select_claimable_suppressed(conn, &job_id, live_kind.as_deref(), live_ref.as_deref())
-                .await
-        })
-    })
-    .await
-    .map_err(|error| format!("Failed to peek claimable suppressed wakes: {error}"))
-}
-
-pub async fn claim_pending_suppressed_for_job_with_live_source(
-    db: &LocalDb,
-    job_id: &str,
-    live_source: Option<&WakeSource>,
-) -> Result<Vec<SuppressedWake>, String> {
-    let job_id = job_id.to_string();
-    let live_kind = live_source.map(WakeSource::kind).map(ToString::to_string);
-    let live_ref = live_source
-        .and_then(WakeSource::reference)
-        .map(ToString::to_string);
-    let now = chrono::Utc::now().timestamp();
-    db.write(|conn| {
-        let job_id = job_id.clone();
-        let live_kind = live_kind.clone();
-        let live_ref = live_ref.clone();
-        Box::pin(async move {
-            let mut notices = select_claimable_suppressed(
-                conn,
-                &job_id,
-                live_kind.as_deref(),
-                live_ref.as_deref(),
-            )
-            .await?;
-            let snapshots = notices
-                .iter()
-                .map(SuppressedWakeSnapshot::from)
-                .collect::<Vec<_>>();
-            if !snapshots.is_empty() {
-                notices =
-                    claim_suppressed_wake_snapshots_in_conn(conn, &job_id, &snapshots, now).await?;
-            }
-            Ok(notices)
-        })
-    })
-    .await
-    .map_err(|error| format!("Failed to claim suppressed wakes: {error}"))
-}
-
-pub async fn claim_suppressed_wake_preview(
-    db: &LocalDb,
-    job_id: &str,
-    preview: &[SuppressedWake],
-) -> Result<Vec<SuppressedWake>, String> {
-    if preview.is_empty() {
-        return Ok(Vec::new());
-    }
-    let job_id = job_id.to_string();
-    let snapshots = preview
-        .iter()
-        .map(SuppressedWakeSnapshot::from)
-        .collect::<Vec<_>>();
-    let now = chrono::Utc::now().timestamp();
-    db.write(|conn| {
-        let job_id = job_id.clone();
-        let snapshots = snapshots.clone();
-        Box::pin(async move {
-            claim_suppressed_wake_snapshots_in_conn(conn, &job_id, &snapshots, now).await
-        })
-    })
-    .await
-    .map_err(|error| format!("Failed to claim suppressed wake preview: {error}"))
-}
-
-#[derive(Clone)]
-struct SuppressedWakeSnapshot {
-    id: String,
-    updated_at: i64,
-    occurrences: i64,
-    latest_detail_uri: Option<String>,
-    content: Option<String>,
-}
-
-impl From<&SuppressedWake> for SuppressedWakeSnapshot {
-    fn from(notice: &SuppressedWake) -> Self {
-        Self {
-            id: notice.id.clone(),
-            updated_at: notice.updated_at,
-            occurrences: notice.occurrences,
-            latest_detail_uri: notice.latest_detail_uri.clone(),
-            content: notice.content.clone(),
-        }
-    }
-}
-
-async fn claim_suppressed_wake_snapshots_in_conn(
-    conn: &turso::Connection,
-    job_id: &str,
-    snapshots: &[SuppressedWakeSnapshot],
-    now: i64,
-) -> DbResult<Vec<SuppressedWake>> {
-    let mut notices = Vec::new();
-    for snapshot in snapshots {
-        let mut rows = conn
-            .query(
-                "SELECT id, subscription_id, job_id, source_kind, source_ref, fact_kind,
-                        occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at
-                 FROM suppressed_wakes
-                 WHERE job_id = ?1 AND id = ?2 AND updated_at = ?3 AND occurrences = ?4
-                   AND COALESCE(latest_detail_uri, '') = COALESCE(?5, '')
-                   AND COALESCE(content, '') = COALESCE(?6, '')
-                   AND delivered_at IS NULL
-                 LIMIT 1",
-                params![
-                    job_id,
-                    snapshot.id.as_str(),
-                    snapshot.updated_at,
-                    snapshot.occurrences,
-                    snapshot.latest_detail_uri.as_deref(),
-                    snapshot.content.as_deref()
-                ],
-            )
-            .await?;
-        if let Some(row) = rows.next().await? {
-            notices.push(suppressed_from_row(&row)?);
-        }
-    }
-
-    if notices.is_empty() {
-        return Ok(notices);
-    }
-
-    for notice in &notices {
-        conn.execute(
-            "UPDATE suppressed_wakes SET delivered_at = ?1, updated_at = ?1
-             WHERE job_id = ?2 AND id = ?3 AND delivered_at IS NULL",
-            params![now, job_id, notice.id.as_str()],
-        )
-        .await?;
-    }
-
-    let subscription_ids = notices
-        .iter()
-        .filter_map(|notice| notice.subscription_id.clone())
-        .collect::<std::collections::HashSet<_>>();
-    for subscription_id in &subscription_ids {
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM suppressed_wakes
-                 WHERE job_id = ?1 AND subscription_id = ?2 AND delivered_at IS NULL",
-                params![job_id, subscription_id.as_str()],
-            )
-            .await?;
-        let remaining = crate::storage::next_i64(&mut rows, 0).await?.unwrap_or(0);
-        if remaining == 0 {
-            conn.execute(
-                "UPDATE wake_subscriptions SET state = 'active', updated_at = ?1
-                 WHERE id = ?2 AND state = 'muted'",
-                params![now, subscription_id.as_str()],
-            )
-            .await?;
-        }
-    }
-
-    for notice in &mut notices {
-        notice.delivered_at = Some(now);
-        notice.updated_at = now;
-    }
-    Ok(notices)
-}
-
-async fn select_claimable_suppressed(
-    conn: &turso::Connection,
-    job_id: &str,
-    live_kind: Option<&str>,
-    live_ref: Option<&str>,
-) -> DbResult<Vec<SuppressedWake>> {
-    let Some(kind) = live_kind else {
-        return Ok(Vec::new());
-    };
-    let mut rows = conn
-        .query(
-            "SELECT sw.id, sw.subscription_id, sw.job_id, sw.source_kind, sw.source_ref, sw.fact_kind,
-                    sw.occurrences, sw.latest_detail_uri, sw.content, sw.created_at, sw.updated_at, sw.delivered_at
-             FROM suppressed_wakes sw
-             JOIN wake_subscriptions ws ON ws.id = sw.subscription_id
-             WHERE sw.job_id = ?1 AND sw.delivered_at IS NULL
-               AND (ws.mute_until_kind IS NULL
-                    OR (ws.mute_until_kind = ?2 AND COALESCE(ws.mute_until_ref, '') = COALESCE(?3, '')))
-             ORDER BY sw.created_at ASC, sw.id ASC",
-            params![job_id, kind, live_ref],
-        )
-        .await?;
-    let mut notices = Vec::new();
-    while let Some(row) = rows.next().await? {
-        notices.push(suppressed_from_row(&row)?);
-    }
-    Ok(notices)
 }
 
 async fn select_pending_suppressed(
@@ -665,6 +460,7 @@ async fn subscribe_scope_inner(
         None,
         created_by,
         one_shot,
+        None,
     )
     .await
 }
@@ -718,6 +514,121 @@ pub async fn subscribe_one_shot(
     subscribe_scope_inner(db, job_id, &scope, created_by, true).await
 }
 
+/// Subscribe a one-shot phrase watcher on a terminal's output. Persists a
+/// `process` source keyed on the canonical terminal URI, carrying both the
+/// `terminal_output` and `terminal_exit` fact kinds: it fires when the phrase
+/// appears (routed by the live read loop) OR when the terminal exits first, so a
+/// build that dies before printing the phrase still wakes the waiting agent
+/// instead of stranding it. Re-subscribing the same terminal replaces the phrase
+/// (the unique scope index collapses to one output watcher per job+terminal).
+pub async fn subscribe_terminal_output_one_shot(
+    db: &LocalDb,
+    job_id: &str,
+    terminal_uri: &str,
+    phrase: &str,
+    created_by: &str,
+) -> Result<WakeSubscription, String> {
+    let fact_kinds = vec![
+        FACT_KIND_TERMINAL_OUTPUT.to_string(),
+        FACT_KIND_TERMINAL_EXIT.to_string(),
+    ];
+    upsert_subscription(
+        db,
+        job_id,
+        SOURCE_KIND_PROCESS,
+        Some(terminal_uri),
+        Some(&fact_kinds),
+        WakeSubscriptionState::Active,
+        None,
+        None,
+        created_by,
+        true,
+        Some(phrase),
+    )
+    .await
+}
+
+/// Load the active one-shot output-phrase watchers persisted for a terminal's
+/// canonical URI, returned as `(subscription_id, job_id, phrase)` tuples. A
+/// (re)starting PTY session calls this to re-attach the in-memory watchers its
+/// read loop scans, so an output subscription is durable across sessions:
+/// it survives the worktree-fence approval respawn (which tears down the
+/// original session) and a subscribe made while no session was live is honored
+/// by the next session. The `wake_subscriptions` row is the source of truth;
+/// the in-memory watcher list is only a per-session cache.
+pub async fn list_terminal_output_watchers(
+    db: &LocalDb,
+    terminal_uri: &str,
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let terminal_uri = terminal_uri.to_string();
+    db.read(|conn| {
+        let terminal_uri = terminal_uri.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, job_id, match_phrase, source_ref
+                     FROM wake_subscriptions
+                     WHERE source_kind = ?1 AND source_ref = ?2
+                       AND state = 'active' AND match_phrase IS NOT NULL",
+                    params![SOURCE_KIND_PROCESS, terminal_uri.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let Some(phrase) = row.opt_text(2)? else {
+                    continue;
+                };
+                out.push((row.text(0)?, row.text(1)?, phrase, row.text(3)?));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to list terminal output watchers: {error}"))
+}
+
+/// Like `list_terminal_output_watchers` but resolved by the owning job and the
+/// terminal's slug rather than the full canonical URI. The interactive terminal
+/// reader knows `job_id` + `slug` (not the canonical node URI) and uses this to
+/// hydrate its watcher registry at session start. Subscriptions are always
+/// created in the caller's own job scope, so `job_id` plus the trailing
+/// `/terminal/<slug>` segment uniquely identify the terminal. Returns
+/// `(subscription_id, job_id, phrase, terminal_uri)` tuples.
+pub async fn list_terminal_output_watchers_for_job_terminal(
+    db: &LocalDb,
+    job_id: &str,
+    slug: &str,
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let job_id = job_id.to_string();
+    let like = format!("%/terminal/{slug}");
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        let like = like.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, job_id, match_phrase, source_ref
+                     FROM wake_subscriptions
+                     WHERE job_id = ?1 AND source_kind = ?2
+                       AND state = 'active' AND match_phrase IS NOT NULL
+                       AND source_ref LIKE ?3",
+                    params![job_id.as_str(), SOURCE_KIND_PROCESS, like.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let Some(phrase) = row.opt_text(2)? else {
+                    continue;
+                };
+                out.push((row.text(0)?, row.text(1)?, phrase, row.text(3)?));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to list terminal output watchers: {error}"))
+}
+
 pub async fn seed_default_job_subscriptions(db: &LocalDb, job_id: &str) -> Result<(), String> {
     seed_scope(
         db,
@@ -754,6 +665,7 @@ pub async fn mute_scope(
         until.and_then(WakeSource::reference),
         created_by,
         false,
+        None,
     )
     .await
 }
@@ -878,6 +790,7 @@ async fn upsert_subscription(
     until_ref: Option<&str>,
     created_by: &str,
     one_shot: bool,
+    match_phrase: Option<&str>,
 ) -> Result<WakeSubscription, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let job_id = job_id.to_string();
@@ -888,6 +801,7 @@ async fn upsert_subscription(
     let until_ref = until_ref.map(ToString::to_string);
     let created_by = created_by.to_string();
     let state_str = state.as_str().to_string();
+    let match_phrase = match_phrase.map(ToString::to_string);
     let one_shot_int: i64 = if one_shot { 1 } else { 0 };
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
@@ -900,6 +814,7 @@ async fn upsert_subscription(
         let until_ref = until_ref.clone();
         let created_by = created_by.clone();
         let state_str = state_str.clone();
+        let match_phrase = match_phrase.clone();
         Box::pin(async move {
             let mut existing = conn
                 .query(
@@ -923,7 +838,7 @@ async fn upsert_subscription(
                 conn.execute(
                     "UPDATE wake_subscriptions
                      SET state = ?1, mute_until_kind = ?2, mute_until_ref = ?3, updated_at = ?4,
-                         one_shot = ?6
+                         one_shot = ?6, match_phrase = ?7
                      WHERE id = ?5",
                     params![
                         state_str.as_str(),
@@ -931,7 +846,8 @@ async fn upsert_subscription(
                         until_ref.as_deref(),
                         now,
                         existing_id.as_str(),
-                        one_shot_int
+                        one_shot_int,
+                        match_phrase.as_deref()
                     ],
                 )
                 .await?;
@@ -939,8 +855,9 @@ async fn upsert_subscription(
                 conn.execute(
                     "INSERT INTO wake_subscriptions
                      (id, job_id, source_kind, source_ref, fact_kinds_json, state,
-                      mute_until_kind, mute_until_ref, created_by, created_at, updated_at, one_shot)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11)",
+                      mute_until_kind, mute_until_ref, created_by, created_at, updated_at, one_shot,
+                      match_phrase)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)",
                     params![
                         id.as_str(),
                         job_id.as_str(),
@@ -952,7 +869,8 @@ async fn upsert_subscription(
                         until_ref.as_deref(),
                         created_by.as_str(),
                         now,
-                        one_shot_int
+                        one_shot_int,
+                        match_phrase.as_deref()
                     ],
                 )
                 .await?;
@@ -961,7 +879,7 @@ async fn upsert_subscription(
                 .query(
                     "SELECT id, job_id, source_kind, source_ref, fact_kinds_json, state,
                             mute_until_kind, mute_until_ref, created_by, created_at, updated_at,
-                            one_shot
+                            one_shot, match_phrase
                      FROM wake_subscriptions
                      WHERE job_id = ?1 AND source_kind = ?2
                        AND COALESCE(source_ref, '') = COALESCE(?3, '')
@@ -1171,6 +1089,143 @@ pub async fn route_terminal_exit_async(
     .await
 }
 
+/// The resume message an agent sees when a watched phrase appears in a live
+/// terminal's output: slug, the matched phrase, the canonical URI to read, and a
+/// short one-line excerpt (ANSI-stripped, capped) of the matching line.
+pub fn format_terminal_output_message(
+    slug: &str,
+    detail_uri: &str,
+    phrase: &str,
+    excerpt: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "[Terminal output match] `{slug}` printed the watched phrase \"{phrase}\". Read {detail_uri} for full output."
+    );
+    if let Some(excerpt) = excerpt.map(str::trim).filter(|e| !e.is_empty()) {
+        out.push_str(&format!("\n\nMatched line:\n```\n{excerpt}\n```"));
+    }
+    out
+}
+
+fn terminal_output_event(
+    subscriber_job_id: &str,
+    slug: &str,
+    detail_uri: &str,
+    phrase: &str,
+    excerpt: Option<&str>,
+) -> WakeEvent {
+    WakeEvent {
+        source: WakeSource::Process {
+            reference: detail_uri.to_string(),
+        },
+        fact_kind: FACT_KIND_TERMINAL_OUTPUT.to_string(),
+        detail_uri: Some(detail_uri.to_string()),
+        // Targeted, not broadcast: a phrase match is private to the one job whose
+        // watcher matched. Two jobs (or two phrases) watching the same terminal
+        // must not cross-wake on each other's match.
+        delivery: WakeDelivery::Targeted {
+            subscriber_job_id: subscriber_job_id.to_string(),
+            message: format_terminal_output_message(slug, detail_uri, phrase, excerpt),
+        },
+        urgency: DeliveryUrgency::Queue,
+    }
+}
+
+/// Route a terminal-output phrase wake (sync, from the agent PTY read loop).
+pub fn route_terminal_output(
+    orch: &Orchestrator,
+    subscriber_job_id: &str,
+    slug: &str,
+    detail_uri: &str,
+    phrase: &str,
+    excerpt: Option<&str>,
+) -> Result<WakeRouteAction, String> {
+    route_wake_sync(
+        orch,
+        terminal_output_event(subscriber_job_id, slug, detail_uri, phrase, excerpt),
+    )
+}
+
+/// Route a terminal-output phrase wake from an async context (the immediate-fire
+/// path when the phrase is already in the buffer at subscribe time).
+pub async fn route_terminal_output_async(
+    orch: &Orchestrator,
+    subscriber_job_id: &str,
+    slug: &str,
+    detail_uri: &str,
+    phrase: &str,
+    excerpt: Option<&str>,
+) -> Result<WakeRouteAction, String> {
+    route_wake(
+        orch,
+        terminal_output_event(subscriber_job_id, slug, detail_uri, phrase, excerpt),
+    )
+    .await
+}
+
+/// The trailing `<slug>` of a canonical `.../terminal/<slug>` URI.
+fn terminal_slug_from_uri(uri: &str) -> &str {
+    uri.rsplit("/terminal/").next().unwrap_or(uri)
+}
+
+/// Scan one freshly read output chunk against a terminal's live phrase-watcher
+/// registry and route a one-shot `terminal_output` wake for each matched phrase,
+/// dropping the matched watcher. Shared by both terminal readers — the agent-MCP
+/// reader in `mcp::handlers::bash` and the interactive reader in the app's
+/// terminal command — so output watching behaves identically regardless of which
+/// path created the terminal. Each watcher carries its own canonical
+/// `terminal_uri`, so routing needs no `CairnResource`. A cheap no-op when no
+/// watchers are registered, which is the common case for every terminal.
+pub fn scan_and_route_terminal_output(
+    orch: &Orchestrator,
+    watchers: &std::sync::Arc<std::sync::Mutex<Vec<crate::services::TerminalOutputWatcher>>>,
+    data: &str,
+) {
+    // Collect matches under the lock, then route after releasing it so wake
+    // routing never runs while holding the watcher mutex.
+    let matched: Vec<(String, String, String, Option<String>)> = {
+        let Ok(mut guard) = watchers.lock() else {
+            return;
+        };
+        if guard.is_empty() {
+            return;
+        }
+        let mut matched = Vec::new();
+        guard.retain_mut(|watcher| {
+            let scan = crate::services::scan_for_phrase(&watcher.carry, data, &watcher.phrase);
+            match scan.matched_excerpt {
+                Some(excerpt) => {
+                    matched.push((
+                        watcher.job_id.clone(),
+                        watcher.terminal_uri.clone(),
+                        watcher.phrase.clone(),
+                        Some(excerpt),
+                    ));
+                    false // drop the matched watcher (one-shot)
+                }
+                None => {
+                    watcher.carry = scan.carry;
+                    true
+                }
+            }
+        });
+        matched
+    };
+    for (job_id, terminal_uri, phrase, excerpt) in matched {
+        let slug = terminal_slug_from_uri(&terminal_uri);
+        if let Err(error) = route_terminal_output(
+            orch,
+            &job_id,
+            slug,
+            &terminal_uri,
+            &phrase,
+            excerpt.as_deref(),
+        ) {
+            log::warn!("Failed to route terminal-output wake for {terminal_uri}: {error}");
+        }
+    }
+}
+
 pub fn route_condition_event(
     orch: &Orchestrator,
     condition_ref: &str,
@@ -1267,10 +1322,12 @@ async fn route_wake_to_subscription(
             .await?;
             WakeRouteAction::Delivered
         }
-        WakeSubscriptionState::Muted => {
-            suppress_wake_for_subscription(orch, event, &subscription).await?;
-            WakeRouteAction::Suppressed
-        }
+        // Mute is now downgrade-at-creation for pushes (CAIRN-1900); the legacy
+        // suppressed_wakes digest store is gone. A non-interrupt wake to a muted
+        // subscription on these live non-push callers (terminal exit, condition,
+        // resource, process, child-attention broadcast) is dropped — there is no
+        // digest to accrue and no ride-along channel for them.
+        WakeSubscriptionState::Muted => WakeRouteAction::Dropped,
         WakeSubscriptionState::Unsubscribed => WakeRouteAction::Dropped,
     };
 
@@ -1317,38 +1374,25 @@ async fn deliver_active_wake(
     subscription: &WakeSubscription,
     prefix: Option<&str>,
 ) -> Result<(), String> {
-    match &event.delivery {
+    let (job_id, message) = match &event.delivery {
         WakeDelivery::Targeted {
             subscriber_job_id,
             message,
-        } => {
-            let message = format_message_with_prefix(prefix, message);
-            deliver_resume_wake(
-                orch,
-                subscriber_job_id,
-                &message,
-                &event.source,
-                event.urgency,
-            )
-            .await?;
-        }
-        WakeDelivery::Broadcast { message } => {
-            let message = format_message_with_prefix(prefix, message);
-            deliver_resume_wake(
-                orch,
-                &subscription.job_id,
-                &message,
-                &event.source,
-                event.urgency,
-            )
-            .await?;
-        }
+        } => (
+            subscriber_job_id.as_str(),
+            format_message_with_prefix(prefix, message),
+        ),
+        WakeDelivery::Broadcast { message } => (
+            subscription.job_id.as_str(),
+            format_message_with_prefix(prefix, message),
+        ),
         WakeDelivery::MessageDigest { .. } => {
-            // Active message-like wakes are handled by the durable message or
-            // side-channel row that created the wake. Returning Delivered tells
-            // callers not to suppress or drop that row here.
+            // Active message-like wakes are carried by the durable message or
+            // side-channel row that created the wake; nothing to resume here.
+            return Ok(());
         }
-    }
+    };
+    crate::orchestrator::parent_wake::queue_or_resume_parent(orch, job_id, &message, event.urgency);
     Ok(())
 }
 
@@ -1357,64 +1401,6 @@ fn format_message_with_prefix(prefix: Option<&str>, message: &str) -> String {
         Some(prefix) => format!("{prefix}{message}"),
         None => message.to_string(),
     }
-}
-
-async fn suppress_wake_for_subscription(
-    orch: &Orchestrator,
-    event: &WakeEvent,
-    subscription: &WakeSubscription,
-) -> Result<(), String> {
-    match &event.delivery {
-        WakeDelivery::Targeted { .. } | WakeDelivery::Broadcast { .. } => {
-            record_suppressed_fact(
-                &orch.db.local,
-                subscription,
-                &event.fact_kind,
-                event.detail_uri.as_deref(),
-            )
-            .await?;
-        }
-        WakeDelivery::MessageDigest { content, .. } => {
-            record_suppressed_message_for_subscription(
-                &orch.db.local,
-                subscription,
-                &event.fact_kind,
-                content,
-            )
-            .await?;
-        }
-    }
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "suppressed_wakes", "action": "upsert"}),
-    );
-    Ok(())
-}
-
-async fn deliver_resume_wake(
-    orch: &Orchestrator,
-    job_id: &str,
-    message: &str,
-    live_source: &WakeSource,
-    urgency: DeliveryUrgency,
-) -> Result<(), String> {
-    let digest = claim_pending_suppressed_for_job_with_live_source(
-        &orch.db.local,
-        job_id,
-        Some(live_source),
-    )
-    .await?;
-    let message = if digest.is_empty() {
-        message.to_string()
-    } else {
-        format!(
-            "{}\n\n{}",
-            message,
-            SuppressedWake::render_digest_with_context(&digest, Some(live_source))
-        )
-    };
-    crate::orchestrator::parent_wake::queue_or_resume_parent(orch, job_id, &message, urgency);
-    Ok(())
 }
 
 pub async fn seed_default_child_subscription_for_parent_job(
@@ -1444,6 +1430,82 @@ pub async fn seed_default_child_subscription_for_issue(
     seed_default_child_subscription_for_parent_job(db, &parent_job_id, issue_uri)
         .await
         .map(Some)
+}
+
+pub async fn reconcile_default_child_subscription_for_issue(
+    db: &LocalDb,
+    child_issue_id: &str,
+    issue_uri: &str,
+) -> Result<Option<WakeSubscription>, String> {
+    let parent_job_id = parent_job_for_child_issue_async(db, child_issue_id).await?;
+    remove_stale_default_child_subscriptions(db, issue_uri, parent_job_id.as_deref()).await?;
+    match parent_job_id {
+        Some(parent_job_id) => {
+            seed_default_child_subscription_for_parent_job(db, &parent_job_id, issue_uri)
+                .await
+                .map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+async fn remove_stale_default_child_subscriptions(
+    db: &LocalDb,
+    issue_uri: &str,
+    current_parent_job_id: Option<&str>,
+) -> Result<usize, String> {
+    let issue_uri = issue_uri.to_string();
+    let current_parent_job_id = current_parent_job_id.map(ToString::to_string);
+    let default_fact_kinds = default_child_fact_kinds_json();
+    db.write(|conn| {
+        let issue_uri = issue_uri.clone();
+        let current_parent_job_id = current_parent_job_id.clone();
+        let default_fact_kinds = default_fact_kinds.clone();
+        Box::pin(async move {
+            let changed = match current_parent_job_id.as_deref() {
+                Some(parent_job_id) => {
+                    conn.execute(
+                        "DELETE FROM wake_subscriptions
+                         WHERE created_by = 'system'
+                           AND source_kind = 'issue'
+                           AND source_ref = ?1
+                           AND one_shot = 0
+                           AND COALESCE(fact_kinds_json, '') = ?2
+                           AND job_id != ?3",
+                        params![
+                            issue_uri.as_str(),
+                            default_fact_kinds.as_str(),
+                            parent_job_id
+                        ],
+                    )
+                    .await?
+                }
+                None => {
+                    conn.execute(
+                        "DELETE FROM wake_subscriptions
+                         WHERE created_by = 'system'
+                           AND source_kind = 'issue'
+                           AND source_ref = ?1
+                           AND one_shot = 0
+                           AND COALESCE(fact_kinds_json, '') = ?2",
+                        params![issue_uri.as_str(), default_fact_kinds.as_str()],
+                    )
+                    .await?
+                }
+            };
+            Ok(changed as usize)
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to reconcile default child wake subscriptions: {error}"))
+}
+
+fn default_child_fact_kinds_json() -> String {
+    let kinds = DEFAULT_CHILD_FACT_KINDS
+        .iter()
+        .map(|kind| (*kind).to_string())
+        .collect::<Vec<_>>();
+    fact_kinds_json(Some(&kinds)).unwrap_or_else(|| "[]".to_string())
 }
 
 async fn parent_job_for_child_issue_async(
@@ -1504,6 +1566,31 @@ async fn parent_job_for_child_issue_async(
     .map_err(|error| format!("Failed to resolve parent wake job: {error}"))
 }
 
+/// The single mute rule, applied at push creation (CAIRN-1900). When the
+/// recipient holds an active **mute** on the push's source, a requested `Wake`
+/// is downgraded to `Passive` so the push never wakes the idle recipient and
+/// instead rides along on its next run — the ride-along *is* the re-engagement
+/// digest, collapsed by supersede-by-key, with no `suppressed_wakes` row ever
+/// written. `Interrupt` is never downgraded and `Passive` is already the lowest
+/// level, so both short-circuit without a query. Reuses the same
+/// `matching_subscription` resolution every other routing decision uses.
+pub async fn mute_downgrade(
+    db: &LocalDb,
+    recipient_job_id: &str,
+    source_kind: &str,
+    source_ref: Option<&str>,
+    fact_kind: &str,
+    requested: Wake,
+) -> Result<Wake, String> {
+    if requested != Wake::Wake {
+        return Ok(requested);
+    }
+    let muted = matching_subscription(db, recipient_job_id, source_kind, source_ref, fact_kind)
+        .await?
+        .is_some_and(|sub| sub.state == WakeSubscriptionState::Muted);
+    Ok(if muted { Wake::Passive } else { requested })
+}
+
 async fn matching_subscription(
     db: &LocalDb,
     job_id: &str,
@@ -1538,7 +1625,7 @@ async fn matching_subscriptions_for_source(
                 .query(
                     "SELECT id, job_id, source_kind, source_ref, fact_kinds_json, state,
                             mute_until_kind, mute_until_ref, created_by, created_at, updated_at,
-                            one_shot
+                            one_shot, match_phrase
                      FROM wake_subscriptions
                      WHERE source_kind = ?1
                        AND (COALESCE(source_ref, '') = COALESCE(?2, '')
@@ -1586,10 +1673,20 @@ fn best_matching_subscription(
                 && sub
                     .fact_kinds
                     .as_ref()
-                    .map(|kinds| kinds.iter().any(|kind| kind == fact_kind))
+                    .map(|kinds| {
+                        kinds.iter().any(|subscription_kind| {
+                            fact_kind_matches(subscription_kind, fact_kind)
+                        })
+                    })
                     .unwrap_or(true)
         })
         .max_by_key(subscription_match_score)
+}
+
+fn fact_kind_matches(subscription_kind: &str, event_kind: &str) -> bool {
+    subscription_kind == event_kind
+        || (subscription_kind == "review" && REVIEW_LEGACY_FACT_KINDS.contains(&event_kind))
+        || (event_kind == "review" && REVIEW_LEGACY_FACT_KINDS.contains(&subscription_kind))
 }
 
 fn subscription_match_score(sub: &WakeSubscription) -> (i32, i32, i32, i64) {
@@ -1713,25 +1810,6 @@ async fn select_pending_live_side_channel(
     Ok(notices)
 }
 
-async fn record_suppressed_message_for_subscription(
-    db: &LocalDb,
-    subscription: &WakeSubscription,
-    fact_kind: &str,
-    content: &str,
-) -> Result<SuppressedWake, String> {
-    insert_message_wake_row(
-        db,
-        Some(subscription.id.as_str()),
-        &subscription.job_id,
-        &subscription.source_kind,
-        subscription.source_ref.as_deref(),
-        fact_kind,
-        None,
-        content,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn insert_message_wake_row(
     db: &LocalDb,
@@ -1797,121 +1875,6 @@ async fn insert_message_wake_row(
     })
     .await
     .map_err(|error| format!("Failed to record wake message: {error}"))
-}
-
-#[cfg(test)]
-pub async fn record_suppressed_message(
-    db: &LocalDb,
-    job_id: &str,
-    source_kind: &str,
-    source_ref: Option<&str>,
-    content: &str,
-) -> Result<SuppressedWake, String> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp();
-    let job_id = job_id.to_string();
-    let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(ToString::to_string);
-    let content = content.to_string();
-    db.write(|conn| {
-        let id = id.clone();
-        let job_id = job_id.clone();
-        let source_kind = source_kind.clone();
-        let source_ref = source_ref.clone();
-        let content = content.clone();
-        Box::pin(async move {
-            conn.execute(
-                "INSERT INTO suppressed_wakes
-                 (id, subscription_id, job_id, source_kind, source_ref, fact_kind,
-                  occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at)
-                 VALUES (?1, NULL, ?2, ?3, ?4, NULL, 1, NULL, ?5, ?6, ?6, NULL)",
-                params![id.as_str(), job_id.as_str(), source_kind.as_str(), source_ref.as_deref(), content.as_str(), now],
-            )
-            .await?;
-            let mut rows = conn
-                .query(
-                    "SELECT id, subscription_id, job_id, source_kind, source_ref, fact_kind,
-                            occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at
-                     FROM suppressed_wakes WHERE id = ?1",
-                    params![id.as_str()],
-                )
-                .await?;
-            let row = rows
-                .next()
-                .await?
-                .ok_or_else(|| crate::storage::DbError::Row("missing suppressed wake".to_string()))?;
-            suppressed_from_row(&row)
-        })
-    })
-    .await
-    .map_err(|error| format!("Failed to record suppressed message: {error}"))
-}
-
-async fn record_suppressed_fact(
-    db: &LocalDb,
-    subscription: &WakeSubscription,
-    fact_kind: &str,
-    detail_uri: Option<&str>,
-) -> Result<(), String> {
-    let now = chrono::Utc::now().timestamp();
-    db.write(|conn| {
-        let subscription = subscription.clone();
-        let fact_kind = fact_kind.to_string();
-        let detail_uri = detail_uri.map(ToString::to_string);
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT id FROM suppressed_wakes
-                     WHERE job_id = ?1 AND source_kind = ?2
-                       AND COALESCE(source_ref, '') = COALESCE(?3, '')
-                       AND COALESCE(fact_kind, '') = COALESCE(?4, '')
-                       AND content IS NULL AND delivered_at IS NULL
-                     LIMIT 1",
-                    params![
-                        subscription.job_id.as_str(),
-                        subscription.source_kind.as_str(),
-                        subscription.source_ref.as_deref(),
-                        fact_kind.as_str(),
-                    ],
-                )
-                .await?;
-            let existing_id = crate::storage::next_text(&mut rows, 0).await?;
-            drop(rows);
-            if let Some(existing_id) = existing_id {
-                conn.execute(
-                    "UPDATE suppressed_wakes
-                     SET occurrences = occurrences + 1,
-                         latest_detail_uri = ?1,
-                         updated_at = ?2
-                     WHERE id = ?3",
-                    params![detail_uri.as_deref(), now, existing_id.as_str()],
-                )
-                .await?;
-            } else {
-                let id = uuid::Uuid::new_v4().to_string();
-                conn.execute(
-                    "INSERT INTO suppressed_wakes
-                     (id, subscription_id, job_id, source_kind, source_ref, fact_kind,
-                      occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, NULL, ?8, ?8, NULL)",
-                    params![
-                        id.as_str(),
-                        subscription.id.as_str(),
-                        subscription.job_id.as_str(),
-                        subscription.source_kind.as_str(),
-                        subscription.source_ref.as_deref(),
-                        fact_kind.as_str(),
-                        detail_uri.as_deref(),
-                        now
-                    ],
-                )
-                .await?;
-            }
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| format!("Failed to record suppressed wake: {error}"))
 }
 
 #[cfg(test)]
@@ -2053,16 +2016,15 @@ mod tests {
             .db
             .local
             .query_all(
-                "SELECT sender_name, content, delivered_at FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+                "SELECT sender_name, content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
                 params![fixture.run_id],
-                |row| Ok((row.text(0)?, row.text(1)?, row.opt_i64(2)?)),
+                |row| Ok((row.text(0)?, row.text(1)?)),
             )
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, "system");
         assert!(rows[0].1.contains(fixture.terminal_uri));
-        assert!(rows[0].2.is_none(), "queued direct remains pending");
         assert!(
             list_subscriptions_for_job(&orch.db.local, fixture.job_id)
                 .await
@@ -2117,7 +2079,7 @@ mod tests {
             .db
             .local
             .query_all(
-                "SELECT COUNT(*) FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1 AND delivered_at IS NULL",
+                "SELECT COUNT(*) FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
                 params![fixture.run_id],
                 |row| row.i64(0),
             )
@@ -2234,6 +2196,173 @@ mod tests {
     }
 
     #[test]
+    fn terminal_output_message_carries_slug_phrase_uri_and_excerpt() {
+        let msg = format_terminal_output_message(
+            "dev",
+            "cairn://p/P/1/1/builder/terminal/dev",
+            "ready",
+            Some("VITE ready in 412 ms"),
+        );
+        assert!(msg.contains("dev"), "{msg}");
+        assert!(msg.contains("ready"), "{msg}");
+        assert!(
+            msg.contains("cairn://p/P/1/1/builder/terminal/dev"),
+            "{msg}"
+        );
+        assert!(msg.contains("VITE ready in 412 ms"), "{msg}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_wake_delivers_targeted_and_consumes_one_shot() {
+        let db = migrated_db().await;
+        let fixture = seed_queueable_node(&db).await;
+        subscribe_terminal_output_one_shot(
+            &db,
+            fixture.job_id,
+            fixture.terminal_uri,
+            "ready",
+            "agent",
+        )
+        .await
+        .unwrap();
+        let recorder = RecordingProcessSpawner::new();
+        let orch = test_orchestrator_with_services(
+            db,
+            TestServicesBuilder::new()
+                .with_process(recorder.clone())
+                .build(),
+        );
+
+        let action = route_terminal_output_async(
+            &orch,
+            fixture.job_id,
+            "dev",
+            fixture.terminal_uri,
+            "ready",
+            Some("server ready on :3860"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, WakeRouteAction::Delivered);
+        assert_eq!(
+            recorder.spawn_count(),
+            0,
+            "queue wake must not resume/spawn"
+        );
+
+        let rows = orch
+            .db
+            .local
+            .query_all(
+                "SELECT content FROM messages WHERE channel_type='direct' AND recipient_run_id = ?1",
+                params![fixture.run_id],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("ready"), "{}", rows[0]);
+        assert!(rows[0].contains(fixture.terminal_uri), "{}", rows[0]);
+        assert!(rows[0].contains("server ready on :3860"), "{}", rows[0]);
+
+        assert!(
+            list_subscriptions_for_job(&orch.db.local, fixture.job_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "one-shot output wake is consumed after delivery"
+        );
+
+        // A second output match for the same terminal finds nothing left to wake.
+        let again = route_terminal_output_async(
+            &orch,
+            fixture.job_id,
+            "dev",
+            fixture.terminal_uri,
+            "ready",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, WakeRouteAction::Dropped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_subscription_also_wakes_on_exit() {
+        let db = migrated_db().await;
+        let fixture = seed_queueable_node(&db).await;
+        subscribe_terminal_output_one_shot(
+            &db,
+            fixture.job_id,
+            fixture.terminal_uri,
+            "ready",
+            "agent",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        // The terminal dies before ever printing the phrase; the dual-fact
+        // subscription still wakes the waiting agent on exit rather than
+        // stranding it forever.
+        let action = route_terminal_exit_async(
+            &orch,
+            "dev",
+            fixture.terminal_uri,
+            Some(1),
+            Some(3),
+            Some("error: build failed"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(action, WakeRouteAction::Delivered);
+        assert!(
+            list_subscriptions_for_job(&orch.db.local, fixture.job_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the output subscription is consumed by the exit wake"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_output_watchers_persist_for_session_hydration() {
+        let db = migrated_db().await;
+        seed_job(&db).await;
+        let uri = "cairn://p/P/1/1/builder/terminal/dev";
+        subscribe_terminal_output_one_shot(&db, "j", uri, "ready", "agent")
+            .await
+            .unwrap();
+
+        // A (re)starting session hydrates its in-memory watchers from this list,
+        // so the subscription is not bound to the session live at subscribe time.
+        let watchers = list_terminal_output_watchers(&db, uri).await.unwrap();
+        assert_eq!(watchers.len(), 1);
+        assert_eq!(watchers[0].1, "j", "carries the subscribing job");
+        assert_eq!(watchers[0].2, "ready", "carries the phrase to scan for");
+        assert_eq!(watchers[0].3, uri, "carries the canonical terminal URI");
+
+        // The same rows resolve by (job_id, slug), which is how the interactive
+        // reader — which lacks the canonical URI — hydrates its registry.
+        let by_slug = list_terminal_output_watchers_for_job_terminal(&db, "j", "dev")
+            .await
+            .unwrap();
+        assert_eq!(by_slug.len(), 1);
+        assert_eq!(by_slug[0].3, uri);
+        // A different slug on the same job does not match.
+        let other_slug = list_terminal_output_watchers_for_job_terminal(&db, "j", "build")
+            .await
+            .unwrap();
+        assert!(other_slug.is_empty());
+
+        // A different terminal URI shares nothing.
+        let other = list_terminal_output_watchers(&db, "cairn://p/P/1/1/builder/terminal/other")
+            .await
+            .unwrap();
+        assert!(other.is_empty());
+    }
+
+    #[test]
     fn child_attention_message_with_detail_reads_detail_once() {
         let issue_uri = "cairn://p/P/2";
         let detail_uri = "cairn://p/P/2/1/builder/permissions/perm-2";
@@ -2306,51 +2435,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn digest_collapses_facts_and_preserves_messages() {
-        let db = migrated_db().await;
-        seed_job(&db).await;
-        subscribe(&db, "j", "issue", Some("cairn://p/P/2"), None, "agent")
-            .await
-            .unwrap();
-        let sub = mute(
-            &db,
-            "j",
-            "issue",
-            Some("cairn://p/P/2"),
-            None,
-            None,
-            None,
-            "agent",
-        )
-        .await
-        .unwrap();
-        record_suppressed_fact(&db, &sub, "pr_state_change", Some("latest-1"))
-            .await
-            .unwrap();
-        record_suppressed_fact(&db, &sub, "pr_state_change", Some("latest-2"))
-            .await
-            .unwrap();
-        record_suppressed_message_for_subscription(&db, &sub, "message", "[user → child] hello")
-            .await
-            .unwrap();
-        let claimed =
-            claim_pending_suppressed_for_job_with_live_source(&db, "j", Some(&WakeSource::User))
-                .await
-                .unwrap();
-        assert_eq!(claimed.len(), 2);
-        assert!(claimed
-            .iter()
-            .any(|n| n.fact_kind.as_deref() == Some("pr_state_change")
-                && n.occurrences == 2
-                && n.latest_detail_uri.as_deref() == Some("latest-2")));
-        assert!(claimed
-            .iter()
-            .any(|n| n.content.as_deref() == Some("[user → child] hello")));
-        let subs = list_subscriptions_for_job(&db, "j").await.unwrap();
-        assert_eq!(subs[0].state, WakeSubscriptionState::Active);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2439,7 +2523,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn muted_queue_wake_records_digest_but_interrupt_pierces_mute() {
+    async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
         let db = migrated_db().await;
         seed_job(&db).await;
         let sub = mute(
@@ -2456,6 +2540,9 @@ mod tests {
         .unwrap();
         let orch = test_orchestrator(db);
 
+        // CAIRN-1900: mute is downgrade-at-creation for pushes; the suppressed_wakes
+        // digest store is gone. A non-interrupt wake to a muted source on these live
+        // non-push callers is dropped and writes no suppressed_wakes row.
         let queue_action = route_wake(
             &orch,
             WakeEvent {
@@ -2472,15 +2559,16 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(queue_action, WakeRouteAction::Suppressed);
-        assert_eq!(
+        assert_eq!(queue_action, WakeRouteAction::Dropped);
+        assert!(
             peek_pending_suppressed_for_job(&orch.db.local, "j")
                 .await
                 .unwrap()
-                .len(),
-            1
+                .is_empty(),
+            "a muted non-interrupt wake writes no suppressed_wakes digest row"
         );
 
+        // Interrupt still pierces the mute and delivers.
         let interrupt_action = route_wake(
             &orch,
             WakeEvent {
@@ -2499,13 +2587,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(interrupt_action, WakeRouteAction::Delivered);
-        assert!(
-            peek_pending_suppressed_for_job(&orch.db.local, "j")
-                .await
-                .unwrap()
-                .is_empty(),
-            "interrupt pierces mute and claims the queued digest into the delivered wake"
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2561,50 +2642,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn muted_child_side_channel_records_digest_instead_of_normal_notice() {
-        let db = migrated_db().await;
-        seed_job(&db).await;
-        subscribe(&db, "j", "issue", Some("cairn://p/P/2"), None, "agent")
-            .await
-            .unwrap();
-        mute(
-            &db,
-            "j",
-            "issue",
-            Some("cairn://p/P/2"),
-            None,
-            None,
-            None,
-            "agent",
-        )
-        .await
-        .unwrap();
-
-        let subscription =
-            matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "message")
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(subscription.state, WakeSubscriptionState::Muted);
-        record_suppressed_message_for_subscription(
-            &db,
-            &subscription,
-            "message",
-            "[Side-channel] the user messaged your child cairn://p/P/2/1/builder:\nplease polish",
-        )
-        .await
-        .unwrap();
-        let pending = peek_pending_suppressed_for_job(&db, "j").await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].source_ref.as_deref(), Some("cairn://p/P/2"));
-        assert_eq!(pending[0].fact_kind.as_deref(), Some("message"));
-        assert!(pending[0]
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("please polish"));
-    }
-    #[tokio::test(flavor = "current_thread")]
     async fn seeds_default_child_subscription_from_recorded_parent_job() {
         let db = migrated_db().await;
         seed_job(&db).await;
@@ -2623,12 +2660,137 @@ mod tests {
         assert_eq!(seeded.job_id, "j");
         assert_eq!(seeded.source_kind, "issue");
         assert_eq!(seeded.source_ref.as_deref(), Some("cairn://p/P/2"));
-        let kinds = seeded.fact_kinds.unwrap();
-        assert!(kinds.contains(&"question".to_string()));
-        assert!(kinds.contains(&"message".to_string()));
+        let mut kinds = seeded.fact_kinds.unwrap();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            vec![
+                "message".to_string(),
+                "permission".to_string(),
+                "question".to_string(),
+                "resolved".to_string(),
+                "review".to_string(),
+            ]
+        );
 
         let subs = list_subscriptions_for_job(&db, "j").await.unwrap();
         assert_eq!(subs.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_child_subscription_moves_default_to_current_parent() {
+        let db = migrated_db().await;
+        seed_job(&db).await;
+        seed_second_job(&db).await;
+        db.execute(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_issue_id, parent_job_id, created_at, updated_at)
+             VALUES('child', 'p', 2, 'Child', 'active', 'active', 'none', 'i', 'j2', 2, 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        seed_default_child_subscription_for_parent_job(&db, "j", "cairn://p/P/2")
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+             VALUES('manual','p','i','complete','sm',3,3)",
+            (),
+        )
+        .await
+        .unwrap();
+        subscribe(&db, "manual", "issue", Some("cairn://p/P/2"), None, "agent")
+            .await
+            .unwrap();
+
+        let seeded = reconcile_default_child_subscription_for_issue(&db, "child", "cairn://p/P/2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seeded.job_id, "j2");
+
+        assert!(list_subscriptions_for_job(&db, "j")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_subscriptions_for_job(&db, "j2").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            list_subscriptions_for_job(&db, "manual")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "manual watcher must be preserved"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_child_subscription_orphan_removes_only_system_default() {
+        let db = migrated_db().await;
+        seed_job(&db).await;
+        db.execute_script(
+            "
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('child', 'p', 2, 'Child', 'active', 'active', 'none', 2, 2);
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+              VALUES('manual','p','i','complete','sm',3,3);
+            ",
+        )
+        .await
+        .unwrap();
+        seed_default_child_subscription_for_parent_job(&db, "j", "cairn://p/P/2")
+            .await
+            .unwrap();
+        subscribe(&db, "manual", "issue", Some("cairn://p/P/2"), None, "agent")
+            .await
+            .unwrap();
+
+        let reconciled =
+            reconcile_default_child_subscription_for_issue(&db, "child", "cairn://p/P/2")
+                .await
+                .unwrap();
+        assert!(reconciled.is_none());
+        assert!(list_subscriptions_for_job(&db, "j")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_subscriptions_for_job(&db, "manual")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_fact_aliases_match_legacy_child_subscription_kinds() {
+        let db = migrated_db().await;
+        seed_job(&db).await;
+        let legacy = vec![
+            "agent_idle_with_work".to_string(),
+            "pr_state_change".to_string(),
+        ];
+        subscribe(
+            &db,
+            "j",
+            "issue",
+            Some("cairn://p/P/2"),
+            Some(&legacy),
+            "agent",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "review")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2828,63 +2990,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn claimable_preview_does_not_deliver_or_lift_mute() {
+    async fn mute_downgrade_lowers_wake_for_muted_source_only() {
         let db = migrated_db().await;
         seed_job(&db).await;
-        let sub = mute(
-            &db,
-            "j",
-            "issue",
-            Some("cairn://p/P/2"),
-            None,
-            None,
-            None,
-            "agent",
-        )
-        .await
-        .unwrap();
-        record_suppressed_fact(&db, &sub, "pr_state_change", Some("latest"))
-            .await
-            .unwrap();
-
-        let preview =
-            peek_claimable_suppressed_for_job_with_live_source(&db, "j", Some(&WakeSource::User))
-                .await
-                .unwrap();
-        assert_eq!(preview.len(), 1);
-        let pending = peek_pending_suppressed_for_job(&db, "j").await.unwrap();
+        // Unmuted source: a requested Wake stays Wake.
         assert_eq!(
-            pending.len(),
-            1,
-            "preview must not stamp the digest delivered"
+            mute_downgrade(
+                &db,
+                "j",
+                "issue",
+                Some("cairn://p/P/2"),
+                "review",
+                Wake::Wake
+            )
+            .await
+            .unwrap(),
+            Wake::Wake
         );
-        let still_muted = list_subscriptions_for_job(&db, "j")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.id == sub.id)
-            .unwrap();
-        assert_eq!(still_muted.state, WakeSubscriptionState::Muted);
-
-        let claimed =
-            claim_pending_suppressed_for_job_with_live_source(&db, "j", Some(&WakeSource::User))
-                .await
-                .unwrap();
-        assert_eq!(claimed.len(), 1);
-        let lifted = list_subscriptions_for_job(&db, "j")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.id == sub.id)
-            .unwrap();
-        assert_eq!(lifted.state, WakeSubscriptionState::Active);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn preview_claim_leaves_post_preview_updates_pending_and_muted() {
-        let db = migrated_db().await;
-        seed_job(&db).await;
-        let sub = mute(
+        mute(
             &db,
             "j",
             "issue",
@@ -2896,181 +3019,47 @@ mod tests {
         )
         .await
         .unwrap();
-        record_suppressed_fact(&db, &sub, "pr_state_change", Some("latest-1"))
-            .await
-            .unwrap();
-        let preview =
-            peek_claimable_suppressed_for_job_with_live_source(&db, "j", Some(&WakeSource::User))
-                .await
-                .unwrap();
-        assert_eq!(preview.len(), 1);
-        assert_eq!(preview[0].occurrences, 1);
-        assert_eq!(preview[0].latest_detail_uri.as_deref(), Some("latest-1"));
-
-        // Simulate the direct-message race window: after the digest was rendered
-        // into a successful resume prompt, the muted source emits more work before
-        // the post-success claim runs. A same-kind fact collapses into the
-        // previewed row id; a message creates a second row. Neither was rendered.
-        record_suppressed_fact(&db, &sub, "pr_state_change", Some("latest-2"))
-            .await
-            .unwrap();
-        record_suppressed_message_for_subscription(&db, &sub, "message", "[user → child] later")
-            .await
-            .unwrap();
-
-        let claimed = claim_suppressed_wake_preview(&db, "j", &preview)
-            .await
-            .unwrap();
-        assert!(
-            claimed.is_empty(),
-            "a rendered snapshot that changed after preview must not be delivered"
-        );
-        let pending = peek_pending_suppressed_for_job(&db, "j").await.unwrap();
+        // Muted source: a requested Wake is downgraded to Passive (ride-along).
         assert_eq!(
-            pending.len(),
-            2,
-            "post-preview rows remain for the next live wake"
+            mute_downgrade(
+                &db,
+                "j",
+                "issue",
+                Some("cairn://p/P/2"),
+                "review",
+                Wake::Wake
+            )
+            .await
+            .unwrap(),
+            Wake::Passive
         );
-        assert!(pending.iter().any(|notice| {
-            notice.fact_kind.as_deref() == Some("pr_state_change")
-                && notice.occurrences == 2
-                && notice.latest_detail_uri.as_deref() == Some("latest-2")
-        }));
-        assert!(pending
-            .iter()
-            .any(|notice| notice.content.as_deref() == Some("[user → child] later")));
-        let still_muted = list_subscriptions_for_job(&db, "j")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.id == sub.id)
-            .unwrap();
-        assert_eq!(still_muted.state, WakeSubscriptionState::Muted);
-
-        let later_preview =
-            peek_claimable_suppressed_for_job_with_live_source(&db, "j", Some(&WakeSource::User))
-                .await
-                .unwrap();
-        assert_eq!(later_preview.len(), 2);
-        let later_claim = claim_suppressed_wake_preview(&db, "j", &later_preview)
-            .await
-            .unwrap();
-        assert_eq!(later_claim.len(), 2);
-        let lifted = list_subscriptions_for_job(&db, "j")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.id == sub.id)
-            .unwrap();
-        assert_eq!(lifted.state, WakeSubscriptionState::Active);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn generic_self_resume_does_not_claim_no_until_digest_or_lift_mute() {
-        let db = migrated_db().await;
-        seed_job(&db).await;
-        let sub = mute(
-            &db,
-            "j",
-            "issue",
-            Some("cairn://p/P/2"),
-            None,
-            None,
-            None,
-            "agent",
-        )
-        .await
-        .unwrap();
-        record_suppressed_fact(&db, &sub, "pr_state_change", Some("latest"))
-            .await
-            .unwrap();
-
-        let self_resume_claim = claim_pending_suppressed_for_job_with_live_source(&db, "j", None)
-            .await
-            .unwrap();
-        assert!(
-            self_resume_claim.is_empty(),
-            "self-suspend/generic resumes must not flush wake digests"
-        );
-        let pending = peek_pending_suppressed_for_job(&db, "j").await.unwrap();
+        // Interrupt is never downgraded, even when muted.
         assert_eq!(
-            pending.len(),
-            1,
-            "digest remains pending for the next live wake"
+            mute_downgrade(
+                &db,
+                "j",
+                "issue",
+                Some("cairn://p/P/2"),
+                "review",
+                Wake::Interrupt
+            )
+            .await
+            .unwrap(),
+            Wake::Interrupt
         );
-        let still_muted = list_subscriptions_for_job(&db, "j")
+        // Passive is already the lowest level and short-circuits unchanged.
+        assert_eq!(
+            mute_downgrade(
+                &db,
+                "j",
+                "issue",
+                Some("cairn://p/P/2"),
+                "review",
+                Wake::Passive
+            )
             .await
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.id == sub.id)
-            .unwrap();
-        assert_eq!(still_muted.state, WakeSubscriptionState::Muted);
-
-        let live_claim =
-            claim_pending_suppressed_for_job_with_live_source(&db, "j", Some(&WakeSource::User))
-                .await
-                .unwrap();
-        assert_eq!(live_claim.len(), 1, "external user wake claims the digest");
-        let lifted = list_subscriptions_for_job(&db, "j")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|candidate| candidate.id == sub.id)
-            .unwrap();
-        assert_eq!(lifted.state, WakeSubscriptionState::Active);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn until_filter_controls_digest_claim_and_lift() {
-        let db = migrated_db().await;
-        seed_job(&db).await;
-        subscribe(&db, "j", "issue", Some("cairn://p/P/2"), None, "agent")
-            .await
-            .unwrap();
-        let sub = mute(
-            &db,
-            "j",
-            "issue",
-            Some("cairn://p/P/2"),
-            None,
-            Some("user"),
-            None,
-            "agent",
-        )
-        .await
-        .unwrap();
-        record_suppressed_fact(&db, &sub, "pr_state_change", Some("latest"))
-            .await
-            .unwrap();
-
-        let generic = claim_pending_suppressed_for_job_with_live_source(&db, "j", None)
-            .await
-            .unwrap();
-        assert!(
-            generic.is_empty(),
-            "generic resume must not lift until:user mute"
+            .unwrap(),
+            Wake::Passive
         );
-        let peer = WakeSource::Peer {
-            reference: Some("cairn://p/P/1/1/peer".to_string()),
-        };
-        let peer_claim = claim_pending_suppressed_for_job_with_live_source(&db, "j", Some(&peer))
-            .await
-            .unwrap();
-        assert!(
-            peer_claim.is_empty(),
-            "peer wake must not lift until:user mute"
-        );
-        let user_claim =
-            claim_pending_suppressed_for_job_with_live_source(&db, "j", Some(&WakeSource::User))
-                .await
-                .unwrap();
-        assert_eq!(user_claim.len(), 1);
-        let sub = list_subscriptions_for_job(&db, "j")
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|s| s.id == sub.id)
-            .unwrap();
-        assert_eq!(sub.state, WakeSubscriptionState::Active);
     }
 }

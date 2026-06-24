@@ -238,7 +238,7 @@ fn segment_suffix(meta: &SegmentMeta, shown: usize) -> Option<String> {
     // A pushdown collection reports `N of M issues`/`messages` in its natural
     // unit. When the total is not cheaply knowable (messages), the suffix is
     // omitted and the header stays bare.
-    if matches!(meta.natural_unit, NaturalUnit::Record) {
+    if matches!(meta.natural_unit, NaturalUnit::Record | NaturalUnit::Turn) {
         let total = meta.total_units?;
         let noun = meta.unit_noun.as_deref()?;
         return Some(format!("{shown} of {total} {noun}"));
@@ -366,7 +366,10 @@ fn cut_body(body: &str, budget: usize, numbered: bool) -> BodyCut {
 /// emitting the enriched header, body, an always-valid continue footer, and any
 /// issue history. Updates `meta.shown_units`, `truncated`, and `char_continuation`.
 pub fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
-    if matches!(seg.meta.natural_unit, NaturalUnit::Record) {
+    if matches!(
+        seg.meta.natural_unit,
+        NaturalUnit::Record | NaturalUnit::Turn
+    ) {
         return render_record_segment(seg, budget);
     }
     let ReadSegment {
@@ -414,8 +417,8 @@ pub fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
                     None
                 }
             }
-            // Record pages are rendered by render_record_segment, never here.
-            NaturalUnit::Record => None,
+            // Record/turn pages are rendered by render_record_segment, never here.
+            NaturalUnit::Record | NaturalUnit::Turn => None,
             NaturalUnit::Line | NaturalUnit::File => {
                 let total = meta.total_units.unwrap_or(meta.offset + cut.shown_lines);
                 if cut.budget_truncated
@@ -779,6 +782,29 @@ mod tests {
             out.text,
             "=== cairn://p/CAIRN/1/messages?limit=5 ===\n[ts] sender: hello"
         );
+    }
+
+    #[test]
+    fn turn_segment_emits_turn_suffix_and_paging_footer() {
+        let mut meta = SegmentMeta::new(
+            "cairn://p/CAIRN/1/1/builder/chat?offset=1&limit=1",
+            SegmentKind::Resource,
+            NaturalUnit::Turn,
+        );
+        meta.total_units = Some(3);
+        meta.shown_units = 1;
+        meta.unit_noun = Some("turns".to_string());
+        meta.offset = 1;
+        meta.limit = Some(1);
+
+        let out = render_segment(ReadSegment::text("# chat\n\n## Turn 2\nbody", meta), 10_000);
+
+        assert!(out.text.starts_with(
+            "=== cairn://p/CAIRN/1/1/builder/chat?offset=1&limit=1 [1 of 3 turns] ==="
+        ));
+        assert!(out
+            .text
+            .contains("continue: cairn://p/CAIRN/1/1/builder/chat?limit=1&offset=2"));
     }
 
     #[test]

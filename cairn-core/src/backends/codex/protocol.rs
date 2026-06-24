@@ -10,6 +10,7 @@ pub(super) struct CodexStdin {
     cwd: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    service_tier: Option<String>,
     current_turn_id: Arc<Mutex<Option<String>>>,
 }
 
@@ -20,6 +21,7 @@ impl CodexStdin {
         cwd: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        service_tier: Option<String>,
         current_turn_id: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
@@ -28,6 +30,7 @@ impl CodexStdin {
             cwd,
             model,
             reasoning_effort,
+            service_tier,
             current_turn_id,
         }
     }
@@ -44,6 +47,9 @@ impl CodexStdin {
         }
         if let Some(ref effort) = self.reasoning_effort {
             params["reasoningEffort"] = serde_json::json!(effort);
+        }
+        if let Some(ref tier) = self.service_tier {
+            params["serviceTier"] = serde_json::json!(tier);
         }
         let result = self.client.send_request("turn/start", params)?;
         if let Some(turn_id) = result
@@ -99,21 +105,15 @@ impl BackendStdin for CodexStdin {
 pub(super) struct StreamingState {
     pub(super) stream_id: String,
     pub(super) run_id: String,
-    pub(super) session_id: Option<String>,
     pub(super) version: i32,
     pub(super) acc: StreamAccumulator,
 }
 
 impl StreamingState {
-    pub(super) fn new(
-        stream: &ActiveMessageStream,
-        run_id: &str,
-        session_id: Option<&str>,
-    ) -> Self {
+    pub(super) fn new(stream: &ActiveMessageStream, run_id: &str) -> Self {
         Self {
             stream_id: stream.stream.id.clone(),
             run_id: run_id.to_string(),
-            session_id: session_id.map(str::to_string),
             version: stream.stream.version,
             acc: StreamAccumulator::new(),
         }

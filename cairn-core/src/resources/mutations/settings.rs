@@ -26,11 +26,14 @@ const PREF_KEYS: &[&str] = &[
     "orphanCleanupDays",
     "bugReports",
     "thinkingDisplayMode",
+    "logLevel",
     "pendingMemoryThreshold",
     "externalReplies",
+    "subscriptionFees",
     "activeBackend",
     "tiers",
     "backends",
+    "openrouterRouting",
 ];
 
 /// Section objects that route to dedicated stores.
@@ -324,6 +327,13 @@ mod tests {
     fn accepts_known_pref_and_section_keys() {
         assert!(validate(&["branchPrefix", "gitIdentities", "keybinds", "buildServices"]).is_ok());
         assert!(validate(&["activeBackend", "tiers", "backends", "accounts"]).is_ok());
+    }
+
+    #[test]
+    fn accepts_openrouter_routing_and_doc_parity_keys() {
+        // openrouterRouting is the new routing object; logLevel/subscriptionFees
+        // are documented URI-writable prefs that were missing from the allowlist.
+        assert!(validate(&["openrouterRouting", "logLevel", "subscriptionFees"]).is_ok());
     }
 
     #[test]

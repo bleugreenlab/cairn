@@ -1,0 +1,73 @@
+# Minimal proof recipe for the port-based context model (CAIRN-1941, Wave 4).
+#
+# A single agent owns BOTH of the artifact-bearing context ports:
+#   - context-out -> `summary` ArtifactNode (user-gated): the terminal output.
+#     Writing it ends the turn; it advances the DAG only after user confirm.
+#   - context-self -> `scratch` ArtifactNode (auto): a living working doc the
+#     agent creates and patches across its whole run. It never ends the turn,
+#     never advances the DAG, and keeps its own per-name version chain.
+#
+# This file is the runnable artifact behind the lifecycle test
+# (tests/ctx_self_lifecycle.rs) and the live ctx-self proof: import it as a
+# recipe and run it on a scratch issue to watch an agent write its living doc.
+cairnVersion: 1
+name: Ctx-self proof
+description: An agent owning a terminal context-out artifact and a context-self living doc
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+    scope: issue
+- id: worker-1
+  type: agent
+  name: Worker
+  position: 0@100
+  config:
+    agent: build
+- id: summary-1
+  type: artifact
+  name: Summary
+  position: 0@200
+  config:
+    artifactType: summary
+    confirmPolicy: user
+    schema:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: string
+          description: The terminal result
+- id: scratch-1
+  type: artifact
+  name: Scratch
+  position: 240@100
+  config:
+    artifactType: scratch
+    confirmPolicy: auto
+    schema:
+      type: object
+      properties:
+        note:
+          type: string
+          description: Current working note
+        extra:
+          type: string
+          description: Additional scratch detail
+edges:
+- from: trigger-1@control-out
+  to: worker-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: worker-1@context-in
+  type: context
+- from: worker-1@context-out
+  to: summary-1@context-in
+  type: context
+- from: worker-1@context-self
+  to: scratch-1@context-in
+  type: context

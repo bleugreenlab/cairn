@@ -233,7 +233,11 @@ async fn assert_copy_from_workspace_source(kind: ConfigKind) {
     assert_eq!(additive.id, "src-copy", "{kind:?}");
     assert_eq!(additive.name, "Source", "{kind:?}");
     assert!(additive.workspace_id.is_none(), "{kind:?}");
-    assert_eq!(additive.project_id, Some(ctx.project_id.clone()), "{kind:?}");
+    assert_eq!(
+        additive.project_id,
+        Some(ctx.project_id.clone()),
+        "{kind:?}"
+    );
     assert!(kind.project_path(&ctx, "src-copy").exists(), "{kind:?}");
     assert!(
         kind.workspace_path(&ctx, "src").exists(),
@@ -255,7 +259,10 @@ async fn assert_copy_rejects_existing_target(kind: ConfigKind) {
     kind.write_workspace(&ctx, "src", "Source");
     kind.write_workspace(&ctx, "taken", "Taken");
 
-    assert_err_contains(kind.copy(&ctx, "src", None, "taken", None), "already exists");
+    assert_err_contains(
+        kind.copy(&ctx, "src", None, "taken", None),
+        "already exists",
+    );
 }
 
 #[tokio::test]

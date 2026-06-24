@@ -23,13 +23,15 @@ use crate::execution::dag::{recipe_edge_to_db, recipe_node_to_db};
 use crate::execution::step_behavior::resolve_node_behavior;
 use crate::models::{
     AgentConfig, AgentSnapshot, ExecutionSnapshot, Job, JobStatus, Model, OutputSchema,
-    OutputSchemaInfo, RecipeEdge, RecipeNode, Run, RunStatus, Session, SessionStatus,
-    TurnStartReason, TurnState,
+    OutputSchemaInfo, RecipeNode, Run, RunStatus, Session, SessionStatus, TurnStartReason,
+    TurnState,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::sync::SyncMessage;
-use crate::transcripts::stream_store::{get_next_sequence, insert_event, EventInsert};
+use crate::transcripts::stream_store::{
+    get_next_sequence, insert_event, insert_event_stamping_pushes, EventInsert,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -54,6 +56,7 @@ mod worktrees;
 pub use child_tasks::create_child_task;
 pub(crate) use inputs::{
     find_downstream_artifact_schema_conn, find_downstream_artifact_schema_with_snapshot_conn,
+    resolve_ctx_self_schemas_conn, resolve_ctx_self_schemas_with_snapshot,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;

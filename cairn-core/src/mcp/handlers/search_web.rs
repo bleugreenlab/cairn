@@ -335,10 +335,7 @@ fn parse_jina(body: &str) -> Result<Vec<SearchResult>, String> {
 
 // --- Shared helpers ---------------------------------------------------------
 
-fn decode<T: for<'de> Deserialize<'de>>(
-    id: SearchProviderId,
-    body: &str,
-) -> Result<T, String> {
+fn decode<T: for<'de> Deserialize<'de>>(id: SearchProviderId, body: &str) -> Result<T, String> {
     serde_json::from_str(body).map_err(|e| {
         format!(
             "Web search via {} returned an unexpected response shape ({e}). Raw response:\n\n{}",
@@ -494,7 +491,10 @@ mod tests {
         let req = build_request(SearchProviderId::Exa, "q", &opts(&[]), "k");
         assert_eq!(req.method, "POST");
         assert_eq!(req.url, "https://api.exa.ai/search");
-        assert!(req.headers.iter().any(|(k, v)| k == "x-api-key" && v == "k"));
+        assert!(req
+            .headers
+            .iter()
+            .any(|(k, v)| k == "x-api-key" && v == "k"));
         let body: serde_json::Value = serde_json::from_str(req.body.as_deref().unwrap()).unwrap();
         assert_eq!(body["numResults"], 10);
         assert_eq!(body["contents"]["text"], true);

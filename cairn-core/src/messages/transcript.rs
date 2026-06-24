@@ -63,6 +63,7 @@ pub async fn insert_message_events(
             "system:message",
             &data,
             now,
+            &[],
         )
         .await
         {
@@ -86,6 +87,80 @@ pub async fn insert_message_events(
             },
         )));
     }
+}
+
+/// Persist a single carrying event for drained attention pushes and stamp each
+/// push delivered by it, atomically (CAIRN-1881). Used by the busy-agent
+/// event-boundary drain in `dispatch`: the pushes are just another source
+/// feeding the same transcript-event + reminder sink as directs and side-channel
+/// notices. Best-effort: an insert failure is logged and leaves the pushes
+/// pending to redeliver, matching the surrounding augmentation behaviour.
+pub async fn insert_attention_push_events(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: Option<&str>,
+    pushes: &[crate::orchestrator::attention_push::Push],
+    resolved: &str,
+) {
+    if pushes.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp() as i32;
+    let event_id = uuid::Uuid::new_v4().to_string();
+    // CAIRN-1891: render delivered wakes through the one wake-card formatter —
+    // store the carrying event as an `attention:briefing` whose content is the
+    // structured `{active, catchup}` card payload plus the `resolved` markdown the
+    // agent received (for the detail modal), not a raw `system:message` line.
+    let summary = crate::orchestrator::attention_push::push_event_content_json(pushes, resolved);
+    let push_ids: Vec<String> = pushes.iter().map(|p| p.id.clone()).collect();
+    let transcript_event = TranscriptEvent {
+        event_type: "attention:briefing".to_string(),
+        session_id: session_id.map(|s| s.to_string()),
+        parent_tool_use_id: None,
+        content: Some(summary),
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error: false,
+        thinking_ms: None,
+        raw: Some(serde_json::json!({ "attention_push_ids": push_ids })),
+    };
+    let data = serde_json::to_string(&transcript_event).unwrap_or_default();
+
+    let sequence = match insert_system_event(
+        &orch.db.local,
+        &event_id,
+        run_id,
+        session_id,
+        "system:message",
+        &data,
+        now,
+        &push_ids,
+    )
+    .await
+    {
+        Ok(sequence) => sequence,
+        Err(error) => {
+            log::warn!("Failed to insert attention push event: {}", error);
+            return;
+        }
+    };
+
+    orch.sync(SyncMessage::Event(SyncEvent::transcript(
+        SyncTranscriptEvent {
+            id: event_id.clone(),
+            run_id: run_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            sequence,
+            event_type: "system:message".to_string(),
+            data: data.clone(),
+            created_at: i64::from(now),
+            turn_id: orch.process_state.get_current_turn_id(run_id),
+        },
+    )));
 }
 
 /// Insert a `user` transcript event per delivered queued user message, so the
@@ -202,6 +277,7 @@ pub async fn insert_side_channel_events(
             "system:message",
             &data,
             now,
+            &[],
         )
         .await
         {
@@ -356,9 +432,10 @@ async fn insert_user_event(
     data: &str,
     now: i32,
 ) -> DbResult<i32> {
-    insert_system_event(db, event_id, run_id, session_id, "user", data, now).await
+    insert_system_event(db, event_id, run_id, session_id, "user", data, now, &[]).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_system_event(
     db: &LocalDb,
     event_id: &str,
@@ -367,12 +444,14 @@ async fn insert_system_event(
     event_type: &str,
     data: &str,
     now: i32,
+    push_ids: &[String],
 ) -> DbResult<i32> {
     let event_id = event_id.to_string();
     let run_id = run_id.to_string();
     let session_id = session_id.map(str::to_string);
     let event_type = event_type.to_string();
     let data = data.to_string();
+    let push_ids = push_ids.to_vec();
 
     db.write(|conn| {
         let event_id = event_id.clone();
@@ -380,6 +459,7 @@ async fn insert_system_event(
         let session_id = session_id.clone();
         let event_type = event_type.clone();
         let data = data.clone();
+        let push_ids = push_ids.clone();
         Box::pin(async move {
             let sequence = next_event_sequence(conn, &run_id).await?;
             conn.execute(
@@ -403,6 +483,11 @@ async fn insert_system_event(
                 ],
             )
             .await?;
+            // CAIRN-1881: when this event carries attention pushes, stamp each
+            // delivered by it inside the same transaction as the INSERT. Roll
+            // back together → the push redelivers.
+            crate::orchestrator::attention_push::stamp_delivered_conn(conn, &push_ids, &event_id)
+                .await?;
             Ok(sequence)
         })
     })

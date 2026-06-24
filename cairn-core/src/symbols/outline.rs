@@ -21,8 +21,11 @@ use super::walk::{build_globset, relative, source_files};
 /// Produce an outline for a file or directory `target`, rooted at `root`.
 pub fn outline(root: &Path, target: &Path, glob: Option<&str>) -> Rendered {
     if target.is_file() {
+        // Single file: rows are path-less (`line:signature  [tags]`). The read
+        // header (`=== uri ===`) already carries the path, so repeating it on
+        // every row is pure noise.
         let display = relative(root, target).to_string_lossy().into_owned();
-        return Rendered::message(outline_file(&display, target).unwrap_or_else(|| {
+        return Rendered::message(outline_file(target).unwrap_or_else(|| {
             format!("no bundled grammar for {display} — outline needs a known file type")
         }));
     }
@@ -33,36 +36,54 @@ pub fn outline(root: &Path, target: &Path, glob: Option<&str>) -> Rendered {
         },
         None => None,
     };
+    // Multi-file walk: group each file's path-less rows under a single path
+    // header line, separated by a blank line, rather than prefixing the path
+    // onto every row.
     let mut blocks = Vec::new();
     for (path, _lang) in source_files(root, target, globset.as_ref()) {
         let display = relative(root, &path).to_string_lossy().into_owned();
-        if let Some(rendered) = outline_file(&display, &path) {
+        if let Some(rendered) = outline_file(&path) {
             if !rendered.is_empty() {
-                blocks.push(rendered);
+                blocks.push(format!("{display}\n{rendered}"));
             }
         }
     }
     if blocks.is_empty() {
         return Rendered::message("no outline entries");
     }
-    Rendered::message(blocks.join("\n"))
+    Rendered::message(blocks.join("\n\n"))
 }
 
-fn outline_file(display: &str, path: &Path) -> Option<String> {
+fn outline_file(path: &Path) -> Option<String> {
     let lang = lang_for_path(path)?;
     let src = std::fs::read_to_string(path).ok()?;
-    Some(outline_text(display, &src, Some(lang)))
+    Some(outline_text(&src, Some(lang)))
 }
 
-/// Outline a single in-memory source, labeling rows with `display_path`. The
-/// bytes-based entry the archival/gitcoord read path uses: a recorded
+/// Outline a single in-memory source as path-less rows (`line:signature  [tags]`).
+/// The bytes-based entry the archival/gitcoord read path uses: a recorded
 /// single-file outline reconstructs identically from a git blob (the engine
 /// only parses text). `None` lang → empty (no bundled grammar).
-pub fn outline_text(display_path: &str, src: &str, lang: Option<SupportLang>) -> String {
+pub fn outline_text(src: &str, lang: Option<SupportLang>) -> String {
     match lang {
-        Some(lang) => render_items(display_path, &extract_items(src, lang)),
+        Some(lang) => render_items(&extract_items(src, lang)),
         None => String::new(),
     }
+}
+
+/// Count the file headers in a multi-file outline body. Entry rows are
+/// line-numbered (`\d+:…`); every other non-empty line is a file header. Used
+/// to report `N matches in M files` for a directory outline.
+pub fn file_count(body: &str) -> usize {
+    body.lines()
+        .filter(|line| !line.is_empty() && !is_row(line))
+        .count()
+}
+
+/// Whether a body line is an entry row (`\d+:…`) rather than a file header.
+fn is_row(line: &str) -> bool {
+    let digits = line.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0 && line.as_bytes().get(digits) == Some(&b':')
 }
 
 /// Extract top-level items with their direct members from a source string.
@@ -85,8 +106,13 @@ pub fn extract_items(src: &str, lang: SupportLang) -> Vec<OutlineItem<'static>> 
 }
 
 fn unwrap_decl<'r>(node: &SymbolNode<'r>) -> SymbolNode<'r> {
-    if matches!(node.kind().as_ref(), "export_statement" | "decorated_definition") {
-        if let Some(inner) = node.children().find(|c| item_symbol_type(c.kind().as_ref()).is_some())
+    if matches!(
+        node.kind().as_ref(),
+        "export_statement" | "decorated_definition"
+    ) {
+        if let Some(inner) = node
+            .children()
+            .find(|c| item_symbol_type(c.kind().as_ref()).is_some())
         {
             return inner;
         }
@@ -195,8 +221,11 @@ const MEMBER_LIST_KINDS: &[&str] = &[
 /// Top-level item kinds → outline symbol category. `None` means "not an item".
 fn item_symbol_type(kind: &str) -> Option<SymbolType> {
     Some(match kind {
-        "function_item" | "function_signature_item" | "function_declaration"
-        | "generator_function_declaration" | "function_definition" => SymbolType::Function,
+        "function_item"
+        | "function_signature_item"
+        | "function_declaration"
+        | "generator_function_declaration"
+        | "function_definition" => SymbolType::Function,
         "method_declaration" => SymbolType::Method,
         "struct_item" | "union_item" => SymbolType::Struct,
         "enum_item" | "enum_declaration" => SymbolType::Enum,
@@ -218,7 +247,9 @@ fn member_symbol_type(kind: &str) -> Option<SymbolType> {
     Some(match kind {
         "function_item" | "function_signature_item" | "function_definition" => SymbolType::Method,
         "method_definition" | "method_signature" | "method_elem" => SymbolType::Method,
-        "field_declaration" | "public_field_definition" | "field_definition"
+        "field_declaration"
+        | "public_field_definition"
+        | "field_definition"
         | "property_signature" => SymbolType::Field,
         "enum_variant" | "enum_member" => SymbolType::EnumMember,
         "const_item" => SymbolType::Constant,
@@ -251,24 +282,23 @@ fn is_public(node: &SymbolNode) -> bool {
     )
 }
 
-fn render_items(display: &str, items: &[OutlineItem]) -> String {
+fn render_items(items: &[OutlineItem]) -> String {
     let mut lines = Vec::new();
     for item in items {
-        lines.push(render_entry(display, &item.entry, item.is_exported, item.is_import, 0));
+        lines.push(render_entry(
+            &item.entry,
+            item.is_exported,
+            item.is_import,
+            0,
+        ));
         for member in &item.members {
-            lines.push(render_entry(display, &member.entry, member.is_public, false, 1));
+            lines.push(render_entry(&member.entry, member.is_public, false, 1));
         }
     }
     lines.join("\n")
 }
 
-fn render_entry(
-    display: &str,
-    entry: &OutlineEntry,
-    flagged: bool,
-    is_import: bool,
-    depth: usize,
-) -> String {
+fn render_entry(entry: &OutlineEntry, flagged: bool, is_import: bool, depth: usize) -> String {
     let indent = "  ".repeat(depth);
     let line = entry.range.start.line + 1;
     let mut tags = vec![symbol_type_label(entry.symbol_type).to_string()];
@@ -278,11 +308,7 @@ fn render_entry(
     if flagged {
         tags.push(if depth == 0 { "exported" } else { "pub" }.to_string());
     }
-    format!(
-        "{display}:{line}:{indent}{}  [{}]",
-        entry.signature,
-        tags.join(" ")
-    )
+    format!("{line}:{indent}{}  [{}]", entry.signature, tags.join(" "))
 }
 
 fn symbol_type_label(symbol_type: SymbolType) -> &'static str {
@@ -325,7 +351,10 @@ mod tests {
     fn extracts_rust_impl_methods() {
         let src = "struct Foo;\nimpl Foo {\n    pub fn go(&self) {}\n    fn hidden(&self) {}\n}\n";
         let items = extract_items(src, SupportLang::Rust);
-        let impl_item = items.iter().find(|i| i.entry.ast_kind == "impl_item").unwrap();
+        let impl_item = items
+            .iter()
+            .find(|i| i.entry.ast_kind == "impl_item")
+            .unwrap();
         assert_eq!(impl_item.entry.name, "Foo");
         assert_eq!(impl_item.members.len(), 2);
         assert!(impl_item.members[0].is_public);
@@ -339,7 +368,11 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].entry.name, "Circle");
         assert!(items[0].is_exported);
-        let names: Vec<_> = items[0].members.iter().map(|m| m.entry.name.as_ref()).collect();
+        let names: Vec<_> = items[0]
+            .members
+            .iter()
+            .map(|m| m.entry.name.as_ref())
+            .collect();
         assert!(names.contains(&"radius"));
         assert!(names.contains(&"area"));
     }
@@ -350,7 +383,11 @@ mod tests {
         let items = extract_items(src, SupportLang::Python);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].entry.name, "Animal");
-        let names: Vec<_> = items[0].members.iter().map(|m| m.entry.name.as_ref()).collect();
+        let names: Vec<_> = items[0]
+            .members
+            .iter()
+            .map(|m| m.entry.name.as_ref())
+            .collect();
         assert!(names.contains(&"speak"));
         assert!(names.contains(&"move"));
     }
@@ -360,7 +397,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
         let r = outline(dir.path(), &dir.path().join("a.rs"), None);
-        assert!(r.body.contains("a.rs:1:"));
-        assert!(r.body.contains("[function exported]"));
+        // A single-file outline is path-less: the read header carries the path.
+        assert_eq!(r.body, "1:pub fn alpha() {}  [function exported]");
+        assert!(!r.body.contains("a.rs"));
+    }
+
+    #[test]
+    fn multi_file_groups_rows_under_path_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn alpha() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "pub fn beta() {}\n").unwrap();
+        let r = outline(dir.path(), dir.path(), Some("**/*.rs"));
+        // Each file contributes a bare path header followed by path-less rows.
+        assert!(r
+            .body
+            .contains("a.rs\n1:pub fn alpha() {}  [function exported]"));
+        assert!(r
+            .body
+            .contains("b.rs\n1:pub fn beta() {}  [function exported]"));
+        // Two header lines, two rows.
+        assert_eq!(file_count(&r.body), 2);
+    }
+
+    #[test]
+    fn file_count_counts_headers_not_rows() {
+        let body = "src/a.rs\n1:fn x()  [function]\n2:fn y()  [function]\n\nsrc/b.rs\n3:fn z()  [function]";
+        assert_eq!(file_count(body), 2);
     }
 }

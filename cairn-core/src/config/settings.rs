@@ -7,8 +7,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use cairn_common::logging::LogLevel;
+
 use crate::config::presets::{default_presets_config, PresetsConfig};
-use crate::models::{ExternalReplyMode, MergeType, Model, Preset, Settings, ThinkingDisplayMode};
+use crate::models::{
+    ExternalReplyMode, MergeType, Model, OpenRouterRouting, Preset, Settings, ThinkingDisplayMode,
+};
 
 /// Custom deserializer for max_thinking_tokens to distinguish between:
 /// - Field missing → None (should default to Some(31999))
@@ -66,19 +70,16 @@ pub struct SettingsFile {
     auto_start_jobs: Option<bool>,
     #[serde(default)]
     pub orphan_cleanup_days: Option<i32>,
-    /// Grace window (seconds) before an unanswered child question/permission
-    /// escalates from a passive briefing item to a steering wake of the parent.
-    /// Default 60. The window lets the user answer in the app first; only a
-    /// blocker still open at the deadline wakes the parent (so an autonomous
-    /// coordinator is never stalled forever).
-    #[serde(default)]
-    pub pending_blocker_timeout_secs: Option<u64>,
     /// Whether agent bug reports are enabled (default: true)
     #[serde(default)]
     pub bug_reports: Option<bool>,
     /// Thinking block display mode in chat transcripts
     #[serde(default)]
     pub thinking_display_mode: Option<ThinkingDisplayMode>,
+    /// File-log verbosity level. Absent = the light `Standard` default; `verbose`
+    /// is the opt-in full-debug + profiler level (today's behavior).
+    #[serde(default)]
+    pub log_level: Option<LogLevel>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     #[serde(default)]
     pub pending_memory_threshold: Option<i32>,
@@ -98,12 +99,12 @@ pub struct SettingsFile {
     /// `docs/worktree-fence.md` — Managed Build Services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_services: Option<HashMap<String, crate::config::build_services::BuildServiceConfig>>,
-    /// Web-fetch provider registry: settings-configured providers that back
-    /// `read http(s)://…` and local `.pdf` reads, keyed by provider name.
-    /// Config-only (YAML, not in the Settings DTO). Absent = only the built-in
-    /// `regular` + `bmd` providers are offered. See `docs/mcp-server.md`.
+    /// Typed web-fetch provider options, keyed by provider id
+    /// (`bmd`/`jina`/`firecrawl`) then option key. Config-only (YAML, not in the
+    /// Settings DTO). Validated against the per-provider descriptor in
+    /// `crate::config::web_fetch`. See `docs/settings.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_services: Option<HashMap<String, crate::config::web_services::WebServiceConfig>>,
+    pub web_fetch: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
     /// Which web-fetch provider backs fetch. Config-only (YAML, not in the
     /// Settings DTO). Absent / `regular` = the built-in plain-HTTP fetch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +119,32 @@ pub struct SettingsFile {
     /// (YAML, not in the Settings DTO). Absent = web search is unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_web_search: Option<String>,
+    /// Typed PDF-extraction provider options, keyed by provider id
+    /// (`local`/`bmd`) then option key. Config-only (YAML, not in the Settings
+    /// DTO). Validated against `crate::config::pdf`. See `docs/settings.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<HashMap<String, HashMap<String, serde_yaml::Value>>>,
+    /// Which PDF-extraction provider backs `.pdf` reads. Config-only (YAML, not
+    /// in the Settings DTO). Absent / `local` = the built-in local extractor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_pdf: Option<String>,
+    /// Flat monthly subscription fee per backend, in USD. A backend absent from
+    /// this map is treated as metered (pay-as-you-go, no normalization). e.g.
+    /// `{"claude": 200.0, "codex": 200.0}`. Drives effective-cost analytics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_fees: Option<HashMap<String, f64>>,
+    /// OpenRouter provider-routing controls (ZDR + sort). Absent = OpenRouter's
+    /// normal routing; omitted from YAML when all-default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openrouter_routing: Option<OpenRouterRouting>,
+    /// Per-project commands the user has accepted as worktree-fence crossers
+    /// (`projectId -> [command, ...]`). A project terminal command's `write`
+    /// carveout (or coarse fence crossing) is honored only when its command is
+    /// listed here, so a cloned repo can declare a fence-crosser but cannot grant
+    /// itself the crossing — acceptance is user-owned. Config-only (YAML, not in
+    /// the Settings DTO); preserved across saves. See `crate::config::dev_commands`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_fence_commands: Option<HashMap<String, Vec<String>>>,
 }
 
 /// Map legacy preferredModels to tier presets.
@@ -183,6 +210,17 @@ impl SettingsFile {
 
         // Build presets config (migrate from legacy if needed)
         let presets: PresetsConfig = if let Some(ref backends) = self.backends {
+            // The set of known backends is defined in code, not in the settings
+            // file. Start from the full default set so every available provider
+            // (including ones added after this install was first configured)
+            // always appears, then overlay the on-disk customizations per
+            // backend so the user's tier choices still win. Without this, an
+            // older settings.yaml that names only `claude`/`codex` would hide a
+            // newer backend like `openrouter` entirely.
+            let mut merged = default_presets_config(max_thinking_tokens).backends;
+            for (name, presets) in backends.clone() {
+                merged.insert(name, presets);
+            }
             PresetsConfig {
                 active_backend: self
                     .active_backend
@@ -194,7 +232,7 @@ impl SettingsFile {
                         .map(|s| s.to_string())
                         .collect()
                 }),
-                backends: backends.clone(),
+                backends: merged,
             }
         } else {
             // Legacy migration: build default presets, then overlay legacy model fields.
@@ -242,6 +280,9 @@ impl SettingsFile {
                 .external_replies
                 .clone()
                 .unwrap_or(ExternalReplyMode::Watchers),
+            log_level: self.log_level.unwrap_or(LogLevel::Standard),
+            subscription_fees: self.subscription_fees.clone().unwrap_or_default(),
+            openrouter_routing: self.openrouter_routing.clone().unwrap_or_default(),
         }
     }
 
@@ -262,16 +303,29 @@ impl SettingsFile {
             orphan_cleanup_days: Some(settings.orphan_cleanup_days),
             bug_reports: Some(settings.bug_reports),
             thinking_display_mode: Some(settings.thinking_display_mode.clone()),
+            log_level: Some(settings.log_level),
             pending_memory_threshold: Some(settings.pending_memory_threshold.max(1)),
             external_replies: Some(settings.external_replies.clone()),
+            subscription_fees: if settings.subscription_fees.is_empty() {
+                None
+            } else {
+                Some(settings.subscription_fees.clone())
+            },
+            openrouter_routing: if settings.openrouter_routing == OpenRouterRouting::default() {
+                None
+            } else {
+                Some(settings.openrouter_routing.clone())
+            },
             // Config-only (YAML, not in the DTO); preserved across saves.
             sandbox_deny_read: None,
             build_services: None,
-            web_services: None,
+            accepted_fence_commands: None,
+            web_fetch: None,
             active_web_fetch: None,
             web_search: None,
             active_web_search: None,
-            pending_blocker_timeout_secs: None,
+            pdf: None,
+            active_pdf: None,
         }
     }
 }
@@ -281,13 +335,14 @@ pub fn get_settings_path(config_dir: &std::path::Path) -> PathBuf {
     config_dir.join("settings.yaml")
 }
 
-/// The pending-blocker escalation window in seconds (default 60). Read at
-/// item-open time so changing it does not require a restart.
-pub fn load_pending_blocker_timeout_secs(config_dir: &std::path::Path) -> u64 {
+/// The file-log verbosity level (default `Standard`). Read once at process
+/// startup by each binary to seed `LogConfig.level`; logging initializes before
+/// settings load, so changing it takes effect on the next run.
+pub fn load_log_level(config_dir: &std::path::Path) -> LogLevel {
     load_settings_file(config_dir)
         .ok()
-        .and_then(|f| f.pending_blocker_timeout_secs)
-        .unwrap_or(60)
+        .and_then(|f| f.log_level)
+        .unwrap_or_default()
 }
 
 /// Load settings from file. Returns defaults if file doesn't exist or is invalid.
@@ -337,6 +392,41 @@ pub fn load_build_services(
     }
 }
 
+/// Load the per-project map of user-accepted fence-crossing commands from
+/// workspace settings (`projectId -> [command, ...]`). Empty when unset.
+///
+/// A terminal command's `write` carveout (or coarse fence crossing) only takes
+/// effect once the user has accepted that command here — so a repo can declare a
+/// fence-crosser but cannot grant itself the crossing. See `config::dev_commands`.
+pub fn load_accepted_fence_commands(config_dir: &std::path::Path) -> HashMap<String, Vec<String>> {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|f| f.accepted_fence_commands)
+        .unwrap_or_default()
+}
+
+/// Accept or revoke one project command as a fence-crosser, persisting the change
+/// to `acceptedFenceCommands` in `settings.yaml`. Surgical: only that key is
+/// touched. An empty list for a project is dropped from the map.
+pub fn set_accepted_fence_command(
+    config_dir: &std::path::Path,
+    project_id: &str,
+    command: &str,
+    accepted: bool,
+) -> Result<(), String> {
+    let mut map = load_accepted_fence_commands(config_dir);
+    let command = command.trim().to_string();
+    let entry = map.entry(project_id.to_string()).or_default();
+    entry.retain(|c| c != &command);
+    if accepted && !command.is_empty() {
+        entry.push(command);
+    }
+    if entry.is_empty() {
+        map.remove(project_id);
+    }
+    write_accepted_fence_commands_map(config_dir, &map)
+}
+
 /// Persist the `enabled` flag for one build service into the `buildServices`
 /// mapping of `settings.yaml`, materializing the built-in defaults into the file
 /// first if it has no `buildServices` block yet (so a toggle of the default
@@ -384,6 +474,30 @@ fn write_build_services_map(
     config_dir: &std::path::Path,
     map: &HashMap<String, crate::config::build_services::BuildServiceConfig>,
 ) -> Result<(), String> {
+    let value = serde_yaml::to_value(map)
+        .map_err(|e| format!("Failed to serialize build services: {e}"))?;
+    write_settings_key(config_dir, "buildServices", value)
+}
+
+/// Surgically write the `acceptedFenceCommands` mapping into `settings.yaml`.
+fn write_accepted_fence_commands_map(
+    config_dir: &std::path::Path,
+    map: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let value = serde_yaml::to_value(map)
+        .map_err(|e| format!("Failed to serialize accepted fence commands: {e}"))?;
+    write_settings_key(config_dir, "acceptedFenceCommands", value)
+}
+
+/// Surgically write one top-level `key` into `settings.yaml`, leaving every other
+/// key and the header comment intact. The canonical UI write path for config-only
+/// settings (build services, fence acceptance) that the worktree fence blocks
+/// agents from editing directly.
+fn write_settings_key(
+    config_dir: &std::path::Path,
+    key: &str,
+    value: serde_yaml::Value,
+) -> Result<(), String> {
     let path = get_settings_path(config_dir);
     let mut root = match std::fs::read_to_string(&path) {
         Ok(content) => match serde_yaml::from_str::<serde_yaml::Value>(&content)
@@ -395,12 +509,7 @@ fn write_build_services_map(
         },
         Err(_) => serde_yaml::Mapping::new(),
     };
-    let value = serde_yaml::to_value(map)
-        .map_err(|e| format!("Failed to serialize build services: {e}"))?;
-    root.insert(
-        serde_yaml::Value::String("buildServices".to_string()),
-        value,
-    );
+    root.insert(serde_yaml::Value::String(key.to_string()), value);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -490,11 +599,16 @@ pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Resul
         .ok()
         .and_then(|existing| existing.build_services);
 
-    // The web-fetch provider registry and its active selector are config-only
-    // too: carry the on-disk values forward rather than dropping them on save.
-    file.web_services = load_settings_file(config_dir)
+    // Fence-command acceptance is config-only too: preserve the on-disk value.
+    file.accepted_fence_commands = load_settings_file(config_dir)
         .ok()
-        .and_then(|existing| existing.web_services);
+        .and_then(|existing| existing.accepted_fence_commands);
+
+    // The typed web-fetch registry and its active selector are config-only
+    // too: carry the on-disk values forward rather than dropping them on save.
+    file.web_fetch = load_settings_file(config_dir)
+        .ok()
+        .and_then(|existing| existing.web_fetch);
     file.active_web_fetch = load_settings_file(config_dir)
         .ok()
         .and_then(|existing| existing.active_web_fetch);
@@ -508,11 +622,14 @@ pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Resul
         .ok()
         .and_then(|existing| existing.active_web_search);
 
-    // The pending-blocker escalation window is config-only (YAML, not in the
-    // DTO): carry the on-disk value forward rather than dropping it on save.
-    file.pending_blocker_timeout_secs = load_settings_file(config_dir)
+    // The typed PDF registry and its active selector are config-only too:
+    // carry the on-disk values forward rather than dropping them on save.
+    file.pdf = load_settings_file(config_dir)
         .ok()
-        .and_then(|existing| existing.pending_blocker_timeout_secs);
+        .and_then(|existing| existing.pdf);
+    file.active_pdf = load_settings_file(config_dir)
+        .ok()
+        .and_then(|existing| existing.active_pdf);
 
     // Add header comment
     let yaml =
@@ -612,6 +729,63 @@ externalReplies: disabled
     }
 
     #[test]
+    fn test_subscription_fees_roundtrip() {
+        let mut fees = HashMap::new();
+        fees.insert("claude".to_string(), 200.0);
+        fees.insert("codex".to_string(), 200.0);
+        let settings = Settings {
+            subscription_fees: fees.clone(),
+            ..test_settings()
+        };
+
+        // DTO -> file -> DTO survives.
+        let file = SettingsFile::from_settings(&settings);
+        let restored = file.to_settings();
+        assert_eq!(restored.subscription_fees, fees);
+
+        // YAML load/save survives, and an empty map serializes to absent.
+        let yaml = serde_yaml::to_string(&file).unwrap();
+        assert!(yaml.contains("subscriptionFees"));
+        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.to_settings().subscription_fees, fees);
+
+        let empty = SettingsFile::from_settings(&test_settings());
+        assert!(empty.subscription_fees.is_none());
+        let empty_yaml = serde_yaml::to_string(&empty).unwrap();
+        assert!(!empty_yaml.contains("subscriptionFees"));
+    }
+
+    #[test]
+    fn test_openrouter_routing_roundtrip() {
+        use crate::models::{OpenRouterRouting, OpenRouterSort};
+
+        let routing = OpenRouterRouting {
+            zero_data_retention: true,
+            sort: Some(OpenRouterSort::Throughput),
+        };
+        let settings = Settings {
+            openrouter_routing: routing.clone(),
+            ..test_settings()
+        };
+
+        // DTO -> file -> DTO survives.
+        let file = SettingsFile::from_settings(&settings);
+        let restored = file.to_settings();
+        assert_eq!(restored.openrouter_routing, routing);
+
+        // YAML load/save survives, and an all-default routing serializes to absent.
+        let yaml = serde_yaml::to_string(&file).unwrap();
+        assert!(yaml.contains("openrouterRouting"));
+        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.to_settings().openrouter_routing, routing);
+
+        let empty = SettingsFile::from_settings(&test_settings());
+        assert!(empty.openrouter_routing.is_none());
+        let empty_yaml = serde_yaml::to_string(&empty).unwrap();
+        assert!(!empty_yaml.contains("openrouterRouting"));
+    }
+
+    #[test]
     fn test_settings_roundtrip_disabled_thinking() {
         let settings = Settings {
             max_thinking_tokens: None,
@@ -660,6 +834,35 @@ externalReplies: disabled
 
         let settings = parsed.to_settings();
         assert_eq!(settings.max_thinking_tokens, None);
+    }
+
+    #[test]
+    fn accepted_fence_commands_set_load_and_persist() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+        std::fs::write(get_settings_path(dir), "branchPrefix: agent\n").unwrap();
+
+        // Accept a command for a project.
+        set_accepted_fence_command(dir, "proj-1", "bun run dev:instance", true).unwrap();
+        assert_eq!(
+            load_accepted_fence_commands(dir)
+                .get("proj-1")
+                .map(Vec::as_slice),
+            Some(&["bun run dev:instance".to_string()][..])
+        );
+
+        // Accepting again is idempotent (no duplicate).
+        set_accepted_fence_command(dir, "proj-1", "bun run dev:instance", true).unwrap();
+        assert_eq!(load_accepted_fence_commands(dir)["proj-1"].len(), 1);
+
+        // A normal settings save preserves the acceptance map.
+        let settings = load_settings(dir);
+        save_settings(dir, &settings).unwrap();
+        assert!(load_accepted_fence_commands(dir).contains_key("proj-1"));
+
+        // Revoke drops the now-empty project entry entirely.
+        set_accepted_fence_command(dir, "proj-1", "bun run dev:instance", false).unwrap();
+        assert!(load_accepted_fence_commands(dir).is_empty());
     }
 
     #[test]
@@ -776,31 +979,31 @@ buildServices:
     }
 
     #[test]
-    fn web_services_and_active_fetch_persist_across_save() {
+    fn web_fetch_pdf_and_active_selectors_persist_across_save() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
         let yaml = r#"branchPrefix: agent
-webServices:
-  jina:
-    transport: http
-    url: "https://r.jina.ai/{url}"
-    headers:
-      Authorization: "Bearer ${JINA_API_KEY}"
+webFetch:
+  firecrawl:
+    onlyMainContent: false
 activeWebFetch: jina
+activePdf: bmd
 "#;
         std::fs::write(get_settings_path(dir), yaml).unwrap();
 
         // The config-only fields parse off the file.
         let file = load_settings_file(dir).unwrap();
-        assert!(file.web_services.as_ref().unwrap().contains_key("jina"));
+        assert!(file.web_fetch.as_ref().unwrap().contains_key("firecrawl"));
         assert_eq!(file.active_web_fetch.as_deref(), Some("jina"));
+        assert_eq!(file.active_pdf.as_deref(), Some("bmd"));
 
         // Saving settings (which never touches these) carries them forward.
         let settings = load_settings(dir);
         save_settings(dir, &settings).unwrap();
         let after = load_settings_file(dir).unwrap();
-        assert!(after.web_services.as_ref().unwrap().contains_key("jina"));
+        assert!(after.web_fetch.as_ref().unwrap().contains_key("firecrawl"));
         assert_eq!(after.active_web_fetch.as_deref(), Some("jina"));
+        assert_eq!(after.active_pdf.as_deref(), Some("bmd"));
     }
 
     #[test]
@@ -917,6 +1120,53 @@ backends:
             settings.backends["claude"]["lg"].model,
             Model::new(Model::OPUS)
         );
+    }
+
+    #[test]
+    fn test_missing_default_backend_is_backfilled() {
+        // An older settings.yaml that names only claude/codex must still surface
+        // every known backend (e.g. openrouter) so the provider list is driven
+        // by code, not by what the file happened to persist.
+        let yaml = r#"
+activeBackend: claude
+tiers:
+  - sm
+  - md
+  - lg
+backends:
+  claude:
+    sm:
+      model: haiku
+    md:
+      model: sonnet
+    lg:
+      model: opus
+  codex:
+    sm:
+      model: gpt-5.4-mini
+    md:
+      model: gpt-5.3-codex
+    lg:
+      model: gpt-5.5
+"#;
+        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let settings = file.to_settings();
+
+        // The named backends keep their on-disk customizations.
+        assert_eq!(
+            settings.backends["claude"]["lg"].model,
+            Model::new(Model::OPUS)
+        );
+        assert_eq!(
+            settings.backends["codex"]["md"].model.as_str(),
+            "gpt-5.3-codex"
+        );
+        // The unnamed-but-known backend is backfilled from defaults.
+        assert!(
+            settings.backends.contains_key("openrouter"),
+            "openrouter must be present even though settings.yaml omits it"
+        );
+        assert_eq!(settings.backends["openrouter"].len(), 3);
     }
 
     #[test]
@@ -1046,6 +1296,22 @@ thinkingDisplayMode: full
 
         let settings = file.to_settings();
         assert_eq!(settings.thinking_display_mode, ThinkingDisplayMode::Full);
+    }
+
+    #[test]
+    fn test_log_level_defaults_to_standard_and_roundtrips() {
+        // Absent in YAML → the light Standard default.
+        let file: SettingsFile = serde_yaml::from_str("branchPrefix: custom\n").unwrap();
+        assert_eq!(file.log_level, None);
+        assert_eq!(file.to_settings().log_level, LogLevel::Standard);
+
+        // Explicit value parses and survives the DTO round-trip.
+        let file: SettingsFile = serde_yaml::from_str("logLevel: verbose\n").unwrap();
+        assert_eq!(file.log_level, Some(LogLevel::Verbose));
+        let settings = file.to_settings();
+        assert_eq!(settings.log_level, LogLevel::Verbose);
+        let restored = SettingsFile::from_settings(&settings).to_settings();
+        assert_eq!(restored.log_level, LogLevel::Verbose);
     }
 
     #[test]

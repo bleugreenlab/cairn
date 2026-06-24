@@ -346,6 +346,56 @@ pub const TURSO_MIGRATIONS: &[Migration] = &[
         "tool_invocations",
         include_str!("../../../../turso_migrations/0067_tool_invocations.sql"),
     ),
+    Migration::new(
+        "0068",
+        "job_browsers",
+        include_str!("../../../../turso_migrations/0068_job_browsers.sql"),
+    ),
+    Migration::new(
+        "0069",
+        "add_event_cost_usd",
+        include_str!("../../../../turso_migrations/0069_add_event_cost_usd.sql"),
+    ),
+    Migration::new(
+        "0070",
+        "attention_pushes",
+        include_str!("../../../../turso_migrations/0070_attention_pushes.sql"),
+    ),
+    Migration::new(
+        "0071",
+        "attention_push_fingerprint",
+        include_str!("../../../../turso_migrations/0071_attention_push_fingerprint.sql"),
+    ),
+    Migration::new(
+        "0072",
+        "merge_request_head_sha",
+        include_str!("../../../../turso_migrations/0072_merge_request_head_sha.sql"),
+    ),
+    Migration::new(
+        "0073",
+        "attention_read_cursors",
+        include_str!("../../../../turso_migrations/0073_attention_read_cursors.sql"),
+    ),
+    Migration::new(
+        "0074",
+        "drop_attention_ledger",
+        include_str!("../../../../turso_migrations/0074_drop_attention_ledger.sql"),
+    ),
+    Migration::new(
+        "0075",
+        "drop_messages_delivered_at",
+        include_str!("../../../../turso_migrations/0075_drop_messages_delivered_at.sql"),
+    ),
+    Migration::new(
+        "0076",
+        "terminal_output_wakes",
+        include_str!("../../../../turso_migrations/0076_terminal_output_wakes.sql"),
+    ),
+    Migration::new(
+        "0077",
+        "event_content_change_id",
+        include_str!("../../../../turso_migrations/0077_event_content_change_id.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -431,7 +481,17 @@ mod tests {
                 "0064_clear_skyline_cache_for_system_event_filter".to_string(),
                 "0065_merge_request_is_local".to_string(),
                 "0066_config_disables".to_string(),
-                "0067_tool_invocations".to_string()
+                "0067_tool_invocations".to_string(),
+                "0068_job_browsers".to_string(),
+                "0069_add_event_cost_usd".to_string(),
+                "0070_attention_pushes".to_string(),
+                "0071_attention_push_fingerprint".to_string(),
+                "0072_merge_request_head_sha".to_string(),
+                "0073_attention_read_cursors".to_string(),
+                "0074_drop_attention_ledger".to_string(),
+                "0075_drop_messages_delivered_at".to_string(),
+                "0076_terminal_output_wakes".to_string(),
+                "0077_event_content_change_id".to_string()
             ]
         );
         Ok(db)
@@ -500,6 +560,64 @@ mod tests {
             .await
             .unwrap(),
             1
+        );
+    }
+
+    /// 0074 drops the dead attention ledger tables; 0075 drops the retired
+    /// messages.delivered_at column and its partial index.
+    #[tokio::test]
+    async fn migrations_0074_0075_drop_attention_ledger_and_delivered_at() {
+        let db = migrated_db().await.unwrap();
+
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='attention_items'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "attention_items should be dropped"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='attention_seen'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "attention_seen should be dropped"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='attention_evaluations'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "attention_evaluations should be dropped"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name='delivered_at'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "messages.delivered_at should be dropped"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_messages_pending_directs'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "idx_messages_pending_directs should be dropped"
         );
     }
 

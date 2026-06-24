@@ -100,8 +100,14 @@ mod tests {
 
     #[test]
     fn detects_language_by_extension() {
-        assert_eq!(lang_for_path(Path::new("src/lib.rs")), Some(SupportLang::Rust));
-        assert_eq!(lang_for_path(Path::new("a/b.py")), Some(SupportLang::Python));
+        assert_eq!(
+            lang_for_path(Path::new("src/lib.rs")),
+            Some(SupportLang::Rust)
+        );
+        assert_eq!(
+            lang_for_path(Path::new("a/b.py")),
+            Some(SupportLang::Python)
+        );
         assert_eq!(lang_for_path(Path::new("main.go")), Some(SupportLang::Go));
         assert_eq!(
             lang_for_path(Path::new("app.ts")),

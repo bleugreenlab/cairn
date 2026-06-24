@@ -86,9 +86,7 @@ fn parse_mode(raw: &str) -> Option<ChangeMode> {
 const COMMIT_MSG_GUIDANCE: &str =
     "file-target changes require a commit_msg so the work is committed to git — \
      uncommitted worktree edits are lost permanently if the worktree is cleaned up. \
-     Pass a descriptive commit_msg. commit_msg: \"NO_COMMIT\" is reserved for resolving \
-     an in-progress merge or rebase; the mutation handler rejects it (and restores the \
-     worktree to HEAD) anywhere else.";
+     Pass a descriptive commit_msg (or \"^\" to amend the previous commit).";
 
 /// Validate a raw `write` payload and return **every** blocking problem.
 ///
@@ -167,9 +165,9 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
     // `mode:"apply"` call that lands the edits, so a preview never needs one.
     let preview_shaped = match obj.get("preview").and_then(|value| value.as_bool()) {
         Some(explicit) => explicit,
-        None => array.iter().any(|item| {
-            item.get("mode").and_then(|value| value.as_str()) == Some("rename")
-        }),
+        None => array
+            .iter()
+            .any(|item| item.get("mode").and_then(|value| value.as_str()) == Some("rename")),
     };
     let mut first_file_without_commit: Option<usize> = None;
 
@@ -277,10 +275,9 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
                 }
                 TargetKind::File => {
                     // Structural validation only checks that *some* commit_msg is
-                    // present for file targets. Whether the `NO_COMMIT` sentinel
-                    // is actually allowed depends on repo state (mid-merge /
-                    // mid-rebase), which needs filesystem access this crate does
-                    // not have; that gate lives in the mutation handler.
+                    // present for file targets; the mutation handler owns the
+                    // commit/restore decision (it needs filesystem access this
+                    // crate does not have).
                     if !commit_msg_present && first_file_without_commit.is_none() {
                         first_file_without_commit = Some(index);
                     }
@@ -446,15 +443,17 @@ mod tests {
     }
 
     #[test]
-    fn no_commit_and_amend_sentinels_accepted() {
-        for sentinel in ["NO_COMMIT", "^"] {
+    fn any_present_commit_msg_validates() {
+        // Structural validation only requires that *some* commit_msg is present;
+        // `^` (amend) and an ordinary message both pass.
+        for commit_msg in ["^", "land the change"] {
             let errors = validate_change_value(&json!({
                 "changes": [{ "target": "file:a.rs", "mode": "create", "payload": { "content": "x" } }],
-                "commit_msg": sentinel
+                "commit_msg": commit_msg
             }));
             assert!(
                 errors.is_empty(),
-                "sentinel {sentinel} rejected: {errors:?}"
+                "commit_msg {commit_msg} rejected: {errors:?}"
             );
         }
     }

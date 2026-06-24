@@ -7,8 +7,8 @@ use turso::params;
 use super::common::{
     connect_and_find_node_job, connect_and_find_task_job, connect_for_read,
     find_action_run_by_node_name, find_job_by_node_name, find_query_value, get_artifact_for_job,
-    get_direct_artifact_for_job, reject_query_params, resolve_issue_id, visible_job_node_segment,
-    ResourceActionRun,
+    get_direct_artifact_for_job, get_named_artifact_for_job, list_named_artifacts_for_job,
+    reject_query_params, resolve_issue_id, visible_job_node_segment, ResourceActionRun,
 };
 use super::transcript::{
     format_transcript_digest, get_nth_run_id, get_single_event, load_job_events_ordered,
@@ -184,7 +184,10 @@ async fn render_node_activity(conn: &turso::Connection, job_id: &str) -> Option<
         count_phrase(events, "event"),
     );
     if let Some(ts) = last_activity {
-        summary.push_str(&format!(" \u{b7} last active {}", format_node_timestamp(ts)));
+        summary.push_str(&format!(
+            " \u{b7} last active {}",
+            format_node_timestamp(ts)
+        ));
     }
 
     let mut output = format!("## Activity\n\n{}\n", summary);
@@ -323,7 +326,7 @@ pub(super) async fn read_node_wakes(
         ));
         out.push('\n');
     }
-    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- patch `{unmute:{kind,ref?}}`\n- delete `{unsubscribe:{kind,ref?}}`\n");
+    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- patch `{unmute:{kind,ref?}}`\n- delete `{unsubscribe:{kind,ref?}}`\n");
     out
 }
 
@@ -776,11 +779,20 @@ pub(super) async fn read_node(
     output.push_str("## Resources\n\n");
     output.push_str(&format!("- Chat: `{}/chat`\n", base_uri));
 
-    // Surface the artifact at its canonical, schema-named URI (e.g. `/plan`,
-    // `/create-pr`) — never the generic `/artifact` alias (CAIRN-1219).
-    if let Some(artifact) = get_artifact_for_job(&conn, &job.id).await {
-        output.push_str(&format!(
-            "- Artifact: `{}`\n",
+    // Surface every named artifact this node has produced at its canonical,
+    // schema-named URI (e.g. `/plan`, `/create-pr`) — never the generic
+    // `/artifact` alias (CAIRN-1219). Each distinct addressed name owns its own
+    // version chain, so a node may surface several; a single-artifact node lists
+    // exactly one, rendered identically to before.
+    let mut named_artifacts = list_named_artifacts_for_job(&conn, &job.id).await;
+    if named_artifacts.is_empty() {
+        // The node's own artifact may live on a child job (a delegated task);
+        // fall back to the child-inclusive lookup so it still surfaces.
+        named_artifacts.extend(get_artifact_for_job(&conn, &job.id).await);
+    }
+    let artifact_uris: Vec<String> = named_artifacts
+        .iter()
+        .map(|artifact| {
             build_node_artifact_uri_named(
                 project_key,
                 number,
@@ -788,7 +800,17 @@ pub(super) async fn read_node(
                 &visible_node_segment,
                 artifact.schema_name(),
             )
-        ));
+        })
+        .collect();
+    match artifact_uris.as_slice() {
+        [] => {}
+        [single] => output.push_str(&format!("- Artifact: `{}`\n", single)),
+        many => {
+            output.push_str("- Artifacts:\n");
+            for uri in many {
+                output.push_str(&format!("  - `{}`\n", uri));
+            }
+        }
     }
 
     // Check for PR data via merge_requests
@@ -1003,12 +1025,17 @@ pub(super) async fn read_node_chat(
     params: &[QueryParam],
 ) -> String {
     // `latest=true` flips turn order (newest turn first; events within a turn
-    // stay chronological). Consume it before the unsupported-param check; grep
-    // and offset/limit are stripped upstream by the shared view layer.
+    // stay chronological). `offset`/`limit` page whole turns rather than rendered
+    // lines, so consume them here instead of letting the shared line view slice
+    // through a turn.
     let latest = matches!(find_query_value(params, "latest"), Some("true") | Some("1"));
+    let turn_offset =
+        find_query_value(params, "offset").and_then(|value| value.parse::<i64>().ok());
+    let turn_limit =
+        find_query_value(params, "limit").and_then(|value| value.parse::<usize>().ok());
     let leftover: Vec<QueryParam> = params
         .iter()
-        .filter(|param| param.key != "latest")
+        .filter(|param| param.key != "latest" && param.key != "offset" && param.key != "limit")
         .cloned()
         .collect();
     if let Some(error) = reject_query_params("node chat", &leftover) {
@@ -1040,7 +1067,15 @@ pub(super) async fn read_node_chat(
         exec_seq,
         status: &job.status,
     };
-    format_transcript_digest(&event_rows, &base_uri, &meta, &turn_sequences, latest)
+    format_transcript_digest(
+        &event_rows,
+        &base_uri,
+        &meta,
+        &turn_sequences,
+        latest,
+        turn_offset,
+        turn_limit,
+    )
 }
 
 pub(super) async fn read_node_chat_raw(
@@ -1237,8 +1272,13 @@ pub(super) async fn read_node_artifact(
             Err(error) => return error,
         };
 
-    // Get artifact for this job (or child jobs)
-    let artifact = get_artifact_for_job(&conn, &job.id).await;
+    // A named read (`.../{node}/plan`) returns that name's own version chain; the
+    // generic `/artifact` alias (name: None) keeps the latest-overall behavior
+    // for back-compat reads.
+    let artifact = match artifact_name {
+        Some(name) => get_named_artifact_for_job(&conn, &job.id, name).await,
+        None => get_artifact_for_job(&conn, &job.id).await,
+    };
     let body = match &artifact {
         Some(a) => render_artifact_markdown(&a.data),
         None => format!(
@@ -1345,11 +1385,15 @@ pub(super) async fn read_task_chat(
     task_name: &str,
     params: &[QueryParam],
 ) -> String {
-    // `latest=true` flips turn order; grep/offset/limit are stripped upstream.
+    // `latest=true` flips turn order; `offset`/`limit` page whole turns.
     let latest = matches!(find_query_value(params, "latest"), Some("true") | Some("1"));
+    let turn_offset =
+        find_query_value(params, "offset").and_then(|value| value.parse::<i64>().ok());
+    let turn_limit =
+        find_query_value(params, "limit").and_then(|value| value.parse::<usize>().ok());
     let leftover: Vec<QueryParam> = params
         .iter()
-        .filter(|param| param.key != "latest")
+        .filter(|param| param.key != "latest" && param.key != "offset" && param.key != "limit")
         .cloned()
         .collect();
     if let Some(error) = reject_query_params("task chat", &leftover) {
@@ -1384,7 +1428,15 @@ pub(super) async fn read_task_chat(
         exec_seq,
         status: &task_job.status,
     };
-    format_transcript_digest(&event_rows, &base_uri, &meta, &turn_sequences, latest)
+    format_transcript_digest(
+        &event_rows,
+        &base_uri,
+        &meta,
+        &turn_sequences,
+        latest,
+        turn_offset,
+        turn_limit,
+    )
 }
 
 pub(super) async fn read_task_chat_raw(

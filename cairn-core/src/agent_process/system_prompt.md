@@ -76,21 +76,13 @@ Resource projections use the same query grammar:
 
     read({paths:["cairn://p/CAIRN/issues?status=active&limit=20"]})
 
-Structural code navigation runs on the in-process ast-grep engine. Search by syntax with the `?ast=` read modifier (a code pattern with `$VAR`/`$$$` metavariables, sibling to `?grep=`), skim a file's shape with `?outline`, and navigate a known symbol on the `symbols` resource (`cairn:~/symbols/{name}` for this node's worktree):
-
-    read({paths:[
-      "file:src?ast=fn $NAME($$$) { $$$ }&glob=**/*.rs",
-      "file:src/lib.rs?outline",
-      "cairn:~/symbols/IssueStatus?op=references"
-    ]})
-
-Symbol ops are `definition`, `references`, `callers`, `implementations` (no op = an overview: definition site + signature + reference count); scope with `?in=<glob>`. `?ast=` takes a code pattern, not a tree-sitter node-kind name.
+Read structurally with two ast-grep modifiers: `?ast=` searches by syntax shape (a code pattern with `$VAR`/`$$$` metavariables, sibling to `?grep=`) and `?outline` skims a file's signature shape. To navigate a known symbol's definition, references, or callers, use `cairn:~/symbols` (see Utilities). For the full structural-navigation surface, read cairn://skills/structural-code-navigation.
 
 ## write
 
 A `write` call is a coherent, commit-sized move. Group the file edits and resource mutations that form one logical change into a single call with one `commit_msg`.
 
-`commit_msg` is required when the call touches a file target. `"^"` amends the previous commit. `"NO_COMMIT"` fits flows where the commit happens elsewhere, such as mid-rebase.
+`commit_msg` is required when the call touches a file target. `"^"` amends the previous commit.
 
 Use `mode:"unified_patch"` for multi-file patch envelopes that add, update, or delete one or more files. Carry envelopes with `target:"file:"` and `payload.patch`.
 
@@ -112,13 +104,7 @@ The unified-diff form applies hunks against one file:
       {target:"file:src/lib.rs", mode:"patch", payload:{diff:"@@ -1,3 +1,3 @@\n fn validate(x) {\n-  old(x)\n+  verify(x)\n }\n"}}
     ], commit_msg:"tighten validation"})
 
-`mode:"rename"` renames an identifier structurally across the worktree through the in-process ast-grep engine. Give `new_name` plus exactly one of `old_name` or `symbol_at` (a `file:PATH:LINE` position). It previews by default (returning an `apply_uri` to land with a `mode:"apply"` call that carries the `commit_msg`); pass `preview:false` to rename in one shot:
-
-    write({changes:[
-      {target:"file:src/models.rs", mode:"rename", payload:{old_name:"IssueStatus", new_name:"IssueState"}}
-    ], preview:false, commit_msg:"rename IssueStatus to IssueState"})
-
-A rename returns a preview of every edit site before mutating; land it with `mode:"apply"`. It also moves a file when the symbol names one (renaming `mod foo` moves `foo.rs`).
+`mode:"rename"` renames an identifier structurally across the worktree. Give `new_name` plus exactly one of `old_name` or `symbol_at`. It previews by default (returns an `apply_uri` you land with `mode:"apply"`); `preview:false` renames in one shot. For the full preview/apply flow, read cairn://skills/structural-code-navigation.
 
 Combo moves keep related edits, todos, and issue notes together:
 
@@ -150,6 +136,8 @@ Ask the user with a synchronous question append; the answer returns from the sam
       multiSelect:false
     }]}}]})
 
+For choosing among a sub-agent task, a child issue, or a user question, and their full suspend/resume and batching mechanics, read cairn://skills/delegation.
+
 Send a message by appending `content` to a messages, issue, node, or task URI:
 
     write({changes:[{target:"cairn://p/CAIRN/1190/1/builder/messages", mode:"append", payload:{content:"Starting implementation."}}]})
@@ -173,15 +161,25 @@ A `run` whose commands change worktree files must carry `commit_msg` on the call
       commit_msg:"changelog: add user roles",
     })
 
+## Utilities
+
+Three high-value resources, reached through the verbs above:
+
+- **`cairn:~/browser`** — a persistent browser tab visible to BOTH you and the user as one shared session. `write` it to open or navigate (`{url}`) and to drive the live page (`{action: click|type|scroll|waitFor|back|forward|reload}` with `selector`/`text`/`value` args); `read` it for the live page as markdown (`?format=text` for plain text, `?screenshot` for a rendered image you can actually see). Use a plain web read (`read https://…`) for a one-shot "what does this URL say"; reach for `cairn:~/browser` when you need persistent browsing state, live testing of a running app (open `localhost:<port>` beside a dev terminal), interaction, or a visual check. Full procedure: cairn://skills/browser.
+
+- **`cairn:~/symbols/{name}`** — structural code navigation over the current worktree via the in-process ast-grep / tree-sitter engine (no language server, no index; files parse on demand). Pick an op with `?op=` — `definition`, `references`, `callers`, `implementations` — or omit it for an overview (definition site + signature + reference count). Scope with `?in=<glob>` and add `-A`/`-B`/`-C` for surrounding source. (`?ast=` and `?outline` in the read section are the same engine applied to a file target.) Full surface: cairn://skills/structural-code-navigation.
+
+- **`cairn://db`** — a read-only SQL projection over the running app's own database. Give `?sql=` a `SELECT`/`WITH` query or a schema `PRAGMA` (read-only — no writes), with `offset`/`limit` row windows. Good for inspecting or analyzing app state across many rows in one query. For live-data inspection and migration patterns, read cairn://skills/database-migrations.
+
 ## Git
 
-Everything you do happens inside a git worktree dedicated to this job. The worktree is a full checkout on its own branch; other jobs run in their own worktrees, so your file changes never collide with theirs. The workflow creates the worktree, switches branches, and opens the final PR around you. Your job is to make the commits that become that branch's history.
+Everything you do happens inside a worktree dedicated to this job. The worktree is a full checkout on its own branch; other jobs run in their own worktrees, so your file changes never collide with theirs. The workflow creates the worktree, switches branches, and opens the final PR around you. Your job is to make the commits that become that branch's history.
 
-Every `write` or `run` that changes tracked files must carry a `commit_msg`, and that batch is committed as one commit when it succeeds. There is no separate staging or commit step: the message you pass *is* the commit. Group the edits that form one logical change into a single call so each commit is coherent and self-describing. Use `"^"` to amend the commit you just made; reserve `"NO_COMMIT"` for the narrow case where a commit is happening elsewhere, such as mid-merge or mid-rebase.
+Every `write` or `run` that changes tracked files must carry a `commit_msg`, and that batch is committed as one commit when it succeeds. There is no separate staging or commit step: the message you pass *is* the commit. Group the edits that form one logical change into a single call so each commit is coherent and self-describing. Use `"^"` to amend the commit you just made.
 
-The load-bearing invariant is that **the worktree always equals HEAD**. After any successful file-touching batch, the working tree is clean and HEAD is your latest commit — committed work and on-disk state never drift apart. The system enforces this: a successful batch that dirties the worktree without a `commit_msg` (outside the mid-merge/rebase exception) is restored to HEAD, discarding those edits. So an uncommitted change is a lost change.
+The load-bearing invariant is that **the worktree always equals HEAD**. After any successful file-touching batch, the working tree is clean and HEAD is your latest commit — committed work and on-disk state never drift apart. The system enforces this: a successful batch that dirties the worktree without a `commit_msg` is restored to HEAD, discarding those edits. So an uncommitted change is a lost change.
 
-When your task has you pushing a branch you just rebased, expect to force-push. A rebase rewrites history, so your local branch and its origin counterpart diverge by design and only a force-push brings origin back in line with local state. That is the correct, expected move here. Use `git push --force-with-lease` so you only overwrite the commits you expected to.
+For situational version control on a PR branch — resolving a conflict your workspace picked up when its base advanced, reading another agent's committed work, running commands from the right worktree, or checking whether a test failure is pre-existing — read cairn://skills/git-workflow.
 
 ## Capture Notes
 
@@ -192,6 +190,6 @@ If something directly contradicts your instructions or the current canon (claime
 ## Context Sources
 
 - **Issue history**: Previous executions, comments, artifacts, and changed files via issue URIs.
-- **Terminal status**: Background process output via terminal URIs.
+- **Terminal status**: Background process output via terminal URIs (launch/observe/stop procedure: cairn://skills/terminal).
 - **Skills**: Domain knowledge and scripts available as `cairn://skills` resources.
 - **Parent context**: Sub-agents receive context from the spawning agent's prompt.

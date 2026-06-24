@@ -12,10 +12,15 @@
 //! - Preserve Claude's conversation cache
 //! - Can be reused for continuation without spawning a new process
 
+use crate::agent_process::stream::TranscriptEvent;
 use crate::mcp::handlers::{emit_attention, AttentionEvent};
 use crate::models::{Run, RunStatus, TurnState};
 use crate::storage::{run_db_blocking, DbError, DbResult, RowExt};
+use crate::transcripts::stream_store::{self, EventInsert};
+use std::collections::HashSet;
+use uuid::Uuid;
 
+use super::attention_push::{Boundary, Wake};
 use super::Orchestrator;
 
 fn emit_db_change(orch: &Orchestrator, table: &str, action: &str) {
@@ -334,7 +339,11 @@ fn transition_run(orch: &Orchestrator, run_id: &str, to: RunStatus) -> Result<Ru
     Ok(from)
 }
 
-fn set_exit_reason(orch: &Orchestrator, run_id: &str, reason: &str) -> Result<(), String> {
+pub(crate) fn set_exit_reason(
+    orch: &Orchestrator,
+    run_id: &str,
+    reason: &str,
+) -> Result<(), String> {
     let db = orch.db.local.clone();
     let run_id = run_id.to_string();
     let reason = reason.to_string();
@@ -427,6 +436,172 @@ fn active_turn_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
         .or_else(|| current_turn_id_for_run(orch, run_id))
 }
 
+#[derive(Debug, Clone)]
+struct PendingRunToolResult {
+    tool_use_id: String,
+    tool_name: String,
+    session_id: Option<String>,
+    parent_tool_use_id: Option<String>,
+}
+
+fn normalized_tool_name(name: &str) -> &str {
+    name.rsplit("__").next().unwrap_or(name)
+}
+
+fn is_run_tool_call(name: &str, input: &serde_json::Value) -> bool {
+    let normalized = normalized_tool_name(name).to_ascii_lowercase();
+    normalized == "run"
+        || normalized == "bash"
+        || name == "Bash"
+        || input.get("command").is_some_and(|value| value.is_string())
+}
+
+fn pending_run_tool_results(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<Vec<PendingRunToolResult>, String> {
+    let db = orch.db.local.clone();
+    let run_id = run_id.to_string();
+    let turn_id = turn_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            let run_id = run_id.clone();
+            let turn_id = turn_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT data
+                         FROM events
+                         WHERE run_id = ?1
+                           AND turn_id = ?2
+                           AND event_type IN ('assistant', 'tool_result')
+                         ORDER BY sequence ASC, rowid ASC",
+                        (run_id.as_str(), turn_id.as_str()),
+                    )
+                    .await?;
+                let mut candidates = Vec::new();
+                let mut completed = HashSet::new();
+                while let Some(row) = rows.next().await? {
+                    let data = row.text(0)?;
+                    let Ok(event) = serde_json::from_str::<TranscriptEvent>(&data) else {
+                        continue;
+                    };
+                    match event.event_type.as_str() {
+                        "assistant" => {
+                            for tool in event.tool_uses.unwrap_or_default() {
+                                if is_run_tool_call(&tool.name, &tool.input) {
+                                    candidates.push(PendingRunToolResult {
+                                        tool_use_id: tool.id,
+                                        tool_name: tool.name,
+                                        session_id: event.session_id.clone(),
+                                        parent_tool_use_id: event.parent_tool_use_id.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        "tool_result" => {
+                            if let Some(tool_use_id) = event.tool_use_id {
+                                completed.insert(tool_use_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(candidates
+                    .into_iter()
+                    .filter(|candidate| !completed.contains(&candidate.tool_use_id))
+                    .collect())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn fail_pending_run_tool_results(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: &str,
+) -> Result<usize, String> {
+    let pending = pending_run_tool_results(orch, run_id, turn_id)?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let mut sequence = stream_store::get_next_sequence(orch.db.local.clone(), run_id)?;
+    let now = chrono::Utc::now().timestamp() as i32;
+    let mut inserted = 0;
+    for pending_result in pending {
+        let event_id = Uuid::new_v4().to_string();
+        let event = TranscriptEvent {
+            event_type: "tool_result".to_string(),
+            session_id: pending_result.session_id.clone(),
+            parent_tool_use_id: pending_result.parent_tool_use_id.clone(),
+            content: None,
+            thinking: None,
+            tool_name: Some(pending_result.tool_name.clone()),
+            tool_input: None,
+            tool_uses: None,
+            tool_use_id: Some(pending_result.tool_use_id.clone()),
+            tool_result: Some("Run interrupted by user stop.".to_string()),
+            is_error: true,
+            thinking_ms: None,
+            raw: Some(serde_json::json!({ "synthetic": true, "reason": "user_stop" })),
+        };
+        let data = serde_json::to_string(&event).unwrap_or_default();
+        let event_insert = EventInsert {
+            id: event_id.clone(),
+            run_id: run_id.to_string(),
+            session_id: pending_result.session_id.clone(),
+            sequence,
+            timestamp: now,
+            event_type: "tool_result".to_string(),
+            data: data.clone(),
+            parent_tool_use_id: pending_result.parent_tool_use_id.clone(),
+            created_at: now,
+            input_tokens: None,
+            cache_read_tokens: None,
+            cache_create_tokens: None,
+            output_tokens: None,
+            thinking_tokens: None,
+            turn_id: Some(turn_id.to_string()),
+            cost_usd: None,
+        };
+        if stream_store::insert_event(orch.db.local.clone(), event_insert)? {
+            inserted += 1;
+            orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
+                id: event_id,
+                run_id: run_id.to_string(),
+                session_id: pending_result.session_id.clone(),
+                sequence: Some(sequence),
+                event_type: "tool_result".to_string(),
+                data: Some(data),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_create_tokens: None,
+                thinking_tokens: None,
+                created_at: Some(now as i64),
+                turn_id: Some(turn_id.to_string()),
+            }));
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({
+                    "table": "events",
+                    "action": "insert",
+                    "runId": run_id,
+                    "run_id": run_id,
+                    "sessionId": pending_result.session_id,
+                    "session_id": pending_result.session_id,
+                }),
+            );
+        }
+        sequence += 1;
+    }
+    Ok(inserted)
+}
+
 pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str) {
     let Some(turn_id) = active_turn_id_for_run(orch, run_id) else {
         return;
@@ -436,6 +611,17 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str) {
         log::warn!("Run {} current turn {} was not found", run_id, turn_id);
         return;
     };
+
+    if state == "running" {
+        if let Err(error) = fail_pending_run_tool_results(orch, run_id, &turn_id) {
+            log::warn!(
+                "Failed to fail pending run tool results for run {} turn {}: {}",
+                run_id,
+                turn_id,
+                error
+            );
+        }
+    }
 
     let result = match state.as_str() {
         "running" => interrupt_turn(orch, &turn_id),
@@ -559,12 +745,12 @@ fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
         return false;
     };
     let issue_uri = ctx.issue_uri();
-    // CAIRN-1647: the child's turn just ended — enrich any unresponded
-    // message items for its issue with the response state so the requesting
-    // parent's next briefing shows the child already acted on the message.
-    crate::orchestrator::attention_delivery::enrich_message_items_on_turn_end(
-        orch, &issue_id, &issue_uri,
-    );
+    // CAIRN-1882: the single creator of a review push. At this work-turn idle
+    // edge, push a review to the issue's watchers when there is reviewable
+    // output. Independent of the idle fact computed below (which still drives the
+    // desktop "completed" toast and `cairn watch`): only the review-to-watcher
+    // wake moved to the push queue.
+    create_review_push_on_turn_end(orch, job_id, &issue_id, &ctx);
     // Resolve the fact (and any detail URI) synchronously via the shared helper.
     let db = orch.db.local.clone();
     let issue_id_for_fact = issue_id.clone();
@@ -595,6 +781,557 @@ fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
         updated_at: idle.updated_at,
     });
     true
+}
+
+/// Create the review push at this work-turn idle edge (CAIRN-1882).
+///
+/// The node-idle edge of the review push (the second edge — when a PR opens
+/// after the node already idled — is [`create_review_push_for_pr_open`]): when a
+/// producing node's turn ends and it is idle, push a `review:{issue}` to each
+/// watcher of the node's issue if
+///
+/// 1. the just-ended turn was a *work* turn (`start_reason != 'memory_review'`),
+///    and
+/// 2. the issue has reviewable output — either an open, unmerged `merge_requests`
+///    row, or a create-pr/unconfirmed-plan artifact for the producing job.
+///
+/// `content_ref` is the producing node's `/pr` URI when a PR exists, else its
+/// artifact URI — the resolvable thing the watcher reviews. Supersede-by-key
+/// collapses repeats; the delivery layer (CAIRN-1881) drains, lazy-resolves, and
+/// stamps the push. The producing node is never a recipient of its own review.
+fn create_review_push_on_turn_end(
+    orch: &Orchestrator,
+    job_id: &str,
+    issue_id: &str,
+    ctx: &crate::orchestrator::attention::IssueAttentionContext,
+) {
+    // Gate: only a WORK-turn idle creates a review push. A trailing memory-review
+    // turn end (start_reason = 'memory_review') must not.
+    if latest_turn_is_memory_review(orch, job_id) {
+        return;
+    }
+    let db = orch.db.local.clone();
+    let issue_id_owned = issue_id.to_string();
+    let job_id_owned = job_id.to_string();
+    let ctx_owned = ctx.clone();
+    let result = run_db_blocking(move || async move {
+        create_review_push_rows(&db, &job_id_owned, &issue_id_owned, &ctx_owned).await
+    });
+    match result {
+        Ok(recipients) => wake_review_recipients(orch, &recipients),
+        Err(e) => log::warn!(
+            "review push creation for job {} failed: {}",
+            &job_id[..job_id.len().min(8)],
+            e
+        ),
+    }
+}
+
+/// The PR-open edge of the review push (CAIRN-1891) — the second of the two edges
+/// at which a review fires. The model: a review fires when (producing node
+/// quiescent) AND (reviewable work exists), at the moment the *later* of the two
+/// becomes true. [`create_review_push_on_turn_end`] is the edge where idle is the
+/// later event; this is the edge where the PR opening is.
+///
+/// A builder that writes a `create-pr` artifact and idles cannot fire the review
+/// at its idle edge: the PR is not open yet (branch push + webhook lag), and the
+/// create-pr artifact auto-confirms on write (the PR lifecycle is the gate,
+/// CAIRN-1219), so neither reviewable arm matches at that instant. Slice B
+/// (CAIRN-1882) demoted the PR webhook to state-only, so without this edge the
+/// review wake is lost entirely. The webhook is the moment that observes the PR
+/// opening, so it fires the review here — gated on the producing node being
+/// quiescent (not running a *work* turn — a trailing memory-review turn still
+/// counts as quiescent — and not self-suspended on its own work) so a mid-work
+/// `synchronize` does not fire, and fingerprint-deduped by the shared row creator
+/// so a mergeability-only settle (unchanged diffstat) does not re-wake.
+///
+/// `issue_id` and `source_branch` come from the merge_request the webhook just
+/// updated. The producing builder is resolved by `source_branch`, NOT by
+/// `merge_requests.job_id`: the PR is opened by a separate pr-action node, which
+/// is blocked while the PR is open and so always reads as non-quiescent — gating
+/// on it would never fire (the live CAIRN-1891 bug). Builder and pr-node share the
+/// branch, so the builder is the work-producing job on `source_branch`. Shares
+/// [`create_review_push_rows`] and [`wake_review_recipients`] with the node-idle
+/// edge — one implementation of the fingerprint/dedup/push/wake logic, two
+/// trigger edges.
+pub async fn create_review_push_for_pr_open(
+    orch: &Orchestrator,
+    issue_id: &str,
+    source_branch: &str,
+) {
+    let db = &orch.db.local;
+    // Resolve the producing BUILDER by the shared branch — not the pr-action node
+    // that owns the merge_request. Without a builder there is nothing to gate on,
+    // so skip rather than fire blind.
+    let builder_job_id = match find_producing_builder_job(db, issue_id, source_branch).await {
+        Ok(Some(job_id)) => job_id,
+        Ok(None) => {
+            log::warn!(
+                "PR-open review push: no producing builder on branch {} for issue {}",
+                source_branch,
+                &issue_id[..issue_id.len().min(8)]
+            );
+            return;
+        }
+        Err(e) => {
+            log::warn!("PR-open review push: builder lookup failed: {e}");
+            return;
+        }
+    };
+    // Quiescence gate on the BUILDER. A builder running a *work* turn is still
+    // committing work (the diffstat is in flux), so the review is premature. But a
+    // running *memory-review* turn is quiescent-for-review: the work turn already
+    // ended and the PR is the reviewable output, and the node-idle edge gates out
+    // memory-review turn ends — so on the common build path (create-pr → trailing
+    // memory-review turn → `opened` webhook lands while it runs) this edge is the
+    // ONLY one that can wake the watcher. Treating a running memory-review turn as
+    // busy would lose that wake permanently. A builder self-suspended on its own
+    // sub-work is not done either. Fail closed (a lookup error reads as
+    // non-quiescent) so a transient read error never fires a spurious wake.
+    let active = crate::messages::delivery::head_turn_active(db, &builder_job_id)
+        .await
+        .unwrap_or(true);
+    let memory_review = latest_turn_is_memory_review(orch, &builder_job_id);
+    let self_suspended = crate::messages::delivery::head_turn_self_suspended(db, &builder_job_id)
+        .await
+        .unwrap_or(true);
+    log::debug!(
+        "PR-open review: issue={} branch={} builder={} active={} memory_review={} self_suspended={}",
+        &issue_id[..issue_id.len().min(8)],
+        source_branch,
+        &builder_job_id[..builder_job_id.len().min(8)],
+        active,
+        memory_review,
+        self_suspended,
+    );
+    if (active && !memory_review) || self_suspended {
+        return;
+    }
+    let ctx = match crate::orchestrator::attention::read_issue_for_attention(db, issue_id).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            log::warn!(
+                "PR-open review push: issue context for {} failed: {}",
+                &issue_id[..issue_id.len().min(8)],
+                e
+            );
+            return;
+        }
+    };
+    match create_review_push_rows(db, &builder_job_id, issue_id, &ctx).await {
+        Ok(recipients) => {
+            log::debug!(
+                "PR-open review: pushed to {} watcher(s) for issue {}",
+                recipients.len(),
+                &issue_id[..issue_id.len().min(8)]
+            );
+            wake_review_recipients(orch, &recipients);
+        }
+        Err(e) => log::warn!(
+            "PR-open review push creation for job {} failed: {}",
+            &builder_job_id[..builder_job_id.len().min(8)],
+            e
+        ),
+    }
+}
+
+/// The work-producing builder job for a PR, resolved by the shared branch rather
+/// than `merge_requests.job_id` (CAIRN-1891). The PR is opened by a separate
+/// pr-action node (`merge_requests.job_id`), which is blocked-while-open with a
+/// pending turn and so never reads as quiescent; gating on it silently loses the
+/// wake. The builder and the pr-node share the branch, so among jobs on
+/// `source_branch` the builder is selected as the node that **produced the
+/// reviewable artifact** (a create-pr or plan). The pr-action node consumes that
+/// artifact and opens the PR but writes none itself, so this deterministically
+/// picks the builder even when the pr-node also carries the branch, a worktree,
+/// and a (blocked) turn. `None` when no job on the branch exists.
+async fn find_producing_builder_job(
+    db: &crate::storage::LocalDb,
+    issue_id: &str,
+    source_branch: &str,
+) -> Result<Option<String>, String> {
+    let issue_id = issue_id.to_string();
+    let source_branch = source_branch.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        let source_branch = source_branch.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT j.id FROM jobs j
+                     WHERE j.issue_id = ?1
+                       AND j.branch = ?2
+                     ORDER BY
+                       -- The builder is the node that produced the reviewable
+                       -- artifact (create-pr/plan); the pr-action node writes
+                       -- none, so this excludes it even when it shares the branch
+                       -- and carries a blocked turn.
+                       CASE WHEN EXISTS (
+                         SELECT 1 FROM artifacts a
+                         WHERE a.job_id = j.id
+                           AND a.artifact_type IN ('create-pr', 'plan')
+                       ) THEN 0 ELSE 1 END,
+                       -- Then a node with a worktree that ran agent work turns,
+                       -- as a secondary guard against pure action nodes.
+                       CASE WHEN j.worktree_path IS NOT NULL THEN 0 ELSE 1 END,
+                       CASE WHEN EXISTS (SELECT 1 FROM turns t WHERE t.job_id = j.id)
+                            THEN 0 ELSE 1 END,
+                       j.created_at DESC
+                     LIMIT 1",
+                    (issue_id.as_str(), source_branch.as_str()),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok::<_, DbError>(Some(row.text(0)?)),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Create the review push rows for an issue's watchers — the single shared
+/// implementation behind both review edges (node-idle and PR-open). Resolves the
+/// reviewable `content_ref` + change fingerprint, then pushes a `review:{issue}`
+/// to each watcher except the producing node, skipping any watcher whose latest
+/// review push already carries this fingerprint (CAIRN-1889 change-trigger;
+/// supersede-by-key collapses an undelivered older-fingerprint row). Returns the
+/// recipients that received a fresh push so the caller can wake them.
+///
+/// DB-only and async: the node-idle edge runs it inside `run_db_blocking`; the
+/// PR-open webhook edge awaits it directly.
+async fn create_review_push_rows(
+    db: &crate::storage::LocalDb,
+    producing_job_id: &str,
+    issue_id: &str,
+    ctx: &crate::orchestrator::attention::IssueAttentionContext,
+) -> Result<Vec<String>, String> {
+    let issue_uri = ctx.issue_uri();
+    // Reviewable predicate (disjunction), resolved straight into the content_ref
+    // the watcher follows plus a change fingerprint:
+    //   arm 1 — an open unmerged PR -> the producing node's `/pr` URI;
+    //   arm 2 — a create-pr artifact or unconfirmed plan artifact -> its artifact URI.
+    // The second arm is load-bearing at the node-idle edge: at the create-pr idle
+    // the PR may not be open yet, but the artifact write is already observable.
+    // Neither arm -> no push.
+    let Some((content_ref, fingerprint)) = reviewable_ref_and_fingerprint(
+        db,
+        &ctx.project_key,
+        ctx.number,
+        issue_id,
+        producing_job_id,
+    )
+    .await?
+    else {
+        log::debug!(
+            "review push: no reviewable ref (job={} issue={})",
+            &producing_job_id[..producing_job_id.len().min(8)],
+            issue_uri
+        );
+        return Ok(Vec::new());
+    };
+    let key = format!("review:{issue_uri}");
+    let watchers =
+        crate::orchestrator::attention_delivery::subscriber_jobs_for_issue(db, &issue_uri).await?;
+    log::debug!(
+        "review push: job={} content_ref={} fp={} watchers={}",
+        &producing_job_id[..producing_job_id.len().min(8)],
+        content_ref,
+        fingerprint,
+        watchers.len()
+    );
+    let mut pushed = Vec::new();
+    for recipient in watchers {
+        // Never push to the producing node itself.
+        if recipient == producing_job_id {
+            continue;
+        }
+        // CAIRN-1889 change-trigger: skip when the latest review push to this
+        // recipient (delivered OR undelivered) already carries this fingerprint —
+        // the reviewable state is unchanged, so re-firing would spuriously
+        // re-wake. A changed fingerprint creates a new push; supersede-by-key
+        // still collapses an undelivered older-fingerprint row to the newest.
+        if let Some(Some(prev)) =
+            super::attention_push::latest_push_fingerprint(db, &recipient, &key)
+                .await
+                .map_err(|e| e.to_string())?
+        {
+            if prev == fingerprint {
+                log::debug!(
+                    "review push: recipient {} deduped (fingerprint unchanged)",
+                    &recipient[..recipient.len().min(8)]
+                );
+                continue;
+            }
+        }
+        let (_, effective) = super::attention_push::push_with_fingerprint(
+            db,
+            &recipient,
+            &content_ref,
+            Wake::Wake,
+            Boundary::Event,
+            &key,
+            Some(&fingerprint),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        // A watcher that muted this issue gets a `Passive` review row that rides
+        // along on its next run; it is not handed back to `wake_review_recipients`
+        // so an idle muted watcher is never woken (CAIRN-1900).
+        if effective.wakes_idle() {
+            pushed.push(recipient);
+        }
+    }
+    Ok(pushed)
+}
+
+/// Wake each watcher that received a fresh review push so an already-idle one
+/// wakes now instead of only seeing the review ride along with an unrelated later
+/// wake (CAIRN-1889). `nudge_job_for_urgency` is the shared resume-ladder
+/// primitive: an idle recipient resumes; a busy one (a mid-turn agent OR a
+/// self-suspended one, both of which read as active) is left alone for the
+/// event-boundary push drain or its own-work resume to deliver the push. Steer
+/// wakes idle and never stops a busy turn.
+fn wake_review_recipients(orch: &Orchestrator, recipients: &[String]) {
+    for recipient in recipients {
+        if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
+            orch,
+            recipient,
+            crate::messages::queued::DeliveryUrgency::Steer,
+        ) {
+            log::warn!(
+                "review push wake for {} failed: {}",
+                &recipient[..recipient.len().min(8)],
+                e
+            );
+        }
+    }
+}
+
+/// Whether the job's most recent turn was a memory-review turn. The work-turn
+/// idle gate for the review push: a trailing `memory_review` turn end is not a
+/// work turn and must not create a review push (CAIRN-1882).
+fn latest_turn_is_memory_review(orch: &Orchestrator, job_id: &str) -> bool {
+    blocking_text_lookup(
+        orch,
+        job_id,
+        "SELECT CASE WHEN start_reason = 'memory_review' THEN '1' ELSE '0' END
+         FROM turns WHERE job_id = ?1
+         ORDER BY created_at DESC, sequence DESC LIMIT 1",
+        TextColumn::Optional,
+    )
+    .as_deref()
+        == Some("1")
+}
+
+/// The reviewable content_ref + change fingerprint at a work-turn idle, or `None`
+/// when nothing is reviewable (CAIRN-1889). The fingerprint is the change key the
+/// creator compares against the latest review push to decide whether to re-fire.
+///
+/// - Arm 1 (open unmerged PR), branch-precise: scoped to the producing builder's
+///   own branch (`jobs.branch == merge_requests.source_branch`) so an unrelated
+///   open PR on another branch for the same issue can't drive this node's review.
+///   The producing node's `/pr` URI and a head-SHA-or-diffstat fingerprint (see
+///   [`open_pr_review_arm`]).
+/// - Arm 2 (create-pr artifact or unconfirmed plan artifact): the artifact URI
+///   and an `artifact:{version}:{updated_at}` fingerprint.
+async fn reviewable_ref_and_fingerprint(
+    db: &crate::storage::LocalDb,
+    project_key: &str,
+    number: i32,
+    issue_id: &str,
+    job_id: &str,
+) -> Result<Option<(String, String)>, String> {
+    // Arm 1 is scoped to this builder's own branch. Both edges pass the builder
+    // job, whose `jobs.branch` is the PR's `source_branch`, so the open-PR lookup
+    // is unambiguous even when an issue carries more than one branch/PR.
+    if let Some(source_branch) = job_branch(db, job_id).await? {
+        if let Some(arm1) =
+            open_pr_review_arm(db, project_key, number, issue_id, &source_branch, job_id).await?
+        {
+            return Ok(Some(arm1));
+        }
+    }
+    review_artifact_ref(db, project_key, number, job_id).await
+}
+
+/// The producing builder's branch (`jobs.branch`), or `None` when unset (a
+/// plan-only node has no worktree branch, in which case arm 1 never applies).
+async fn job_branch(db: &crate::storage::LocalDb, job_id: &str) -> Result<Option<String>, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query("SELECT branch FROM jobs WHERE id = ?1", (job_id.as_str(),))
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok::<_, DbError>(row.opt_text(0)?),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Arm 1: an open PR on `source_branch` for the issue, resolved to a content_ref
+/// the watcher reviews plus a change fingerprint.
+///
+/// Reviewability is driven by the `merge_requests` row ALONE — "an open PR on
+/// this branch." The content URI is built from the `builder_job_id` we already
+/// resolved (cleanly joinable to its execution), NOT from `mr.job_id`: that is
+/// the pr-action node, whose execution may not join, and an inner join through it
+/// dropped the whole row so a real open PR read as unreviewable (the live
+/// CAIRN-1891 failure). The builder node is the right review target anyway. If
+/// the builder's node coordinates don't resolve, the content_ref falls back to
+/// the issue URI, which still resolves for the drain/render path.
+///
+/// The fingerprint prefers the PR head commit SHA (`pr:{mr}:sha:{sha}`), which a
+/// real new commit always changes and a mergeability-only settle never does; it
+/// falls back to the diffstat (`pr:{mr}:{additions}:{deletions}`) when no head
+/// SHA has been recorded yet. `None` when no open PR exists on that branch.
+async fn open_pr_review_arm(
+    db: &crate::storage::LocalDb,
+    project_key: &str,
+    number: i32,
+    issue_id: &str,
+    source_branch: &str,
+    builder_job_id: &str,
+) -> Result<Option<(String, String)>, String> {
+    let issue_id = issue_id.to_string();
+    let source_branch = source_branch.to_string();
+    let builder_job_id = builder_job_id.to_string();
+    #[allow(clippy::type_complexity)]
+    let resolved: Option<(
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    )> = db
+        .read(|conn| {
+            let issue_id = issue_id.clone();
+            let source_branch = source_branch.clone();
+            let builder_job_id = builder_job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT mr.id, mr.additions, mr.deletions, mr.head_sha,
+                                e.seq, j.uri_segment
+                         FROM merge_requests mr
+                         LEFT JOIN jobs j ON j.id = ?3
+                         LEFT JOIN executions e ON j.execution_id = e.id
+                         WHERE mr.issue_id = ?1 AND mr.source_branch = ?2
+                           AND mr.status = 'open'
+                         ORDER BY mr.updated_at DESC
+                         LIMIT 1",
+                        (
+                            issue_id.as_str(),
+                            source_branch.as_str(),
+                            builder_job_id.as_str(),
+                        ),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok::<_, DbError>(Some((
+                        row.text(0)?,
+                        row.opt_i64(1)?,
+                        row.opt_i64(2)?,
+                        row.opt_text(3)?,
+                        row.opt_i64(4)?,
+                        row.opt_text(5)?,
+                    ))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(resolved.map(
+        |(mr_id, additions, deletions, head_sha, seq, uri_segment)| {
+            let content_ref = match (seq, uri_segment) {
+                (Some(seq), Some(node)) => cairn_common::uri::build_node_artifact_uri_named(
+                    project_key,
+                    number,
+                    seq as i32,
+                    &node,
+                    None,
+                ),
+                _ => format!("cairn://p/{project_key}/{number}"),
+            };
+            let fingerprint = match head_sha {
+                Some(sha) => format!("pr:{mr_id}:sha:{sha}"),
+                None => {
+                    let fmt =
+                        |n: Option<i64>| n.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+                    format!("pr:{mr_id}:{}:{}", fmt(additions), fmt(deletions))
+                }
+            };
+            (content_ref, fingerprint)
+        },
+    ))
+}
+
+/// The producing job's create-pr or unconfirmed plan artifact, resolved to its
+/// node-artifact URI plus an `artifact:{version}:{updated_at}` change fingerprint
+/// (CAIRN-1889), or `None` when the job has no such artifact. Arm 2 of the
+/// review-push reviewable predicate. `create-pr` remains reviewable even when it
+/// is already confirmed because the PR lifecycle auto-confirms that artifact
+/// before every deployment shape has observed the PR-open edge.
+async fn review_artifact_ref(
+    db: &crate::storage::LocalDb,
+    project_key: &str,
+    number: i32,
+    job_id: &str,
+) -> Result<Option<(String, String)>, String> {
+    let job_id = job_id.to_string();
+    let resolved: Option<(i64, String, Option<String>, i64, i64)> = db
+        .read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT e.seq, j.uri_segment, a.output_name, a.version, a.updated_at
+                         FROM artifacts a
+                         JOIN jobs j ON a.job_id = j.id
+                         JOIN executions e ON j.execution_id = e.id
+                         WHERE a.job_id = ?1
+                           AND (a.artifact_type = 'create-pr'
+                                OR (a.artifact_type = 'plan' AND a.confirmed = 0))
+                         ORDER BY a.version DESC
+                         LIMIT 1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok::<_, DbError>(Some((
+                        row.i64(0)?,
+                        row.text(1)?,
+                        row.opt_text(2)?,
+                        row.i64(3)?,
+                        row.i64(4)?,
+                    ))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(
+        resolved.map(|(seq, node, output_name, version, updated_at)| {
+            let uri = cairn_common::uri::build_node_artifact_uri_named(
+                project_key,
+                number,
+                seq as i32,
+                &node,
+                output_name.as_deref(),
+            );
+            (uri, format!("artifact:{version}:{updated_at}"))
+        }),
+    )
 }
 
 fn job_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
@@ -1288,6 +2025,125 @@ pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     stop_session_internal(orch, run_id)
 }
 
+/// Marker recorded as the response of an `ask_user` prompt cancelled by a
+/// job-level stop, so the pending prompt no longer counts toward the issue's
+/// NeedsInput attention. The agent never reads it — the turn is terminalized and
+/// the user starts a fresh turn with a follow-up (CAIRN-1907, Option A).
+const STOP_CANCELLED_PROMPT_RESPONSE: &str = "[cancelled by stop]";
+
+/// Job-level stop for a suspended/waiting job that has no live run attached.
+///
+/// Run-scoped [`stop_session`] needs a `run_id` to interrupt and park warm, but a
+/// job that suspended on a foreground question or an inline delegated task can
+/// finalize its run (the OpenRouter owned loop keeps no warm process) and rest in
+/// a non-terminal state with NO run to attach to. Pressing Stop there used to fail
+/// with "no active run". This idles the job from its id directly:
+///
+/// 1. A live run IS attached -> defer entirely to the run-scoped path, leaving the
+///    existing warm-park behavior unchanged.
+/// 2. Otherwise fully idle the job (Option A): cascade-stop every descendant child
+///    run, cancel any open prompt, and terminalize the live
+///    (`pending`/`running`/`yielded`) turns — which drops a pending delegated
+///    successor and ends the yielded work turn — then recompute so the projection
+///    reflects a steerable, no-longer-waiting state. The user can immediately send
+///    a follow-up that starts a fresh turn.
+pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+    // A live run is attached: the run-scoped path is the unchanged behavior.
+    if let Some(run_id) = live_run_id_for_job(orch, job_id) {
+        return stop_session(orch, &run_id);
+    }
+
+    // No run to attach to. Cascade-stop descendant child runs first, mirroring
+    // the child cascade `stop_session` performs from a run id.
+    for child_run_id in descendant_running_run_ids_for_job(orch, job_id) {
+        log::info!(
+            "Stopping child run {} (job-level stop of {})",
+            child_run_id,
+            job_id
+        );
+        let _ = stop_session_internal(orch, &child_run_id);
+    }
+
+    // Cancel open input and terminalize the job's live turns (drops a pending
+    // delegated successor), then recompute the projection.
+    cancel_open_input_and_live_turns_for_job(orch, job_id)?;
+    if let Err(error) = crate::execution::advancement::recompute_job(orch, job_id) {
+        log::warn!("Failed to recompute job {job_id} after job-level stop: {error}");
+    }
+
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "prompts", "action": "update"}),
+    );
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "turns", "action": "update"}),
+    );
+
+    Ok(())
+}
+
+/// Running (`starting`/`live`) run ids for every descendant job of `job_id`. The
+/// job-level analogue of [`child_run_ids_for_run`], resolved from a job id rather
+/// than a run id (a suspended job may have no run of its own).
+fn descendant_running_run_ids_for_job(orch: &Orchestrator, job_id: &str) -> Vec<String> {
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let descendant_job_ids = find_descendant_job_ids(conn, &job_id).await?;
+                if descendant_job_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                get_running_runs_for_jobs(conn, &descendant_job_ids).await
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or_default()
+}
+
+/// Cancel any open `ask_user` prompt on the job and terminalize its live
+/// (`pending`/`running`/`yielded`) turns in one write. Cancelling the open prompt
+/// clears the issue's NeedsInput attention; terminalizing the live turns drops a
+/// pending delegated successor and ends the yielded work turn so the job's latest
+/// turn is no longer live and it recomputes to a steerable state.
+fn cancel_open_input_and_live_turns_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<(), String> {
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let now = chrono::Utc::now().timestamp();
+                conn.execute(
+                    "UPDATE prompts
+                     SET response = ?1, answered_at = ?2
+                     WHERE response IS NULL
+                       AND turn_id IN (SELECT id FROM turns WHERE job_id = ?3)",
+                    (STOP_CANCELLED_PROMPT_RESPONSE, now, job_id.as_str()),
+                )
+                .await?;
+                conn.execute(
+                    "UPDATE turns
+                     SET state = 'cancelled', ended_at = ?1, updated_at = ?1
+                     WHERE job_id = ?2 AND state IN ('pending', 'running', 'yielded')",
+                    (now, job_id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
 /// Internal stop without cascading (used by cascading stop)
 ///
 /// Sends an interrupt control request via stdin and transitions the process
@@ -1573,6 +2429,27 @@ mod memory_review_tests {
         .unwrap();
     }
 
+    /// Seed `count` recorded events on `run-review`. The no-drafts reflection
+    /// nudge is gated on event activity (`events > REFLECTION_ACTIVITY_THRESHOLD`),
+    /// not turn count, so a node job needs enough events to clear the threshold.
+    async fn insert_events_for_review_run(db: &LocalDb, count: i64) {
+        db.write(move |conn| {
+            Box::pin(async move {
+                for seq in 0..count {
+                    conn.execute(
+                        "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
+                         VALUES (?1, 'run-review', ?2, 1, 'assistant', '{}', 1)",
+                        (format!("ev-{seq}"), seq),
+                    )
+                    .await?;
+                }
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
     /// Insert a MemoryReview turn for `j-review` in the given state. Review
     /// completion now keys off this turn reaching a terminal state, so the
     /// `sent` path needs one present to fire.
@@ -1753,11 +2630,14 @@ mod memory_review_tests {
     }
 
     #[tokio::test]
-    async fn null_no_drafts_node_job_long_session_sends_reflection() {
+    async fn null_no_drafts_node_job_substantial_activity_sends_reflection() {
         let db = test_db().await;
         seed_job_row(&db, None, false).await;
         insert_artifact(&db).await;
         insert_run_session_with_turns(&db, 11).await;
+        // The no-drafts reflection nudge is gated on event activity (events > 50),
+        // not turn count, so seed enough events to clear the threshold.
+        insert_events_for_review_run(&db, 60).await;
         let orch = test_orchestrator(db);
 
         finish_memory_review_if_due(&orch, "j-review", "run-review");
@@ -1833,7 +2713,7 @@ mod memory_review_tests {
 /// parents hung forever.
 #[cfg(test)]
 mod warm_completion_tests {
-    use super::{finalize_run, transition_to_warm_state};
+    use super::{finalize_run, stop_job, transition_to_warm_state};
     use crate::agent_process::process::{wrap_plain_stdin, RunHandle};
     use crate::db::DbState;
     use crate::models::RunStatus;
@@ -2175,5 +3055,659 @@ mod warm_completion_tests {
         // produces. Before the fix this stayed 'pending' forever and the parent
         // batch hung.
         assert_eq!(turn_state(&orch, "succ").await, "complete");
+    }
+
+    async fn scalar_text(orch: &Orchestrator, sql: &'static str, id: &str) -> Option<String> {
+        let id = id.to_string();
+        orch.db
+            .local
+            .read(move |conn| {
+                let id = id.clone();
+                Box::pin(async move {
+                    let mut rows = conn.query(sql, (id.as_str(),)).await?;
+                    match rows.next().await? {
+                        Some(row) => row.opt_text(0),
+                        None => Ok(None),
+                    }
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Seed a runless suspended parent: a `running` job with no live run of its
+    /// own, a yielded work turn plus a pending `dependency_unblock` successor, an
+    /// open `ask_user` prompt, and a delegated child with a live run. This is the
+    /// shape a job rests in after suspending on a foreground question or inline
+    /// task when its run finalized (the OpenRouter owned loop keeps no warm
+    /// process). Standalone (no execution) so the recompute takes the simple path.
+    async fn seed_runless_suspended_job(db: &LocalDb) {
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-sj','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-sj','w-sj','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-sj','p-sj',7,'T','waiting','needs_input',1,1)", ()).await?;
+                // Yielded work turn + the pending successor it points at. Inserted
+                // before the job because `jobs.current_turn_id` references it.
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('sj-anchor','s-sj','j-sj-parent',1,'yielded','awaiting_input','initial',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at) VALUES ('sj-succ','s-sj','j-sj-parent',2,'sj-anchor','pending','dependency_unblock',1,1)", ()).await?;
+                // Parent job: running, no live run (its prior run exited).
+                conn.execute("INSERT INTO jobs (id, issue_id, project_id, status, node_name, current_turn_id, created_at, updated_at) VALUES ('j-sj-parent','i-sj','p-sj','running','builder','sj-succ',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, issue_id, project_id, status, created_at, updated_at) VALUES ('r-sj-parent','j-sj-parent','i-sj','p-sj','exited',1,1)", ()).await?;
+                // Open ask_user prompt on the work turn.
+                conn.execute("INSERT INTO prompts (id, run_id, turn_id, questions, response, created_at) VALUES ('sj-prompt','r-sj-parent','sj-anchor','[]',NULL,1)", ()).await?;
+                // Delegated child still running.
+                conn.execute("INSERT INTO jobs (id, parent_job_id, issue_id, project_id, status, node_name, created_at, updated_at) VALUES ('j-sj-child','j-sj-parent','i-sj','p-sj','running','task',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, issue_id, project_id, status, created_at, updated_at) VALUES ('r-sj-child','j-sj-child','i-sj','p-sj','live',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_job_idles_runless_suspended_job_and_stops_children() {
+        let db = test_db().await;
+        seed_runless_suspended_job(&db).await;
+        let orch = test_orchestrator(db);
+
+        stop_job(&orch, "j-sj-parent").unwrap();
+
+        // The open prompt is cancelled (no longer counts toward NeedsInput).
+        assert!(
+            scalar_text(
+                &orch,
+                "SELECT response FROM prompts WHERE id = ?1",
+                "sj-prompt"
+            )
+            .await
+            .is_some(),
+            "open prompt should be answered/cancelled"
+        );
+        // The yielded work turn and the pending successor are both terminalized,
+        // so the job's latest turn is no longer live (drops the pending successor).
+        assert_eq!(turn_state(&orch, "sj-anchor").await, "cancelled");
+        assert_eq!(turn_state(&orch, "sj-succ").await, "cancelled");
+        // The delegated child's live run is stopped.
+        assert_ne!(
+            scalar_text(&orch, "SELECT status FROM runs WHERE id = ?1", "r-sj-child")
+                .await
+                .as_deref(),
+            Some("live"),
+            "child run should no longer be live"
+        );
+    }
+}
+
+/// CAIRN-1882: the work-turn idle edge is the single creator of a review push.
+/// These cover the canonical scenarios from `docs/attention-redesign.md`: a
+/// reviewable work-turn idle pushes exactly one `review:{issue}` to each watcher
+/// (never to the producing node), a memory-review turn end does not, an idle with
+/// no reviewable output does not, and successive idles supersede to one
+/// undelivered row.
+#[cfg(test)]
+mod review_push_tests {
+    use super::{
+        create_review_push_for_pr_open, create_review_push_on_turn_end, issue_for_attention_by_job,
+    };
+    use crate::db::DbState;
+    use crate::orchestrator::attention_push::{
+        list_pending, stamp_delivered, Boundary, Push, Wake,
+    };
+    use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::Arc;
+
+    const ISSUE_URI: &str = "cairn://p/PRJ/7";
+    const REVIEW_KEY: &str = "review:cairn://p/PRJ/7";
+
+    async fn test_db() -> LocalDb {
+        crate::storage::migrated_test_db("review-push.db").await
+    }
+
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// Producing builder node `j-prod` (issue `i-rev` / `cairn://p/PRJ/7`, exec
+    /// seq 1) whose just-ended turn carries `start_reason`, a watcher job
+    /// `j-watch`, and an active issue subscription for BOTH so the producing
+    /// node's self-exclusion is exercised.
+    async fn seed(db: &LocalDb, start_reason: &str) {
+        db.execute_script(&format!(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p-rev','w','Project','PRJ','/tmp/repo',1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('i-rev','p-rev',7,'Rev','active','active','none',1,1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e-rev','r','i-rev','p-rev','running',1,1);
+            INSERT INTO jobs(id, execution_id, project_id, issue_id, status, uri_segment, node_name, branch, worktree_path, created_at, updated_at)
+              VALUES('j-prod','e-rev','p-rev','i-rev','complete','builder','builder','b','/tmp/wt',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, status, node_name, created_at, updated_at)
+              VALUES('j-watch','p-rev','i-rev','running','watcher',1,1);
+            INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
+              VALUES('r-prod','p-rev','j-prod','i-rev',1,1);
+            INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+              VALUES('t-prod','s-prod','j-prod',1,'complete','{start_reason}',1,1);
+            INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state, created_by, created_at, updated_at, one_shot)
+              VALUES('sub-watch','j-watch','issue','{ISSUE_URI}','active','agent',1,1,0);
+            INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state, created_by, created_at, updated_at, one_shot)
+              VALUES('sub-prod','j-prod','issue','{ISSUE_URI}','active','agent',1,1,0);
+            "
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn insert_open_pr(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr-rev','j-prod','p-rev','i-rev','t','b','main','open',1,1);",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_artifact(db: &LocalDb, artifact_type: &str, confirmed: i64) {
+        db.execute_script(&format!(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-rev','j-prod','{artifact_type}',1,'{{}}',1,'{artifact_type}',{confirmed},1,1);"
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn pending(orch: &Orchestrator, recipient: &str) -> Vec<Push> {
+        list_pending(&orch.db.local, recipient).await.unwrap()
+    }
+
+    fn run_review_push(orch: &Orchestrator) {
+        let (issue_id, ctx) =
+            issue_for_attention_by_job(orch, "j-prod").expect("issue context for producing job");
+        create_review_push_on_turn_end(orch, "j-prod", &issue_id, &ctx);
+    }
+
+    async fn run_pr_open(orch: &Orchestrator) {
+        // The webhook passes (issue_id, source_branch); the builder is resolved
+        // from the branch inside the creator. `insert_open_pr` uses branch 'b',
+        // matching the seeded builder j-prod's branch.
+        create_review_push_for_pr_open(orch, "i-rev", "b").await;
+    }
+
+    #[tokio::test]
+    async fn work_idle_with_unconfirmed_create_pr_artifact_pushes_review() {
+        // The create-pr idle: the PR is not open yet, but the unconfirmed
+        // artifact is observable -> the second predicate arm fires.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_artifact(&db, "create-pr", 0).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+
+        let watcher = pending(&orch, "j-watch").await;
+        assert_eq!(watcher.len(), 1);
+        assert_eq!(watcher[0].key, REVIEW_KEY);
+        assert!(watcher[0].content_ref.contains("/builder/"));
+        // The producing node is never a recipient of its own review.
+        assert!(pending(&orch, "j-prod").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_idle_with_open_pr_pushes_review() {
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+
+        let watcher = pending(&orch, "j-watch").await;
+        assert_eq!(watcher.len(), 1);
+        assert_eq!(watcher[0].key, REVIEW_KEY);
+        assert!(watcher[0]
+            .content_ref
+            .starts_with("cairn://p/PRJ/7/1/builder"));
+        assert!(pending(&orch, "j-prod").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn memory_review_turn_end_creates_no_review_push() {
+        // The gate: a trailing memory-review turn is not a work turn, so even an
+        // open PR yields no review push.
+        let db = test_db().await;
+        seed(&db, "memory_review").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+
+        assert!(pending(&orch, "j-watch").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_idle_with_confirmed_create_pr_artifact_pushes_review() {
+        // CAIRN-1999 shape: the create-pr artifact was already confirmed by the
+        // artifact lifecycle, but the parent still needs a review push for the
+        // child output even if no PR-open edge creates one.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_artifact(&db, "create-pr", 1).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+
+        let watcher = pending(&orch, "j-watch").await;
+        assert_eq!(watcher.len(), 1);
+        assert_eq!(watcher[0].key, REVIEW_KEY);
+        assert!(watcher[0].content_ref.contains("/builder/"));
+        assert!(pending(&orch, "j-prod").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn work_idle_without_reviewable_output_no_push() {
+        // A work turn with neither an open PR nor a create-pr/unconfirmed-plan
+        // artifact -> nothing reviewable.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_artifact(&db, "plan", 1).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+
+        assert!(pending(&orch, "j-watch").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successive_work_idles_collapse_to_one_undelivered() {
+        // Two work-turn idles with the SAME reviewable state and no delivery in
+        // between yield one undelivered review row: the first creates it, the
+        // second is skipped by the change-trigger (CAIRN-1889) because the
+        // undelivered push already carries the same fingerprint.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+        run_review_push(&orch);
+
+        assert_eq!(pending(&orch, "j-watch").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_fingerprint_skips_review_even_after_delivery() {
+        // One review fires (fp=A); after it is delivered, a second work-turn idle
+        // with the SAME reviewable state must NOT re-create a review push.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+        let first = pending(&orch, "j-watch").await;
+        assert_eq!(first.len(), 1);
+
+        // Deliver the first push: it leaves the supersede partial index but stays
+        // in the table for the fingerprint lookup.
+        stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
+            .await
+            .unwrap();
+        assert!(pending(&orch, "j-watch").await.is_empty());
+
+        // Same diffstat -> skipped, no re-wake.
+        run_review_push(&orch);
+        assert!(
+            pending(&orch, "j-watch").await.is_empty(),
+            "an unchanged reviewable state must not re-create a review push"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_diffstat_creates_new_review_after_delivery() {
+        // New commits change the diffstat -> a fresh review push, even after the
+        // first was delivered.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+        let first = pending(&orch, "j-watch").await;
+        assert_eq!(first.len(), 1);
+        stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
+            .await
+            .unwrap();
+
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE merge_requests SET additions=10, deletions=2 WHERE id='mr-rev';",
+            )
+            .await
+            .unwrap();
+        run_review_push(&orch);
+        let second = pending(&orch, "j-watch").await;
+        assert_eq!(second.len(), 1, "a changed diffstat re-creates the review");
+        assert_ne!(second[0].id, first[0].id);
+    }
+
+    #[tokio::test]
+    async fn mergeability_only_change_does_not_refire_review() {
+        // A mergeability settle touches non-diffstat columns only -> same
+        // fingerprint -> no new review push.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_review_push(&orch);
+        let first = pending(&orch, "j-watch").await;
+        assert_eq!(first.len(), 1);
+        stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
+            .await
+            .unwrap();
+
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE merge_requests SET github_mergeable='MERGEABLE', updated_at=999 WHERE id='mr-rev';",
+            )
+            .await
+            .unwrap();
+        run_review_push(&orch);
+        assert!(
+            pending(&orch, "j-watch").await.is_empty(),
+            "a mergeability-only settle must not re-create a review push"
+        );
+    }
+
+    // --- CAIRN-1891: the PR-open edge of the review push ---------------------
+
+    #[tokio::test]
+    async fn pr_open_with_quiescent_producer_pushes_one_review() {
+        // The producing builder's head turn is complete (quiescent) and the PR is
+        // now open -> exactly one review to the watcher, never to the producing
+        // node itself. This is the wake the create-pr idle edge cannot fire.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+
+        let watcher = pending(&orch, "j-watch").await;
+        assert_eq!(watcher.len(), 1);
+        assert_eq!(watcher[0].key, REVIEW_KEY);
+        assert!(watcher[0]
+            .content_ref
+            .starts_with("cairn://p/PRJ/7/1/builder"));
+        assert!(pending(&orch, "j-prod").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_open_with_running_producer_does_not_push() {
+        // The quiescence gate: a producing node still mid-turn (a `synchronize`
+        // landing during active work) does NOT fire a review.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        db.execute_script("UPDATE turns SET state='running' WHERE id='t-prod';")
+            .await
+            .unwrap();
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+
+        assert!(pending(&orch, "j-watch").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_open_self_suspended_producer_does_not_push() {
+        // A producing node self-suspended on its own work (yielded waiting on a
+        // dependency/sub-agent) is not quiescent either -> no review.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        db.execute_script(
+            "UPDATE turns SET state='yielded', yield_reason='dependency_wait' WHERE id='t-prod';",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+
+        assert!(pending(&orch, "j-watch").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pr_open_resolves_builder_by_branch_not_mr_job() {
+        // The live CAIRN-1891 job-identity bug: the merge_request is owned by a
+        // separate pr-action node (blocked while the PR is open -> a running turn,
+        // never quiescent), while the builder that did the work is a DIFFERENT job
+        // on the same branch. Gating on `mr.job_id` would always bail; the gate
+        // must resolve and check the builder via `source_branch`.
+        let db = test_db().await;
+        seed(&db, "initial").await; // builder j-prod: branch 'b', turn complete (quiescent)
+                                    // The pr-action node owns the merge_request and — reproducing the live
+                                    // shape — has NO joinable execution (execution_id NULL), so an arm-1 query
+                                    // that joined through mr.job_id would drop the row and read the open PR as
+                                    // unreviewable. The builder (j-prod) is the joinable node.
+        db.execute_script(
+            "INSERT INTO jobs(id, project_id, issue_id, status, uri_segment, node_name, created_at, updated_at)
+               VALUES('j-prnode','p-rev','i-rev','blocked','pr','pr',1,1);
+             INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+               VALUES('mr-rev','j-prnode','p-rev','i-rev','t','b','main','open',1,1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+
+        let watcher = pending(&orch, "j-watch").await;
+        assert_eq!(
+            watcher.len(),
+            1,
+            "must resolve the builder by source_branch and fire, not gate on the blocked pr-node"
+        );
+        assert_eq!(watcher[0].key, REVIEW_KEY);
+    }
+
+    #[tokio::test]
+    async fn pr_open_changed_head_sha_refires_even_with_same_diffstat() {
+        // Head SHA is the precise change key: two different commits can share a
+        // diffstat, so a real new commit must re-review even when +/- is unchanged.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        db.execute_script("UPDATE merge_requests SET head_sha='sha-aaa' WHERE id='mr-rev';")
+            .await
+            .unwrap();
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+        let first = pending(&orch, "j-watch").await;
+        assert_eq!(first.len(), 1);
+        stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
+            .await
+            .unwrap();
+
+        // New commit, SAME diffstat, different head SHA -> must re-fire.
+        orch.db
+            .local
+            .execute_script("UPDATE merge_requests SET head_sha='sha-bbb' WHERE id='mr-rev';")
+            .await
+            .unwrap();
+        run_pr_open(&orch).await;
+        let second = pending(&orch, "j-watch").await;
+        assert_eq!(
+            second.len(),
+            1,
+            "a changed head SHA must re-create the review even with an unchanged diffstat"
+        );
+        assert_ne!(second[0].id, first[0].id);
+    }
+
+    #[tokio::test]
+    async fn pr_open_during_memory_review_turn_fires_review() {
+        // The common build path: create-pr (work turn ends) -> a trailing
+        // memory-review turn runs -> the `opened` webhook lands while it runs. A
+        // running memory-review turn is quiescent-for-review (the PR is the
+        // reviewable output, and the node-idle edge gates out memory-review turn
+        // ends), so the PR-open edge MUST fire here — otherwise the wake is lost
+        // permanently when no further commit produces a later webhook.
+        let db = test_db().await;
+        seed(&db, "memory_review").await;
+        insert_open_pr(&db).await;
+        db.execute_script("UPDATE turns SET state='running' WHERE id='t-prod';")
+            .await
+            .unwrap();
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+
+        let watcher = pending(&orch, "j-watch").await;
+        assert_eq!(
+            watcher.len(),
+            1,
+            "a running memory-review turn must not block the PR-open review"
+        );
+        assert_eq!(watcher[0].key, REVIEW_KEY);
+
+        // The node-idle edge for that same memory-review turn end is gated out, so
+        // it adds nothing — still exactly one undelivered review (no double).
+        run_review_push(&orch);
+        assert_eq!(pending(&orch, "j-watch").await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pr_open_same_diffstat_is_deduped() {
+        // A mergeability-only settle re-delivers the open PR with an unchanged
+        // diffstat -> the fingerprint matches the delivered push, so no re-wake.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+        let first = pending(&orch, "j-watch").await;
+        assert_eq!(first.len(), 1);
+        stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
+            .await
+            .unwrap();
+        assert!(pending(&orch, "j-watch").await.is_empty());
+
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE merge_requests SET github_mergeable='MERGEABLE', updated_at=999 WHERE id='mr-rev';",
+            )
+            .await
+            .unwrap();
+        run_pr_open(&orch).await;
+        assert!(
+            pending(&orch, "j-watch").await.is_empty(),
+            "a mergeability-only settle must not re-create a review push"
+        );
+    }
+
+    #[tokio::test]
+    async fn pr_open_changed_diffstat_creates_new_review() {
+        // New commits change the diffstat between webhook deliveries -> a fresh
+        // review push, even after the first was delivered.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+        let first = pending(&orch, "j-watch").await;
+        assert_eq!(first.len(), 1);
+        stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
+            .await
+            .unwrap();
+
+        orch.db
+            .local
+            .execute_script(
+                "UPDATE merge_requests SET additions=20, deletions=4 WHERE id='mr-rev';",
+            )
+            .await
+            .unwrap();
+        run_pr_open(&orch).await;
+        let second = pending(&orch, "j-watch").await;
+        assert_eq!(second.len(), 1, "a changed diffstat re-creates the review");
+        assert_ne!(second[0].id, first[0].id);
+    }
+
+    #[tokio::test]
+    async fn pr_open_and_node_idle_share_one_creator() {
+        // Both edges run the same row creator: the PR-open edge creates the
+        // review, and a subsequent node-idle edge against the unchanged diffstat
+        // is deduped by the same fingerprint logic to the one undelivered row.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        insert_open_pr(&db).await;
+        let orch = test_orchestrator(db);
+
+        run_pr_open(&orch).await;
+        let after_pr_open = pending(&orch, "j-watch").await;
+        assert_eq!(after_pr_open.len(), 1);
+        let row_id = after_pr_open[0].id.clone();
+
+        run_review_push(&orch);
+        let after_idle = pending(&orch, "j-watch").await;
+        assert_eq!(after_idle.len(), 1);
+        assert_eq!(
+            after_idle[0].id, row_id,
+            "both edges share one push row keyed review:{{issue}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_push_resolved_inlines_referent_content() {
+        // CAIRN-1891 Deliverable 2: a drained push renders its referent content
+        // inline, not just the URI. The header carries the wake level + the
+        // content_ref URI; a resolved body is appended beneath it.
+        let db = test_db().await;
+        seed(&db, "initial").await;
+        let orch = test_orchestrator(db);
+
+        let push = Push {
+            id: "p-render".into(),
+            recipient: "j-watch".into(),
+            content_ref: ISSUE_URI.into(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: REVIEW_KEY.into(),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+        let rendered =
+            crate::orchestrator::attention_delivery::render_push_resolved(&orch, &push).await;
+
+        let header = format!("Attention update (wake): {ISSUE_URI}");
+        assert!(
+            rendered.starts_with(&header),
+            "header must carry the wake level + content_ref URI: {rendered}"
+        );
+        assert!(
+            rendered.len() > header.len(),
+            "expected resolved referent content inlined beneath the URI header: {rendered}"
+        );
     }
 }

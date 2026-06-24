@@ -1,5 +1,8 @@
 use super::actions::{apply_action_create, apply_action_delete, apply_action_patch};
 use super::agents::{apply_agent_create, apply_agent_delete, apply_agent_patch};
+use super::browsers::{
+    apply_browser_action, apply_browser_delete, apply_browser_ensure, BrowserInteractionArgs,
+};
 use super::labels::{apply_label_create, apply_label_delete, apply_label_patch};
 use super::mcp::{apply_mcp_create, apply_mcp_delete, apply_mcp_patch};
 use super::memories::{
@@ -188,6 +191,10 @@ struct WakeFilterPayload {
     kind: String,
     reference: Option<String>,
     fact_kinds: Option<Vec<String>>,
+    /// Terminal subscriptions only: `"exit"` (default) or `"output"`.
+    on: Option<String>,
+    /// Terminal `on:"output"` subscriptions only: the literal phrase to watch for.
+    phrase: Option<String>,
 }
 
 fn parse_wake_filter(
@@ -244,10 +251,21 @@ fn parse_wake_filter(
                 .collect::<ResourceMutationResult<Vec<_>>>()
         })
         .transpose()?;
+    let on = obj
+        .get("on")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let phrase = obj
+        .get("phrase")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string);
     Ok(WakeFilterPayload {
         kind,
         reference,
         fact_kinds,
+        on,
+        phrase,
     })
 }
 
@@ -316,6 +334,41 @@ async fn subscribe_terminal_wake(
 
     let uri = cairn_common::uri::build_node_terminal_uri(project, number, exec_seq, node_id, &slug);
 
+    match filter.on.as_deref().unwrap_or("exit") {
+        "exit" => {
+            subscribe_terminal_exit_wake(
+                orch, index, item, job_id, created_by, dry_run, &slug, &uri, &row,
+            )
+            .await
+        }
+        "output" => {
+            subscribe_terminal_output_wake(
+                orch, index, item, job_id, filter, created_by, dry_run, &slug, &uri, &row,
+            )
+            .await
+        }
+        other => Err(build_failure(
+            index,
+            item,
+            format!("terminal subscribe `on` must be \"exit\" or \"output\" (got \"{other}\")"),
+        )),
+    }
+}
+
+/// Subscribe a one-shot terminal-**exit** wake: resume the node when the terminal
+/// finishes (fires immediately if it already exited).
+#[allow(clippy::too_many_arguments)]
+async fn subscribe_terminal_exit_wake(
+    orch: &Orchestrator,
+    index: usize,
+    item: &ChangeItem,
+    job_id: &str,
+    created_by: &str,
+    dry_run: bool,
+    slug: &str,
+    uri: &str,
+    row: &crate::mcp::handlers::bash::TerminalWakeRow,
+) -> ResourceMutationResult<String> {
     if dry_run {
         return Ok(format!("Would subscribe terminal-exit wake: {slug}"));
     }
@@ -329,7 +382,7 @@ async fn subscribe_terminal_wake(
         &orch.db.local,
         job_id,
         "process",
-        Some(&uri),
+        Some(uri),
         Some(&fact_kinds),
         created_by,
     )
@@ -343,8 +396,8 @@ async fn subscribe_terminal_wake(
         let runtime_secs = row.exited_at.map(|exited| (exited - row.created_at).max(0));
         crate::orchestrator::wakes::route_terminal_exit_async(
             orch,
-            &slug,
-            &uri,
+            slug,
+            uri,
             row.exit_code,
             runtime_secs,
             row.output_tail.as_deref(),
@@ -359,6 +412,111 @@ async fn subscribe_terminal_wake(
             "Subscribed to terminal '{slug}' exit; end your turn to resume when it finishes ({uri})"
         ))
     }
+}
+
+/// Subscribe a one-shot terminal-**output** phrase wake: resume the node when a
+/// literal phrase appears in the running terminal's output. The subscription
+/// also fires on terminal exit, so a process that dies before printing the
+/// phrase still wakes the waiting agent. Only meaningful on a running terminal.
+#[allow(clippy::too_many_arguments)]
+async fn subscribe_terminal_output_wake(
+    orch: &Orchestrator,
+    index: usize,
+    item: &ChangeItem,
+    job_id: &str,
+    filter: &WakeFilterPayload,
+    created_by: &str,
+    dry_run: bool,
+    slug: &str,
+    uri: &str,
+    row: &crate::mcp::handlers::bash::TerminalWakeRow,
+) -> ResourceMutationResult<String> {
+    let phrase = filter
+        .phrase
+        .as_deref()
+        .map(str::trim)
+        .filter(|phrase| !phrase.is_empty())
+        .ok_or_else(|| {
+            build_failure(
+                index,
+                item,
+                "terminal output subscribe requires a non-empty phrase, e.g. {subscribe:{kind:\"terminal\",ref:\"cairn:~/terminal/dev\",on:\"output\",phrase:\"ready\"}}",
+            )
+        })?;
+
+    if row.status == "exited" {
+        return Err(build_failure(
+            index,
+            item,
+            format!(
+                "Terminal '{slug}' has already exited; output watching applies only to a running terminal. Read {uri} for its output."
+            ),
+        ));
+    }
+
+    if dry_run {
+        return Ok(format!(
+            "Would subscribe terminal-output wake on '{slug}' for phrase \"{phrase}\""
+        ));
+    }
+
+    // Persist first: the subscription is a durable, terminal-scoped property,
+    // not bound to whichever PTY session is live right now. A (re)starting
+    // session hydrates it (see spawn_terminal_session), so it survives the
+    // worktree-fence approval respawn and a subscribe made before any session
+    // is live — "wake me if this terminal outputs X", across sessions.
+    let sub = crate::orchestrator::wakes::subscribe_terminal_output_one_shot(
+        &orch.db.local,
+        job_id,
+        uri,
+        phrase,
+        created_by,
+    )
+    .await
+    .map_err(|error| build_failure(index, item, error))?;
+
+    // If a session is live now, also attach an in-memory watcher to it (the
+    // hydrate path only runs at session start) and scan its current buffer so an
+    // already-printed phrase fires immediately. A missing or dead session is no
+    // longer an error: the persisted subscription stands and the next session
+    // picks it up.
+    use crate::mcp::handlers::bash::OutputWatchRegistration;
+    if let Some(session_id) = row.session_id.as_deref() {
+        match crate::mcp::handlers::bash::register_terminal_output_watcher(
+            orch, session_id, &sub.id, job_id, phrase, uri,
+        ) {
+            OutputWatchRegistration::AlreadyPresent { excerpt } => {
+                // The phrase is already in the buffer: fire immediately. The
+                // queued delivery lands at turn end and the one-shot consume
+                // removes the subscription we just created.
+                crate::orchestrator::wakes::route_terminal_output_async(
+                    orch,
+                    job_id,
+                    slug,
+                    uri,
+                    phrase,
+                    excerpt.as_deref(),
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                return Ok(format!(
+                    "Terminal '{slug}' already printed \"{phrase}\"; resume queued for turn end ({uri})"
+                ));
+            }
+            OutputWatchRegistration::Registered => {
+                return Ok(format!(
+                    "Subscribed to terminal '{slug}' output for phrase \"{phrase}\"; end your turn to resume when it appears ({uri})"
+                ));
+            }
+            // No live session backing the row right now; the persisted
+            // subscription still stands and the next session will pick it up.
+            OutputWatchRegistration::NotLive => {}
+        }
+    }
+
+    Ok(format!(
+        "Subscribed to terminal '{slug}' output for phrase \"{phrase}\"; end your turn to resume when it next prints, across restarts ({uri})"
+    ))
 }
 
 /// Parse the optional `execution` object on an issue-create payload into a
@@ -658,6 +816,143 @@ pub(crate) async fn dispatch_resource_change(
                     .map_err(|error| build_failure(index, item, error))?
             }
         }
+        (
+            CairnResource::NodeBrowser { slug, .. }
+            | CairnResource::TaskBrowser { slug, .. }
+            | CairnResource::ProjectBrowser { slug, .. },
+            ChangeMode::Create,
+        ) => {
+            let url = item
+                .payload
+                .as_ref()
+                .and_then(|payload| payload_trimmed_non_empty_str(payload, "url", &["navigate"]))
+                .map(ToOwned::to_owned);
+            if dry_run {
+                match &url {
+                    Some(url) => format!("Would open browser {slug} at {url}"),
+                    None => format!("Would open browser {slug}"),
+                }
+            } else {
+                apply_browser_ensure(orch, &resource, url)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+            }
+        }
+        (
+            CairnResource::NodeBrowser { slug, .. }
+            | CairnResource::TaskBrowser { slug, .. }
+            | CairnResource::ProjectBrowser { slug, .. },
+            ChangeMode::Replace,
+        ) => {
+            // `replace` is the agent-intuitive "go to a URL / set the page":
+            // an idempotent ensure + navigate, identical to `patch` with a url
+            // but with the url required. Missing url is a hard error with guidance.
+            let url = item
+                .payload
+                .as_ref()
+                .and_then(|payload| payload_trimmed_non_empty_str(payload, "url", &["navigate"]))
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    build_failure(
+                        index,
+                        item,
+                        "mode=replace sets the page URL; provide payload.url",
+                    )
+                })?;
+            if dry_run {
+                format!("Would navigate browser {slug} to {url}")
+            } else {
+                apply_browser_ensure(orch, &resource, Some(url))
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+            }
+        }
+        (
+            CairnResource::NodeBrowser { slug, .. }
+            | CairnResource::TaskBrowser { slug, .. }
+            | CairnResource::ProjectBrowser { slug, .. },
+            ChangeMode::Patch,
+        ) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
+            let url =
+                payload_trimmed_non_empty_str(payload, "url", &["navigate"]).map(ToOwned::to_owned);
+            let action =
+                payload_trimmed_non_empty_str(payload, "action", &[]).map(ToOwned::to_owned);
+            if url.is_none() && action.is_none() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload requires url/navigate or action (back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad)",
+                ));
+            }
+            let args = BrowserInteractionArgs {
+                selector: payload_trimmed_non_empty_str(payload, "selector", &[])
+                    .map(ToOwned::to_owned),
+                text: payload_trimmed_non_empty_str(payload, "text", &[]).map(ToOwned::to_owned),
+                handle: payload_trimmed_non_empty_str(payload, "handle", &["ref"])
+                    .map(ToOwned::to_owned),
+                // value may legitimately be empty (clearing a field), so it is
+                // not trimmed-non-empty filtered.
+                value: payload_str(payload, "value", &[]).map(ToOwned::to_owned),
+                to: payload_trimmed_non_empty_str(payload, "to", &[]).map(ToOwned::to_owned),
+                by: payload.get("by").and_then(serde_json::Value::as_i64),
+                timeout_ms: payload
+                    .get("timeoutMs")
+                    .or_else(|| payload.get("timeout_ms"))
+                    .and_then(serde_json::Value::as_u64),
+                submit: payload_bool(payload, "submit"),
+                kinds: payload
+                    .get("kinds")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    }),
+            };
+            if dry_run {
+                match (&url, &action) {
+                    (Some(url), _) => format!("Would navigate browser {slug} to {url}"),
+                    (None, Some(action)) => format!("Would {action} browser {slug}"),
+                    (None, None) => unreachable!("guarded above"),
+                }
+            } else {
+                match url {
+                    // navigate (idempotent ensure) vs drive an action.
+                    Some(url) => apply_browser_ensure(orch, &resource, Some(url)).await,
+                    None => {
+                        let action = action.expect("guarded: url or action is present");
+                        apply_browser_action(orch, &resource, action, args).await
+                    }
+                }
+                .map_err(|error| build_failure(index, item, error))?
+            }
+        }
+        (
+            CairnResource::NodeBrowser { slug, .. }
+            | CairnResource::TaskBrowser { slug, .. }
+            | CairnResource::ProjectBrowser { slug, .. },
+            ChangeMode::Delete,
+        ) => {
+            if item.payload.is_some() {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "mode=delete does not accept payload",
+                ));
+            }
+            if dry_run {
+                format!("Would close browser {slug}")
+            } else {
+                apply_browser_delete(orch, &resource)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+            }
+        }
         (CairnResource::IssueExecutions { project, number }, ChangeMode::Append) => {
             let recipe = match item.payload.as_ref().and_then(|p| p.get("recipe")) {
                 Some(value) => Some(value.as_str().ok_or_else(|| {
@@ -899,7 +1194,32 @@ pub(crate) async fn dispatch_resource_change(
                             )
                         }
                     }
-                    None => format!("node {node_id} has no active run to stop"),
+                    None => {
+                        // No live run attached. A job can still be non-terminal yet
+                        // runless when it suspended on a foreground question or an
+                        // inline delegated task and its run finalized (the
+                        // OpenRouter owned loop keeps no warm process). Idle it at
+                        // the job level (CAIRN-1907): cancel the open prompt, drop
+                        // the pending successor, cascade-stop children, and recompute
+                        // to a steerable state. A genuinely terminal job has nothing
+                        // to stop.
+                        let job = crate::jobs::queries::get_job(&orch.db.local, &owner_id)
+                            .await
+                            .map_err(|error| build_failure(index, item, error.to_string()))?;
+                        if job.status.is_terminal() {
+                            format!("node {node_id} has no active run to stop")
+                        } else if dry_run {
+                            format!(
+                                "Would stop {node_id}: cancel its pending prompt, drop the pending successor, stop child runs, and idle the job (no live run attached)"
+                            )
+                        } else {
+                            crate::orchestrator::lifecycle::stop_job(orch, &owner_id)
+                                .map_err(|error| build_failure(index, item, error))?;
+                            format!(
+                                "Stopped {node_id}: cancelled pending input, stopped child runs, and idled the job (steerable for a follow-up)"
+                            )
+                        }
+                    }
                 }
             } else {
                 let has_pr = crate::pr_data::actions::try_resolve_mr_context_for_job(
@@ -2386,6 +2706,30 @@ pub(crate) async fn dispatch_resource_change(
         }
     };
 
+    // Browser writes can opt into an inline post-action page read via
+    // `?return_content=true` on the target URI, halving the round-trip for a
+    // "navigate/click then read". Browser-scoped and best-effort: the mutation
+    // already applied, so a render failure rides along as appended text rather
+    // than failing the change.
+    let summary = if !dry_run
+        && wants_return_content(&item.target)
+        && matches!(
+            resource,
+            CairnResource::NodeBrowser { .. }
+                | CairnResource::TaskBrowser { .. }
+                | CairnResource::ProjectBrowser { .. }
+        ) {
+        let page = crate::resources::browsers::render_browser(
+            orch,
+            &resource,
+            crate::browsers::BridgeFormat::Markdown,
+        )
+        .await;
+        format!("{summary}\n\n{page}")
+    } else {
+        summary
+    };
+
     if !dry_run {
         let resource_uri = resource.to_uri();
         if let Err(error) = crate::orchestrator::wakes::route_resource_updated(orch, &resource_uri)
@@ -2403,6 +2747,22 @@ pub(crate) async fn dispatch_resource_change(
         data: applied_data,
         promoted_memory,
     })
+}
+
+/// Whether a browser write target opted into an inline post-action page read
+/// via `?return_content=true` on the target URI. The mutation path parses the
+/// resource without its query string, so the flag is read off the raw target.
+/// `return_content`, `return_content=true`, and `return_content=1` all enable it.
+fn wants_return_content(target: &str) -> bool {
+    target
+        .split_once('?')
+        .map(|(_, query)| {
+            query.split('&').any(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                key == "return_content" && matches!(value, "" | "true" | "1")
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Reject skill mutations that target a package sub-path (only the skill root is mutable).
@@ -2558,6 +2918,58 @@ mod resource_gate_tests {
             "run-1"
         );
         assert_eq!(terminal_slug_from_ref("  dev  "), "dev");
+    }
+
+    #[test]
+    fn return_content_flag_parses_off_the_target_query() {
+        assert!(wants_return_content("cairn:~/browser?return_content=true"));
+        assert!(wants_return_content("cairn:~/browser?return_content=1"));
+        assert!(wants_return_content("cairn:~/browser?return_content"));
+        assert!(wants_return_content(
+            "cairn:~/browser?format=markdown&return_content=true"
+        ));
+        // Absent, false, or a different key does not enable it.
+        assert!(!wants_return_content("cairn:~/browser"));
+        assert!(!wants_return_content(
+            "cairn:~/browser?return_content=false"
+        ));
+        assert!(!wants_return_content("cairn:~/browser?other=true"));
+    }
+
+    #[test]
+    fn parse_wake_filter_reads_terminal_output_on_and_phrase() {
+        let it = item(
+            "cairn://p/CAIRN/1/1/builder/wakes",
+            ChangeMode::Append,
+            None,
+        );
+        let value = serde_json::json!({
+            "kind": "terminal",
+            "ref": "cairn:~/terminal/dev",
+            "on": "output",
+            "phrase": "ready",
+        });
+        let filter = parse_wake_filter(0, &it, &value, "subscribe").unwrap();
+        assert_eq!(filter.kind, "terminal");
+        assert_eq!(filter.reference.as_deref(), Some("cairn:~/terminal/dev"));
+        assert_eq!(filter.on.as_deref(), Some("output"));
+        assert_eq!(filter.phrase.as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn parse_wake_filter_defaults_output_fields_to_none() {
+        let it = item(
+            "cairn://p/CAIRN/1/1/builder/wakes",
+            ChangeMode::Append,
+            None,
+        );
+        let value = serde_json::json!({ "kind": "terminal", "ref": "cairn:~/terminal/dev" });
+        let filter = parse_wake_filter(0, &it, &value, "subscribe").unwrap();
+        assert!(
+            filter.on.is_none(),
+            "on defaults to exit semantics downstream"
+        );
+        assert!(filter.phrase.is_none());
     }
 
     #[test]
@@ -3005,13 +3417,43 @@ mod issue_mutation_tests {
     }
 
     #[tokio::test]
-    async fn node_patch_stop_without_live_run_reports_no_active_run() {
+    async fn node_patch_stop_without_live_run_idles_nonterminal_job() {
+        // A non-terminal job with no live run (suspended/waiting — e.g. an
+        // OpenRouter agent that finalized its run on a foreground question) is
+        // idled at the job level rather than rejected (CAIRN-1907).
         let orch = seeded_orch().await;
         let (number, _job_id, run_id) = seed_running_node(&orch).await;
-        // No live run: mark the only run exited first.
+        // No live run: mark the only run exited first. The job stays 'running'.
         exec_sql(
             &orch,
             format!("UPDATE runs SET status = 'exited' WHERE id = '{run_id}'"),
+        )
+        .await;
+        let item = change_item(
+            &format!("cairn://p/CAIRN/{number}/1/builder"),
+            ChangeMode::Patch,
+            Some(serde_json::json!({"action": "stop"})),
+        );
+        let summary = apply(&orch, &item).await.unwrap();
+        assert!(
+            summary.contains("Stopped") && summary.contains("idled"),
+            "got: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_patch_stop_terminal_job_reports_no_active_run() {
+        // A genuinely terminal job with no live run has nothing to stop.
+        let orch = seeded_orch().await;
+        let (number, job_id, run_id) = seed_running_node(&orch).await;
+        exec_sql(
+            &orch,
+            format!("UPDATE runs SET status = 'exited' WHERE id = '{run_id}'"),
+        )
+        .await;
+        exec_sql(
+            &orch,
+            format!("UPDATE jobs SET status = 'complete' WHERE id = '{job_id}'"),
         )
         .await;
         let item = change_item(
@@ -3390,7 +3832,7 @@ mod issue_mutation_tests {
                     conn.execute(
                         "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
                          VALUES ('exec-x','r',?1,(SELECT project_id FROM issues WHERE id=?1),'running',1,1,?2)",
-                        turso::params![issue_id.as_str(), snapshot_json.as_str()],
+                        (issue_id.as_str(), snapshot_json.as_str()),
                     )
                     .await?;
                     Ok(())
@@ -3413,10 +3855,7 @@ mod issue_mutation_tests {
         let json = orch
             .db
             .local
-            .query_opt_text(
-                "SELECT snapshot FROM executions WHERE id='exec-x'",
-                turso::params![],
-            )
+            .query_opt_text("SELECT snapshot FROM executions WHERE id='exec-x'", ())
             .await
             .unwrap()
             .unwrap();
@@ -3429,6 +3868,7 @@ mod issue_mutation_tests {
         match ty {
             KeyType::Str => serde_json::json!("sample"),
             KeyType::Bool => serde_json::json!(true),
+            KeyType::Int => serde_json::json!(1),
             KeyType::Array => serde_json::json!([]),
             KeyType::Object => serde_json::json!({}),
         }
@@ -3472,6 +3912,9 @@ mod issue_mutation_tests {
             K::ProjectIssues => "cairn://p/CAIRN/issues",
             K::ProjectMessages => "cairn://p/CAIRN/messages",
             K::ProjectTerminal => "cairn://p/CAIRN/terminal/dev",
+            K::ProjectBrowser => "cairn://p/CAIRN/browser/main",
+            K::NodeBrowser => "cairn://p/CAIRN/1/1/builder/browser/main",
+            K::TaskBrowser => "cairn://p/CAIRN/1/1/builder/task/sub/browser/main",
             K::Issue => "cairn://p/CAIRN/1",
             K::IssueExecutions => "cairn://p/CAIRN/1/executions",
             K::IssueExecution => "cairn://p/CAIRN/1/executions/2",

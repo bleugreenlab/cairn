@@ -275,7 +275,6 @@ async fn typed_question_event_carries_inline_questions() {
         issue_id: issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
         fact: AttentionFact::Question {
-            escalate: false,
             detail_uri: "cairn://p/WATCH/1/1/planner/questions/q-1".to_string(),
             content: QuestionContent {
                 questions: vec![Question {
@@ -335,7 +334,6 @@ async fn distinct_facts_for_same_issue_each_pass_through_dedupe() {
         issue_id: issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
         fact: AttentionFact::ArtifactWritten {
-            escalate: false,
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
             content: ArtifactSummary {
                 output_name: "pr".to_string(),
@@ -354,7 +352,6 @@ async fn distinct_facts_for_same_issue_each_pass_through_dedupe() {
         issue_id: issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
         fact: AttentionFact::AgentIdleWithWork {
-            escalate: false,
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
         },
         attention: IssueAttention::NeedsApproval,
@@ -651,7 +648,6 @@ async fn watch_returns_event_fact_in_response_json() {
         issue_id: fixture.issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
         fact: AttentionFact::ArtifactWritten {
-            escalate: false,
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
             content: ArtifactSummary {
                 output_name: "pr".to_string(),
@@ -818,7 +814,6 @@ async fn watch_returns_on_idle_with_work_event_with_none_attention() {
         issue_id: fixture.issue_id.clone(),
         issue_uri: "cairn://p/WATCH/1".to_string(),
         fact: AttentionFact::AgentIdleWithWork {
-            escalate: false,
             detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
         },
         attention: IssueAttention::None,

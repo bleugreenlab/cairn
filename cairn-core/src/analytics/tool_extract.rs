@@ -92,7 +92,10 @@ pub fn extract_run_invocations(events: &[Event]) -> Vec<ToolInvocation> {
 
 /// Strip an MCP prefix (`mcp__cairn__read` -> `read`) and lowercase.
 fn normalize_base(name: &str) -> String {
-    name.rsplit("__").next().unwrap_or(name).to_ascii_lowercase()
+    name.rsplit("__")
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase()
 }
 
 /// Coarse verb for a normalized base tool name.
@@ -117,7 +120,10 @@ fn classify(base: &str, input: &Value) -> (String, String, Option<String>) {
 /// Pull a representative target string from a tool input. The bool marks a raw
 /// shell command (no URI) versus a URI/path target.
 fn extract_target(base: &str, input: &Value) -> Option<(String, bool)> {
-    if matches!(base, "run" | "bash" | "execute" | "killshell" | "kill_shell") {
+    if matches!(
+        base,
+        "run" | "bash" | "execute" | "killshell" | "kill_shell"
+    ) {
         if let Some(arr) = input.get("commands").and_then(Value::as_array) {
             if let Some(first) = arr.first() {
                 if let Some(target) = str_field(first, "target") {
@@ -204,7 +210,11 @@ fn classify_uri(raw: &str) -> (String, String, Option<String>) {
     if target.starts_with("http://") || target.starts_with("https://") {
         return ("http".to_string(), host_of(target), Some(truncate(target)));
     }
-    ("other".to_string(), "other".to_string(), Some(truncate(target)))
+    (
+        "other".to_string(),
+        "other".to_string(),
+        Some(truncate(target)),
+    )
 }
 
 /// File kind = lowercase extension, or `dir` for a directory-looking path.
@@ -250,6 +260,9 @@ fn cairn_kind(path: &str) -> String {
         "create-pr",
         "plan",
         "issues",
+        // `dev` must precede `db` so cairn://dev/db and cairn://dev/pid bucket
+        // as the dev family, not as the host-db `db` kind.
+        "dev",
         "db",
         "bug",
         "help",
@@ -319,6 +332,7 @@ mod tests {
             thinking_tokens: None,
             storage_mode: None,
             content_commit: None,
+            content_change_id: None,
             content_render_sha: None,
             data_blob: None,
             codec: None,
@@ -438,6 +452,9 @@ mod tests {
         assert_eq!(cairn_kind("cairn://p/CAIRN/1821/1/builder/chat"), "chat");
         assert_eq!(cairn_kind("cairn://p/CAIRN/1821/changed"), "changed");
         assert_eq!(cairn_kind("cairn://db"), "db");
+        assert_eq!(cairn_kind("cairn://dev"), "dev");
+        assert_eq!(cairn_kind("cairn://dev/db?sql=SELECT 1"), "dev");
+        assert_eq!(cairn_kind("cairn://dev/pid"), "dev");
         assert_eq!(cairn_kind("cairn:~/memories"), "memories");
         assert_eq!(cairn_kind("cairn://p/CAIRN"), "project");
         assert_eq!(cairn_kind("cairn://p/CAIRN/1821"), "issue");

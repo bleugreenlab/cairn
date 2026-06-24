@@ -254,7 +254,24 @@ pub(crate) fn queue_or_resume_parent(
         crate::messages::delivery::latest_run_for_job(&orch.db.local, parent_job_id)
     {
         let message_id = match persist_system_direct(orch, &recipient_run_id, message, urgency) {
-            Ok(message_id) => Some(message_id),
+            Ok(message_id) => {
+                // Ride the attention push queue (CAIRN-1900): create a `direct:`
+                // push so the nudge below has a drainable push and the raw
+                // messages row is not orphaned by the retired delivered_at path.
+                if let Err(error) = crate::messages::delivery::enqueue_direct_push(
+                    orch,
+                    parent_job_id,
+                    &message_id,
+                    urgency,
+                ) {
+                    log::warn!(
+                        "failed to enqueue child attention direct push for parent job {}: {}",
+                        &parent_job_id[..parent_job_id.len().min(8)],
+                        error
+                    );
+                }
+                Some(message_id)
+            }
             Err(error) => {
                 log::warn!(
                     "failed to persist child attention direct for parent job {}: {}",

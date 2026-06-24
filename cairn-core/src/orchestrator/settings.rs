@@ -58,6 +58,20 @@ impl Orchestrator {
         if let Some(mode) = input.external_replies {
             current.external_replies = mode;
         }
+        if let Some(level) = input.log_level {
+            current.log_level = level;
+        }
+        if let Some(routing) = input.openrouter_routing {
+            current.openrouter_routing = routing;
+        }
+        if let Some(fees) = input.subscription_fees {
+            // Drop non-positive / non-finite entries so a cleared input means
+            // "metered" rather than a 0-fee ratio.
+            current.subscription_fees = fees
+                .into_iter()
+                .filter(|(_, v)| v.is_finite() && *v > 0.0)
+                .collect();
+        }
 
         settings::save_settings(&self.config_dir, &current)?;
 

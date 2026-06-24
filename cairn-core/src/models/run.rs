@@ -143,6 +143,12 @@ pub struct Event {
     pub storage_mode: Option<String>,
     #[serde(skip, default)]
     pub content_commit: Option<String>,
+    /// The stable jj change-id of the commit `content_commit` was forward-mapped
+    /// to at teardown (CAIRN-1964). Durable provenance for the git coordinate;
+    /// never consumed by reconstruction. `None` for plain-git worktrees and for
+    /// non-git-addressed shapes.
+    #[serde(skip, default)]
+    pub content_change_id: Option<String>,
     #[serde(skip, default)]
     pub content_render_sha: Option<String>,
     #[serde(skip, default)]

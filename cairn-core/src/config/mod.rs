@@ -34,20 +34,23 @@
 
 pub mod agents;
 pub mod build_services;
+pub mod dev_commands;
 pub mod keybinds;
 pub mod mcp_import;
 pub mod mcp_servers;
 pub mod mcp_setup;
 pub mod mcp_tools;
+pub mod pdf;
 pub mod presets;
 pub mod project_settings;
+pub mod provider_options;
 pub mod recipes;
 pub mod secrets;
 pub mod settings;
 pub mod skill_fetch;
 pub mod skills;
+pub mod web_fetch;
 pub mod web_search;
-pub mod web_services;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

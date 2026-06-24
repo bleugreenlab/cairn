@@ -10,8 +10,11 @@
 //!
 //! * **Patch body** ([`node_base_tip_diff`]) renders the cumulative `base..tip`
 //!   diff from the in-memory [`ObjectStore`]. For a live worktree the base is the
-//!   recorded `pack_anchor` (fork point) and the tip is the worktree HEAD,
-//!   resolved from the shared repo object database. For a torn-down worktree the
+//!   recorded `pack_anchor` (fork point) and the tip is the worktree's latest
+//!   sealed commit, resolved jj-natively (`@-`) because agent worktrees are
+//!   non-colocated jj workspaces (`.jj`, no `.git`) — a git read of HEAD inside
+//!   one walks up the tree and resolves an unrelated repo. Both commits live in
+//!   the shared repo object database. For a torn-down worktree the
 //!   base/tip and a layered range pack come from `execution_history`. One
 //!   renderer serves both, so the diff matches before, during, and after a PR,
 //!   and for local-only PRs.
@@ -290,7 +293,12 @@ async fn load_execution_history(
 /// when the node owns no worktree, or when neither a live worktree nor an
 /// archived `execution_history` row can supply a base/tip pair — the facet's
 /// presence signal (file_changes) still works in that case.
-pub async fn node_base_tip_diff(db: &LocalDb, job_id: &str) -> Result<Option<NodeDiff>, String> {
+pub async fn node_base_tip_diff(
+    db: &LocalDb,
+    job_id: &str,
+    jj_binary_path: &str,
+    config_dir: &Path,
+) -> Result<Option<NodeDiff>, String> {
     let Some(coords) = load_diff_coords(db, job_id)
         .await
         .map_err(|e| format!("loading node diff coordinates: {e}"))?
@@ -305,15 +313,42 @@ pub async fn node_base_tip_diff(db: &LocalDb, job_id: &str) -> Result<Option<Nod
     let repo = Path::new(&coords.repo_path);
 
     let (store, base_hex, tip_hex) = if worktree_exists {
+        let wt = Path::new(&worktree_path);
+        // Agent worktrees are non-colocated jj workspaces (`.jj`, no `.git`); a
+        // git command run inside one resolves repo state against an unrelated
+        // repo up the directory tree. Resolve both base and tip jj-natively for
+        // those, and keep the git path only for genuine plain-git worktrees.
+        let is_jj = crate::jj::is_jj_dir(wt);
         let base = match coords.base_anchor.clone() {
             Some(base) => base,
+            None if is_jj => {
+                // A jj workspace captures its base anchor jj-natively at job
+                // creation, so a missing anchor here is a degenerate state — and
+                // the git merge-base fallback can't run in a `.jj`-only worktree.
+                log::warn!("node diff: jj workspace {worktree_path} has no recorded base anchor");
+                return Ok(None);
+            }
             None => match merge_base_fallback(&worktree_path, &coords.default_branch) {
                 Some(base) => base,
                 None => return Ok(None),
             },
         };
-        let Some(tip) = git_head(&worktree_path) else {
-            return Ok(None);
+        let tip = if is_jj {
+            // `@-` is the latest sealed commit — the jj analogue of git HEAD.
+            let jj = crate::jj::JjEnv::resolve(jj_binary_path, config_dir);
+            match crate::jj::head_commit(&jj, wt) {
+                Ok(sha) if !sha.trim().is_empty() => sha.trim().to_string(),
+                Ok(_) => return Ok(None),
+                Err(e) => {
+                    log::warn!("node diff: jj head_commit failed for {worktree_path}: {e}");
+                    return Ok(None);
+                }
+            }
+        } else {
+            match git_head(&worktree_path) {
+                Some(sha) => sha,
+                None => return Ok(None),
+            }
         };
         let store =
             ObjectStore::new(repo, None).map_err(|e| format!("building live object store: {e}"))?;
@@ -598,7 +633,7 @@ mod tests {
             // so the live path is taken.
             seed_worktree_group(&db, repo, repo, Some(&base)).await;
 
-            let diff = node_base_tip_diff(&db, "owner")
+            let diff = node_base_tip_diff(&db, "owner", "jj", dir)
                 .await
                 .unwrap()
                 .expect("live diff present");
@@ -614,8 +649,93 @@ mod tests {
             // Worktree path points nowhere on disk and there is no execution
             // history, so the patch body can't resolve.
             seed_worktree_group(&db, "/repo", "/nonexistent/wt", Some("base")).await;
-            let diff = node_base_tip_diff(&db, "owner").await.unwrap();
+            let diff = node_base_tip_diff(&db, "owner", "jj", std::path::Path::new("/tmp"))
+                .await
+                .unwrap();
             assert!(diff.is_none());
+        }
+
+        /// jj availability gate, mirroring the jj module tests: run only when a
+        /// jj binary is resolvable via `CAIRN_JJ_BIN` or PATH `jj`.
+        fn jj_bin() -> Option<String> {
+            let bin = std::env::var("CAIRN_JJ_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "jj".to_string());
+            crate::env::command(&bin)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                .then_some(bin)
+        }
+
+        /// Regression for the git-in-jj-worktree hazard. A live NON-colocated jj
+        /// workspace (`.jj`, no `.git`) must resolve its tip jj-natively (`@-`),
+        /// not with `git rev-parse HEAD` run inside the worktree (which walks up
+        /// to an unrelated repo). The previous code took the git path: in a
+        /// `.jj`-only worktree that yields a foreign or unresolvable sha, so the
+        /// renderer can't find the tip and the commit walk spins to its cap. The
+        /// jj-native resolver renders the real `base..tip`.
+        #[tokio::test]
+        #[serial_test::serial(jj)]
+        async fn node_base_tip_diff_renders_live_jj_workspace() {
+            let Some(bin) = jj_bin() else {
+                eprintln!("skipping node_base_tip_diff_renders_live_jj_workspace: jj not resolvable via CAIRN_JJ_BIN/PATH");
+                return;
+            };
+            let home = tempfile::tempdir().unwrap();
+            let proj = tempfile::tempdir().unwrap();
+            let wts = tempfile::tempdir().unwrap();
+
+            // Project git repo with a base commit — the ObjectStore backing.
+            init_repo(proj.path());
+            write_file(proj.path(), "shared.rs", b"base\n");
+            let base = commit_all(proj.path(), "base");
+
+            // Shared jj store over the project git, then a non-colocated workspace.
+            let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+            let store = home.path().join("jj-stores").join("proj");
+            crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+            let ws = wts.path().join("job");
+            crate::jj::add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None)
+                .unwrap();
+
+            // The invariant that broke the git path: `.jj` present, no `.git`.
+            assert!(ws.join(".jj").is_dir(), "workspace carries .jj");
+            assert!(
+                !ws.join(".git").exists(),
+                "workspace is non-colocated (no .git)"
+            );
+
+            // A fresh workspace's @- is the base; seal a change to advance the tip.
+            assert_eq!(crate::jj::head_commit(&jj, &ws).unwrap(), base);
+            std::fs::write(ws.join("added.rs"), "new\n").unwrap();
+            crate::jj::seal(&jj, &ws, "work", None).unwrap();
+
+            let db = migrated_db().await;
+            // repo_path is the project git (the store backing); the worktree is
+            // the live `.jj`-only workspace; the base anchor is the fork point.
+            seed_worktree_group(
+                &db,
+                proj.path().to_str().unwrap(),
+                ws.to_str().unwrap(),
+                Some(&base),
+            )
+            .await;
+
+            let diff = node_base_tip_diff(&db, "owner", &bin, home.path())
+                .await
+                .unwrap()
+                .expect("live jj diff present");
+            let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                vec!["added.rs"],
+                "the sealed addition is in the diff"
+            );
+            assert_eq!(diff.commits_ahead, 1);
+            assert!(diff.total_additions >= 1);
         }
     }
 }

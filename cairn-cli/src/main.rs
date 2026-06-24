@@ -309,7 +309,7 @@ impl schemars::JsonSchema for ChangeInput {
                 },
                 "commit_msg": {
                     "type": "string",
-                    "description": "Git commit message. REQUIRED when the batch contains any file-target change (the edits are committed so they survive worktree cleanup); omit it for resource-only batches. Use '^' to amend the previous commit. 'NO_COMMIT' is valid only while resolving an in-progress merge or rebase; anywhere else the worktree is restored to HEAD."
+                    "description": "Git commit message. REQUIRED when the batch contains any file-target change (the edits are committed so they survive worktree cleanup); omit it for resource-only batches. Use '^' to amend the previous commit. Without a commit_msg, a batch that dirties the worktree is restored to HEAD."
                 },
                 "preview": {
                     "type": "boolean",
@@ -379,8 +379,8 @@ struct RunInput {
     stop_on_error: Option<bool>,
     /// Commit message for successful worktree-bound batches that dirty the tree.
     /// Stages all changes and commits once after success. Use "^" to amend the
-    /// previous commit; "NO_COMMIT" is valid only while resolving an in-progress
-    /// merge or rebase; anywhere else the worktree is restored to HEAD.
+    /// previous commit. Without a commit_msg, a batch that dirties the worktree
+    /// is restored to HEAD.
     #[serde(
         rename = "commit_msg",
         default,
@@ -1002,7 +1002,7 @@ Targets:
 
 Don't guess a resource's payload: `read` the target URI first — its affordance block lists the exact actions (mode + required/optional payload keys + a copy-paste example) and read filters. If a mutation is unsupported or missing a required key, the rejection enumerates what the resource accepts.
 
-Notes: `atomic` defaults to false: matching items apply, failed items are reported in `failures`, and `commit_msg` commits only files that applied; set `atomic:true` for fail-fast apply behavior. `cairn:~/...` resolves against your running node; `preview:true` returns an `apply_uri` to re-submit with `mode=apply`; `commit_msg` is REQUIRED whenever the batch touches a file target (`\"^\"` amends the previous commit; `\"NO_COMMIT\"` is valid only while resolving an in-progress merge or rebase, anywhere else the worktree is restored to HEAD) — uncommitted worktree edits are lost if the worktree is cleaned up; task/question appends to `cairn:~/tasks` and `cairn:~/questions` block until results return. Change reports list per-item `applied` and `failures`."#
+Notes: `atomic` defaults to false: matching items apply, failed items are reported in `failures`, and `commit_msg` commits only files that applied; set `atomic:true` for fail-fast apply behavior. `cairn:~/...` resolves against your running node; `preview:true` returns an `apply_uri` to re-submit with `mode=apply`; `commit_msg` is REQUIRED whenever the batch touches a file target (`\"^\"` amends the previous commit; without a commit_msg the worktree is restored to HEAD) — uncommitted worktree edits are lost if the worktree is cleaned up; task/question appends to `cairn:~/tasks` and `cairn:~/questions` block until results return. Change reports list per-item `applied` and `failures`."#
     )]
     async fn write(
         &self,
@@ -1139,7 +1139,7 @@ Partial failures never abort: a target that errors shows its message inline as t
     /// synchronously. Parallel by default; `sequential: true` runs in order.
     /// Long-running terminals are managed by `write` on terminal resources.
     #[tool(
-        description = "Execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is a shell `command`, a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`, or a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <command-or-target> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. `NO_COMMIT` is valid only while resolving an in-progress merge or rebase; anywhere else the worktree is restored to HEAD. Not for long-lived/background processes — use a terminal resource via `write` for those. Each item's `timeout` (ms, default 120000, max 600000) is honored by the host: when an item exceeds it, that item is terminated and its result block reports the timeout with whatever output it produced so far — the batch is never aborted with no output. Outer layers (the callback transport and the agent's own tool timeout) are sized strictly above the host budget, so a legal batch always runs to completion: sequential batches get the sum of per-item timeouts, parallel batches the max."
+        description = "Execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is a shell `command`, a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`, or a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <command-or-target> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. Not for long-lived/background processes — use a terminal resource via `write` for those. Each item's `timeout` (ms, default 120000, max 600000) is honored by the host: when an item exceeds it, that item is terminated and its result block reports the timeout with whatever output it produced so far — the batch is never aborted with no output. Outer layers (the callback transport and the agent's own tool timeout) are sized strictly above the host budget, so a legal batch always runs to completion: sequential batches get the sum of per-item timeouts, parallel batches the max."
     )]
     async fn run(&self, params: Parameters<RunInput>) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
@@ -1280,7 +1280,7 @@ impl ServerHandler for CairnMcp {
              - read: Read file contents, directory listings, canonical cairn://p/... resources, and read-query projections such as `src?glob=**/*.rs`, `src?grep=foo&glob=*.ts`, or `cairn://p/CAIRN?search=uri&limit=5`\n\\
 
              - write: Apply ordered file and cairn:// resource mutations — files, terminals, delegated tasks (append to a node's tasks collection), user questions (append to a node's questions collection), and output artifacts (write/patch your node's artifact via cairn:~/<name>)\n\
-             - run: Execute an ordered batch of synchronous shell commands and skill-script targets (parallel by default; `sequential` for ordered). If a successful worktree-bound run dirties the tree, pass `commit_msg` to commit it (`^` amends). `NO_COMMIT` is valid only while resolving an in-progress merge or rebase; anywhere else the worktree is restored to HEAD.\n\n\
+             - run: Execute an ordered batch of synchronous shell commands and skill-script targets (parallel by default; `sequential` for ordered). If a successful worktree-bound run dirties the tree, pass `commit_msg` to commit it (`^` amends). Without a commit_msg, a run that dirties the worktree is restored to HEAD.\n\n\
              Output artifact: when your node declares an output schema, write your result with `write` to `cairn:~/<name>` (mode create, then mode patch to revise). The payload is validated against the schema server-side. Do this as the last action of your turn; the write pauses the run for user review, and the session resumes on their reply."
             .to_string();
 
@@ -1452,10 +1452,13 @@ async fn main() -> Result<()> {
         args.command,
         Some(Command::Read { .. }) | Some(Command::Write { .. }) | Some(Command::Watch { .. })
     );
+    // `None` level: the spawning app injects `CAIRN_LOG_LEVEL`, which the filter
+    // resolution picks up; a directly-launched cairn-cli falls back to Standard.
     let _log_guard = cairn_common::logging::init(cairn_common::logging::LogConfig {
         process: cairn_common::logging::ProcessTag::Mcp,
         log_dir: None,
         stderr: !is_cli,
+        level: None,
     })
     .expect("Failed to initialize logging");
 

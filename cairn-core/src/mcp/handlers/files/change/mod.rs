@@ -176,6 +176,27 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         payload.changes.len()
     );
 
+    // Changes can only happen in a worktree. A non-jj cwd is the project's live
+    // checkout behind a long-lived manager / triage / read-only agent (project
+    // chat included); reject any file-target edit BEFORE applying it so the
+    // user's checkout is never written to and never reverted. Resource-only
+    // writes (issues, messages, todos, tasks) are unaffected.
+    if !crate::jj::is_jj_dir(std::path::Path::new(&request.cwd)) {
+        if let Some((index, item)) = payload
+            .changes
+            .iter()
+            .enumerate()
+            .find(|(_, item)| matches!(target_family(&item.target), Ok(TargetFamily::File)))
+        {
+            let IndexedFailure { failure, .. } = *build_failure(
+                index,
+                item,
+                file_mutations::NON_WORKTREE_CHANGE_ERROR.to_string(),
+            );
+            return change_report_json(Vec::new(), vec![failure], None, false);
+        }
+    }
+
     // Worktree fence (writes). Detect any out-of-worktree file target up front
     // and gate it BEFORE applying anything, so a suspend leaves no partial side
     // effects and the slow-path resume can safely re-drive the whole batch.
@@ -446,7 +467,12 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         // Rename is its own branch: its target is a file URI (so the contiguous
         // File slice below would otherwise swallow it), but the edit set is
         // computed out of band by the structural engine, not the textual file path.
-        if item.mode == ChangeMode::Rename {
+        // A `cairn://` resource target with mode=rename is not a structural rename;
+        // let it fall through to the resource dispatch, which rejects it through the
+        // contract gate as an unsupported mutation rather than a rename-payload error.
+        if item.mode == ChangeMode::Rename
+            && matches!(target_family(&item.target), Ok(TargetFamily::File))
+        {
             let worktree = std::path::Path::new(&request.cwd);
             let rename_result = match file_mutations::parse_rename_spec(worktree, item) {
                 Ok((route_file, spec, new_name)) => {
@@ -1259,13 +1285,19 @@ mod change_preview_tests {
         use super::preview::input_is_preview_shaped;
         use serde_json::json;
         // An explicit `preview` boolean wins in either direction.
-        assert!(input_is_preview_shaped(&json!({"preview": true, "changes": []})));
+        assert!(input_is_preview_shaped(
+            &json!({"preview": true, "changes": []})
+        ));
         assert!(!input_is_preview_shaped(
             &json!({"preview": false, "changes": [{"mode": "rename"}]})
         ));
         // Absent `preview`: only a rename item makes the call preview-shaped.
-        assert!(input_is_preview_shaped(&json!({"changes": [{"mode": "rename"}]})));
-        assert!(!input_is_preview_shaped(&json!({"changes": [{"mode": "patch"}]})));
+        assert!(input_is_preview_shaped(
+            &json!({"changes": [{"mode": "rename"}]})
+        ));
+        assert!(!input_is_preview_shaped(
+            &json!({"changes": [{"mode": "patch"}]})
+        ));
         assert!(!input_is_preview_shaped(&json!({"changes": []})));
     }
 

@@ -1,14 +1,21 @@
 //! Integration tests for the command-checkpoint <-> agent auto-fix loop.
 //!
 //! Drives a real execution DAG (agent -> checkpoint(command) -> agent) through
-//! `advance_execution_with_actions` against a real temp git worktree, so the
-//! checkpoint command actually runs and the worktree HEAD SHA gate is exercised
-//! end to end: fail -> Blocked + recorded run, fix+commit -> re-arm -> re-run ->
-//! pass -> downstream advances; plus the no-progress and hard-cap termination
-//! paths and the manual Re-run entry.
+//! `advance_execution_with_actions` against a real temp jj agent workspace, so
+//! the checkpoint command actually runs and the worktree HEAD SHA gate is
+//! exercised end to end: fail -> Blocked + recorded run, fix+seal -> re-arm ->
+//! re-run -> pass -> downstream advances; plus the no-progress and hard-cap
+//! termination paths and the manual Re-run entry.
+//!
+//! The worktree is a NON-colocated `.jj` workspace (the production shape), not a
+//! git worktree: CAIRN-1970 ported the checkpoint cache's head/dirty reads off
+//! git porcelain to `jj log -r @-` / `jj diff`, so a git-only worktree never
+//! advances the head the re-arm gate reads. A real agent's "fix and commit" is
+//! modeled by writing the file and sealing (`jj::seal`), which advances `@-`.
 
 mod common;
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -16,6 +23,7 @@ use cairn_core::internal::db::DbState;
 use cairn_core::internal::execution::advancement::{
     advance_execution_with_actions, rerun_checkpoint_job,
 };
+use cairn_core::internal::jj::{self, JjEnv};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
@@ -32,23 +40,26 @@ struct Ctx {
     orch: Orchestrator,
     db: Arc<LocalDb>,
     project_id: String,
+    config_dir: PathBuf,
     _db_temp: TempDir,
     _temp: TempDir,
 }
 
 async fn ctx() -> Ctx {
     let temp = tempdir().unwrap();
+    let config_dir = temp.path().join("config");
     let (db_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
     let project_id = common::create_project(&db, "CKL").await;
     let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db.clone(), search_index));
     let services = Arc::new(TestServicesBuilder::new().build());
-    let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    let orch = Orchestrator::builder(db_state, services, config_dir.clone()).build();
     Ctx {
         orch,
         db,
         project_id,
+        config_dir,
         _db_temp: db_temp,
         _temp: temp,
     }
@@ -56,20 +67,28 @@ async fn ctx() -> Ctx {
 
 struct CheckpointLoop {
     c: Ctx,
-    _worktree: TempDir,
+    worktree: Worktree,
     path: String,
     sha: String,
 }
 
-async fn checkpoint_loop(command: &str) -> CheckpointLoop {
+impl CheckpointLoop {
+    /// Write a file and seal it, advancing the workspace `@-` exactly as a real
+    /// agent's fix-and-commit does. Returns the new head commit id.
+    fn commit_file(&self, name: &str) -> String {
+        self.worktree.commit_file(name)
+    }
+}
+
+async fn checkpoint_loop(command: &str) -> Option<CheckpointLoop> {
     checkpoint_loop_with_status(command, "pending", true).await
 }
 
-async fn blocked_checkpoint_loop(command: &str) -> CheckpointLoop {
+async fn blocked_checkpoint_loop(command: &str) -> Option<CheckpointLoop> {
     checkpoint_loop_with_status(command, "blocked", true).await
 }
 
-async fn blocked_checkpoint_without_downstream(command: &str) -> CheckpointLoop {
+async fn blocked_checkpoint_without_downstream(command: &str) -> Option<CheckpointLoop> {
     checkpoint_loop_with_status(command, "blocked", false).await
 }
 
@@ -77,9 +96,11 @@ async fn checkpoint_loop_with_status(
     command: &str,
     checkpoint_status: &str,
     include_downstream: bool,
-) -> CheckpointLoop {
+) -> Option<CheckpointLoop> {
     let c = ctx().await;
-    let (worktree, path, sha) = git_worktree();
+    let worktree = Worktree::try_new(&c.config_dir)?;
+    let path = worktree.path();
+    let sha = worktree.head();
     insert_execution(&c.db, EXEC_ID, &snapshot(command)).await;
     insert_job(
         &c.db,
@@ -125,12 +146,12 @@ async fn checkpoint_loop_with_status(
         .await;
     }
 
-    CheckpointLoop {
+    Some(CheckpointLoop {
         c,
-        _worktree: worktree,
+        worktree,
         path,
         sha,
-    }
+    })
 }
 
 async fn advance_execution(h: &CheckpointLoop) {
@@ -152,58 +173,125 @@ async fn assert_latest_checkpoint_passed(h: &CheckpointLoop, passed: bool) {
     assert_eq!(latest_passed(&h.c.db, CHECKPOINT_JOB).await, Some(passed));
 }
 
-/// Create a git worktree with an initial commit. Returns (TempDir, path, sha).
-fn git_worktree() -> (TempDir, String, String) {
-    let dir = tempdir().unwrap();
-    let path = dir.path().to_string_lossy().to_string();
+// ── jj worktree harness ──────────────────────────────────────────────────────
+//
+// A real agent worktree is a NON-colocated `.jj` workspace over a shared store
+// (no `.git` in the workspace dir). The re-arm SHA gate reads the head via
+// `jj log -r @-`, so the harness must advance that head by sealing — a git-only
+// worktree (the pre-CAIRN-1970 harness) never moves it and the checkpoint stays
+// blocked. A colocated `jj git init --colocate` repo would carry a `.git` and
+// mask exactly this git-vs-jj mismatch, so `try_new` asserts there is none.
+
+/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
+fn jj_bin() -> Option<String> {
+    let bin = std::env::var("CAIRN_JJ_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "jj".to_string());
+    Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        .then_some(bin)
+}
+
+/// Initialize a throwaway project git repo with one commit, the store's base.
+fn init_git_repo(repo: &Path) {
     let git = |args: &[&str]| {
         let out = Command::new("git")
             .args(args)
-            .current_dir(&path)
+            .current_dir(repo)
             .output()
-            .unwrap_or_else(|e| panic!("git {:?} failed to spawn: {e}", args));
+            .unwrap_or_else(|e| panic!("git {args:?} failed to spawn: {e}"));
         assert!(
             out.status.success(),
-            "git {:?} failed: {}",
-            args,
+            "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    git(&["init", "-q"]);
+    git(&["init", "-q", "-b", "main"]);
     git(&["config", "user.email", "t@t.test"]);
     git(&["config", "user.name", "Test"]);
-    std::fs::write(format!("{path}/seed.txt"), "seed").unwrap();
+    std::fs::write(repo.join("seed.txt"), "seed").unwrap();
     git(&["add", "."]);
     git(&["commit", "-q", "-m", "init"]);
-    let sha = head_sha(&path);
-    (dir, path, sha)
 }
 
-fn commit_file(path: &str, name: &str) -> String {
-    std::fs::write(format!("{path}/{name}"), "x").unwrap();
-    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "fix"]] {
-        let out = Command::new("git")
-            .args(&args)
-            .current_dir(path)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {:?}: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    head_sha(path)
-}
-
-fn head_sha(path: &str) -> String {
+fn git_head_sha(repo: &Path) -> String {
     let out = Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(path)
+        .current_dir(repo)
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A non-colocated jj agent workspace over a shared store, mirroring production
+/// worktree provisioning. The head advances only via [`Worktree::commit_file`]
+/// (a real agent seal), the same `jj log -r @-` the production gate reads.
+struct Worktree {
+    _project: TempDir,
+    dir: TempDir,
+    config_dir: PathBuf,
+}
+
+impl Worktree {
+    /// Provision the workspace, or `None` to self-skip when jj is unavailable.
+    /// `config_dir` MUST be the orchestrator's config dir so the checkpoint
+    /// gate's `JjEnv` resolves the same store.
+    fn try_new(config_dir: &Path) -> Option<Self> {
+        jj_bin()?;
+        let project = tempdir().unwrap();
+        init_git_repo(project.path());
+        let dir = tempdir().unwrap();
+        let jj = JjEnv::resolve("jj", config_dir);
+        let store = jj::project_store_dir(config_dir, project.path());
+        jj::ensure_project_store(&jj, &store, project.path()).unwrap();
+        let base = git_head_sha(project.path());
+        jj::add_workspace(
+            &jj,
+            &store,
+            dir.path(),
+            "agent/CKL-1-builder-0",
+            &base,
+            None,
+        )
+        .unwrap();
+        // Non-colocated: a `.git` here would mask the git-vs-jj head mismatch
+        // this harness exists to exercise.
+        assert!(
+            !dir.path().join(".git").exists(),
+            "jj workspace must be non-colocated (no .git)"
+        );
+        Some(Self {
+            _project: project,
+            dir,
+            config_dir: config_dir.to_path_buf(),
+        })
+    }
+
+    fn jj(&self) -> JjEnv {
+        JjEnv::resolve("jj", &self.config_dir)
+    }
+
+    fn path(&self) -> String {
+        self.dir.path().to_string_lossy().to_string()
+    }
+
+    /// The workspace head (`jj log -r @-`), the representation the production
+    /// checkpoint gate reads.
+    fn head(&self) -> String {
+        jj::head_commit(&self.jj(), self.dir.path()).unwrap()
+    }
+
+    /// Write a file and seal it, advancing `@-` to a new commit exactly as a
+    /// real agent seal does. Returns the new head commit id.
+    fn commit_file(&self, name: &str) -> String {
+        std::fs::write(self.dir.path().join(name), "x").unwrap();
+        jj::seal(&self.jj(), self.dir.path(), "fix", None).unwrap();
+        self.head()
+    }
 }
 
 /// agent(builder) --control--> checkpoint(ci, command) --control--> agent(done)
@@ -442,7 +530,10 @@ async fn insert_failed_run(db: &LocalDb, job_id: &str, attempt: i64, sha: &str) 
 /// checkpoint integration coverage.)
 #[tokio::test]
 async fn pass_first_completes_and_downstream_advances() {
-    let h = checkpoint_loop("exit 0").await;
+    let Some(h) = checkpoint_loop("exit 0").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
     advance_execution(&h).await;
     assert_checkpoint(&h, "complete", 1).await;
@@ -457,7 +548,10 @@ async fn pass_first_completes_and_downstream_advances() {
 /// sessionless upstream there is nothing to wake, so it stays Blocked.
 #[tokio::test]
 async fn fail_blocks_and_records_run() {
-    let h = checkpoint_loop("test -f fixed.txt").await;
+    let Some(h) = checkpoint_loop("test -f fixed.txt").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
     advance_execution(&h).await;
     assert_checkpoint(&h, "blocked", 1).await;
@@ -469,14 +563,17 @@ async fn fail_blocks_and_records_run() {
 /// the new worktree -> pass -> Complete -> downstream advances.
 #[tokio::test]
 async fn fix_commit_rearms_reruns_and_passes() {
-    let h = checkpoint_loop("test -f fixed.txt").await;
+    let Some(h) = checkpoint_loop("test -f fixed.txt").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
     // 1. First run fails -> Blocked.
     advance_execution(&h).await;
     assert_checkpoint(&h, "blocked", 1).await;
 
-    // 2. Agent "fixes" and commits -> new HEAD.
-    commit_file(&h.path, "fixed.txt");
+    // 2. Agent "fixes" and seals -> new HEAD.
+    h.commit_file("fixed.txt");
 
     // 3. Advance: re-arm re-pends the checkpoint, it re-runs and passes.
     advance_execution(&h).await;
@@ -492,7 +589,10 @@ async fn fix_commit_rearms_reruns_and_passes() {
 /// unchanged), so the re-arm pass is a no-op and the checkpoint stays Blocked.
 #[tokio::test]
 async fn no_new_commit_does_not_rerun() {
-    let h = checkpoint_loop("test -f fixed.txt").await;
+    let Some(h) = checkpoint_loop("test -f fixed.txt").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
     advance_execution(&h).await;
     assert_checkpoint(&h, "blocked", 1).await;
@@ -506,7 +606,10 @@ async fn no_new_commit_does_not_rerun() {
 /// checkpoint — it stays Blocked for manual resolution.
 #[tokio::test]
 async fn attempt_cap_stops_rearm() {
-    let h = blocked_checkpoint_without_downstream("test -f fixed.txt").await;
+    let Some(h) = blocked_checkpoint_without_downstream("test -f fixed.txt").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
     // Pre-seed CHECKPOINT_MAX_ATTEMPTS (5) failed runs at the original SHA.
     for attempt in 1..=5 {
@@ -514,7 +617,7 @@ async fn attempt_cap_stops_rearm() {
     }
 
     // A new commit would normally re-arm, but the cap is exhausted.
-    commit_file(&h.path, "fixed.txt");
+    h.commit_file("fixed.txt");
     advance_execution(&h).await;
     assert_job_status(&h, CHECKPOINT_JOB, "blocked").await;
     assert_eq!(
@@ -528,7 +631,10 @@ async fn attempt_cap_stops_rearm() {
 /// (with the fix present) passes -> Complete.
 #[tokio::test]
 async fn manual_rerun_resets_and_passes() {
-    let h = blocked_checkpoint_loop("test -f fixed.txt").await;
+    let Some(h) = blocked_checkpoint_loop("test -f fixed.txt").await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
 
     // A prior failed run exists at the original SHA.
     insert_failed_run(&h.c.db, CHECKPOINT_JOB, 1, &h.sha).await;
@@ -549,7 +655,11 @@ async fn manual_rerun_resets_and_passes() {
 #[tokio::test]
 async fn rerun_rejects_non_checkpoint() {
     let c = ctx().await;
-    let (_wt, path, _sha) = git_worktree();
+    let Some(wt) = Worktree::try_new(&c.config_dir) else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let path = wt.path();
     insert_execution(&c.db, EXEC_ID, &snapshot("exit 0")).await;
     // An agent job with a session is not a command checkpoint.
     insert_job(

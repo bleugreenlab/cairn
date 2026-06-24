@@ -67,6 +67,7 @@ pub enum ResourceKind {
     ProjectIssues,
     ProjectMessages,
     ProjectTerminal,
+    ProjectBrowser,
     Issue,
     Changed,
     IssueExecutions,
@@ -82,8 +83,10 @@ pub enum ResourceKind {
     NodeArtifact,
     NodeChanged,
     NodeTerminal,
+    NodeBrowser,
     NodeMessages,
     TaskTerminal,
+    TaskBrowser,
     Task,
     TaskChat,
     TaskChatRaw,
@@ -99,6 +102,9 @@ pub enum ResourceKind {
     NodePermissions,
     NodePermission,
     Db,
+    Dev,
+    DevDb,
+    DevPid,
     Logs,
     Bug,
     Skills,
@@ -138,6 +144,7 @@ impl ResourceKind {
         ResourceKind::ProjectIssues,
         ResourceKind::ProjectMessages,
         ResourceKind::ProjectTerminal,
+        ResourceKind::ProjectBrowser,
         ResourceKind::Issue,
         ResourceKind::Changed,
         ResourceKind::IssueExecutions,
@@ -153,8 +160,10 @@ impl ResourceKind {
         ResourceKind::NodeArtifact,
         ResourceKind::NodeChanged,
         ResourceKind::NodeTerminal,
+        ResourceKind::NodeBrowser,
         ResourceKind::NodeMessages,
         ResourceKind::TaskTerminal,
+        ResourceKind::TaskBrowser,
         ResourceKind::Task,
         ResourceKind::TaskChat,
         ResourceKind::TaskChatRaw,
@@ -170,6 +179,9 @@ impl ResourceKind {
         ResourceKind::NodePermissions,
         ResourceKind::NodePermission,
         ResourceKind::Db,
+        ResourceKind::Dev,
+        ResourceKind::DevDb,
+        ResourceKind::DevPid,
         ResourceKind::Logs,
         ResourceKind::Bug,
         ResourceKind::Skills,
@@ -208,6 +220,7 @@ impl ResourceKind {
 pub enum KeyType {
     Str,
     Bool,
+    Int,
     Array,
     Object,
 }
@@ -217,6 +230,7 @@ impl KeyType {
         match self {
             KeyType::Str => "str",
             KeyType::Bool => "bool",
+            KeyType::Int => "int",
             KeyType::Array => "array",
             KeyType::Object => "object",
         }
@@ -424,6 +438,69 @@ const FIELD: KeySpec = KeySpec::new(
     "top-level string artifact field to edit; defaults to content then body",
 );
 const COMMAND: KeySpec = KeySpec::new("command", KeyType::Str, "");
+const BROWSER_URL: KeySpec = KeySpec::with_aliases(
+    "url",
+    &["navigate"],
+    KeyType::Str,
+    "navigate the browser to this URL",
+);
+/// The full browser patch action vocabulary. Advertised verbatim in
+/// [`BROWSER_ACTION`] and pinned against the set `apply_browser_action` actually
+/// handles by a cairn-core test, so the structured affordance can't silently
+/// under-advertise an action the dispatch really accepts.
+pub const BROWSER_ACTIONS: &[&str] = &[
+    "back",
+    "forward",
+    "reload",
+    "click",
+    "type",
+    "scroll",
+    "waitFor",
+    "waitForNavigation",
+    "waitForLoad",
+    "clearData",
+];
+const BROWSER_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "back|forward|reload (history); click (needs selector|text|handle); type (needs value + selector|text|handle); scroll (needs selector|text|handle|to|by); waitFor (needs selector); waitForNavigation|waitForLoad (await the next navigation/page-load, optional timeoutMs); clearData (clears website data — default cookies+cache, or kinds). Interaction args below.",
+);
+const BROWSER_SELECTOR: KeySpec = KeySpec::new(
+    "selector",
+    KeyType::Str,
+    "CSS selector target for click/type/scroll/waitFor",
+);
+const BROWSER_TEXT: KeySpec = KeySpec::new(
+    "text",
+    KeyType::Str,
+    "visible-text target (alternative to selector) for click/type/scroll",
+);
+const BROWSER_VALUE: KeySpec = KeySpec::new(
+    "value",
+    KeyType::Str,
+    "text to type; required by type (may be empty to clear the field)",
+);
+const BROWSER_SUBMIT: KeySpec =
+    KeySpec::new("submit", KeyType::Bool, "press Enter after typing (type)");
+const BROWSER_TO: KeySpec = KeySpec::new("to", KeyType::Str, "scroll target top|bottom (scroll)");
+const BROWSER_BY: KeySpec = KeySpec::new("by", KeyType::Int, "scroll delta in pixels (scroll)");
+const BROWSER_TIMEOUT_MS: KeySpec = KeySpec::with_aliases(
+    "timeoutMs",
+    &["timeout_ms"],
+    KeyType::Int,
+    "poll/await budget in ms (waitFor, waitForNavigation, waitForLoad)",
+);
+const BROWSER_HANDLE: KeySpec = KeySpec::with_aliases(
+    "handle",
+    &["ref"],
+    KeyType::Str,
+    "element handle (ref e1..eN) from the last ?interactive read; a click/type/scroll locator resolved via the durable element anchor",
+);
+const BROWSER_KINDS: KeySpec = KeySpec::new(
+    "kinds",
+    KeyType::Array,
+    "data buckets for clearData: cookies|cache|storage (default cookies+cache); clears the live webview's persistent website data",
+);
 const DESCRIPTION: KeySpec = KeySpec::new("description", KeyType::Str, "");
 const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 const EXECUTION: KeySpec = KeySpec::new(
@@ -635,6 +712,43 @@ const MCP_SCOPE: KeySpec = KeySpec::new(
 // Empty mutation set, named for readability.
 const NO_MUTATIONS: &[MutationSpec] = &[];
 const NO_PROJECTIONS: &[ProjectionSpec] = &[];
+
+/// Browser reads accept a content format, a native screenshot, the page's
+/// captured runtime buffers (console/network), or its actionable elements
+/// (interactive). The screenshot/console/network/interactive facets are
+/// mutually exclusive; the screenshot is a host-native capture returned as an
+/// image block (works even on about:blank). Content reads page like any
+/// resource via ?offset/?limit.
+const BROWSER_READ_PROJECTIONS: &[ProjectionSpec] = &[
+    ProjectionSpec {
+        key: "format",
+        values: "markdown (default) | text — live page content",
+    },
+    ProjectionSpec {
+        key: "screenshot",
+        values: "(no value) — a PNG screenshot of the rendered page, returned as an image",
+    },
+    ProjectionSpec {
+        key: "console",
+        values: "(no value) — the page's captured console output + uncaught errors; optional &limit=N",
+    },
+    ProjectionSpec {
+        key: "network",
+        values: "(no value) — the page's captured fetch/XHR request summaries; optional &limit=N",
+    },
+    ProjectionSpec {
+        key: "interactive",
+        values: "(no value) — actionable elements as durable handles (e1..eN) with descriptor + selector, for click/type/scroll by handle; optional &limit=N",
+    },
+    ProjectionSpec {
+        key: "offset",
+        values: "N — line window into a long content read (follows the continue: footer)",
+    },
+    ProjectionSpec {
+        key: "limit",
+        values: "N — line-window size for content (a buffer/element cap for ?console/?network/?interactive)",
+    },
+];
 const NO_RELATED: &[RelatedSpec] = &[];
 const NO_CROSS_ACTIONS: &[CrossActionSpec] = &[];
 // Shared read-query projections for the symbol resources (node- and project-scoped).
@@ -836,6 +950,43 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
             ProjectionSpec { key: "sql", values: "read-only SELECT/WITH or schema PRAGMA" },
             ProjectionSpec { key: "offset", values: "N rows to skip (default 0)" },
             ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },
+        ],
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NO_MUTATIONS,
+    },
+    ResourceContract {
+        kind: ResourceKind::Dev,
+        uri_template: "cairn://dev",
+        name: "Dev instance introspection",
+        description: "Process-introspection tools for a running `bun run dev:instance` (the per-branch dev build you launched). read cairn://dev lists running instances and the available sub-tools: cairn://dev/db (read-only SQL against the instance's database) and cairn://dev/pid (the instance's OS process id, e.g. to target it with Axon accessibility).",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NO_MUTATIONS,
+    },
+    ResourceContract {
+        kind: ResourceKind::DevDb,
+        uri_template: "cairn://dev/db",
+        name: "Dev instance database SQL projection",
+        description: "Read-only SQL against a running `bun run dev:instance` database (the per-branch dev build you launched), not the host app's own DB. The instance holds a process lock on its database file, so this queries the instance's own MCP callback server, which means the instance must be running. Same statement policy as cairn://db (SELECT, read-only WITH, schema PRAGMAs) with offset/limit row windows. read cairn://dev/db with no ?sql lists registered instances and their running state; ?at=<branch-or-key> selects one (optional when exactly one is registered, or exactly one is running).",
+        read_projections: &[
+            ProjectionSpec { key: "sql", values: "read-only SELECT/WITH or schema PRAGMA; omit to list dev instances" },
+            ProjectionSpec { key: "at", values: "branch name or slug key of the dev instance to query" },
+            ProjectionSpec { key: "offset", values: "N rows to skip (default 0)" },
+            ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },
+        ],
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NO_MUTATIONS,
+    },
+    ResourceContract {
+        kind: ResourceKind::DevPid,
+        uri_template: "cairn://dev/pid",
+        name: "Dev instance process id",
+        description: "The OS process id(s) of running `bun run dev:instance`(s). Each instance reports its own std::process::id() over its MCP callback server (authoritative, no lsof), so a caller can target the process with external tools such as Axon accessibility without shelling out. read cairn://dev/pid lists every running instance's pid; ?at=<branch-or-key> selects one.",
+        read_projections: &[
+            ProjectionSpec { key: "at", values: "branch name or slug key of the dev instance to target" },
         ],
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -1130,6 +1281,57 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
                 optional: &[],
                 label: "stop terminal",
                 example: "write({changes:[{target:\"cairn://p/PROJECT/terminal/SLUG\",mode:\"delete\"}]})",
+            },
+        ],
+    },
+    ResourceContract {
+        kind: ResourceKind::ProjectBrowser,
+        uri_template: "cairn://p/{project}/browser/{slug}",
+        name: "Project browser",
+        description: "Project-scoped shared browser pane (native webview). replace = go to a URL (sets the page; url required). create = open/ensure the pane (url optional). patch = drive it: navigate (url/navigate) or history/interaction (action: back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad; click/type/scroll take a selector, visible text, or a ?interactive handle). delete = close it. create/replace/patch are an idempotent ensure — they reuse the open pane (reopening it if closed) and never error on an existing slug. Read returns the live url/title/status plus current page content (paged via ?offset/?limit); ?screenshot for a native PNG, ?console/?network for captured runtime buffers, ?interactive for actionable elements as durable handles (e1..eN). Add ?return_content=true to a write to get the post-action page inline. The pane self-heals across an app restart.",
+        read_projections: BROWSER_READ_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Create,
+                required: &[],
+                optional: &[BROWSER_URL],
+                label: "open/ensure browser",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/browser\",mode:\"create\",payload:{url:\"https://example.com\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Replace,
+                required: &[BROWSER_URL],
+                optional: &[],
+                label: "go to a URL (set the page)",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/browser\",mode:\"replace\",payload:{url:\"https://example.com\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[],
+                optional: &[
+                    BROWSER_URL,
+                    BROWSER_ACTION,
+                    BROWSER_SELECTOR,
+                    BROWSER_TEXT,
+                    BROWSER_HANDLE,
+                    BROWSER_VALUE,
+                    BROWSER_SUBMIT,
+                    BROWSER_TO,
+                    BROWSER_BY,
+                    BROWSER_TIMEOUT_MS,
+                    BROWSER_KINDS,
+                ],
+                label: "navigate / drive browser",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/browser\",mode:\"patch\",payload:{action:\"click\",text:\"Sign in\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Delete,
+                required: &[],
+                optional: &[],
+                label: "close browser",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/browser\",mode:\"delete\"}]})",
             },
         ],
     },
@@ -1519,6 +1721,57 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         ],
     },
     ResourceContract {
+        kind: ResourceKind::NodeBrowser,
+        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/browser/{slug}",
+        name: "Node browser",
+        description: "Execution node shared browser pane (native webview). cairn:~/browser is the default shared session (slug optional; add /SLUG for additional browsers). replace = go to a URL (sets the page; url required). create = open/ensure the pane (url optional). patch = drive it: navigate (url/navigate) or history/interaction (action: back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad; click/type/scroll take a selector, visible text, or a ?interactive handle). delete = close it. create/replace/patch are an idempotent ensure — they reuse the open pane (reopening it if closed) and never error on an existing slug. Read returns the live url/title/status plus current page content (paged via ?offset/?limit); ?screenshot for a native PNG, ?console/?network for captured runtime buffers, ?interactive for actionable elements as durable handles (e1..eN). Add ?return_content=true to a write to get the post-action page inline. The user sees and can drive the same session, which self-heals across an app restart.",
+        read_projections: BROWSER_READ_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Create,
+                required: &[],
+                optional: &[BROWSER_URL],
+                label: "open/ensure browser",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"create\",payload:{url:\"https://example.com\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Replace,
+                required: &[BROWSER_URL],
+                optional: &[],
+                label: "go to a URL (set the page)",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"replace\",payload:{url:\"https://example.com\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[],
+                optional: &[
+                    BROWSER_URL,
+                    BROWSER_ACTION,
+                    BROWSER_SELECTOR,
+                    BROWSER_TEXT,
+                    BROWSER_HANDLE,
+                    BROWSER_VALUE,
+                    BROWSER_SUBMIT,
+                    BROWSER_TO,
+                    BROWSER_BY,
+                    BROWSER_TIMEOUT_MS,
+                    BROWSER_KINDS,
+                ],
+                label: "navigate / drive browser",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"patch\",payload:{action:\"click\",text:\"Sign in\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Delete,
+                required: &[],
+                optional: &[],
+                label: "close browser",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"delete\"}]})",
+            },
+        ],
+    },
+    ResourceContract {
         kind: ResourceKind::TaskTerminal,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/terminal/{slug}",
         name: "Task terminal",
@@ -1547,6 +1800,57 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
                 optional: &[],
                 label: "stop terminal",
                 example: "write({changes:[{target:\"cairn:~/terminal/SLUG\",mode:\"delete\"}]})",
+            },
+        ],
+    },
+    ResourceContract {
+        kind: ResourceKind::TaskBrowser,
+        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/browser/{slug}",
+        name: "Task browser",
+        description: "Sub-agent task shared browser pane (native webview) scoped to the task job. replace = go to a URL (sets the page; url required). create = open/ensure the pane (url optional). patch = drive it: navigate (url/navigate) or history/interaction (action: back|forward|reload|click|type|scroll|waitFor|waitForNavigation|waitForLoad; click/type/scroll take a selector, visible text, or a ?interactive handle). delete = close it. create/replace/patch are an idempotent ensure — they reuse the open pane (reopening it if closed) and never error on an existing slug. Read returns the live url/title/status plus current page content (paged via ?offset/?limit); ?screenshot for a native PNG, ?console/?network for captured runtime buffers, ?interactive for actionable elements as durable handles (e1..eN). Add ?return_content=true to a write to get the post-action page inline. Self-heals across an app restart.",
+        read_projections: BROWSER_READ_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Create,
+                required: &[],
+                optional: &[BROWSER_URL],
+                label: "open/ensure browser",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"create\",payload:{url:\"https://example.com\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Replace,
+                required: &[BROWSER_URL],
+                optional: &[],
+                label: "go to a URL (set the page)",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"replace\",payload:{url:\"https://example.com\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[],
+                optional: &[
+                    BROWSER_URL,
+                    BROWSER_ACTION,
+                    BROWSER_SELECTOR,
+                    BROWSER_TEXT,
+                    BROWSER_HANDLE,
+                    BROWSER_VALUE,
+                    BROWSER_SUBMIT,
+                    BROWSER_TO,
+                    BROWSER_BY,
+                    BROWSER_TIMEOUT_MS,
+                    BROWSER_KINDS,
+                ],
+                label: "navigate / drive browser",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"patch\",payload:{action:\"click\",text:\"Sign in\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Delete,
+                required: &[],
+                optional: &[],
+                label: "close browser",
+                example: "write({changes:[{target:\"cairn:~/browser\",mode:\"delete\"}]})",
             },
         ],
     },

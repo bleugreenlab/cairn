@@ -1,3 +1,4 @@
+use crate::agent_process::process::SuspendKind;
 use crate::config::{
     agents as config_agents,
     presets::{load_effective_presets, resolve_runtime_selection},
@@ -231,7 +232,53 @@ pub async fn spawn_task_packets(
         return background_task_response(orch, &parent_ctx, &materialized).await;
     }
 
+    // Owned-loop backends (OpenRouter) never inline-wait on delegated tasks:
+    // there is no warm process, so the parent resumes by cold-restarting when the
+    // child results land. Suspend the turn now instead of blocking the HTTP
+    // thread on the completion wait.
+    let owns_turn_loop = input
+        .run_id
+        .map(|run_id| orch.process_state.run_owns_turn_loop(run_id))
+        .unwrap_or(false);
+    if owns_turn_loop {
+        return suspend_parent_for_owned_loop(orch, &parent_ctx, &materialized);
+    }
+
     wait_for_tasks_completion(orch, &parent_ctx, materialized).await
+}
+
+/// Owned-loop (OpenRouter) variant of `suspend_parent_for_tasks`: prepare the
+/// parent's pending successor turn so completion-resume works, then request a
+/// structured suspend on the parent run. Unlike the warm-process path it does
+/// NOT schedule the deferred durable suspend (which interrupts the process) —
+/// the owned loop finalizes the run itself after this returns.
+fn suspend_parent_for_owned_loop(
+    orch: &Orchestrator,
+    parent_ctx: &ParentRunContext,
+    materialized: &[MaterializedTask],
+) -> CallbackResponse {
+    let first = &materialized[0];
+    if let Err(error) = prepare_parent_for_delegated_wait(orch, parent_ctx, &first.packet) {
+        log::warn!(
+            "Failed to prepare owned-loop delegated wait for parent job {}: {}",
+            parent_ctx.job_id,
+            error
+        );
+    }
+    orch.process_state
+        .request_suspend(&parent_ctx.run_id, SuspendKind::DelegatedTask);
+    let summary = if materialized.len() == 1 {
+        format!("Delegated task '{}'", materialized[0].description)
+    } else {
+        format!("{} delegated tasks", materialized.len())
+    };
+    CallbackResponse {
+        result: format!(
+            "{} suspended; the run will resume from the real child result(s).",
+            summary
+        ),
+        ..Default::default()
+    }
 }
 
 /// Fire-and-forget response for `background` spawns: return task URIs without

@@ -18,7 +18,7 @@ use super::*;
 use crate::models::{RecipeNode, RecipeNodeType, TriggerEvent, TurnState};
 use crate::transitions::outcome::{recompute_execution_status_conn, recompute_issue_status_conn};
 use crate::transitions::projection::{derive_job_status, CheckpointGate, JobFacts, Resolution};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 /// A job whose derived status differs from its cached status.
 #[derive(Debug, Clone)]
@@ -63,53 +63,23 @@ struct SweepJob {
     parent_tool_use_id: Option<String>,
 }
 
-/// Classify the checkpoint gate of a recipe node.
-fn classify_gate(node: &RecipeNode) -> CheckpointGate {
-    // The producing node's human-approval gate is declared on its own output
-    // schema via `confirm_policy`: `User` blocks once the turn completes until
-    // the artifact is confirmed; `Auto` (or no declared schema) never blocks.
-    // Field inheritance from a downstream context edge is irrelevant here — the
-    // gate is the producing node's decision.
-    let confirm = |schema: Option<&crate::models::SchemaConfig>| match schema {
-        Some(s) if s.confirm_policy == crate::models::ConfirmPolicy::User => {
-            CheckpointGate::ConfirmGate
-        }
-        _ => CheckpointGate::None,
-    };
-    match node.node_type {
-        RecipeNodeType::Agent => confirm(
-            node.agent_config
-                .as_ref()
-                .and_then(|c| c.output_schema.as_ref()),
-        ),
-        RecipeNodeType::Action => confirm(
-            node.action_config
-                .as_ref()
-                .and_then(|c| c.output_schema.as_ref()),
-        ),
-        // Standalone checkpoint nodes are always a command gate now.
-        RecipeNodeType::Checkpoint => CheckpointGate::Command,
-        _ => CheckpointGate::None,
+/// The checkpoint gate for a node. A standalone checkpoint node runs a command
+/// gate; every other node's gate is its terminal (`context-out`) target's confirm
+/// policy — `User` blocks once the turn completes until the artifact is confirmed,
+/// `Auto` (or no contract) never blocks. The PR auto-confirm override (CAIRN-1219)
+/// is already baked into the resolver: a `pr` target forces `Auto`, so a
+/// PR-feeding node resolves to `None` here.
+fn gate_for(
+    node: Option<&RecipeNode>,
+    confirm_policy: Option<crate::models::ConfirmPolicy>,
+) -> CheckpointGate {
+    match node {
+        Some(n) if n.node_type == RecipeNodeType::Checkpoint => CheckpointGate::Command,
+        _ => match confirm_policy {
+            Some(crate::models::ConfirmPolicy::User) => CheckpointGate::ConfirmGate,
+            _ => CheckpointGate::None,
+        },
     }
-}
-
-/// A node whose output flows (via a context edge) into a first-class `pr` node
-/// never carries a pre-PR approval gate: the PR lifecycle (open → merge/close) is
-/// the human checkpoint, and the producer's output auto-confirms straight into PR
-/// creation. See CAIRN-1219 / CAIRN-1220.
-fn node_feeds_pr(snapshot: &crate::models::ExecutionSnapshot, node_id: &str) -> bool {
-    let pr_ids: HashSet<&str> = snapshot
-        .recipe
-        .nodes
-        .iter()
-        .filter(|n| n.node_type == RecipeNodeType::Pr)
-        .map(|n| n.id.as_str())
-        .collect();
-    snapshot.recipe.edges.iter().any(|edge| {
-        edge.edge_type.to_string() == "context"
-            && edge.source_node_id == node_id
-            && pr_ids.contains(edge.target_node_id.as_str())
-    })
 }
 
 /// The latest *work* turn state for a job, used to derive `live_turn` /
@@ -176,6 +146,36 @@ async fn latest_artifact_confirmed(conn: &turso::Connection, job_id: &str) -> Db
         .transpose()?
         .map(|v| v != 0)
         .unwrap_or(false))
+}
+
+/// The confirmation of the job's *terminal* artifact, scoped to its name. A
+/// `context-self` living doc writes under its own name and must never resolve the
+/// terminal gate, so the confirm flag is read from the terminal artifact chain
+/// only. Falls back to the job-scoped latest when the contract is unnamed (a
+/// command checkpoint, whose seeded artifact has a NULL `output_name`).
+async fn latest_artifact_confirmed_for(
+    conn: &turso::Connection,
+    job_id: &str,
+    required_name: Option<&str>,
+) -> DbResult<bool> {
+    match required_name {
+        Some(name) => {
+            let mut rows = conn
+                .query(
+                    "SELECT confirmed FROM artifacts WHERE job_id = ?1 AND output_name = ?2 ORDER BY version DESC LIMIT 1",
+                    params![job_id, name],
+                )
+                .await?;
+            Ok(rows
+                .next()
+                .await?
+                .map(|r| r.i64(0))
+                .transpose()?
+                .map(|v| v != 0)
+                .unwrap_or(false))
+        }
+        None => latest_artifact_confirmed(conn, job_id).await,
+    }
 }
 
 /// Whether any artifact row exists for the job — i.e. the node produced its
@@ -525,7 +525,6 @@ pub async fn recompute_job_status_conn(
         None => false,
     };
 
-    let confirmed = latest_artifact_confirmed(conn, job_id).await?;
     let downstream_schema = match recipe_node_id.as_deref() {
         Some(node_id) => {
             crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
@@ -536,7 +535,16 @@ pub async fn recompute_job_status_conn(
         None => None,
     };
     let requires_output = downstream_schema.is_some();
-    let required_artifact_name = downstream_schema.and_then(|schema| schema.artifact_name);
+    let confirm_policy = downstream_schema
+        .as_ref()
+        .map(|schema| schema.confirm_policy);
+    let required_artifact_name = downstream_schema
+        .as_ref()
+        .and_then(|schema| schema.artifact_name.clone());
+    // Confirmation is scoped to the terminal artifact name: a ctx-self living
+    // doc's confirm flag must never resolve the job's gate.
+    let confirmed =
+        latest_artifact_confirmed_for(conn, job_id, required_artifact_name.as_deref()).await?;
     let artifact_present =
         artifact_present_for(conn, job_id, required_artifact_name.as_deref()).await?;
     let facts = JobFacts {
@@ -551,11 +559,7 @@ pub async fn recompute_job_status_conn(
             Some(TurnState::Failed)
         ),
         turn_complete: matches!(turn, Some(TurnState::Complete)),
-        checkpoint: match node {
-            Some(n) if node_feeds_pr(&snapshot, &n.id) => CheckpointGate::None,
-            Some(n) => classify_gate(n),
-            None => CheckpointGate::None,
-        },
+        checkpoint: gate_for(node, confirm_policy),
         resolution: if confirmed {
             Resolution::Confirmed
         } else {
@@ -684,19 +688,28 @@ pub async fn recompute_execution_jobs_conn(
             )
             .await?;
             let turn = latest_turn_state(conn, &j.id).await?;
-            let confirmed = latest_artifact_confirmed(conn, &j.id).await?;
             // A node "requires output" when it has an effective output contract:
-            // its own output schema, or the input schema of a downstream consumer
-            // it feeds (e.g. a builder feeding a `pr` node's create-pr). This
-            // reuses the exact resolver that tells the agent what to write, so the
-            // completion gate and the instruction never drift.
+            // the schema of its single context-out edge target (an ArtifactNode,
+            // or a downstream `pr`/action input port). This reuses the exact
+            // resolver that tells the agent what to write, so the completion gate
+            // and the instruction never drift.
             let downstream_schema =
                 crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
                     conn, &snapshot, node_id,
                 )
                 .await?;
             let requires_output = downstream_schema.is_some();
-            let required_artifact_name = downstream_schema.and_then(|schema| schema.artifact_name);
+            let confirm_policy = downstream_schema
+                .as_ref()
+                .map(|schema| schema.confirm_policy);
+            let required_artifact_name = downstream_schema
+                .as_ref()
+                .and_then(|schema| schema.artifact_name.clone());
+            // Confirmation is scoped to the terminal artifact name so a ctx-self
+            // living doc never resolves this gate.
+            let confirmed =
+                latest_artifact_confirmed_for(conn, &j.id, required_artifact_name.as_deref())
+                    .await?;
             let artifact_present =
                 artifact_present_for(conn, &j.id, required_artifact_name.as_deref()).await?;
 
@@ -712,11 +725,7 @@ pub async fn recompute_execution_jobs_conn(
                     Some(TurnState::Failed)
                 ),
                 turn_complete: matches!(turn, Some(TurnState::Complete)),
-                checkpoint: match node {
-                    Some(n) if node_feeds_pr(&snapshot, &n.id) => CheckpointGate::None,
-                    Some(n) => classify_gate(n),
-                    None => CheckpointGate::None,
-                },
+                checkpoint: gate_for(node, confirm_policy),
                 resolution: if confirmed {
                     Resolution::Confirmed
                 } else {
@@ -792,7 +801,7 @@ pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
     let execution_id = run_advancement_db(async move {
         db.query_opt_text(
             "SELECT execution_id FROM jobs WHERE id = ?1",
-            turso::params![job_id_owned.as_str()],
+            (job_id_owned,),
         )
         .await
         .map_err(|e| e.to_string())
@@ -921,7 +930,6 @@ pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Resu
                     issue_id,
                     issue_uri: ctx.issue_uri(),
                     fact: crate::orchestrator::AttentionFact::Resolved {
-                        escalate: false,
                         final_status: ctx.status.clone(),
                     },
                     attention: ctx.attention,
@@ -1067,16 +1075,6 @@ mod gate_tests {
         }
     }
 
-    fn schema(policy: ConfirmPolicy) -> SchemaConfig {
-        SchemaConfig {
-            name: "plan".to_string(),
-            schema: None,
-            confirm_policy: policy,
-            tool_name: None,
-            description: None,
-        }
-    }
-
     #[test]
     fn top_level_terminal_job_fires_job_ended() {
         let change = JobStatusChange {
@@ -1143,22 +1141,31 @@ mod gate_tests {
         assert!(change.emits_blocked_lifecycle_message());
     }
 
+    // The gate is now driven by the resolved terminal (context-out) target's
+    // confirm policy, not an inline node schema. A `pr` target is already forced
+    // to Auto by the resolver, so a PR-feeding node arrives here as `Auto`.
     #[test]
     fn user_policy_is_confirm_gate() {
-        let node = agent_node(Some(schema(ConfirmPolicy::User)));
-        assert_eq!(classify_gate(&node), CheckpointGate::ConfirmGate);
+        let node = agent_node(None);
+        assert_eq!(
+            gate_for(Some(&node), Some(ConfirmPolicy::User)),
+            CheckpointGate::ConfirmGate
+        );
     }
 
     #[test]
     fn auto_policy_is_no_gate() {
-        let node = agent_node(Some(schema(ConfirmPolicy::Auto)));
-        assert_eq!(classify_gate(&node), CheckpointGate::None);
+        let node = agent_node(None);
+        assert_eq!(
+            gate_for(Some(&node), Some(ConfirmPolicy::Auto)),
+            CheckpointGate::None
+        );
     }
 
     #[test]
-    fn no_schema_is_no_gate() {
+    fn no_contract_is_no_gate() {
         let node = agent_node(None);
-        assert_eq!(classify_gate(&node), CheckpointGate::None);
+        assert_eq!(gate_for(Some(&node), None), CheckpointGate::None);
     }
 
     #[test]
@@ -1180,7 +1187,8 @@ mod gate_tests {
             condition_config: None,
             context_config: None,
         };
-        assert_eq!(classify_gate(&node), CheckpointGate::Command);
+        // A checkpoint node is a command gate regardless of confirm policy.
+        assert_eq!(gate_for(Some(&node), None), CheckpointGate::Command);
     }
 }
 
@@ -1509,5 +1517,229 @@ mod artifact_present_tests {
             .await
             .unwrap();
         assert!(present, "the required create-pr artifact is present");
+    }
+}
+
+#[cfg(test)]
+mod port_gate_tests {
+    use super::recompute_job_status_conn;
+    use crate::models::{
+        AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, ExecutionSnapshot, JobStatus,
+        NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
+        RecipeTrigger, TriggerContext, TriggerType,
+    };
+    use crate::storage::{DbError, LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use std::collections::HashMap;
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("port_gate.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        std::mem::forget(temp);
+        db
+    }
+
+    fn agent(id: &str) -> RecipeNode {
+        RecipeNode {
+            id: id.to_string(),
+            node_type: RecipeNodeType::Agent,
+            name: id.to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: Some(AgentNodeConfig {
+                agent_config_id: Some(id.to_string()),
+                output_schema: None,
+                git_config: None,
+            }),
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        }
+    }
+
+    fn artifact_node(id: &str, name: &str, policy: ConfirmPolicy) -> RecipeNode {
+        RecipeNode {
+            id: id.to_string(),
+            node_type: RecipeNodeType::Artifact,
+            name: id.to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: Some(ArtifactNodeConfig {
+                name: name.to_string(),
+                schema: Some(serde_json::json!({"type": "object"})),
+                confirm_policy: policy,
+                content: None,
+            }),
+            condition_config: None,
+            context_config: None,
+        }
+    }
+
+    fn ctx_edge(id: &str, from: &str, from_handle: &str, to: &str) -> RecipeEdge {
+        RecipeEdge {
+            id: id.to_string(),
+            edge_type: RecipeEdgeType::Context,
+            source_node_id: from.to_string(),
+            source_handle: from_handle.to_string(),
+            target_node_id: to.to_string(),
+            target_handle: "context-in".to_string(),
+        }
+    }
+
+    /// planner --context-out--> plan(user) --context-out--> builder, plus a
+    /// ctx-self `notes` doc the planner owns.
+    fn snapshot_json() -> String {
+        let snap = ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: "recipe-1".to_string(),
+                name: "Recipe".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![
+                    agent("planner"),
+                    artifact_node("plan-node", "plan", ConfirmPolicy::User),
+                    agent("builder"),
+                    artifact_node("notes-node", "notes", ConfirmPolicy::Auto),
+                ],
+                edges: vec![
+                    ctx_edge("e1", "planner", "context-out", "plan-node"),
+                    ctx_edge("e2", "plan-node", "context-out", "builder"),
+                    ctx_edge("e3", "planner", "context-self", "notes-node"),
+                ],
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: Some("i-1".to_string()),
+                project_id: "p-1".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 1,
+        };
+        snap.to_json().unwrap()
+    }
+
+    /// Seed the FK chain + a complete planner turn. Artifacts are added by the
+    /// caller to exercise the gate.
+    async fn seed(db: &LocalDb) {
+        let snapshot = snapshot_json();
+        db.write(move |conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-planner','e-1','planner','i-1','p-1','running','planner','planner',1,1)", ()).await?;
+                conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-1','j-planner','codex','open',1,1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-1','s-1','j-planner',1,'complete','initial',1,2,2)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn add_artifact(db: &LocalDb, id: &str, name: &str, confirmed: i64, version: i64) {
+        let id = id.to_string();
+        let name = name.to_string();
+        db.write(move |conn| {
+            let id = id.clone();
+            let name = name.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES (?1,'j-planner',?2,?3,'{}',?4,?2,1,1)",
+                    (id.as_str(), name.as_str(), confirmed, version),
+                )
+                .await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn planner_status(db: &LocalDb) -> JobStatus {
+        db.read(|conn| Box::pin(async move { recompute_job_status_conn(conn, "j-planner").await }))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn user_gate_blocks_until_terminal_artifact_confirmed() {
+        let db = test_db().await;
+        seed(&db).await;
+        // Turn complete, no plan yet -> Blocked (required output missing).
+        assert_eq!(planner_status(&db).await, JobStatus::Blocked);
+
+        // Plan written but unconfirmed under a `user` ctx-out gate -> Blocked.
+        add_artifact(&db, "a-plan", "plan", 0, 1).await;
+        assert_eq!(planner_status(&db).await, JobStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn user_gate_completes_when_terminal_artifact_confirmed() {
+        let db = test_db().await;
+        seed(&db).await;
+        add_artifact(&db, "a-plan", "plan", 1, 1).await;
+        assert_eq!(planner_status(&db).await, JobStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn ctx_self_confirmation_does_not_resolve_terminal_gate() {
+        let db = test_db().await;
+        seed(&db).await;
+        // Terminal plan is unconfirmed; a later, confirmed ctx-self `notes`
+        // artifact must NOT flip the gate (confirmation is name-scoped). Under a
+        // job-scoped latest-confirmed read this would wrongly derive Complete.
+        add_artifact(&db, "a-plan", "plan", 0, 1).await;
+        add_artifact(&db, "a-notes", "notes", 1, 2).await;
+        assert_eq!(planner_status(&db).await, JobStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn approve_confirms_terminal_not_higher_versioned_ctx_self() {
+        let db = test_db().await;
+        seed(&db).await;
+        // Terminal `plan` written once (v1, unconfirmed under the user gate).
+        add_artifact(&db, "a-plan", "plan", 0, 1).await;
+        // ctx-self `notes` patched repeatedly so its per-name chain outruns the
+        // terminal in version count (v2, v3). "Latest overall" by version DESC
+        // would resolve to notes, not plan.
+        add_artifact(&db, "a-notes-1", "notes", 1, 2).await;
+        add_artifact(&db, "a-notes-2", "notes", 1, 3).await;
+        // Pre-fix this derived Blocked forever: approve confirmed the higher
+        // versioned `notes` and never the terminal `plan`.
+        assert_eq!(planner_status(&db).await, JobStatus::Blocked);
+
+        let confirmed = db
+            .write(|conn| {
+                Box::pin(async move {
+                    crate::execution::checkpoints::confirm_latest_artifact_conn(conn, "j-planner")
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        // Approve targets the terminal `plan`, not the higher-versioned `notes`.
+        assert_eq!(confirmed.output_name.as_deref(), Some("plan"));
+        // Gate now resolves -> the job completes.
+        assert_eq!(planner_status(&db).await, JobStatus::Complete);
     }
 }

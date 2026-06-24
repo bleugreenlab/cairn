@@ -16,6 +16,10 @@
 /// `cairn_env` ("dev"/"prod") is always set as `CAIRN_ENV` in the MCP server env
 /// so the child (built `--release`) resolves the same Cairn home and callback
 /// port as the app that spawned it, rather than keying on its own build profile.
+///
+/// `log_level` (a `LogLevel` name: "quiet"/"standard"/"verbose") is set as
+/// `CAIRN_LOG_LEVEL` so the child's `logging::init` resolves the same file-log
+/// verbosity as the app that spawned it.
 pub fn build_mcp_config_json(
     cairn_cli_path: &str,
     callback_url: &str,
@@ -23,6 +27,7 @@ pub fn build_mcp_config_json(
     home_uri: Option<&str>,
     cairn_env: &str,
     cairn_home: Option<&str>,
+    log_level: &str,
 ) -> serde_json::Value {
     let mut args: Vec<&str> = Vec::new();
     if let Some(agents_json) = available_agents {
@@ -31,7 +36,8 @@ pub fn build_mcp_config_json(
     }
     let mut env = serde_json::json!({
         "CAIRN_CALLBACK_URL": callback_url,
-        "CAIRN_ENV": cairn_env
+        "CAIRN_ENV": cairn_env,
+        "CAIRN_LOG_LEVEL": log_level
     });
     if let Some(uri) = home_uri {
         env["CAIRN_HOME_URI"] = serde_json::Value::String(uri.to_string());
@@ -71,6 +77,7 @@ pub fn build_mcp_config_string(
     home_uri: Option<&str>,
     cairn_env: &str,
     cairn_home: Option<&str>,
+    log_level: &str,
 ) -> String {
     let callback_url = format!("http://127.0.0.1:{}/api/mcp", callback_port);
     let config = build_mcp_config_json(
@@ -80,6 +87,7 @@ pub fn build_mcp_config_string(
         home_uri,
         cairn_env,
         cairn_home,
+        log_level,
     );
     serde_json::to_string(&config).expect("MCP config JSON always serializes")
 }
@@ -97,6 +105,7 @@ mod tests {
             None,
             "prod",
             None,
+            "standard",
         );
 
         let servers = config.get("mcpServers").unwrap();
@@ -112,6 +121,11 @@ mod tests {
         );
         // CAIRN_ENV is always propagated to the child.
         assert_eq!(env.get("CAIRN_ENV").unwrap().as_str().unwrap(), "prod");
+        // CAIRN_LOG_LEVEL is always propagated so the child matches app verbosity.
+        assert_eq!(
+            env.get("CAIRN_LOG_LEVEL").unwrap().as_str().unwrap(),
+            "standard"
+        );
         // No home URI / home provided — keys must be absent
         assert!(env.get("CAIRN_HOME_URI").is_none());
         assert!(env.get("CAIRN_HOME").is_none());
@@ -126,6 +140,7 @@ mod tests {
             None,
             "dev",
             Some("/Users/me/.cairn-dev-feature-x"),
+            "standard",
         );
 
         let env = &config["mcpServers"]["cairn"]["env"];
@@ -144,6 +159,7 @@ mod tests {
             Some("cairn://p/CAIRN/42/1/builder"),
             "dev",
             None,
+            "verbose",
         );
 
         let env = &config["mcpServers"]["cairn"]["env"];
@@ -163,6 +179,7 @@ mod tests {
             Some("cairn://p/CAIRN/1/1/planner/task/agent-spawn"),
             "prod",
             None,
+            "standard",
         );
         let b = build_mcp_config_string(
             "/usr/bin/cairn-cli",
@@ -171,6 +188,7 @@ mod tests {
             Some("cairn://p/CAIRN/1/1/planner/task/planbuild-recipe"),
             "prod",
             None,
+            "standard",
         );
 
         // Each run gets its own home URI baked in — no shared file to clobber.
@@ -193,6 +211,7 @@ mod tests {
             None,
             "prod",
             None,
+            "standard",
         );
 
         let args = config["mcpServers"]["cairn"]["args"].as_array().unwrap();

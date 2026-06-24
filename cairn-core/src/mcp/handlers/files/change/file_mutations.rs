@@ -15,9 +15,14 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use turso::params;
 
-/// Sentinel value for commit_msg that skips git add/commit entirely.
-/// The file is written to disk but left as an unstaged change.
-const NO_COMMIT: &str = "NO_COMMIT";
+/// Rejection returned when a file-target change is attempted in a non-worktree
+/// cwd (the project's live checkout). Changes can only happen in a worktree, so
+/// the batch is refused BEFORE any edit is written and the checkout is never
+/// touched. Resource writes (issues, messages, todos, tasks) are unaffected.
+pub(super) const NON_WORKTREE_CHANGE_ERROR: &str =
+    "Changes can only be made in a worktree. This agent runs on the project's live \
+     checkout (no worktree); file edits are rejected here and the checkout is left \
+     untouched. Resource writes (issues, messages, todos, tasks) still work.";
 
 /// File-target keys parsed from a change item's `payload`. Mirrors how resource
 /// handlers read structured keys from `item.payload`, so every change item is
@@ -1015,7 +1020,14 @@ pub(super) fn emit_worktree_changed(orch: &Orchestrator, cwd: &str) {
 pub(super) fn parse_rename_spec(
     worktree: &std::path::Path,
     item: &ChangeItem,
-) -> Result<(std::path::PathBuf, crate::symbols::rename::RenameSpec, String), String> {
+) -> Result<
+    (
+        std::path::PathBuf,
+        crate::symbols::rename::RenameSpec,
+        String,
+    ),
+    String,
+> {
     #[derive(Deserialize)]
     struct RenamePayload {
         #[serde(default)]
@@ -1130,7 +1142,10 @@ pub(super) fn prepare_rename_changes(
                 applied.push(rename_applied(
                     rename_index,
                     dest_target.clone(),
-                    format!("R {src_target}\u{2192}{dest_target} ({} sites)", edit.site_count),
+                    format!(
+                        "R {src_target}\u{2192}{dest_target} ({} sites)",
+                        edit.site_count
+                    ),
                 ));
             }
             (Some(content), None) => {
@@ -1204,50 +1219,42 @@ pub(super) async fn finalize_file_commit(
         }
     }
 
-    let commit_msg = commit_msg.unwrap_or(NO_COMMIT);
-    if commit_msg == NO_COMMIT {
-        // NO_COMMIT is only legitimate while resolving an in-progress merge or
-        // rebase. The edits are already on disk, so when the repo is not mid
-        // transition we reject *and* restore the worktree to HEAD to keep the
-        // worktree==HEAD invariant the session-archival scheme depends on.
-        if !crate::mcp::git::is_repo_mid_transition(std::path::Path::new(&request.cwd)) {
-            let restore =
-                crate::mcp::git::restore_worktree_to_head(std::path::Path::new(&request.cwd));
-            emit_worktree_changed(orch, &request.cwd);
-            let error = match restore {
-                Ok(()) => "NO_COMMIT is only valid while resolving an in-progress merge or \
-                           rebase; the worktree was restored to HEAD. Pass a descriptive \
-                           commit_msg so the edits are committed."
-                    .to_string(),
-                Err(re) => format!(
-                    "NO_COMMIT is only valid while resolving an in-progress merge or rebase, \
-                     and restoring the worktree to HEAD failed: {re}"
-                ),
-            };
-            return Err(Box::new(IndexedFailure {
-                failure: ChangeFailure {
-                    index: first_change.index,
-                    target: first_change.item.target.clone(),
-                    mode: mode_name(first_change.item.mode).to_string(),
-                    kind: "file".to_string(),
-                    error: error.clone(),
-                },
-                commit: Some(CommitReport {
-                    status: "failed".to_string(),
-                    sha: None,
-                    pr_number: None,
-                    message: Some(error),
-                }),
-            }));
-        }
+    // Route worktree mutations through the VCS seam (jj for a worktree). A
+    // non-worktree cwd is rejected up front in `handle_change`, so this path
+    // always sees a jj workspace.
+    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&request.cwd));
+
+    let Some(commit_msg) = commit_msg else {
+        // The file edits are already on disk. With no commit_msg, restore the
+        // worktree to HEAD (preserving the worktree==HEAD invariant the
+        // session-archival scheme depends on) and tell the agent to pass one.
+        let restore = vcs.discard(std::path::Path::new(&request.cwd));
         emit_worktree_changed(orch, &request.cwd);
-        return Ok(Some(CommitReport {
-            status: "skipped".to_string(),
-            sha: None,
-            pr_number: None,
-            message: Some("File changes applied without a git commit".to_string()),
+        let error = match restore {
+            Ok(()) => "File edits require a descriptive commit_msg; the worktree was \
+                       restored to HEAD. Pass commit_msg so the edits are committed."
+                .to_string(),
+            Err(re) => format!(
+                "File edits require a descriptive commit_msg, and restoring the \
+                 worktree to HEAD failed: {re}"
+            ),
+        };
+        return Err(Box::new(IndexedFailure {
+            failure: ChangeFailure {
+                index: first_change.index,
+                target: first_change.item.target.clone(),
+                mode: mode_name(first_change.item.mode).to_string(),
+                kind: "file".to_string(),
+                error: error.clone(),
+            },
+            commit: Some(CommitReport {
+                status: "failed".to_string(),
+                sha: None,
+                pr_number: None,
+                message: Some(error),
+            }),
         }));
-    }
+    };
 
     if commit_msg == "^" && !promoted_memory_uris.is_empty() {
         return Err(Box::new(IndexedFailure {
@@ -1296,7 +1303,7 @@ pub(super) async fn finalize_file_commit(
         }
     }
 
-    match crate::mcp::git::git_commit_files(
+    match vcs.seal_files(
         std::path::Path::new(&request.cwd),
         &unique_paths,
         &final_commit_msg,
@@ -1321,8 +1328,7 @@ pub(super) async fn finalize_file_commit(
         Err(e) => {
             // The edits were applied but the commit failed. Restore the worktree
             // to HEAD so a failed write does not strand uncommitted dirt.
-            let restore =
-                crate::mcp::git::restore_worktree_to_head(std::path::Path::new(&request.cwd));
+            let restore = vcs.discard(std::path::Path::new(&request.cwd));
             emit_worktree_changed(orch, &request.cwd);
             let error = match restore {
                 Ok(()) => format!(

@@ -15,7 +15,6 @@ use super::issue::{
     read_issue_executions,
 };
 use super::labels::{read_label, read_labels};
-use super::symbols::{read_node_symbols, read_project_symbols};
 use super::memories::{read_node_memories_collection, read_node_memory};
 use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
 use super::node::{
@@ -25,6 +24,7 @@ use super::node::{
     read_task_artifact, read_task_chat, read_task_chat_event, read_task_chat_raw,
     read_task_chat_turn,
 };
+use super::symbols::{read_node_symbols, read_project_symbols};
 
 use super::actions::{read_action, read_actions_collection};
 use super::agents::{read_agent, read_agents_collection};
@@ -38,7 +38,7 @@ use super::settings::read_settings;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 use cairn_common::query::{split_target_query, QueryParam};
-use cairn_common::read::{Affordance, NaturalUnit, SegmentKind};
+use cairn_common::read::{Affordance, ImageBlock, NaturalUnit, SegmentKind};
 use cairn_common::uri::{parse_uri, CairnResource};
 use std::path::{Path, PathBuf};
 use turso::Value;
@@ -68,6 +68,9 @@ pub(crate) struct RenderedResource {
     /// the `[N matches]` header suffix for a universal-grep result.
     pub match_count: Option<usize>,
     pub affordance: Option<Affordance>,
+    /// Image blocks (e.g. a browser screenshot) lifted into the read envelope
+    /// alongside the text body. Empty for ordinary text resources.
+    pub images: Vec<ImageBlock>,
 }
 
 impl RenderedResource {
@@ -88,6 +91,7 @@ impl RenderedResource {
             limit,
             match_count: None,
             affordance,
+            images: Vec::new(),
         }
     }
 
@@ -105,6 +109,7 @@ impl RenderedResource {
             limit: None,
             match_count: Some(match_count),
             affordance,
+            images: Vec::new(),
         }
     }
 
@@ -127,8 +132,50 @@ impl RenderedResource {
             limit: Some(limit),
             match_count: None,
             affordance,
+            images: Vec::new(),
         }
     }
+
+    /// A chat digest result: the producer already applied turn offset/limit.
+    fn turns(
+        content: String,
+        shown_units: usize,
+        offset: usize,
+        limit: Option<usize>,
+        total_units: usize,
+        affordance: Option<Affordance>,
+    ) -> Self {
+        Self {
+            content,
+            natural_unit: NaturalUnit::Turn,
+            unit_noun: Some("turns"),
+            total_units: Some(total_units),
+            shown_units: Some(shown_units),
+            offset: Some(offset as i64),
+            limit,
+            match_count: None,
+            affordance,
+            images: Vec::new(),
+        }
+    }
+}
+
+fn rendered_chat_turn_count(content: &str) -> usize {
+    content
+        .lines()
+        .filter(|line| line.starts_with("## Turn "))
+        .count()
+}
+
+fn rendered_chat_total_turns(content: &str) -> Option<usize> {
+    let header = content.lines().next()?;
+    let marker = " turn";
+    let before_marker = header.split(marker).next()?;
+    before_marker
+        .rsplit('·')
+        .next()
+        .map(str::trim)
+        .and_then(|value| value.parse::<usize>().ok())
 }
 
 const DB_SQL_DEFAULT_LIMIT: usize = 100;
@@ -142,8 +189,19 @@ struct DbSqlProjection {
 }
 
 fn parse_db_sql_projection(params: &[QueryParam]) -> Result<DbSqlProjection, String> {
+    parse_db_sql_projection_with(params, &[], "cairn://db")
+}
+
+/// Shared parser for the `cairn://db` / `cairn://dev/db` SQL projections.
+/// `allowed_extra` names resource-specific params beyond `sql`/`offset`/`limit`
+/// (the dev/db `at` selector); `resource` labels error messages.
+fn parse_db_sql_projection_with(
+    params: &[QueryParam],
+    allowed_extra: &[&str],
+    resource: &str,
+) -> Result<DbSqlProjection, String> {
     let sql = find_query_value(params, "sql")
-        .ok_or_else(|| "cairn://db requires a 'sql' query parameter".to_string())?
+        .ok_or_else(|| format!("{resource} requires a 'sql' query parameter"))?
         .to_string();
     let offset = match find_query_value(params, "offset") {
         Some(value) => value
@@ -159,12 +217,12 @@ fn parse_db_sql_projection(params: &[QueryParam]) -> Result<DbSqlProjection, Str
     };
     let limit = requested_limit.min(DB_SQL_MAX_LIMIT);
 
-    if let Some(unsupported) = params
-        .iter()
-        .find(|param| !matches!(param.key.as_str(), "sql" | "offset" | "limit"))
-    {
+    if let Some(unsupported) = params.iter().find(|param| {
+        !matches!(param.key.as_str(), "sql" | "offset" | "limit")
+            && !allowed_extra.contains(&param.key.as_str())
+    }) {
         return Err(format!(
-            "Unsupported query parameter '{}' for cairn://db",
+            "Unsupported query parameter '{}' for {resource}",
             unsupported.key
         ));
     }
@@ -333,6 +391,72 @@ async fn produce_db_sql_resource(
             RenderedResource::line(format!("SQL query failed: {error}"), affordance, None, None)
         }
     }
+}
+
+/// `cairn://dev/db` — relay a read-only SQL projection to a running
+/// `dev:instance`. With no `sql`, list registered instances; otherwise resolve
+/// the selected instance and query its own `cairn://db` over its callback
+/// server, returning the cleaned row body. The instance re-validates the
+/// read-only statement policy on its side.
+async fn produce_dev_db_sql_resource(
+    params: &[QueryParam],
+    affordance: Option<Affordance>,
+) -> RenderedResource {
+    use super::dev_instances;
+
+    if find_query_value(params, "sql").is_none() {
+        return RenderedResource::line(
+            dev_instances::render_listing().await,
+            affordance,
+            None,
+            None,
+        );
+    }
+    let projection = match parse_db_sql_projection_with(params, &["at"], "cairn://dev/db") {
+        Ok(projection) => projection,
+        Err(error) => return RenderedResource::line(error, affordance, None, None),
+    };
+    let instance = match dev_instances::resolve_instance(find_query_value(params, "at")).await {
+        Ok(instance) => instance,
+        Err(error) => return RenderedResource::line(error.message(), affordance, None, None),
+    };
+    match dev_instances::query_db(
+        &instance,
+        &projection.sql,
+        projection.offset,
+        projection.limit,
+    )
+    .await
+    {
+        Ok(body) => RenderedResource::line(body, affordance, None, None),
+        Err(error) => RenderedResource::line(error, affordance, None, None),
+    }
+}
+
+/// `cairn://dev` — the process-introspection collection entrypoint: list running
+/// dev instances and the available sub-tools (db, pid).
+async fn produce_dev_collection_resource(affordance: Option<Affordance>) -> RenderedResource {
+    RenderedResource::line(
+        super::dev_instances::render_collection().await,
+        affordance,
+        None,
+        None,
+    )
+}
+
+/// `cairn://dev/pid` — report the OS process id(s) of running dev instance(s).
+/// Each instance reports its own `std::process::id()` over its MCP callback
+/// server. `?at=` selects one; otherwise every running instance is listed.
+async fn produce_dev_pid_resource(
+    params: &[QueryParam],
+    affordance: Option<Affordance>,
+) -> RenderedResource {
+    RenderedResource::line(
+        super::dev_instances::render_pids(find_query_value(params, "at")).await,
+        affordance,
+        None,
+        None,
+    )
 }
 
 async fn run_db_sql_projection(
@@ -790,6 +914,44 @@ pub(crate) async fn produce_cairn_resource(
         return produce_db_sql_resource(orch, &split.params, affordance).await;
     }
 
+    if matches!(resource, CairnResource::DevDb) {
+        return produce_dev_db_sql_resource(&split.params, affordance).await;
+    }
+
+    if matches!(resource, CairnResource::Dev) {
+        return produce_dev_collection_resource(affordance).await;
+    }
+
+    if matches!(resource, CairnResource::DevPid) {
+        return produce_dev_pid_resource(&split.params, affordance).await;
+    }
+
+    // Browser screenshot: a host-native capture returned as an image block rather
+    // than text. Intercept before the text body path (other browser reads are
+    // line-unit text). Only `?screenshot` diverts here; content reads fall
+    // through to the normal text renderer below.
+    if matches!(
+        resource,
+        CairnResource::NodeBrowser { .. }
+            | CairnResource::TaskBrowser { .. }
+            | CairnResource::ProjectBrowser { .. }
+    ) {
+        match super::browsers::parse_browser_read_mode(&split.params) {
+            Ok(super::browsers::BrowserReadMode::Screenshot) => {
+                let (header, image) =
+                    super::browsers::render_browser_screenshot(orch, &resource).await;
+                let mut rendered = RenderedResource::line(header, affordance, None, None);
+                if let Some(image) = image {
+                    rendered.images.push(image);
+                }
+                return rendered;
+            }
+            // Content/console/network reads are line-unit text; fall through.
+            Ok(_) => {}
+            Err(error) => return RenderedResource::line(error, affordance, None, None),
+        }
+    }
+
     // `/issues`: unit = issue. limit/offset push down to SQL; the header reports
     // a truthful total from a COUNT over the same filters.
     if let CairnResource::ProjectIssues { project } = &resource {
@@ -804,6 +966,7 @@ pub(crate) async fn produce_cairn_resource(
                 limit: view_limit,
                 match_count: None,
                 affordance,
+                images: Vec::new(),
             },
             Err(error) => RenderedResource::line(error, affordance, view_offset, view_limit),
         };
@@ -833,7 +996,30 @@ pub(crate) async fn produce_cairn_resource(
             limit: view_limit,
             match_count: None,
             affordance,
+            images: Vec::new(),
         };
+    }
+
+    let is_chat_digest = matches!(
+        resource,
+        CairnResource::NodeChat { .. } | CairnResource::TaskChat { .. }
+    );
+    if is_chat_digest {
+        let content = render_resource_body(orch, request, &resource, split.params.clone()).await;
+        let shown_turns = rendered_chat_turn_count(&content);
+        let total_turns = rendered_chat_total_turns(&content).unwrap_or(shown_turns);
+        let resolved_offset = match view_offset.unwrap_or(0) {
+            raw if raw < 0 => total_turns.saturating_sub(raw.unsigned_abs() as usize),
+            raw => (raw as usize).min(total_turns),
+        };
+        return RenderedResource::turns(
+            content,
+            shown_turns,
+            resolved_offset,
+            view_limit,
+            total_turns,
+            affordance,
+        );
     }
 
     // Resources whose renderer owns its own params (search/grep projections):
@@ -845,7 +1031,19 @@ pub(crate) async fn produce_cairn_resource(
     ) || matches!(resource, CairnResource::Project { .. })
         && find_query_value(&split.params, "search").is_some();
 
-    let body_params = if renderer_owns_params {
+    // Browser ?console/?network/?interactive reads consume `limit` as a
+    // page-side buffer/element cap inside the producer (the bridge request),
+    // not just as a view line window. Keep `limit` in their body params (strip
+    // only `offset`) so the cap actually reaches the producer; the view still
+    // applies `view_limit` to the rendered window below.
+    let is_browser_resource = matches!(
+        resource,
+        CairnResource::NodeBrowser { .. }
+            | CairnResource::TaskBrowser { .. }
+            | CairnResource::ProjectBrowser { .. }
+    );
+
+    let body_params = if renderer_owns_params || is_browser_resource {
         strip_params(&split.params, &["offset"])
     } else {
         strip_params(&split.params, &["offset", "limit"])
@@ -874,6 +1072,9 @@ async fn render_resource_body(
 ) -> String {
     match resource.clone() {
         CairnResource::Db => produce_db_sql_resource(orch, &params, None).await.content,
+        CairnResource::Dev => produce_dev_collection_resource(None).await.content,
+        CairnResource::DevDb => produce_dev_db_sql_resource(&params, None).await.content,
+        CairnResource::DevPid => produce_dev_pid_resource(&params, None).await.content,
         CairnResource::Logs => logs_resource_body(&cairn_common::paths::cairn_log_dir(), &params),
         CairnResource::Project { project } => {
             if find_query_value(&params, "search").is_some() {
@@ -1587,6 +1788,34 @@ async fn render_resource_body(
         | CairnResource::ProjectTerminal { .. } => {
             "Terminal URIs are handled by read_resource".to_string()
         }
+        // Browser reads render the durable job_browsers row (url/title/status)
+        // plus, when a webview is live, an extraction of the current page content
+        // via the injected content-script bridge. `?format=markdown|text`.
+        // `?screenshot` is handled earlier in `produce_cairn_resource` (it
+        // returns an image block); reaching here under screenshot means the
+        // image path was bypassed (e.g. combined with `?grep`).
+        CairnResource::NodeBrowser { .. }
+        | CairnResource::TaskBrowser { .. }
+        | CairnResource::ProjectBrowser { .. } => {
+            match super::browsers::parse_browser_read_mode(&params) {
+                Ok(super::browsers::BrowserReadMode::Content(format)) => {
+                    super::browsers::render_browser(orch, resource, format).await
+                }
+                Ok(super::browsers::BrowserReadMode::Console { limit }) => {
+                    super::browsers::render_browser_console(orch, resource, limit).await
+                }
+                Ok(super::browsers::BrowserReadMode::Network { limit }) => {
+                    super::browsers::render_browser_network(orch, resource, limit).await
+                }
+                Ok(super::browsers::BrowserReadMode::Interactive { limit }) => {
+                    super::browsers::render_browser_interactive(orch, resource, limit).await
+                }
+                Ok(super::browsers::BrowserReadMode::Screenshot) => {
+                    "Browser screenshots are images; read cairn:~/browser?screenshot on its own (not combined with grep).".to_string()
+                }
+                Err(error) => error,
+            }
+        }
         CairnResource::Bug => {
             "cairn://bug is write-only; use change with mode=append to submit reports".to_string()
         }
@@ -1675,6 +1904,65 @@ mod tests {
             parse_db_sql_projection(&db_params("sql=SELECT 1&offset=2&limit=5001")).unwrap();
         assert_eq!(parsed.offset, 2);
         assert_eq!(parsed.limit, DB_SQL_MAX_LIMIT);
+    }
+
+    #[test]
+    fn dev_db_projection_allows_at_and_keeps_db_unchanged() {
+        // dev/db requires sql like db, but labels the error with its own URI and
+        // accepts the `at` selector alongside sql/offset/limit.
+        let err = parse_db_sql_projection_with(&db_params("at=foo"), &["at"], "cairn://dev/db")
+            .unwrap_err();
+        assert!(
+            err.contains("cairn://dev/db") && err.contains("sql"),
+            "{err}"
+        );
+
+        let parsed = parse_db_sql_projection_with(
+            &db_params("sql=SELECT 1&at=main&offset=1&limit=10"),
+            &["at"],
+            "cairn://dev/db",
+        )
+        .unwrap();
+        assert_eq!(parsed.offset, 1);
+        assert_eq!(parsed.limit, 10);
+
+        // An unknown param is still rejected, and the read-only policy holds.
+        let unknown = vec![
+            QueryParam {
+                key: "sql".to_string(),
+                value: "SELECT 1".to_string(),
+            },
+            QueryParam {
+                key: "bogus".to_string(),
+                value: "1".to_string(),
+            },
+        ];
+        assert!(
+            parse_db_sql_projection_with(&unknown, &["at"], "cairn://dev/db")
+                .unwrap_err()
+                .contains("bogus")
+        );
+        assert!(parse_db_sql_projection_with(
+            &db_params("sql=DELETE FROM issues"),
+            &["at"],
+            "cairn://dev/db"
+        )
+        .is_err());
+
+        // cairn://db is unchanged: it does not accept the dev/db selector.
+        let db_with_at = vec![
+            QueryParam {
+                key: "sql".to_string(),
+                value: "SELECT 1".to_string(),
+            },
+            QueryParam {
+                key: "at".to_string(),
+                value: "x".to_string(),
+            },
+        ];
+        assert!(parse_db_sql_projection(&db_with_at)
+            .unwrap_err()
+            .contains("at"));
     }
 
     #[test]
@@ -1918,5 +2206,98 @@ line2', X'0001020AFF', 2.5),
         assert_eq!(matches, 1);
         assert!(rendered.contains("boom"));
         assert!(!rendered.contains("all good"));
+    }
+
+    /// End-to-end regression for the read router's param threading: a browser
+    /// `?interactive&limit=N` read must carry `limit` all the way into the
+    /// page-side `ListInteractive` request, not strip it as a mere view window.
+    /// Drives `produce_cairn_resource` against a stub webview that captures the
+    /// bridge request and replies, then asserts the emitted request kind+limit.
+    #[tokio::test]
+    async fn browser_interactive_read_threads_limit_to_the_producer() {
+        use crate::browsers::BrowserCommand;
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let local = LocalDb::open(dir.path().join("browser-read.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        let worktree = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            worktree.path().to_path_buf(),
+        )
+        .browser_command_tx(Some(tx))
+        .build();
+
+        // Stub webview: reply to the ListInteractive bridge request (so the read
+        // completes) and capture the exact request JSON the producer emitted.
+        let responses = orch.browser_bridge_responses.clone();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let mut captured_tx = Some(captured_tx);
+            while let Some(cmd) = rx.recv().await {
+                if let BrowserCommand::Bridge {
+                    request_id,
+                    request_json,
+                    ..
+                } = cmd
+                {
+                    if let Some(c) = captured_tx.take() {
+                        let _ = c.send(request_json);
+                    }
+                    let reply = serde_json::json!({ "ok": true, "elements": [] }).to_string();
+                    let _ = responses.send((request_id, reply));
+                }
+            }
+        });
+
+        let request = McpCallbackRequest {
+            cwd: String::new(),
+            run_id: None,
+            tool: "read".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        };
+        let rendered =
+            produce_cairn_resource(&orch, &request, "cairn://p/BRW/browser?interactive&limit=3")
+                .await;
+        assert!(
+            rendered.content.contains("Interactive elements"),
+            "{}",
+            rendered.content
+        );
+
+        let request_json = captured_rx.await.expect("bridge request captured");
+        let value: serde_json::Value = serde_json::from_str(&request_json).unwrap();
+        assert_eq!(value["kind"], "listInteractive");
+        // The regression: without threading, limit arrives null and only the
+        // outer line window applies.
+        assert_eq!(value["limit"], 3);
     }
 }

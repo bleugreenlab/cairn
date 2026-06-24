@@ -37,22 +37,30 @@ impl TimeRange {
 pub enum Bucket {
     Day,
     Week,
+    Month,
 }
 
 impl Bucket {
-    /// Bucket width in seconds. The value is a fixed constant, never user text,
-    /// so it is safe to interpolate directly into a SQL expression.
-    pub(crate) fn seconds(self) -> i64 {
+    /// A SQL expression that truncates the epoch-seconds column `ts_col` to the
+    /// start of its bucket, returning an integer epoch. Day/Week use fixed-width
+    /// flooring; calendar months can't be expressed that way, so Month uses
+    /// SQLite's `strftime(... 'start of month')`. `ts_col` is always a controlled
+    /// column name (never user text), so direct interpolation is safe.
+    pub(crate) fn bucket_expr(self, ts_col: &str) -> String {
         match self {
-            Bucket::Day => 86_400,
-            Bucket::Week => 604_800,
+            Bucket::Day => format!("({ts_col} / 86400) * 86400"),
+            Bucket::Week => format!("({ts_col} / 604800) * 604800"),
+            Bucket::Month => {
+                format!("CAST(strftime('%s', {ts_col}, 'unixepoch', 'start of month') AS INTEGER)")
+            }
         }
     }
 
-    /// Parse a raw frontend string; anything but an explicit `week` is `Day`.
+    /// Parse a raw frontend string: `week`, `month`, else `day`.
     pub fn parse(raw: Option<&str>) -> Self {
         match raw {
             Some(s) if s.eq_ignore_ascii_case("week") => Bucket::Week,
+            Some(s) if s.eq_ignore_ascii_case("month") => Bucket::Month,
             _ => Bucket::Day,
         }
     }
@@ -88,6 +96,37 @@ pub struct TokensPerLocPoint {
 pub struct CostPoint {
     pub bucket_start: i64,
     pub cost_usd: f64,
+    pub billable_tokens: i64,
+}
+
+/// One (month, backend) effective-cost point. `effective_cost` allocates a
+/// provider's flat subscription fee across its usage, or passes through real
+/// metered cost. See `analytics::effective_cost`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EffectiveCostPoint {
+    /// First-of-month epoch seconds (UTC).
+    pub month_start: i64,
+    pub backend: String,
+    /// True only when this backend reports a real per-generation cost
+    /// (genuinely pay-as-you-go, e.g. OpenRouter). Subscription backends
+    /// (Claude/Codex) are never metered, even before a fee is configured.
+    pub metered: bool,
+    /// True when the month contains "now" (running estimate, not yet settled).
+    pub provisional: bool,
+    /// The flat monthly fee for a subscription backend; 0 for metered.
+    pub subscription_fee: f64,
+    /// Workspace-wide list-price cost for (month, backend); drives the ratio.
+    pub list_cost: f64,
+    /// List/real-price cost of the displayed (scoped) usage.
+    pub scoped_cost: f64,
+    /// `fee / workspace_list_cost` for subscriptions; `1.0` for metered;
+    /// `None` when undefined (a fee is paid but there is no priced usage).
+    pub ratio: Option<f64>,
+    /// Effective cost of the scoped usage: `scoped_cost * ratio` for a
+    /// subscription, or real metered cost. 0 when the fee is unrecovered.
+    pub effective_cost: f64,
+    /// Billable tokens in the scoped usage for this (month, backend).
     pub billable_tokens: i64,
 }
 

@@ -132,7 +132,10 @@ mod tests {
 
     #[test]
     fn legacy_opus_is_priced_higher() {
-        assert_eq!(price_for(Some("claude-opus-4-1-20250805")), Some(OPUS_LEGACY));
+        assert_eq!(
+            price_for(Some("claude-opus-4-1-20250805")),
+            Some(OPUS_LEGACY)
+        );
         assert_eq!(price_for(Some("claude-opus-4-20250514")), Some(OPUS_LEGACY));
     }
 
@@ -154,7 +157,14 @@ mod tests {
     #[test]
     fn codex_cost_ignores_cache_components() {
         // gpt-5.4: 1M input($2.50) + 1M output($15), cache ignored.
-        let cost = cost_usd("codex", Some("gpt-5"), 1_000_000, 500_000, 500_000, 1_000_000);
+        let cost = cost_usd(
+            "codex",
+            Some("gpt-5"),
+            1_000_000,
+            500_000,
+            500_000,
+            1_000_000,
+        );
         assert!((cost - 17.50).abs() < 1e-9, "got {cost}");
     }
 

@@ -8,15 +8,15 @@
 // ── Domain operations ──────────────────────────────────
 pub mod action_configs;
 pub mod action_runs;
-pub mod config_disables;
 pub mod analytics;
 pub mod archival;
 pub mod artifacts;
+pub mod browsers;
+pub mod config_disables;
 pub mod issues;
 pub mod jobs;
 pub mod labels;
 pub mod memories;
-pub mod symbols;
 pub mod merge_requests;
 pub mod messages;
 pub mod pr_data;
@@ -25,6 +25,7 @@ pub mod runs;
 pub mod scratch;
 pub mod search;
 pub mod sessions;
+pub mod symbols;
 pub mod todos;
 pub mod turns;
 
@@ -65,6 +66,8 @@ mod embeddings;
 mod env;
 mod execution;
 mod git;
+mod jj;
+mod markdown_frontmatter;
 mod mcp;
 mod node_segments;
 mod notify;

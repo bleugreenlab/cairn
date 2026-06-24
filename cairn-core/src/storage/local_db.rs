@@ -308,9 +308,11 @@ impl LocalDb {
     /// Reclaim freelist space by writing a self-contained, compacted image of
     /// this database to `dest` via `VACUUM INTO`.
     ///
-    /// Unlike an in-place `VACUUM`, this runs no checkpoint, so it sidesteps the
-    /// MVCC TRUNCATE-checkpoint corruption that makes in-place `VACUUM` unusable
-    /// on the migrated schema (see docs/database.md). `dest` is therefore itself
+    /// Unlike an in-place `VACUUM`, this writes a separate image that can be
+    /// validated before any offline swap. Older Turso revisions also had an MVCC
+    /// TRUNCATE-checkpoint corruption path on migrated schemas with deleted rows;
+    /// keep checkpoint-heavy changes covered by the regression tests described in
+    /// docs/database.md. `dest` is therefore itself
     /// an MVCC three-file set (`{dest, dest-wal, dest-log}`) with committed data
     /// living in the sidecars; move and validate it as a whole set, never the
     /// `.db` file alone.
@@ -1079,6 +1081,74 @@ mod tests {
                 .await
                 .unwrap(),
             7
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_preserves_migrated_schema_after_delete_heavy_writes() {
+        let db = crate::storage::migrated_test_db("checkpoint-delete-heavy.turso.db").await;
+        let path = db.path().to_path_buf();
+
+        for i in 0..60 {
+            db.execute(
+                "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
+                (format!("checkpoint-w{i}"), format!("checkpoint-name-{i}")),
+            )
+            .await
+            .unwrap();
+        }
+
+        db.execute(
+            "UPDATE workspaces SET updated_at = 2 WHERE id IN (
+                SELECT id FROM workspaces WHERE id LIKE 'checkpoint-w%' ORDER BY id LIMIT 30
+            )",
+            (),
+        )
+        .await
+        .unwrap();
+
+        for i in (0..60).step_by(3) {
+            db.execute(
+                "DELETE FROM workspaces WHERE id = ?1",
+                (format!("checkpoint-w{i}"),),
+            )
+            .await
+            .unwrap();
+        }
+
+        db.consume_query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            query_text(&db, "PRAGMA integrity_check").await.unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM workspaces WHERE id LIKE 'checkpoint-w%'"
+            )
+            .await
+            .unwrap(),
+            40
+        );
+
+        let reopened = LocalDb::open(path).await.unwrap();
+        assert_eq!(
+            query_text(&reopened, "PRAGMA integrity_check")
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            query_i64(
+                &reopened,
+                "SELECT COUNT(*) FROM workspaces WHERE id LIKE 'checkpoint-w%'"
+            )
+            .await
+            .unwrap(),
+            40
         );
     }
 }

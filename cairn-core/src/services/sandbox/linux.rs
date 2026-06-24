@@ -15,7 +15,7 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
-use landlock::{Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
+use landlock::{AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI};
 
 const ABI_VERSION: ABI = ABI::V1;
 
@@ -33,6 +33,11 @@ pub fn is_available() -> bool {
 /// Install a `pre_exec` hook that restricts the child to write only within the
 /// policy's writable set. Fail-closed: if landlock cannot be applied, the spawn
 /// fails rather than running unconfined.
+///
+/// For a read-only-checkout policy the live checkout is absent from
+/// [`SandboxPolicy::writable_paths`], so write-confinement excludes it
+/// automatically here — the kernel denies writes into the checkout while reads
+/// stay unconfined (the v1 Linux scope). No Linux-specific branch is needed.
 pub fn install_pre_exec(cmd: &mut std::process::Command, policy: &SandboxPolicy) {
     let mut writable = policy.writable_paths();
     // /dev is I/O plumbing (tty, null, fd) and must stay writable.

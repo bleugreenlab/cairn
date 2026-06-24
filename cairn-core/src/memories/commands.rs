@@ -143,12 +143,20 @@ pub fn send_memory_review_on_idle(
 
                 // Drafts present -> review them; this fires for every run,
                 // sub-agent tasks included. No drafts -> invite a reflection,
-                // but only for top-level node jobs after a meaningfully long
-                // session. Tasks (parent_job_id set) skip the nudge so every
-                // Explore/etc. isn't pushed to memorize, and short sessions skip
-                // it to avoid noisy end-of-job interruptions.
+                // but only for top-level node jobs that did substantial work.
+                // Tasks (parent_job_id set) skip the nudge so every Explore/etc.
+                // isn't pushed to memorize, and trivial jobs skip it (too little
+                // activity to be worth a reflection) to avoid noisy end-of-job
+                // interruptions.
                 let content = if drafts.is_empty() {
-                    if is_task || !run_session_exceeds_turn_threshold(conn, &run_id, 10).await? {
+                    if is_task
+                        || !job_activity_exceeds_threshold(
+                            conn,
+                            &job_id,
+                            REFLECTION_ACTIVITY_THRESHOLD,
+                        )
+                        .await?
+                    {
                         return Ok(false);
                     }
                     build_reflection_prompt()
@@ -199,17 +207,32 @@ Whatever remains after this review turn is saved for triage.\n\nDraft memories:\
     Ok(prompt)
 }
 
-async fn run_session_exceeds_turn_threshold(
+/// Minimum number of recorded events across a job's runs before the no-drafts
+/// reflection nudge is sent. Chosen against the observed data shape: a builder
+/// that did real work logs hundreds of events even when it finishes in one or
+/// two turns (each tool call records an assistant event plus a result event),
+/// while a trivial job logs only a handful. 50 sits well clear of the trivial
+/// floor yet far below the heavy-worker band, so substantial jobs are invited
+/// to reflect without interrupting near-no-op ones.
+const REFLECTION_ACTIVITY_THRESHOLD: i64 = 50;
+
+/// Whether a job did enough work to be worth a reflection nudge, measured by the
+/// total event count across every run of the job. Events, not turns, are the
+/// unit: the heaviest builders do hundreds of tool calls in only one or two
+/// turns, so a turn count systematically under-invites exactly the busiest jobs.
+/// Counting across all of the job's runs (rather than one run's session) keeps
+/// the measure from being deflated by session rotation over a long job.
+async fn job_activity_exceeds_threshold(
     conn: &turso::Connection,
-    run_id: &str,
+    job_id: &str,
     threshold: i64,
 ) -> Result<bool, DbError> {
     let mut rows = conn
         .query(
             "SELECT COUNT(*)
-             FROM turns
-             WHERE session_id = (SELECT session_id FROM runs WHERE id = ?1)",
-            params![run_id],
+             FROM events
+             WHERE run_id IN (SELECT id FROM runs WHERE job_id = ?1)",
+            params![job_id],
         )
         .await?;
     let Some(row) = rows.next().await? else {
@@ -366,4 +389,246 @@ fn job_has_artifacts_or_review_state(
         .await
         .map_err(|e| e.to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::send_memory_review_on_idle;
+    use crate::db::DbState;
+    use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use turso::params;
+
+    struct TestOrch {
+        _temp: TempDir,
+        orch: Orchestrator,
+    }
+
+    async fn test_orch() -> TestOrch {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let local = Arc::new(
+            LocalDb::open(temp.path().join("review-test.db"))
+                .await
+                .unwrap(),
+        );
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/project', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('issue-main', 'project-1', 42, 'Main', 'active', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('exec-main', 'recipe', 'issue-main', 'project-1', 'running', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let search_index =
+            Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let db = Arc::new(DbState::new(local, search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch = OrchestratorBuilder::new(db, services, config_dir).build();
+        TestOrch { _temp: temp, orch }
+    }
+
+    async fn insert_job(test: &TestOrch, job_id: &str, parent_job_id: Option<&str>) {
+        test.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, parent_job_id, created_at, updated_at)
+                 VALUES (?1, 'exec-main', 'issue-main', 'project-1', 'running', 'builder', 'builder', ?2, 1, 1)",
+                params![job_id, parent_job_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn insert_run(test: &TestOrch, run_id: &str, job_id: &str, session_id: &str) {
+        test.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO runs (id, issue_id, project_id, job_id, status, session_id, created_at, updated_at)
+                 VALUES (?1, 'issue-main', 'project-1', ?2, 'running', ?3, 1, 1)",
+                params![run_id, job_id, session_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn insert_events(test: &TestOrch, run_id: &str, count: i64) {
+        for seq in 0..count {
+            let id = format!("{run_id}-event-{seq}");
+            test.orch
+                .db
+                .local
+                .execute(
+                    "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES (?1, ?2, ?3, 1, 'assistant', '{}', 1)",
+                    params![id.as_str(), run_id, seq],
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn insert_artifact(test: &TestOrch, job_id: &str) {
+        test.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO artifacts (id, job_id, artifact_type, data, created_at, updated_at)
+                 VALUES (?1, ?2, 'create-pr', '{}', 1, 1)",
+                params![format!("{job_id}-artifact").as_str(), job_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn insert_draft_memory(test: &TestOrch, job_id: &str, id: &str) {
+        test.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
+                 VALUES (?1, ?1, 'project-1', 'a durable fact', 'draft', 'project', 'project-1', ?2, 1, 'cairn://p/PRJ/42/1/builder/chat/turn/2', 1, 1)",
+                params![id, job_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn review_state(test: &TestOrch, job_id: &str) -> Option<String> {
+        test.orch
+            .db
+            .local
+            .query_one(
+                "SELECT memory_review_state FROM jobs WHERE id = ?1",
+                params![job_id],
+                |row| row.opt_text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn message_to_run(test: &TestOrch, run_id: &str) -> Option<String> {
+        test.orch
+            .db
+            .local
+            .query_opt(
+                "SELECT content FROM messages WHERE recipient_run_id = ?1 LIMIT 1",
+                params![run_id],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn heavy_but_few_turns_job_is_nudged_to_reflect() {
+        let test = test_orch().await;
+        insert_job(&test, "job-heavy", None).await;
+        // Two runs (e.g. resumed across a session rotation), each below the
+        // threshold alone but well over it combined, proving the count spans
+        // the whole job rather than one run's session.
+        insert_run(&test, "run-a", "job-heavy", "session-1").await;
+        insert_run(&test, "run-b", "job-heavy", "session-2").await;
+        insert_events(&test, "run-a", 30).await;
+        insert_events(&test, "run-b", 40).await;
+        insert_artifact(&test, "job-heavy").await;
+
+        let sent = send_memory_review_on_idle(&test.orch, "job-heavy", "run-b").unwrap();
+        assert!(
+            sent,
+            "a heavy job with no drafts should be nudged to reflect"
+        );
+        assert_eq!(
+            review_state(&test, "job-heavy").await.as_deref(),
+            Some("sent")
+        );
+        let content = message_to_run(&test, "run-b").await.expect("a message");
+        assert!(
+            content.contains("take a moment to reflect"),
+            "expected the reflection prompt, got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trivial_job_is_not_nudged() {
+        let test = test_orch().await;
+        insert_job(&test, "job-trivial", None).await;
+        insert_run(&test, "run-t", "job-trivial", "session-1").await;
+        insert_events(&test, "run-t", 5).await;
+        insert_artifact(&test, "job-trivial").await;
+
+        let sent = send_memory_review_on_idle(&test.orch, "job-trivial", "run-t").unwrap();
+        assert!(!sent, "a trivial job should not be nudged");
+        assert_eq!(review_state(&test, "job-trivial").await, None);
+        assert_eq!(message_to_run(&test, "run-t").await, None);
+    }
+
+    #[tokio::test]
+    async fn task_skips_reflection_nudge_even_when_heavy() {
+        let test = test_orch().await;
+        insert_job(&test, "job-parent", None).await;
+        insert_job(&test, "job-task", Some("job-parent")).await;
+        insert_run(&test, "run-task", "job-task", "session-1").await;
+        insert_events(&test, "run-task", 80).await;
+        insert_artifact(&test, "job-task").await;
+
+        let sent = send_memory_review_on_idle(&test.orch, "job-task", "run-task").unwrap();
+        assert!(
+            !sent,
+            "a sub-agent task should never get the reflection nudge"
+        );
+        assert_eq!(review_state(&test, "job-task").await, None);
+        assert_eq!(message_to_run(&test, "run-task").await, None);
+    }
+
+    #[tokio::test]
+    async fn drafts_present_are_always_reviewed_regardless_of_activity() {
+        let test = test_orch().await;
+        insert_job(&test, "job-drafts", None).await;
+        insert_run(&test, "run-d", "job-drafts", "session-1").await;
+        // Far below the activity threshold: the drafts-present path must fire
+        // unconditionally, ignoring the activity gate entirely.
+        insert_events(&test, "run-d", 3).await;
+        insert_artifact(&test, "job-drafts").await;
+        insert_draft_memory(&test, "job-drafts", "mem-1").await;
+
+        let sent = send_memory_review_on_idle(&test.orch, "job-drafts", "run-d").unwrap();
+        assert!(sent, "a job with draft memories must always be reviewed");
+        assert_eq!(
+            review_state(&test, "job-drafts").await.as_deref(),
+            Some("sent")
+        );
+        let content = message_to_run(&test, "run-d").await.expect("a message");
+        assert!(
+            content.contains("review the memories you captured"),
+            "expected the draft-review prompt, got: {content}"
+        );
+    }
 }

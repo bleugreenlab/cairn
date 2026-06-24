@@ -16,9 +16,8 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::pr_data::helpers::{
-    compute_checks_status, compute_local_mergeable, fast_forward_active_worktree,
-    fetch_checks_via_api, fetch_pr_via_api, local_merge, local_pr_files,
-    update_main_repo_after_merge, ParsedPrDetails,
+    compute_checks_status, compute_local_mergeable, fetch_checks_via_api, fetch_pr_via_api,
+    local_pr_files, reconcile_main_checkout_after_merge, ParsedPrDetails,
 };
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::transitions::Resolution;
@@ -69,15 +68,6 @@ pub struct MergeMrContext {
 
 fn db_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
-}
-
-fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<String>) -> String {
-    let force_merge = merge_context.is_workspace || merge_context.has_triage_batch;
-    if force_merge {
-        "merge".to_string()
-    } else {
-        merge_method.unwrap_or_else(|| "squash".to_string())
-    }
 }
 
 /// Query the `merge_requests` row linked to a job (joined with its project for
@@ -301,6 +291,56 @@ async fn load_mr_issue_id(db: &LocalDb, mr_id: &str) -> Result<Option<String>, S
     )
     .await
     .map_err(|e| db_error("Failed to load merge request issue", e))
+}
+
+/// The PR's source branch / jj bookmark, used to read jj conflict state.
+async fn load_mr_source_branch(db: &LocalDb, mr_id: &str) -> Result<Option<String>, String> {
+    let mr_id = mr_id.to_string();
+    db.query_opt_text(
+        "SELECT source_branch FROM merge_requests WHERE id = ?1",
+        params![mr_id.as_str()],
+    )
+    .await
+    .map_err(|e| db_error("Failed to load merge request source branch", e))
+}
+
+/// Whether a PR source bookmark carries a recorded jj conflict. jj records merge
+/// conflicts *inside* the commit, which GitHub still reports as mergeable (and
+/// renders as garbage), so every PR read and merge boundary trusts this over the
+/// GitHub mergeable bit. `false` (fail-open on the read side) when jj cannot be
+/// consulted — only a definite recorded conflict gates.
+pub(crate) fn jj_source_branch_conflicted(
+    jj_binary_path: &str,
+    config_dir: &Path,
+    repo_path: &str,
+    source_branch: &str,
+) -> bool {
+    let jj = crate::jj::JjEnv::resolve(jj_binary_path, config_dir);
+    let store = crate::jj::project_store_dir(config_dir, Path::new(repo_path));
+    match crate::jj::branch_has_conflict(&jj, &store, source_branch) {
+        Ok(conflicted) => conflicted,
+        Err(e) => {
+            log::warn!("jj conflict check for {source_branch} failed (treating as clean): {e}");
+            false
+        }
+    }
+}
+
+/// Mergeability override for a jj PR read path: `Conflicting` when the source
+/// bookmark has a recorded conflict, else `None` (keep the GitHub value).
+async fn jj_conflict_mergeable_override(
+    orch: &Orchestrator,
+    repo_path: &str,
+    mr_id: &str,
+) -> Option<MergeableState> {
+    let source_branch = load_mr_source_branch(&orch.db.local, mr_id).await.ok()??;
+    jj_source_branch_conflicted(
+        &orch.jj_binary_path,
+        &orch.config_dir,
+        repo_path,
+        &source_branch,
+    )
+    .then_some(MergeableState::Conflicting)
 }
 
 async fn update_merge_request_github_cache(
@@ -934,7 +974,10 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
     let creds = get_credentials_for_owner(&orch.db.local, &owner).await?;
 
     let http = &*orch.services.http;
-    let pr_details = fetch_pr_via_api(http, &creds, &owner, &repo, pr_number).await?;
+    let mut pr_details = fetch_pr_via_api(http, &creds, &owner, &repo, pr_number).await?;
+    if let Some(mergeable) = jj_conflict_mergeable_override(orch, &repo_path, &mr_id).await {
+        pr_details.mergeable = mergeable;
+    }
     let checks = fetch_checks_via_api(http, &creds, &owner, &repo, &pr_details.head_sha)
         .await
         .unwrap_or_default();
@@ -1219,10 +1262,17 @@ pub async fn render_live_pr_section(
     };
 
     let http = &*orch.services.http;
-    let pr_details = match fetch_pr_via_api(http, &creds, &owner, &repo, pr_number).await {
+    let mut pr_details = match fetch_pr_via_api(http, &creds, &owner, &repo, pr_number).await {
         Ok(d) => d,
         Err(e) => return Some(format!("{header}\n(failed to fetch live PR: {e})\n")),
     };
+    // Same jj conflict gate as the cache refresh: a jj-conflicted source bookmark
+    // is rendered (and re-cached) as Conflicting, not GitHub's false mergeable.
+    if let Some(mergeable) =
+        jj_conflict_mergeable_override(orch, &mr_context.repo_path, &mr_context.mr_id).await
+    {
+        pr_details.mergeable = mergeable;
+    }
     let checks = fetch_checks_via_api(http, &creds, &owner, &repo, &pr_details.head_sha)
         .await
         .unwrap_or_default();
@@ -1426,28 +1476,27 @@ pub async fn reconcile_after_merge(orch: Orchestrator, ctx: MergeMrContext) {
         }
     }
 
-    // 2. Pull the main repository to reflect merged changes (only when it is on
-    //    the default branch; gated on the `pull_on_merge` setting).
-    if pr_number.is_some() && pull_on_merge_setting() {
-        let git = &*orch.services.git;
-        if let Err(e) = update_main_repo_after_merge(git, &repo_path, &default_branch) {
-            log::warn!("Failed to update main repo after merge: {}", e);
-        }
+    // 2. Reconcile the user's project checkout. The merge fold exported the
+    //    default branch into the backing `.git`, which advances
+    //    `refs/heads/<default>` but detaches the checkout's HEAD; re-attach it
+    //    and fast-forward to the merged tip (for BOTH local and remote merges).
+    //    A remote merge with `pull_on_merge` also pulls origin to absorb any
+    //    external advance of the default branch.
+    let git = &*orch.services.git;
+    let pull = pr_number.is_some() && pull_on_merge_setting();
+    if let Err(e) = reconcile_main_checkout_after_merge(git, &repo_path, &default_branch, pull) {
+        log::warn!("Failed to reconcile main checkout after merge: {}", e);
     }
 
-    // 3. Fast-forward an active worktree on the PR's target branch (e.g. a
-    //    Coordinator integration branch). Always runs — a stale agent worktree
-    //    is the bug this fixes — and skips the main-repo/default-branch checkout
-    //    handled by step 2.
-    {
-        let git = &*orch.services.git;
-        if pr_number.is_some() {
-            if let Err(e) = fast_forward_active_worktree(git, Path::new(&repo_path), &target_branch)
-            {
-                log::warn!("Worktree fast-forward after merge failed: {}", e);
-            }
-        }
-    }
+    // 3. Downstream-workspace reconciliation runs synchronously inside
+    //    `resolve_pr_node` (before this background task is spawned), in
+    //    `base_advance::reconcile_jj_downstream`. It does two asymmetric things
+    //    over the shared store: in-flight SIBLINGS (branched FROM the integration
+    //    branch) auto-rebase onto the advanced tip, and the workspace whose branch
+    //    IS the integration branch (a Coordinator) has its `@` re-parented onto
+    //    the folded tip via `crate::jj::advance_workspace_onto` — the jj-native
+    //    restoration of the old git "post-merge fast-forward of active worktrees".
+    //    So there is no git worktree fast-forward step here.
 
     // 4. Tear down worktrees and branches for the merged issue (issue-wide).
     //    Scoped to the merged PR's issue, so a Coordinator worktree on a
@@ -1465,6 +1514,283 @@ pub async fn reconcile_after_merge(orch: Orchestrator, ctx: MergeMrContext) {
     log::info!("Post-merge reconciliation completed for owner {}", owner_id);
 }
 
+/// Perform a jj source→target merge entirely in the shared store: fold the
+/// source's commit into the target bookmark, then (for a project with a
+/// remote) push the target to origin. The push advances the target branch and —
+/// because the source's head commit is now an ancestor of the target —
+/// GitHub's out-of-band "merged outside GitHub" detection marks the source PR
+/// Merged (the way `git merge feature; git push` does). Returns the new
+/// target-tip commit id to persist as `merge_requests.merged_commit`. For a
+/// no-remote project the push is skipped and the fold is purely local.
+///
+/// Two fold shapes, discriminated by whether the target IS the project default
+/// branch:
+///
+/// - target ≠ default (a child PR into a Coordinator integration branch):
+///   `reconcile_siblings` keeps the source sitting on the current integration
+///   tip, so a forward-only `merge_into_bookmark` is correct and a backwards
+///   refusal would be a genuine orchestration bug — keep it loud.
+/// - target == default: the default branch advances OUTSIDE Cairn's fold chain
+///   (another PR merged into it, or an external push), so the source's fork
+///   point may now lag the live tip and a bare FF would be refused. Fetch the
+///   live tip and rebase the source onto it, then FF. For the default `squash`
+///   method the rebased chain is first collapsed to a single commit on the live
+///   tip (`squash_branch_onto`) so the default branch gains exactly one commit
+///   per PR; the `merge` method (workspace / memory-triage PRs) keeps the real
+///   per-commit fold via `rebase_then_fold_into`. Either way the rebase/squash
+///   rewrites the source's commit id, so origin's PR head SHA is no longer
+///   reachable from the new target; push the rewritten source first so its PR
+///   head matches the commit that lands on the default branch, then advance the
+///   target to mark the PR Merged out of band.
+async fn store_merge_child(
+    orch: &Orchestrator,
+    merge_context: &MergeMrContext,
+    method: &str,
+) -> Result<String, String> {
+    let repo_path = merge_context.mr.repo_path.as_str();
+    let target_branch = merge_context.target_branch.as_str();
+    let source_branch = merge_context.source_branch.as_str();
+    let default_branch = merge_context.default_branch.as_str();
+    let project_id = merge_context.project_id.as_str();
+    let has_remote = !merge_context.mr.is_local;
+    let squash_title = merge_context.title.as_str();
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+
+    if target_branch == default_branch {
+        // The default branch advances out of band. Bring its live tip into the
+        // store (it may have moved via another Cairn merge OR externally — a
+        // fetch covers both) and rebase the source onto it before the FF fold,
+        // so the fold can never go backwards.
+        let dest = if has_remote {
+            // Track + fetch so `<target>@origin` resolves to the live tip
+            // (mirrors how `base_advance.rs` learns an external default advance).
+            // Best-effort: warn and fall back to whatever the store last saw.
+            if let Err(e) = crate::jj::track_bookmark(&jj, &store, target_branch) {
+                log::debug!("jj store merge: track {target_branch} (continuing): {e}");
+            }
+            if let Err(e) = crate::jj::fetch_remote(&jj, &store, "origin") {
+                log::warn!(
+                    "jj store merge: fetch origin before rebase-then-fold (continuing): {e}"
+                );
+            }
+            format!("{target_branch}@origin")
+        } else {
+            target_branch.to_string()
+        };
+
+        if method == "squash" {
+            // Squash landing: rebase the source onto the live default tip, then
+            // collapse the rebased chain to a single commit on that tip before
+            // the FF — so the default branch gains exactly one commit per PR
+            // instead of every per-change commit the agent sealed.
+            crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)?;
+            if crate::jj::branch_has_conflict(&jj, &store, source_branch)? {
+                // The rebase recorded a conflict and the default bookmark was NOT
+                // moved. The source's live workspace `@` was rebased out from
+                // under it and is now stale: materialize the markers (as
+                // `reconcile_siblings` does) so resolve-and-retry is actionable,
+                // and let the merge gate keep blocking until they are resolved.
+                materialize_source_conflict_in_workspaces(orch, project_id, &jj, source_branch)
+                    .await;
+                return Err(format!(
+                    "Refusing to merge: rebasing `{source_branch}` onto the advanced default branch `{target_branch}` recorded a conflict. Resolve the conflict markers in the workspace and let it re-seal, then merge again."
+                ));
+            }
+            // Idempotence guard (mirrors the old real-fold path's no-op on a
+            // retry): if the source already resolves to the LOCAL default
+            // bookmark, a prior attempt's fold already landed this PR's content
+            // and only local resolution / DB marking failed. Squashing again
+            // would mint a fresh empty commit on the default tip and FF onto it,
+            // adding one empty commit per retry. Skip the squash+fold and fall
+            // through to the return. Compared against the LOCAL target (not
+            // `dest`): when an interrupted retry still needs to advance origin,
+            // the source already equals the local tip while `dest@origin` may
+            // lag, and re-squashing against the lagging origin tip would mint a
+            // sideways commit the FF then refuses. The remote push block below
+            // still runs, idempotently finishing any unpushed origin advance.
+            let already_landed = matches!(
+                (
+                    crate::jj::bookmark_commit(&jj, &store, source_branch),
+                    crate::jj::bookmark_commit(&jj, &store, target_branch),
+                ),
+                (Some(source_tip), Some(target_tip)) if source_tip == target_tip
+            );
+            if !already_landed {
+                // Collapse to one commit whose parent is the live default tip and
+                // whose tree equals the rebased source, then FF the default to it.
+                crate::jj::squash_branch_onto(&jj, &store, source_branch, &dest, squash_title)?;
+                crate::jj::merge_into_bookmark(&jj, &store, target_branch, source_branch)?;
+            }
+        } else {
+            // Non-squash (workspace / memory-triage): keep the real fold so the
+            // default branch carries every sealed commit. Rebase the source onto
+            // the live default tip, then FF the default to it.
+            if let Err(conflict_err) =
+                crate::jj::rebase_then_fold_into(&jj, &store, target_branch, source_branch, &dest)
+            {
+                // The rebase recorded a conflict on the source bookmark and
+                // aborted the fold — the default bookmark was NOT moved. The
+                // source's live workspace `@` was rebased out from under it and is
+                // now stale: its on-disk files do not yet carry the conflict
+                // markers. Materialize them (as `reconcile_siblings` does after a
+                // store-driven rebase) so the resolve-and-retry guidance is
+                // actionable, and the merge gate keeps blocking until the agent
+                // resolves them.
+                materialize_source_conflict_in_workspaces(orch, project_id, &jj, source_branch)
+                    .await;
+                return Err(conflict_err);
+            }
+        }
+
+        if has_remote {
+            // Advance the rebased source's PR head on origin BEFORE advancing the
+            // target. The rebase rewrote the source's commit id, so origin's PR
+            // head must move to the rebased commit or GitHub never marks the PR
+            // Merged (its old head SHA is not reachable from the advanced
+            // default). Load-bearing, so fail closed: do NOT advance the target
+            // on origin while the PR head still points at the abandoned commit —
+            // that would land the content but leave the PR unmerged. A retry is
+            // idempotent (the source already sits on the fetched tip).
+            if let Err(e) = crate::jj::track_bookmark(&jj, &store, source_branch) {
+                log::debug!("jj store merge: track {source_branch} (continuing): {e}");
+            }
+            crate::jj::push_store_bookmark(&jj, &store, source_branch).map_err(|e| {
+                format!(
+                    "Refusing to complete the merge: could not advance the rebased source `{source_branch}` on origin ({e}). The default branch was not advanced on origin; retry the merge."
+                )
+            })?;
+            reflect_child_merge_on_github(&jj, &store, target_branch)?;
+        }
+    } else {
+        // Child→integration: reconcile keeps the source on the current
+        // integration tip, so a forward-only fold is correct. Defensively track
+        // the target before the fold-push, or jj rejects pushing a bookmark whose
+        // `@origin` ref was created outside this store's jj (best-effort).
+        if has_remote {
+            if let Err(e) = crate::jj::track_bookmark(&jj, &store, target_branch) {
+                log::debug!("jj store merge: track {target_branch} (continuing): {e}");
+            }
+        }
+
+        // Fold the source's real commit into the target bookmark (forward-only).
+        crate::jj::merge_into_bookmark(&jj, &store, target_branch, source_branch)?;
+
+        // Reflect the merge on GitHub by advancing origin's target ref.
+        if has_remote {
+            reflect_child_merge_on_github(&jj, &store, target_branch)?;
+        }
+    }
+
+    crate::jj::bookmark_commit(&jj, &store, target_branch)
+        .ok_or_else(|| format!("target bookmark `{target_branch}` did not resolve after the fold"))
+}
+
+/// After `rebase_then_fold_into` records a conflict on the source bookmark and
+/// aborts the default-branch fold, the source branch's live workspace `@` was
+/// rebased out from under it and is now stale — its on-disk files do not yet
+/// carry the conflict markers. Refresh each workspace on the source branch (as
+/// `reconcile_siblings` does after a store-driven rebase) so the resolve-and-retry
+/// error is actionable: the agent actually sees markers to resolve. Best-effort
+/// — a refresh failure only means the agent must `jj workspace update-stale`
+/// itself; it never blocks the (already-failed) merge.
+async fn materialize_source_conflict_in_workspaces(
+    orch: &Orchestrator,
+    project_id: &str,
+    jj: &crate::jj::JjEnv,
+    source_branch: &str,
+) {
+    let worktrees = match load_worktrees_on_branch(&orch.db.local, project_id, source_branch).await
+    {
+        Ok(worktrees) => worktrees,
+        Err(e) => {
+            log::warn!(
+                "jj store merge: could not load workspaces on {source_branch} to materialize conflict: {e}"
+            );
+            return;
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    for worktree in worktrees {
+        // Several jobs can share one physical worktree; refresh each once.
+        if !seen.insert(worktree.clone()) {
+            continue;
+        }
+        if let Err(e) = crate::jj::update_stale(jj, Path::new(&worktree)) {
+            log::warn!("jj store merge: update-stale {worktree} after conflict failed: {e}");
+        }
+    }
+}
+
+/// Worktree paths of in-flight jobs whose branch IS `branch` (the source branch
+/// of a merge). Mirrors `base_advance::load_on_branch_workspaces`' status guard
+/// so a just-finished Coordinator (status `complete`) whose PR is not yet marked
+/// merged is still found.
+async fn load_worktrees_on_branch(
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+) -> Result<Vec<String>, String> {
+    let project_id = project_id.to_string();
+    let branch = branch.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        let branch = branch.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT j.worktree_path
+                     FROM jobs j
+                     WHERE j.project_id = ?1
+                       AND j.branch = ?2
+                       AND j.worktree_path IS NOT NULL
+                       AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
+                             OR EXISTS (
+                               SELECT 1 FROM merge_requests mr
+                               WHERE mr.source_branch = j.branch
+                                 AND mr.project_id = j.project_id
+                                 AND mr.status NOT IN ('merged', 'closed')
+                             ) )",
+                    params![project_id.as_str(), branch.as_str()],
+                )
+                .await?;
+            let mut worktrees = Vec::new();
+            while let Some(row) = rows.next().await? {
+                worktrees.push(row.text(0)?);
+            }
+            Ok(worktrees)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Reflect a folded child merge as Merged on GitHub by pushing the advanced
+/// integration bookmark to origin. This is the single swappable seam for the
+/// GitHub-state hypothesis: if live testing ever shows GitHub marks the PR Closed
+/// (or is unreliable), a state-only merge-API call belongs here and nowhere else
+/// — the store already owns the content by this point.
+fn reflect_child_merge_on_github(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    integration_branch: &str,
+) -> Result<(), String> {
+    crate::jj::push_store_bookmark(jj, store, integration_branch)
+}
+
+/// Resolve the effective merge method for a PR. Squash is the default shape for
+/// a normal PR landing on the default branch (one commit per PR), but workspace
+/// PRs and memory-triage-batch PRs deliberately preserve their individual
+/// commits, so they always force `"merge"` regardless of the requested method.
+fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<String>) -> String {
+    let force_merge = merge_context.is_workspace || merge_context.has_triage_batch;
+    if force_merge {
+        "merge".to_string()
+    } else {
+        merge_method.unwrap_or_else(|| "squash".to_string())
+    }
+}
+
 /// Merge a PR, mark the issue merged, and run post-merge reconciliation (file
 /// capture, optional main-repo pull, active-worktree fast-forward, teardown, PR
 /// refresh) in the background via `reconcile_after_merge`.
@@ -1477,87 +1803,33 @@ pub async fn merge_pr_for_job(
     let repo_path = merge_context.mr.repo_path.clone();
     let issue_id = merge_context.issue_id.clone();
 
-    let method = effective_merge_method(&merge_context, merge_method);
-    if let Some(pr_number) = merge_context.mr.github_pr_number {
-        let (owner, repo) = get_owner_repo(&repo_path)?;
-        let creds = get_credentials_for_owner(&orch.db.local, &owner).await?;
-
-        let http = &*orch.services.http;
-        api::merge_pr(http, &creds, &owner, &repo, pr_number, &method).await?;
-    } else {
-        log::info!(
-            "Starting local merge request merge for job/action {}: {} -> {} using {} in {}",
-            job_id,
-            merge_context.source_branch,
-            merge_context.target_branch,
-            method,
-            repo_path
-        );
-        let local_files = match local_pr_files(
-            &*orch.services.git,
-            Path::new(&repo_path),
-            &merge_context.target_branch,
-            &merge_context.source_branch,
-        ) {
-            Ok(files) => files,
-            Err(error) => {
-                log::warn!(
-                    "Could not capture local merge request file list before merge for job/action {} ({} -> {}): {}",
-                    job_id,
-                    merge_context.source_branch,
-                    merge_context.target_branch,
-                    error
-                );
-                Vec::new()
-            }
-        };
-        let merged_commit = local_merge(
-            &*orch.services.git,
-            Path::new(&repo_path),
-            &merge_context.target_branch,
-            &merge_context.source_branch,
-            &method,
-            &merge_context.title,
-        )
-        .map_err(|error| {
-            let message = format!(
-                "Local merge failed for {} -> {} in {}: {}",
-                merge_context.source_branch, merge_context.target_branch, repo_path, error
-            );
-            log::error!("{}", message);
-            message
-        })?;
-        log::info!(
-            "Local merge request git merge succeeded for job/action {} at commit {}",
-            job_id,
-            merged_commit
-        );
-        if !local_files.is_empty() {
-            match resolve_file_change_job_id(&orch.db.local, job_id).await {
-                Ok(Some(file_change_job_id)) => {
-                    if let Err(error) = store_file_changes(orch, &file_change_job_id, &local_files).await
-                    {
-                        log::warn!(
-                            "Local merge request merged but file-change history capture failed for owner {} (resolved job {}): {}",
-                            job_id,
-                            file_change_job_id,
-                            error
-                        );
-                    }
-                }
-                Ok(None) => log::warn!(
-                    "Local merge request merged but file-change history capture skipped for owner {}: no jobs.id owner found",
-                    job_id
-                ),
-                Err(error) => log::warn!(
-                    "Local merge request merged but file-change history capture skipped for owner {}: {}",
-                    job_id,
-                    error
-                ),
-            }
-        }
-        persist_merged_commit(&orch.db.local, &merge_context.mr.mr_id, &merged_commit).await?;
+    // Merge boundary: refuse a jj-conflicted source bookmark before the store
+    // fold. Fails closed regardless of cached/rendered mergeable state — a
+    // conflicted child must never be folded into integration. Under
+    // store-owns-merge the old staleness window largely dissolves: a
+    // cleanly-rebased sibling is pushed immediately, so origin's PR head tracks
+    // the local rebased tip rather than lagging a stale pre-rebase commit.
+    if jj_source_branch_conflicted(
+        &orch.jj_binary_path,
+        &orch.config_dir,
+        &repo_path,
+        &merge_context.source_branch,
+    ) {
+        return Err(format!(
+            "Refusing to merge: the jj source bookmark `{}` has a recorded conflict. Resolve the conflict in the workspace and let it re-seal/push, then merge.",
+            merge_context.source_branch
+        ));
     }
+    // The shared jj store owns the merge: fold the child's commit into the
+    // integration bookmark and (for a remote project) push it, which advances
+    // origin and marks the child PR Merged out-of-band. A no-remote jj project
+    // folds locally and skips the push. The method selects the *shape* that lands
+    // on the default branch: `squash` (the default) collapses the source to one
+    // commit before the fold; `merge` (forced for workspace / memory-triage PRs)
+    // keeps every sealed commit.
+    let method = effective_merge_method(&merge_context, merge_method);
+    let merged_commit = store_merge_child(orch, &merge_context, &method).await?;
+    persist_merged_commit(&orch.db.local, &merge_context.mr.mr_id, &merged_commit).await?;
 
     let closed_sessions = resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
         .await
@@ -1611,26 +1883,150 @@ mod tests {
         }
     }
 
+    /// Squash is the default landing shape; workspace and memory-triage-batch PRs
+    /// always force `merge` so their individual commits survive, even when the
+    /// caller asks for another method.
     #[test]
-    fn canon_prs_always_use_merge_method() {
+    fn effective_merge_method_defaults_squash_and_forces_merge_for_canon() {
+        // Workspace PR forces merge regardless of the requested method.
         assert_eq!(
             effective_merge_method(&merge_context(true, false), Some("squash".to_string())),
             "merge"
         );
+        // Memory-triage-batch PR forces merge regardless of the requested method.
         assert_eq!(
             effective_merge_method(&merge_context(false, true), Some("rebase".to_string())),
             "merge"
         );
+        // A normal PR with no requested method defaults to squash.
         assert_eq!(
             effective_merge_method(&merge_context(false, false), None),
             "squash"
         );
+        // An explicit method on a normal PR is honored.
+        assert_eq!(
+            effective_merge_method(&merge_context(false, false), Some("merge".to_string())),
+            "merge"
+        );
     }
+
+    /// The merge gate trusts jj's recorded conflict state: a sibling whose
+    /// auto-rebase recorded a conflict is blocked, a cleanly-rebased sibling is
+    /// not, and a non-jj project never gates. Self-skips when jj is unresolvable.
+    #[test]
+    fn jj_source_branch_conflicted_gates_only_recorded_conflicts() {
+        let bin = match std::env::var("CAIRN_JJ_BIN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                crate::env::command("jj")
+                    .arg("--version")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|_| "jj".to_string())
+            }) {
+            Some(bin) => bin,
+            None => {
+                eprintln!("skipping jj_source_branch_conflicted_gates_only_recorded_conflicts: jj not resolvable");
+                return;
+            }
+        };
+        let run_git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(
+                crate::env::git()
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        let home = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+
+        run_git(proj.path(), &["init", "-q", "-b", "main"]);
+        run_git(proj.path(), &["config", "user.email", "t@e.com"]);
+        run_git(proj.path(), &["config", "user.name", "T"]);
+        std::fs::write(proj.path().join("shared.rs"), "base\n").unwrap();
+        run_git(proj.path(), &["add", "-A"]);
+        run_git(proj.path(), &["commit", "-q", "-m", "base"]);
+
+        // Build the shared store at the path the gate computes from config_dir.
+        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+        let store = crate::jj::project_store_dir(home.path(), proj.path());
+        crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let cfg = home.path().join("jj").join("config.toml");
+        let jj_cfg = |cwd: &std::path::Path, args: &[&str]| {
+            let out = crate::env::command(&bin)
+                .args(args)
+                .current_dir(cwd)
+                .env("JJ_CONFIG", &cfg)
+                .env("EDITOR", "true")
+                .env("JJ_EDITOR", "true")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "jj {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let int = "agent/CAIRN-1940-coordinator-0";
+        jj_cfg(&store, &["bookmark", "create", "-r", "main", int]);
+
+        let overlap = "agent/CAIRN-1-builder-0";
+        let clean = "agent/CAIRN-2-builder-0";
+        let ws_o = wts.path().join("o");
+        let ws_c = wts.path().join("c");
+        crate::jj::add_workspace(&jj, &store, &ws_o, overlap, int, None).unwrap();
+        crate::jj::add_workspace(&jj, &store, &ws_c, clean, int, None).unwrap();
+        std::fs::write(ws_o.join("shared.rs"), "overlap-change\n").unwrap();
+        crate::jj::seal(&jj, &ws_o, "overlap", None).unwrap();
+        std::fs::write(ws_c.join("other.rs"), "clean-change\n").unwrap();
+        crate::jj::seal(&jj, &ws_c, "clean", None).unwrap();
+
+        // Advance the integration tip conflictingly, then reconcile (rebase).
+        jj_cfg(&store, &["new", int]);
+        std::fs::write(store.join("shared.rs"), "integration-advanced\n").unwrap();
+        jj_cfg(&store, &["describe", "-m", "advance"]);
+        jj_cfg(&store, &["bookmark", "set", int, "-r", "@"]);
+        crate::jj::reconcile_siblings(
+            &jj,
+            &store,
+            int,
+            &[
+                (overlap.to_string(), ws_o.clone()),
+                (clean.to_string(), ws_c.clone()),
+            ],
+        )
+        .unwrap();
+
+        let proj_path = proj.path().to_string_lossy().to_string();
+        assert!(
+            jj_source_branch_conflicted(&bin, home.path(), &proj_path, overlap),
+            "a recorded-conflict sibling must gate the merge"
+        );
+        assert!(
+            !jj_source_branch_conflicted(&bin, home.path(), &proj_path, clean),
+            "a cleanly-rebased sibling must not gate"
+        );
+
+        // A non-jj project (no config marker) never gates.
+        let git_proj = tempfile::tempdir().unwrap();
+        assert!(!jj_source_branch_conflicted(
+            &bin,
+            home.path(),
+            &git_proj.path().to_string_lossy(),
+            overlap
+        ));
+    }
+
     use crate::db::DbState;
     use crate::services::testing::{MockGitClient, TestServicesBuilder};
-    use crate::services::GitOutput;
     use crate::storage::{LocalDb, SearchIndex};
-    use std::path::Path;
     use std::sync::Arc;
 
     async fn migrated_db() -> LocalDb {
@@ -1903,73 +2299,5 @@ mod tests {
         assert_eq!(ctx.target_branch, "integration");
         assert_eq!(ctx.default_branch, "main");
         assert_eq!(ctx.mr.job_id, "owner-job");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn reconcile_fast_forwards_worktree_on_pr_target_branch() {
-        // A real but non-git tempdir as repo_path makes get_owner_repo fail
-        // cleanly, so reconcile's credential/HTTP steps (file capture, PR
-        // refresh) are graceful no-ops and the test turns purely on git.
-        let repo_dir = tempfile::tempdir().unwrap();
-        let repo_path = repo_dir.path().to_string_lossy().to_string();
-
-        let db = migrated_db().await;
-        seed_merge_request(&db, "owner-job", &repo_path, "integration").await;
-
-        let porcelain = format!(
-            "worktree {repo_path}\nHEAD aaa\nbranch refs/heads/main\n\nworktree /wt/coord\nHEAD bbb\nbranch refs/heads/integration\n"
-        );
-        let repo_path_for_branch = repo_path.clone();
-
-        let mut git = MockGitClient::new();
-        git.expect_worktree_list()
-            .returning(move |_| Ok(porcelain.clone()));
-        git.expect_current_branch().returning(move |repo: &Path| {
-            if repo.to_string_lossy() == repo_path_for_branch {
-                // != default "main" → the main-repo pull (step 2) skips, isolating
-                // the assertion to the worktree fast-forward.
-                Ok("feature".to_string())
-            } else {
-                // The integration worktree at /wt/coord.
-                Ok("integration".to_string())
-            }
-        });
-        git.expect_status().returning(|_| Ok(String::new()));
-        // The fast-forward must fetch then `merge --ff-only origin/integration`.
-        // If target_branch were wrongly the project default, the worktree lookup
-        // would resolve to the main repo path and be skipped — these calls would
-        // never fire and the `.times(1)` expectations would fail.
-        git.expect_run()
-            .withf(|_, args| args.first().map(String::as_str) == Some("fetch"))
-            .times(1)
-            .returning(|_, _| {
-                Ok(GitOutput {
-                    success: true,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                })
-            });
-        git.expect_run()
-            .withf(|_, args| {
-                args.first().map(String::as_str) == Some("merge")
-                    && args.iter().any(|a| a == "origin/integration")
-            })
-            .times(1)
-            .returning(|_, _| {
-                Ok(GitOutput {
-                    success: true,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                })
-            });
-
-        let orch = test_orchestrator(db, git);
-        let ctx = resolve_merge_mr_context_for_job(&orch.db.local, "owner-job")
-            .await
-            .unwrap();
-
-        // No jobs seeded for issue-1 → teardown is a no-op (no further git calls).
-        // MockGitClient verifies the `.times(1)` fetch + ff-only merge on drop.
-        reconcile_after_merge(orch, ctx).await;
     }
 }

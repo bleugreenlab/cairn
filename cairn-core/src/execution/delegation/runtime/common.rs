@@ -580,7 +580,7 @@ async fn latest_run_for_job(db: &LocalDb, job_id: &str) -> Result<Option<String>
         ORDER BY created_at DESC
         LIMIT 1
         ",
-        turso::params![job_id.as_str()],
+        (job_id,),
     )
     .await
     .map_err(|e| format!("Failed to load delegated run: {}", e))

@@ -88,11 +88,7 @@ const PYTHON: LangSpec = LangSpec {
 };
 
 const GO: LangSpec = LangSpec {
-    decls: &[
-        "function_declaration",
-        "method_declaration",
-        "type_spec",
-    ],
+    decls: &["function_declaration", "method_declaration", "type_spec"],
     calls: &["call_expression"],
     callee_fields: &["function"],
 };

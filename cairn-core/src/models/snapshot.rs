@@ -516,15 +516,16 @@ mod tests {
             extras: Some(RuntimeExtras {
                 max_thinking_tokens: None,
                 reasoning_effort: Some("high".to_string()),
+                service_tier: Some("priority".to_string()),
             }),
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("reasoningEffort"));
+        assert!(json.contains("serviceTier"));
         let restored: AgentSnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            restored.extras.unwrap().reasoning_effort.as_deref(),
-            Some("high")
-        );
+        let extras = restored.extras.unwrap();
+        assert_eq!(extras.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(extras.service_tier.as_deref(), Some("priority"));
     }
 
     /// extras is omitted from JSON when None (skip_serializing_if).

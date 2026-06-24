@@ -16,6 +16,7 @@ use crate::models::{
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 use turso::params;
@@ -248,7 +249,11 @@ pub async fn handle_pr_node(
     let (worktree_path, branch_name, base_branch) =
         find_implementation_context(orch, action_run).await?;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
-    let has_remote = crate::mcp::git::has_remote(std::path::Path::new(&worktree_path));
+    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+        .await?
+        .unwrap_or_default();
+    let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
+    let has_remote = vcs.has_remote();
 
     // Seed the merge_requests row with the create-pr title/body before the slow
     // push + GitHub open below. The PR facet appears as soon as this action run
@@ -279,6 +284,7 @@ pub async fn handle_pr_node(
 
     let github = if has_remote {
         let pr_url = open_or_update_github_pr(
+            &vcs,
             &worktree_path,
             &branch_name,
             base_branch.as_deref(),
@@ -395,8 +401,8 @@ async fn resolve_action_inputs(
 
     // Load recipe data from execution snapshot
     let snapshot = load_execution_snapshot(&orch.db.local, &action_run.execution_id).await?;
-    let nodes = snapshot.recipe.nodes;
-    let edges = snapshot.recipe.edges;
+    let nodes = &snapshot.recipe.nodes;
+    let edges = &snapshot.recipe.edges;
 
     // Build node lookup map
     let node_map: HashMap<&str, &RecipeNode> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
@@ -472,8 +478,30 @@ async fn resolve_action_inputs(
         .await?;
 
         if let Some(source_job) = source_job {
+            // Key the load by the producer's resolved terminal CONTRACT name
+            // (e.g. `create-pr`), never the raw edge handle (`context-out`), and
+            // exclude the producer's context-self living-doc names from the
+            // latest-across-job fallback. Without this, a patched, higher-
+            // versioned ctx-self doc (e.g. `plan`) wins the fallback and opens
+            // the PR with the wrong title/body (CAIRN-1953).
+            let terminal_name =
+                producer_terminal_artifact_name(&orch.db.local, &snapshot, &edge.source_node_id)
+                    .await?;
+            let ctx_self_names: Vec<String> =
+                crate::execution::jobs::resolve_ctx_self_schemas_with_snapshot(
+                    &snapshot,
+                    &edge.source_node_id,
+                )
+                .into_iter()
+                .filter_map(|info| info.artifact_name)
+                .collect();
+            let load_name = terminal_name
+                .as_deref()
+                .unwrap_or(edge.source_handle.as_str());
+
             if let Some(artifact) =
-                latest_artifact_for_job(&orch.db.local, &source_job.id, &edge.source_handle).await?
+                latest_artifact_for_job(&orch.db.local, &source_job.id, load_name, &ctx_self_names)
+                    .await?
             {
                 if let Some(field_value) = artifact.data.get(&edge.source_handle) {
                     inputs.insert(edge.target_handle.clone(), field_value.clone());
@@ -491,6 +519,68 @@ async fn resolve_action_inputs(
 // Built-in action handlers
 // ============================================================================
 
+/// Where PR-creation `gh`/`git` commands run. jj is the only substrate: a jj
+/// workspace is `.jj`-only with no `.git`, so gh/git resolve the repo and
+/// `origin` from the project checkout (`repo_path`), while push and head-sha
+/// reads run jj-side against the workspace.
+struct PrVcs {
+    /// cwd for `gh`/`git`: the project checkout (the workspace has no `.git`).
+    gh_cwd: PathBuf,
+    /// The jj driver for the shared store.
+    jj: crate::jj::JjEnv,
+    /// The job's branch / jj bookmark name.
+    branch: String,
+    /// Cairn home, for locating the shared jj store of the project.
+    config_dir: PathBuf,
+}
+
+impl PrVcs {
+    fn resolve(orch: &Orchestrator, _worktree: &str, repo_path: &str, branch: &str) -> Self {
+        Self {
+            gh_cwd: PathBuf::from(repo_path),
+            jj: crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir),
+            branch: branch.to_string(),
+            config_dir: orch.config_dir.clone(),
+        }
+    }
+
+    /// Does the PR target have a usable `origin`? Checked in `gh_cwd` (the
+    /// project checkout); the jj workspace itself has no remote.
+    fn has_remote(&self) -> bool {
+        crate::mcp::git::has_remote(&self.gh_cwd)
+    }
+
+    /// Push the job's bookmark to origin jj-side from the workspace.
+    fn push(&self, worktree: &str) {
+        crate::jj::push_to_origin(&self.jj, Path::new(worktree), &self.branch);
+    }
+
+    /// The branch HEAD commit recorded as the merge_request `head_sha`.
+    fn head_sha(&self, worktree: &str) -> Result<String, String> {
+        crate::jj::head_commit(&self.jj, Path::new(worktree))
+    }
+}
+
+/// Load a project's repo checkout path (the git-backed checkout that carries
+/// `origin`), used as the gh/git cwd for jj-managed PR creation.
+async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<String>, String> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT repo_path FROM projects WHERE id = ?1",
+                    (project_id.as_str(),),
+                )
+                .await?;
+            crate::storage::next_text(&mut rows, 0).await
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to load project repo_path: {e}"))
+}
+
 /// Handle the create_pr action using `gh` CLI.
 async fn handle_create_pr(
     orch: &Orchestrator,
@@ -501,9 +591,14 @@ async fn handle_create_pr(
         find_implementation_context(orch, action_run).await?;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
 
-    let has_remote = crate::mcp::git::has_remote(std::path::Path::new(&worktree_path));
+    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+        .await?
+        .unwrap_or_default();
+    let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
+    let has_remote = vcs.has_remote();
     let github = if has_remote {
         let pr_url = open_or_update_github_pr(
+            &vcs,
             &worktree_path,
             &branch_name,
             base_branch.as_deref(),
@@ -546,6 +641,32 @@ async fn handle_create_pr(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
+
+    // CAIRN-1891: the PR is open in-process right now. The webhook PR-open edge
+    // can be missed (the relay WebSocket can be disconnected when GitHub delivers
+    // the `opened` event, and reconnect fetches 0 missed events), so fire the
+    // review here too — the reliable, in-process edge. Record the branch HEAD as
+    // the merge_request's head_sha FIRST so this edge and the (later) webhook edge
+    // compute the SAME review fingerprint — the webhook's `pull_request.head.sha`
+    // is this same commit — and the shared creator's fingerprint-dedup collapses
+    // them to exactly one wake. Fires for local PRs too (no webhook ever comes).
+    if let Ok(head_sha) = vcs.head_sha(&worktree_path) {
+        if let Err(e) = set_mr_head_sha(&orch.db.local, parent_job_id, &head_sha).await {
+            log::warn!(
+                "Failed to record merge_request head_sha for job {}: {}",
+                parent_job_id,
+                e
+            );
+        }
+    }
+    if let Some(issue_id) = action_run.issue_id.as_deref() {
+        crate::orchestrator::lifecycle::create_review_push_for_pr_open(
+            orch,
+            issue_id,
+            &branch_name,
+        )
+        .await;
+    }
 
     // Refresh the GitHub PR cache so mergeability / review / check state is
     // known promptly. Without this the cache stays unknown until a webhook or
@@ -592,6 +713,7 @@ async fn handle_create_pr(
 }
 
 async fn open_or_update_github_pr(
+    vcs: &PrVcs,
     worktree_path: &str,
     branch_name: &str,
     base_branch: Option<&str>,
@@ -599,10 +721,10 @@ async fn open_or_update_github_pr(
     body: Option<&str>,
 ) -> Result<String, String> {
     log::info!("Creating PR for branch {}", branch_name);
-    crate::mcp::git::push_to_origin(std::path::Path::new(worktree_path));
+    vcs.push(worktree_path);
 
     if let Some(base) = base_branch {
-        ensure_base_branch_on_origin(worktree_path, base)?;
+        ensure_base_branch_on_origin(vcs, base)?;
     }
 
     let body_str = body.unwrap_or("");
@@ -611,10 +733,14 @@ async fn open_or_update_github_pr(
         args.push("--base");
         args.push(base);
     }
+    // The PR is opened from the project checkout, which sits on the user's
+    // branch rather than the agent branch, so name the head branch explicitly.
+    args.push("--head");
+    args.push(branch_name);
 
     let output = crate::env::gh()
         .args(&args)
-        .current_dir(worktree_path)
+        .current_dir(&vcs.gh_cwd)
         .output()
         .map_err(|e| format!("Failed to run gh: {}", e))?;
 
@@ -633,9 +759,13 @@ async fn open_or_update_github_pr(
         "PR already exists for branch {}, updating instead",
         branch_name
     );
+    // From the project checkout the current branch is not the agent branch, so
+    // identify the existing PR by its head branch explicitly.
+    let mut view_args: Vec<&str> = vec!["pr", "view", branch_name];
+    view_args.extend(["--json", "number,url"]);
     let view_output = crate::env::gh()
-        .args(["pr", "view", "--json", "number,url"])
-        .current_dir(worktree_path)
+        .args(&view_args)
+        .current_dir(&vcs.gh_cwd)
         .output()
         .map_err(|e| format!("Failed to run gh pr view: {}", e))?;
     if !view_output.status.success() {
@@ -661,7 +791,7 @@ async fn open_or_update_github_pr(
         .args([
             "pr", "edit", &pr_number, "--title", title, "--body", body_str,
         ])
-        .current_dir(worktree_path)
+        .current_dir(&vcs.gh_cwd)
         .output()
         .map_err(|e| format!("Failed to run gh pr edit: {}", e))?;
     if !edit_output.status.success() {
@@ -672,14 +802,21 @@ async fn open_or_update_github_pr(
     Ok(pr_url)
 }
 
-fn ensure_base_branch_on_origin(worktree_path: &str, base_branch: &str) -> Result<(), String> {
+/// Ensure a non-default base branch exists on origin before opening a PR against
+/// it. A git worktree shares the project's remotes, so the base ref is pushed
+/// from `gh_cwd`. A jj integration-branch base (e.g. a Coordinator's
+/// `agent/CAIRN-<n>-coordinator-<k>`) lives only as a bookmark in the shared
+/// store — the project checkout has no local ref for it — so it is published
+/// from the store instead.
+fn ensure_base_branch_on_origin(vcs: &PrVcs, base_branch: &str) -> Result<(), String> {
+    let gh_cwd = vcs.gh_cwd.as_path();
     if base_branch == "HEAD" || base_branch.starts_with("origin/") {
         return Ok(());
     }
 
     let default_branch = crate::env::git()
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        .current_dir(worktree_path)
+        .current_dir(gh_cwd)
         .output()
         .ok()
         .and_then(|output| {
@@ -697,30 +834,9 @@ fn ensure_base_branch_on_origin(worktree_path: &str, base_branch: &str) -> Resul
         return Ok(());
     }
 
-    let remote_ref = format!("refs/remotes/origin/{base_branch}");
-    let exists = crate::env::git()
-        .args(["show-ref", "--verify", "--quiet", &remote_ref])
-        .current_dir(worktree_path)
-        .status()
-        .map_err(|e| format!("Failed to check remote base branch: {e}"))?
-        .success();
-    if exists {
-        return Ok(());
-    }
-
-    let output = crate::env::git()
-        .args(["push", "origin", base_branch])
-        .current_dir(worktree_path)
-        .output()
-        .map_err(|e| format!("Failed to push base branch {base_branch}: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "Failed to push base branch {base_branch}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
+    // The base bookmark lives in the shared store, not the project checkout.
+    let store = crate::jj::project_store_dir(&vcs.config_dir, gh_cwd);
+    crate::jj::ensure_bookmark_on_origin(&vcs.jj, &store, base_branch)
 }
 
 /// Refuse an automated terminal resolution while the resolved issue still has
@@ -755,54 +871,32 @@ async fn handle_merge_pr(
         ensure_resolution_not_blocked(orch, issue_id, "merged").await?;
     }
 
-    let (worktree_path, _, _) = find_implementation_context(orch, action_run).await?;
+    let (_worktree_path, branch_name, _) = find_implementation_context(orch, action_run).await?;
+    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+        .await?
+        .unwrap_or_default();
+    let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
 
-    // Get merge method from settings
-    let merge_method = orch.get_settings().merge_type.to_string();
-
-    // Use gh pr merge
-    let output = crate::env::gh()
-        .args(["pr", "merge", "--auto", &format!("--{}", merge_method)])
-        .current_dir(&worktree_path)
-        .output()
-        .map_err(|e| format!("Failed to run gh pr merge: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr merge failed: {}", stderr));
+    // Merge boundary: refuse a jj-conflicted source bookmark before merging.
+    // Trusts jj's recorded conflict state, not the GitHub mergeable bit (which is
+    // false for a jj-conflicted commit).
+    if crate::pr_data::actions::jj_source_branch_conflicted(
+        &orch.jj_binary_path,
+        &orch.config_dir,
+        &repo_path,
+        &branch_name,
+    ) {
+        return Err(format!(
+            "Refusing to merge: the jj source bookmark `{branch_name}` has a recorded conflict; resolve it first."
+        ));
     }
 
-    // Update merge_request status
-    let now = chrono::Utc::now().timestamp() as i32;
-    {
-        let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
-        update_merge_request_status(&orch.db.local, &mr_job_id, "merged", now).await?;
-
-        // Resolve issue as merged
-        if let Some(ref issue_id) = action_run.issue_id {
-            crate::issues::crud::resolve(
-                &orch.db.local,
-                &*orch.services.clock,
-                issue_id,
-                crate::transitions::Resolution::Merged,
-            )
-            .await
-            .map_err(|e| format!("Failed to resolve issue as merged: {}", e))?;
-            crate::execution::advancement::release_dependent_executions(orch, issue_id).await?;
-        }
-    }
-
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
-    );
-    if action_run.issue_id.is_some() {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "issues", "action": "update"}),
-        );
-    }
-
+    // The shared jj store owns the merge. Route through the same in-app merge
+    // path (fold + push integration, resolve the PR node, reconcile siblings,
+    // wake watchers), so recipe and in-app merges are identical. Passing `None`
+    // selects the default `squash` shape, landing one commit per PR on the
+    // default branch.
+    crate::pr_data::actions::merge_pr_for_job(orch, &mr_job_id, None).await?;
     Ok(Some(serde_json::json!({ "merged": true })))
 }
 
@@ -811,11 +905,17 @@ async fn handle_close_pr(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
-    let (worktree_path, _, _) = find_implementation_context(orch, action_run).await?;
+    let (worktree_path, branch_name, _) = find_implementation_context(orch, action_run).await?;
+    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+        .await?
+        .unwrap_or_default();
+    let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
+    let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
+    let pr_number = load_mr_pr_number(&orch.db.local, &mr_job_id).await?;
 
     let output = crate::env::gh()
-        .args(["pr", "close"])
-        .current_dir(&worktree_path)
+        .args(close_pr_args(pr_number))
+        .current_dir(&vcs.gh_cwd)
         .output()
         .map_err(|e| format!("Failed to run gh pr close: {}", e))?;
 
@@ -827,7 +927,6 @@ async fn handle_close_pr(
     // Update merge_request status
     let now = chrono::Utc::now().timestamp() as i32;
     {
-        let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
         update_merge_request_status(&orch.db.local, &mr_job_id, "closed", now).await?;
     }
 
@@ -875,6 +974,39 @@ async fn find_mr_job_id_for_action(
     action_run: &ActionRun,
 ) -> Result<String, String> {
     find_mr_job_id_for_execution(&orch.db.local, &action_run.execution_id).await
+}
+
+/// The GitHub PR number recorded for a merge_request owner, if any. `None` for a
+/// local (no-remote) PR or before the number is known.
+async fn load_mr_pr_number(db: &LocalDb, mr_job_id: &str) -> Result<Option<i64>, String> {
+    let mr_job_id = mr_job_id.to_string();
+    db.read(|conn| {
+        let mr_job_id = mr_job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT github_pr_number FROM merge_requests WHERE job_id = ?1 LIMIT 1",
+                    (mr_job_id.as_str(),),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => crate::storage::RowExt::opt_i64(&row, 0),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to load PR number: {e}"))
+}
+
+/// `gh pr close` argv, naming the PR explicitly when known so a cwd that is not
+/// the agent branch (the project checkout) resolves the right PR.
+fn close_pr_args(pr_number: Option<i64>) -> Vec<String> {
+    let mut args = vec!["pr".to_string(), "close".to_string()];
+    if let Some(number) = pr_number {
+        args.push(number.to_string());
+    }
+    args
 }
 
 // ============================================================================
@@ -1246,16 +1378,57 @@ async fn source_job_for_node(
     .map_err(|e| format!("Failed to query source job: {}", e))
 }
 
+/// Resolve a producer node's terminal output contract name (e.g. `create-pr`)
+/// from the execution snapshot. This is the `output_name` its terminal artifact
+/// is stored under, so consumers key their artifact load by it rather than the
+/// raw `context-out` edge handle.
+async fn producer_terminal_artifact_name(
+    db: &LocalDb,
+    snapshot: &ExecutionSnapshot,
+    producer_node_id: &str,
+) -> Result<Option<String>, String> {
+    let snapshot = snapshot.clone();
+    let producer_node_id = producer_node_id.to_string();
+    db.read(move |conn| {
+        let snapshot = snapshot.clone();
+        let producer_node_id = producer_node_id.clone();
+        Box::pin(async move {
+            Ok::<_, DbError>(
+                crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
+                    conn,
+                    &snapshot,
+                    &producer_node_id,
+                )
+                .await?
+                .and_then(|info| info.artifact_name),
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to resolve producer terminal artifact name: {e}"))
+}
+
+/// Load the latest artifact a producer job wrote for a consumer edge.
+///
+/// Match first by the resolved `output_name` (the terminal contract name). If
+/// that misses, fall back to the latest artifact across the job — but never one
+/// whose `output_name` is in `exclude_from_fallback`, which carries the
+/// producer's `context-self` living-doc names. This stops a patched, higher-
+/// versioned ctx-self doc (e.g. `plan`) from being served as the terminal input
+/// and opening the PR with the wrong title/body (CAIRN-1953).
 async fn latest_artifact_for_job(
     db: &LocalDb,
     job_id: &str,
     output_name: &str,
+    exclude_from_fallback: &[String],
 ) -> Result<Option<Artifact>, String> {
     let job_id = job_id.to_string();
     let output_name = output_name.to_string();
+    let exclude_from_fallback = exclude_from_fallback.to_vec();
     db.read(|conn| {
         let job_id = job_id.clone();
         let output_name = output_name.clone();
+        let exclude_from_fallback = exclude_from_fallback.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
@@ -1279,15 +1452,20 @@ async fn latest_artifact_for_job(
                             parent_version_id, output_name, created_at, updated_at, seen_at, confirmed
                      FROM artifacts
                      WHERE job_id = ?1
-                     ORDER BY version DESC
-                     LIMIT 1",
+                     ORDER BY version DESC",
                     (job_id.as_str(),),
                 )
                 .await?;
-            rows.next()
-                .await?
-                .map(|row| artifact_from_row(&row))
-                .transpose()
+            while let Some(row) = rows.next().await? {
+                let artifact = artifact_from_row(&row)?;
+                if let Some(name) = artifact.output_name.as_deref() {
+                    if exclude_from_fallback.iter().any(|excluded| excluded == name) {
+                        continue;
+                    }
+                }
+                return Ok(Some(artifact));
+            }
+            Ok(None)
         })
     })
     .await
@@ -1500,6 +1678,28 @@ async fn upsert_merge_request_for_pr(
     .map_err(|e| format!("Failed to upsert merge_request: {}", e))
 }
 
+/// Record the PR head commit SHA on the open merge_request for `job_id`
+/// (CAIRN-1891). Set in-process at PR creation from the builder's worktree HEAD
+/// so the in-process and webhook PR-open review edges share one fingerprint.
+async fn set_mr_head_sha(db: &LocalDb, job_id: &str, head_sha: &str) -> Result<(), String> {
+    let job_id = job_id.to_string();
+    let head_sha = head_sha.to_string();
+    db.write(|conn| {
+        let job_id = job_id.clone();
+        let head_sha = head_sha.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE merge_requests SET head_sha = ?1 WHERE job_id = ?2 AND status = 'open'",
+                (head_sha.as_str(), job_id.as_str()),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 async fn find_mr_job_id_for_execution(db: &LocalDb, execution_id: &str) -> Result<String, String> {
     let execution_id = execution_id.to_string();
     db.query_text(
@@ -1612,4 +1812,88 @@ fn artifact_from_row(row: &turso::Row) -> Result<Artifact, DbError> {
         seen_at: row.opt_i64(10)?,
         confirmed: row.i64(11)? != 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("actions.db")).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        // Leak the tempdir so the file outlives the test body.
+        std::mem::forget(temp);
+        db
+    }
+
+    /// A coordinator/pr-shaped job that wrote BOTH a `create-pr` terminal
+    /// artifact (v1) and a higher-versioned `plan` context-self living doc (v2).
+    /// The PR input must resolve to `create-pr`, never the higher-versioned
+    /// `plan` — whether the load is keyed by the terminal contract name or falls
+    /// through to the latest-across-job fallback (CAIRN-1953).
+    #[tokio::test]
+    async fn pr_input_resolves_to_create_pr_not_higher_versioned_ctx_self() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,'{}')", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-coord','e-1','coord','i-1','p-1','complete','coord','coord',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-pr','j-coord','create-pr',1,'{\"title\":\"Real PR\",\"body\":\"ship it\"}',1,'create-pr',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-plan','j-coord','plan',1,'{\"title\":\"Plan doc\",\"content\":\"living doc\"}',2,'plan',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let exclude = vec!["plan".to_string()];
+
+        // Keyed by the terminal contract name: exact match.
+        let by_name = latest_artifact_for_job(&db, "j-coord", "create-pr", &exclude)
+            .await
+            .unwrap()
+            .expect("create-pr artifact");
+        assert_eq!(by_name.output_name.as_deref(), Some("create-pr"));
+        assert_eq!(
+            by_name.data.get("title").and_then(|v| v.as_str()),
+            Some("Real PR")
+        );
+
+        // Keyed by the raw edge handle: the exact match misses, but the fallback
+        // must skip the higher-versioned `plan` ctx-self doc and return create-pr.
+        let by_handle = latest_artifact_for_job(&db, "j-coord", "context-out", &exclude)
+            .await
+            .unwrap()
+            .expect("fallback resolves to create-pr");
+        assert_eq!(by_handle.output_name.as_deref(), Some("create-pr"));
+        assert_eq!(
+            by_handle.data.get("title").and_then(|v| v.as_str()),
+            Some("Real PR")
+        );
+
+        // The `plan` chain remains intact and addressable after the PR resolves.
+        let plan = latest_artifact_for_job(&db, "j-coord", "plan", &[])
+            .await
+            .unwrap()
+            .expect("plan artifact still present");
+        assert_eq!(plan.output_name.as_deref(), Some("plan"));
+        assert_eq!(
+            plan.data.get("content").and_then(|v| v.as_str()),
+            Some("living doc")
+        );
+    }
+
+    #[test]
+    fn close_pr_args_names_pr_when_known() {
+        assert_eq!(close_pr_args(Some(7)), vec!["pr", "close", "7"]);
+        assert_eq!(close_pr_args(None), vec!["pr", "close"]);
+    }
 }

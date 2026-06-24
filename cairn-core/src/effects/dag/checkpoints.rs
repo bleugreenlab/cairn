@@ -135,8 +135,8 @@ fn check_checkpoint_cache(
     })
     .ok()??;
 
-    let current_sha = get_current_head_sha(worktree_path).ok()?;
-    let currently_dirty = is_worktree_dirty(worktree_path).unwrap_or(true);
+    let current_sha = get_current_head_sha(orch, worktree_path).ok()?;
+    let currently_dirty = is_worktree_dirty(orch, worktree_path).unwrap_or(true);
     let is_valid = cached.1 == current_sha && cached.2 == 0 && !currently_dirty;
 
     Some((cached.0, cached.1, is_valid))

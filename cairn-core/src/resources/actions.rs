@@ -53,12 +53,8 @@ pub(crate) async fn read_actions_collection(
     // context, only workspace actions are visible.
     let actions: Vec<ActionConfig> = match project_id.as_deref() {
         Some(project_id) => {
-            match action_queries::list_action_configs_for_context(
-                &orch.db.local,
-                project_id,
-                false,
-            )
-            .await
+            match action_queries::list_action_configs_for_context(&orch.db.local, project_id, false)
+                .await
             {
                 Ok(list) => list,
                 Err(e) => return format!("Error listing actions: {e}"),

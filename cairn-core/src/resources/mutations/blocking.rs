@@ -386,10 +386,7 @@ async fn job_uri_segment(orch: &Orchestrator, job_id: &str) -> Option<String> {
     let job_id = job_id.to_string();
     orch.db
         .local
-        .query_opt_text(
-            "SELECT uri_segment FROM jobs WHERE id = ?1",
-            turso::params![job_id.as_str()],
-        )
+        .query_opt_text("SELECT uri_segment FROM jobs WHERE id = ?1", (job_id,))
         .await
         .ok()
         .flatten()

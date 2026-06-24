@@ -653,14 +653,14 @@ async fn seed_gated_execution(db: &LocalDb, project_id: &str, issue_id: &str) {
             )
             .await?;
             conn.execute(
-                "INSERT INTO artifacts(id, job_id, artifact_type, data, version, created_at, updated_at, confirmed)
-                 VALUES ('artifact-plan', 'job-planner', 'plan', 'the plan body', 1, 3, 3, 0)",
+                "INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, created_at, updated_at, confirmed)
+                 VALUES ('artifact-plan', 'job-planner', 'plan', 'the plan body', 1, 'plan', 3, 3, 0)",
                 (),
             )
             .await?;
             conn.execute(
-                "INSERT INTO artifacts(id, job_id, artifact_type, data, version, created_at, updated_at, confirmed)
-                 VALUES ('artifact-pr', 'job-builder', 'pr', 'the pr body', 1, 4, 4, 1)",
+                "INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, created_at, updated_at, confirmed)
+                 VALUES ('artifact-pr', 'job-builder', 'pr', 'the pr body', 1, 'pr', 4, 4, 1)",
                 (),
             )
             .await?;
@@ -1018,6 +1018,92 @@ async fn artifact_uri_prefers_output_name_over_artifact_type() {
     assert!(!aliased.contains("builder/artifact"));
     // The generic alias and the bare artifact_type are both absent as a target.
     assert!(!aliased.contains("builder/pr\""));
+}
+
+// --- Per-name artifact chains: named reads + full listing (CAIRN-1942) ---
+
+/// Seed one complete `builder` job carrying two independent named artifact
+/// chains: `plan` (v1 -> v2) and `notes` (v1). Each addressed name is its own
+/// `output_name` identity, exactly as the write path now stores them.
+async fn seed_two_named_artifacts(fixture: &IssueProjectFixture, issue_id: &str) {
+    let project_id = fixture.project_id.clone();
+    let issue_id = issue_id.to_string();
+    fixture
+        .db
+        .write(|conn| {
+            let project_id = project_id.clone();
+            let issue_id = issue_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-multi', 'recipe', ?1, ?2, 'running', 1, 1)",
+                    params![issue_id.as_str(), project_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+                     VALUES ('job-multi', 'exec-multi', 'builder', ?1, ?2, 'Builder', 'complete', 1, 1, 'builder')",
+                    params![issue_id.as_str(), project_id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, created_at, updated_at, confirmed)
+                     VALUES ('plan-v1', 'job-multi', 'plan', '{\"content\":\"plan one\"}', 1, 'plan', 3, 3, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO artifacts(id, job_id, artifact_type, data, version, parent_version_id, output_name, created_at, updated_at, confirmed)
+                     VALUES ('plan-v2', 'job-multi', 'plan', '{\"content\":\"plan two\"}', 2, 'plan-v1', 'plan', 4, 4, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO artifacts(id, job_id, artifact_type, data, version, output_name, created_at, updated_at, confirmed)
+                     VALUES ('notes-v1', 'job-multi', 'notes', '{\"content\":\"notes one\"}', 1, 'notes', 5, 5, 1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn node_summary_lists_every_named_artifact() {
+    let fixture = issue_project_fixture("MCP").await;
+    let issue_id = fixture
+        .insert_issue_with_status_and_time(1, "Multi-artifact node", "active", 1)
+        .await;
+    seed_two_named_artifacts(&fixture, &issue_id).await;
+
+    let summary = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder".to_string()).await;
+    // Both named chains surface at their canonical, schema-named URIs.
+    assert!(summary.contains("- Artifacts:"), "unexpected: {summary}");
+    assert!(summary.contains("cairn://p/MCP/1/1/builder/plan"));
+    assert!(summary.contains("cairn://p/MCP/1/1/builder/notes"));
+}
+
+#[tokio::test]
+async fn named_read_returns_its_own_chain_latest() {
+    let fixture = issue_project_fixture("MCP").await;
+    let issue_id = fixture
+        .insert_issue_with_status_and_time(1, "Multi-artifact read", "active", 1)
+        .await;
+    seed_two_named_artifacts(&fixture, &issue_id).await;
+
+    // The `plan` read returns the plan chain's latest version (v2), never notes.
+    let plan = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder/plan".to_string()).await;
+    assert!(plan.contains("plan two"), "unexpected: {plan}");
+    assert!(!plan.contains("plan one"));
+    assert!(!plan.contains("notes one"));
+
+    // The `notes` read returns its own chain, independent of plan.
+    let notes = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder/notes".to_string()).await;
+    assert!(notes.contains("notes one"), "unexpected: {notes}");
+    assert!(!notes.contains("plan two"));
 }
 
 // --- Issue create + optional execution start (CAIRN-1192) ---

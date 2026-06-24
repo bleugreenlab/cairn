@@ -118,6 +118,10 @@ struct LegacyTerminalCommand {
     command: String,
     #[serde(default)]
     persistent: bool,
+    // Carried through the always-run legacy parse so a `write` carveout on a
+    // terminal command is not dropped during migration. See `TerminalCommand`.
+    #[serde(default)]
+    write: Vec<String>,
 }
 
 /// Get the path to the project config file (\[project\]/.cairn/config.yaml)
@@ -225,6 +229,7 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
                 .map(|c| TerminalCommand {
                     name: c.name,
                     command: c.command,
+                    write: c.write,
                 })
                 .collect()
         }),
@@ -237,6 +242,18 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
     };
 
     Ok((settings, needs_migration))
+}
+
+/// Load the project's terminal commands.
+///
+/// Reads `[project_path]/.cairn/config.yaml` directly without the migration
+/// rewrite that `load_project_settings` performs, so it is safe on the hot
+/// worktree-fence policy-build path (it reads each terminal command's `write`
+/// carveout). Returns an empty list when the file is absent or invalid.
+pub fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::TerminalCommand> {
+    load_project_settings_file(project_path)
+        .map(|(file, _)| file.terminal_commands.unwrap_or_default())
+        .unwrap_or_default()
 }
 
 /// Save project settings to file
@@ -356,6 +373,7 @@ mod tests {
             terminal_commands: Some(vec![TerminalCommand {
                 name: "Dev Server".to_string(),
                 command: "npm run dev".to_string(),
+                write: vec![],
             }]),
             default_branch: Some("develop".to_string()),
             ..Default::default()
@@ -684,6 +702,44 @@ backends:
         let backends = loaded.backends.unwrap();
         assert!(backends.contains_key("codex"));
         assert_eq!(backends["codex"]["lg"].model.as_str(), "gpt-5.5");
+    }
+
+    #[test]
+    fn terminal_command_write_parses_and_survives_migration() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+
+        // ciCommands forces the legacy migration rewrite; a terminal command's
+        // `write` carveout must ride through it (the always-run legacy parse).
+        let content = r#"
+ciCommands:
+  - npm test
+terminalCommands:
+  - name: Dev
+    command: "bun run build:mcp && bun dev:instance"
+    write:
+      - "~/.cairn-dev-*"
+"#;
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+
+        let loaded = load_terminal_commands(project_path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Dev");
+        assert_eq!(loaded[0].write, vec!["~/.cairn-dev-*"]);
+
+        // After the migration rewrite the carveout is still present on disk.
+        load_project_settings(project_path);
+        let after = load_terminal_commands(project_path);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].write, vec!["~/.cairn-dev-*"]);
+    }
+
+    #[test]
+    fn load_terminal_commands_empty_when_absent() {
+        let temp = TempDir::new().unwrap();
+        assert!(load_terminal_commands(temp.path()).is_empty());
     }
 
     #[test]

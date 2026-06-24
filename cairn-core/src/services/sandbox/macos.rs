@@ -39,12 +39,16 @@ pub fn sbpl_profile(policy: &SandboxPolicy) -> String {
         out.push_str(&format!("(deny file-read* {})\n", deny_rules));
     }
 
-    // Re-allow reads of the worktree + writable set LAST (last-match-wins) so a
-    // denylist entry (e.g. a user-configured one covering a prefix of the
-    // worktree) can never block the agent from reading its own source. Regex
-    // write scopes are re-allowed for reads too, matching the subpath behavior.
+    // Re-allow reads of the readable set LAST (last-match-wins) so a denylist
+    // entry (e.g. a user-configured one covering a prefix of the worktree) can
+    // never block the agent from reading its own source. The readable set keeps
+    // the worktree even for a read-only-checkout policy, whose writable set drops
+    // it — so a non-worktree live checkout stays readable while its writes are
+    // denied. Regex write scopes are re-allowed for reads too.
+    let mut readable: Vec<PathBuf> = policy.readable_paths();
+    readable.push(PathBuf::from("/dev"));
     let read_allow_rules = join_rules(
-        &subpath_rules(&writable),
+        &subpath_rules(&readable),
         &regex_rules(&policy.writable_regex),
     );
     if !read_allow_rules.is_empty() {
@@ -222,6 +226,7 @@ mod tests {
             writable_extra: vec![],
             deny_read: vec![PathBuf::from("/home/x/.aws")],
             writable_regex: vec![],
+            worktree_writable: true,
         };
         let profile = sbpl_profile(&policy);
         assert!(profile.starts_with("(version 1)\n(allow default)\n"));
@@ -247,6 +252,7 @@ mod tests {
             writable_extra: vec![],
             deny_read: vec![],
             writable_regex: vec![],
+            worktree_writable: true,
         };
         let (program, args) = wrap_argv("bash", &["-c".into(), "echo hi".into()], &policy);
         assert_eq!(program, "/usr/bin/sandbox-exec");
@@ -329,6 +335,7 @@ mod tests {
             writable_extra: vec![],
             deny_read: vec![secret.clone()],
             writable_regex: vec![],
+            worktree_writable: true,
         };
 
         let run = |cmd: &str| -> std::process::Output {
@@ -385,6 +392,7 @@ mod tests {
             writable_extra: vec![],
             deny_read: vec![base.path().to_path_buf()], // a broad denylist entry
             writable_regex: vec![],
+            worktree_writable: true,
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -420,6 +428,7 @@ mod tests {
             writable_extra: vec![cache.clone()],
             deny_read: vec![],
             writable_regex: vec![],
+            worktree_writable: true,
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);
@@ -443,6 +452,46 @@ mod tests {
             "write outside the carve-out must be denied"
         );
         assert!(!sibling.exists());
+    }
+
+    #[test]
+    fn readonly_checkout_profile_reads_but_does_not_write_cwd() {
+        // A non-worktree live-checkout policy keeps the checkout readable but
+        // drops it from the write-allow, so a kernel write into it is denied.
+        let checkout = PathBuf::from("/project/live");
+        let policy = SandboxPolicy::for_readonly_checkout(&checkout, &[], vec![]);
+        let profile = sbpl_profile(&policy);
+
+        // The checkout appears in the final read re-allow.
+        let read_allow = profile.rfind("(allow file-read*").unwrap();
+        assert!(
+            profile[read_allow..].contains("/project/live"),
+            "read-only checkout must stay readable:\n{profile}"
+        );
+        // ... but NOT in the write-allow line.
+        let write_allow_line = profile
+            .lines()
+            .find(|l| l.starts_with("(allow file-write*"))
+            .unwrap_or("");
+        assert!(
+            !write_allow_line.contains("/project/live"),
+            "read-only checkout must NOT be writable: {write_allow_line}"
+        );
+    }
+
+    #[test]
+    fn for_run_profile_writes_cwd() {
+        let wt = PathBuf::from("/work/wt");
+        let policy = SandboxPolicy::for_run(&wt, &[], vec![]);
+        let profile = sbpl_profile(&policy);
+        let write_allow_line = profile
+            .lines()
+            .find(|l| l.starts_with("(allow file-write*"))
+            .unwrap_or("");
+        assert!(
+            write_allow_line.contains("/work/wt"),
+            "for_run must keep cwd writable: {write_allow_line}"
+        );
     }
 
     #[test]
@@ -490,6 +539,7 @@ mod tests {
             writable_extra: vec![state.clone()],
             deny_read: vec![],
             writable_regex: vec![super::super::glob_to_regex(&glob)],
+            worktree_writable: true,
         };
         let run = |cmd: &str| -> std::process::Output {
             let (program, args) = wrap_argv("/bin/bash", &["-c".into(), cmd.into()], &policy);

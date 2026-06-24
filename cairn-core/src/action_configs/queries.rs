@@ -110,8 +110,7 @@ pub async fn list_action_configs_for_context(
         by_name.insert(action.name.clone(), action);
     }
 
-    let disabled =
-        crate::config_disables::list_disabled_keys(db, project_id, "action").await?;
+    let disabled = crate::config_disables::list_disabled_keys(db, project_id, "action").await?;
 
     let mut actions: Vec<ActionConfig> = by_name
         .into_values()
@@ -423,7 +422,7 @@ mod tests {
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
                      VALUES (?1, 'default', ?1, ?1, '/tmp/proj', 1, 1, 0)",
-                    turso::params![id.as_str()],
+                    (id.as_str(),),
                 )
                 .await?;
                 Ok(())

@@ -59,11 +59,16 @@ pub async fn ask_questions(
         node_name,
         exec_seq,
         current_turn_id,
+        owns_turn_loop,
     ) = {
         let ctx = match super::run_context::lookup_run(&orch.db.local, request).await {
             Ok(ctx) => ctx,
             Err(e) => return e,
         };
+
+        // Owned-loop backends (OpenRouter) suspend the turn on a foreground
+        // question instead of inline-waiting and entering AwaitingHost.
+        let owns_turn_loop = !background && orch.process_state.run_owns_turn_loop(&ctx.run_id);
 
         let now = chrono::Utc::now().timestamp() as i32;
         let prompt_id = uuid::Uuid::new_v4().to_string();
@@ -204,11 +209,45 @@ pub async fn ask_questions(
                 crate::orchestrator::attention::read_issue_for_attention(&orch.db.local, issue_id)
                     .await
             {
+                // Push the question to the issue's watchers (CAIRN-1887): a
+                // `wake` + `event` push keyed `question:{issue}`, ref'd to the
+                // prompt, excluding the asking node (it is self-suspended on its
+                // own question). The legacy emit below still drives `cairn watch`
+                // and the desktop toast.
+                let issue_uri = issue_ctx.issue_uri();
+                match crate::orchestrator::attention_delivery::push_to_issue_watchers(
+                    &orch.db.local,
+                    &issue_uri,
+                    Some(ctx.job_id.as_str()),
+                    &detail_uri,
+                    crate::orchestrator::attention_push::Wake::Wake,
+                    crate::orchestrator::attention_push::Boundary::Event,
+                    &format!("question:{issue_uri}"),
+                )
+                .await
+                {
+                    // CAIRN-1889: actively resume each idle watcher so it wakes
+                    // now instead of only noticing the question when something
+                    // else happens to resume it. `nudge_job_for_urgency` is the
+                    // shared resume-ladder primitive (idle -> resume; busy or
+                    // self-suspended -> no-op).
+                    Ok(recipients) => {
+                        for recipient in &recipients {
+                            if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
+                                orch,
+                                recipient,
+                                crate::messages::queued::DeliveryUrgency::Steer,
+                            ) {
+                                log::warn!("question push wake failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => log::warn!("question push creation failed: {}", e),
+                }
                 orch.emit_attention_event(crate::orchestrator::AttentionEvent {
                     issue_id: issue_id.to_string(),
                     issue_uri: issue_ctx.issue_uri(),
                     fact: crate::orchestrator::AttentionFact::Question {
-                        escalate: false,
                         detail_uri,
                         content: crate::orchestrator::attention::QuestionContent {
                             questions: payload.questions.clone(),
@@ -224,8 +263,10 @@ pub async fn ask_questions(
             orch.wake_for_issue(issue_id).await;
         }
 
-        // Yield the process for host interaction (foreground only).
-        if !background {
+        // Yield the process for host interaction (foreground only). Owned-loop
+        // backends skip AwaitingHost so `should_resume` stays true at answer
+        // time; they suspend the turn from the owned loop instead.
+        if !background && !owns_turn_loop {
             if let Some(ref turn_id) = current_turn_id {
                 orch.process_state.yield_for_host(&ctx.run_id, turn_id);
             }
@@ -253,6 +294,7 @@ pub async fn ask_questions(
             ctx.job_name,
             ctx.exec_seq,
             current_turn_id,
+            owns_turn_loop,
         )
     };
 
@@ -306,6 +348,17 @@ pub async fn ask_questions(
             tool_name: None,
         },
     );
+
+    // Owned-loop backends (OpenRouter) never inline-wait: there is no warm
+    // process, so a resume cold-restarts the turn regardless. Suspend now and let
+    // the answer drive a fresh resumed turn. The DB turn was already yielded above
+    // so a successor can form; we deliberately did not enter AwaitingHost, keeping
+    // `should_resume` true at answer time.
+    if owns_turn_loop {
+        orch.process_state
+            .request_suspend(&run_id, crate::agent_process::process::SuspendKind::Prompt);
+        return "Prompt suspended; the run will resume when the user answers.".to_string();
+    }
 
     // Block waiting for user response (like the permission wait does)
     let mut rx = orch.prompt_responses.subscribe();

@@ -182,6 +182,12 @@ pub struct PtySession {
     /// agent/promoted sessions, which are non-interactive and detect completion
     /// via EOF rather than prompt markers.
     pub command_state: Option<Arc<Mutex<CommandState>>>,
+    /// Live phrase watchers on this terminal's output stream. Populated for
+    /// agent PTY terminals (the only kind whose chunked read loop scans output);
+    /// `None` for promoted-run and user sessions. The agent read loop and the
+    /// wake-subscribe path share this `Arc`, so a subscription created after the
+    /// terminal starts is seen by the running loop without a restart.
+    pub output_watchers: Option<Arc<Mutex<Vec<TerminalOutputWatcher>>>>,
 }
 
 /// Manages all active PTY sessions
@@ -239,6 +245,113 @@ impl PtyState {
 
 /// Maximum output buffer size (64KB) - same as commands.rs
 pub const MAX_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Max length (chars) of the excerpt surfaced in a phrase-match wake message.
+/// Keeps the wake to a small contextual line rather than leaking a large chunk.
+pub const PHRASE_EXCERPT_MAX: usize = 200;
+
+/// A live phrase watcher on a terminal's output stream. Registered on the agent
+/// PTY session when an agent subscribes `{kind:"terminal", on:"output", phrase}`,
+/// matched against each output chunk by the agent read loop, and removed the
+/// first time it matches (one-shot).
+#[derive(Clone, Debug)]
+pub struct TerminalOutputWatcher {
+    /// The `wake_subscriptions` row to consume + wake when the phrase appears.
+    pub subscription_id: String,
+    /// The subscribing job; the wake is delivered only to it.
+    pub job_id: String,
+    /// Literal substring to match (case-sensitive).
+    pub phrase: String,
+    /// Trailing bytes carried from the previous chunk so a phrase split across a
+    /// chunk boundary is still detected. Always shorter than `phrase`.
+    pub carry: String,
+    /// Canonical `.../terminal/<slug>` URI this watcher belongs to, so a match
+    /// routes its wake without needing the originating `CairnResource`. This lets
+    /// both terminal readers (agent-MCP and interactive) share one scan path.
+    pub terminal_uri: String,
+}
+
+/// Outcome of scanning one output chunk for a watcher's phrase.
+pub struct PhraseScan {
+    /// A short excerpt (the matched line, ANSI-stripped, trimmed, capped) when
+    /// the phrase appeared in this chunk; `None` otherwise.
+    pub matched_excerpt: Option<String>,
+    /// The carry to retain for the next chunk (empty once matched).
+    pub carry: String,
+}
+
+/// Scan `chunk` (prefixed with the watcher's `carry` from the previous chunk)
+/// for `phrase`. Literal, case-sensitive substring match against the raw output
+/// bytes. On a hit, returns the matched line ANSI-stripped, trimmed, and capped
+/// to `PHRASE_EXCERPT_MAX` chars; otherwise returns a trailing carry shorter
+/// than the phrase so a match straddling the next boundary is still caught.
+pub fn scan_for_phrase(carry: &str, chunk: &str, phrase: &str) -> PhraseScan {
+    if phrase.is_empty() {
+        return PhraseScan {
+            matched_excerpt: None,
+            carry: String::new(),
+        };
+    }
+    let mut combined = String::with_capacity(carry.len() + chunk.len());
+    combined.push_str(carry);
+    combined.push_str(chunk);
+    if let Some(pos) = combined.find(phrase) {
+        return PhraseScan {
+            matched_excerpt: Some(excerpt_around(&combined, pos, phrase.len())),
+            carry: String::new(),
+        };
+    }
+    let keep = phrase.len().saturating_sub(1);
+    PhraseScan {
+        matched_excerpt: None,
+        carry: tail_within_bytes(&combined, keep),
+    }
+}
+
+/// Return the suffix of `s` whose byte length is at most `max_bytes`, snapped
+/// forward to the next char boundary so the slice never splits a UTF-8 char.
+fn tail_within_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
+}
+
+/// Extract the single line containing the match at `[pos, pos+phrase_len)`,
+/// strip ANSI escape sequences, trim, and cap to `PHRASE_EXCERPT_MAX` chars.
+fn excerpt_around(s: &str, pos: usize, phrase_len: usize) -> String {
+    let line_start = s[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let after = pos + phrase_len;
+    let line_end = s[after..].find('\n').map(|i| after + i).unwrap_or(s.len());
+    let cleaned = strip_ansi(&s[line_start..line_end]);
+    cleaned.trim().chars().take(PHRASE_EXCERPT_MAX).collect()
+}
+
+/// Remove ANSI CSI escape sequences (`ESC [ … final-byte`) so the excerpt reads
+/// as plain text. Other bytes pass through unchanged.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&n) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
 
 /// Ensure terminal input submits as a line: append `\n` unless already present.
 pub fn ensure_submitted_line(content: &str) -> Cow<'_, str> {
@@ -758,5 +871,83 @@ mod tests {
         assert!(!shell.is_empty());
         // On Unix with SHELL set, should return that
         // On Windows or without SHELL, should return a default
+    }
+
+    // =========================================================================
+    // scan_for_phrase tests (terminal-output phrase wake matching)
+    // =========================================================================
+
+    #[test]
+    fn scan_for_phrase_matches_within_chunk() {
+        let scan = scan_for_phrase("", "build finished: ready to serve\n", "ready");
+        assert_eq!(
+            scan.matched_excerpt.as_deref(),
+            Some("build finished: ready to serve")
+        );
+        assert!(scan.carry.is_empty(), "a match clears the carry");
+    }
+
+    #[test]
+    fn scan_for_phrase_no_match_keeps_carry_shorter_than_phrase() {
+        let phrase = "ready";
+        let scan = scan_for_phrase("", "server is rea", phrase);
+        assert!(scan.matched_excerpt.is_none());
+        // The carry retains a tail short enough that a match straddling the next
+        // chunk boundary is still caught, but never as long as the phrase.
+        assert!(!scan.carry.is_empty());
+        assert!(scan.carry.len() < phrase.len());
+    }
+
+    #[test]
+    fn scan_for_phrase_matches_across_chunk_boundary() {
+        let phrase = "ready";
+        let first = scan_for_phrase("", "server is rea", phrase);
+        assert!(first.matched_excerpt.is_none());
+        let second = scan_for_phrase(&first.carry, "dy now\n", phrase);
+        let excerpt = second
+            .matched_excerpt
+            .expect("phrase split across two chunks must still match");
+        assert!(excerpt.contains("ready"));
+    }
+
+    #[test]
+    fn scan_for_phrase_is_case_sensitive() {
+        let scan = scan_for_phrase("", "all READY here\n", "ready");
+        assert!(
+            scan.matched_excerpt.is_none(),
+            "matching is a literal, case-sensitive substring"
+        );
+    }
+
+    #[test]
+    fn scan_for_phrase_strips_ansi_from_excerpt() {
+        let chunk = "\u{1b}[32mcompile ready\u{1b}[0m\n";
+        let scan = scan_for_phrase("", chunk, "ready");
+        let excerpt = scan.matched_excerpt.expect("should match");
+        assert_eq!(excerpt, "compile ready");
+        assert!(!excerpt.contains('\u{1b}'), "escape bytes must be stripped");
+    }
+
+    #[test]
+    fn scan_for_phrase_excerpt_is_single_line_and_capped() {
+        let mut chunk = String::from("noise before\n");
+        chunk.push_str(&"x".repeat(500));
+        chunk.push_str(" ready ");
+        chunk.push_str(&"y".repeat(500));
+        chunk.push('\n');
+        chunk.push_str("noise after\n");
+        let scan = scan_for_phrase("", &chunk, "ready");
+        let excerpt = scan.matched_excerpt.expect("should match");
+        assert!(excerpt.chars().count() <= PHRASE_EXCERPT_MAX);
+        // The excerpt is the matched line only, never neighbouring lines.
+        assert!(!excerpt.contains("noise before"));
+        assert!(!excerpt.contains("noise after"));
+    }
+
+    #[test]
+    fn scan_for_phrase_empty_phrase_never_matches() {
+        let scan = scan_for_phrase("", "anything at all\n", "");
+        assert!(scan.matched_excerpt.is_none());
+        assert!(scan.carry.is_empty());
     }
 }

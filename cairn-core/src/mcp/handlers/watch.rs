@@ -234,7 +234,6 @@ async fn synthesize_event(
         .await
         .map(|idle| idle.fact)
         .unwrap_or_else(|| AttentionFact::AgentIdleWithWork {
-            escalate: false,
             detail_uri: issue_uri.clone(),
         });
     AttentionEvent {
@@ -263,7 +262,7 @@ async fn latest_external_reply_event(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT m.id, m.sender_name, m.content, COALESCE(m.delivered_at, m.created_at),
+                        "SELECT m.id, m.sender_name, m.content, m.created_at,
                                 i.attention, i.status
                          FROM messages m
                          JOIN issues i ON i.id = ?4
@@ -271,8 +270,8 @@ async fn latest_external_reply_event(
                            AND m.channel_id = ?1
                            AND m.sender_run_id IS NOT NULL
                            AND m.sender_name LIKE ?2
-                           AND (?3 IS NULL OR COALESCE(m.delivered_at, m.created_at) > ?3)
-                         ORDER BY COALESCE(m.delivered_at, m.created_at) DESC, m.created_at DESC
+                           AND (?3 IS NULL OR m.created_at > ?3)
+                         ORDER BY m.created_at DESC
                          LIMIT 1",
                         params![
                             channel_id.as_str(),
@@ -311,7 +310,6 @@ async fn latest_external_reply_event(
         issue_id: issue_ref.issue_id.clone(),
         issue_uri,
         fact: AttentionFact::ExternalMessageReply {
-            escalate: false,
             detail_uri,
             message_id,
             content: ExternalMessageReplyContent { sender, body },
@@ -394,7 +392,6 @@ mod tests {
             issue_id: "i-1".to_string(),
             issue_uri: "cairn://p/CAIRN/1".to_string(),
             fact: AttentionFact::ExternalMessageReply {
-                escalate: false,
                 detail_uri: "cairn://p/CAIRN/1/messages".to_string(),
                 message_id: "m-1".to_string(),
                 content: ExternalMessageReplyContent {
@@ -499,7 +496,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_external_reply(db: &LocalDb, delivered_at: i64) {
+    async fn seed_external_reply(db: &LocalDb, marker: i64) {
         db.write(move |conn| {
             Box::pin(async move {
                 conn.execute(
@@ -516,13 +513,14 @@ mod tests {
                 conn.execute(
                     "INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at)
                      VALUES ('i-1181', 'p-cairn', 1181, 'T', '', 'active', 'in_progress', 'none', 0, 1, ?1)",
-                    params![delivered_at],
+                    params![marker],
                 )
                 .await?;
+                // The external reply's catch-up cursor is its own created_at.
                 conn.execute(
-                    "INSERT INTO messages (id, channel_type, channel_id, sender_run_id, sender_name, recipient_run_id, content, created_at, delivered_at)
-                     VALUES ('m-external', 'issue', 'CAIRN/1181', 'run-builder', 'cairn://p/CAIRN/1181/1/builder', NULL, 'done', ?1, ?2)",
-                    params![delivered_at - 1, delivered_at],
+                    "INSERT INTO messages (id, channel_type, channel_id, sender_run_id, sender_name, recipient_run_id, content, created_at)
+                     VALUES ('m-external', 'issue', 'CAIRN/1181', 'run-builder', 'cairn://p/CAIRN/1181/1/builder', NULL, 'done', ?1)",
+                    params![marker],
                 )
                 .await?;
                 Ok::<_, DbError>(())

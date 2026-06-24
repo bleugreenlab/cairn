@@ -425,12 +425,15 @@ pub(super) async fn get_direct_artifact_for_job(
     conn: &turso::Connection,
     job_id: &str,
 ) -> Option<ResourceArtifact> {
+    // Most recently written name wins. `version` is per-name, so ordering by it
+    // would compare versions across unrelated output names; order by write
+    // recency (`created_at`, then `rowid` as the insertion-order tiebreaker).
     let sql = format!(
         "
         SELECT {ARTIFACT_COLUMNS}
         FROM artifacts
         WHERE job_id = ?1
-        ORDER BY version DESC
+        ORDER BY created_at DESC, rowid DESC
         LIMIT 1
         "
     );
@@ -456,7 +459,7 @@ pub(super) async fn get_artifact_for_job(
         SELECT {ARTIFACT_COLUMNS}
         FROM artifacts
         WHERE job_id IN (SELECT id FROM jobs WHERE parent_job_id = ?1)
-        ORDER BY version DESC
+        ORDER BY created_at DESC, rowid DESC
         LIMIT 1
         "
     );
@@ -466,6 +469,89 @@ pub(super) async fn get_artifact_for_job(
         .ok()
         .flatten()
         .and_then(|row| resource_artifact_from_row(&row).ok())
+}
+
+/// Get the latest version of a specifically-named artifact for a job (checking
+/// the job itself, then its child jobs). Unlike [`get_artifact_for_job`], this
+/// filters by `output_name`, so a named read (`.../{node}/plan`) returns that
+/// name's own version chain rather than whatever name carries the highest
+/// version across the job.
+pub(super) async fn get_named_artifact_for_job(
+    conn: &turso::Connection,
+    job_id: &str,
+    output_name: &str,
+) -> Option<ResourceArtifact> {
+    let direct = format!(
+        "
+        SELECT {ARTIFACT_COLUMNS}
+        FROM artifacts
+        WHERE job_id = ?1 AND output_name = ?2
+        ORDER BY version DESC
+        LIMIT 1
+        "
+    );
+    let mut rows = conn
+        .query(direct.as_str(), params![job_id, output_name])
+        .await
+        .ok()?;
+    if let Some(row) = rows.next().await.ok().flatten() {
+        return resource_artifact_from_row(&row).ok();
+    }
+
+    let child = format!(
+        "
+        SELECT {ARTIFACT_COLUMNS}
+        FROM artifacts
+        WHERE job_id IN (SELECT id FROM jobs WHERE parent_job_id = ?1)
+          AND output_name = ?2
+        ORDER BY version DESC
+        LIMIT 1
+        "
+    );
+    let mut rows = conn
+        .query(child.as_str(), params![job_id, output_name])
+        .await
+        .ok()?;
+    rows.next()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| resource_artifact_from_row(&row).ok())
+}
+
+/// List the latest version of every distinct named artifact a job has produced,
+/// ordered by name. Each `output_name` chain contributes exactly one row (its
+/// highest version). A single-artifact node yields exactly one entry — the same
+/// artifact [`get_artifact_for_job`] would surface.
+pub(super) async fn list_named_artifacts_for_job(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> Vec<ResourceArtifact> {
+    let sql = format!(
+        "
+        SELECT {ARTIFACT_COLUMNS}
+        FROM (
+            SELECT {ARTIFACT_COLUMNS},
+                   ROW_NUMBER() OVER (
+                       PARTITION BY output_name
+                       ORDER BY version DESC
+                   ) AS name_rank
+            FROM artifacts
+            WHERE job_id = ?1
+        ) ranked
+        WHERE name_rank = 1
+        ORDER BY output_name
+        "
+    );
+    let mut artifacts = Vec::new();
+    if let Ok(mut rows) = conn.query(sql.as_str(), (job_id,)).await {
+        while let Ok(Some(row)) = rows.next().await {
+            if let Ok(artifact) = resource_artifact_from_row(&row) {
+                artifacts.push(artifact);
+            }
+        }
+    }
+    artifacts
 }
 
 pub(super) async fn find_task_by_name(

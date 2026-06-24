@@ -142,6 +142,11 @@ pub(super) fn discover_codex_models() -> Result<Vec<DiscoveredModel>, String> {
                     })
                     .collect(),
                 context_window: model.context_window,
+                canonical_slug: None,
+                pricing: None,
+                supported_parameters: Vec::new(),
+                router: false,
+                architecture_modality: None,
             })
             .collect());
     }

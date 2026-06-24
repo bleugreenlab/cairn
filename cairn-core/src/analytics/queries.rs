@@ -66,13 +66,25 @@ const SCOPE_RANGE: &str = "(?1 IS NULL OR te.project_id = ?1)
 /// Positional params for [`SCOPE_RANGE`].
 fn scope_range_params(scope: &Scope, range: &TimeRange) -> Vec<Value> {
     vec![
-        scope
-            .project_id
-            .clone()
-            .map_or(Value::Null, Value::Text),
+        scope.project_id.clone().map_or(Value::Null, Value::Text),
         range.start.map_or(Value::Null, Value::Integer),
         range.end.map_or(Value::Null, Value::Integer),
     ]
+}
+
+/// Scope/range predicate over the `cost_events` alias `ce`, using params
+/// `?4`/`?5`/`?6` so it can sit alongside [`SCOPE_RANGE`] in one statement
+/// without relying on positional-param reuse.
+const COST_SCOPE_RANGE: &str = "(?4 IS NULL OR ce.project_id = ?4)
+        AND (?5 IS NULL OR ce.ts >= ?5)
+        AND (?6 IS NULL OR ce.ts < ?6)";
+
+/// `scope_range_params` repeated twice: `?1..?3` bind [`SCOPE_RANGE`] and
+/// `?4..?6` bind [`COST_SCOPE_RANGE`].
+fn scope_range_params_doubled(scope: &Scope, range: &TimeRange) -> Vec<Value> {
+    let mut params = scope_range_params(scope, range);
+    params.extend(scope_range_params(scope, range));
+    params
 }
 
 /// Per-session billable total bucketed by the session's first event time.
@@ -88,7 +100,7 @@ pub(crate) async fn avg_tokens_per_session(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<SessionBucketRow>> {
-    let secs = bucket.seconds();
+    let bucket_expr = bucket.bucket_expr("session_ts");
     let sql = format!(
         "WITH {cte},
         sessions_agg AS (
@@ -99,7 +111,7 @@ pub(crate) async fn avg_tokens_per_session(
             WHERE te.session_id IS NOT NULL AND {filter}
             GROUP BY te.session_id
         )
-        SELECT (session_ts / {secs}) * {secs} AS bucket_start,
+        SELECT {bucket_expr} AS bucket_start,
                AVG(total) AS avg_tokens,
                COUNT(*) AS session_count
         FROM sessions_agg
@@ -192,7 +204,12 @@ pub(crate) async fn tokens_per_loc(
     .await
 }
 
-/// Token components for one (bucket, model, backend) group.
+/// Token components for one (bucket, model, backend) group, plus any real
+/// metered cost recorded on that group's events. For metered backends
+/// (OpenRouter) the exact cost lands on the settlement event, which is a
+/// different event than the billable token event but shares the same
+/// (bucket, model, backend) group, so it is joined here rather than summed
+/// inside the billable-token CTE.
 pub(crate) struct CostComponentRow {
     pub bucket_start: i64,
     pub model: Option<String>,
@@ -202,6 +219,10 @@ pub(crate) struct CostComponentRow {
     pub cache_create: i64,
     pub output: i64,
     pub billable: i64,
+    /// Sum of real `events.cost_usd` for this group (0 when none reported).
+    pub exact_cost: f64,
+    /// Count of events in this group that carried a real `cost_usd`.
+    pub exact_cost_count: i64,
 }
 
 pub(crate) async fn cost_components(
@@ -210,25 +231,67 @@ pub(crate) async fn cost_components(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<CostComponentRow>> {
-    let secs = bucket.seconds();
+    let tok_bucket = bucket.bucket_expr("te.ts");
+    let cost_bucket = bucket.bucket_expr("e.created_at");
     let sql = format!(
-        "WITH {cte}
-        SELECT (te.ts / {secs}) * {secs} AS bucket_start,
-               te.model,
-               te.backend,
-               SUM(te.input_tokens),
-               SUM(te.cache_read_tokens),
-               SUM(te.cache_create_tokens),
-               SUM(te.output_tokens),
-               SUM(te.billable_tokens)
-        FROM token_events te
-        WHERE {filter}
-        GROUP BY bucket_start, te.model, te.backend
-        ORDER BY bucket_start",
+        "WITH {cte},
+        cost_events AS (
+            SELECT {cost_bucket} AS bucket_start,
+                   j.model AS model,
+                   LOWER(COALESCE(r.backend, s.backend, 'claude')) AS backend,
+                   COALESCE(r.project_id, j.project_id) AS project_id,
+                   e.created_at AS ts,
+                   e.cost_usd AS cost_usd
+            FROM events e
+            LEFT JOIN runs r ON r.id = e.run_id
+            LEFT JOIN sessions s ON s.id = e.session_id
+            LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+            WHERE e.cost_usd IS NOT NULL
+        ),
+        tok AS (
+            SELECT {tok_bucket} AS bucket_start,
+                   te.model AS model,
+                   te.backend AS backend,
+                   SUM(te.input_tokens) AS input,
+                   SUM(te.cache_read_tokens) AS cache_read,
+                   SUM(te.cache_create_tokens) AS cache_create,
+                   SUM(te.output_tokens) AS output,
+                   SUM(te.billable_tokens) AS billable
+            FROM token_events te
+            WHERE {filter}
+            GROUP BY bucket_start, te.model, te.backend
+        ),
+        cost AS (
+            SELECT ce.bucket_start AS bucket_start,
+                   ce.model AS model,
+                   ce.backend AS backend,
+                   SUM(ce.cost_usd) AS exact_cost,
+                   COUNT(ce.cost_usd) AS exact_count
+            FROM cost_events ce
+            WHERE {cost_filter}
+            GROUP BY ce.bucket_start, ce.model, ce.backend
+        )
+        SELECT tok.bucket_start,
+               tok.model,
+               tok.backend,
+               tok.input,
+               tok.cache_read,
+               tok.cache_create,
+               tok.output,
+               tok.billable,
+               COALESCE(cost.exact_cost, 0.0),
+               COALESCE(cost.exact_count, 0)
+        FROM tok
+        LEFT JOIN cost
+            ON cost.bucket_start = tok.bucket_start
+           AND IFNULL(cost.model, '') = IFNULL(tok.model, '')
+           AND cost.backend = tok.backend
+        ORDER BY tok.bucket_start",
         cte = TOKEN_EVENTS_CTE,
         filter = SCOPE_RANGE,
+        cost_filter = COST_SCOPE_RANGE,
     );
-    db.query_all(sql, scope_range_params(scope, range), |row| {
+    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
         Ok(CostComponentRow {
             bucket_start: row.i64(0)?,
             model: row.opt_text(1)?,
@@ -238,6 +301,111 @@ pub(crate) async fn cost_components(
             cache_create: row.i64(5)?,
             output: row.i64(6)?,
             billable: row.i64(7)?,
+            exact_cost: row.opt_f64(8)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(9)?,
+        })
+    })
+    .await
+}
+
+/// Per-model token components for a single backend, plus any real metered cost
+/// recorded on that model's events and the count of distinct runs. The
+/// backend-scoped sibling of [`CostComponentRow`]: grouped by model only (no
+/// time bucket), filtered to one backend, for the provider usage card.
+pub(crate) struct ProviderModelComponentRow {
+    pub model: Option<String>,
+    pub backend: String,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub output: i64,
+    pub billable: i64,
+    pub runs: i64,
+    /// Sum of real `events.cost_usd` for this model (0 when none reported).
+    pub exact_cost: f64,
+    /// Count of events for this model that carried a real `cost_usd`.
+    pub exact_cost_count: i64,
+}
+
+/// Per-model billable token totals and real metered cost for one backend over a
+/// scope/range. Mirrors [`cost_components`] (the exact-cost join lives on the
+/// settlement event, a different event than the billable token event but the
+/// same `(model, backend)` group) but collapses the time bucket and pins a
+/// single backend via `?7`, reused across both CTE predicates.
+pub(crate) async fn provider_model_components(
+    db: &LocalDb,
+    backend: &str,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<Vec<ProviderModelComponentRow>> {
+    let sql = format!(
+        "WITH {cte},
+        cost_events AS (
+            SELECT j.model AS model,
+                   LOWER(COALESCE(r.backend, s.backend, 'claude')) AS backend,
+                   COALESCE(r.project_id, j.project_id) AS project_id,
+                   e.created_at AS ts,
+                   e.cost_usd AS cost_usd
+            FROM events e
+            LEFT JOIN runs r ON r.id = e.run_id
+            LEFT JOIN sessions s ON s.id = e.session_id
+            LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+            WHERE e.cost_usd IS NOT NULL
+        ),
+        tok AS (
+            SELECT te.model AS model,
+                   te.backend AS backend,
+                   SUM(te.input_tokens) AS input,
+                   SUM(te.cache_read_tokens) AS cache_read,
+                   SUM(te.cache_create_tokens) AS cache_create,
+                   SUM(te.output_tokens) AS output,
+                   SUM(te.billable_tokens) AS billable,
+                   COUNT(DISTINCT te.run_id) AS runs
+            FROM token_events te
+            WHERE te.backend = ?7 AND {filter}
+            GROUP BY te.model, te.backend
+        ),
+        cost AS (
+            SELECT ce.model AS model,
+                   ce.backend AS backend,
+                   SUM(ce.cost_usd) AS exact_cost,
+                   COUNT(ce.cost_usd) AS exact_count
+            FROM cost_events ce
+            WHERE ce.backend = ?7 AND {cost_filter}
+            GROUP BY ce.model, ce.backend
+        )
+        SELECT tok.model,
+               tok.backend,
+               tok.input,
+               tok.cache_read,
+               tok.cache_create,
+               tok.output,
+               tok.billable,
+               tok.runs,
+               COALESCE(cost.exact_cost, 0.0),
+               COALESCE(cost.exact_count, 0)
+        FROM tok
+        LEFT JOIN cost
+            ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
+           AND cost.backend = tok.backend",
+        cte = TOKEN_EVENTS_CTE,
+        filter = SCOPE_RANGE,
+        cost_filter = COST_SCOPE_RANGE,
+    );
+    let mut params = scope_range_params_doubled(scope, range);
+    params.push(Value::Text(backend.to_string()));
+    db.query_all(sql, params, |row| {
+        Ok(ProviderModelComponentRow {
+            model: row.opt_text(0)?,
+            backend: row.text(1)?,
+            input: row.i64(2)?,
+            cache_read: row.i64(3)?,
+            cache_create: row.i64(4)?,
+            output: row.i64(5)?,
+            billable: row.i64(6)?,
+            runs: row.i64(7)?,
+            exact_cost: row.opt_f64(8)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(9)?,
         })
     })
     .await
@@ -497,7 +665,7 @@ pub(crate) async fn tool_calls_per_session(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<ToolSessionBucketRow>> {
-    let secs = bucket.seconds();
+    let bucket_expr = bucket.bucket_expr("session_ts");
     let sql = format!(
         "WITH session_calls AS (
             SELECT r.session_id AS session_id,
@@ -507,7 +675,7 @@ pub(crate) async fn tool_calls_per_session(
             WHERE r.session_id IS NOT NULL AND {filter}
             GROUP BY r.session_id
         )
-        SELECT (session_ts / {secs}) * {secs} AS bucket_start,
+        SELECT {bucket_expr} AS bucket_start,
                AVG(calls) AS avg_calls,
                COUNT(*) AS session_count
         FROM session_calls
@@ -539,9 +707,9 @@ pub(crate) async fn tool_mix(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<ToolMixRow>> {
-    let secs = bucket.seconds();
+    let bucket_expr = bucket.bucket_expr("ti.ts");
     let sql = format!(
-        "SELECT (ti.ts / {secs}) * {secs} AS bucket_start, ti.verb, COUNT(*) AS c
+        "SELECT {bucket_expr} AS bucket_start, ti.verb, COUNT(*) AS c
         {join}
         WHERE {filter}
         GROUP BY bucket_start, ti.verb

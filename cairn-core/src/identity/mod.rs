@@ -86,6 +86,9 @@ pub enum ApiProvider {
     /// Google APIs (Gemini)
     #[serde(rename = "google")]
     Google,
+    /// OpenRouter APIs
+    #[serde(rename = "openrouter", alias = "open_router")]
+    OpenRouter,
     /// GitHub APIs
     #[serde(rename = "github", alias = "git_hub")]
     GitHub,
@@ -97,6 +100,7 @@ impl ApiProvider {
             ApiProvider::Anthropic => "anthropic",
             ApiProvider::OpenAI => "openai",
             ApiProvider::Google => "google",
+            ApiProvider::OpenRouter => "openrouter",
             ApiProvider::GitHub => "github",
         }
     }
@@ -107,6 +111,7 @@ impl ApiProvider {
             ApiProvider::Anthropic,
             ApiProvider::OpenAI,
             ApiProvider::Google,
+            ApiProvider::OpenRouter,
             ApiProvider::GitHub,
         ]
     }
@@ -118,6 +123,7 @@ impl std::fmt::Display for ApiProvider {
             ApiProvider::Anthropic => write!(f, "Anthropic"),
             ApiProvider::OpenAI => write!(f, "OpenAI"),
             ApiProvider::Google => write!(f, "Google"),
+            ApiProvider::OpenRouter => write!(f, "OpenRouter"),
             ApiProvider::GitHub => write!(f, "GitHub"),
         }
     }
@@ -195,11 +201,13 @@ impl ProviderAccount {
             (ApiProvider::Anthropic, ProviderAuth::ApiKey { .. }) => vec!["claude", "native"],
             (ApiProvider::OpenAI, ProviderAuth::ApiKey { .. }) => vec!["codex", "native"],
             (ApiProvider::Google, ProviderAuth::ApiKey { .. }) => vec!["native"],
+            (ApiProvider::OpenRouter, ProviderAuth::ApiKey { .. }) => vec!["openrouter"],
             (ApiProvider::GitHub, ProviderAuth::ApiKey { .. }) => vec![],
             // OAuth is CLI-specific
             (ApiProvider::Anthropic, ProviderAuth::OAuthToken { .. }) => vec!["claude"],
             (ApiProvider::OpenAI, ProviderAuth::OAuthToken { .. }) => vec!["codex"],
             (ApiProvider::Google, ProviderAuth::OAuthToken { .. }) => vec![],
+            (ApiProvider::OpenRouter, ProviderAuth::OAuthToken { .. }) => vec![],
             (ApiProvider::GitHub, ProviderAuth::OAuthToken { .. }) => vec![],
             // Local CLI is CLI-specific
             (ApiProvider::Anthropic, ProviderAuth::LocalCli) => vec!["claude"],
@@ -1073,13 +1081,14 @@ mod tests {
     }
 
     #[test]
-    fn api_provider_all_returns_four() {
+    fn api_provider_all_returns_every_provider() {
         let all = ApiProvider::all();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         assert_eq!(all[0], ApiProvider::Anthropic);
         assert_eq!(all[1], ApiProvider::OpenAI);
         assert_eq!(all[2], ApiProvider::Google);
-        assert_eq!(all[3], ApiProvider::GitHub);
+        assert_eq!(all[3], ApiProvider::OpenRouter);
+        assert_eq!(all[4], ApiProvider::GitHub);
     }
 
     // === Serde alias tests (critical for disk compatibility) ===

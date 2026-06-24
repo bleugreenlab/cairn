@@ -32,6 +32,37 @@ use crate::storage::{LocalDb, RowExt};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Remove a job's working directory, dispatching on whether it is a jj workspace
+/// (forget it from the shared store, then delete the dir — it is not a git
+/// worktree of the repo) or a plain git worktree. Idempotent and best-effort.
+fn remove_job_worktree(
+    orch: &Orchestrator,
+    repo_path: &str,
+    wt_path: &Path,
+    branch: Option<&str>,
+) -> Result<(), String> {
+    if crate::jj::is_jj_dir(wt_path) {
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+        if let Some(b) = branch {
+            let _ = crate::jj::forget_workspace(&jj, &store, b);
+        }
+        if wt_path.exists() {
+            std::fs::remove_dir_all(wt_path)
+                .map_err(|e| format!("failed to remove jj workspace dir: {e}"))?;
+        }
+        Ok(())
+    } else {
+        crate::git::worktree::remove_worktree_with_services(
+            &*orch.services.git,
+            &*orch.services.fs,
+            Path::new(repo_path),
+            wt_path,
+            true,
+        )
+    }
+}
+
 /// Which jobs a teardown pass considers.
 pub enum TeardownScope {
     /// All jobs across an issue (PR merge/close, issue close/delete).
@@ -142,11 +173,17 @@ pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Re
         // backstop) before the worktree and branch disappear at teardown, the
         // immutability boundary. Strictly best-effort: any failure logs a warning
         // and rolls back (rows stay `full`) — archival must never block teardown.
+        // Construct the jj driver unconditionally; archival's forward-mapping
+        // helpers self-gate on `is_jj_dir`, so a plain-git worktree is a clean
+        // no-op (identity coordinates, no change-id) while a jj workspace gets
+        // its commits forward-mapped past any auto-rebase.
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
         match crate::archival::archive_target(
             &orch.db.local,
             &target.worktree_path,
             &target.repo_path,
             &target.job_ids,
+            Some(&jj),
         )
         .await
         {
@@ -189,13 +226,7 @@ pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Re
         }
 
         let wt_path = PathBuf::from(&target.worktree_path);
-        match crate::git::worktree::remove_worktree_with_services(
-            &*orch.services.git,
-            &*orch.services.fs,
-            Path::new(&target.repo_path),
-            &wt_path,
-            true,
-        ) {
+        match remove_job_worktree(orch, &target.repo_path, &wt_path, target.branch.as_deref()) {
             Ok(()) => log::info!("Teardown: removed worktree {}", target.worktree_path),
             Err(e) => log::warn!(
                 "Teardown: failed to remove worktree {}: {}",
@@ -275,13 +306,7 @@ pub async fn teardown_removed_node_worktrees(
 
     for target in targets {
         let wt_path = PathBuf::from(&target.worktree_path);
-        match crate::git::worktree::remove_worktree_with_services(
-            &*orch.services.git,
-            &*orch.services.fs,
-            Path::new(&target.repo_path),
-            &wt_path,
-            true,
-        ) {
+        match remove_job_worktree(orch, &target.repo_path, &wt_path, target.branch.as_deref()) {
             Ok(()) => log::info!("Snapshot edit: removed worktree {}", target.worktree_path),
             Err(e) => log::warn!(
                 "Snapshot edit: failed to remove worktree {}: {}",
@@ -349,6 +374,45 @@ async fn kill_terminals_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "job_terminals", "action": "delete"}),
+    );
+
+    // Node-scoped browsers are torn down with their jobs (project browsers
+    // persist). Core cannot touch the live webview handle, so it sends a Close
+    // over the channel for the app-side drain task to destroy it, then deletes
+    // the rows.
+    close_browsers_for_jobs(orch, job_ids).await;
+}
+
+/// Close live native webviews for the given jobs and delete their browser rows.
+///
+/// The live `Webview` handles live app-side; core reaches them only by sending
+/// [`BrowserCommand::Close`](crate::browsers::BrowserCommand) over the channel.
+/// On hosts without a webview layer the channel is `None` and only the rows are
+/// cleared.
+async fn close_browsers_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
+    if job_ids.is_empty() {
+        return;
+    }
+    match crate::browsers::list_running_browsers_for_jobs(&orch.db.local, job_ids).await {
+        Ok(running) => {
+            for browser in &running {
+                if let Some(tx) = &orch.browser_command_tx {
+                    let _ = tx.send(crate::browsers::BrowserCommand::Close {
+                        id: browser.id.clone(),
+                        label: browser.webview_label.clone(),
+                    });
+                }
+            }
+        }
+        Err(e) => log::warn!("Teardown: failed to load running browsers: {e}"),
+    }
+    if let Err(e) = crate::browsers::delete_all_browser_rows_for_jobs(&orch.db.local, job_ids).await
+    {
+        log::warn!("Teardown: failed to delete browser rows: {e}");
+    }
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "job_browsers", "action": "delete"}),
     );
 }
 

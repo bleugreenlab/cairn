@@ -33,6 +33,17 @@ pub struct ProviderCreditsSnapshot {
     pub currency: Option<String>,
 }
 
+/// One model's recorded usage for a metered backend: its real billed cost over
+/// the snapshot's scope, plus billable tokens and run count when known.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModelUsageRow {
+    pub model: String,
+    pub cost_usd: f64,
+    pub tokens: Option<i64>,
+    pub runs: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderUsageSnapshot {
@@ -44,6 +55,12 @@ pub struct ProviderUsageSnapshot {
     pub error: Option<String>,
     pub unsupported_reason: Option<String>,
     pub raw: Option<Value>,
+    /// Per-model usage breakdown for metered backends (OpenRouter). `Some(vec![])`
+    /// means "this is a breakdown-style snapshot with no usage yet" (drives the
+    /// empty state); `None` (the default) means the snapshot carries no breakdown
+    /// at all, keeping window-based Claude/Codex JSON unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_breakdown: Option<Vec<ProviderModelUsageRow>>,
 }
 
 impl ProviderUsageSnapshot {
@@ -57,6 +74,7 @@ impl ProviderUsageSnapshot {
             error: None,
             unsupported_reason: Some(reason.into()),
             raw: None,
+            model_breakdown: None,
         }
     }
 
@@ -75,6 +93,7 @@ impl ProviderUsageSnapshot {
             error: Some(message.into()),
             unsupported_reason: None,
             raw,
+            model_breakdown: None,
         }
     }
 
@@ -111,7 +130,29 @@ mod tests {
             error: None,
             unsupported_reason: None,
             raw: None,
+            model_breakdown: None,
         }
+    }
+
+    #[test]
+    fn model_breakdown_serializes_camel_case_and_omits_when_absent() {
+        let mut snap = snapshot("openrouter_generation");
+        snap.model_breakdown = Some(vec![ProviderModelUsageRow {
+            model: "anthropic/claude".to_string(),
+            cost_usd: 0.1234,
+            tokens: Some(2000),
+            runs: Some(3),
+        }]);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["modelBreakdown"][0]["model"], "anthropic/claude");
+        assert_eq!(json["modelBreakdown"][0]["costUsd"], 0.1234);
+        assert_eq!(json["modelBreakdown"][0]["tokens"], 2000);
+        assert_eq!(json["modelBreakdown"][0]["runs"], 3);
+
+        // A window-based snapshot omits the key entirely (Claude/Codex unchanged).
+        let without = snapshot("claude_usage_tui");
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(json.get("modelBreakdown").is_none());
     }
 
     #[test]

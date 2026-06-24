@@ -5,11 +5,12 @@
 
 mod actions;
 mod agents;
+pub mod browsers;
 mod common;
+mod dev_instances;
 mod files;
 mod issue;
 mod labels;
-pub(crate) mod symbols;
 mod memories;
 mod messages;
 pub(crate) mod mutations;
@@ -18,6 +19,7 @@ mod project;
 mod read;
 mod recipes;
 mod settings;
+pub(crate) mod symbols;
 mod transcript;
 
 pub(crate) use common::resolve_node_owner_id;

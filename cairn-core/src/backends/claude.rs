@@ -22,15 +22,15 @@ use crate::models::{
     ContextTokenState, ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow, RunStatus,
 };
 use crate::orchestrator::session::{
-    assemble_prompt_segments, get_claude_path, insert_error_event, persist_system_prompt_event,
-    write_claude_base_system_prompt_file, write_system_prompt_file,
+    assemble_prompt_segments, flatten_prompt_segments, get_claude_path, insert_error_event,
+    persist_system_prompt_event, write_system_prompt_file,
 };
 use crate::orchestrator::Orchestrator;
 use crate::services::SpawnConfig;
 use crate::storage::{DbError, RowExt};
 use crate::transcripts::stream_store::{
-    abort_stream, append_chunks, finalize_stream, open_stream, process_post_commit_outbox,
-    ActiveMessageStream, EmitDelta, EventInsert, StreamAccumulator,
+    abort_stream, append_chunks, finalize_stream_emit, open_stream, process_post_commit_outbox,
+    ActiveMessageStream, EmitDelta, EventInsert, StreamAccumulator, StreamingToolWrite,
 };
 use std::io::{BufRead, Write};
 use std::process::Command;
@@ -55,6 +55,14 @@ struct StreamingState {
     /// (first content delta / consolidated assistant event). None until thinking
     /// ends; lets finalize report thinking time rather than whole-turn time.
     thinking_ms: Option<i64>,
+    /// Backend wall-clock anchor (epoch ms) for the thinking phase, set once on
+    /// the first non-zero thinking-token count. Emitted on every `streaming-update`
+    /// so any client (including one that opens mid-think) ticks the live duration
+    /// from the true start instead of its own client clock.
+    thinking_started_at_ms: Option<i64>,
+    /// Non-persisted live context for a tool call whose JSON input is currently
+    /// being constructed by the backend stream.
+    tool_write: Option<StreamingToolWrite>,
 }
 
 #[cfg(test)]
@@ -65,6 +73,51 @@ mod tests {
     };
     use crate::agent_process::stream::Usage;
     use crate::backends::SessionStart;
+
+    fn test_streaming_state() -> super::StreamingState {
+        super::StreamingState {
+            stream_id: "stream-test".to_string(),
+            version: 0,
+            acc: crate::transcripts::stream_store::StreamAccumulator::new(),
+            opened_at: std::time::Instant::now(),
+            thinking_ms: None,
+            thinking_started_at_ms: None,
+            tool_write: None,
+        }
+    }
+
+    #[test]
+    fn records_thinking_anchor_once_on_first_nonzero_count() {
+        let mut state = test_streaming_state();
+        assert!(state.thinking_started_at_ms.is_none());
+
+        // A zero or absent count must not arm the anchor.
+        state.record_thinking_started(Some(0));
+        assert!(state.thinking_started_at_ms.is_none());
+        state.record_thinking_started(None);
+        assert!(state.thinking_started_at_ms.is_none());
+
+        // The first non-zero count sets the wall-clock anchor.
+        state.record_thinking_started(Some(50));
+        let first = state.thinking_started_at_ms;
+        assert!(first.is_some());
+
+        // Later counts never move it (the anchor stays the thinking start).
+        state.record_thinking_started(Some(100));
+        assert_eq!(state.thinking_started_at_ms, first);
+    }
+
+    #[test]
+    fn capture_thinking_done_freezes_duration_once() {
+        let mut state = test_streaming_state();
+        assert!(state.thinking_ms.is_none());
+        state.capture_thinking_done();
+        let frozen = state.thinking_ms;
+        assert!(frozen.is_some());
+        // Idempotent: a later boundary signal does not overwrite the duration.
+        state.capture_thinking_done();
+        assert_eq!(state.thinking_ms, frozen);
+    }
 
     #[test]
     fn parse_thinking_tokens_estimate_reads_absolute_estimate() {
@@ -149,6 +202,8 @@ impl StreamingState {
             acc: StreamAccumulator::new(),
             opened_at: std::time::Instant::now(),
             thinking_ms: None,
+            thinking_started_at_ms: None,
+            tool_write: None,
         }
     }
 
@@ -160,17 +215,58 @@ impl StreamingState {
             self.thinking_ms = Some(self.opened_at.elapsed().as_millis() as i64);
         }
     }
+
+    /// Record the backend wall-clock start of the thinking phase, once, the first
+    /// time a non-zero thinking-token count is observed for this stream. Idempotent
+    /// and gated on `tokens > 0` so the anchor lands on the first real thinking
+    /// count and never moves afterward.
+    fn record_thinking_started(&mut self, tokens: Option<u32>) {
+        if self.thinking_started_at_ms.is_none() && tokens.map(|t| t > 0).unwrap_or(false) {
+            self.thinking_started_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        }
+    }
+
+    fn start_tool_write(&mut self, id: Option<String>, name: String) {
+        self.tool_write = Some(StreamingToolWrite {
+            id,
+            name,
+            input_chars: 0,
+            status: "constructing".to_string(),
+        });
+    }
+
+    fn push_tool_input_delta(&mut self, partial_json: &str) {
+        if let Some(tool_write) = self.tool_write.as_mut() {
+            tool_write.input_chars += partial_json.chars().count() as i32;
+        }
+    }
+}
+
+fn extract_tool_start(content_block: &serde_json::Value) -> Option<(Option<String>, String)> {
+    if content_block.get("type").and_then(|value| value.as_str()) != Some("tool_use") {
+        return None;
+    }
+    let name = content_block.get("name").and_then(|value| value.as_str())?;
+    let id = content_block
+        .get("id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    Some((id, name.to_string()))
 }
 
 /// Emit a true-delta `streaming-update`: only the newly-produced scalar tail,
 /// plus the current absolute lengths so the frontend can detect gaps and
 /// self-heal against the DB snapshot.
+#[allow(clippy::too_many_arguments)]
 fn emit_streaming_delta(
     orch: &Orchestrator,
     run_id: &str,
     event_id: &str,
     delta: &EmitDelta,
     thinking_tokens: Option<u32>,
+    thinking_started_at: Option<i64>,
+    thinking_ms: Option<i64>,
+    tool_write: Option<&StreamingToolWrite>,
 ) {
     let _ = orch.services.emitter.emit(
         "streaming-update",
@@ -182,6 +278,9 @@ fn emit_streaming_delta(
             "thinking_delta": delta.thinking_delta,
             "thinking_len": delta.thinking_len,
             "thinking_tokens": thinking_tokens,
+            "thinking_started_at": thinking_started_at,
+            "thinking_ms": thinking_ms,
+            "tool_write": tool_write,
         }),
     );
 }
@@ -317,6 +416,7 @@ fn claude_rate_limit_snapshot(info: &RateLimitInfo) -> ProviderUsageSnapshot {
         error: None,
         unsupported_reason: None,
         raw: serde_json::to_value(info).ok(),
+        model_breakdown: None,
     }
 }
 
@@ -405,7 +505,10 @@ fn run_job_execution(orch: &Orchestrator, run_id: &str) -> (Option<String>, Opti
 fn finalize_streaming_message(
     orch: &Orchestrator,
     run_id: &str,
-    session_id: Option<&str>,
+    // The finalize emit is owned by `finalize_stream_emit` (it scopes from the
+    // finalized stream's own run/session), so this path no longer reads the
+    // passed session id; kept in the signature for call-site symmetry.
+    _session_id: Option<&str>,
     streaming_state: &mut Option<StreamingState>,
     mut final_event: Option<TranscriptEvent>,
     counts: TokenCounts,
@@ -435,7 +538,16 @@ fn finalize_streaming_message(
     // snapshot is swapped for the final assistant event.
     if state.acc.has_unemitted() {
         let delta = state.acc.take_emit_delta();
-        emit_streaming_delta(orch, run_id, &state.stream_id, &delta, None);
+        emit_streaming_delta(
+            orch,
+            run_id,
+            &state.stream_id,
+            &delta,
+            None,
+            state.thinking_started_at_ms,
+            state.thinking_ms,
+            state.tool_write.as_ref(),
+        );
     }
     // Stamp reasoning duration on the finalized event when this message carried
     // thinking. The duration is the thinking phase only — stream open to the
@@ -451,18 +563,15 @@ fn finalize_streaming_message(
             event.thinking_ms = Some(ms);
         }
     }
-    match finalize_stream(
+    match finalize_stream_emit(
         orch.db.local.clone(),
+        &orch.services.emitter,
         &state.stream_id,
         state.version,
         final_event,
         counts,
     ) {
         Ok(finalized) => {
-            let _ = orch
-                .services
-                .emitter
-                .emit("db-change", event_db_change(run_id, session_id, "insert"));
             process_post_commit_outbox(orch, &finalized.outbox_entries);
             true
         }
@@ -522,8 +631,9 @@ fn flush_pending_assistant_before_suppress(
     let now = chrono::Utc::now().timestamp() as i32;
     let data = serde_json::to_string(&pending).unwrap_or_default();
     let current_turn = orch.process_state.get_current_turn_id(run_id);
-    match crate::transcripts::stream_store::insert_event(
+    match crate::transcripts::stream_store::insert_event_emit(
         orch.db.local.clone(),
+        &orch.services.emitter,
         EventInsert {
             id: Uuid::new_v4().to_string(),
             run_id: run_id.to_string(),
@@ -540,17 +650,10 @@ fn flush_pending_assistant_before_suppress(
             output_tokens: counts.output,
             thinking_tokens: counts.thinking,
             turn_id: current_turn,
+            cost_usd: None,
         },
     ) {
-        Ok(inserted) => {
-            if inserted {
-                let _ = orch
-                    .services
-                    .emitter
-                    .emit("db-change", event_db_change(run_id, session_id, "insert"));
-            }
-            inserted
-        }
+        Ok(inserted) => inserted,
         Err(error) => {
             log::warn!(
                 "Failed to insert pending assistant for run {} before suppression: {}",
@@ -560,17 +663,6 @@ fn flush_pending_assistant_before_suppress(
             false
         }
     }
-}
-
-fn event_db_change(run_id: &str, session_id: Option<&str>, action: &str) -> serde_json::Value {
-    serde_json::json!({
-        "table": "events",
-        "action": action,
-        "runId": run_id,
-        "run_id": run_id,
-        "sessionId": session_id,
-        "session_id": session_id,
-    })
 }
 
 /// Claude CLI agent backend.
@@ -671,41 +763,28 @@ impl AgentBackend for ClaudeBackend {
         let use_skip_permissions = matches!(config.permissions.fence, crate::models::Fence::Allow);
 
         let workspace_instructions = crate::workspace::instructions::read_workspace_instructions();
+        let project_instructions = crate::workspace::instructions::read_project_instructions(
+            std::path::Path::new(&config.working_dir),
+        );
 
-        // Write combined system prompt (bundled + workspace + agent) to temp file
-        let prompt_file_path = write_system_prompt_file(
-            &config.run_id,
-            config.system_prompt_content.as_deref(),
-            workspace_instructions.as_deref(),
-        )?;
-
-        // Write Cairn's base Claude system prompt to replace CC's default
-        // entirely (--system-prompt-file). Cairn + agent content is still
-        // appended on top via --append-system-prompt-file above.
-        let base_system_prompt_path = match write_claude_base_system_prompt_file() {
-            Ok(path) => Some(path),
-            Err(e) => {
-                log::warn!(
-                    "Failed to write Claude base system prompt file; falling back to CC default: {}",
-                    e
-                );
-                None
-            }
-        };
-
-        // Persist the assembled prompt as labeled segments (concatenation equals
-        // the effective prompt the CLI receives: base + appended). The base
-        // segment is omitted when the base file failed to write, matching the
-        // appended-only prompt that path sends.
+        // Assemble the uniform system-prompt stack (cairn + workspace + project +
+        // role + orientation) shared by every backend, then deliver it as ONE
+        // file via --system-prompt-file, fully replacing CC's default. The file
+        // bytes equal the persisted segment concatenation exactly. Project/local
+        // CLAUDE.md native memory (a separate context-injection mechanism) is
+        // suppressed via --setting-sources user in the CLI args, so the project
+        // instruction layer reaches Claude exactly once — through the assembled
+        // `project` segment, not also through CC auto-discovery.
         let prompt_segments = assemble_prompt_segments(
-            base_system_prompt_path
-                .as_ref()
-                .map(|_| crate::system_prompt::CLAUDE_SYSTEM_PROMPT),
             &crate::system_prompt::cairn_system_prompt(),
             workspace_instructions.as_deref(),
+            project_instructions.as_deref(),
             config.system_prompt_content.as_deref(),
             config.system_prompt_dynamic_tail.as_deref(),
         );
+        let system_prompt_path =
+            write_system_prompt_file(&config.run_id, &flatten_prompt_segments(&prompt_segments))?;
+
         let initial_sequence = persist_system_prompt_event(
             orch,
             &config.run_id,
@@ -734,8 +813,7 @@ impl AgentBackend for ClaudeBackend {
                 .or_else(|| config.max_thinking_tokens.map(|_| "high".to_string())),
             allowed_tools: config.allowed_tools,
             disallowed_tools: config.disallowed_tools,
-            system_prompt_file: base_system_prompt_path,
-            append_system_prompt_file: Some(prompt_file_path),
+            system_prompt_file: Some(system_prompt_path),
             settings_path: hook_settings_path,
             bidirectional: config.bidirectional,
         };
@@ -1038,6 +1116,11 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
                 "haiku",
                 ClaudeContextOptIn::default(),
             )),
+            canonical_slug: None,
+            pricing: None,
+            supported_parameters: Vec::new(),
+            router: false,
+            architecture_modality: None,
         },
         DiscoveredModel {
             id: "sonnet".to_string(),
@@ -1052,6 +1135,11 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
                 "sonnet",
                 ClaudeContextOptIn::default(),
             )),
+            canonical_slug: None,
+            pricing: None,
+            supported_parameters: Vec::new(),
+            router: false,
+            architecture_modality: None,
         },
         DiscoveredModel {
             id: "opus".to_string(),
@@ -1063,6 +1151,11 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
             default_reasoning_effort: None,
             supported_reasoning_efforts: vec![],
             context_window: Some(claude_context_window("opus", ClaudeContextOptIn::default())),
+            canonical_slug: None,
+            pricing: None,
+            supported_parameters: Vec::new(),
+            router: false,
+            architecture_modality: None,
         },
         DiscoveredModel {
             id: "fable".to_string(),
@@ -1077,6 +1170,11 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
                 "fable",
                 ClaudeContextOptIn::default(),
             )),
+            canonical_slug: None,
+            pricing: None,
+            supported_parameters: Vec::new(),
+            router: false,
+            architecture_modality: None,
         },
     ])
 }
@@ -1247,6 +1345,7 @@ impl ClaudeBackend {
                             if let Some(tokens) = parse_thinking_tokens_estimate(data) {
                                 last_thinking_tokens = Some(tokens);
                                 if let Some(ref mut state) = streaming_state {
+                                    state.record_thinking_started(last_thinking_tokens);
                                     let delta = state.acc.take_emit_delta();
                                     emit_streaming_delta(
                                         orch,
@@ -1254,6 +1353,9 @@ impl ClaudeBackend {
                                         &state.stream_id,
                                         &delta,
                                         last_thinking_tokens,
+                                        state.thinking_started_at_ms,
+                                        state.thinking_ms,
+                                        state.tool_write.as_ref(),
                                     );
                                 } else {
                                     pending_thinking_tokens = Some(tokens);
@@ -1332,6 +1434,7 @@ impl ClaudeBackend {
                                     Ok(stream) => {
                                         let mut new_state = StreamingState::new(&stream);
                                         if last_thinking_tokens.is_some() {
+                                            new_state.record_thinking_started(last_thinking_tokens);
                                             let delta = new_state.acc.take_emit_delta();
                                             emit_streaming_delta(
                                                 orch,
@@ -1339,12 +1442,15 @@ impl ClaudeBackend {
                                                 &new_state.stream_id,
                                                 &delta,
                                                 last_thinking_tokens,
+                                                new_state.thinking_started_at_ms,
+                                                new_state.thinking_ms,
+                                                new_state.tool_write.as_ref(),
                                             );
                                         }
                                         streaming_state = Some(new_state);
                                         let _ = emitter.emit(
                                             "db-change",
-                                            event_db_change(
+                                            crate::notify::event_db_change(
                                                 run_id,
                                                 session_id.as_deref(),
                                                 "insert",
@@ -1356,6 +1462,26 @@ impl ClaudeBackend {
                                             "Failed to open Claude stream for {}: {}",
                                             run_id,
                                             error
+                                        );
+                                    }
+                                }
+                            }
+                            StreamEventInner::ContentBlockStart { content_block, .. } => {
+                                if let (Some(ref mut state), Some(content_block)) =
+                                    (streaming_state.as_mut(), content_block.as_ref())
+                                {
+                                    if let Some((id, name)) = extract_tool_start(content_block) {
+                                        state.start_tool_write(id, name);
+                                        let delta = state.acc.take_emit_delta();
+                                        emit_streaming_delta(
+                                            orch,
+                                            run_id,
+                                            &state.stream_id,
+                                            &delta,
+                                            last_thinking_tokens,
+                                            state.thinking_started_at_ms,
+                                            state.thinking_ms,
+                                            state.tool_write.as_ref(),
                                         );
                                     }
                                 }
@@ -1379,6 +1505,20 @@ impl ClaudeBackend {
                                         DeltaContent::ThinkingDelta { thinking } => {
                                             state.acc.push_thinking(thinking);
                                         }
+                                        DeltaContent::InputJsonDelta { partial_json } => {
+                                            state.push_tool_input_delta(partial_json);
+                                            let delta = state.acc.take_emit_delta();
+                                            emit_streaming_delta(
+                                                orch,
+                                                run_id,
+                                                &state.stream_id,
+                                                &delta,
+                                                last_thinking_tokens,
+                                                state.thinking_started_at_ms,
+                                                state.thinking_ms,
+                                                state.tool_write.as_ref(),
+                                            );
+                                        }
                                         DeltaContent::Unknown => {}
                                     }
                                     let now = std::time::Instant::now();
@@ -1400,6 +1540,7 @@ impl ClaudeBackend {
                                         }
                                     }
                                     if state.acc.should_emit(now) {
+                                        state.record_thinking_started(last_thinking_tokens);
                                         let delta = state.acc.take_emit_delta();
                                         emit_streaming_delta(
                                             orch,
@@ -1407,6 +1548,9 @@ impl ClaudeBackend {
                                             &state.stream_id,
                                             &delta,
                                             last_thinking_tokens,
+                                            state.thinking_started_at_ms,
+                                            state.thinking_ms,
+                                            state.tool_write.as_ref(),
                                         );
                                     }
                                 }
@@ -1488,7 +1632,11 @@ impl ClaudeBackend {
                             );
                             let _ = emitter.emit(
                                 "db-change",
-                                event_db_change(run_id, session_id.as_deref(), "update"),
+                                crate::notify::event_db_change(
+                                    run_id,
+                                    session_id.as_deref(),
+                                    "update",
+                                ),
                             );
                         }
                         sequence += 1;
@@ -1564,6 +1712,7 @@ impl ClaudeBackend {
                     if streaming_state.is_some() && is_assistant && has_thinking && !has_content {
                         if let Some(ref mut state) = streaming_state {
                             state.capture_thinking_done();
+                            state.record_thinking_started(last_thinking_tokens);
                             let delta = state.acc.take_emit_delta();
                             emit_streaming_delta(
                                 orch,
@@ -1571,6 +1720,9 @@ impl ClaudeBackend {
                                 &state.stream_id,
                                 &delta,
                                 last_thinking_tokens,
+                                state.thinking_started_at_ms,
+                                state.thinking_ms,
+                                state.tool_write.as_ref(),
                             );
                         }
                         continue;
@@ -1649,7 +1801,11 @@ impl ClaudeBackend {
                             );
                             let _ = emitter.emit(
                                 "db-change",
-                                event_db_change(run_id, session_id.as_deref(), "update"),
+                                crate::notify::event_db_change(
+                                    run_id,
+                                    session_id.as_deref(),
+                                    "update",
+                                ),
                             );
                         }
                         sequence += 1;
@@ -1679,8 +1835,9 @@ impl ClaudeBackend {
                         }
 
                         let current_turn = orch.process_state.get_current_turn_id(run_id);
-                        let inserted = crate::transcripts::stream_store::insert_event(
+                        let inserted = crate::transcripts::stream_store::insert_event_emit(
                             orch.db.local.clone(),
+                            emitter,
                             EventInsert {
                                 id: event_id.clone(),
                                 run_id: run_id.to_string(),
@@ -1697,6 +1854,7 @@ impl ClaudeBackend {
                                 output_tokens: event_counts.output,
                                 thinking_tokens: event_counts.thinking,
                                 turn_id: current_turn.clone(),
+                                cost_usd: None,
                             },
                         )
                         .unwrap_or(false);
@@ -1718,11 +1876,6 @@ impl ClaudeBackend {
                                 created_at: Some(now as i64),
                                 turn_id: current_turn.clone(),
                             }));
-
-                            let _ = emitter.emit(
-                                "db-change",
-                                event_db_change(run_id, session_id.as_deref(), "insert"),
-                            );
 
                             // Embed events for vibe coloring (agent content) and
                             // session position (user / agent / change feeds).

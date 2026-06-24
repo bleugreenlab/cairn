@@ -42,7 +42,6 @@ pub fn persist_system_prompt_event(
     // static segments and inline only the dynamic tail, never re-running assembly.
     let mut full_prompt = String::new();
     let mut segment_map: Vec<serde_json::Value> = Vec::with_capacity(segments.len());
-    let mut has_backend_base = false;
     for seg in segments {
         let byte_offset = full_prompt.len();
         full_prompt.push_str(&seg.text);
@@ -51,9 +50,6 @@ pub fn persist_system_prompt_event(
             "byteOffset": byte_offset,
             "byteLen": seg.text.len(),
         }));
-        if seg.kind == SEGMENT_KIND_BACKEND_BASE {
-            has_backend_base = true;
-        }
     }
 
     let hash = sha256_hex(&full_prompt);
@@ -62,7 +58,6 @@ pub fn persist_system_prompt_event(
     let run_id_owned = run_id.to_string();
     let session_id_owned = session_id.map(|s| s.to_string());
     let full_prompt_owned = full_prompt.clone();
-    let includes_backend_base = backend == "claude" && has_backend_base;
 
     let transcript_event = TranscriptEvent {
         event_type: "system:prompt".to_string(),
@@ -81,7 +76,6 @@ pub fn persist_system_prompt_event(
             "backend": backend,
             "bytes": full_prompt.len(),
             "hash": hash,
-            "includesBackendBase": includes_backend_base,
             "segments": segment_map,
         })),
     };
@@ -207,7 +201,7 @@ pub fn persist_system_prompt_event(
 
         let _ = orch.services.emitter.emit(
             "db-change",
-            serde_json::json!({"table": "events", "action": "insert"}),
+            crate::notify::event_db_change(run_id, session_id, "insert"),
         );
     }
 
@@ -228,6 +222,10 @@ struct SessionDbContext {
     /// The run's job id, used to key the per-job scratch dir surfaced in the
     /// orientation block. `None` for runs with no job (project chat).
     job_id: Option<String>,
+    /// The run's recipe node id, used to resolve this node's `context-self`
+    /// living-doc targets for the prompt affordance. `None` for sub-agent task
+    /// jobs and project chat (no recipe node).
+    recipe_node_id: Option<String>,
 }
 
 fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbContext, String> {
@@ -247,7 +245,8 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                                 executions.seq,
                                 parent_jobs.uri_segment AS parent_uri_segment,
                                 COALESCE(jobs.base_branch, projects.default_branch) AS effective_base_branch,
-                                runs.job_id
+                                runs.job_id,
+                                jobs.recipe_node_id
                          FROM runs
                          LEFT JOIN issues ON runs.issue_id = issues.id
                          LEFT JOIN projects ON COALESCE(runs.project_id, issues.project_id) = projects.id
@@ -274,6 +273,7 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                 let parent_uri_segment = row.opt_text(7)?;
                 let effective_base_branch = row.opt_text(8)?;
                 let job_id = row.opt_text(9)?;
+                let recipe_node_id = row.opt_text(10)?;
 
                 // All four components are required. A missing component means the run
                 // record is corrupt or incomplete — fail rather than produce a partial URI.
@@ -310,12 +310,120 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                     project_path,
                     effective_base_branch,
                     job_id,
+                    recipe_node_id,
                 })
             })
         })
         .await
         .map_err(|e| e.to_string())
     })
+}
+
+/// Resolve a node's `context-self` living-doc targets for the prompt affordance:
+/// the ArtifactNodes this node owns and patches across its life (name + schema).
+/// Empty for jobs with no recipe node (sub-agent tasks, project chat) or no
+/// `context-self` edges. A read failure degrades to no affordance rather than
+/// failing session startup.
+fn resolve_ctx_self_targets(
+    orch: &Orchestrator,
+    execution_id: &str,
+    node_id: &str,
+) -> Vec<crate::models::OutputSchemaInfo> {
+    let db = orch.db.local.clone();
+    let execution_id = execution_id.to_string();
+    let node_id = node_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            let execution_id = execution_id.clone();
+            let node_id = node_id.clone();
+            Box::pin(async move {
+                crate::execution::jobs::resolve_ctx_self_schemas_conn(conn, &node_id, &execution_id)
+                    .await
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or_default()
+}
+
+/// Render a JSON Schema object's properties as a `Fields:` list for the prompt:
+/// each property's name, type, required/optional flag, and description. Empty
+/// string when the schema declares no `properties`. Shared by the terminal
+/// output-artifact affordance and the living-doc (context-self) affordance so
+/// both surface a node's typed shape identically.
+fn render_schema_fields(schema_value: &serde_json::Value) -> String {
+    let required: Vec<String> = schema_value
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(props) = schema_value.get("properties").and_then(|p| p.as_object()) else {
+        return String::new();
+    };
+    let mut out = String::from("Fields:\n");
+    for (key, val) in props {
+        let ty = val.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+        let desc = val
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        let req = if required.iter().any(|r| r == key) {
+            "required"
+        } else {
+            "optional"
+        };
+        let sep = if desc.is_empty() { "" } else { ": " };
+        out.push_str(&format!("- `{key}` ({ty}, {req}){sep}{desc}\n"));
+    }
+    out
+}
+
+/// Render the `## Living working documents` affordance for a node's
+/// `context-self` targets. Generic and recipe-driven: for each ArtifactNode the
+/// node owns it names the artifact (`cairn:~/<name>`) and lists its fields, then
+/// states the living-doc contract — create AND patch repeatedly across the whole
+/// run, which never ends the turn and never advances the DAG (the explicit
+/// contrast with the single terminal `context-out` artifact). Returns `None`
+/// when the node owns no named, schema-bearing ctx-self targets.
+fn build_ctx_self_section(
+    targets: &[crate::models::OutputSchemaInfo],
+    schema_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    let entries: Vec<(String, serde_json::Value)> = targets
+        .iter()
+        .filter_map(|t| {
+            let name = t.artifact_name.clone()?;
+            let schema =
+                crate::output_schemas::resolve_output_schema(schema_dir, &t.schema).ok()?;
+            Some((name, schema))
+        })
+        .collect();
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut section = String::from(
+        "## Living working documents\n\n\
+         This node owns living working docs (e.g. a scratchpad or status board) \
+         at `cairn:~/<name>`. Create one with `write` (mode `create`) and revise \
+         it anytime with mode `patch` — this never ends your turn or advances \
+         the workflow, so keep it current as you go.\n\n\
+         Your living documents:\n\n",
+    );
+    for (name, schema_value) in &entries {
+        section.push_str(&format!("### `cairn:~/{name}`\n\n"));
+        let fields = render_schema_fields(schema_value);
+        if !fields.is_empty() {
+            section.push_str(&fields);
+            section.push('\n');
+        }
+    }
+    Some(section)
 }
 
 /// Build the orientation block: the agent's concrete coordinates for this run —
@@ -331,6 +439,7 @@ fn build_orientation_block(
     repo_root: Option<&str>,
     base_branch: Option<&str>,
     scratch_dir: Option<&str>,
+    model: Option<&str>,
 ) -> String {
     let mut out = String::from("## Orientation\n\nYour coordinates for this run:\n\n");
     out.push_str(&format!("- Working directory (cwd): `{}`\n", working_dir));
@@ -352,6 +461,9 @@ fn build_orientation_block(
         std::env::consts::OS,
         std::env::consts::ARCH
     ));
+    if let Some(model) = model {
+        out.push_str(&format!("- Model: `{}`\n", model));
+    }
     if let Some(scratch) = scratch_dir {
         out.push_str(&format!(
             "- Scratch dir (TMPDIR): `{}` \u{2014} already exported as `$TMPDIR`/`$TMP`/`$TEMP`; reclaimed at teardown\n",
@@ -808,7 +920,7 @@ pub fn insert_error_event(
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        serde_json::json!({"table": "events", "action": "insert"}),
+        crate::notify::event_db_change(run_id, session_id, "insert"),
     );
 }
 
@@ -867,21 +979,17 @@ fn get_prompt_tmp_dir() -> PathBuf {
         .join("tmp")
 }
 
-/// Write combined system prompt (bundled + agent) to a temp file
-/// Returns the path to the temp file
-pub fn write_system_prompt_file(
-    run_id: &str,
-    agent_prompt: Option<&str>,
-    workspace_instructions: Option<&str>,
-) -> Result<PathBuf, String> {
+/// Write the fully assembled system prompt to a per-run temp file and return its
+/// path. Claude delivers the entire uniform stack (cairn + workspace + project +
+/// role + orientation) as one `--system-prompt-file`, fully replacing CC's
+/// default; the file bytes equal the persisted segment concatenation exactly.
+pub fn write_system_prompt_file(run_id: &str, content: &str) -> Result<PathBuf, String> {
     let tmp_dir = get_prompt_tmp_dir();
     fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
 
     let file_path = tmp_dir.join(format!("prompt-{}.md", run_id));
 
-    let content = build_appended_system_prompt(agent_prompt, workspace_instructions);
-
-    fs::write(&file_path, &content)
+    fs::write(&file_path, content)
         .map_err(|e| format!("Failed to write system prompt file: {}", e))?;
 
     log::debug!(
@@ -898,9 +1006,9 @@ pub fn write_system_prompt_file(
 /// constant, the workspace doctrine, or an agent's role body) and is
 /// content-addressed into `archival_blobs` at teardown; the dynamic tail (the
 /// per-run orientation block) stays inline on the event.
-pub const SEGMENT_KIND_BACKEND_BASE: &str = "backend_base";
 pub const SEGMENT_KIND_CAIRN: &str = "cairn";
 pub const SEGMENT_KIND_WORKSPACE: &str = "workspace";
+pub const SEGMENT_KIND_PROJECT: &str = "project";
 pub const SEGMENT_KIND_AGENT: &str = "agent";
 pub const SEGMENT_KIND_DYNAMIC: &str = "dynamic";
 
@@ -923,23 +1031,23 @@ impl PromptSegment {
     }
 }
 
-/// Assemble the ordered system-prompt segments shared by both backends. Their
-/// concatenation equals what `build_appended_system_prompt` /
-/// `build_effective_system_prompt` produce, plus the backend base prefix:
-/// `backend_base + "\n\n" + cairn + ["\n\n## Workspace Instructions\n\n" + ws] +
-/// ["\n\n" + agent]`.
+/// Assemble the ordered system-prompt segments shared by every backend. Their
+/// concatenation is the full system prompt, identical across Claude, Codex, and
+/// OpenRouter:
+/// `cairn + ["\n\n## Workspace Instructions\n\n" + workspace] +
+///  ["\n\n## Project Instructions\n\n" + project] + ["\n\n" + agent]`,
+/// where the agent piece splits into a static head and the inlined dynamic tail
+/// when `dynamic_tail` is a non-empty suffix of `agent`.
 ///
-/// `backend_base` is the backend's base prompt (`None` for a Claude run whose base
-/// file failed to write, where the base is omitted). `cairn` is the cairn prompt.
-/// `workspace` is the raw workspace-instructions body (the header is added here).
-/// `agent` is the full agent content; `dynamic_tail`, when it is a non-empty
-/// suffix of `agent`, splits it into a static head segment and the inlined
-/// dynamic tail. When `dynamic_tail` does not apply, the whole agent content is
-/// kept as one static segment (still correct, just less dedup).
+/// `cairn` is the Cairn base prompt (always first). `workspace` is the raw
+/// `~/.cairn/AGENTS.md` body and `project` the raw run repo-root `AGENTS.md`
+/// body (each header is added here). `agent` is the full agent role content;
+/// when `dynamic_tail` does not apply, the whole agent content stays one static
+/// segment (still correct, just less dedup).
 pub fn assemble_prompt_segments(
-    backend_base: Option<&str>,
     cairn: &str,
     workspace: Option<&str>,
+    project: Option<&str>,
     agent: Option<&str>,
     dynamic_tail: Option<&str>,
 ) -> Vec<PromptSegment> {
@@ -956,12 +1064,6 @@ pub fn assemble_prompt_segments(
         };
     }
 
-    if let Some(base) = backend_base {
-        segments.push(PromptSegment::new(
-            SEGMENT_KIND_BACKEND_BASE,
-            base.to_string(),
-        ));
-    }
     segments.push(PromptSegment::new(
         SEGMENT_KIND_CAIRN,
         format!("{}{}", lead!(), cairn),
@@ -970,6 +1072,12 @@ pub fn assemble_prompt_segments(
         segments.push(PromptSegment::new(
             SEGMENT_KIND_WORKSPACE,
             format!("{}## Workspace Instructions\n\n{}", lead!(), ws.trim()),
+        ));
+    }
+    if let Some(proj) = project.filter(|content| !content.trim().is_empty()) {
+        segments.push(PromptSegment::new(
+            SEGMENT_KIND_PROJECT,
+            format!("{}## Project Instructions\n\n{}", lead!(), proj.trim()),
         ));
     }
     if let Some(agent) = agent.filter(|content| !content.trim().is_empty()) {
@@ -994,39 +1102,43 @@ pub fn assemble_prompt_segments(
     segments
 }
 
-/// Build the Cairn-controlled system prompt portion appended to backend base prompts.
-pub(crate) fn build_appended_system_prompt(
-    agent_prompt: Option<&str>,
-    workspace_instructions: Option<&str>,
-) -> String {
-    let mut combined = crate::system_prompt::cairn_system_prompt();
-    if let Some(workspace_content) =
-        workspace_instructions.filter(|content| !content.trim().is_empty())
-    {
-        combined.push_str("\n\n## Workspace Instructions\n\n");
-        combined.push_str(workspace_content.trim());
-    }
-    if let Some(agent_content) = agent_prompt.filter(|content| !content.trim().is_empty()) {
-        combined.push_str("\n\n");
-        combined.push_str(agent_content);
-    }
-    combined
+/// Concatenate every segment's text into the full system prompt string. Used by
+/// backends that deliver the prompt as a single blob (Claude's
+/// `--system-prompt-file`, OpenRouter's `system` message).
+pub fn flatten_prompt_segments(segments: &[PromptSegment]) -> String {
+    segments.iter().map(|s| s.text.as_str()).collect()
 }
 
-/// Write the Claude base system prompt (replaces CC's default via
-/// `--system-prompt-file`) to a stable path and return it.
-///
-/// Content is static (compiled in), so the file is shared across runs.
-/// Always overwrites so binary updates pick up new prompt content.
-pub fn write_claude_base_system_prompt_file() -> Result<PathBuf, String> {
-    let tmp_dir = get_prompt_tmp_dir();
-    fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+/// The Codex `baseInstructions` payload: the `cairn` + `workspace` + `project`
+/// segment texts concatenated. Slicing the assembled segments (rather than
+/// rebuilding the string independently) makes Codex's sent bytes equal the
+/// persisted segments by construction, not by coincidence.
+pub fn base_instructions_from_segments(segments: &[PromptSegment]) -> String {
+    segments
+        .iter()
+        .filter(|s| {
+            s.kind == SEGMENT_KIND_CAIRN
+                || s.kind == SEGMENT_KIND_WORKSPACE
+                || s.kind == SEGMENT_KIND_PROJECT
+        })
+        .map(|s| s.text.as_str())
+        .collect()
+}
 
-    let file_path = tmp_dir.join("claude-system-prompt.md");
-    fs::write(&file_path, crate::system_prompt::CLAUDE_SYSTEM_PROMPT)
-        .map_err(|e| format!("Failed to write Claude base system prompt file: {}", e))?;
-
-    Ok(file_path)
+/// The Codex `developerInstructions` payload: the `agent` + `dynamic` segment
+/// texts concatenated, or `None` when the agent content is empty. Paired with
+/// [`base_instructions_from_segments`] so base + developer == the full prompt.
+pub fn developer_instructions_from_segments(segments: &[PromptSegment]) -> Option<String> {
+    let combined: String = segments
+        .iter()
+        .filter(|s| s.kind == SEGMENT_KIND_AGENT || s.kind == SEGMENT_KIND_DYNAMIC)
+        .map(|s| s.text.as_str())
+        .collect();
+    if combined.trim().is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
 }
 
 /// Clean up a specific prompt file after a run completes
@@ -1167,6 +1279,7 @@ pub fn start_agent_session(
     // `CAIRN_HOME_URI` / `--agents` payload.
     let cairn_home = cairn_common::paths::cairn_home();
     let cairn_home_str = cairn_home.to_string_lossy();
+    let log_level = crate::config::settings::load_log_level(&orch.config_dir);
     let mcp_config_json = crate::config::mcp_setup::build_mcp_config_string(
         &orch.mcp_binary_path,
         orch.mcp_callback_port,
@@ -1174,6 +1287,7 @@ pub fn start_agent_session(
         Some(home_uri.as_str()),
         cairn_common::paths::env_str(),
         Some(cairn_home_str.as_ref()),
+        log_level.as_str(),
     );
     log::debug!("start_agent_session: MCP config built inline");
     log::info!("[PROFILE] MCP config done: {:?}", start_time.elapsed());
@@ -1196,6 +1310,7 @@ pub fn start_agent_session(
         permissions,
         max_thinking_tokens,
         reasoning_effort,
+        service_tier,
     ) = {
         use crate::config::{agents as config_agents, skills as config_skills, ConfigResult};
         let run_issue_id = db_context.run_issue_id.clone();
@@ -1206,7 +1321,7 @@ pub fn start_agent_session(
         // AgentConfig, resolved at launch/edit time — never recomputed against
         // current presets here. This is the deferred-resolution deletion that
         // keeps a resumed session stable across workspace-settings changes.
-        let (max_thinking_tokens, reasoning_effort) = {
+        let (max_thinking_tokens, reasoning_effort, service_tier) = {
             let extras = agent_config
                 .as_ref()
                 .and_then(|ac| ac.extras.clone())
@@ -1216,6 +1331,7 @@ pub fn start_agent_session(
                     .max_thinking_tokens
                     .or(workspace_settings.max_thinking_tokens),
                 extras.reasoning_effort.clone(),
+                extras.service_tier.clone(),
             )
         };
 
@@ -1386,9 +1502,9 @@ pub fn start_agent_session(
             }
 
             // MCP servers affordance block: configured (enabled) external servers
-            // reachable through the cairn://mcp gateway, each tool rendered as a
-            // terse one-line contract from the persisted tool store (captured when
-            // the server was saved in Settings, so it's available synchronously on
+            // reachable through the cairn://mcp gateway, each server's tools listed
+            // by name from the persisted tool store (captured when the server was
+            // saved or authorized in Settings, so it's available synchronously on
             // the very first session). Full argument schemas stay a
             // `read cairn://mcp/<srv>` away; a server with no captured tools renders
             // a read pointer. Gated on `read` since discovery and invocation go
@@ -1482,33 +1598,7 @@ pub fn start_agent_session(
                     let mut section = format!(
                         "## Output artifact\n\nWhen your work is complete, record your result as this node's output artifact: write it with the `write` verb to `cairn:~/{name}` (mode `create`; use mode `patch` to revise). The payload is validated against the schema below before it is accepted.\n\n"
                     );
-                    let required: Vec<String> = schema_value
-                        .get("required")
-                        .and_then(|r| r.as_array())
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if let Some(props) = schema_value.get("properties").and_then(|p| p.as_object())
-                    {
-                        section.push_str("Fields:\n");
-                        for (key, val) in props {
-                            let ty = val.get("type").and_then(|t| t.as_str()).unwrap_or("any");
-                            let desc = val
-                                .get("description")
-                                .and_then(|d| d.as_str())
-                                .unwrap_or("");
-                            let req = if required.iter().any(|r| r == key) {
-                                "required"
-                            } else {
-                                "optional"
-                            };
-                            let sep = if desc.is_empty() { "" } else { ": " };
-                            section.push_str(&format!("- `{key}` ({ty}, {req}){sep}{desc}\n"));
-                        }
-                    }
+                    section.push_str(&render_schema_fields(&schema_value));
                     // Writing the artifact is itself the signal that the work is
                     // ready — it notifies the user and advances the workflow. The
                     // gating sentence is only true when the node waits on a human.
@@ -1520,6 +1610,25 @@ pub fn start_agent_session(
                             " The artifact is held for user confirmation before downstream work proceeds.",
                         );
                     }
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
+                    content.push_str(&section);
+                }
+            }
+
+            // Inject the living-doc (context-self) affordance: any ArtifactNode
+            // this node's `context-self` port targets. Generic and recipe-driven
+            // — a node with no ctx-self targets (most nodes, and every sub-agent
+            // task) gets nothing here. Resolved fresh from the execution snapshot
+            // so it always reflects the running recipe's ports.
+            if let (Some(node_id), Some(execution_id)) =
+                (db_context.recipe_node_id.as_deref(), _execution_id)
+            {
+                let ctx_self_targets = resolve_ctx_self_targets(orch, execution_id, node_id);
+                if let Some(section) =
+                    build_ctx_self_section(&ctx_self_targets, orch.schema_dir.as_deref())
+                {
                     if !content.is_empty() {
                         content.push_str("\n\n");
                     }
@@ -1550,6 +1659,7 @@ pub fn start_agent_session(
                 project_path_for_prompt.as_ref().and_then(|p| p.to_str()),
                 db_context.effective_base_branch.as_deref(),
                 scratch_dir.as_deref(),
+                resolved_model.as_ref().map(|m| m.as_str()),
             ));
 
             // The dynamic tail = everything appended from `dynamic_start` (the
@@ -1576,6 +1686,7 @@ pub fn start_agent_session(
             permissions,
             max_thinking_tokens,
             reasoning_effort,
+            service_tier,
         )
     };
 
@@ -1602,6 +1713,7 @@ pub fn start_agent_session(
         home_uri: home_uri.clone(),
         max_thinking_tokens,
         reasoning_effort,
+        service_tier,
         permissions,
         bidirectional: true,
         identity: resolved_identity,
@@ -1628,8 +1740,11 @@ mod tests {
             Some("/repos/cairn"),
             Some("main"),
             Some("/tmp/cairn-scratch-job-1"),
+            Some("claude-opus-4"),
         );
         assert!(block.contains("## Orientation"));
+        // The resolved model is surfaced as part of the per-run dynamic tail.
+        assert!(block.contains("Model: `claude-opus-4`"));
         assert!(block.contains("/work/CAIRN-1288-builder-0"));
         assert!(block.contains("cairn://p/CAIRN/1288/1/builder"));
         assert!(block.contains("cairn:~/"));
@@ -1679,15 +1794,109 @@ mod tests {
 
     #[test]
     fn orientation_block_omits_missing_optionals() {
-        let block =
-            build_orientation_block("/work/wt", "cairn://p/P/1/1/node", None, None, None, None);
+        let block = build_orientation_block(
+            "/work/wt",
+            "cairn://p/P/1/1/node",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(block.contains("Working directory (cwd): `/work/wt`"));
         assert!(!block.contains("Project:"));
         assert!(!block.contains("Repository root:"));
         assert!(!block.contains("Base branch:"));
+        assert!(!block.contains("Model:"));
         assert!(block.contains("Platform:"));
         // No scratch line when the run has no job (e.g. project chat).
         assert!(!block.contains("Scratch dir"));
+    }
+
+    fn ctx_self_target(name: &str, schema: serde_json::Value) -> crate::models::OutputSchemaInfo {
+        crate::models::OutputSchemaInfo {
+            schema: crate::models::OutputSchema::Custom(schema),
+            artifact_name: Some(name.to_string()),
+            confirm_policy: crate::models::ConfirmPolicy::Auto,
+            tool_name: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn ctx_self_section_absent_for_empty_targets() {
+        assert!(build_ctx_self_section(&[], None).is_none());
+    }
+
+    #[test]
+    fn ctx_self_section_states_living_doc_contract() {
+        let targets = vec![ctx_self_target(
+            "board",
+            serde_json::json!({
+                "type": "object",
+                "required": ["scratch"],
+                "properties": {
+                    "scratch": {"type": "string", "description": "freeform notes"},
+                    "items": {"type": "array"}
+                }
+            }),
+        )];
+        let section = build_ctx_self_section(&targets, None)
+            .expect("a named, schema-bearing target should render a section");
+        // Names the living doc by its addressable URI.
+        assert!(section.contains("cairn:~/board"));
+        // States the defining contract: repeated create/patch, no turn end, no
+        // DAG advance — the contrast with the terminal output artifact.
+        assert!(section.contains("`patch`"));
+        assert!(section.contains("never ends your turn"));
+        assert!(section.contains("advances the workflow"));
+        // Surfaces the typed fields, required vs optional.
+        assert!(section.contains("`scratch` (string, required): freeform notes"));
+        assert!(section.contains("`items` (array, optional)"));
+    }
+
+    #[test]
+    fn ctx_self_section_lists_every_named_target() {
+        let targets = vec![
+            ctx_self_target("plan", serde_json::json!({"type": "object"})),
+            ctx_self_target("notes", serde_json::json!({"type": "object"})),
+        ];
+        let section = build_ctx_self_section(&targets, None).expect("two targets render");
+        assert!(section.contains("cairn:~/plan"));
+        assert!(section.contains("cairn:~/notes"));
+    }
+
+    #[test]
+    fn ctx_self_section_skips_unnamed_targets() {
+        let unnamed = crate::models::OutputSchemaInfo {
+            schema: crate::models::OutputSchema::Custom(serde_json::json!({"type": "object"})),
+            artifact_name: None,
+            confirm_policy: crate::models::ConfirmPolicy::Auto,
+            tool_name: None,
+            description: None,
+        };
+        assert!(build_ctx_self_section(&[unnamed], None).is_none());
+    }
+
+    #[test]
+    fn render_schema_fields_marks_required_and_optional() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+                "title": {"type": "string", "description": "the heading"},
+                "body": {"type": "string"}
+            }
+        });
+        let rendered = render_schema_fields(&schema);
+        assert!(rendered.starts_with("Fields:\n"));
+        assert!(rendered.contains("`title` (string, required): the heading"));
+        assert!(rendered.contains("`body` (string, optional)"));
+    }
+
+    #[test]
+    fn render_schema_fields_empty_without_properties() {
+        assert!(render_schema_fields(&serde_json::json!({"type": "object"})).is_empty());
     }
 
     #[test]
@@ -1696,10 +1905,12 @@ mod tests {
             crate::models::TerminalCommand {
                 name: "Dev Server".to_string(),
                 command: "npm run dev".to_string(),
+                write: vec![],
             },
             crate::models::TerminalCommand {
                 name: "Tests".to_string(),
                 command: "bun run test".to_string(),
+                write: vec![],
             },
         ];
         let section = build_available_terminals_section(&cmds)
@@ -1875,10 +2086,7 @@ mod tests {
         let raw = events[0].raw.as_ref().unwrap();
         assert_eq!(raw.get("backend").and_then(|v| v.as_str()), Some("codex"));
         assert_eq!(raw.get("bytes").and_then(|v| v.as_u64()), Some(15));
-        assert_eq!(
-            raw.get("includesBackendBase").and_then(|v| v.as_bool()),
-            Some(false)
-        );
+        assert!(raw.get("includesBackendBase").is_none());
         assert!(raw.get("hash").and_then(|v| v.as_str()).unwrap().len() >= 64);
     }
 
@@ -1968,37 +2176,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_appended_system_prompt_includes_base_and_agent_content() {
-        let prompt = build_appended_system_prompt(Some("agent instructions"), None);
-        assert!(prompt.contains(&crate::system_prompt::cairn_system_prompt()));
-        assert!(prompt.contains("agent instructions"));
-        assert!(prompt.contains("\n\nagent instructions"));
-    }
-
-    #[test]
-    fn build_appended_system_prompt_includes_workspace_instructions_before_agent_content() {
-        let prompt =
-            build_appended_system_prompt(Some("agent instructions"), Some("workspace doctrine"));
-        assert!(prompt
-            .contains("\n\n## Workspace Instructions\n\nworkspace doctrine\n\nagent instructions"));
-    }
-
-    #[test]
-    fn build_appended_system_prompt_omits_workspace_section_when_absent() {
-        let prompt = build_appended_system_prompt(None, None);
-        assert!(!prompt.contains("\n## Workspace Instructions\n"));
-    }
-
-    #[test]
-    fn build_appended_system_prompt_omits_memory_injection_block() {
-        let prompt = build_appended_system_prompt(None, None);
-        assert!(!prompt.contains("\n## Memories\n"));
-        assert!(!prompt.contains("Stored context you can pull"));
-        assert!(prompt.contains("## Capture Notes"));
-    }
-
-    /// The Claude/Codex assembly path (base + cairn + workspace + agent) yields an
+    /// The uniform assembly (cairn + workspace + project + agent) yields an
     /// ordered segment map whose concatenation is the composed prompt, and whose
     /// agent content is split into a static head and the inlined dynamic tail.
     #[test]
@@ -2006,9 +2184,9 @@ mod tests {
         let agent = "<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>";
         let dynamic = "\n\nORIENTATION\n</agent_role>";
         let segs = assemble_prompt_segments(
-            Some("BASE"),
             "CAIRN",
             Some("ws doctrine"),
+            Some("proj doctrine"),
             Some(agent),
             Some(dynamic),
         );
@@ -2016,9 +2194,9 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                SEGMENT_KIND_BACKEND_BASE,
                 SEGMENT_KIND_CAIRN,
                 SEGMENT_KIND_WORKSPACE,
+                SEGMENT_KIND_PROJECT,
                 SEGMENT_KIND_AGENT,
                 SEGMENT_KIND_DYNAMIC,
             ]
@@ -2026,7 +2204,7 @@ mod tests {
         let full: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(
             full,
-            "BASE\n\nCAIRN\n\n## Workspace Instructions\n\nws doctrine\n\n<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>"
+            "CAIRN\n\n## Workspace Instructions\n\nws doctrine\n\n## Project Instructions\n\nproj doctrine\n\n<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>"
         );
         assert_eq!(
             segs.iter()
@@ -2044,14 +2222,13 @@ mod tests {
         );
     }
 
-    /// A Claude run whose base file failed to write (no backend base) and which
-    /// has no workspace doctrine: those segments are omitted, and with no dynamic
-    /// tail the agent content stays one static segment.
+    /// A run with no workspace or project doctrine omits those segments, and with
+    /// no dynamic tail the agent content stays one static segment.
     #[test]
     fn assemble_prompt_segments_omits_absent_pieces() {
         let segs = assemble_prompt_segments(
-            None,
             "CAIRN",
+            None,
             None,
             Some("<agent_role>\nx\n</agent_role>"),
             None,
@@ -2060,6 +2237,46 @@ mod tests {
         assert_eq!(kinds, vec![SEGMENT_KIND_CAIRN, SEGMENT_KIND_AGENT]);
         let full: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(full, "CAIRN\n\n<agent_role>\nx\n</agent_role>");
+    }
+
+    /// Codex derives its two payloads by slicing the same assembled segments, so
+    /// base + developer reproduces the full prompt (and the persisted segments)
+    /// exactly — byte-identity by construction.
+    #[test]
+    fn codex_base_and_developer_slices_recompose_the_full_prompt() {
+        let agent = "<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>";
+        let dynamic = "\n\nORIENTATION\n</agent_role>";
+        let segs = assemble_prompt_segments(
+            "CAIRN",
+            Some("ws doctrine"),
+            Some("proj doctrine"),
+            Some(agent),
+            Some(dynamic),
+        );
+        let base = base_instructions_from_segments(&segs);
+        let developer = developer_instructions_from_segments(&segs).unwrap();
+        // Base = cairn + workspace + project; developer = agent + dynamic.
+        assert_eq!(
+            base,
+            "CAIRN\n\n## Workspace Instructions\n\nws doctrine\n\n## Project Instructions\n\nproj doctrine"
+        );
+        assert_eq!(
+            developer,
+            "\n\n<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>"
+        );
+        // base + developer == the flattened full prompt == persisted segments.
+        assert_eq!(format!("{base}{developer}"), flatten_prompt_segments(&segs));
+    }
+
+    /// With no agent content there is nothing to send as developer instructions.
+    #[test]
+    fn developer_instructions_absent_without_agent_segment() {
+        let segs = assemble_prompt_segments("CAIRN", Some("ws"), None, None, None);
+        assert!(developer_instructions_from_segments(&segs).is_none());
+        assert_eq!(
+            base_instructions_from_segments(&segs),
+            "CAIRN\n\n## Workspace Instructions\n\nws"
+        );
     }
 
     /// Seed the minimal workspace/project/issue/job/session rows needed for the

@@ -203,7 +203,11 @@ async fn append_role_memory_scopes_by_agent_role_not_node_name() {
     // resolves to this project (and the memory's project_id FK is satisfied).
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(repo.join(".cairn/agents")).unwrap();
-    std::fs::write(repo.join(".cairn/agents/builder.md"), "Builder role prompt.").unwrap();
+    std::fs::write(
+        repo.join(".cairn/agents/builder.md"),
+        "Builder role prompt.",
+    )
+    .unwrap();
     let project_id = common::insert_project_with_repo(&local_db, "ROLE", &repo).await;
 
     // The recipe node segment is `agent-1`, but it runs the `builder` role.

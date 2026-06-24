@@ -62,6 +62,7 @@ fn active_stream_to_event(active: ActiveMessageStream) -> Event {
         thinking_tokens: None,
         storage_mode: None,
         content_commit: None,
+        content_change_id: None,
         content_render_sha: None,
         data_blob: None,
         codec: None,
@@ -112,13 +113,13 @@ pub(crate) const EVENT_COLUMNS: &str =
     "id, run_id, session_id, sequence, timestamp, event_type, data,
     parent_tool_use_id, created_at, input_tokens, cache_read_tokens, cache_create_tokens,
     output_tokens, turn_id, thinking_tokens, storage_mode, content_commit, content_render_sha,
-    data_blob, codec";
+    data_blob, codec, content_change_id";
 
 /// Number of columns `EVENT_COLUMNS` projects, and therefore the zero-based
 /// index of any extra column appended after it (e.g. `SELECT {EVENT_COLUMNS},
 /// rowid` puts `rowid` here). Keep in lockstep with `EVENT_COLUMNS`: adding a
 /// column there without bumping this read a trailing column at the wrong index.
-pub(crate) const EVENT_COLUMN_COUNT: usize = 20;
+pub(crate) const EVENT_COLUMN_COUNT: usize = 21;
 
 const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id";
 
@@ -1021,6 +1022,7 @@ pub(crate) fn event_from_row(row: &Row) -> DbResult<Event> {
         content_render_sha: row.opt_text(17)?,
         data_blob: row.opt_blob(18)?,
         codec: row.opt_text(19)?,
+        content_change_id: row.opt_text(20)?,
         read_segments: None,
     })
 }

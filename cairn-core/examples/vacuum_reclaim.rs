@@ -133,9 +133,16 @@ async fn run(live: &Path) -> Result<(), String> {
     println!("reclaimed in {:.1}s", start.elapsed().as_secs_f64());
     println!("  before: {}", human(before));
     println!("  after:  {}", human(after));
-    println!("  freed:  {} ({:.1}%)", human(freed), percent(freed, before));
+    println!(
+        "  freed:  {} ({:.1}%)",
+        human(freed),
+        percent(freed, before)
+    );
     println!();
-    println!("The original three-file set is preserved at {}*", backup.display());
+    println!(
+        "The original three-file set is preserved at {}*",
+        backup.display()
+    );
     println!("Open the Cairn app. If it works normally, delete the backup:");
     println!("  rm {}*", backup.display());
     println!("If it does NOT open, restore the backup over the live set:");

@@ -176,15 +176,31 @@ pub(super) fn create_initial_turn(
     Ok(())
 }
 
-/// The start reason for a follow-up resume. A resume that runs while the job's
-/// memory review is `sent` (the review prompt was delivered, resuming the agent
-/// into its reflection turn) is the MemoryReview turn; everything else is a
-/// normal FollowUp. Tagging it here is what lets the job-status projection treat
-/// the review as post-completion housekeeping rather than the job's latest work.
+/// The start reason for a follow-up resume. A resume is the post-completion
+/// MemoryReview turn only when it is the system-initiated reflection delivery:
+/// the job's memory review is `sent` AND the resume carries no user-authored
+/// content. A user follow-up — an explicit resume message, a prompt/permission
+/// answer (both fold into `user_initiated`), or a still-pending queued message
+/// the resume sweep is about to claim — is always a normal FollowUp work turn,
+/// even while a review is `sent`.
+///
+/// This distinction is load-bearing: the job-status projection excludes
+/// `memory_review` turns from the job's terminal outcome (it reads the latest
+/// *work* turn). Tagging a real work turn `memory_review` therefore hides the
+/// completed work, so a confirm-gated node can never derive Complete even after
+/// its artifact is confirmed — freezing DAG advancement with no error
+/// (CAIRN-2014). Tagging the genuine reflection turn here is what lets the
+/// projection treat the review as post-completion housekeeping rather than the
+/// job's latest work.
 async fn followup_start_reason_conn(
     conn: &turso::Connection,
     job_id: &str,
+    user_initiated: bool,
 ) -> DbResult<TurnStartReason> {
+    // User steering is always a work turn, never a reflection.
+    if user_initiated {
+        return Ok(TurnStartReason::FollowUp);
+    }
     let mut rows = conn
         .query(
             "SELECT memory_review_state FROM jobs WHERE id = ?1",
@@ -195,11 +211,22 @@ async fn followup_start_reason_conn(
         .next()
         .await?
         .and_then(|row| row.opt_text(0).ok().flatten());
-    Ok(if state.as_deref() == Some("sent") {
-        TurnStartReason::MemoryReview
-    } else {
-        TurnStartReason::FollowUp
-    })
+    if state.as_deref() != Some("sent") {
+        return Ok(TurnStartReason::FollowUp);
+    }
+    // No explicit resume message, but a pending queued user follow-up (delivered
+    // by the resume sweep that runs just after turn creation) still makes this a
+    // work turn — the user is steering, not reflecting.
+    let mut queued = conn
+        .query(
+            "SELECT 1 FROM queued_messages WHERE job_id = ?1 AND delivered_at IS NULL LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    if queued.next().await?.is_some() {
+        return Ok(TurnStartReason::FollowUp);
+    }
+    Ok(TurnStartReason::MemoryReview)
 }
 
 pub(super) async fn create_successor_turn_conn(
@@ -244,6 +271,7 @@ pub(super) fn create_followup_turn(
     orch: &Orchestrator,
     session_id: &str,
     job_id: &str,
+    user_initiated: bool,
 ) -> Result<String, String> {
     let (turn_id, created) = run_db({
         let db = orch.db.local.clone();
@@ -255,7 +283,8 @@ pub(super) fn create_followup_turn(
                 let job_id = job_id.clone();
                 Box::pin(async move {
                     let head_turn = get_head_turn_conn(conn, &job_id).await?;
-                    let start_reason = followup_start_reason_conn(conn, &job_id).await?;
+                    let start_reason =
+                        followup_start_reason_conn(conn, &job_id, user_initiated).await?;
                     let new_turn_id = uuid::Uuid::new_v4().to_string();
                     if let Some(head) = head_turn {
                         if head.state == TurnState::Pending {
@@ -490,4 +519,101 @@ pub(super) fn transition_job_to_running(orch: &Orchestrator, job_id: &str) -> Re
         }),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod followup_start_reason_tests {
+    use super::*;
+    use crate::messages::queued::{enqueue_async, Delivery};
+    use crate::storage::migrated_test_db;
+
+    async fn insert_job(db: &LocalDb, job_id: &str, review_state: Option<&str>) {
+        let job_id = job_id.to_string();
+        let review_state = review_state.map(|s| s.to_string());
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            let review_state = review_state.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('p','w','P','PRJ','/tmp/prj',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs (id, project_id, status, memory_review_state, created_at, updated_at)
+                     VALUES (?1, 'p', 'running', ?2, 1, 1)",
+                    params![job_id.as_str(), review_state.as_deref()],
+                )
+                .await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn start_reason(db: &LocalDb, job_id: &str, user_initiated: bool) -> TurnStartReason {
+        let job_id = job_id.to_string();
+        db.read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move { followup_start_reason_conn(conn, &job_id, user_initiated).await })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_followup_while_review_sent_is_work_turn() {
+        // CAIRN-2014: a user-initiated resume must be a FollowUp work turn even
+        // while the memory review is `sent`. Tagging it `memory_review` would hide
+        // the turn from the completion projection and strand a confirm-gated node.
+        let db = migrated_test_db("turns-followup-user.db").await;
+        insert_job(&db, "j-sent", Some("sent")).await;
+        assert_eq!(
+            start_reason(&db, "j-sent", true).await,
+            TurnStartReason::FollowUp
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn system_resume_while_review_sent_is_memory_review() {
+        // The genuine reflection delivery (no user content) is the MemoryReview turn.
+        let db = migrated_test_db("turns-followup-system.db").await;
+        insert_job(&db, "j-sent", Some("sent")).await;
+        assert_eq!(
+            start_reason(&db, "j-sent", false).await,
+            TurnStartReason::MemoryReview
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_queued_message_makes_resume_a_work_turn() {
+        // No explicit message, but a pending queued user follow-up (claimed by the
+        // resume sweep) means the user is steering — a work turn, not a reflection.
+        let db = migrated_test_db("turns-followup-queued.db").await;
+        insert_job(&db, "j-sent", Some("sent")).await;
+        enqueue_async(&db, "j-sent", "do more", Delivery::Queue)
+            .await
+            .unwrap();
+        assert_eq!(
+            start_reason(&db, "j-sent", false).await,
+            TurnStartReason::FollowUp
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_review_pending_is_followup() {
+        let db = migrated_test_db("turns-followup-none.db").await;
+        insert_job(&db, "j-none", None).await;
+        assert_eq!(
+            start_reason(&db, "j-none", false).await,
+            TurnStartReason::FollowUp
+        );
+    }
 }

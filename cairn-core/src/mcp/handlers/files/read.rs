@@ -288,7 +288,7 @@ pub(crate) fn produce_archived_file_segment(
             }
             let src = String::from_utf8_lossy(bytes);
             let lang = crate::symbols::engine::lang_for_path(path);
-            let body = crate::symbols::outline::outline_text(rel_path, &src, lang);
+            let body = crate::symbols::outline::outline_text(&src, lang);
             let (matches, _files) = grep_counts(&body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(matches);
@@ -864,11 +864,13 @@ pub(crate) async fn produce_file_segment(
         ReadProjection::Outline { glob } => {
             let target = &resolved_target.full_path;
             let rendered = crate::symbols::outline::outline(worktree, target, glob.as_deref());
-            let (matches, files) = grep_counts(&rendered.body);
+            let (matches, _files) = grep_counts(&rendered.body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(matches);
             if target.is_dir() {
-                meta.file_count = Some(files);
+                // Rows are path-less; files are grouped under header lines, so the
+                // file count comes from the headers, not grep's path prefix.
+                meta.file_count = Some(crate::symbols::outline::file_count(&rendered.body));
             }
             Produced::Segment(ReadSegment::text(rendered.body, meta))
         }

@@ -47,6 +47,10 @@ pub mod backends {
     pub use crate::backends::*;
 }
 
+pub mod browsers {
+    pub use crate::browsers::*;
+}
+
 pub mod db {
     pub use crate::db::*;
 }
@@ -79,6 +83,10 @@ pub mod git {
     pub use crate::git::*;
 }
 
+pub mod jj {
+    pub use crate::jj::*;
+}
+
 pub mod identity {
     pub use crate::identity::*;
 }
@@ -101,6 +109,10 @@ pub mod notify {
 
 pub mod orchestrator {
     pub use crate::orchestrator::*;
+}
+
+pub mod resources {
+    pub use crate::resources::*;
 }
 
 pub mod services {

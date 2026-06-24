@@ -9,9 +9,9 @@ use uuid::Uuid;
 
 use super::{
     ActionNodeConfig, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, CheckpointNodeConfig,
-    ConditionErrorBehavior, ConditionNodeConfig, ConditionType, ContextNodeConfig, EventFilter,
-    NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger,
-    ScheduleConfig, SchemaConfig, TriggerConfig, TriggerScope, WorktreeMode,
+    ConditionErrorBehavior, ConditionNodeConfig, ConditionType, ConfirmPolicy, ContextNodeConfig,
+    EventFilter, NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType,
+    RecipeTrigger, ScheduleConfig, SchemaConfig, TriggerConfig, TriggerScope, WorktreeMode,
 };
 
 /// Generate a slug from a name (lowercase, hyphens, no special chars)
@@ -137,11 +137,13 @@ pub struct NodeFileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint_config: Option<CheckpointNodeConfig>,
 
-    // Artifact config
+    // Artifact config (typed schema node)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_policy: Option<ConfirmPolicy>,
 
     // Condition config
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -340,10 +342,16 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
         has_config = true;
     }
 
-    // Artifact config
+    // Artifact config (typed schema node)
     if let Some(ac) = &node.artifact_config {
-        config.artifact_type = Some(ac.artifact_type.clone());
+        config.artifact_type = Some(ac.name.clone());
         config.schema = ac.schema.clone();
+        if ac.confirm_policy != ConfirmPolicy::default() {
+            config.confirm_policy = Some(ac.confirm_policy);
+        }
+        if ac.content.is_some() {
+            config.content = ac.content.clone();
+        }
         has_config = true;
     }
 
@@ -564,6 +572,64 @@ impl RecipeFile {
             }
         }
 
+        // A node's context-self living-doc names must stay distinct from its
+        // terminal context-out artifact name. The runtime excludes a producer's
+        // ctx-self names from the terminal latest-fallback BY NAME, so a
+        // collision would wrongly drop the terminal artifact (CAIRN-1925/1953).
+        // Catch it at authoring time rather than as a silent runtime mis-resolve.
+        {
+            // node id -> the artifact/contract name it declares (artifact node
+            // name, or a pr/action node's input-schema name).
+            let declared_name: HashMap<&str, String> = self
+                .nodes
+                .iter()
+                .filter_map(|n| {
+                    let config = n.config.as_ref()?;
+                    let name = match n.node_type {
+                        RecipeNodeType::Artifact => config.artifact_type.clone(),
+                        RecipeNodeType::Pr | RecipeNodeType::Action => {
+                            config.input_schema.as_ref().map(|s| s.name.clone())
+                        }
+                        _ => None,
+                    }?;
+                    Some((n.id.as_str(), name))
+                })
+                .collect();
+
+            for node in &self.nodes {
+                let mut ctx_self_names: Vec<&str> = Vec::new();
+                let mut terminal_name: Option<&str> = None;
+                for edge in &self.edges {
+                    let (source_node, source_handle) = parse_node_handle(&edge.from);
+                    if source_node != node.id {
+                        continue;
+                    }
+                    let (target_node, _) = parse_node_handle(&edge.to);
+                    match source_handle {
+                        Some("context-self") => {
+                            if let Some(name) = declared_name.get(target_node) {
+                                ctx_self_names.push(name.as_str());
+                            }
+                        }
+                        Some("context-out") => {
+                            if let Some(name) = declared_name.get(target_node) {
+                                terminal_name = Some(name.as_str());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(terminal) = terminal_name {
+                    if ctx_self_names.contains(&terminal) {
+                        errors.push(format!(
+                            "Node '{}' has a context-self living doc named '{}' that collides with its terminal context-out artifact name; they must be distinct",
+                            node.name, terminal
+                        ));
+                    }
+                }
+            }
+        }
+
         RecipeFileValidation {
             valid: errors.is_empty(),
             warnings,
@@ -632,10 +698,18 @@ impl RecipeFileNode {
 
         let checkpoint_config = config.checkpoint_config;
 
-        let artifact_config = config.artifact_type.map(|at| ArtifactNodeConfig {
-            artifact_type: at,
-            schema: config.schema,
-        });
+        // Typed ArtifactNode: carries the artifact name, JSON schema, confirm
+        // policy, and (for the collapsed Context case) inline literal content.
+        let artifact_config = if self.node_type == RecipeNodeType::Artifact {
+            Some(ArtifactNodeConfig {
+                name: config.artifact_type.clone().unwrap_or_default(),
+                schema: config.schema.clone(),
+                confirm_policy: config.confirm_policy.unwrap_or_default(),
+                content: config.content.clone(),
+            })
+        } else {
+            None
+        };
 
         // Condition config
         let condition_config = if config.condition_type.is_some() || config.ports.is_some() {
@@ -652,8 +726,16 @@ impl RecipeFileNode {
             None
         };
 
-        // Context config
-        let context_config = config.content.map(|content| ContextNodeConfig { content });
+        // Legacy Context node config (kept for old-snapshot tolerance; new
+        // recipes carry literal content on an ArtifactNode instead).
+        let context_config = if self.node_type == RecipeNodeType::Context {
+            config
+                .content
+                .clone()
+                .map(|content| ContextNodeConfig { content })
+        } else {
+            None
+        };
 
         // Remap parent_id if present
         let parent_id = self
@@ -1372,10 +1454,18 @@ edges: []
             ),
             ("build", include_str!("../../../../recipes/build.yaml")),
             (
+                "coordinator",
+                include_str!("../../../../recipes/coordinator.yaml"),
+            ),
+            (
                 "task-list",
                 include_str!("../../../../recipes/task-list.yaml"),
             ),
             ("setup", include_str!("../../../../recipes/setup.yaml")),
+            (
+                "memory-triage",
+                include_str!("../../../../recipes/memory-triage.yaml"),
+            ),
         ];
         for (name, yaml) in recipes {
             let parsed = RecipeFile::from_yaml(yaml)
@@ -1496,20 +1586,285 @@ edges:
     }
 
     #[test]
-    fn planbuild_planner_uses_user_confirm_policy() {
+    fn planbuild_plan_artifact_node_carries_user_confirm_gate() {
+        // Under the port model the plan gate lives on the `plan` ArtifactNode
+        // between planner and builder, not on an inline planner outputSchema.
         let parsed =
             RecipeFile::from_yaml(include_str!("../../../../recipes/planbuild.yaml")).unwrap();
+
+        // The planner agent carries no inline output schema.
         let planner = parsed
             .nodes
             .iter()
             .find(|n| n.id == "planner-1")
             .expect("planner-1 node");
-        let schema = planner
+        assert!(planner
             .config
             .as_ref()
             .and_then(|c| c.output_schema.as_ref())
-            .expect("planner output schema");
-        assert_eq!(schema.name, "plan");
-        assert_eq!(schema.confirm_policy, crate::models::ConfirmPolicy::User);
+            .is_none());
+
+        // The terminal contract is the `plan` ArtifactNode it feeds.
+        let plan = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "plan-1")
+            .expect("plan-1 artifact node");
+        assert_eq!(plan.node_type, crate::models::RecipeNodeType::Artifact);
+        let config = plan.config.as_ref().expect("plan config");
+        assert_eq!(config.artifact_type.as_deref(), Some("plan"));
+        assert_eq!(
+            config.confirm_policy,
+            Some(crate::models::ConfirmPolicy::User)
+        );
+
+        // Imported into a Recipe, the ArtifactNode resolves to a typed config.
+        let recipe = parsed.into_recipe(None, None);
+        let plan_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == crate::models::RecipeNodeType::Artifact)
+            .expect("imported plan artifact node");
+        let artifact_config = plan_node.artifact_config.as_ref().expect("artifact config");
+        assert_eq!(artifact_config.name, "plan");
+        assert_eq!(
+            artifact_config.confirm_policy,
+            crate::models::ConfirmPolicy::User
+        );
+        assert!(artifact_config.schema.is_some());
+    }
+
+    #[test]
+    fn coordinator_and_build_ship_create_pr_terminal() {
+        // Decision 1 of the port model: the producer's `context-out` points
+        // straight at the PR action's typed `create-pr` input — no standalone
+        // create-pr ArtifactNode. This is the terminal output contract for the
+        // coordinator/build agent, and it auto-confirms (the PR lifecycle, not a
+        // pre-PR artifact confirmation, is the human gate).
+        for (recipe_name, yaml, producer) in [
+            (
+                "coordinator",
+                include_str!("../../../../recipes/coordinator.yaml"),
+                "coordinator-1",
+            ),
+            (
+                "build",
+                include_str!("../../../../recipes/build.yaml"),
+                "builder-1",
+            ),
+        ] {
+            let parsed = RecipeFile::from_yaml(yaml)
+                .unwrap_or_else(|e| panic!("{recipe_name} failed to parse: {e}"));
+
+            // The producing agent carries no inline output schema: its terminal
+            // contract is defined solely by its single context-out edge target.
+            let producer_node = parsed
+                .nodes
+                .iter()
+                .find(|n| n.id == producer)
+                .unwrap_or_else(|| panic!("{recipe_name}: {producer} node"));
+            assert!(
+                producer_node
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.output_schema.as_ref())
+                    .is_none(),
+                "{recipe_name}: {producer} must carry no inline outputSchema"
+            );
+
+            // Exactly one context-out edge, from the producer to the PR node's
+            // context-in port.
+            let ctx_out: Vec<&RecipeFileEdge> = parsed
+                .edges
+                .iter()
+                .filter(|e| e.from == format!("{producer}@context-out"))
+                .collect();
+            assert_eq!(
+                ctx_out.len(),
+                1,
+                "{recipe_name}: producer ships exactly one terminal output"
+            );
+            assert_eq!(
+                ctx_out[0].to, "pr-1@context-in",
+                "{recipe_name}: context-out targets the PR node's input port"
+            );
+            assert_eq!(ctx_out[0].edge_type, RecipeEdgeType::Context);
+
+            // The PR node's typed input port defines the terminal schema: name
+            // `create-pr`, auto-confirm.
+            let pr = parsed
+                .nodes
+                .iter()
+                .find(|n| n.id == "pr-1")
+                .unwrap_or_else(|| panic!("{recipe_name}: pr-1 node"));
+            assert_eq!(pr.node_type, crate::models::RecipeNodeType::Pr);
+            let input = pr
+                .config
+                .as_ref()
+                .and_then(|c| c.input_schema.as_ref())
+                .unwrap_or_else(|| panic!("{recipe_name}: pr-1 inputSchema"));
+            assert_eq!(input.name, "create-pr");
+            assert_eq!(input.confirm_policy, crate::models::ConfirmPolicy::Auto);
+        }
+    }
+
+    #[test]
+    fn coordinator_owns_a_distinct_context_self_board() {
+        // The coordinator carries a living plan/board as a context-self doc,
+        // independent of its terminal `create-pr` output. The board is an
+        // auto-confirm ArtifactNode named `board`, reached by a context-self edge.
+        let parsed = RecipeFile::from_yaml(include_str!("../../../../recipes/coordinator.yaml"))
+            .expect("coordinator parses");
+
+        let ctx_self: Vec<&RecipeFileEdge> = parsed
+            .edges
+            .iter()
+            .filter(|e| e.from == "coordinator-1@context-self")
+            .collect();
+        assert_eq!(ctx_self.len(), 1, "coordinator owns one context-self board");
+        assert_eq!(ctx_self[0].to, "board-1@context-in");
+        assert_eq!(ctx_self[0].edge_type, RecipeEdgeType::Context);
+
+        let board = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "board-1")
+            .expect("board node");
+        assert_eq!(board.node_type, RecipeNodeType::Artifact);
+        let config = board.config.as_ref().expect("board config");
+        assert_eq!(config.artifact_type.as_deref(), Some("board"));
+        // A living doc never gates; it must stay auto-confirm so the job-wide
+        // `validate_confirmable` check is not tripped by the board.
+        assert_eq!(
+            config.confirm_policy,
+            Some(crate::models::ConfirmPolicy::Auto)
+        );
+        assert!(config.schema.is_some(), "board carries an inline schema");
+
+        // The board name is distinct from the terminal `create-pr` contract, the
+        // CAIRN-1953 correctness invariant the runtime relies on.
+        assert_ne!(config.artifact_type.as_deref(), Some("create-pr"));
+        assert!(parsed.validate().valid);
+    }
+
+    #[test]
+    fn context_self_name_colliding_with_terminal_fails_validation() {
+        // A context-self living doc sharing the terminal context-out artifact
+        // name would make the runtime's name-keyed terminal latest-fallback drop
+        // the terminal artifact. Validation must reject it (CAIRN-1925/1953).
+        let yaml = r#"
+cairnVersion: 1
+name: Colliding
+description: ctx-self name collides with terminal output name
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+    scope: issue
+- id: worker-1
+  type: agent
+  name: Worker
+  position: 0@100
+  config:
+    agent: build
+- id: out-1
+  type: artifact
+  name: Out
+  position: 0@200
+  config:
+    artifactType: summary
+    confirmPolicy: user
+    schema:
+      type: object
+- id: self-1
+  type: artifact
+  name: Self
+  position: 240@100
+  config:
+    artifactType: summary
+    confirmPolicy: auto
+    schema:
+      type: object
+edges:
+- from: trigger-1@control-out
+  to: worker-1@control-in
+  type: control
+- from: worker-1@context-out
+  to: out-1@context-in
+  type: context
+- from: worker-1@context-self
+  to: self-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).expect("parses").validate();
+        assert!(!validation.valid, "collision must fail validation");
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|e| e.contains("collides") && e.contains("summary")),
+            "errors name the collision: {:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn distinct_context_self_and_terminal_names_validate() {
+        // The same shape with distinct names is valid — proving the check keys on
+        // a real name collision, not merely on owning both ports.
+        let yaml = r#"
+cairnVersion: 1
+name: Distinct
+description: ctx-self and terminal names differ
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+    scope: issue
+- id: worker-1
+  type: agent
+  name: Worker
+  position: 0@100
+  config:
+    agent: build
+- id: out-1
+  type: artifact
+  name: Out
+  position: 0@200
+  config:
+    artifactType: summary
+    confirmPolicy: user
+    schema:
+      type: object
+- id: self-1
+  type: artifact
+  name: Self
+  position: 240@100
+  config:
+    artifactType: scratch
+    confirmPolicy: auto
+    schema:
+      type: object
+edges:
+- from: trigger-1@control-out
+  to: worker-1@control-in
+  type: control
+- from: worker-1@context-out
+  to: out-1@context-in
+  type: context
+- from: worker-1@context-self
+  to: self-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).expect("parses").validate();
+        assert!(validation.valid, "errors: {:?}", validation.errors);
     }
 }

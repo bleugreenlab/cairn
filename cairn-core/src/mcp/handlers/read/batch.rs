@@ -57,6 +57,12 @@ pub async fn handle_read_batch(
     // per-target `[duplicate call]` stub.
     if let Some(run_id) = request.run_id.as_deref() {
         for segment in &mut segments {
+            // Browser reads are snapshots of an interactive surface; repeating the
+            // same URI is an intentional poll/visual re-check, not flailing over
+            // a static resource. Always return the fresh browser read result.
+            if is_browser_resource_target(&segment.meta.uri) {
+                continue;
+            }
             let fingerprint = format!("read_batch_target\u{1}{}", segment.meta.uri);
             let hash = crate::dispatch::hash_content(&segment.body);
             if let crate::agent_process::process::DedupOutcome::Duplicate {
@@ -124,6 +130,18 @@ fn is_web_target(target: &str) -> bool {
         .map(|split| split.identity)
         .unwrap_or_else(|_| target.to_string());
     base.to_lowercase().ends_with(".pdf")
+}
+
+fn is_browser_resource_target(target: &str) -> bool {
+    let Ok(split) = split_target_query(target) else {
+        return false;
+    };
+    matches!(
+        parse_uri(&split.identity),
+        Some(CairnResource::NodeBrowser { .. })
+            | Some(CairnResource::TaskBrowser { .. })
+            | Some(CairnResource::ProjectBrowser { .. })
+    )
 }
 
 /// Grep-family params peeled off a materialized body (web URL, terminal buffer)
@@ -245,6 +263,10 @@ async fn produce_resource_segment(
 
     let rendered = crate::resources::produce_cairn_resource(orch, request, target).await;
     let affordance = rendered.affordance;
+    // Image blocks (e.g. a browser screenshot) ride alongside the text body into
+    // the segment; `assemble` lifts them into the envelope and cairn-cli emits
+    // each as an MCP image content block.
+    let images = rendered.images;
 
     match rendered.natural_unit {
         NaturalUnit::Match => {
@@ -258,7 +280,7 @@ async fn produce_resource_segment(
             ReadSegment {
                 body: rendered.content,
                 affordance,
-                images: Vec::new(),
+                images,
                 history: None,
                 meta,
             }
@@ -278,7 +300,24 @@ async fn produce_resource_segment(
             ReadSegment {
                 body: rendered.content,
                 affordance,
-                images: Vec::new(),
+                images,
+                history: None,
+                meta,
+            }
+        }
+        NaturalUnit::Turn => {
+            let mut meta = SegmentMeta::new(target, SegmentKind::Resource, NaturalUnit::Turn);
+            meta.total_units = rendered.total_units;
+            meta.shown_units = rendered
+                .shown_units
+                .unwrap_or_else(|| rendered.content.matches("\n## Turn ").count());
+            meta.unit_noun = rendered.unit_noun.map(str::to_string);
+            meta.offset = rendered.offset.unwrap_or(0).max(0) as usize;
+            meta.limit = rendered.limit;
+            ReadSegment {
+                body: rendered.content,
+                affordance,
+                images,
                 history: None,
                 meta,
             }
@@ -293,7 +332,7 @@ async fn produce_resource_segment(
             ReadSegment {
                 body: window.body,
                 affordance,
-                images: Vec::new(),
+                images,
                 history: None,
                 meta,
             }
@@ -855,13 +894,37 @@ mod tests {
         assert!(!is_web_target("cairn://p/X/1"));
     }
 
+    #[test]
+    fn browser_resource_targets_are_classified_for_dedup_exemption() {
+        assert!(is_browser_resource_target("cairn://p/X/browser"));
+        assert!(is_browser_resource_target(
+            "cairn://p/X/browser/main?format=text"
+        ));
+        assert!(is_browser_resource_target(
+            "cairn://p/X/1/1/builder/browser"
+        ));
+        assert!(is_browser_resource_target(
+            "cairn://p/X/1/1/builder/task/explore/browser/preview?screenshot"
+        ));
+        assert!(!is_browser_resource_target("cairn://p/X/1"));
+        assert!(!is_browser_resource_target("file:src/lib.rs"));
+    }
+
     async fn read_batch_envelope(
         orch: &Orchestrator,
         paths: serde_json::Value,
     ) -> ReadBatchEnvelope {
+        read_batch_envelope_for_run(orch, paths, None).await
+    }
+
+    async fn read_batch_envelope_for_run(
+        orch: &Orchestrator,
+        paths: serde_json::Value,
+        run_id: Option<&str>,
+    ) -> ReadBatchEnvelope {
         let request = McpCallbackRequest {
             cwd: tempfile::tempdir().unwrap().keep().display().to_string(),
-            run_id: None,
+            run_id: run_id.map(str::to_string),
             tool: "read_batch".to_string(),
             payload: serde_json::json!({ "paths": paths }),
             tool_use_id: None,
@@ -869,6 +932,72 @@ mod tests {
         let cursors = Mutex::new(HashMap::new());
         let result = handle_read_batch(orch, &request, &cursors).await;
         serde_json::from_str(&result).unwrap()
+    }
+
+    fn register_turn(orch: &Orchestrator, run_id: &str, turn_id: &str) {
+        use crate::agent_process::process::RunHandle;
+
+        let mut processes = orch.process_state.processes.lock().unwrap();
+        processes.register(
+            run_id.to_string(),
+            RunHandle::test_handle(Some("sess"), None),
+        );
+        drop(processes);
+        assert!(orch.process_state.begin_turn(run_id, turn_id));
+    }
+
+    #[tokio::test]
+    async fn read_batch_dedupes_repeated_non_browser_reads() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-rb-1', 'proj-rb', 1, 'First', 'active', 1, 1)",
+        )
+        .await;
+        register_turn(&orch, "run-rb", "turn-rb");
+
+        let first = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1"]),
+            Some("run-rb"),
+        )
+        .await;
+        assert!(!first.text.contains("[duplicate call]"), "{}", first.text);
+
+        let second = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1"]),
+            Some("run-rb"),
+        )
+        .await;
+        assert!(second.text.contains("[duplicate call]"), "{}", second.text);
+    }
+
+    #[tokio::test]
+    async fn read_batch_does_not_dedupe_repeated_browser_reads() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        register_turn(&orch, "run-rb", "turn-rb");
+
+        let first = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn://p/RB/browser/main"]),
+            Some("run-rb"),
+        )
+        .await;
+        assert!(first.text.contains("# Browser main"), "{}", first.text);
+        assert!(!first.text.contains("[duplicate call]"), "{}", first.text);
+
+        let second = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn://p/RB/browser/main"]),
+            Some("run-rb"),
+        )
+        .await;
+        assert!(second.text.contains("# Browser main"), "{}", second.text);
+        assert!(!second.text.contains("[duplicate call]"), "{}", second.text);
     }
 
     #[tokio::test]

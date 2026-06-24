@@ -255,7 +255,7 @@ pub async fn get_db(db: &LocalDb, id: &str) -> Result<Option<DbProject>, CairnEr
                             remote_url, hidden, server_id, is_workspace
                      FROM projects
                      WHERE id = ?1",
-                    (id.as_str(),),
+                    (id,),
                 )
                 .await?;
             rows.next()
@@ -424,7 +424,7 @@ pub async fn delete_db(db: &LocalDb, id: &str) -> Result<(), CairnError> {
     db.write(|conn| {
         let id = id.clone();
         Box::pin(async move {
-            conn.execute("DELETE FROM projects WHERE id = ?1", (id.as_str(),))
+            conn.execute("DELETE FROM projects WHERE id = ?1", (id,))
                 .await?;
             Ok(())
         })
@@ -435,12 +435,9 @@ pub async fn delete_db(db: &LocalDb, id: &str) -> Result<(), CairnError> {
 
 pub async fn repo_path(db: &LocalDb, id: &str) -> Result<Option<String>, CairnError> {
     let id = id.to_string();
-    db.query_text(
-        "SELECT repo_path FROM projects WHERE id = ?1",
-        turso::params![id.as_str()],
-    )
-    .await
-    .map_err(CairnError::from)
+    db.query_text("SELECT repo_path FROM projects WHERE id = ?1", (id,))
+        .await
+        .map_err(CairnError::from)
 }
 
 pub async fn worktree_paths(db: &LocalDb, project_id: &str) -> Result<Vec<String>, CairnError> {

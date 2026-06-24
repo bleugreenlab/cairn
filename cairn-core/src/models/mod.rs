@@ -42,7 +42,9 @@ pub use common::{
 };
 
 // Workspace and settings
-pub use workspace::{ExternalReplyMode, Settings, UpdateSettings};
+pub use workspace::{
+    ExternalReplyMode, OpenRouterRouting, OpenRouterSort, Settings, UpdateSettings,
+};
 
 // Project types
 pub use project::{CreateProject, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject};
@@ -53,7 +55,8 @@ pub use context_tokens::ContextTokenState;
 
 // Provider usage snapshot types
 pub use provider_usage::{
-    ProviderCreditsSnapshot, ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow,
+    ProviderCreditsSnapshot, ProviderModelUsageRow, ProviderUsageScope, ProviderUsageSnapshot,
+    ProviderUsageWindow,
 };
 
 // Issue types
@@ -94,6 +97,7 @@ pub use recipe::{
     ScheduleInterval, SchedulePeriod, SchemaConfig, TriggerConfig, TriggerScope, UpdateRecipe,
     WorktreeMode,
 };
+pub use recipe::{CONTEXT_IN_HANDLE, CONTEXT_OUT_HANDLE, CONTEXT_SELF_HANDLE};
 
 // Recipe file types (export/import)
 pub use recipe_file::{RecipeFile, RecipeFileValidation};

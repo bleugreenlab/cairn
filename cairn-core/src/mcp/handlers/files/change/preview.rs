@@ -398,7 +398,9 @@ pub(super) async fn preview_change(
         // edited file, pushing a target hash for every edited/moved path so the
         // apply round-trip's drift guard rejects a stale apply. A move's new path
         // hashes as "missing" on both preview and apply, so the guard still holds.
-        if item.mode == ChangeMode::Rename {
+        if item.mode == ChangeMode::Rename
+            && matches!(target_family(&item.target), Ok(TargetFamily::File))
+        {
             let rename_result = match super::file_mutations::parse_rename_spec(worktree, item) {
                 Ok((route_file, spec, new_name)) => {
                     crate::symbols::rename::compute_plan(worktree, &route_file, spec, &new_name)

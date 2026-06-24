@@ -131,6 +131,13 @@ pub(super) async fn resolve_job_inputs_conn(
         .iter()
         .filter(|edge| edge.target_node_id == node_id && edge.edge_type == "context")
         .collect();
+    // Typed view of the snapshot nodes, for ArtifactNode source resolution.
+    let rnode_map: HashMap<&str, &RecipeNode> = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
 
     let mut inputs = Vec::new();
     for edge in context_edges {
@@ -160,6 +167,25 @@ pub(super) async fn resolve_job_inputs_conn(
             continue;
         }
 
+        if source_node.node_type == "artifact" {
+            // Port model: the consumer reads from an ArtifactNode. Load the
+            // PRODUCER's artifact (whoever's context-out targets this node), keyed
+            // by the ArtifactNode's name. A literal-content ArtifactNode with no
+            // producer contributes its static content instead.
+            if let Some(input) = load_artifact_node_input_conn(
+                conn,
+                execution_id,
+                &rnode_map,
+                &all_edges,
+                edge.source_node_id.as_str(),
+            )
+            .await?
+            {
+                inputs.push(input);
+            }
+            continue;
+        }
+
         let Some(source_job) = crate::db_records::load_live_job_by_execution_node_conn(
             conn,
             execution_id,
@@ -174,8 +200,27 @@ pub(super) async fn resolve_job_inputs_conn(
             continue;
         };
 
+        // Direct agent→consumer context edge (no intermediate ArtifactNode). The
+        // producer stores its terminal artifact under its resolved CONTRACT name
+        // (e.g. `create-pr`), never under the raw edge handle (`context-out`).
+        // Key the load by that name, and pass the producer's context-self
+        // living-doc names so the latest-across-job fallback can never serve a
+        // patched, higher-versioned ctx-self doc as this consumer's terminal
+        // input in place of the real terminal artifact (CAIRN-1953).
+        let terminal_name = find_downstream_artifact_schema_with_snapshot_conn(
+            conn,
+            &snapshot,
+            edge.source_node_id.as_str(),
+        )
+        .await?
+        .and_then(|info| info.artifact_name);
+        let ctx_self_names = ctx_self_artifact_names(&snapshot, edge.source_node_id.as_str());
+        let load_name = terminal_name
+            .as_deref()
+            .unwrap_or(edge.source_handle.as_str());
+
         if let Some((artifact_type, data_json)) =
-            load_artifact_for_edge_conn(conn, &source_job.id, &edge.source_handle).await?
+            load_artifact_for_edge_conn(conn, &source_job.id, load_name, &ctx_self_names).await?
         {
             let data = serde_json::from_str(&data_json).unwrap_or_default();
             inputs.push(ResolvedInput {
@@ -197,6 +242,74 @@ pub(super) async fn resolve_job_inputs_conn(
     }
 
     Ok(inputs)
+}
+
+/// Resolve a consumer's input from an ArtifactNode on its `context-in` edge.
+///
+/// The producer is whoever's `context-out` edge targets this ArtifactNode; load
+/// that producer's artifact keyed by the ArtifactNode's `name` (its stored
+/// `output_name`). When the ArtifactNode has no producer but carries inline
+/// literal `content`, it is a static input document (the collapsed Context node).
+pub(super) async fn load_artifact_node_input_conn(
+    conn: &turso::Connection,
+    execution_id: &str,
+    rnode_map: &HashMap<&str, &RecipeNode>,
+    all_edges: &[DbRecipeEdge],
+    artifact_node_id: &str,
+) -> DbResult<Option<ResolvedInput>> {
+    let Some(artifact_node) = rnode_map.get(artifact_node_id).copied() else {
+        return Ok(None);
+    };
+    let cfg = artifact_node.artifact_config.as_ref();
+    let name = cfg
+        .map(|c| c.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_default();
+
+    // Producer = the node whose context-out edge targets this ArtifactNode.
+    let producer_id = all_edges
+        .iter()
+        .find(|edge| {
+            edge.edge_type == "context"
+                && edge.source_handle == crate::models::CONTEXT_OUT_HANDLE
+                && edge.target_node_id == artifact_node_id
+        })
+        .map(|edge| edge.source_node_id.clone());
+
+    if let Some(producer_id) = producer_id {
+        if let Some(producer_job) = crate::db_records::load_live_job_by_execution_node_conn(
+            conn,
+            execution_id,
+            &producer_id,
+        )
+        .await?
+        {
+            let ctx_self_names = ctx_self_names_from_edges(rnode_map, all_edges, &producer_id);
+            if let Some((artifact_type, data_json)) =
+                load_artifact_for_edge_conn(conn, &producer_job.id, &name, &ctx_self_names).await?
+            {
+                let data = serde_json::from_str(&data_json).unwrap_or_default();
+                return Ok(Some(ResolvedInput {
+                    artifact_type,
+                    data,
+                }));
+            }
+        }
+        return Ok(None);
+    }
+
+    // No producer: a literal-content ArtifactNode is a static input document.
+    if let Some(content) = cfg.and_then(|c| c.content.as_ref()) {
+        return Ok(Some(ResolvedInput {
+            artifact_type: "context".to_string(),
+            data: serde_json::json!({
+                "content": content,
+                "title": artifact_node.name,
+            }),
+        }));
+    }
+
+    Ok(None)
 }
 
 pub(super) async fn build_trigger_context_conn(
@@ -305,10 +418,52 @@ pub(super) async fn load_issue_title_description_conn(
         .transpose()
 }
 
+/// The producer's `context-self` living-doc artifact names. These are never a
+/// consumer's terminal input, so they are excluded from the latest-across-job
+/// fallback in [`load_artifact_for_edge_conn`].
+fn ctx_self_artifact_names(snapshot: &ExecutionSnapshot, node_id: &str) -> Vec<String> {
+    resolve_ctx_self_schemas_with_snapshot(snapshot, node_id)
+        .into_iter()
+        .filter_map(|info| info.artifact_name)
+        .collect()
+}
+
+/// `context-self` artifact names for a producer node, computed directly from the
+/// snapshot edges and typed node map (used on the ArtifactNode path, where the
+/// full [`ExecutionSnapshot`] isn't threaded through).
+fn ctx_self_names_from_edges(
+    rnode_map: &HashMap<&str, &RecipeNode>,
+    all_edges: &[DbRecipeEdge],
+    node_id: &str,
+) -> Vec<String> {
+    all_edges
+        .iter()
+        .filter(|edge| {
+            edge.edge_type == "context"
+                && edge.source_node_id == node_id
+                && edge.source_handle == crate::models::CONTEXT_SELF_HANDLE
+        })
+        .filter_map(|edge| rnode_map.get(edge.target_node_id.as_str()).copied())
+        .filter_map(|node| node.artifact_config.as_ref())
+        .map(|cfg| cfg.name.clone())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Load a producer's artifact for a consumer edge.
+///
+/// Match first by the resolved artifact `output_name` (the terminal/ArtifactNode
+/// contract name). If that misses, fall back to the latest artifact across the
+/// job — but never one whose `output_name` is in `exclude_from_fallback`. That
+/// exclusion carries the producer's `context-self` living-doc names so a patched,
+/// higher-versioned ctx-self doc (e.g. `plan`) can never be served as a
+/// consumer's terminal input in place of the real terminal artifact (e.g.
+/// `create-pr`).
 pub(super) async fn load_artifact_for_edge_conn(
     conn: &turso::Connection,
     job_id: &str,
     output_name: &str,
+    exclude_from_fallback: &[String],
 ) -> DbResult<Option<(String, String)>> {
     let mut exact = conn
         .query(
@@ -324,12 +479,20 @@ pub(super) async fn load_artifact_for_edge_conn(
 
     let mut fallback = conn
         .query(
-            "SELECT id, artifact_type, data FROM artifacts
-             WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
+            "SELECT id, artifact_type, data, output_name FROM artifacts
+             WHERE job_id = ?1 ORDER BY version DESC",
             (job_id,),
         )
         .await?;
-    if let Some(row) = fallback.next().await? {
+    while let Some(row) = fallback.next().await? {
+        if let Some(name) = row.opt_text(3)? {
+            if exclude_from_fallback
+                .iter()
+                .any(|excluded| excluded == &name)
+            {
+                continue;
+            }
+        }
         return Ok(Some((row.text(1)?, row.text(2)?)));
     }
 
@@ -367,12 +530,20 @@ pub(crate) async fn find_downstream_artifact_schema_conn(
     find_downstream_artifact_schema_with_snapshot_conn(conn, &snapshot, node_id).await
 }
 
-/// Resolve a node's effective output contract against an already-loaded
-/// snapshot. Returns the producer's own declared output schema, or — when it
-/// declares none — the `inputSchema` of a downstream `action`/`pr`/`artifact`
-/// consumer reached by a context edge. `Some` here means "this node was told to
-/// produce an artifact"; the job-completion gate keys on exactly that. Splitting
-/// the snapshot load out lets the recompute sweep reuse its loaded snapshot.
+/// Resolve a node's effective terminal output contract against an already-loaded
+/// snapshot.
+///
+/// Port model: the contract is the schema of the node's single `context-out`
+/// edge target — an [`ArtifactNode`](crate::models::ArtifactNodeConfig) (carrying
+/// `name` + `schema` + `confirm_policy`) or an `action`/`pr` input port. `Some`
+/// here means "this node was told to produce a terminal artifact"; the
+/// job-completion gate keys on exactly that.
+///
+/// Back-compat: old execution snapshots predate ArtifactNodes and carry an inline
+/// agent/action `outputSchema` plus a direct `context-out` edge to the consumer.
+/// When the ctx-out target carries no schema (it points straight at another
+/// agent), the node's own inline `outputSchema` is the contract. Splitting the
+/// snapshot load out lets the recompute sweep reuse its loaded snapshot.
 pub(crate) async fn find_downstream_artifact_schema_with_snapshot_conn(
     conn: &turso::Connection,
     snapshot: &ExecutionSnapshot,
@@ -384,127 +555,152 @@ pub(crate) async fn find_downstream_artifact_schema_with_snapshot_conn(
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    let context_edges: Vec<&RecipeEdge> = snapshot
+
+    // Port model: follow the single context-out edge to its target's schema.
+    if let Some(edge) = snapshot.recipe.edges.iter().find(|edge| {
+        edge.edge_type.to_string() == "context"
+            && edge.source_node_id == node_id
+            && edge.source_handle == crate::models::CONTEXT_OUT_HANDLE
+    }) {
+        if let Some(info) =
+            resolve_ctx_out_target_schema(conn, &node_map, &edge.target_node_id).await?
+        {
+            return Ok(Some(info));
+        }
+    }
+
+    // Back-compat: a pre-port snapshot carries the contract inline on the node.
+    legacy_own_output_schema(&node_map, node_id)
+}
+
+/// Resolve the terminal contract carried by a `context-out` edge's target: an
+/// ArtifactNode's typed schema, or an `action`/`pr` node's input port. A `pr`
+/// target always auto-confirms — the PR lifecycle (open → merge/close) is the
+/// human gate, never a pre-PR artifact confirmation (CAIRN-1219). An ArtifactNode
+/// with no `schema` (a pure literal-content input document) is not a terminal
+/// contract.
+async fn resolve_ctx_out_target_schema(
+    conn: &turso::Connection,
+    node_map: &HashMap<&str, &RecipeNode>,
+    target_node_id: &str,
+) -> DbResult<Option<OutputSchemaInfo>> {
+    let Some(target) = node_map.get(target_node_id) else {
+        return Ok(None);
+    };
+    match target.node_type.to_string().as_str() {
+        "artifact" => {
+            let Some(cfg) = target.artifact_config.as_ref() else {
+                return Ok(None);
+            };
+            let Some(schema) = cfg.schema.clone() else {
+                return Ok(None);
+            };
+            Ok(Some(OutputSchemaInfo {
+                schema: OutputSchema::Custom(schema),
+                artifact_name: Some(cfg.name.clone()).filter(|n| !n.is_empty()),
+                confirm_policy: cfg.confirm_policy,
+                tool_name: None,
+                description: None,
+            }))
+        }
+        "action" | "pr" => {
+            let Some(action_cfg) = target.action_config.as_ref() else {
+                return Ok(None);
+            };
+            if let Some(input_schema) = action_cfg.input_schema.as_ref() {
+                if let Some(mut info) = extract_schema_from_slot_config(input_schema)? {
+                    if target.node_type.to_string() == "pr" {
+                        info.confirm_policy = crate::models::ConfirmPolicy::Auto;
+                    }
+                    return Ok(Some(info));
+                }
+            }
+            // Legacy `create_pr`-style action referencing an action_config row.
+            let action_config_id = action_cfg.action_config_id.clone().or_else(|| {
+                (!action_cfg.action.is_empty()).then(|| format!("builtin:{}", action_cfg.action))
+            });
+            if let Some(action_config_id) = action_config_id {
+                return load_action_config_schema_conn(conn, &action_config_id).await;
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Back-compat resolver for pre-port snapshots: the node's own inline output
+/// schema (agent or action). Returns `None` for the new authored model, where
+/// agents carry no inline `outputSchema`.
+fn legacy_own_output_schema(
+    node_map: &HashMap<&str, &RecipeNode>,
+    node_id: &str,
+) -> DbResult<Option<OutputSchemaInfo>> {
+    let Some(node) = node_map.get(node_id) else {
+        return Ok(None);
+    };
+    let own = match node.node_type.to_string().as_str() {
+        "agent" => node
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.output_schema.as_ref()),
+        "action" => node
+            .action_config
+            .as_ref()
+            .and_then(|c| c.output_schema.as_ref()),
+        _ => None,
+    };
+    match own {
+        Some(schema) => extract_schema_from_slot_config(schema),
+        None => Ok(None),
+    }
+}
+
+/// Enumerate a node's `context-self` living-doc targets: the ArtifactNodes the
+/// node owns and patches across its life. Each carries its own name + schema used
+/// to validate ctx-self writes; they are NOT the terminal contract and never gate
+/// the job. ArtifactNodes with no schema are skipped (nothing to validate).
+pub(crate) async fn resolve_ctx_self_schemas_conn(
+    conn: &turso::Connection,
+    node_id: &str,
+    execution_id: &str,
+) -> DbResult<Vec<OutputSchemaInfo>> {
+    let snapshot = require_execution_snapshot_conn(conn, execution_id).await?;
+    Ok(resolve_ctx_self_schemas_with_snapshot(&snapshot, node_id))
+}
+
+pub(crate) fn resolve_ctx_self_schemas_with_snapshot(
+    snapshot: &ExecutionSnapshot,
+    node_id: &str,
+) -> Vec<OutputSchemaInfo> {
+    let node_map: HashMap<&str, &RecipeNode> = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    snapshot
         .recipe
         .edges
         .iter()
-        .filter(|edge| edge.edge_type.to_string() == "context" && edge.source_node_id == node_id)
-        .collect();
-
-    // The producing node's own output schema. Even when the field *shape* is
-    // inherited from a downstream action, the URI the agent writes to and the
-    // confirm gate belong to this node, so its declared name and confirm policy
-    // win over anything carried by the inherited shape.
-    let own_schema =
-        node_map
-            .get(node_id)
-            .and_then(|node| match node.node_type.to_string().as_str() {
-                "agent" => node
-                    .agent_config
-                    .as_ref()
-                    .and_then(|c| c.output_schema.as_ref()),
-                "action" => node
-                    .action_config
-                    .as_ref()
-                    .and_then(|c| c.output_schema.as_ref()),
-                _ => None,
-            });
-    let own_artifact_name = own_schema.map(|s| s.name.clone()).filter(|n| !n.is_empty());
-    let own_confirm_policy = own_schema.map(|s| s.confirm_policy);
-    let stamp = |info: Option<OutputSchemaInfo>| {
-        info.map(|mut info| {
-            if info.artifact_name.is_none() {
-                info.artifact_name = own_artifact_name.clone();
-            }
-            if let Some(policy) = own_confirm_policy {
-                info.confirm_policy = policy;
-            }
-            info
+        .filter(|edge| {
+            edge.edge_type.to_string() == "context"
+                && edge.source_node_id == node_id
+                && edge.source_handle == crate::models::CONTEXT_SELF_HANDLE
         })
-    };
-
-    if let Some(node) = node_map.get(node_id) {
-        if node.node_type.to_string() == "agent" {
-            if let Some(ref agent_cfg) = node.agent_config {
-                if let Some(ref output_schema) = agent_cfg.output_schema {
-                    if let Some(schema_info) = extract_schema_from_slot_config(output_schema)? {
-                        return Ok(stamp(Some(schema_info)));
-                    }
-                }
-            }
-        }
-    }
-
-    log::info!(
-        "find_downstream_artifact_schema: node_id={}, recipe={}, found {} context edges",
-        node_id,
-        snapshot.recipe.id,
-        context_edges.len()
-    );
-
-    for edge in context_edges {
-        if let Some(target_node) = node_map.get(edge.target_node_id.as_str()) {
-            let target_type = target_node.node_type.to_string();
-            // A consumer node — a generic `action` or a first-class `pr` — declares
-            // the producer's output contract (name + shape) via its `inputSchema`.
-            // This is the single source of the artifact's `cairn:~/<name>` address;
-            // the agent is instructed with exactly this name (CAIRN-1219).
-            if target_type == "action" || target_type == "pr" {
-                if let Some(ref action_cfg) = target_node.action_config {
-                    if let Some(ref input_schema) = action_cfg.input_schema {
-                        if let Some(mut schema_info) =
-                            extract_schema_from_slot_config(input_schema)?
-                        {
-                            // A `pr` consumer always auto-confirms: the PR lifecycle
-                            // (open → merge/close) is the human gate, never a pre-PR
-                            // artifact confirmation. The producer declares nothing,
-                            // so the contract — name, shape, auto-confirm — is wholly
-                            // the pr node's. Bypass `stamp` (no producer override).
-                            if target_type == "pr" {
-                                schema_info.confirm_policy = crate::models::ConfirmPolicy::Auto;
-                                if schema_info.artifact_name.is_none() {
-                                    schema_info.artifact_name = own_artifact_name.clone();
-                                }
-                                return Ok(Some(schema_info));
-                            }
-                            return Ok(stamp(Some(schema_info)));
-                        }
-                    }
-
-                    // Legacy `create_pr`-style action: resolve the schema from the
-                    // referenced action_config. (A `pr` node has no action_config_id
-                    // and an empty `action`, so this is action-only.)
-                    let action_config_id = action_cfg.action_config_id.clone().or_else(|| {
-                        if !action_cfg.action.is_empty() {
-                            Some(format!("builtin:{}", action_cfg.action))
-                        } else {
-                            None
-                        }
-                    });
-
-                    if let Some(action_config_id) = action_config_id {
-                        if let Some(schema_info) =
-                            load_action_config_schema_conn(conn, &action_config_id).await?
-                        {
-                            return Ok(stamp(Some(schema_info)));
-                        }
-                    }
-                }
-            }
-
-            if target_type == "artifact" {
-                if let Some(ref agent_cfg) = target_node.agent_config {
-                    if let Some(ref output_schema) = agent_cfg.output_schema {
-                        if let Some(schema_info) = extract_schema_from_slot_config(output_schema)? {
-                            return Ok(stamp(Some(schema_info)));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(stamp(None))
+        .filter_map(|edge| {
+            let target = node_map.get(edge.target_node_id.as_str())?;
+            let cfg = target.artifact_config.as_ref()?;
+            let schema = cfg.schema.clone()?;
+            Some(OutputSchemaInfo {
+                schema: OutputSchema::Custom(schema),
+                artifact_name: Some(cfg.name.clone()).filter(|n| !n.is_empty()),
+                // ctx-self living docs are always auto-confirm; they never gate.
+                confirm_policy: crate::models::ConfirmPolicy::Auto,
+                tool_name: None,
+                description: None,
+            })
+        })
+        .collect()
 }
 
 pub(super) async fn load_action_config_schema_conn(
@@ -557,4 +753,419 @@ pub(super) fn extract_schema_from_slot_config(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod port_model_tests {
+    use super::*;
+    use crate::models::{
+        ActionNodeConfig, AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, NodePosition,
+        RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger,
+        SchemaConfig, TriggerContext, TriggerType,
+    };
+    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use std::collections::HashMap;
+
+    fn agent(id: &str) -> RecipeNode {
+        RecipeNode {
+            id: id.to_string(),
+            node_type: RecipeNodeType::Agent,
+            name: id.to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: Some(AgentNodeConfig {
+                agent_config_id: Some(id.to_string()),
+                output_schema: None,
+                git_config: None,
+            }),
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        }
+    }
+
+    fn artifact_node(id: &str, name: &str, policy: ConfirmPolicy) -> RecipeNode {
+        RecipeNode {
+            id: id.to_string(),
+            node_type: RecipeNodeType::Artifact,
+            name: id.to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: Some(ArtifactNodeConfig {
+                name: name.to_string(),
+                schema: Some(serde_json::json!({
+                    "type": "object",
+                    "required": ["title", "content"],
+                    "properties": {
+                        "title": { "type": "string" },
+                        "content": { "type": "string" }
+                    }
+                })),
+                confirm_policy: policy,
+                content: None,
+            }),
+            condition_config: None,
+            context_config: None,
+        }
+    }
+
+    fn pr_node(id: &str, name: &str) -> RecipeNode {
+        RecipeNode {
+            id: id.to_string(),
+            node_type: RecipeNodeType::Pr,
+            name: id.to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: Some(ActionNodeConfig {
+                action_config_id: None,
+                action: String::new(),
+                action_params: serde_json::Value::Null,
+                input_schema: Some(SchemaConfig {
+                    name: name.to_string(),
+                    schema: Some(serde_json::json!({"type": "object"})),
+                    // A `user` policy here must be overridden to `auto` by the
+                    // resolver: the PR lifecycle is the gate (CAIRN-1219).
+                    confirm_policy: ConfirmPolicy::User,
+                    tool_name: None,
+                    description: None,
+                }),
+                output_schema: None,
+            }),
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        }
+    }
+
+    fn ctx_edge(id: &str, from: &str, from_handle: &str, to: &str, to_handle: &str) -> RecipeEdge {
+        RecipeEdge {
+            id: id.to_string(),
+            edge_type: RecipeEdgeType::Context,
+            source_node_id: from.to_string(),
+            source_handle: from_handle.to_string(),
+            target_node_id: to.to_string(),
+            target_handle: to_handle.to_string(),
+        }
+    }
+
+    fn snapshot(nodes: Vec<RecipeNode>, edges: Vec<RecipeEdge>) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: "recipe-1".to_string(),
+                name: "Recipe".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes,
+                edges,
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: Some("i-1".to_string()),
+                project_id: "p-1".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 1,
+        }
+    }
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("inputs.db")).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        // Leak the tempdir so the file outlives the test body.
+        std::mem::forget(temp);
+        db
+    }
+
+    /// planner --context-out--> plan(ArtifactNode) --context-out--> builder,
+    /// builder --context-out--> pr. Plus an optional ctx-self `notes` node.
+    fn planbuild_snapshot(with_ctx_self: bool) -> ExecutionSnapshot {
+        let mut nodes = vec![
+            agent("planner"),
+            artifact_node("plan-node", "plan", ConfirmPolicy::User),
+            agent("builder"),
+            pr_node("pr", "create-pr"),
+        ];
+        let mut edges = vec![
+            ctx_edge("e1", "planner", "context-out", "plan-node", "context-in"),
+            ctx_edge("e2", "plan-node", "context-out", "builder", "context-in"),
+            ctx_edge("e3", "builder", "context-out", "pr", "context-in"),
+        ];
+        if with_ctx_self {
+            nodes.push(artifact_node("notes-node", "notes", ConfirmPolicy::Auto));
+            edges.push(ctx_edge(
+                "e4",
+                "planner",
+                "context-self",
+                "notes-node",
+                "context-in",
+            ));
+        }
+        snapshot(nodes, edges)
+    }
+
+    #[tokio::test]
+    async fn terminal_contract_follows_context_out_to_artifact_node() {
+        let db = test_db().await;
+        let snap = planbuild_snapshot(false);
+        let info = db
+            .read(move |conn| {
+                let snap = snap.clone();
+                Box::pin(async move {
+                    find_downstream_artifact_schema_with_snapshot_conn(conn, &snap, "planner").await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("planner has a terminal contract");
+        assert_eq!(info.artifact_name.as_deref(), Some("plan"));
+        assert_eq!(info.confirm_policy, ConfirmPolicy::User);
+        assert!(matches!(info.schema, OutputSchema::Custom(_)));
+    }
+
+    #[tokio::test]
+    async fn pr_target_forces_auto_confirm() {
+        let db = test_db().await;
+        let snap = planbuild_snapshot(false);
+        let info = db
+            .read(move |conn| {
+                let snap = snap.clone();
+                Box::pin(async move {
+                    find_downstream_artifact_schema_with_snapshot_conn(conn, &snap, "builder").await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("builder feeds the pr");
+        assert_eq!(info.artifact_name.as_deref(), Some("create-pr"));
+        // The pr input schema declared `user`, but the PR lifecycle is the gate.
+        assert_eq!(info.confirm_policy, ConfirmPolicy::Auto);
+    }
+
+    #[tokio::test]
+    async fn ctx_self_target_is_not_the_terminal_contract() {
+        let snap = planbuild_snapshot(true);
+        // ctx-self enumeration finds `notes`...
+        let selfs = resolve_ctx_self_schemas_with_snapshot(&snap, "planner");
+        assert_eq!(selfs.len(), 1);
+        assert_eq!(selfs[0].artifact_name.as_deref(), Some("notes"));
+
+        // ...but the terminal contract is still `plan`, never `notes`.
+        let db = test_db().await;
+        let info = db
+            .read(move |conn| {
+                let snap = snap.clone();
+                Box::pin(async move {
+                    find_downstream_artifact_schema_with_snapshot_conn(conn, &snap, "planner").await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("terminal contract");
+        assert_eq!(info.artifact_name.as_deref(), Some("plan"));
+    }
+
+    #[tokio::test]
+    async fn legacy_inline_output_schema_still_resolves() {
+        // Old snapshot: planner carries an inline outputSchema and a direct
+        // context-out edge to the builder (no ArtifactNode).
+        let mut planner = agent("planner");
+        planner.agent_config = Some(AgentNodeConfig {
+            agent_config_id: Some("planner".to_string()),
+            output_schema: Some(SchemaConfig {
+                name: "plan".to_string(),
+                schema: Some(serde_json::json!({"type": "object"})),
+                confirm_policy: ConfirmPolicy::User,
+                tool_name: None,
+                description: None,
+            }),
+            git_config: None,
+        });
+        let snap = snapshot(
+            vec![planner, agent("builder")],
+            vec![ctx_edge(
+                "e1",
+                "planner",
+                "context-out",
+                "builder",
+                "context-in",
+            )],
+        );
+        let db = test_db().await;
+        let info = db
+            .read(move |conn| {
+                let snap = snap.clone();
+                Box::pin(async move {
+                    find_downstream_artifact_schema_with_snapshot_conn(conn, &snap, "planner").await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("legacy inline schema resolves");
+        assert_eq!(info.artifact_name.as_deref(), Some("plan"));
+        assert_eq!(info.confirm_policy, ConfirmPolicy::User);
+    }
+
+    #[tokio::test]
+    async fn consumer_reads_producer_artifact_through_artifact_node() {
+        let db = test_db().await;
+        let snap = planbuild_snapshot(false);
+        let snapshot_json = snap.to_json().unwrap();
+        db.write(move |conn| {
+            let snapshot_json = snapshot_json.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot_json.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-planner','e-1','planner','i-1','p-1','complete','planner','planner',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-builder','e-1','builder','i-1','p-1','running','builder','builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-plan','j-planner','plan',1,'{\"title\":\"Plan A\",\"content\":\"do the thing\"}',1,'plan',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let inputs = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let builder = crate::db_records::load_live_job_by_execution_node_conn(
+                        conn, "e-1", "builder",
+                    )
+                    .await?
+                    .expect("builder job");
+                    resolve_job_inputs_conn(conn, &builder).await
+                })
+            })
+            .await
+            .unwrap();
+
+        let plan_input = inputs
+            .iter()
+            .find(|i| i.artifact_type == "plan")
+            .expect("builder receives the planner's plan artifact");
+        assert_eq!(
+            plan_input.data.get("content").and_then(|v| v.as_str()),
+            Some("do the thing")
+        );
+    }
+
+    /// The latest-across-job fallback must skip a higher-versioned context-self
+    /// living doc and return the real terminal artifact (CAIRN-1953).
+    #[tokio::test]
+    async fn load_artifact_for_edge_excludes_ctx_self_from_fallback() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,'{}')", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-coord','e-1','coord','i-1','p-1','complete','coord','coord',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-pr','j-coord','create-pr',1,'{\"title\":\"Real PR\"}',1,'create-pr',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-plan','j-coord','plan',1,'{\"title\":\"Plan doc\"}',2,'plan',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let (by_name, by_handle_excluded, by_handle_unfiltered) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let exclude = vec!["plan".to_string()];
+                    let by_name =
+                        load_artifact_for_edge_conn(conn, "j-coord", "create-pr", &exclude).await?;
+                    let by_handle_excluded =
+                        load_artifact_for_edge_conn(conn, "j-coord", "context-out", &exclude)
+                            .await?;
+                    let by_handle_unfiltered =
+                        load_artifact_for_edge_conn(conn, "j-coord", "context-out", &[]).await?;
+                    Ok::<_, DbError>((by_name, by_handle_excluded, by_handle_unfiltered))
+                })
+            })
+            .await
+            .unwrap();
+
+        // Exact match by contract name returns create-pr.
+        assert_eq!(by_name.unwrap().0, "create-pr");
+        // Handle keying misses; the fallback skips the higher-versioned ctx-self
+        // `plan` and returns create-pr.
+        assert_eq!(by_handle_excluded.unwrap().0, "create-pr");
+        // Without the exclusion, the latest-across-job fallback returns `plan`
+        // — the exact pre-fix behavior that opened the PR with the wrong content.
+        assert_eq!(by_handle_unfiltered.unwrap().0, "plan");
+    }
+
+    /// A consumer on a direct context edge must not receive the producer's
+    /// context-self living doc as an input artifact (CAIRN-1953).
+    #[tokio::test]
+    async fn direct_edge_consumer_skips_producer_ctx_self_doc() {
+        let db = test_db().await;
+        let snap = snapshot(
+            vec![
+                agent("planner"),
+                agent("builder"),
+                artifact_node("notes-node", "notes", ConfirmPolicy::Auto),
+            ],
+            vec![
+                ctx_edge("e1", "planner", "context-out", "builder", "context-in"),
+                ctx_edge("e2", "planner", "context-self", "notes-node", "context-in"),
+            ],
+        );
+        let snapshot_json = snap.to_json().unwrap();
+        db.write(move |conn| {
+            let snapshot_json = snapshot_json.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot_json.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-planner','e-1','planner','i-1','p-1','running','planner','planner',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-builder','e-1','builder','i-1','p-1','running','builder','builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-notes','j-planner','notes',1,'{\"title\":\"Notes\",\"content\":\"living doc\"}',1,'notes',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let inputs = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let builder = crate::db_records::load_live_job_by_execution_node_conn(
+                        conn, "e-1", "builder",
+                    )
+                    .await?
+                    .expect("builder job");
+                    resolve_job_inputs_conn(conn, &builder).await
+                })
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            inputs.iter().all(|i| i.artifact_type != "notes"),
+            "builder must not receive the planner's context-self `notes` doc"
+        );
+    }
 }

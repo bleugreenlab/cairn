@@ -2,7 +2,7 @@ use crate::db_records::DbProject;
 use crate::error::CairnError;
 use crate::github::api::parse_repo_from_url;
 use crate::models::ProjectRemoteStatus;
-use crate::pr_data::helpers::update_main_repo_after_merge;
+use crate::pr_data::helpers::reconcile_main_checkout_after_merge;
 use crate::projects::crud;
 use crate::services::GitClient;
 use crate::storage::LocalDb;
@@ -12,7 +12,15 @@ use std::path::Path;
 pub enum PushRemoteSyncOutcome {
     IgnoredNonDefaultRef,
     NoMatchingProject,
-    Pulled { project_id: String },
+    /// A matching default-branch push was processed: the project resolved and its
+    /// default branch is known. The main-checkout pull is attempted as a
+    /// best-effort side effect (a failure is logged, not surfaced here), so this
+    /// variant signals "reconcile in-flight siblings for `default_branch`"
+    /// regardless of whether the user's checkout could be fast-forwarded.
+    Pulled {
+        project_id: String,
+        default_branch: String,
+    },
 }
 
 pub fn attach_remote(
@@ -103,12 +111,27 @@ pub async fn pull_project_on_default_branch_push(
     let default_branch = project
         .default_branch
         .as_deref()
-        .unwrap_or(event_default_branch);
-    update_main_repo_after_merge(git, &project.repo_path, default_branch)
-        .map_err(CairnError::Internal)?;
+        .unwrap_or(event_default_branch)
+        .to_string();
+    // The main-checkout pull is best-effort: it can fail for reasons local to the
+    // user's checkout (uncommitted changes that won't stash/pop, a pull
+    // conflict) that have nothing to do with the externally-advanced tip on
+    // origin. A failure here must NOT abort processing — the in-flight sibling
+    // reconcile the caller runs on `Pulled` fetches origin into the shared store
+    // itself and is independent of the main checkout's state, so the dirty-
+    // checkout case is exactly when reconciliation still needs to happen.
+    if let Err(error) =
+        reconcile_main_checkout_after_merge(git, &project.repo_path, &default_branch, true)
+    {
+        log::warn!(
+            "Default-branch push for project {}: main checkout pull failed (continuing to sibling reconcile): {}",
+            project.id, error
+        );
+    }
 
     Ok(PushRemoteSyncOutcome::Pulled {
         project_id: project.id,
+        default_branch,
     })
 }
 
@@ -341,8 +364,56 @@ mod tests {
         assert_eq!(
             outcome,
             PushRemoteSyncOutcome::Pulled {
-                project_id: "local".to_string()
+                project_id: "local".to_string(),
+                default_branch: "main".to_string(),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn push_sync_returns_pulled_even_when_checkout_pull_fails() {
+        // A dirty/diverged main checkout can fail the best-effort pull, but the
+        // externally-advanced tip is still on origin and the sibling reconcile
+        // fetches it into the shared store itself. The outcome must still be
+        // `Pulled` so the caller reconciles in-flight workspaces.
+        let db = migrated_db().await;
+        insert_project(&db, "local", "/repos/local", None, None).await;
+
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok("https://github.com/acme/workspace.git".to_string()));
+        git.expect_current_branch()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok("main".to_string()));
+        git.expect_status()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok(String::new()));
+        git.expect_pull()
+            .with(
+                function(|path: &Path| path == Path::new("/repos/local")),
+                eq("origin"),
+                eq("main"),
+            )
+            .returning(|_, _, _| Err("local changes would be overwritten by merge".to_string()));
+
+        let outcome = pull_project_on_default_branch_push(
+            &db,
+            &git,
+            "acme/workspace",
+            "refs/heads/main",
+            "main",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            PushRemoteSyncOutcome::Pulled {
+                project_id: "local".to_string(),
+                default_branch: "main".to_string(),
+            },
+            "a failed main-checkout pull must not suppress the sibling reconcile signal"
         );
     }
 

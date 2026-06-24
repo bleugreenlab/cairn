@@ -7,24 +7,17 @@
 
 /// Cairn's base system prompt (compiled into the binary).
 ///
-/// Shared across backends. Appended on top of each backend's Cairn-owned base
-/// prompt so every backend receives the same global harness contract.
+/// Shared across backends as the first system-prompt segment, so every backend
+/// receives the same global harness contract.
 pub const CAIRN_SYSTEM_PROMPT: &str = include_str!("agent_process/system_prompt.md");
 
-/// Codex-only base prompt (compiled into the binary).
-///
-/// Replaces Codex CLI's default base instructions via `baseInstructions`.
-/// `CAIRN_SYSTEM_PROMPT` is appended on top, so the effective base prompt is
-/// `CODEX_SYSTEM_PROMPT` + Cairn additions.
-pub const CODEX_SYSTEM_PROMPT: &str = include_str!("agent_process/codex_system_prompt.md");
-
-/// Claude-only base system prompt (compiled into the binary).
-///
-/// Replaces Claude Code's default system prompt entirely via
-/// `--system-prompt-file`. `CAIRN_SYSTEM_PROMPT` is still appended on top via
-/// `--append-system-prompt-file`, so the effective prompt is
-/// `CLAUDE_SYSTEM_PROMPT` + Cairn additions + agent-specific content.
-pub const CLAUDE_SYSTEM_PROMPT: &str = include_str!("agent_process/claude_system_prompt.md");
+/// The default provider-agnostic workspace character prompt (compiled into the
+/// binary). Seeded once to `~/.cairn/AGENTS.md` on a fresh install; from there
+/// it is assembled as the `workspace` segment for every backend, carrying the
+/// motivating doctrine the old per-backend base prompts used to hold. It is
+/// never assembled directly — only used as the seed bytes.
+pub const DEFAULT_WORKSPACE_PROMPT: &str =
+    include_str!("agent_process/default_workspace_prompt.md");
 
 use cairn_common::contract::{KeySpec, KeyType, RESOURCE_CONTRACTS};
 
@@ -126,11 +119,12 @@ spans resources rather than belonging to any single one:
   `commit_msg` for file-target edits; a successful worktree-bound `run` that
   dirties the tree without one is reverted to HEAD, entry dirt included. Commit
   work you want kept in the same call that creates it.
-- `commit_msg: "NO_COMMIT"` is valid only while resolving an in-progress merge
-  or rebase; anywhere else the batch's changes are restored to HEAD.
+- When a base advance auto-rebases your workspace and records a conflict, the
+  conflict markers materialize in your files; resolve them and re-seal on your
+  next `write`/`run` with a normal `commit_msg`. No manual rebase or force-push.
 - While a worktree-bound agent tree is dirty, every tool result includes a
   `<system-reminder>` telling the agent to commit or discard the changes; it
-  clears automatically once `git status --porcelain` is empty.
+  clears automatically once the working copy is clean.
 - `preview: true` validates and computes the change report without side effects
   and needs no `commit_msg`, returning an `apply_uri`; land it by re-submitting a
   single item with `mode: "apply"`, that URI, and the `commit_msg` that commits

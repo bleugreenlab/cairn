@@ -105,6 +105,75 @@ pub fn callback_port() -> u16 {
     }
 }
 
+// ============================================================================
+// dev:instance resolution
+//
+// `bun run dev:instance` (scripts/dev-instance.ts) launches a branch-keyed dev
+// build whose home is `~/.cairn-dev-<key>` (key = slugified branch), with its
+// database at `<home>/cairn-dev.turso.db` and MCP callback port `3860 + slot`
+// where the slot is persisted per branch in `~/.cairn-dev-instances.json`. These
+// helpers mirror that launcher's path/slug/port contract so the host app can
+// resolve a running dev instance and query it (see docs/dev-instances.md). They
+// key off the OS home directory, not `CAIRN_HOME`: instance roots always live
+// under the real home even when the host app itself runs with a `CAIRN_HOME`
+// override.
+// ============================================================================
+
+/// Base MCP callback port for `dev:instance` slots: slot `s` binds `BASE + s`.
+/// Mirrors `CALLBACK_PORT_BASE` in scripts/dev-instance.ts.
+pub const DEV_INSTANCE_CALLBACK_PORT_BASE: u16 = 3860;
+
+/// Prefix marking a `dev:instance` home directory. The trailing hyphen keeps
+/// instance homes (`~/.cairn-dev-<key>`) distinct from the base `tauri dev`
+/// (slot 0) home `~/.cairn-dev`.
+pub const DEV_INSTANCE_HOME_PREFIX: &str = ".cairn-dev-";
+
+/// Database filename inside every `dev:instance` home.
+pub const DEV_INSTANCE_DB_FILENAME: &str = "cairn-dev.turso.db";
+
+/// Filename of the `dev:instance` branch->slot registry under the OS home.
+pub const DEV_INSTANCE_REGISTRY_FILENAME: &str = ".cairn-dev-instances.json";
+
+/// The OS user home directory (`~`), independent of any `CAIRN_HOME` override.
+pub fn os_home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+/// Slugify a git branch into a `dev:instance` key, matching `slugify` in
+/// scripts/dev-instance.ts: lowercase, every run of non-alphanumeric chars
+/// collapses to a single `-`, and leading/trailing `-` are trimmed. Returns
+/// `None` when the result is empty (mirroring the launcher's rejection).
+pub fn dev_instance_slug(branch: &str) -> Option<String> {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for ch in branch.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(ch.to_ascii_lowercase());
+        } else {
+            pending_dash = true;
+        }
+    }
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
+/// The `dev:instance` registry path (`~/.cairn-dev-instances.json`).
+pub fn dev_instance_registry_path() -> Option<PathBuf> {
+    os_home_dir().map(|home| home.join(DEV_INSTANCE_REGISTRY_FILENAME))
+}
+
+/// The `dev:instance` home directory for a slug key (`~/.cairn-dev-<key>`).
+pub fn dev_instance_home(key: &str) -> Option<PathBuf> {
+    os_home_dir().map(|home| home.join(format!("{DEV_INSTANCE_HOME_PREFIX}{key}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,5 +346,31 @@ mod tests {
         assert_eq!(callback_port(), 3857);
 
         clear_env();
+    }
+
+    #[test]
+    fn dev_instance_slug_matches_launcher_contract() {
+        // Lowercased, non-alphanumeric runs collapse to one '-', ends trimmed.
+        assert_eq!(
+            dev_instance_slug("agent/CAIRN-1928-builder-0").as_deref(),
+            Some("agent-cairn-1928-builder-0")
+        );
+        assert_eq!(dev_instance_slug("main").as_deref(), Some("main"));
+        assert_eq!(
+            dev_instance_slug("feature/Foo_Bar").as_deref(),
+            Some("feature-foo-bar")
+        );
+        assert_eq!(
+            dev_instance_slug("--weird//name--").as_deref(),
+            Some("weird-name")
+        );
+        // An already-slugified key round-trips to itself (selector tolerance).
+        assert_eq!(
+            dev_instance_slug("agent-cairn-1928-builder-0").as_deref(),
+            Some("agent-cairn-1928-builder-0")
+        );
+        // Empty / all-separator branches slugify to nothing.
+        assert_eq!(dev_instance_slug(""), None);
+        assert_eq!(dev_instance_slug("///"), None);
     }
 }

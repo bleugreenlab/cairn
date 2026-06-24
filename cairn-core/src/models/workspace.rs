@@ -4,6 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use std::collections::HashMap;
 
+use cairn_common::logging::LogLevel;
+
 use super::common::{MergeType, Model, Preset, ThinkingDisplayMode};
 
 /// How agent replies to the special `to: "external"` target are handled.
@@ -44,6 +46,31 @@ pub struct Workspace {
     pub updated_at: i64,
 }
 
+/// OpenRouter provider-routing controls. OpenRouter is the only backend with a
+/// routing concept, so this is a single typed object rather than a backend-keyed
+/// map. Defaults leave OpenRouter's normal routing untouched.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRouterRouting {
+    /// Restrict routing to zero-data-retention provider endpoints (`provider.zdr`).
+    /// Strictly opt-in: when false, no `zdr` field is sent.
+    #[serde(default)]
+    pub zero_data_retention: bool,
+    /// Routing sort preference → `provider.sort`. None = OpenRouter's default
+    /// (price-weighted load balancing); field is omitted when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<OpenRouterSort>,
+}
+
+/// Routing sort preference for `provider.sort`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenRouterSort {
+    Price,
+    Throughput,
+    Latency,
+}
+
 /// Settings DTO for API responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -69,6 +96,18 @@ pub struct Settings {
     pub pending_memory_threshold: i32,
     /// Behavior for replies to the documented `to: "external"` target.
     pub external_replies: ExternalReplyMode,
+    /// File-log verbosity level (default `standard`; `verbose` opts into full
+    /// debug + profiler logging). Takes effect on the next app start.
+    pub log_level: LogLevel,
+    /// Flat monthly subscription fee per backend, in USD. Empty = every backend
+    /// is metered (no subscription normalization). Drives effective-cost
+    /// analytics; OpenRouter is always metered regardless of this map.
+    #[serde(default)]
+    pub subscription_fees: HashMap<String, f64>,
+    /// OpenRouter provider-routing controls (ZDR + sort). Default = OpenRouter's
+    /// normal routing.
+    #[serde(default)]
+    pub openrouter_routing: OpenRouterRouting,
 }
 
 /// DTO for updating settings
@@ -100,4 +139,10 @@ pub struct UpdateSettings {
     pub pending_memory_threshold: Option<i32>,
     /// Behavior for replies to the documented `to: "external"` target.
     pub external_replies: Option<ExternalReplyMode>,
+    /// File-log verbosity level.
+    pub log_level: Option<LogLevel>,
+    /// Flat monthly subscription fee per backend, in USD (replaces the whole map).
+    pub subscription_fees: Option<HashMap<String, f64>>,
+    /// OpenRouter provider-routing controls (replaces the whole object).
+    pub openrouter_routing: Option<OpenRouterRouting>,
 }

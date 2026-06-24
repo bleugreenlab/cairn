@@ -11,6 +11,7 @@ pub mod git;
 pub mod handlers;
 pub mod oauth;
 pub mod types;
+pub mod vcs;
 pub mod wildcard;
 
 pub use auth::McpAuthState;

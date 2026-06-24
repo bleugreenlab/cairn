@@ -16,7 +16,7 @@ fn db_error(context: &str, error: DbError) -> String {
 /// only needs one edit here and a matching row-index update in
 /// [`message_from_row`].
 const MESSAGE_COLUMNS: &str = "id, channel_type, channel_id, sender_run_id, sender_name,
-        recipient_run_id, content, created_at, delivered_at, urgency";
+        recipient_run_id, content, created_at, urgency";
 
 /// Convert a database row to a domain Message.
 fn message_from_row(row: &turso::Row) -> DbResult<Message> {
@@ -30,14 +30,34 @@ fn message_from_row(row: &turso::Row) -> DbResult<Message> {
         recipient_run_id: row.opt_text(5)?,
         content: row.text(6)?,
         created_at: row.i64(7)?,
-        delivered_at: row.opt_i64(8)?,
         urgency: row
-            .opt_text(9)?
+            .opt_text(8)?
             .as_deref()
             .map(DeliveryUrgency::parse)
             .transpose()
             .map_err(DbError::Row)?,
     })
+}
+
+/// Load a single message by id, or `None` when no such row exists. The attention
+/// push delivery layer uses this to resolve a `direct:` push's frozen content
+/// from the durable `messages` row (the push key carries the message id), which
+/// is why migrating directs onto the push queue needs no schema change
+/// (CAIRN-1900).
+pub async fn get_message_by_id_async(db: &LocalDb, id: &str) -> DbResult<Option<Message>> {
+    let id = id.to_string();
+    db.read(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            let sql = format!("SELECT {} FROM messages WHERE id = ?1", MESSAGE_COLUMNS);
+            let mut rows = conn.query(&sql, params![id.as_str()]).await?;
+            rows.next()
+                .await?
+                .map(|row| message_from_row(&row))
+                .transpose()
+        })
+    })
+    .await
 }
 
 async fn load_message_by_id(conn: &turso::Connection, id: &str) -> DbResult<Message> {
@@ -133,8 +153,38 @@ pub(super) async fn insert_message_async(
     content: &str,
     urgency: Option<DeliveryUrgency>,
 ) -> Result<Message, String> {
+    let now = chrono::Utc::now().timestamp();
+    insert_message_at_async(
+        db,
+        channel_type,
+        channel_id,
+        sender_run_id,
+        sender_name,
+        recipient_run_id,
+        content,
+        urgency,
+        now,
+    )
+    .await
+}
+
+/// Insert a message with an explicit `created_at`. Most callers use
+/// [`insert_message_async`] (which stamps `now`); the external-reply path passes
+/// the issue's strictly-monotonic `updated_at` so the row's own timestamp is the
+/// `cairn watch` catch-up cursor.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn insert_message_at_async(
+    db: &LocalDb,
+    channel_type: &ChannelType,
+    channel_id: Option<&str>,
+    sender_run_id: Option<&str>,
+    sender_name: &str,
+    recipient_run_id: Option<&str>,
+    content: &str,
+    urgency: Option<DeliveryUrgency>,
+    created_at: i64,
+) -> Result<Message, String> {
     let id = Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
     let channel_type = channel_type.to_string();
     let channel_id = channel_id.map(str::to_string);
     let sender_run_id = sender_run_id.map(str::to_string);
@@ -167,7 +217,7 @@ pub(super) async fn insert_message_async(
                     sender_name.as_str(),
                     recipient_run_id.as_deref(),
                     content.as_str(),
-                    now,
+                    created_at,
                     urgency.as_deref()
                 ],
             )
@@ -178,6 +228,35 @@ pub(super) async fn insert_message_async(
     })
     .await
     .map_err(|error| db_error("Failed to insert message", error))
+}
+
+/// Insert an issue-channel external reply with an explicit `created_at`.
+///
+/// The external-reply catch-up cursor (`cairn watch`) is the message's own
+/// `created_at`: the caller passes the issue's freshly-bumped, strictly-
+/// monotonic `updated_at` so the row's timestamp equals the cursor the live
+/// `ExternalMessageReply` event broadcasts. This unifies the message timestamp
+/// with the watch cursor, replacing the retired `delivered_at` marker.
+pub async fn insert_external_reply(
+    db: &LocalDb,
+    channel_id: &str,
+    sender_run_id: &str,
+    sender_name: &str,
+    content: &str,
+    created_at: i64,
+) -> Result<Message, String> {
+    insert_message_at_async(
+        db,
+        &ChannelType::Issue,
+        Some(channel_id),
+        Some(sender_run_id),
+        sender_name,
+        None,
+        content,
+        None,
+        created_at,
+    )
+    .await
 }
 
 /// Query messages by channel with cursor-based pagination.
@@ -448,189 +527,6 @@ pub(super) async fn query_directs_for_job_async(
     .map_err(|error| db_error("Failed to query node messages", error))
 }
 
-/// Atomically claim all pending direct messages addressed to `run_id`.
-///
-/// A direct message is "pending" while its `delivered_at` is NULL. Within one
-/// `db.write` closure (a single MVCC transaction in Turso) the function reads
-/// the pending rows and stamps `delivered_at = now` on the same set, so a
-/// concurrent caller from another injection path cannot double-claim the same
-/// message. Both injection paths (Claude hook additionalContext and Cairn
-/// tool-result augmentation) call this on every prompt boundary.
-///
-/// Returns the messages just claimed, in chronological order (oldest first).
-pub fn claim_pending_directs_for_run(db: &LocalDb, run_id: &str) -> Result<Vec<Message>, String> {
-    let run_id = run_id.to_string();
-    run_db_blocking(move || async move { claim_pending_directs_for_run_async(db, &run_id).await })
-}
-
-pub async fn claim_pending_directs_for_run_async(
-    db: &LocalDb,
-    run_id: &str,
-) -> Result<Vec<Message>, String> {
-    claim_pending_directs_for_run_with_boundary_async(db, run_id, DirectClaimBoundary::Tool).await
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum DirectClaimBoundary {
-    Tool,
-    All,
-}
-
-pub async fn claim_pending_directs_for_run_with_boundary_async(
-    db: &LocalDb,
-    run_id: &str,
-    boundary: DirectClaimBoundary,
-) -> Result<Vec<Message>, String> {
-    let run_id = run_id.to_string();
-    let now = chrono::Utc::now().timestamp();
-
-    db.write(|conn| {
-        let run_id = run_id.clone();
-        Box::pin(async move {
-            let urgency_clause = match boundary {
-                DirectClaimBoundary::Tool => {
-                    "AND COALESCE(urgency, 'steer') IN ('passive', 'steer', 'interrupt')"
-                }
-                DirectClaimBoundary::All => "",
-            };
-            let select_sql = format!(
-                "SELECT {} FROM messages
-                     WHERE channel_type = 'direct'
-                       AND recipient_run_id = ?1
-                       AND delivered_at IS NULL
-                       {}
-                     ORDER BY created_at ASC, id ASC",
-                MESSAGE_COLUMNS, urgency_clause
-            );
-            let rows = conn.query(&select_sql, params![run_id.as_str()]).await?;
-            let mut messages = collect_messages(rows).await?;
-
-            if !messages.is_empty() {
-                conn.execute(
-                    &format!(
-                        "UPDATE messages
-                     SET delivered_at = ?1
-                     WHERE channel_type = 'direct'
-                       AND recipient_run_id = ?2
-                       AND delivered_at IS NULL
-                       {}",
-                        urgency_clause
-                    ),
-                    params![now, run_id.as_str()],
-                )
-                .await?;
-                // Reflect the stamp on the returned objects so callers see the
-                // post-claim state without an extra round trip.
-                for msg in messages.iter_mut() {
-                    msg.delivered_at = Some(now);
-                }
-            }
-
-            Ok(messages)
-        })
-    })
-    .await
-    .map_err(|error| db_error("Failed to claim pending direct messages", error))
-}
-
-/// Non-stamping read of the pending directs addressed to `run_id`.
-///
-/// Mirrors the SELECT in [`claim_pending_directs_for_run`] but does NOT stamp
-/// `delivered_at`, so a caller can decide whether to act on the pending set
-/// (e.g. resume an idle job to deliver it) before committing to delivery. The
-/// flush-on-idle path peeks first and stamps each message via
-/// [`mark_direct_delivered`] only after the resume succeeds, so a failed resume
-/// leaves the directs pending for the next prompt boundary rather than dropping
-/// them.
-pub fn peek_pending_directs_for_run(db: &LocalDb, run_id: &str) -> Result<Vec<Message>, String> {
-    let run_id = run_id.to_string();
-    run_db_blocking(move || async move { peek_pending_directs_for_run_async(db, &run_id).await })
-}
-
-pub async fn peek_pending_directs_for_run_async(
-    db: &LocalDb,
-    run_id: &str,
-) -> Result<Vec<Message>, String> {
-    let run_id = run_id.to_string();
-
-    db.read(|conn| {
-        let run_id = run_id.clone();
-        Box::pin(async move {
-            let select_sql = format!(
-                "SELECT {} FROM messages
-                     WHERE channel_type = 'direct'
-                       AND recipient_run_id = ?1
-                       AND delivered_at IS NULL
-                       AND COALESCE(urgency, 'steer') IN ('queue', 'steer', 'interrupt')
-                     ORDER BY created_at ASC, id ASC",
-                MESSAGE_COLUMNS
-            );
-            let rows = conn.query(&select_sql, params![run_id.as_str()]).await?;
-            collect_messages(rows).await
-        })
-    })
-    .await
-    .map_err(|error| db_error("Failed to peek pending direct messages", error))
-}
-
-/// Stamp `delivered_at = now` on a specific direct message that the system
-/// has just delivered through a path other than [`claim_pending_directs_for_run`]
-/// (e.g. a warm-process stdin push). Idempotent: if the row is already
-/// stamped, the UPDATE simply matches no rows.
-pub fn mark_direct_delivered(db: &LocalDb, message_id: &str) -> Result<(), String> {
-    let message_id = message_id.to_string();
-    run_db_blocking(move || async move { mark_direct_delivered_async(db, &message_id).await })
-}
-
-pub async fn mark_direct_delivered_async(db: &LocalDb, message_id: &str) -> Result<(), String> {
-    let message_id = message_id.to_string();
-    let now = chrono::Utc::now().timestamp();
-
-    db.write(|conn| {
-        let message_id = message_id.clone();
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE messages
-                 SET delivered_at = ?1
-                 WHERE id = ?2 AND delivered_at IS NULL",
-                params![now, message_id.as_str()],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| db_error("Failed to mark direct message delivered", error))
-}
-
-/// Stamp a message's `delivered_at` with a caller-provided timestamp.
-///
-/// Channel messages do not use delivery state, so the external-reply path uses
-/// this otherwise-idle column as a durable cursor marker for `cairn watch`
-/// catch-up. Direct-message callers should continue using
-/// [`mark_direct_delivered_async`].
-pub async fn stamp_message_delivered_at(
-    db: &LocalDb,
-    message_id: &str,
-    delivered_at: i64,
-) -> Result<(), String> {
-    let message_id = message_id.to_string();
-
-    db.write(|conn| {
-        let message_id = message_id.clone();
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE messages SET delivered_at = ?1 WHERE id = ?2",
-                params![delivered_at, message_id.as_str()],
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|error| db_error("Failed to stamp message delivered_at", error))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,126 +732,6 @@ mod tests {
 
         assert!(matches!(msg.channel_type, ChannelType::Direct));
         assert_eq!(msg.recipient_run_id.as_deref(), Some("run-2"));
-        // New DM starts pending (delivered_at IS NULL).
-        assert_eq!(msg.delivered_at, None);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_claim_pending_directs_marks_delivered_and_returns_messages() {
-        let db = migrated_db().await;
-
-        // Two pending DMs to the same recipient, one DM to someone else, one
-        // channel message that should never appear.
-        let m1 = insert_message_async(
-            &db,
-            &ChannelType::Direct,
-            None,
-            Some("sender-1"),
-            "planner",
-            Some("recipient-A"),
-            "first",
-            None,
-        )
-        .await
-        .unwrap();
-        let m2 = insert_message_async(
-            &db,
-            &ChannelType::Direct,
-            None,
-            Some("sender-2"),
-            "reviewer",
-            Some("recipient-A"),
-            "second",
-            None,
-        )
-        .await
-        .unwrap();
-        insert_message_async(
-            &db,
-            &ChannelType::Direct,
-            None,
-            Some("sender-3"),
-            "other-sender",
-            Some("recipient-B"),
-            "for someone else",
-            None,
-        )
-        .await
-        .unwrap();
-        insert_message_async(
-            &db,
-            &ChannelType::Issue,
-            Some("PROJ/1"),
-            Some("sender-1"),
-            "planner",
-            None,
-            "channel post",
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Claim returns both pending DMs to A. The two inserts share a
-        // wall-clock second in the test, so order between them is
-        // tiebroken by UUID and not load-bearing — we just check membership.
-        let claimed = claim_pending_directs_for_run_async(&db, "recipient-A")
-            .await
-            .unwrap();
-        assert_eq!(claimed.len(), 2);
-        let claimed_ids: std::collections::HashSet<&str> =
-            claimed.iter().map(|m| m.id.as_str()).collect();
-        assert!(claimed_ids.contains(m1.id.as_str()));
-        assert!(claimed_ids.contains(m2.id.as_str()));
-        for msg in &claimed {
-            assert!(
-                msg.delivered_at.is_some(),
-                "claim should stamp delivered_at"
-            );
-        }
-
-        // Second claim returns nothing — the messages are now delivered.
-        let again = claim_pending_directs_for_run_async(&db, "recipient-A")
-            .await
-            .unwrap();
-        assert!(again.is_empty(), "claim is idempotent for the same caller");
-
-        // The DM addressed to recipient-B is still pending.
-        let b = claim_pending_directs_for_run_async(&db, "recipient-B")
-            .await
-            .unwrap();
-        assert_eq!(b.len(), 1);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_mark_direct_delivered_is_idempotent() {
-        let db = migrated_db().await;
-
-        let msg = insert_message_async(
-            &db,
-            &ChannelType::Direct,
-            None,
-            Some("sender"),
-            "planner",
-            Some("recipient"),
-            "hi",
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(msg.delivered_at, None);
-
-        // First mark stamps delivered_at.
-        mark_direct_delivered_async(&db, &msg.id).await.unwrap();
-        let pending = claim_pending_directs_for_run_async(&db, "recipient")
-            .await
-            .unwrap();
-        assert!(
-            pending.is_empty(),
-            "after mark_direct_delivered, message is no longer pending"
-        );
-
-        // Second mark is a no-op (no panic, no double stamp).
-        mark_direct_delivered_async(&db, &msg.id).await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -994,45 +770,5 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "public");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_peek_pending_directs_does_not_stamp_delivered() {
-        let db = migrated_db().await;
-
-        insert_message_async(
-            &db,
-            &ChannelType::Direct,
-            None,
-            Some("sender"),
-            "planner",
-            Some("recipient"),
-            "still pending",
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Peek returns the pending direct...
-        let peeked = peek_pending_directs_for_run_async(&db, "recipient")
-            .await
-            .unwrap();
-        assert_eq!(peeked.len(), 1);
-        assert_eq!(peeked[0].content, "still pending");
-        assert_eq!(
-            peeked[0].delivered_at, None,
-            "peek must report the message as undelivered"
-        );
-
-        // ...but leaves it claimable: a subsequent atomic claim still finds it,
-        // which would not be true if peek had stamped delivered_at.
-        let claimed = claim_pending_directs_for_run_async(&db, "recipient")
-            .await
-            .unwrap();
-        assert_eq!(
-            claimed.len(),
-            1,
-            "peek must not stamp delivered_at, so the message is still claimable"
-        );
     }
 }

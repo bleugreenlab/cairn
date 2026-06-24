@@ -51,6 +51,13 @@ pub struct SandboxPolicy {
     /// path is allowlist-by-concrete-fd and does not yet translate these (the
     /// service sandbox is macOS-first, mirroring the read-denylist gap).
     pub writable_regex: Vec<String>,
+    /// Whether the `worktree` root is writable. True for an ordinary worktree run
+    /// and for a service. False for a **read-only-checkout** policy (see
+    /// [`SandboxPolicy::for_readonly_checkout`]), where the project's live
+    /// checkout must stay readable but every write into it is kernel-denied. The
+    /// worktree is always in [`readable_paths`](Self::readable_paths) regardless;
+    /// this flag only gates the write-allow.
+    pub worktree_writable: bool,
 }
 
 impl SandboxPolicy {
@@ -75,6 +82,44 @@ impl SandboxPolicy {
             writable_extra,
             deny_read,
             writable_regex: Vec::new(),
+            worktree_writable: true,
+        }
+    }
+
+    /// Build a policy for a non-worktree run on the project's **live checkout**.
+    ///
+    /// Like [`for_run`](Self::for_run) but the checkout itself is **read-only**:
+    /// it stays in the readable set (the agent reads the project source) but is
+    /// dropped from the writable set, so any write into the live checkout is
+    /// kernel-denied. Only temp dirs, toolchain caches, and session grants stay
+    /// writable. This makes "a non-worktree agent cannot leave a file behind in
+    /// the live checkout" true at the kernel, complementing the read-only
+    /// dirt-detection warning. See `docs/worktree-fence.md`.
+    pub fn for_readonly_checkout(
+        checkout: &Path,
+        granted: &[String],
+        deny_read: Vec<PathBuf>,
+    ) -> Self {
+        let granted_paths: Vec<PathBuf> = granted
+            .iter()
+            .filter(|g| g.starts_with('/'))
+            .map(PathBuf::from)
+            // A grant within the read-only checkout (or an ancestor whose subpath
+            // grant would include it) must NOT re-open the checkout to writes: the
+            // read-only guarantee outranks any session grant. Dropped here so the
+            // policy is bulletproof regardless of caller.
+            .filter(|p| !(p.starts_with(checkout) || checkout.starts_with(p)))
+            .collect();
+
+        let mut writable_extra = default_writable_extra();
+        writable_extra.extend(granted_paths);
+
+        Self {
+            worktree: checkout.to_path_buf(),
+            writable_extra,
+            deny_read,
+            writable_regex: Vec::new(),
+            worktree_writable: false,
         }
     }
 
@@ -106,13 +151,29 @@ impl SandboxPolicy {
             writable_extra,
             deny_read,
             writable_regex: writable_globs.iter().map(|g| glob_to_regex(g)).collect(),
+            worktree_writable: true,
         }
     }
 
-    /// All writable subpaths: worktree + extras (temp + toolchain + grants).
-    /// Also the set re-allowed for reads after the denylist, so the worktree
-    /// stays readable even if a denylist entry covers a prefix of it.
+    /// Writable subpaths that drive the OS **write-allow**: the worktree (only
+    /// when [`worktree_writable`](Self::worktree_writable)) + extras (temp +
+    /// toolchain + grants). A read-only-checkout policy drops the worktree here so
+    /// writes into the live checkout are kernel-denied.
     pub fn writable_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if self.worktree_writable {
+            paths.push(self.worktree.clone());
+        }
+        paths.extend(self.writable_extra.iter().cloned());
+        paths
+    }
+
+    /// Readable subpaths re-allowed after the read denylist: the worktree
+    /// (**always**, even for a read-only checkout) + extras. So a denylist entry
+    /// covering a prefix of the checkout can never block the agent from reading
+    /// its own source, and a read-only checkout stays fully readable while its
+    /// writes are denied.
+    pub fn readable_paths(&self) -> Vec<PathBuf> {
         let mut paths = vec![self.worktree.clone()];
         paths.extend(self.writable_extra.iter().cloned());
         paths
@@ -448,6 +509,67 @@ mod tests {
         assert!(policy.deny_read.contains(&PathBuf::from("/home/x/.aws")));
         // Worktree is always writable (and thus readable via the re-allow).
         assert!(policy.writable_paths().contains(&wt));
+    }
+
+    #[test]
+    fn for_readonly_checkout_drops_cwd_from_writable_but_keeps_it_readable() {
+        let checkout = PathBuf::from("/project/live");
+        let granted = vec!["/scratch/ok".to_string()];
+        let policy = SandboxPolicy::for_readonly_checkout(&checkout, &granted, vec![]);
+
+        // The live checkout is NOT writable: a write into it is kernel-denied,
+        // even though it is the policy's `worktree` root.
+        assert!(
+            !policy.writable_paths().contains(&checkout),
+            "the live checkout must be dropped from the writable set"
+        );
+        // But it stays readable so the agent can read project source.
+        assert!(
+            policy.readable_paths().contains(&checkout),
+            "the live checkout must stay in the readable set"
+        );
+        // Session grants and the temp/toolchain carve-outs remain writable.
+        assert!(policy
+            .writable_paths()
+            .contains(&PathBuf::from("/scratch/ok")));
+        for p in default_writable_extra() {
+            assert!(
+                policy.writable_paths().contains(&p),
+                "toolchain/temp carve-out must stay writable: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn for_readonly_checkout_drops_checkout_covering_grants() {
+        // No session grant — not even one for the checkout itself, a path inside
+        // it, or an ancestor whose subpath grant would include it — may re-open
+        // the read-only checkout to writes.
+        let checkout = PathBuf::from("/project/live");
+        let granted = vec![
+            "/project/live".to_string(),     // the checkout itself
+            "/project/live/src".to_string(), // inside the checkout
+            "/project".to_string(),          // ancestor (subpath would include it)
+            "/scratch/ok".to_string(),       // safely outside
+        ];
+        let policy = SandboxPolicy::for_readonly_checkout(&checkout, &granted, vec![]);
+        let writable = policy.writable_paths();
+        assert!(!writable.contains(&checkout));
+        assert!(!writable.contains(&PathBuf::from("/project/live/src")));
+        assert!(!writable.contains(&PathBuf::from("/project")));
+        // A safely-outside grant still applies.
+        assert!(writable.contains(&PathBuf::from("/scratch/ok")));
+        // And the checkout stays readable throughout.
+        assert!(policy.readable_paths().contains(&checkout));
+    }
+
+    #[test]
+    fn for_run_keeps_cwd_writable_and_readable() {
+        let wt = PathBuf::from("/work/wt");
+        let policy = SandboxPolicy::for_run(&wt, &[], vec![]);
+        assert!(policy.writable_paths().contains(&wt));
+        assert!(policy.readable_paths().contains(&wt));
     }
 
     #[test]

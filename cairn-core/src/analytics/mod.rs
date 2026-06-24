@@ -16,9 +16,9 @@ use std::collections::HashMap;
 use crate::storage::{DbResult, LocalDb};
 
 pub use types::{
-    Bucket, CostPoint, EconomicsRow, ModelRoleEconomics, Scope, TargetBreakdown, TargetShapeRow,
-    TimeRange, TokensPerLocPoint, TokensPerSessionPoint, ToolBackfillSummary,
-    ToolCallsPerSessionPoint, ToolMixPoint, TopTargetRow,
+    Bucket, CostPoint, EconomicsRow, EffectiveCostPoint, ModelRoleEconomics, Scope,
+    TargetBreakdown, TargetShapeRow, TimeRange, TokensPerLocPoint, TokensPerSessionPoint,
+    ToolBackfillSummary, ToolCallsPerSessionPoint, ToolMixPoint, TopTargetRow,
 };
 
 /// Average billable tokens per session, bucketed by the session's first event.
@@ -76,17 +76,9 @@ pub async fn cost_timeseries(
 ) -> DbResult<Vec<CostPoint>> {
     let rows = queries::cost_components(db, scope, range, bucket).await?;
     let mut buckets: HashMap<i64, (f64, i64)> = HashMap::new();
-    for row in rows {
-        let cost = pricing::cost_usd(
-            &row.backend,
-            row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
-        );
+    for row in &rows {
         let entry = buckets.entry(row.bucket_start).or_insert((0.0, 0));
-        entry.0 += cost;
+        entry.0 += group_cost(row);
         entry.1 += row.billable;
     }
     let mut points: Vec<CostPoint> = buckets
@@ -98,6 +90,233 @@ pub async fn cost_timeseries(
         })
         .collect();
     points.sort_by_key(|p| p.bucket_start);
+    Ok(points)
+}
+
+/// The cost of one (bucket, model, backend) group: the real metered cost when
+/// any event in the group reported one, else the price-table estimate. The
+/// price table returns ~$0 for many metered (OpenRouter) models, so a real cost
+/// is always preferred when present.
+fn group_cost(row: &queries::CostComponentRow) -> f64 {
+    if row.exact_cost_count > 0 {
+        row.exact_cost
+    } else {
+        pricing::cost_usd(
+            &row.backend,
+            row.model.as_deref(),
+            row.input,
+            row.cache_read,
+            row.cache_create,
+            row.output,
+        )
+    }
+}
+
+/// Real per-model cost for one backend: the metered dollar amount Cairn recorded
+/// for that model, with billable tokens and run count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderModelCost {
+    pub model: String,
+    pub cost_usd: f64,
+    pub billable_tokens: i64,
+    pub runs: i64,
+}
+
+/// Per-model cost for a single backend, preferring the real metered cost
+/// (`events.cost_usd`) over the price-table estimate, sorted by cost descending.
+///
+/// This is the canonical answer for "what did we actually bill per model on this
+/// backend" and powers the provider usage card (e.g. OpenRouter), where the
+/// price table returns ~$0 for many metered models. Distinct from
+/// [`model_role_economics`], the all-backend dashboard view computed purely from
+/// the price table.
+pub async fn provider_model_costs(
+    db: &LocalDb,
+    backend: &str,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<Vec<ProviderModelCost>> {
+    let rows = queries::provider_model_components(db, backend, scope, range).await?;
+    let mut costs: Vec<ProviderModelCost> = rows
+        .into_iter()
+        .map(|row| {
+            let cost_usd = if row.exact_cost_count > 0 {
+                row.exact_cost
+            } else {
+                pricing::cost_usd(
+                    &row.backend,
+                    row.model.as_deref(),
+                    row.input,
+                    row.cache_read,
+                    row.cache_create,
+                    row.output,
+                )
+            };
+            let model = row
+                .model
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "unknown".to_string());
+            ProviderModelCost {
+                model,
+                cost_usd,
+                billable_tokens: row.billable,
+                runs: row.runs,
+            }
+        })
+        .collect();
+    costs.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(costs)
+}
+
+/// First-of-month (UTC) epoch seconds for the current wall-clock time. Mirrors
+/// the SQLite `start of month` bucketing so the in-progress month is flagged
+/// provisional.
+fn current_month_start() -> i64 {
+    use chrono::{Datelike, TimeZone, Utc};
+    let now = Utc::now();
+    Utc.with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+        .single()
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
+
+/// Effective (subscription-normalized) cost per (month, backend).
+///
+/// For each provider-month the workspace-wide list-price cost defines a ratio
+/// against the configured flat subscription fee (`ratio = fee / list_cost`); the
+/// scoped usage's list cost is then multiplied by that ratio to allocate the
+/// provider's share of the fee. By construction the effective costs across a
+/// provider-month sum to the fee when scoped to the whole workspace. Backends
+/// with no configured fee (e.g. OpenRouter) are metered and pass through at real
+/// cost with `ratio = 1`.
+pub async fn effective_cost(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    fees: &HashMap<String, f64>,
+) -> DbResult<Vec<EffectiveCostPoint>> {
+    // The ratio denominator is always workspace-wide, even when display usage is
+    // scoped to a project: a project shows its effective share of the shared fee.
+    let workspace = Scope::new(None);
+    let workspace_rows = queries::cost_components(db, &workspace, range, Bucket::Month).await?;
+    let scoped_rows = queries::cost_components(db, scope, range, Bucket::Month).await?;
+
+    let mut workspace_cost: HashMap<(i64, String), f64> = HashMap::new();
+    for row in &workspace_rows {
+        *workspace_cost
+            .entry((row.bucket_start, row.backend.clone()))
+            .or_default() += group_cost(row);
+    }
+
+    #[derive(Default)]
+    struct ScopedAgg {
+        cost: f64,
+        billable: i64,
+        /// Whether any event in this group reported a real per-generation cost.
+        /// This — not the absence of a configured fee — is what makes a backend
+        /// genuinely metered (pay-as-you-go, e.g. OpenRouter). Claude/Codex never
+        /// report exact cost, so they are always subscription backends.
+        has_exact: bool,
+    }
+    let mut scoped: HashMap<(i64, String), ScopedAgg> = HashMap::new();
+    for row in &scoped_rows {
+        let entry = scoped
+            .entry((row.bucket_start, row.backend.clone()))
+            .or_default();
+        entry.cost += group_cost(row);
+        entry.billable += row.billable;
+        entry.has_exact |= row.exact_cost_count > 0;
+    }
+
+    let current_month = current_month_start();
+    let mut points: Vec<EffectiveCostPoint> = scoped
+        .into_iter()
+        .map(|((month_start, backend), agg)| {
+            let workspace_list = workspace_cost
+                .get(&(month_start, backend.clone()))
+                .copied()
+                .unwrap_or(0.0);
+            let fee = fees
+                .get(&backend)
+                .copied()
+                .filter(|f| f.is_finite() && *f > 0.0);
+            let provisional = month_start == current_month;
+            if agg.has_exact {
+                // Genuinely metered backend (OpenRouter): pass through real cost.
+                // A real per-generation cost is authoritative even if a fee was
+                // configured, so metering wins over normalization here.
+                EffectiveCostPoint {
+                    month_start,
+                    backend,
+                    metered: true,
+                    provisional,
+                    subscription_fee: 0.0,
+                    list_cost: workspace_list,
+                    scoped_cost: agg.cost,
+                    ratio: Some(1.0),
+                    effective_cost: agg.cost,
+                    billable_tokens: agg.billable,
+                }
+            } else {
+                // Subscription backend (Claude/Codex). With a fee, normalize;
+                // without one, there is no effective cost yet — the card shows the
+                // list-price estimate and prompts the user to set a fee. The
+                // `subscription_fee == 0 && !metered` shape signals "no fee set".
+                match fee {
+                    Some(fee) if workspace_list > 0.0 => {
+                        let ratio = fee / workspace_list;
+                        EffectiveCostPoint {
+                            month_start,
+                            backend,
+                            metered: false,
+                            provisional,
+                            subscription_fee: fee,
+                            list_cost: workspace_list,
+                            scoped_cost: agg.cost,
+                            ratio: Some(ratio),
+                            effective_cost: agg.cost * ratio,
+                            billable_tokens: agg.billable,
+                        }
+                    }
+                    // Fee paid but no priced usage: ratio undefined (unrecovered).
+                    Some(fee) => EffectiveCostPoint {
+                        month_start,
+                        backend,
+                        metered: false,
+                        provisional,
+                        subscription_fee: fee,
+                        list_cost: 0.0,
+                        scoped_cost: agg.cost,
+                        ratio: None,
+                        effective_cost: 0.0,
+                        billable_tokens: agg.billable,
+                    },
+                    // No fee configured: show list-price estimate, no allocation.
+                    None => EffectiveCostPoint {
+                        month_start,
+                        backend,
+                        metered: false,
+                        provisional,
+                        subscription_fee: 0.0,
+                        list_cost: workspace_list,
+                        scoped_cost: agg.cost,
+                        ratio: None,
+                        effective_cost: 0.0,
+                        billable_tokens: agg.billable,
+                    },
+                }
+            }
+        })
+        .collect();
+    points.sort_by(|a, b| {
+        a.month_start
+            .cmp(&b.month_start)
+            .then_with(|| a.backend.cmp(&b.backend))
+    });
     Ok(points)
 }
 
@@ -449,10 +668,7 @@ mod tests {
             .await
             .unwrap();
         assert!(out.by_role.iter().any(|r| r.key == "Explore"));
-        assert!(!out
-            .by_role
-            .iter()
-            .any(|r| r.key == "Trace The Parser Flow"));
+        assert!(!out.by_role.iter().any(|r| r.key == "Trace The Parser Flow"));
     }
 
     #[tokio::test]
@@ -591,5 +807,419 @@ mod tests {
         assert_eq!(normalize_role(Some("pr-review-2")), "Pr Review");
         assert_eq!(normalize_role(None), "Other");
         assert_eq!(normalize_role(Some("  ")), "Other");
+    }
+
+    // --- Effective (subscription-normalized) cost ---
+
+    /// 2025-01-01 and 2025-02-01 00:00:00 UTC, the month-bucket boundaries used
+    /// by the effective-cost tests.
+    const JAN_2025: i64 = 1_735_689_600;
+    const FEB_2025: i64 = 1_738_368_000;
+
+    async fn cost_db() -> LocalDb {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("eff-cost-test.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj', 'default', 'Proj', 'PRJ', '/tmp/prj', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    /// Seed a job/session/run triple keyed by `suffix` for one backend+model.
+    async fn seed_run(db: &LocalDb, suffix: &str, backend: &str, model: &str) {
+        db.execute_script(&format!(
+            "INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+              VALUES ('job-{s}', 'proj', 'running', '{model}', 'builder', 'builder', 1, 1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+              VALUES ('sess-{s}', 'job-{s}', '{backend}', 'open', 1, 1, 1);
+             INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
+              VALUES ('run-{s}', 'proj', 'job-{s}', 'exited', 'sess-{s}', '{backend}', 1, 1);",
+            s = suffix,
+            model = model,
+            backend = backend
+        ))
+        .await
+        .unwrap();
+    }
+
+    /// Insert one event on `run-{suffix}` with the given type, timestamp, input
+    /// and output tokens, and optional real `cost_usd`.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_event(
+        db: &LocalDb,
+        id: &str,
+        suffix: &str,
+        etype: &str,
+        ts: i64,
+        input: i64,
+        output: i64,
+        cost: Option<f64>,
+    ) {
+        let cost_sql = cost.map_or_else(|| "NULL".to_string(), |c| c.to_string());
+        db.execute_script(&format!(
+            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                cache_create_tokens, output_tokens, thinking_tokens, cost_usd)
+             VALUES ('{id}', 'run-{suffix}', NULL, 1, {ts}, '{etype}', '{{}}',
+                NULL, {ts}, {input}, 0, 0, {output}, 0, {cost_sql});"
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn fees(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn point<'a>(
+        points: &'a [EffectiveCostPoint],
+        month_start: i64,
+        backend: &str,
+    ) -> &'a EffectiveCostPoint {
+        points
+            .iter()
+            .find(|p| p.month_start == month_start && p.backend == backend)
+            .unwrap_or_else(|| panic!("missing point for {backend} @ {month_start}"))
+    }
+
+    #[tokio::test]
+    async fn effective_cost_ratio_allocates_the_fee() {
+        let db = cost_db().await;
+        // One claude assistant turn: 1M input + 1M output of sonnet =>
+        // list cost (1e6*3 + 1e6*15)/1e6 = $18.
+        seed_run(&db, "c", "claude", "sonnet").await;
+        add_event(
+            &db,
+            "c1",
+            "c",
+            "assistant",
+            JAN_2025 + 100,
+            1_000_000,
+            1_000_000,
+            None,
+        )
+        .await;
+
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[("claude", 200.0)]),
+        )
+        .await
+        .unwrap();
+
+        let p = point(&points, JAN_2025, "claude");
+        assert!(!p.metered);
+        assert!(
+            (p.list_cost - 18.0).abs() < 1e-9,
+            "list_cost {}",
+            p.list_cost
+        );
+        assert!((p.subscription_fee - 200.0).abs() < 1e-9);
+        let ratio = p.ratio.expect("ratio present");
+        assert!((ratio - 200.0 / 18.0).abs() < 1e-9, "ratio {ratio}");
+        // Workspace scope: effective cost allocates the whole flat fee.
+        assert!(
+            (p.effective_cost - 200.0).abs() < 1e-6,
+            "effective {}",
+            p.effective_cost
+        );
+        assert_eq!(p.billable_tokens, 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn effective_cost_sums_to_fee_across_models() {
+        let db = cost_db().await;
+        // Two claude models in the same month roll up to one (month, backend)
+        // point whose effective cost is exactly the fee.
+        seed_run(&db, "son", "claude", "sonnet").await;
+        seed_run(&db, "op", "claude", "opus").await;
+        add_event(
+            &db,
+            "s1",
+            "son",
+            "assistant",
+            JAN_2025 + 10,
+            1_000_000,
+            1_000_000,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "o1",
+            "op",
+            "assistant",
+            JAN_2025 + 20,
+            1_000_000,
+            1_000_000,
+            None,
+        )
+        .await;
+
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[("claude", 200.0)]),
+        )
+        .await
+        .unwrap();
+        let claude: Vec<_> = points.iter().filter(|p| p.backend == "claude").collect();
+        assert_eq!(claude.len(), 1, "one claude point per month");
+        assert!((claude[0].effective_cost - 200.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn effective_cost_zero_priced_usage_yields_no_ratio() {
+        let db = cost_db().await;
+        // An unpriced model: billable tokens exist but list cost is $0, so the
+        // ratio is undefined rather than NaN/Inf.
+        seed_run(&db, "m", "claude", "mystery-model").await;
+        add_event(&db, "m1", "m", "assistant", JAN_2025 + 5, 1000, 1000, None).await;
+
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[("claude", 200.0)]),
+        )
+        .await
+        .unwrap();
+        let p = point(&points, JAN_2025, "claude");
+        assert!(p.ratio.is_none());
+        assert_eq!(p.effective_cost, 0.0);
+        assert!((p.subscription_fee - 200.0).abs() < 1e-9);
+        assert!(p.effective_cost.is_finite());
+    }
+
+    #[tokio::test]
+    async fn effective_cost_subscription_without_fee_is_not_metered() {
+        let db = cost_db().await;
+        // Claude is a subscription backend: with no configured fee and no real
+        // per-generation cost, it must NOT be reported as metered. The card
+        // shows the list-price estimate ($18) rather than a fabricated "actual".
+        seed_run(&db, "c", "claude", "sonnet").await;
+        add_event(
+            &db,
+            "c1",
+            "c",
+            "assistant",
+            JAN_2025 + 100,
+            1_000_000,
+            1_000_000,
+            None,
+        )
+        .await;
+
+        let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), &fees(&[]))
+            .await
+            .unwrap();
+        let p = point(&points, JAN_2025, "claude");
+        assert!(!p.metered, "claude is a subscription backend, not metered");
+        assert_eq!(p.subscription_fee, 0.0);
+        assert!(p.ratio.is_none());
+        assert!(
+            (p.scoped_cost - 18.0).abs() < 1e-9,
+            "list estimate {}",
+            p.scoped_cost
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_cost_metered_backend_uses_real_cost() {
+        let db = cost_db().await;
+        // OpenRouter (no configured fee) bills its assistant event for tokens and
+        // settles the real dollar cost on the result event. The real cost ($0.42)
+        // must win over the price-table estimate ($0.018 for sonnet).
+        seed_run(&db, "or", "openrouter", "sonnet").await;
+        add_event(
+            &db,
+            "or1",
+            "or",
+            "assistant",
+            JAN_2025 + 30,
+            1000,
+            1000,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "or2",
+            "or",
+            "result:success",
+            JAN_2025 + 31,
+            0,
+            0,
+            Some(0.42),
+        )
+        .await;
+
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[("claude", 200.0)]),
+        )
+        .await
+        .unwrap();
+        let p = point(&points, JAN_2025, "openrouter");
+        assert!(p.metered);
+        assert_eq!(p.ratio, Some(1.0));
+        assert!(
+            (p.effective_cost - 0.42).abs() < 1e-9,
+            "effective {}",
+            p.effective_cost
+        );
+        assert!((p.scoped_cost - 0.42).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn effective_cost_buckets_by_calendar_month_and_flags_provisional() {
+        use chrono::{Datelike, TimeZone, Utc};
+        let db = cost_db().await;
+        seed_run(&db, "c", "claude", "sonnet").await;
+        // One event in January, one in February: two distinct month buckets.
+        add_event(&db, "j", "c", "assistant", JAN_2025 + 100, 1000, 1000, None).await;
+        add_event(&db, "f", "c", "assistant", FEB_2025 + 100, 1000, 1000, None).await;
+        // One event in the current wall-clock month: must be flagged provisional.
+        let now = Utc::now();
+        let now_month = Utc
+            .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        add_event(
+            &db,
+            "n",
+            "c",
+            "assistant",
+            now.timestamp(),
+            1000,
+            1000,
+            None,
+        )
+        .await;
+
+        let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), &fees(&[]))
+            .await
+            .unwrap();
+
+        assert!(!point(&points, JAN_2025, "claude").provisional);
+        assert!(!point(&points, FEB_2025, "claude").provisional);
+        assert!(point(&points, now_month, "claude").provisional);
+        assert_ne!(JAN_2025, FEB_2025);
+    }
+
+    #[tokio::test]
+    async fn cost_timeseries_prefers_exact_metered_cost() {
+        let db = cost_db().await;
+        seed_run(&db, "or", "openrouter", "sonnet").await;
+        add_event(
+            &db,
+            "or1",
+            "or",
+            "assistant",
+            JAN_2025 + 30,
+            1000,
+            1000,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "or2",
+            "or",
+            "result:success",
+            JAN_2025 + 31,
+            0,
+            0,
+            Some(0.42),
+        )
+        .await;
+
+        let points = cost_timeseries(&db, &Scope::default(), &TimeRange::default(), Bucket::Month)
+            .await
+            .unwrap();
+        let p = point_cost(&points, JAN_2025);
+        // Real metered cost ($0.42), not the price-table estimate ($0.018).
+        assert!((p.cost_usd - 0.42).abs() < 1e-9, "cost {}", p.cost_usd);
+    }
+
+    #[tokio::test]
+    async fn provider_model_costs_uses_real_metered_cost_and_filters_backend() {
+        let db = cost_db().await;
+        // OpenRouter: bills tokens on the assistant event, settles the real dollar
+        // cost ($0.42) on the result event.
+        seed_run(&db, "or", "openrouter", "sonnet").await;
+        add_event(
+            &db,
+            "or1",
+            "or",
+            "assistant",
+            JAN_2025 + 30,
+            1000,
+            1000,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "or2",
+            "or",
+            "result:success",
+            JAN_2025 + 31,
+            0,
+            0,
+            Some(0.42),
+        )
+        .await;
+        // A claude run in the same workspace must be excluded by the backend filter.
+        seed_run(&db, "c", "claude", "opus").await;
+        add_event(&db, "c1", "c", "assistant", JAN_2025 + 40, 1000, 1000, None).await;
+
+        let rows =
+            provider_model_costs(&db, "openrouter", &Scope::new(None), &TimeRange::default())
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), 1, "only the openrouter model is returned");
+        assert_eq!(rows[0].model, "sonnet");
+        // Real metered cost ($0.42), not the price-table estimate (~$0.018).
+        assert!(
+            (rows[0].cost_usd - 0.42).abs() < 1e-9,
+            "cost {}",
+            rows[0].cost_usd
+        );
+        assert_eq!(rows[0].billable_tokens, 2000);
+        assert_eq!(rows[0].runs, 1);
+    }
+
+    #[tokio::test]
+    async fn provider_model_costs_empty_without_usage() {
+        let db = cost_db().await;
+        let rows =
+            provider_model_costs(&db, "openrouter", &Scope::new(None), &TimeRange::default())
+                .await
+                .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    fn point_cost(points: &[CostPoint], bucket_start: i64) -> &CostPoint {
+        points
+            .iter()
+            .find(|p| p.bucket_start == bucket_start)
+            .unwrap_or_else(|| panic!("missing cost point @ {bucket_start}"))
     }
 }

@@ -329,47 +329,14 @@ fn property_desc(spec: &serde_json::Value) -> String {
         .unwrap_or_default()
 }
 
-/// Render a tool as a single-line `name(arg?: type, ...)` signature for the
-/// agent orientation affordance block — awareness plus a cheap contract, with the
-/// full argument schema a `read cairn://mcp/<server>` away. A trailing `?` on an
-/// argument marks it optional; the type uses the same flattening as the full
-/// contract (`property_type`), falling back to compact inline JSON for shapes
-/// that have no simple type.
-pub fn terse_tool_signature(tool: &McpToolDef) -> String {
-    let props = tool
-        .input_schema
-        .get("properties")
-        .and_then(|v| v.as_object());
-    let required: std::collections::HashSet<&str> = tool
-        .input_schema
-        .get("required")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-        .unwrap_or_default();
-    let args = match props {
-        Some(props) if !props.is_empty() => props
-            .iter()
-            .map(|(name, spec)| {
-                let opt = if required.contains(name.as_str()) {
-                    ""
-                } else {
-                    "?"
-                };
-                format!("{name}{opt}: {}", property_type(spec))
-            })
-            .collect::<Vec<_>>()
-            .join(", "),
-        _ => String::new(),
-    };
-    format!("{}({})", tool.name, args)
-}
-
 /// Render the compact MCP affordance block for the agent orientation prompt:
-/// each configured (enabled) server with its tools as terse one-line contracts.
-/// Tool lists come from the persisted tool store (`config::mcp_tools`), captured
-/// when a server was saved in Settings; a server absent from the store renders a
-/// `read cairn://mcp/<server>` pointer instead, so awareness never blocks on
-/// spawning a server inline. Returns `None` when no servers are configured.
+/// each configured (enabled) server with its tools listed by name and one-line
+/// description. Tool lists come from the persisted tool store
+/// (`config::mcp_tools`), captured when a server was saved in Settings; a server
+/// absent from the store renders a `read cairn://mcp/<server>` pointer instead,
+/// so awareness never blocks on spawning a server inline. Full argument schemas
+/// stay a `read cairn://mcp/<server>` away. Returns `None` when no servers are
+/// configured.
 pub fn render_mcp_affordance_block(
     servers: &HashMap<String, McpServerConfig>,
     tools_by_server: &HashMap<String, Vec<McpToolDef>>,
@@ -392,11 +359,7 @@ pub fn render_mcp_affordance_block(
             Some(tools) if !tools.is_empty() => {
                 out.push_str(&format!("- **{name}** ({transport})\n"));
                 for tool in tools {
-                    out.push_str(&format!(
-                        "  - `{}`{}\n",
-                        terse_tool_signature(tool),
-                        one_line_desc(tool)
-                    ));
+                    out.push_str(&format!("  - `{}`{}\n", tool.name, one_line_desc(tool)));
                 }
             }
             Some(_) => {
@@ -511,35 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn terse_signature_marks_optionals_and_argless() {
-        let t = tool(
-            "look",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "app": { "type": "string" },
-                    "depth": { "type": "number" }
-                },
-                "required": ["app"]
-            }),
-        );
-        let sig = terse_tool_signature(&t);
-        // Required arg has no `?`; optional arg does. Whole thing is one line.
-        assert!(sig.contains("app: string"));
-        assert!(!sig.contains("app?: string"));
-        assert!(sig.contains("depth?: number"));
-        assert!(sig.starts_with("look("));
-        assert!(sig.ends_with(")"));
-        assert!(!sig.contains('\n'));
-
-        let argless = tool(
-            "snapshot",
-            serde_json::json!({ "type": "object", "properties": {} }),
-        );
-        assert_eq!(terse_tool_signature(&argless), "snapshot()");
-    }
-
-    #[test]
     fn affordance_block_renders_stored_contracts_and_missing_pointer() {
         let mut servers: HashMap<String, McpServerConfig> = HashMap::new();
         servers.insert(
@@ -589,9 +523,10 @@ mod tests {
         assert!(block.contains("## MCP Servers"));
         assert!(block.contains("cairn://mcp/<server>/<tool>"));
         assert!(!block.contains("inputSchema"));
-        // Stored server: terse per-tool contract with description.
+        // Stored server: tool listed by name with its one-line description.
         assert!(block.contains("- **axon** (stdio)"));
-        assert!(block.contains("`look(app?: string)`"));
+        assert!(block.contains("- `look`"));
+        assert!(!block.contains("look(app?: string)"));
         assert!(block.contains("Observe Axon's current surface"));
         // Server with no stored tools: a read pointer, not a spawn.
         assert!(block

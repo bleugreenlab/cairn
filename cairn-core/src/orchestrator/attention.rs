@@ -31,16 +31,12 @@ pub enum AttentionFact {
     /// A question was stored for the user. Full questions payload is inline
     /// (always small enough for the wire).
     Question {
-        #[serde(default)]
-        escalate: bool,
         detail_uri: String,
         content: QuestionContent,
     },
     /// A permission prompt was raised. Inline content carries the tool name,
     /// the tool_use_id, and the tool input the user has to authorize.
     Permission {
-        #[serde(default)]
-        escalate: bool,
         detail_uri: String,
         content: PermissionContent,
     },
@@ -48,8 +44,6 @@ pub enum AttentionFact {
     /// describe the change (title, summary, output_name, version, confirmed);
     /// the body is read from `detail_uri` if the caller wants it.
     ArtifactWritten {
-        #[serde(default)]
-        escalate: bool,
         detail_uri: String,
         content: ArtifactSummary,
     },
@@ -62,33 +56,21 @@ pub enum AttentionFact {
     /// NeedsInput / NeedsAuthorization / NeedsApproval. For other states,
     /// `detail_uri` is best-effort and may be the bare issue URI; consumers
     /// should always inspect `event.attention` to dispatch.
-    AgentIdleWithWork {
-        #[serde(default)]
-        escalate: bool,
-        detail_uri: String,
-    },
+    AgentIdleWithWork { detail_uri: String },
     /// Webhook reported a PR state change. Inline content is the live state.
     PrStateChange {
-        #[serde(default)]
-        escalate: bool,
         detail_uri: String,
         content: PrStateContent,
     },
     /// A node replied to an external driver. Inline content carries the reply
     /// body so `cairn watch` callers can consume it without a follow-up read.
     ExternalMessageReply {
-        #[serde(default)]
-        escalate: bool,
         detail_uri: String,
         message_id: String,
         content: ExternalMessageReplyContent,
     },
     /// The issue reached a terminal status (merged, closed, or failed).
-    Resolved {
-        #[serde(default)]
-        escalate: bool,
-        final_status: IssueStatus,
-    },
+    Resolved { final_status: IssueStatus },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,27 +136,13 @@ pub struct AttentionFactKey {
 }
 
 impl AttentionFact {
-    /// Canonical delivery urgency for this fact kind.
-    ///
-    /// Legacy per-fact `escalate` flags are interpreted only at this boundary:
-    /// an escalated fact becomes an interrupt, which is the one urgency that
-    /// pierces muted wake subscriptions.
+    /// Canonical delivery urgency for this fact kind. The external-reply fact
+    /// steers an external `cairn watch` driver; every other fact is queue
+    /// urgency.
     pub fn urgency(&self) -> DeliveryUrgency {
         match self {
-            AttentionFact::Question { escalate: true, .. }
-            | AttentionFact::Permission { escalate: true, .. }
-            | AttentionFact::ArtifactWritten { escalate: true, .. }
-            | AttentionFact::AgentIdleWithWork { escalate: true, .. }
-            | AttentionFact::PrStateChange { escalate: true, .. }
-            | AttentionFact::ExternalMessageReply { escalate: true, .. }
-            | AttentionFact::Resolved { escalate: true, .. } => DeliveryUrgency::Interrupt,
             AttentionFact::ExternalMessageReply { .. } => DeliveryUrgency::Steer,
-            AttentionFact::Question { .. }
-            | AttentionFact::Permission { .. }
-            | AttentionFact::ArtifactWritten { .. }
-            | AttentionFact::AgentIdleWithWork { .. }
-            | AttentionFact::PrStateChange { .. }
-            | AttentionFact::Resolved { .. } => DeliveryUrgency::Queue,
+            _ => DeliveryUrgency::Queue,
         }
     }
 
@@ -552,7 +520,6 @@ pub async fn idle_fact_for_issue(
     if ctx.status.is_terminal() {
         return Some(IdleFact {
             fact: AttentionFact::Resolved {
-                escalate: false,
                 final_status: ctx.status.clone(),
             },
             updated_at: ctx.updated_at,
@@ -585,10 +552,7 @@ pub async fn idle_fact_for_issue(
                 .unwrap_or_else(|| issue_uri.clone()),
         };
         return Some(IdleFact {
-            fact: AttentionFact::AgentIdleWithWork {
-                escalate: false,
-                detail_uri,
-            },
+            fact: AttentionFact::AgentIdleWithWork { detail_uri },
             updated_at: ctx.updated_at,
         });
     }
@@ -602,7 +566,6 @@ pub async fn idle_fact_for_issue(
     {
         return Some(IdleFact {
             fact: AttentionFact::AgentIdleWithWork {
-                escalate: false,
                 detail_uri: work.detail_uri,
             },
             updated_at: work.updated_at,
@@ -729,25 +692,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn attention_fact_urgency_uses_escalation_only_as_interrupt_alias() {
-        let default = AttentionFact::Question {
-            escalate: false,
-            detail_uri: "q".to_string(),
-            content: QuestionContent { questions: vec![] },
-        };
-        let escalated = AttentionFact::Resolved {
-            escalate: true,
-            final_status: IssueStatus::Complete,
-        };
-        assert_eq!(default.urgency(), DeliveryUrgency::Queue);
-        assert_eq!(escalated.urgency(), DeliveryUrgency::Interrupt);
-    }
-
-    #[test]
     fn attention_fact_kinds_declare_delivery_urgency() {
         assert_eq!(
             (AttentionFact::Question {
-                escalate: false,
                 detail_uri: "q".to_string(),
                 content: QuestionContent { questions: vec![] },
             })
@@ -756,7 +703,6 @@ mod tests {
         );
         assert_eq!(
             (AttentionFact::Permission {
-                escalate: false,
                 detail_uri: "p".to_string(),
                 content: PermissionContent {
                     tool_name: "tool".to_string(),
@@ -769,7 +715,6 @@ mod tests {
         );
         assert_eq!(
             (AttentionFact::ArtifactWritten {
-                escalate: false,
                 detail_uri: "a".to_string(),
                 content: ArtifactSummary {
                     output_name: "pr".to_string(),
@@ -785,7 +730,6 @@ mod tests {
         );
         assert_eq!(
             (AttentionFact::AgentIdleWithWork {
-                escalate: false,
                 detail_uri: "idle".to_string(),
             })
             .urgency(),
@@ -793,7 +737,6 @@ mod tests {
         );
         assert_eq!(
             (AttentionFact::PrStateChange {
-                escalate: false,
                 detail_uri: "pr".to_string(),
                 content: PrStateContent {
                     number: 1,
@@ -809,7 +752,6 @@ mod tests {
         );
         assert_eq!(
             (AttentionFact::ExternalMessageReply {
-                escalate: false,
                 detail_uri: "messages".to_string(),
                 message_id: "m".to_string(),
                 content: ExternalMessageReplyContent {
@@ -822,7 +764,6 @@ mod tests {
         );
         assert_eq!(
             (AttentionFact::Resolved {
-                escalate: false,
                 final_status: IssueStatus::Complete,
             })
             .urgency(),
@@ -831,27 +772,18 @@ mod tests {
     }
 
     #[test]
-    fn fact_keys_distinguish_distinct_facts_and_collapse_same_kind_uri() {
+    fn fact_keys_distinguish_distinct_facts() {
         let q = AttentionFact::Question {
-            escalate: false,
-            detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-1".into(),
-            content: QuestionContent { questions: vec![] },
-        };
-        let same = AttentionFact::Question {
-            escalate: true,
             detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-1".into(),
             content: QuestionContent { questions: vec![] },
         };
         let other = AttentionFact::Question {
-            escalate: false,
             detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-2".into(),
             content: QuestionContent { questions: vec![] },
         };
         let idle = AttentionFact::AgentIdleWithWork {
-            escalate: false,
             detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-1".into(),
         };
-        assert_eq!(q.key(), same.key());
         assert_ne!(q.key(), other.key());
         assert_ne!(q.key(), idle.key());
     }
@@ -862,7 +794,6 @@ mod tests {
             issue_id: "i-1".into(),
             issue_uri: "cairn://p/CAIRN/1".into(),
             fact: AttentionFact::Resolved {
-                escalate: false,
                 final_status: IssueStatus::Merged,
             },
             attention: IssueAttention::None,
@@ -883,7 +814,6 @@ mod tests {
             issue_id: "i-1".into(),
             issue_uri: "cairn://p/CAIRN/1".into(),
             fact: AttentionFact::Question {
-                escalate: false,
                 detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-1".into(),
                 content: QuestionContent { questions: vec![] },
             },
@@ -910,7 +840,6 @@ mod tests {
             status: IssueStatus::Active,
             updated_at: 1700000001,
             fact: AttentionFact::ExternalMessageReply {
-                escalate: false,
                 detail_uri: "cairn://p/CAIRN/1209/messages".to_string(),
                 message_id: "msg-1".to_string(),
                 content: ExternalMessageReplyContent {

@@ -462,11 +462,43 @@ async fn emit_permission_attention(
         if let Ok(issue_ctx) =
             crate::orchestrator::attention::read_issue_for_attention(&orch.db.local, issue_id).await
         {
+            // Push the permission to the issue's watchers (CAIRN-1887): a `wake`
+            // + `event` push keyed `permission:{issue}`, ref'd to the permission
+            // row, excluding the requesting node (self-suspended on its own
+            // permission). The legacy emit below still drives `cairn watch` and
+            // the desktop toast.
+            let issue_uri = issue_ctx.issue_uri();
+            match crate::orchestrator::attention_delivery::push_to_issue_watchers(
+                &orch.db.local,
+                &issue_uri,
+                Some(ctx.job_id.as_str()),
+                &detail_uri,
+                crate::orchestrator::attention_push::Wake::Wake,
+                crate::orchestrator::attention_push::Boundary::Event,
+                &format!("permission:{issue_uri}"),
+            )
+            .await
+            {
+                // CAIRN-1889: actively resume each idle watcher of the permission
+                // via the shared resume-ladder primitive (idle -> resume; busy or
+                // self-suspended -> no-op).
+                Ok(recipients) => {
+                    for recipient in &recipients {
+                        if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
+                            orch,
+                            recipient,
+                            crate::messages::queued::DeliveryUrgency::Steer,
+                        ) {
+                            log::warn!("permission push wake failed: {}", e);
+                        }
+                    }
+                }
+                Err(e) => log::warn!("permission push creation failed: {}", e),
+            }
             orch.emit_attention_event(crate::orchestrator::AttentionEvent {
                 issue_id: issue_id.to_string(),
                 issue_uri: issue_ctx.issue_uri(),
                 fact: crate::orchestrator::AttentionFact::Permission {
-                    escalate: false,
                     detail_uri,
                     content: crate::orchestrator::attention::PermissionContent {
                         tool_name: tool_name.to_string(),

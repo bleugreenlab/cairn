@@ -162,6 +162,8 @@ pub enum DeltaContent {
     TextDelta { text: String },
     /// Thinking delta (extended thinking)
     ThinkingDelta { thinking: String },
+    /// Tool input JSON bytes streamed while Claude is constructing a tool call.
+    InputJsonDelta { partial_json: String },
     /// Unknown delta type
     #[serde(other)]
     Unknown,
@@ -799,6 +801,54 @@ mod tests {
     fn test_parse_invalid_json() {
         let result = parse_event("not valid json");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_claude_tool_use_stream_start_and_input_delta() {
+        let start_json = r#"{"type":"stream_event","session_id":"s1","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{},"caller":{"type":"direct"}}}}"#;
+        let (event, _) = parse_event(start_json).unwrap();
+        match event {
+            ClaudeEvent::StreamEvent {
+                inner:
+                    StreamEventInner::ContentBlockStart {
+                        index,
+                        content_block: Some(content_block),
+                    },
+                ..
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(
+                    content_block.get("type").and_then(|v| v.as_str()),
+                    Some("tool_use")
+                );
+                assert_eq!(
+                    content_block.get("id").and_then(|v| v.as_str()),
+                    Some("toolu_1")
+                );
+                assert_eq!(
+                    content_block.get("name").and_then(|v| v.as_str()),
+                    Some("Bash")
+                );
+            }
+            _ => panic!("Expected tool-use ContentBlockStart"),
+        }
+
+        let delta_json = r#"{"type":"stream_event","session_id":"s1","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\": \"echo tool\"}"}}}"#;
+        let (event, _) = parse_event(delta_json).unwrap();
+        match event {
+            ClaudeEvent::StreamEvent {
+                inner:
+                    StreamEventInner::ContentBlockDelta {
+                        index,
+                        delta: DeltaContent::InputJsonDelta { partial_json },
+                    },
+                ..
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(partial_json, r#"{"command": "echo tool"}"#);
+            }
+            _ => panic!("Expected input_json_delta"),
+        }
     }
 
     #[test]

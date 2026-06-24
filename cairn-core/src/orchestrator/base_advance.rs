@@ -5,13 +5,12 @@
 //! message is non-waking: it is delivered at the recipient's next prompt/tool
 //! boundary instead of resuming the job mechanically.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::messages::delivery::{latest_run_for_job, queue_system_direct};
 use crate::models::ExecutionSnapshot;
 use crate::orchestrator::Orchestrator;
-use crate::services::GitClient;
 use crate::storage::{DbError, DbResult, RowExt};
 use turso::params;
 
@@ -28,6 +27,7 @@ struct MergedJob {
 struct SiblingJob {
     id: String,
     worktree_path: String,
+    branch: Option<String>,
 }
 
 #[derive(Debug)]
@@ -61,123 +61,373 @@ pub async fn notify_downstream_of_base_advance(
         );
         return Ok(());
     };
-    let Some(merged_worktree) = merged_job.worktree_path.as_deref() else {
+
+    // jj is the only substrate: a base advance is reconciled by a non-blocking
+    // auto-rebase of in-flight siblings over the shared store. The advance
+    // propagates through the commit graph itself; conflicts are recorded (not
+    // blocking) and no sibling rebase/force-push is required.
+    let Some(repo_path) = load_project_repo_path(orch, &merged_job.project_id).await? else {
         log::debug!(
-            "Skipping base advance notify for job {}: no worktree_path",
+            "Skipping base advance reconcile for job {}: no project repo_path",
             merged_job.id
         );
         return Ok(());
     };
+    reconcile_jj_downstream(orch, merged_job_id, &merged_job, base_branch, &repo_path).await
+}
 
-    let merged_files = changed_files(&*orch.services.git, Path::new(merged_worktree), base_branch)
-        .map_err(|error| {
-            log::warn!(
-                "Failed to compute changed files for merged job {}: {}",
-                merged_job.id,
-                error
-            );
-            error
-        })
-        .ok();
-    let mr_info = load_merge_request_info(orch, merged_job_id, &merged_job.id).await?;
+/// Sentinel for `load_sibling_jobs` when there is no merged job to exclude — an
+/// external default-branch advance has no Cairn-tracked owner, so every in-flight
+/// sibling on the branch is a reconcile candidate. No job row carries an empty
+/// id, so `j.id != ''` excludes nothing.
+const EXCLUDE_NONE: &str = "";
+
+/// Reconcile in-flight siblings of a merged jj job by auto-rebasing each onto
+/// the locally-advanced integration tip over the shared store and pushing the
+/// cleanly-rebased ones so their PR heads advance. Non-blocking: conflicts are
+/// recorded for the agent to resolve, and a conflicted sibling is woken (via a
+/// `Steer` system direct) to resolve and re-seal so its PR can advance.
+/// Cleanly-rebased siblings get nothing.
+async fn reconcile_jj_downstream(
+    orch: &Orchestrator,
+    merged_job_id: &str,
+    merged_job: &MergedJob,
+    base_branch: &str,
+    repo_path: &str,
+) -> Result<(), String> {
+    // Advance the workspace that sits ON the merged branch (a Coordinator on its
+    // integration bookmark) onto the freshly-folded tip. This is asymmetric to
+    // the sibling reconcile below: `reconcile_siblings` rebases the *children*
+    // (branched FROM the branch); nobody otherwise re-parents the workspace whose
+    // branch IS the branch, so the fold moves the bookmark out from under its `@`
+    // and a later edit+seal would orphan off the advanced branch. Runs
+    // independently of (and before) the sibling reconcile — a coordinator must be
+    // advanced even when it has no other in-flight siblings.
+    advance_on_branch_workspaces(orch, &merged_job.project_id, base_branch, repo_path).await;
+
+    let siblings =
+        load_sibling_jobs(orch, &merged_job.project_id, base_branch, &merged_job.id).await?;
+    if siblings.is_empty() {
+        log::debug!(
+            "jj base advance for merged job {}: no in-flight siblings to reconcile",
+            merged_job.id
+        );
+        return Ok(());
+    }
+
+    // The store already owns the merge (the child's commit was folded into the
+    // integration bookmark), so the rebase dest is the bare local integration
+    // bookmark — no fetch needed.
     let issue_info = match merged_job.issue_id.as_deref() {
         Some(issue_id) => load_issue_info(orch, issue_id).await?,
         None => None,
     };
-    let siblings =
-        load_sibling_jobs(orch, &merged_job.project_id, base_branch, &merged_job.id).await?;
+    let pr_number = load_merge_request_info(orch, merged_job_id, &merged_job.id)
+        .await?
+        .and_then(|info| info.pr_number);
+    let note = build_jj_conflict_note(base_branch, pr_number, issue_info.as_ref());
+    reconcile_base_advance(
+        orch,
+        &format!("merged job {}", merged_job.id),
+        repo_path,
+        base_branch,
+        siblings,
+        note,
+    )
+    .await
+}
 
-    for sibling in siblings {
-        let sibling_files = changed_files(
-            &*orch.services.git,
-            Path::new(&sibling.worktree_path),
-            base_branch,
-        )
-        .map_err(|error| {
-            log::warn!(
-                "Failed to compute changed files for sibling job {}: {}",
-                sibling.id,
-                error
-            );
-            error
-        })
-        .ok();
+/// Where the advanced default-branch tip comes from. Selects how the tip is
+/// brought into the shared store and which revset the siblings rebase onto — the
+/// only two differences between the webhook and non-webhook reconcile paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultAdvanceSource {
+    /// The advance landed on origin — a non-Cairn merge or a direct push,
+    /// detected via the GitHub `push` webhook. The local checkout may not have
+    /// pulled, so origin is the source of truth: fetch it into the store and
+    /// rebase siblings onto the remote-tracking `<default>@origin` tip.
+    Remote,
+    /// The advance happened in the backing git locally with no `push` webhook —
+    /// a local-only project (no remote/webhook subscription) or a manual
+    /// `git pull` on the default branch. `ensure_project_store`'s `import_git`
+    /// already imports the moved local ref, so rebase siblings onto the local
+    /// `<default>` bookmark; no origin fetch is involved (and a local-only
+    /// project has no origin to fetch).
+    Local,
+}
 
-        let overlap = match (&merged_files, &sibling_files) {
-            (Some(merged), Some(sibling)) => overlap_files(merged, sibling),
-            _ => Vec::new(),
-        };
-        if merged_files.is_some() && sibling_files.is_some() && overlap.is_empty() {
-            continue;
+impl DefaultAdvanceSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Remote => "external advance",
+            Self::Local => "local advance",
         }
+    }
 
-        let Some(run_id) = latest_run_for_job(&orch.db.local, &sibling.id) else {
-            log::debug!(
-                "Skipping base advance notify for sibling job {}: no run",
-                sibling.id
+    /// The `jj rebase` destination revset for an advance on `default_branch`.
+    fn rebase_dest(self, default_branch: &str) -> String {
+        match self {
+            Self::Remote => format!("{default_branch}@origin"),
+            Self::Local => default_branch.to_string(),
+        }
+    }
+}
+
+/// Reconcile in-flight siblings after the project's default branch advanced
+/// **outside Cairn** (a non-Cairn PR merged in the GitHub UI, or a direct push to
+/// the default branch), detected via the GitHub `push` webhook. Thin wrapper over
+/// [`reconcile_default_advance`] with the `Remote` source.
+pub async fn reconcile_external_default_advance(
+    orch: &Orchestrator,
+    project_id: &str,
+    default_branch: &str,
+) -> Result<(), String> {
+    reconcile_default_advance(
+        orch,
+        project_id,
+        default_branch,
+        DefaultAdvanceSource::Remote,
+    )
+    .await
+}
+
+/// Reconcile in-flight siblings after the project's default branch advanced
+/// **locally with no GitHub `push` webhook** — a local-only project (no
+/// remote/webhook subscription) or a manual `git pull` on the default branch.
+/// The webhook path never fires for these, so without this trigger the shared
+/// store's view of the default branch stays stale and in-flight siblings remain
+/// based on the old tip until something else (a Cairn merge) advances it. Thin
+/// wrapper over [`reconcile_default_advance`] with the `Local` source: it imports
+/// the moved local ref into the store and rebases each sibling onto the local
+/// `<default>` bookmark. Driven by the periodic sweep
+/// ([`reconcile_all_local_default_advances`]).
+pub async fn reconcile_local_default_advance(
+    orch: &Orchestrator,
+    project_id: &str,
+    default_branch: &str,
+) -> Result<(), String> {
+    reconcile_default_advance(
+        orch,
+        project_id,
+        default_branch,
+        DefaultAdvanceSource::Local,
+    )
+    .await
+}
+
+/// Shared body for both default-branch-advance reconcile paths (webhook `Remote`
+/// and non-webhook `Local`). Mirrors the Cairn-merge path: gate on in-flight
+/// siblings, bring the advanced tip into the shared store, then auto-rebase every
+/// in-flight sibling on that branch onto the new tip over the shared store — push
+/// the cleanly-rebased ones, record conflicts non-blocking, and wake only the
+/// siblings this reconcile actually rewrote (the before/after commit-id guard in
+/// `reconcile_base_advance`, which also makes the webhook/sweep double-fire on a
+/// remote-then-local advance idempotent). Runs regardless of the project's
+/// `pull_on_merge` setting: that gates the user's main-checkout pull, not
+/// agent-workspace reconciliation. Non-fatal end to end — every failure is logged
+/// and swallowed so neither the webhook handler nor the periodic sweep errors on
+/// it.
+async fn reconcile_default_advance(
+    orch: &Orchestrator,
+    project_id: &str,
+    default_branch: &str,
+    source: DefaultAdvanceSource,
+) -> Result<(), String> {
+    let Some(repo_path) = load_project_repo_path(orch, project_id).await? else {
+        log::debug!(
+            "Skipping {} reconcile: no repo_path for project {project_id}",
+            source.label()
+        );
+        return Ok(());
+    };
+    let siblings = load_sibling_jobs(orch, project_id, default_branch, EXCLUDE_NONE).await?;
+    if siblings.is_empty() {
+        log::debug!(
+            "{} on {default_branch}: no in-flight siblings to reconcile",
+            source.label()
+        );
+        return Ok(());
+    }
+
+    // Bring the advanced tip into the shared store. `ensure_project_store` runs
+    // `jj git import`, which imports the backing git's refs — including the local
+    // `<default>` ref a local-only advance or a manual `git pull` moved — so the
+    // rebase dest resolves regardless of which branch the main checkout sits on.
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+    if let Err(error) = crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path)) {
+        log::warn!(
+            "{} on {default_branch}: ensure store failed: {error}",
+            source.label()
+        );
+        return Ok(());
+    }
+    // The webhook advance lives on origin, not in the local checkout, so it
+    // additionally fetches origin to advance the `<default>@origin` tracking
+    // bookmark. The local path needs no fetch — the import above already brought
+    // the moved local ref in.
+    if source == DefaultAdvanceSource::Remote {
+        if let Err(error) = crate::jj::fetch_remote(&jj, &store, "origin") {
+            log::warn!(
+                "{} on {default_branch}: jj git fetch failed: {error}",
+                source.label()
             );
-            continue;
-        };
-        let note = build_note(
-            base_branch,
-            mr_info.as_ref().and_then(|info| info.pr_number),
-            issue_info.as_ref(),
-            merged_files.as_deref(),
-            sibling_files.as_deref(),
-            &overlap,
-        );
-        queue_system_direct(orch, &run_id, &note)?;
-        log::info!(
-            "Queued base branch advance notification for sibling job {} after merged job {}",
-            sibling.id,
-            merged_job.id
-        );
+            return Ok(());
+        }
     }
 
-    Ok(())
+    let note = build_external_advance_conflict_note(default_branch);
+    reconcile_base_advance(
+        orch,
+        &format!("{} on {default_branch}", source.label()),
+        &repo_path,
+        &source.rebase_dest(default_branch),
+        siblings,
+        note,
+    )
+    .await
 }
 
-fn changed_files(
-    git: &dyn GitClient,
-    worktree_path: &Path,
-    base_branch: &str,
-) -> Result<Vec<String>, String> {
-    let output = git.run(
-        worktree_path,
-        vec![
-            "diff".to_string(),
-            "--name-only".to_string(),
-            format!("{}...HEAD", base_branch),
-        ],
-    )?;
-    if !output.success {
-        return Err(format!("git diff failed: {}", output.stderr));
+/// Sweep every locally-checked-out project for a non-webhook default-branch
+/// advance and reconcile its in-flight default-branch siblings. Drives
+/// [`reconcile_local_default_advance`] per project; that call gates on in-flight
+/// siblings before touching jj, so a project with no active default-branch work
+/// costs only a cheap DB query. Errors per project are logged, never propagated —
+/// one project's failure must not abort the sweep.
+pub async fn reconcile_all_local_default_advances(orch: &Orchestrator) {
+    let projects = match load_projects_for_default_reconcile(orch).await {
+        Ok(projects) => projects,
+        Err(error) => {
+            log::warn!("local default-advance sweep: failed to load projects: {error}");
+            return;
+        }
+    };
+    for (project_id, default_branch) in projects {
+        if let Err(error) =
+            reconcile_local_default_advance(orch, &project_id, &default_branch).await
+        {
+            log::warn!("local default-advance reconcile for project {project_id} failed: {error}");
+        }
     }
-    Ok(output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
 }
 
-fn overlap_files(merged_files: &[String], sibling_files: &[String]) -> Vec<String> {
-    let sibling_set: HashSet<&str> = sibling_files.iter().map(String::as_str).collect();
-    merged_files
+/// Shared reconcile body for both base-advance paths (Cairn merge and external
+/// default-branch advance): build the `(branch, workspace)` specs, snapshot each
+/// sibling's pre-reconcile commit id, run the non-blocking auto-rebase onto
+/// `rebase_dest`, then wake only the siblings whose conflicted commit this
+/// reconcile actually (re)wrote.
+///
+/// The before/after commit-id guard makes both paths idempotent against their
+/// double-fires: a Cairn merge into the default branch fires the merge path AND a
+/// GitHub `push` webhook for the same advance, and a second reconcile at the same
+/// dest tip is a `jj rebase` no-op (the conflicted commit id is unchanged), so
+/// `after == before` → no redundant wake.
+async fn reconcile_base_advance(
+    orch: &Orchestrator,
+    label: &str,
+    repo_path: &str,
+    rebase_dest: &str,
+    siblings: Vec<SiblingJob>,
+    note: String,
+) -> Result<(), String> {
+    let specs: Vec<(String, std::path::PathBuf)> = siblings
         .iter()
-        .filter(|file| sibling_set.contains(file.as_str()))
+        .filter_map(|sibling| {
+            let branch = sibling_branch(sibling)?;
+            Some((branch, std::path::PathBuf::from(&sibling.worktree_path)))
+        })
+        .collect();
+    if specs.is_empty() {
+        log::debug!("jj base advance ({label}): no in-flight siblings with a branch to reconcile");
+        return Ok(());
+    }
+
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+
+    // Snapshot each sibling's commit id BEFORE the rebase, so we can wake only
+    // those this reconcile actually moved (the double-fire guard).
+    let before: HashMap<String, String> = specs
+        .iter()
+        .filter_map(|(branch, _)| {
+            crate::jj::bookmark_commit(&jj, &store, branch).map(|commit| (branch.clone(), commit))
+        })
+        .collect();
+
+    let report = match crate::jj::reconcile_siblings(&jj, &store, rebase_dest, &specs) {
+        Ok(report) => report,
+        Err(error) => {
+            log::warn!("jj sibling reconcile ({label}) failed: {error}");
+            return Ok(());
+        }
+    };
+    log::info!(
+        "jj reconcile ({label}): {} rebased clean, {} recorded a conflict",
+        report.rebased_clean.len(),
+        report.conflicted.len()
+    );
+
+    if report.conflicted.is_empty() {
+        return Ok(());
+    }
+
+    // Re-read each conflicted sibling's commit id AFTER the rebase; wake only the
+    // ones whose commit actually changed (a no-op double-fire leaves it equal).
+    let after: HashMap<String, String> = report
+        .conflicted
+        .iter()
+        .filter_map(|branch| {
+            crate::jj::bookmark_commit(&jj, &store, branch).map(|commit| (branch.clone(), commit))
+        })
+        .collect();
+    let to_wake = conflicted_siblings_to_wake(&report.conflicted, &before, &after);
+    if to_wake.is_empty() {
+        log::debug!("jj reconcile ({label}): conflicts unchanged since a prior reconcile; no redundant wake");
+        return Ok(());
+    }
+    notify_conflicted_siblings(orch, &siblings, &to_wake, &note)
+}
+
+/// Filter the conflicted siblings down to those this reconcile actually rewrote:
+/// a branch whose commit id changed between the before/after snapshots. A
+/// double-fire reconcile at the same dest tip is a `jj rebase` no-op, so its
+/// conflicted commit id is unchanged → it is filtered out and not re-woken. When
+/// either snapshot is missing (an unexpected resolve failure), wake
+/// conservatively rather than silently dropping a real conflict.
+fn conflicted_siblings_to_wake(
+    conflicted: &[String],
+    before: &HashMap<String, String>,
+    after: &HashMap<String, String>,
+) -> Vec<String> {
+    conflicted
+        .iter()
+        .filter(
+            |branch| match (before.get(branch.as_str()), after.get(branch.as_str())) {
+                (Some(before_commit), Some(after_commit)) => before_commit != after_commit,
+                _ => true,
+            },
+        )
         .cloned()
         .collect()
 }
 
-fn build_note(
+/// The sibling's jj bookmark: the job row's `branch`, or the workspace marker.
+fn sibling_branch(sibling: &SiblingJob) -> Option<String> {
+    sibling
+        .branch
+        .clone()
+        .or_else(|| crate::jj::read_branch_marker(Path::new(&sibling.worktree_path)))
+}
+
+/// The note for a sibling whose auto-rebase recorded a conflict. It carries no
+/// rebase commands — the rebase already happened over the shared store; the agent
+/// only resolves the materialized conflict markers in its workspace, then lets it
+/// re-seal/push. Delivered via a waking `Steer` system direct (see
+/// `notify_conflicted_siblings`).
+fn build_jj_conflict_note(
     base_branch: &str,
     pr_number: Option<i64>,
     issue_info: Option<&IssueInfo>,
-    merged_files: Option<&[String]>,
-    sibling_files: Option<&[String]>,
-    overlap: &[String],
 ) -> String {
     let pr_fragment = pr_number
         .map(|number| format!("PR #{} merged", number))
@@ -185,31 +435,149 @@ fn build_note(
     let issue_fragment = issue_info
         .map(|issue| format!(" (cairn://p/{}/{})", issue.project_key, issue.number))
         .unwrap_or_default();
-    let file_section = if merged_files.is_none() || sibling_files.is_none() {
-        "Files it changed could not be determined; rebase to be safe.".to_string()
-    } else {
-        format!(
-            "Files it changed that overlap yours: {}.",
-            format_file_list(overlap)
-        )
-    };
-
     format!(
-        "[Base branch update] Your base branch `{}` advanced — {}{}.\n{}\nRebase before opening/refreshing your PR:\n  git fetch origin {}\n  git rebase origin/{}\n  # resolve conflicts, then verify build + tests\nIf your work does not touch these, you can ignore this.",
-        base_branch, pr_fragment, issue_fragment, file_section, base_branch, base_branch
+        "[Base branch update] Your base branch `{base_branch}` advanced — {pr_fragment}{issue_fragment}. Your work was auto-rebased onto the new tip and a conflict was recorded. Resolve the conflict markers in your workspace at your convenience, then verify build + tests. No manual rebase or force-push is needed."
     )
 }
 
-fn format_file_list(files: &[String]) -> String {
-    if files.is_empty() {
-        "none".to_string()
-    } else {
-        files
-            .iter()
-            .map(|file| format!("`{}`", file))
-            .collect::<Vec<_>>()
-            .join(", ")
+/// Advance the workspace(s) ON the merged branch (the Coordinator on its
+/// integration bookmark) onto the freshly-folded tip. The merge fold
+/// (`merge_into_bookmark`) advanced the integration bookmark out from under the
+/// coordinator's `@`; `reconcile_siblings` only rebases the *children* (branched
+/// FROM integration), never the coordinator (whose branch IS integration). Each
+/// matching workspace has its `@` re-parented onto the new tip via
+/// `crate::jj::advance_workspace_onto`. Best-effort and idempotent: a no-op when
+/// `@` already sits on the tip, so it is safe under the merge/webhook
+/// double-fire. A recorded conflict (effectively impossible for an idle
+/// coordinator's empty `@`, but handled defensively) wakes the workspace with a
+/// non-blocking note rather than leaving it idle on a conflicted `@`.
+///
+/// `branch == default_branch` needs no handling here: the workspace on the
+/// default branch is the user's main checkout, refreshed by `reconcile_after_merge`'s
+/// pull, and no agent job carries `branch = <default>` (jobs always branch as
+/// `agent/...`), so the on-branch query returns nothing for it.
+async fn advance_on_branch_workspaces(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+    repo_path: &str,
+) {
+    let on_branch = match load_on_branch_workspaces(orch, project_id, branch).await {
+        Ok(workspaces) => workspaces,
+        Err(error) => {
+            log::warn!("on-branch advance: failed to load workspaces on {branch}: {error}");
+            return;
+        }
+    };
+    if on_branch.is_empty() {
+        log::debug!("on-branch advance on {branch}: no in-flight workspace sits on the branch");
+        return;
     }
+
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+    let Some(dest) = crate::jj::bookmark_commit(&jj, &store, branch) else {
+        log::debug!("on-branch advance: bookmark {branch} did not resolve in store; skipping");
+        return;
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for workspace in &on_branch {
+        // Inheritance fan-out: several jobs can share one worktree path. Advance
+        // each physical workspace once.
+        if !seen.insert(workspace.worktree_path.clone()) {
+            continue;
+        }
+        let Some(ws_branch) = sibling_branch(workspace) else {
+            continue;
+        };
+        match crate::jj::advance_workspace_onto(
+            &jj,
+            &store,
+            Path::new(&workspace.worktree_path),
+            &ws_branch,
+            &dest,
+        ) {
+            Ok(false) => log::info!(
+                "Advanced on-branch workspace {} onto the {} tip",
+                workspace.worktree_path,
+                branch
+            ),
+            Ok(true) => {
+                log::warn!(
+                    "on-branch advance of {} recorded a conflict; waking it",
+                    workspace.worktree_path
+                );
+                if let Some(run_id) = latest_run_for_job(&orch.db.local, &workspace.id) {
+                    let note = build_on_branch_advance_conflict_note(branch);
+                    if let Err(error) = queue_system_direct(orch, &run_id, &note) {
+                        log::warn!(
+                            "on-branch advance: failed to wake {}: {error}",
+                            workspace.id
+                        );
+                    }
+                }
+            }
+            Err(error) => log::warn!(
+                "on-branch advance of {} failed: {error}",
+                workspace.worktree_path
+            ),
+        }
+    }
+}
+
+/// The note for a workspace ON the advanced branch (the Coordinator) whose
+/// re-parent onto the folded tip recorded a conflict. Like the sibling note it
+/// carries no rebase commands — the advance already happened over the shared
+/// store; the agent only resolves the materialized markers in its workspace.
+fn build_on_branch_advance_conflict_note(branch: &str) -> String {
+    format!(
+        "[Base branch update] Your branch `{branch}` advanced — a child merged into it. Your workspace was advanced onto the new tip and a conflict was recorded. Resolve the conflict markers in your workspace at your convenience, then verify build + tests. No manual rebase or force-push is needed."
+    )
+}
+
+/// The note for a sibling whose auto-rebase recorded a conflict after the default
+/// branch advanced **outside Cairn** (a non-Cairn merge or direct push detected
+/// via the GitHub `push` webhook). Same shape as `build_jj_conflict_note` but
+/// carries no PR number — there is no Cairn-tracked owner for the advance.
+fn build_external_advance_conflict_note(default_branch: &str) -> String {
+    format!(
+        "[Base branch update] Your base branch `{default_branch}` advanced (changes landed outside Cairn). Your work was auto-rebased onto the new tip and a conflict was recorded. Resolve the conflict markers in your workspace at your convenience, then verify build + tests. No manual rebase or force-push is needed."
+    )
+}
+
+/// Wake every sibling whose auto-rebase recorded a conflict: a conflicted
+/// sibling's PR can never advance (jj refuses to push a conflicted commit), so an
+/// idle sibling must resume to resolve the materialized markers and re-seal.
+/// `queue_system_direct` enqueues a `Steer` delivery, which wakes an idle
+/// recipient. Cleanly-rebased siblings are not in `conflicted` and get nothing.
+fn notify_conflicted_siblings(
+    orch: &Orchestrator,
+    siblings: &[SiblingJob],
+    conflicted: &[String],
+    note: &str,
+) -> Result<(), String> {
+    for sibling in siblings {
+        let Some(branch) = sibling_branch(sibling) else {
+            continue;
+        };
+        if !conflicted.contains(&branch) {
+            continue;
+        }
+        let Some(run_id) = latest_run_for_job(&orch.db.local, &sibling.id) else {
+            log::debug!(
+                "jj reconcile: no run for conflicted sibling {} to wake",
+                sibling.id
+            );
+            continue;
+        };
+        queue_system_direct(orch, &run_id, note)?;
+        log::info!(
+            "Woke jj sibling job {} to resolve a recorded conflict",
+            sibling.id
+        );
+    }
+    Ok(())
 }
 
 async fn load_merged_job_for_owner(
@@ -433,9 +801,7 @@ mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::{MockGitClient, TestServicesBuilder};
-    use crate::services::GitOutput;
     use crate::storage::{LocalDb, SearchIndex};
-    use std::path::Path;
     use std::sync::Arc;
 
     async fn migrated_db() -> LocalDb {
@@ -514,153 +880,338 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn jj_conflict_note_carries_no_rebase_commands() {
+        let issue = IssueInfo {
+            project_key: "PROJ".to_string(),
+            number: 7,
+        };
+        let note = build_jj_conflict_note("agent/CAIRN-1940-coordinator-0", Some(42), Some(&issue));
+        assert!(note.contains("[Base branch update]"));
+        assert!(note.contains("PR #42 merged"));
+        assert!(note.contains("cairn://p/PROJ/7"));
+        assert!(note.contains("auto-rebased"));
+        // The note must not instruct a manual rebase/force-push.
+        assert!(!note.contains("git rebase"));
+        assert!(!note.contains("git fetch"));
+        assert!(note.contains("No manual rebase or force-push is needed"));
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn notifies_only_in_flight_siblings_with_overlapping_files() {
+    async fn enumerates_completed_sibling_with_open_pr() {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
+        // The completed sibling has an OPEN merge request on the same base — the
+        // live-bug case where reconcile previously found zero siblings because the
+        // status filter excluded a `complete` job awaiting merge.
+        db.execute_script(
+            "UPDATE jobs SET branch = 'agent/PROJ-4-builder-0' WHERE id = 'job-complete';
+             INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES ('mr-complete', 'job-complete', 'proj-1', 'issue-4', 'PR', 'agent/PROJ-4-builder-0', 'integration', 'open', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db, MockGitClient::new());
 
-        let mut git = MockGitClient::new();
-        git.expect_run()
-            .returning(|repo: &Path, _args: Vec<String>| {
-                let stdout = match repo.to_string_lossy().as_ref() {
-                    "/wt/merged" => "src/shared.rs\nsrc/merged_only.rs",
-                    "/wt/overlap" => "src/shared.rs\nsrc/overlap_only.rs",
-                    "/wt/clean" => "src/clean.rs",
-                    other => panic!("unexpected git diff repo {other}"),
-                };
-                Ok(GitOutput {
-                    success: true,
-                    stdout: stdout.to_string(),
-                    stderr: String::new(),
-                })
-            });
-        let orch = test_orchestrator(db, git);
-
-        notify_downstream_of_base_advance(&orch, "job-merged")
+        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", "job-merged")
             .await
             .unwrap();
+        let ids: std::collections::HashSet<&str> = siblings.iter().map(|s| s.id.as_str()).collect();
 
-        let messages: Vec<(String, String, Option<i64>)> = orch
+        assert!(
+            ids.contains("job-complete"),
+            "a completed sibling with an open PR must be enumerated for rebase"
+        );
+        assert!(
+            ids.contains("job-overlap"),
+            "an in-flight sibling is still enumerated"
+        );
+        assert!(
+            ids.contains("job-clean"),
+            "an in-flight sibling is still enumerated"
+        );
+        assert!(
+            !ids.contains("job-merged"),
+            "the merged job itself is excluded"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_branch_query_selects_coordinator_distinct_from_siblings() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        // The Coordinator: a running job whose BRANCH *is* the integration branch
+        // (it sits ON it), branched FROM 'main'. The fixture's other jobs have
+        // base_branch = 'integration' and a NULL branch (children branched FROM
+        // it). The two queries must be disjoint.
+        db.execute_script(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-coord', 'proj-1', 5, 'Coord', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-coord', 'recipe-default', 'issue-coord', 'proj-1', 'running', 1, 1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, base_branch, created_at, updated_at)
+             VALUES ('job-coord', 'exec-coord', 'node', 'issue-coord', 'proj-1', 'running', '/wt/coord', 'integration', 'main', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        let on_branch = load_on_branch_workspaces(&orch, "proj-1", "integration")
+            .await
+            .unwrap();
+        let on_ids: std::collections::HashSet<&str> =
+            on_branch.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            on_ids.contains("job-coord"),
+            "the workspace ON the integration branch (the coordinator) is selected"
+        );
+        assert_eq!(
+            on_ids.len(),
+            1,
+            "only the on-branch workspace; children branched FROM it are excluded"
+        );
+
+        // The sibling query (branches based ON integration) must NOT include it.
+        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", "job-merged")
+            .await
+            .unwrap();
+        let sib_ids: std::collections::HashSet<&str> =
+            siblings.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            !sib_ids.contains("job-coord"),
+            "the coordinator is not a sibling of itself"
+        );
+        assert!(
+            sib_ids.contains("job-overlap"),
+            "siblings are still the children branched from integration"
+        );
+    }
+
+    #[test]
+    fn on_branch_advance_note_carries_no_rebase_commands() {
+        let note = build_on_branch_advance_conflict_note("agent/CAIRN-1987-coordinator-0");
+        assert!(note.contains("[Base branch update]"));
+        assert!(note.contains("agent/CAIRN-1987-coordinator-0"));
+        assert!(note.contains("a child merged into it"));
+        // The advance already happened over the store; no manual rebase commands.
+        assert!(!note.contains("git rebase"));
+        assert!(!note.contains("git fetch"));
+        assert!(note.contains("No manual rebase or force-push is needed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn excludes_completed_sibling_without_open_pr() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", "job-merged")
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<&str> = siblings.iter().map(|s| s.id.as_str()).collect();
+
+        // job-complete is `complete` with no MR: still excluded.
+        assert!(!ids.contains("job-complete"));
+        assert!(ids.contains("job-overlap"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn external_advance_enumerates_all_in_flight_siblings_with_no_exclusion() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        // An external default-branch advance has no merged job to exclude, so the
+        // sentinel excludes nothing. Every in-flight sibling on the branch is a
+        // reconcile candidate; a completed job without an open PR is still out.
+        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", EXCLUDE_NONE)
+            .await
+            .unwrap();
+        let ids: std::collections::HashSet<&str> = siblings.iter().map(|s| s.id.as_str()).collect();
+
+        assert!(
+            ids.contains("job-overlap"),
+            "in-flight sibling is enumerated"
+        );
+        assert!(ids.contains("job-clean"), "in-flight sibling is enumerated");
+        // job-merged is `complete` with a MERGED merge request; job-complete is
+        // `complete` with no MR. Both are excluded even with no job to exclude.
+        assert!(
+            !ids.contains("job-merged"),
+            "a completed job whose PR already merged is not a reconcile candidate"
+        );
+        assert!(
+            !ids.contains("job-complete"),
+            "a completed job without an open PR is not a reconcile candidate"
+        );
+    }
+
+    #[test]
+    fn external_advance_note_carries_no_pr_or_rebase_commands() {
+        let note = build_external_advance_conflict_note("main");
+        assert!(note.contains("[Base branch update]"));
+        assert!(note.contains("`main`"));
+        assert!(note.contains("outside Cairn"));
+        assert!(note.contains("auto-rebased"));
+        // No Cairn-tracked owner: the note must not reference a PR number.
+        assert!(!note.contains("PR #"));
+        // The note must not instruct a manual rebase/force-push/fetch.
+        assert!(!note.contains("git rebase"));
+        assert!(!note.contains("git fetch"));
+        assert!(note.contains("No manual rebase or force-push is needed"));
+    }
+
+    #[test]
+    fn conflicted_siblings_to_wake_skips_unchanged_commits() {
+        let conflicted = vec![
+            "agent/rewritten".to_string(),
+            "agent/unchanged".to_string(),
+            "agent/missing-after".to_string(),
+        ];
+        let before: HashMap<String, String> = [
+            ("agent/rewritten".to_string(), "commit-a".to_string()),
+            ("agent/unchanged".to_string(), "commit-b".to_string()),
+            ("agent/missing-after".to_string(), "commit-c".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // `rewritten` moved (this reconcile rewrote it), `unchanged` is a
+        // double-fire no-op, `missing-after` failed to resolve post-rebase.
+        let after: HashMap<String, String> = [
+            ("agent/rewritten".to_string(), "commit-a2".to_string()),
+            ("agent/unchanged".to_string(), "commit-b".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let to_wake = conflicted_siblings_to_wake(&conflicted, &before, &after);
+
+        assert!(
+            to_wake.contains(&"agent/rewritten".to_string()),
+            "a sibling this reconcile actually rewrote is woken"
+        );
+        assert!(
+            !to_wake.contains(&"agent/unchanged".to_string()),
+            "a double-fire no-op at the same tip is not re-woken"
+        );
+        assert!(
+            to_wake.contains(&"agent/missing-after".to_string()),
+            "an unresolved snapshot wakes conservatively rather than dropping a conflict"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wakes_only_conflicted_jj_siblings() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        let siblings = vec![
+            SiblingJob {
+                id: "job-overlap".to_string(),
+                worktree_path: "/wt/overlap".to_string(),
+                branch: Some("agent/PROJ-2-builder-0".to_string()),
+            },
+            SiblingJob {
+                id: "job-clean".to_string(),
+                worktree_path: "/wt/clean".to_string(),
+                branch: Some("agent/PROJ-3-builder-0".to_string()),
+            },
+        ];
+        let conflicted = vec!["agent/PROJ-2-builder-0".to_string()];
+        let note = build_jj_conflict_note("integration", Some(42), None);
+
+        notify_conflicted_siblings(&orch, &siblings, &conflicted, &note).unwrap();
+
+        let recipients: Vec<String> = orch
             .db
             .local
             .read(|conn| {
                 Box::pin(async move {
                     let mut rows = conn
                         .query(
-                            "SELECT recipient_run_id, content, delivered_at FROM messages ORDER BY created_at",
+                            "SELECT recipient_run_id FROM messages ORDER BY created_at",
                             (),
                         )
                         .await?;
-                    let mut messages = Vec::new();
+                    let mut v = Vec::new();
                     while let Some(row) = rows.next().await? {
-                        messages.push((row.text(0)?, row.text(1)?, row.opt_i64(2)?));
+                        v.push(row.text(0)?);
                     }
-                    Ok::<_, DbError>(messages)
+                    Ok::<_, DbError>(v)
                 })
             })
             .await
             .unwrap();
 
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].0, "run-job-overlap");
-        assert!(messages[0].1.contains("[Base branch update]"));
-        assert!(messages[0].1.contains("PR #42 merged"));
-        assert!(messages[0].1.contains("cairn://p/PROJ/1"));
-        assert!(messages[0].1.contains("`src/shared.rs`"));
-        assert!(messages[0].2.is_none());
+        assert_eq!(
+            recipients,
+            vec!["run-job-overlap".to_string()],
+            "only the conflicted sibling is woken; the cleanly-rebased one gets nothing"
+        );
+    }
+
+    #[test]
+    fn default_advance_source_selects_dest_and_label() {
+        // The Remote (webhook) path rebases onto the remote-tracking bookmark;
+        // the Local (non-webhook) path rebases onto the local bookmark imported
+        // from the backing git — the one structural difference between the paths.
+        assert_eq!(
+            DefaultAdvanceSource::Remote.rebase_dest("main"),
+            "main@origin"
+        );
+        assert_eq!(DefaultAdvanceSource::Local.rebase_dest("main"), "main");
+        assert_eq!(DefaultAdvanceSource::Remote.label(), "external advance");
+        assert_eq!(DefaultAdvanceSource::Local.label(), "local advance");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn resolves_action_run_owner_to_implementation_job() {
+    async fn default_reconcile_projects_skip_cloud_only_and_branchless() {
         let db = migrated_db().await;
-        seed_base_advance_fixture(&db).await;
+        // p-ok: a local checkout with a default branch — eligible. p-no-repo: no
+        // local checkout (cloud-only) — nothing to advance. p-no-branch: no
+        // default branch — nothing to reconcile onto.
         db.execute_script(
-            "
-            INSERT INTO action_runs (id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, parent_job_id, created_at)
-            VALUES ('action-pr', 'exec-1', 'pr-node', 'builtin:create_pr', 'issue-1', 'proj-1', 'blocked', 'job-merged', 1);
-            UPDATE merge_requests SET job_id = 'action-pr' WHERE id = 'mr-1';
-            ",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('p-ok', 'default', 'Ok', 'OK', '/repo/ok', 'main', 1, 1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('p-no-repo', 'default', 'NoRepo', 'NR', '', 'main', 1, 1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('p-no-branch', 'default', 'NoBranch', 'NB', '/repo/nb', NULL, 1, 1);",
         )
         .await
         .unwrap();
+        let orch = test_orchestrator(db, MockGitClient::new());
 
-        let mut git = MockGitClient::new();
-        git.expect_run()
-            .returning(|repo: &Path, _args: Vec<String>| {
-                let stdout = match repo.to_string_lossy().as_ref() {
-                    "/wt/merged" => "src/shared.rs",
-                    "/wt/overlap" => "src/shared.rs",
-                    "/wt/clean" => "src/clean.rs",
-                    other => panic!("unexpected git diff repo {other}"),
-                };
-                Ok(GitOutput {
-                    success: true,
-                    stdout: stdout.to_string(),
-                    stderr: String::new(),
-                })
-            });
-        let orch = test_orchestrator(db, git);
+        let projects = load_projects_for_default_reconcile(&orch).await.unwrap();
+        let ids: std::collections::HashSet<&str> =
+            projects.iter().map(|(id, _)| id.as_str()).collect();
 
-        notify_downstream_of_base_advance(&orch, "action-pr")
-            .await
-            .unwrap();
-
-        let content: String = orch
-            .db
-            .local
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn.query("SELECT content FROM messages", ()).await?;
-                    let row = rows.next().await?.unwrap();
-                    row.text(0)
-                })
-            })
-            .await
-            .unwrap();
-        assert!(content.contains("PR #42 merged"));
-        assert!(content.contains("`src/shared.rs`"));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn sends_when_a_diff_cannot_be_computed() {
-        let db = migrated_db().await;
-        seed_base_advance_fixture(&db).await;
-
-        let mut git = MockGitClient::new();
-        git.expect_run()
-            .returning(
-                |repo: &Path, _args: Vec<String>| match repo.to_string_lossy().as_ref() {
-                    "/wt/merged" => Ok(GitOutput {
-                        success: true,
-                        stdout: "src/shared.rs".to_string(),
-                        stderr: String::new(),
-                    }),
-                    "/wt/overlap" | "/wt/clean" => Err("missing worktree".to_string()),
-                    other => panic!("unexpected git diff repo {other}"),
-                },
-            );
-        let orch = test_orchestrator(db, git);
-
-        notify_downstream_of_base_advance(&orch, "job-merged")
-            .await
-            .unwrap();
-
-        let count: i64 = orch
-            .db
-            .local
-            .read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn.query("SELECT COUNT(*) FROM messages", ()).await?;
-                    let row = rows.next().await?.unwrap();
-                    row.i64(0)
-                })
-            })
-            .await
-            .unwrap();
-        assert_eq!(count, 2);
+        assert!(
+            ids.contains("p-ok"),
+            "a project with a local checkout and default branch is eligible"
+        );
+        assert!(
+            !ids.contains("p-no-repo"),
+            "a cloud-only project with no local checkout is skipped"
+        );
+        assert!(
+            !ids.contains("p-no-branch"),
+            "a project with no default branch is skipped"
+        );
+        let ok = projects.iter().find(|(id, _)| id == "p-ok").unwrap();
+        assert_eq!(
+            ok.1, "main",
+            "the default branch is returned alongside the id"
+        );
     }
 }
 
+/// In-flight siblings on the same base that may need rebasing after a merge.
+/// Beyond the status filter (still-running jobs), this also enumerates a
+/// **completed** sibling that still has an **open** PR (`merge_requests.status`
+/// not merged/closed): a child whose build job finished but whose PR is awaiting
+/// merge is exactly the sibling that must auto-rebase onto the advanced base.
 async fn load_sibling_jobs(
     orch: &Orchestrator,
     project_id: &str,
@@ -679,13 +1230,19 @@ async fn load_sibling_jobs(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT id, worktree_path
-                         FROM jobs
-                         WHERE project_id = ?1
-                           AND base_branch = ?2
-                           AND id != ?3
-                           AND status NOT IN ('complete', 'failed')
-                           AND worktree_path IS NOT NULL",
+                        "SELECT j.id, j.worktree_path, j.branch
+                         FROM jobs j
+                         WHERE j.project_id = ?1
+                           AND j.base_branch = ?2
+                           AND j.id != ?3
+                           AND j.worktree_path IS NOT NULL
+                           AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
+                                 OR EXISTS (
+                                   SELECT 1 FROM merge_requests mr
+                                   WHERE mr.source_branch = j.branch
+                                     AND mr.project_id = j.project_id
+                                     AND mr.status NOT IN ('merged', 'closed')
+                                 ) )",
                         params![
                             project_id.as_str(),
                             base_branch.as_str(),
@@ -698,9 +1255,63 @@ async fn load_sibling_jobs(
                     siblings.push(SiblingJob {
                         id: row.text(0)?,
                         worktree_path: row.text(1)?,
+                        branch: row.opt_text(2)?,
                     });
                 }
                 Ok(siblings)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The active workspace(s) whose `branch` *is* `branch` itself — the Coordinator
+/// sitting ON its integration bookmark, as opposed to the siblings branched
+/// *from* it that [`load_sibling_jobs`] returns. After a child folds into the
+/// branch, the bookmark advances out from under this workspace's `@`; the sibling
+/// auto-rebase never touches it (it rebases branches based ON this one), so it
+/// must be advanced explicitly. Same in-flight predicate as `load_sibling_jobs`
+/// (still running, or completed with an open PR). Callers dedup by
+/// `worktree_path` for the inheritance fan-out.
+async fn load_on_branch_workspaces(
+    orch: &Orchestrator,
+    project_id: &str,
+    branch: &str,
+) -> Result<Vec<SiblingJob>, String> {
+    let project_id = project_id.to_string();
+    let branch = branch.to_string();
+    orch.db
+        .local
+        .read(|conn| {
+            let project_id = project_id.clone();
+            let branch = branch.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT j.id, j.worktree_path, j.branch
+                         FROM jobs j
+                         WHERE j.project_id = ?1
+                           AND j.branch = ?2
+                           AND j.worktree_path IS NOT NULL
+                           AND ( j.status NOT IN ('complete', 'failed', 'cancelled')
+                                 OR EXISTS (
+                                   SELECT 1 FROM merge_requests mr
+                                   WHERE mr.source_branch = j.branch
+                                     AND mr.project_id = j.project_id
+                                     AND mr.status NOT IN ('merged', 'closed')
+                                 ) )",
+                        params![project_id.as_str(), branch.as_str()],
+                    )
+                    .await?;
+                let mut workspaces = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    workspaces.push(SiblingJob {
+                        id: row.text(0)?,
+                        worktree_path: row.text(1)?,
+                        branch: row.opt_text(2)?,
+                    });
+                }
+                Ok(workspaces)
             })
         })
         .await
@@ -738,6 +1349,61 @@ async fn load_merge_request_info(
                         })
                     })
                     .transpose()
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// The git-backed checkout path for a project (the source of the jj-managed
+/// signal and the anchor for the shared jj store).
+async fn load_project_repo_path(
+    orch: &Orchestrator,
+    project_id: &str,
+) -> Result<Option<String>, String> {
+    let project_id = project_id.to_string();
+    orch.db
+        .local
+        .read(|conn| {
+            let project_id = project_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT repo_path FROM projects WHERE id = ?1",
+                        params![project_id.as_str()],
+                    )
+                    .await?;
+                rows.next().await?.map(|row| row.text(0)).transpose()
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Projects eligible for the local default-advance sweep: those with a local git
+/// checkout (`repo_path`) and a known `default_branch`. A project with no local
+/// checkout (cloud-only) has no backing git ref to advance, and one with no
+/// default branch has no branch to reconcile onto.
+async fn load_projects_for_default_reconcile(
+    orch: &Orchestrator,
+) -> Result<Vec<(String, String)>, String> {
+    orch.db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, default_branch FROM projects
+                         WHERE repo_path IS NOT NULL AND repo_path != ''
+                           AND default_branch IS NOT NULL AND default_branch != ''",
+                        (),
+                    )
+                    .await?;
+                let mut projects = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    projects.push((row.text(0)?, row.text(1)?));
+                }
+                Ok(projects)
             })
         })
         .await

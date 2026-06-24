@@ -4,7 +4,7 @@
 //! `write` verb (the replacement for the deleted dynamic `return` tool).
 
 use crate::mcp::types::{AddCommentPayload, McpCallbackRequest};
-use crate::models::{ConfirmPolicy, ExecutionSnapshot};
+use crate::models::ConfirmPolicy;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, RowExt};
 use turso::params;
@@ -155,6 +155,29 @@ async fn resolve_artifact_schema(
         .flatten()
 }
 
+/// Enumerate the node's `context-self` living-doc targets (name + schema) so a
+/// ctx-self write can be routed to its own schema. Empty for non-recipe jobs.
+async fn resolve_ctx_self_schemas(
+    orch: &Orchestrator,
+    node_id: &str,
+    execution_id: &str,
+) -> Vec<crate::models::OutputSchemaInfo> {
+    let node_id = node_id.to_string();
+    let execution_id = execution_id.to_string();
+    orch.db
+        .local
+        .read(|conn| {
+            let node_id = node_id.clone();
+            let execution_id = execution_id.clone();
+            Box::pin(async move {
+                crate::execution::jobs::resolve_ctx_self_schemas_conn(conn, &node_id, &execution_id)
+                    .await
+            })
+        })
+        .await
+        .unwrap_or_default()
+}
+
 /// Store (or patch) a node/task artifact submitted through the `write` verb.
 ///
 /// ## Lifecycle design
@@ -193,53 +216,78 @@ pub(crate) async fn write_artifact_change(
     )
     .await?;
 
-    // 2. Resolve schema shape + confirm policy from the execution snapshot.
+    // 2. Resolve the terminal (context-out) contract and the ctx-self living-doc
+    //    targets from the execution snapshot, then route the write by the
+    //    addressed name.
     let (node_id, execution_id) = match job_node_execution(orch, &job_id).await.ok().flatten() {
         Some((node_id, execution_id)) => (node_id, execution_id),
         None => (None, None),
     };
 
-    // Resolve the confirm policy, artifact contract name, and schema to validate
-    // against. Node jobs read these from their recipe node (own schema, else
-    // inherited from a downstream context edge). Task jobs have no recipe node:
-    // they auto-confirm and validate against the `return` contract that every
-    // child/delegated task is started with (restoring the validation the dynamic
-    // return tool did).
-    let mut policy = ConfirmPolicy::Auto;
-    let mut validation_schema: Option<crate::models::OutputSchema> = None;
-    let mut required_artifact_name: Option<String> = None;
+    // The terminal contract is the schema of the node's single `context-out` edge
+    // target (an ArtifactNode or a `pr`/action input port). It drives the confirm
+    // policy, the arming decision, and the job-completion gate. A `pr` consumer
+    // auto-confirms — the PR lifecycle is the gate (CAIRN-1219). Task jobs have no
+    // recipe node: they validate against the `return` contract every child task
+    // is started with.
+    let mut terminal_policy = ConfirmPolicy::Auto;
+    let mut terminal_schema: Option<crate::models::OutputSchema> = None;
+    let mut terminal_name: Option<String> = None;
+    let mut self_targets: Vec<crate::models::OutputSchemaInfo> = Vec::new();
     if let (Some(node_id), Some(execution_id)) = (node_id.as_deref(), execution_id.as_deref()) {
-        // One resolved output contract drives both the confirm policy and the
-        // validation shape: the producing node's own schema, else inherited from
-        // the downstream ctx-edge consumer's `inputSchema` (a `pr` consumer
-        // auto-confirms — the PR lifecycle is the gate, see CAIRN-1219).
         if let Some(info) = resolve_artifact_schema(orch, node_id, execution_id).await {
-            policy = info.confirm_policy;
-            required_artifact_name = info.artifact_name;
-            validation_schema = Some(info.schema);
+            terminal_policy = info.confirm_policy;
+            terminal_name = info.artifact_name;
+            terminal_schema = Some(info.schema);
         }
+        self_targets = resolve_ctx_self_schemas(orch, node_id, execution_id).await;
     } else if task_name.is_some() {
-        // Child/delegated tasks are started with the return preset under the
-        // declared `result` artifact name (see child_tasks.rs). Do not derive
-        // the required name from the URI being written: incidental task artifacts
-        // such as `notes` must validate if they use the return shape, but they
-        // must not satisfy/arm the declared task output contract.
-        required_artifact_name = Some("result".to_string());
-        validation_schema = Some(crate::models::OutputSchema::Preset("return".to_string()));
+        terminal_name = Some("result".to_string());
+        terminal_schema = Some(crate::models::OutputSchema::Preset("return".to_string()));
     }
-    let should_arm_terminal_interrupt = should_arm_output_artifact_interrupt(
-        is_patch,
-        artifact_name,
-        required_artifact_name.as_deref(),
-        validation_schema.is_some(),
-    );
+
+    // Route by the addressed name. A `context-self` living doc validates against
+    // its OWN schema, always auto-confirms, and NEVER arms the terminal interrupt
+    // or satisfies the output contract (repeated create+patch across the run is
+    // normal). Anything else takes the terminal contract.
+    let ctx_self_target = artifact_name.and_then(|name| {
+        self_targets
+            .iter()
+            .find(|t| t.artifact_name.as_deref() == Some(name))
+    });
+    let is_ctx_self = ctx_self_target.is_some();
+    let (policy, validation_schema): (ConfirmPolicy, Option<crate::models::OutputSchema>) =
+        match ctx_self_target {
+            Some(target) => (ConfirmPolicy::Auto, Some(target.schema.clone())),
+            None => (terminal_policy, terminal_schema.clone()),
+        };
+
+    // Only a fresh create of the terminal (context-out) artifact arms the boundary
+    // interrupt; a ctx-self write never does.
+    let should_arm_terminal_interrupt = !is_ctx_self
+        && should_arm_output_artifact_interrupt(
+            is_patch,
+            artifact_name,
+            terminal_name.as_deref(),
+            terminal_schema.is_some(),
+        );
 
     // A `patch` resolves against the latest artifact's data; a `create`
     // replaces. Validation and storage operate on the full resulting object so a
     // partial patch (e.g. `{content}` against a plan) can't drop required fields
     // like `title`. File-style text replacement payloads are operations over a
     // prose field, not metadata to store on the artifact.
-    let latest = load_latest_artifact(orch, &job_id).await;
+    // The addressed name (`cairn:~/<name>`) is the artifact's identity and the
+    // key of its version chain. The resolved contract type drives the
+    // `artifact_type` column and is the fallback identity when the caller used
+    // the generic `/artifact` alias (`artifact_name` is `None`). Resolving once
+    // keeps the patch-base load and the store on the same `(job_id, output_name)`
+    // chain. For a single-artifact node the addressed name equals the resolved
+    // type, so identity is unchanged.
+    let (artifact_type, output_name) =
+        resolve_artifact_identity(orch, &job_id, artifact_name).await;
+
+    let latest = load_latest_artifact(orch, &job_id, &output_name).await;
     let prior_confirmed = latest.as_ref().map(|(_, confirmed)| *confirmed);
 
     let effective_payload = match (is_patch, &latest) {
@@ -270,13 +318,19 @@ pub(crate) async fn write_artifact_change(
 
     let data_json = serde_json::to_string(&effective_payload)
         .map_err(|e| format!("Failed to serialize artifact: {e}"))?;
-    let default_type = artifact_name.unwrap_or("document");
-    let stored = store_artifact(orch, &job_id, default_type, data_json, confirmed).await?;
+    let stored = store_artifact(
+        orch,
+        &job_id,
+        &artifact_type,
+        &output_name,
+        data_json,
+        confirmed,
+    )
+    .await?;
 
     let synced_pr_metadata = if let Some((title, body)) = create_pr_artifact_details(
         &effective_payload,
         artifact_name,
-        required_artifact_name.as_deref(),
         stored.output_name.as_deref(),
         &stored.artifact_type,
     ) {
@@ -378,7 +432,6 @@ pub(crate) async fn write_artifact_change(
             issue_id,
             issue_uri: issue_ctx.issue_uri(),
             fact: crate::orchestrator::AttentionFact::ArtifactWritten {
-                escalate: false,
                 detail_uri: artifact_uri.clone(),
                 content: crate::orchestrator::attention::ArtifactSummary {
                     output_name,
@@ -537,12 +590,13 @@ fn should_arm_output_artifact_interrupt(
 fn create_pr_artifact_details(
     payload: &serde_json::Value,
     artifact_name: Option<&str>,
-    required_name: Option<&str>,
     stored_output_name: Option<&str>,
     stored_artifact_type: &str,
 ) -> Option<(String, Option<String>)> {
+    // Keyed on the written artifact's OWN name/type, never on the terminal
+    // contract name: a ctx-self write under a create-pr-terminal node must not
+    // sync the PR.
     let is_create_pr = artifact_name == Some("create-pr")
-        || required_name == Some("create-pr")
         || stored_output_name == Some("create-pr")
         || stored_artifact_type == "create-pr";
     if !is_create_pr {
@@ -759,18 +813,21 @@ fn merge_artifact_payload(base: serde_json::Value, patch: &serde_json::Value) ->
 async fn load_latest_artifact(
     orch: &Orchestrator,
     job_id: &str,
+    output_name: &str,
 ) -> Option<(serde_json::Value, bool)> {
     let job_id = job_id.to_string();
+    let output_name = output_name.to_string();
     let row: Option<(String, i64)> = orch
         .db
         .local
         .read(|conn| {
             let job_id = job_id.clone();
+            let output_name = output_name.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT data, confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
-                        (job_id.as_str(),),
+                        "SELECT data, confirmed FROM artifacts WHERE job_id = ?1 AND output_name = ?2 ORDER BY version DESC LIMIT 1",
+                        params![job_id.as_str(), output_name.as_str()],
                     )
                     .await?;
                 rows.next()
@@ -789,21 +846,50 @@ async fn load_latest_artifact(
     })
 }
 
+/// Resolve an artifact write's stored identity and schema type.
+///
+/// Resolve a written artifact's stored identity `(artifact_type, output_name)`.
+///
+/// The addressed `cairn:~/<name>` is the artifact's identity: the name keys its
+/// per-name version chain (`output_name`) and labels the row (`artifact_type`).
+/// When the caller used the generic `/artifact` alias (no name), fall back to the
+/// node's terminal contract name.
+async fn resolve_artifact_identity(
+    orch: &Orchestrator,
+    job_id: &str,
+    artifact_name: Option<&str>,
+) -> (String, String) {
+    if let Some(name) = artifact_name {
+        return (name.to_string(), name.to_string());
+    }
+    let fallback = resolve_terminal_artifact_name(orch, job_id)
+        .await
+        .unwrap_or_else(|| "document".to_string());
+    (fallback.clone(), fallback)
+}
+
+/// The node's terminal (context-out) artifact name, for the generic `/artifact`
+/// alias fallback.
+async fn resolve_terminal_artifact_name(orch: &Orchestrator, job_id: &str) -> Option<String> {
+    let (node_id, execution_id) = job_node_execution(orch, job_id).await.ok().flatten()?;
+    let node_id = node_id?;
+    let execution_id = execution_id?;
+    resolve_artifact_schema(orch, &node_id, &execution_id)
+        .await
+        .and_then(|info| info.artifact_name)
+}
+
 async fn store_artifact(
     orch: &Orchestrator,
     job_id: &str,
-    default_type: &str,
+    artifact_type: &str,
+    output_name: &str,
     data_json: String,
     confirmed: bool,
 ) -> Result<StoredArtifact, String> {
-    let (artifact_type, _source_handle) =
-        resolve_artifact_type_and_output(orch, job_id, default_type).await;
-    // The artifact's output/display name is its resolved schema name (e.g.
-    // "create-pr", "plan"), NOT the context-edge source handle — the handle
-    // (`_source_handle`, e.g. "context-out") is an input-mapping detail, not a
-    // name. This drives the sidebar label and the canonical artifact URI segment.
-    let output_name = Some(artifact_type.clone());
     let job_id = job_id.to_string();
+    let artifact_type = artifact_type.to_string();
+    let output_name = output_name.to_string();
     orch.db
         .local
         .write(|conn| {
@@ -812,176 +898,92 @@ async fn store_artifact(
             let artifact_type = artifact_type.clone();
             let output_name = output_name.clone();
             Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "
-                        SELECT id, version
-                        FROM artifacts
-                        WHERE job_id = ?1
-                        ORDER BY version DESC
-                        LIMIT 1
-                        ",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                let existing = rows
-                    .next()
-                    .await?
-                    .map(|row| Ok::<_, DbError>((row.text(0)?, row.i64(1)? as i32)))
-                    .transpose()?;
-
-                let (parent_version_id, version) = match existing {
-                    Some((parent_id, parent_version)) => (Some(parent_id), parent_version + 1),
-                    None => (None, 1),
-                };
-                let now = chrono::Utc::now().timestamp() as i32;
-                let artifact_id = uuid::Uuid::new_v4().to_string();
-
-                conn.execute(
-                    "
-                    INSERT INTO artifacts (
-                        id, job_id, artifact_type, schema_version, data, version,
-                        parent_version_id, output_name, confirmed, created_at, updated_at
-                    )
-                    VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-                    ",
-                    params![
-                        artifact_id.as_str(),
-                        job_id.as_str(),
-                        artifact_type.as_str(),
-                        data_json.as_str(),
-                        version,
-                        parent_version_id.as_deref(),
-                        output_name.as_deref(),
-                        if confirmed { 1 } else { 0 },
-                        now
-                    ],
+                insert_next_artifact_version(
+                    conn,
+                    &job_id,
+                    &artifact_type,
+                    &output_name,
+                    &data_json,
+                    confirmed,
                 )
-                .await?;
-
-                Ok(StoredArtifact {
-                    artifact_id,
-                    artifact_type,
-                    version,
-                    parent_version_id,
-                    output_name,
-                    created_at: now,
-                    updated_at: now,
-                })
+                .await
             })
         })
         .await
         .map_err(|e| format!("Failed to store artifact: {}", e))
 }
 
-/// Resolve artifact type and output name from three sources (in priority order):
-/// 1. Source node's own outputSchema.name (when it carries an inline schema)
-/// 2. Downstream ActionNode's inputSchema.name (when it carries an inline schema)
-/// 3. Downstream ArtifactNode's artifactType
-async fn resolve_artifact_type_and_output(
-    orch: &Orchestrator,
+/// Insert the next version in an artifact's `(job_id, output_name)` chain.
+///
+/// Each distinct addressed name a node writes owns an independent version chain:
+/// the parent/version lookup is scoped to `output_name`, so a write to name A
+/// never bumps name B's version and links its parent only within its own chain.
+/// A node that only ever writes one name increments exactly as a per-job chain
+/// did.
+async fn insert_next_artifact_version(
+    conn: &turso::Connection,
     job_id: &str,
-    default_type: &str,
-) -> (String, Option<String>) {
-    // Get job's recipe_node_id and execution_id
-    let job_data = job_node_execution(orch, job_id).await.ok().flatten();
-
-    let (node_id, execution_id) = match job_data {
-        Some((Some(n), Some(e))) => (n, e),
-        _ => return (default_type.to_string(), None),
-    };
-
-    // Load execution snapshot
-    let snapshot = match load_execution_snapshot(orch, &execution_id).await {
-        Ok(s) => s,
-        Err(_) => return (default_type.to_string(), None),
-    };
-
-    // Find source node in snapshot
-    let source_node = match snapshot.recipe.nodes.iter().find(|n| n.id == node_id) {
-        Some(n) => n,
-        None => return (default_type.to_string(), None),
-    };
-
-    // PRIORITY 1: Check source node's own outputSchema
-    if source_node.node_type.to_string() == "agent" {
-        if let Some(ref agent_cfg) = source_node.agent_config {
-            if let Some(ref output_schema) = agent_cfg.output_schema {
-                // A self-contained inline schema makes this node the type source;
-                // a name-only schema (no inline shape) inherits from downstream.
-                if output_schema.schema.is_some() {
-                    return (output_schema.name.clone(), None);
-                }
-            }
-        }
-    }
-
-    // PRIORITY 2 & 3: Check downstream nodes via context edges
-    let context_edges: Vec<_> = snapshot
-        .recipe
-        .edges
-        .iter()
-        .filter(|e| e.source_node_id == node_id && e.edge_type.to_string() == "context")
-        .collect();
-
-    for edge in context_edges {
-        let target_node = match snapshot
-            .recipe
-            .nodes
-            .iter()
-            .find(|n| n.id == edge.target_node_id)
-        {
-            Some(n) => n,
-            None => continue,
-        };
-
-        // PRIORITY 2: Consumer node with inputSchema (action or first-class PR)
-        if target_node.node_type.to_string() == "action"
-            || target_node.node_type.to_string() == "pr"
-        {
-            if let Some(ref action_cfg) = target_node.action_config {
-                if let Some(ref input_schema) = action_cfg.input_schema {
-                    if input_schema.schema.is_some() {
-                        return (input_schema.name.clone(), Some(edge.source_handle.clone()));
-                    }
-                }
-            }
-        }
-
-        // PRIORITY 3: Artifact node
-        if target_node.node_type.to_string() == "artifact" {
-            if let Some(ref artifact_cfg) = target_node.artifact_config {
-                let art_type = if artifact_cfg.artifact_type.is_empty() {
-                    default_type.to_string()
-                } else {
-                    artifact_cfg.artifact_type.clone()
-                };
-                return (art_type, Some(edge.source_handle.clone()));
-            }
-        }
-    }
-
-    (default_type.to_string(), None)
-}
-
-async fn load_execution_snapshot(
-    orch: &Orchestrator,
-    execution_id: &str,
-) -> DbResult<ExecutionSnapshot> {
-    let execution_id = execution_id.to_string();
-    let execution_id_for_query = execution_id.clone();
-    let snapshot_json = orch
-        .db
-        .local
-        .query_opt_text(
-            "SELECT snapshot FROM executions WHERE id = ?1",
-            params![execution_id_for_query.as_str()],
+    artifact_type: &str,
+    output_name: &str,
+    data_json: &str,
+    confirmed: bool,
+) -> Result<StoredArtifact, DbError> {
+    let mut rows = conn
+        .query(
+            "
+            SELECT id, version
+            FROM artifacts
+            WHERE job_id = ?1 AND output_name = ?2
+            ORDER BY version DESC
+            LIMIT 1
+            ",
+            params![job_id, output_name],
         )
         .await?;
+    let existing = rows
+        .next()
+        .await?
+        .map(|row| Ok::<_, DbError>((row.text(0)?, row.i64(1)? as i32)))
+        .transpose()?;
 
-    let snapshot_json = snapshot_json
-        .ok_or_else(|| DbError::Row(format!("Execution has no snapshot: {}", execution_id)))?;
-    serde_json::from_str(&snapshot_json).map_err(|e| DbError::Row(e.to_string()))
+    let (parent_version_id, version) = match existing {
+        Some((parent_id, parent_version)) => (Some(parent_id), parent_version + 1),
+        None => (None, 1),
+    };
+    let now = chrono::Utc::now().timestamp() as i32;
+    let artifact_id = uuid::Uuid::new_v4().to_string();
+
+    conn.execute(
+        "
+        INSERT INTO artifacts (
+            id, job_id, artifact_type, schema_version, data, version,
+            parent_version_id, output_name, confirmed, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+        ",
+        params![
+            artifact_id.as_str(),
+            job_id,
+            artifact_type,
+            data_json,
+            version,
+            parent_version_id.as_deref(),
+            output_name,
+            if confirmed { 1 } else { 0 },
+            now
+        ],
+    )
+    .await?;
+
+    Ok(StoredArtifact {
+        artifact_id,
+        artifact_type: artifact_type.to_string(),
+        version,
+        parent_version_id,
+        output_name: Some(output_name.to_string()),
+        created_at: now,
+        updated_at: now,
+    })
 }
 
 async fn job_node_execution(
@@ -1039,10 +1041,12 @@ mod tests {
     }
 
     #[test]
-    fn create_pr_artifact_details_detects_required_name() {
+    fn create_pr_artifact_details_detects_stored_create_pr_name() {
+        // The generic `/artifact` alias resolves its identity to the terminal
+        // name, so a create-pr write is stored under `output_name = create-pr`.
         let payload = json!({"title":"Updated PR", "body":"Fresh description"});
         let details =
-            super::create_pr_artifact_details(&payload, None, Some("create-pr"), None, "document");
+            super::create_pr_artifact_details(&payload, None, Some("create-pr"), "create-pr");
         assert_eq!(
             details,
             Some((
@@ -1056,7 +1060,20 @@ mod tests {
     fn create_pr_artifact_details_ignores_non_pr_artifacts() {
         let payload = json!({"title":"Plan", "body":"Not a PR"});
         assert!(
-            super::create_pr_artifact_details(&payload, Some("plan"), None, None, "plan").is_none()
+            super::create_pr_artifact_details(&payload, Some("plan"), Some("plan"), "plan")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn create_pr_artifact_details_ignores_ctx_self_under_pr_terminal() {
+        // A ctx-self living doc (`notes`) written by a node whose terminal is
+        // create-pr must NOT sync the PR: keying is on the written artifact's own
+        // name/type, never the terminal contract name.
+        let payload = json!({"title":"Notes", "body":"scratch"});
+        assert!(
+            super::create_pr_artifact_details(&payload, Some("notes"), Some("notes"), "notes")
+                .is_none()
         );
     }
 
@@ -1258,5 +1275,143 @@ mod tests {
     fn non_object_base_yields_patch() {
         let merged = merge_artifact_payload(json!("scalar"), &json!({"content": "c"}));
         assert_eq!(merged, json!({"content": "c"}));
+    }
+
+    // --- Per-(job, output_name) version chains (CAIRN-1942) ---
+
+    async fn seed_artifact_job(db: &crate::storage::LocalDb) -> String {
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('p-art', 'default', 'Art', 'ART', '/tmp/art', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs (id, project_id, status, created_at, updated_at)
+                     VALUES ('job-art', 'p-art', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        "job-art".to_string()
+    }
+
+    /// Store a fresh version addressing `name` (used as both identity and type),
+    /// exercising the same per-name chain logic `store_artifact` drives.
+    async fn store_named_version(
+        db: &crate::storage::LocalDb,
+        job_id: &str,
+        name: &str,
+        data: &str,
+    ) -> super::StoredArtifact {
+        let job_id = job_id.to_string();
+        let name = name.to_string();
+        let data = data.to_string();
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            let name = name.clone();
+            let data = data.clone();
+            Box::pin(async move {
+                super::insert_next_artifact_version(conn, &job_id, &name, &name, &data, false).await
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn latest_version_for_name(
+        db: &crate::storage::LocalDb,
+        job_id: &str,
+        name: &str,
+    ) -> Option<i64> {
+        use crate::storage::RowExt;
+        let job_id = job_id.to_string();
+        let name = name.to_string();
+        db.read(|conn| {
+            let job_id = job_id.clone();
+            let name = name.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT version FROM artifacts WHERE job_id = ?1 AND output_name = ?2 ORDER BY version DESC LIMIT 1",
+                        (job_id.as_str(), name.as_str()),
+                    )
+                    .await?;
+                rows.next().await?.map(|row| row.i64(0)).transpose()
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn version_chains_are_independent_per_output_name() {
+        let db = crate::storage::migrated_test_db("artifact-chains.turso.db").await;
+        let job = seed_artifact_job(&db).await;
+
+        assert_eq!(
+            store_named_version(&db, &job, "plan", "{}").await.version,
+            1
+        );
+        assert_eq!(
+            store_named_version(&db, &job, "notes", "{}").await.version,
+            1
+        );
+        assert_eq!(
+            store_named_version(&db, &job, "plan", "{}").await.version,
+            2
+        );
+        assert_eq!(
+            store_named_version(&db, &job, "notes", "{}").await.version,
+            2
+        );
+        assert_eq!(
+            store_named_version(&db, &job, "plan", "{}").await.version,
+            3
+        );
+
+        // Each name advances on its own; a write to one never bumps the other.
+        assert_eq!(latest_version_for_name(&db, &job, "plan").await, Some(3));
+        assert_eq!(latest_version_for_name(&db, &job, "notes").await, Some(2));
+    }
+
+    #[tokio::test]
+    async fn parent_links_stay_within_one_name_chain() {
+        let db = crate::storage::migrated_test_db("artifact-parents.turso.db").await;
+        let job = seed_artifact_job(&db).await;
+
+        let plan_v1 = store_named_version(&db, &job, "plan", "{}").await;
+        assert!(plan_v1.parent_version_id.is_none());
+        // An unrelated name interleaves; it begins its own chain at v1.
+        let notes_v1 = store_named_version(&db, &job, "notes", "{}").await;
+        assert!(notes_v1.parent_version_id.is_none());
+        // plan v2 parents to plan v1, never to the interleaved notes write.
+        let plan_v2 = store_named_version(&db, &job, "plan", "{}").await;
+        assert_eq!(plan_v2.version, 2);
+        assert_eq!(
+            plan_v2.parent_version_id.as_deref(),
+            Some(plan_v1.artifact_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn single_name_chain_increments_like_before() {
+        let db = crate::storage::migrated_test_db("artifact-single.turso.db").await;
+        let job = seed_artifact_job(&db).await;
+
+        let v1 = store_named_version(&db, &job, "plan", "{}").await;
+        let v2 = store_named_version(&db, &job, "plan", "{}").await;
+        let v3 = store_named_version(&db, &job, "plan", "{}").await;
+        assert_eq!((v1.version, v2.version, v3.version), (1, 2, 3));
+        assert_eq!(
+            v3.parent_version_id.as_deref(),
+            Some(v2.artifact_id.as_str())
+        );
     }
 }

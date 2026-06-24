@@ -102,7 +102,6 @@ pub fn populate_worktree(
     );
 
     let mut result = PopulateResult::default();
-    let mut populated_paths: Vec<String> = Vec::new();
 
     for entry in entries {
         // Always skip .cairn/ directory
@@ -157,7 +156,6 @@ pub fn populate_worktree(
                     match fs.copy_dir_recursive(&src, &dst) {
                         Ok(()) => {
                             result.copied += 1;
-                            populated_paths.push(entry_path.to_string());
                         }
                         Err(e) => {
                             log::warn!("Recursive copy failed for {}: {}", entry, e);
@@ -168,7 +166,6 @@ pub fn populate_worktree(
                     match fs.copy_file(&src, &dst) {
                         Ok(()) => {
                             result.copied += 1;
-                            populated_paths.push(entry_path.to_string());
                         }
                         Err(e) => {
                             log::warn!("Copy failed for {}: {}", entry, e);
@@ -180,7 +177,6 @@ pub fn populate_worktree(
             "symlink" => match fs.symlink(&src, &dst) {
                 Ok(()) => {
                     result.symlinked += 1;
-                    populated_paths.push(entry_path.to_string());
                 }
                 Err(e) => {
                     log::warn!("Symlink failed for {}: {}", entry, e);
@@ -191,73 +187,12 @@ pub fn populate_worktree(
         }
     }
 
-    // Write populated paths to git excludes to prevent accidental commits
-    if !populated_paths.is_empty() {
-        if let Err(e) = write_seeded_excludes(git, fs, worktree_path, &populated_paths) {
-            log::warn!("Failed to write git excludes for populated paths: {}", e);
-        }
-    }
-
+    // Explicitly-populated gitignored content is kept UNCOMMITTED by the jj
+    // store's `snapshot.auto-track` exclude, set before this populate runs and
+    // verified by the security backstop in `prepare_worktree_for_job`. (The old
+    // `.git/info/exclude` seeding was a no-op in a `.jj`-only workspace, which
+    // has no `.git`.)
     Ok(result)
-}
-
-/// Append seeded paths to the worktree's local git exclude file.
-///
-/// Uses `git rev-parse --git-dir` from the worktree to locate the correct
-/// exclude file (works for both main repos and linked worktrees).
-fn write_seeded_excludes(
-    git: &dyn GitClient,
-    fs: &dyn FileSystem,
-    worktree_path: &Path,
-    paths: &[String],
-) -> Result<(), String> {
-    let git_dir = git
-        .rev_parse(worktree_path, vec!["--git-dir".to_string()])?
-        .trim()
-        .to_string();
-
-    let git_dir_path = if Path::new(&git_dir).is_absolute() {
-        PathBuf::from(&git_dir)
-    } else {
-        worktree_path.join(&git_dir)
-    };
-
-    let exclude_path = git_dir_path.join("info").join("exclude");
-
-    // Ensure info/ directory exists
-    if let Some(parent) = exclude_path.parent() {
-        fs.create_dir_all(parent)?;
-    }
-
-    // Read existing content, append our entries under a marker
-    let existing = fs.read_to_string(&exclude_path).unwrap_or_default();
-
-    let marker = "# seeded by cairn (do not edit)";
-    if existing.contains(marker) {
-        // Already written — skip to avoid duplicates
-        return Ok(());
-    }
-
-    let mut new_content = existing;
-    if !new_content.is_empty() && !new_content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    new_content.push_str(marker);
-    new_content.push('\n');
-    for p in paths {
-        new_content.push_str(p);
-        new_content.push('\n');
-    }
-
-    fs.write_str(&exclude_path, &new_content)?;
-
-    log::info!(
-        "Wrote {} seeded paths to {}",
-        paths.len(),
-        exclude_path.display()
-    );
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -308,13 +243,6 @@ mod tests {
         fs.expect_is_symlink()
             .withf(move |p| p == destination.as_path())
             .returning(|_| false);
-    }
-
-    fn expect_simple_exclude_write(git: &mut MockGitClient, fs: &mut MockFileSystem) {
-        git.expect_rev_parse()
-            .returning(|_, _| Ok("/repo/.git/worktrees/wt\n".to_string()));
-        fs.expect_read_to_string().returning(|_| Ok(String::new()));
-        fs.expect_write_str().returning(|_, _| Ok(()));
     }
 
     #[test]
@@ -395,20 +323,6 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        // Exclude file writing
-        git.expect_rev_parse()
-            .returning(|_, _| Ok("/repo/.git/worktrees/worktree\n".to_string()));
-        fs.expect_read_to_string().returning(|_| Ok(String::new()));
-        fs.expect_write_str()
-            .withf(|path, contents| {
-                path == Path::new("/repo/.git/worktrees/worktree/info/exclude")
-                    && contents.contains("# seeded by cairn")
-                    && contents.contains(".env")
-                    && contents.contains("target")
-            })
-            .times(1)
-            .returning(|_, _| Ok(()));
-
         let r = populate_ok(&git, &fs, &config);
         assert_eq!(r.copied, 1);
         assert_eq!(r.symlinked, 1);
@@ -459,8 +373,6 @@ mod tests {
 
         // Should copy, NOT symlink
         fs.expect_copy_file().times(1).returning(|_, _| Ok(()));
-
-        expect_simple_exclude_write(&mut git, &mut fs);
 
         let r = populate_ok(&git, &fs, &config);
         assert_eq!(r.copied, 1);
@@ -530,8 +442,6 @@ mod tests {
             })
             .times(1)
             .returning(|_, _| Ok(()));
-
-        expect_simple_exclude_write(&mut git, &mut fs);
 
         let r = populate_ok(&git, &fs, &config);
         assert_eq!(r.copied, 1);
@@ -603,9 +513,6 @@ mod tests {
                 Ok(())
             }
         });
-
-        // Exclude file writing for the one successfully copied path
-        expect_simple_exclude_write(&mut git, &mut fs);
 
         let r = populate_ok(&git, &fs, &config);
         assert_eq!(r.copied, 1);

@@ -47,6 +47,7 @@ fn codex_context_tokens_from_notification(
     params: &Value,
     run_id: &str,
     session_id: Option<String>,
+    backend: String,
     model: Option<String>,
     captured_at: i64,
 ) -> Option<(Usage, ContextTokenState)> {
@@ -74,7 +75,7 @@ fn codex_context_tokens_from_notification(
     let state = ContextTokenState {
         run_id: run_id.to_string(),
         session_id,
-        backend: "codex".to_string(),
+        backend,
         model,
         used_tokens: last_total_tokens,
         context_window,
@@ -193,6 +194,7 @@ impl CodexBackend {
         current_turn_id: Arc<Mutex<Option<String>>>,
         oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
         initial_sequence: i32,
+        backend_key: String,
     ) {
         log::debug!("codex_app_server: reader started");
         let mut sequence: i32 = initial_sequence;
@@ -972,6 +974,7 @@ impl CodexBackend {
                             params,
                             run_id,
                             session_id.clone(),
+                            backend_key.clone(),
                             model,
                             chrono::Utc::now().timestamp(),
                         ) {
@@ -1153,6 +1156,7 @@ mod tests {
             &notification(18_676, 18_676),
             "run-1",
             Some("session-1".to_string()),
+            "codex".to_string(),
             Some("gpt-5".to_string()),
             123,
         )
@@ -1175,6 +1179,7 @@ mod tests {
             &notification(40_000, 18_676),
             "run-1",
             Some("session-1".to_string()),
+            "codex".to_string(),
             Some("gpt-5".to_string()),
             123,
         )
