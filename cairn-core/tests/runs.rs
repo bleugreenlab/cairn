@@ -49,6 +49,8 @@ async fn insert_job(db: &LocalDb, id: &str, project_id: &str, issue_id: Option<&
     .unwrap();
 }
 
+// Row-insert seed helper; the parameter list mirrors the runs table columns.
+#[allow(clippy::too_many_arguments)]
 async fn insert_run(
     db: &LocalDb,
     id: &str,
@@ -145,6 +147,8 @@ async fn set_job_current_turn(db: &LocalDb, job_id: &str, turn_id: &str) {
     .unwrap();
 }
 
+// Row-insert seed helper; the parameter list mirrors the events table columns.
+#[allow(clippy::too_many_arguments)]
 async fn insert_event(
     db: &LocalDb,
     id: &str,

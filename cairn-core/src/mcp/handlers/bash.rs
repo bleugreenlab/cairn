@@ -27,6 +27,7 @@ use crate::mcp::git::GitAuthor;
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
+use cairn_common::read::{ImageBlock, RunBatchEnvelope};
 use cairn_common::uri::CairnResource;
 
 /// PTY data event payload (mirrors Tauri-side PtyDataPayload)
@@ -135,6 +136,24 @@ struct ItemOutcome {
     /// The item durably suspended on a worktree-fence approval; the whole batch
     /// re-runs on resume. Carried so `handle_run` can surface the suspend marker.
     suspended: bool,
+    /// Image content blocks this item produced. Only an external MCP `tools/call`
+    /// returns them today; collected across the batch into the run envelope so the
+    /// transport edge delivers them as real image content blocks (read-path mirror).
+    images: Vec<ImageBlock>,
+}
+
+impl ItemOutcome {
+    /// A failed item carrying `header` and `body`, with no image blocks — the
+    /// common shape for every error / denial / spawn-failure path.
+    fn failed(header: String, body: impl Into<String>) -> Self {
+        Self {
+            header,
+            body: body.into(),
+            succeeded: false,
+            suspended: false,
+            images: Vec::new(),
+        }
+    }
 }
 
 /// Aborts a spawned task if dropped before it is awaited to completion.
@@ -278,11 +297,14 @@ pub fn redact_command(command: &str) -> String {
 pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     let payload: RunPayload = match super::parse_payload(request) {
         Ok(payload) => payload,
-        Err(error) => return error,
+        Err(error) => return run_envelope(error, Vec::new()),
     };
 
     if payload.commands.is_empty() {
-        return "Invalid payload: `commands` must contain at least one item".to_string();
+        return run_envelope(
+            "Invalid payload: `commands` must contain at least one item".to_string(),
+            Vec::new(),
+        );
     }
 
     let cwd = request.cwd.clone();
@@ -300,10 +322,13 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // commit barrier itself cannot help here: NonWorktreeVcs is a read-only
     // no-op that must never seal or revert the user's checkout.)
     if commit_present && !crate::jj::is_jj_dir(std::path::Path::new(&cwd)) {
-        return "Commits require a worktree. This agent runs on the project's live checkout \
-                (no worktree), so a run carrying commit_msg cannot commit and no commands were \
-                executed. Changes can only be made in a worktree."
-            .to_string();
+        return run_envelope(
+            "Commits require a worktree. This agent runs on the project's live checkout \
+             (no worktree), so a run carrying commit_msg cannot commit and no commands were \
+             executed. Changes can only be made in a worktree."
+                .to_string(),
+            Vec::new(),
+        );
     }
 
     // Look up streaming/run context once for the whole batch. Prefer the
@@ -419,12 +444,10 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         for handle in &mut handles {
             match (&mut handle.0).await {
                 Ok(outcome) => outcomes.push(outcome),
-                Err(e) => outcomes.push(ItemOutcome {
-                    header: "<item>".to_string(),
-                    body: format!("Failed to join run task: {e}"),
-                    succeeded: false,
-                    suspended: false,
-                }),
+                Err(e) => outcomes.push(ItemOutcome::failed(
+                    "<item>".to_string(),
+                    format!("Failed to join run task: {e}"),
+                )),
             }
         }
         outcomes
@@ -433,9 +456,12 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // If any item durably suspended on a worktree-fence approval, return the
     // suspend marker for the whole call; the run re-drives the batch on resume.
     if outcomes.iter().any(|o| o.suspended) {
-        return "Run suspended pending worktree fence approval; resume will \
-                continue once it is answered."
-            .to_string();
+        return run_envelope(
+            "Run suspended pending worktree fence approval; resume will \
+             continue once it is answered."
+                .to_string(),
+            Vec::new(),
+        );
     }
 
     let mut result = compose_run_output(&outcomes);
@@ -453,14 +479,27 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             .map(|(name, email)| GitAuthor::new(name, email)),
         None => None,
     };
-    let barrier = run_commit_barrier(
-        vcs.as_ref(),
-        worktree_path,
-        payload.commit_msg.as_deref(),
-        all_ok,
-        status_before.as_ref(),
-        author.as_ref(),
-    );
+    // Serialize the seal/discard inside the barrier on the per-store jj lock that
+    // base-advance reconcile and merge-fold also hold, so a run-path seal never
+    // forks the shared store's operation log against a concurrent reconcile/fold.
+    // The guard scopes ONLY the barrier's store mutation — the pre-batch snapshot
+    // and per-item command execution above stay outside it (per-workspace reads /
+    // FS work, not shared-store rebase/import). `None` for a non-worktree cwd.
+    let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+    let barrier = {
+        let _store_guard = match store_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        run_commit_barrier(
+            vcs.as_ref(),
+            worktree_path,
+            payload.commit_msg.as_deref(),
+            all_ok,
+            status_before.as_ref(),
+            author.as_ref(),
+        )
+    };
     if barrier.worktree_changed {
         let _ = orch.services.emitter.emit(
             "worktree-changed",
@@ -485,11 +524,13 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         result.push_str(note);
     }
 
-    if result.is_empty() {
+    let text = if result.is_empty() {
         "(no output)".to_string()
     } else {
         result
-    }
+    };
+    let images = collect_run_images(outcomes);
+    run_envelope(text, images)
 }
 
 /// Outcome of the post-batch commit barrier.
@@ -576,35 +617,57 @@ pub(super) fn run_commit_barrier(
             // hygiene gate must not mask it.
             if all_ok {
                 if let Some(before) = before {
-                    if matches!(vcs.changed_since(worktree_path, before), Ok(true)) {
-                        // A non-worktree backend (the project's live checkout)
-                        // cannot revert: rolling it back would destroy the user's
-                        // own uncommitted work. Changes can only happen in a
-                        // worktree, so the stray dirt is left in place and the
-                        // agent is warned loudly instead of (falsely) told it was
-                        // reverted. See `docs/worktree-fence.md`.
-                        if !vcs.can_revert() {
-                            message.push_str(
-                                "\u{26a0}\u{fe0f} This run wrote into the project's live checkout, but changes can only be made in a worktree. The changes were left in place — the live checkout is not reverted, because that could destroy your own uncommitted work — so review and clean them up (`git status` / `git restore`). To make changes that persist, run inside a worktree.",
-                            );
-                            return CommitBarrierOutcome {
-                                message,
-                                worktree_changed,
-                                committed,
-                            };
+                    // A stale `@` blocks `changed_since` too (jj's diff snapshots,
+                    // and snapshotting is what staleness refuses), so it returns
+                    // `Err`, not `Ok(true)`. Treat a stale read as "changed": the
+                    // batch's loose edits are real dirt that must not persist, and
+                    // the stale-resilient `discard` self-heals them to HEAD.
+                    match vcs.changed_since(worktree_path, before) {
+                        Ok(true) => {
+                            // A non-worktree backend (the project's live checkout)
+                            // cannot revert: rolling it back would destroy the
+                            // user's own uncommitted work. Changes can only happen
+                            // in a worktree, so the stray dirt is left in place and
+                            // the agent is warned loudly instead of (falsely) told
+                            // it was reverted. See `docs/worktree-fence.md`.
+                            if !vcs.can_revert() {
+                                message.push_str(
+                                    "\u{26a0}\u{fe0f} This run wrote into the project's live checkout, but changes can only be made in a worktree. The changes were left in place — the live checkout is not reverted, because that could destroy your own uncommitted work — so review and clean them up (`git status` / `git restore`). To make changes that persist, run inside a worktree.",
+                                );
+                                return CommitBarrierOutcome {
+                                    message,
+                                    worktree_changed,
+                                    committed,
+                                };
+                            }
+                            let reset_ok = vcs.discard(worktree_path);
+                            worktree_changed = true;
+                            if let Err(e) = reset_ok {
+                                message.push_str(&format!(
+                                    "\u{26a0}\u{fe0f} Run changed the worktree but no commit_msg was given. Failed to restore the worktree to HEAD: {}. Run with commit_msg like `run({{commands:[…], commit_msg)`, then retry.",
+                                    e
+                                ));
+                            } else {
+                                message.push_str(
+                                    "\u{26a0}\u{fe0f} Run reverted: it changed the worktree but no commit_msg was given. Run with commit_msg like `run({commands:[…], commit_msg)`, then retry.",
+                                );
+                            }
                         }
-                        let reset_ok = vcs.discard(worktree_path);
-                        worktree_changed = true;
-                        if let Err(e) = reset_ok {
-                            message.push_str(&format!(
-                                "\u{26a0}\u{fe0f} Run changed the worktree but no commit_msg was given. Failed to restore the worktree to HEAD: {}. Run with commit_msg like `run({{commands:[…], commit_msg)`, then retry.",
-                                e
-                            ));
-                        } else {
+                        Ok(false) => {}
+                        Err(e) if crate::jj::is_stale_error(&e) && vcs.can_revert() => {
+                            // A sibling advanced `@` out from under this run mid-batch.
+                            // The dirt can't be inspected (jj won't snapshot a stale
+                            // copy), so reconcile to the fresh HEAD via the
+                            // stale-resilient discard and tell the agent to retry.
+                            let _ = vcs.discard(worktree_path);
+                            worktree_changed = true;
                             message.push_str(
-                                "\u{26a0}\u{fe0f} Run reverted: it changed the worktree but no commit_msg was given. Run with commit_msg like `run({commands:[…], commit_msg)`, then retry.",
+                                "\u{26a0}\u{fe0f} Run hit a concurrent worktree advance and was reconciled to HEAD; no commit_msg was given. Re-run with commit_msg to keep changes.",
                             );
                         }
+                        // A non-stale read error (or a non-revertable backend) is
+                        // best-effort: leave the worktree as-is, as before.
+                        Err(_) => {}
                     }
                 }
             }
@@ -956,6 +1019,22 @@ fn water_fill_budgets(natural: &[usize], total: usize) -> Vec<usize> {
         left -= 1;
     }
     alloc
+}
+
+/// Serialize the run result into a [`RunBatchEnvelope`] for the transport edge.
+///
+/// The composed `text` and any `images` ride together so the CLI lifts each image
+/// into its own content block after the text, mirroring the read-batch envelope.
+/// Serializing a struct of string/array fields does not fail in practice; the
+/// fallback returns the bare text so a run never errors on rendering.
+fn run_envelope(text: String, images: Vec<ImageBlock>) -> String {
+    let envelope = RunBatchEnvelope { text, images };
+    serde_json::to_string(&envelope).unwrap_or(envelope.text)
+}
+
+/// Collect every item's image blocks across the batch, in item order.
+fn collect_run_images(outcomes: Vec<ItemOutcome>) -> Vec<ImageBlock> {
+    outcomes.into_iter().flat_map(|o| o.images).collect()
 }
 
 /// Compose per-item outcomes into a single result string, bounded by
@@ -1831,14 +1910,7 @@ async fn run_one(
 ) -> ItemOutcome {
     let spec = match spec {
         Ok(spec) => spec,
-        Err(e) => {
-            return ItemOutcome {
-                header,
-                body: e,
-                succeeded: false,
-                suspended: false,
-            }
-        }
+        Err(e) => return ItemOutcome::failed(header, e),
     };
 
     let (shell, flag) = if cfg!(windows) {
@@ -1887,14 +1959,7 @@ async fn run_one(
     .await
     {
         Ok(exec) => exec,
-        Err(e) => {
-            return ItemOutcome {
-                header,
-                body: format!("Failed to spawn command: {e}"),
-                succeeded: false,
-                suspended: false,
-            }
-        }
+        Err(e) => return ItemOutcome::failed(header, format!("Failed to spawn command: {e}")),
     };
 
     // Denial-driven worktree fence: if the kernel sandbox blocked this command,
@@ -1909,13 +1974,10 @@ async fn run_one(
         // chat would otherwise surface.
         if !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
             let _ = denial;
-            return ItemOutcome {
+            return ItemOutcome::failed(
                 header,
-                body: "This command tried to write the project's live checkout, which is read-only for agents — the write was blocked by the kernel sandbox. Changes can only be made in a worktree; nothing was left in the checkout. Re-run inside a worktree to make changes that persist."
-                    .to_string(),
-                succeeded: false,
-                suspended: false,
-            };
+                "This command tried to write the project's live checkout, which is read-only for agents — the write was blocked by the kernel sandbox. Changes can only be made in a worktree; nothing was left in the checkout. Re-run inside a worktree to make changes that persist.",
+            );
         }
         if let Some((run_id, fence_mode)) = fence::resolve_run_fence(orch, request).await {
             let crossing = match &denial {
@@ -1944,23 +2006,14 @@ async fn run_one(
                     {
                         Ok(e) => exec = e,
                         Err(e) => {
-                            return ItemOutcome {
+                            return ItemOutcome::failed(
                                 header,
-                                body: format!("Failed to spawn command: {e}"),
-                                succeeded: false,
-                                suspended: false,
-                            }
+                                format!("Failed to spawn command: {e}"),
+                            )
                         }
                     }
                 }
-                fence::FenceDecision::Deny(msg) => {
-                    return ItemOutcome {
-                        header,
-                        body: msg,
-                        succeeded: false,
-                        suspended: false,
-                    }
-                }
+                fence::FenceDecision::Deny(msg) => return ItemOutcome::failed(header, msg),
                 fence::FenceDecision::Suspended => {
                     return ItemOutcome {
                         header,
@@ -1969,6 +2022,7 @@ async fn run_one(
                             .to_string(),
                         succeeded: false,
                         suspended: true,
+                        images: Vec::new(),
                     }
                 }
             }
@@ -2000,12 +2054,7 @@ async fn run_one(
              {{subscribe:{{kind:\"terminal\", ref:\"{0}\", on:\"exit\"}}}}.",
             promoted.uri
         ));
-        return ItemOutcome {
-            header,
-            body,
-            succeeded: false,
-            suspended: false,
-        };
+        return ItemOutcome::failed(header, body);
     }
 
     let succeeded = !exec.timed_out && exec.exit_code.is_none_or(|code| code == 0);
@@ -2025,6 +2074,7 @@ async fn run_one(
         body,
         succeeded,
         suspended: false,
+        images: Vec::new(),
     }
 }
 
@@ -2045,12 +2095,7 @@ async fn run_mcp_call(
         timeout,
     } = spec;
     let Some(gateway) = orch.mcp_gateway() else {
-        return ItemOutcome {
-            header,
-            body: "MCP gateway is not available in this host".to_string(),
-            succeeded: false,
-            suspended: false,
-        };
+        return ItemOutcome::failed(header, "MCP gateway is not available in this host");
     };
 
     // Per-session connection pooling keys on the run's job id, isolating
@@ -2063,18 +2108,14 @@ async fn run_mcp_call(
         .call_tool(&session_key, &credential_key, &config, &tool, args, timeout)
         .await
     {
-        Ok(body) => ItemOutcome {
+        Ok(result) => ItemOutcome {
             header,
-            body,
+            body: result.text,
             succeeded: true,
             suspended: false,
+            images: result.images,
         },
-        Err(e) => ItemOutcome {
-            header,
-            body: e,
-            succeeded: false,
-            suspended: false,
-        },
+        Err(e) => ItemOutcome::failed(header, e),
     }
 }
 
@@ -2177,6 +2218,14 @@ async fn execute_process(
             )
             .sandbox(sandbox_policy),
     );
+    // Make bare `git`/`jj` behave correctly inside a jj-only worktree: managed
+    // `JJ_CONFIG`/editor so a bare `jj` commit is pushable, and a
+    // `GIT_CEILING_DIRECTORIES` ceiling so a bare `git` fails loudly instead of
+    // resolving up to the `~/.cairn` HOME repo. Empty (no-op) for a non-worktree
+    // (live-checkout) cwd, so that path is untouched.
+    for (k, v) in crate::mcp::vcs::worktree_shell_vcs_env(orch, std::path::Path::new(cwd)) {
+        spawn_config = spawn_config.env(&k, &v);
+    }
     if let Ok(secret) = orch.mcp_auth.get_secret_for_mcp() {
         spawn_config = spawn_config.env("CAIRN_MCP_SECRET", &secret);
     }
@@ -3122,6 +3171,59 @@ fn glob_covers_checkout(glob: &str, checkout: &std::path::Path) -> bool {
     prefix.starts_with(&checkout) || checkout.starts_with(&prefix)
 }
 
+fn is_safe_jj_workspace_refresh_status_command(command: &str) -> bool {
+    let segments: Vec<&str> = command.split("&&").map(str::trim).collect();
+    if segments.len() != 2 {
+        return false;
+    }
+
+    let refresh: Vec<&str> = segments[0].split_whitespace().collect();
+    let status: Vec<&str> = segments[1].split_whitespace().collect();
+
+    matches!(refresh.as_slice(), ["jj", "workspace", "update-stale"])
+        && matches!(status.as_slice(), ["jj", "st" | "status"])
+}
+
+fn jj_workspace_repo_dir(worktree: &std::path::Path) -> Option<std::path::PathBuf> {
+    let pointer_path = worktree.join(".jj").join("repo");
+    let pointer = std::fs::read_to_string(&pointer_path).ok()?;
+    let pointer = pointer.trim();
+    if pointer.is_empty() {
+        return None;
+    }
+
+    let raw_repo_dir = std::path::Path::new(pointer);
+    let repo_dir = if raw_repo_dir.is_absolute() {
+        raw_repo_dir.to_path_buf()
+    } else {
+        pointer_path.parent()?.join(raw_repo_dir)
+    };
+
+    Some(repo_dir.canonicalize().unwrap_or(repo_dir))
+}
+
+fn apply_safe_jj_workspace_refresh_status_carveout(
+    policy: &mut sandbox::SandboxPolicy,
+    checkout: &std::path::Path,
+    command_for_grant: Option<&str>,
+) {
+    let Some(command) = command_for_grant else {
+        return;
+    };
+    if !is_safe_jj_workspace_refresh_status_command(command) {
+        return;
+    }
+    let Some(repo_dir) = jj_workspace_repo_dir(checkout) else {
+        return;
+    };
+
+    // `jj workspace update-stale && jj st` is Cairn's own workspace-refresh
+    // probe. Non-colocated jj workspaces keep the repo metadata behind a
+    // `.jj/repo` pointer outside the worktree, so allow that exact metadata path
+    // without turning the rest of the command into an unconfined run.
+    policy.writable_extra.push(repo_dir);
+}
+
 /// Build the OS sandbox policy for a run, or `None` when no confinement applies.
 async fn build_run_sandbox_policy(
     orch: &Orchestrator,
@@ -3242,6 +3344,9 @@ async fn build_run_sandbox_policy(
     } else {
         sandbox::SandboxPolicy::for_run(checkout, &granted, deny_read)
     };
+    if !non_worktree {
+        apply_safe_jj_workspace_refresh_status_carveout(&mut policy, checkout, command_for_grant);
+    }
     // Writable carveout scopes are globs: realize them as macOS SBPL regex grants
     // (matching the build-service mechanism), and additionally as a concrete
     // writable subpath for any wildcard-free scope so the Linux landlock path
@@ -3366,6 +3471,12 @@ async fn spawn_terminal_session(
     }
     cmd.env("PATH", crate::env::get_user_path());
     apply_non_interactive_pager_env_to_pty(&mut cmd);
+    // Same jj-only worktree VCS env as the inline spawn path, applied to the PTY /
+    // background-terminal spawn too (the background-terminal regression hides if
+    // only the inline path is patched). Empty for a non-worktree cwd.
+    for (k, v) in crate::mcp::vcs::worktree_shell_vcs_env(orch, std::path::Path::new(&target.cwd)) {
+        cmd.env(k, v);
+    }
     cmd.env("CAIRN_WORKTREE", &target.cwd);
     cmd.env(
         "CAIRN_CALLBACK_URL",
@@ -4237,6 +4348,100 @@ mod tests {
         assert!(!glob_covers_checkout("/scratch/ok", checkout));
     }
 
+    #[test]
+    fn safe_jj_workspace_refresh_status_command_accepts_exact_status_forms() {
+        assert!(is_safe_jj_workspace_refresh_status_command(
+            "jj workspace update-stale && jj st"
+        ));
+        assert!(is_safe_jj_workspace_refresh_status_command(
+            "  jj   workspace   update-stale   &&   jj   status  "
+        ));
+    }
+
+    #[test]
+    fn safe_jj_workspace_refresh_status_command_rejects_extra_shell_work() {
+        assert!(!is_safe_jj_workspace_refresh_status_command(
+            "jj workspace update-stale && jj st && touch outside"
+        ));
+        assert!(!is_safe_jj_workspace_refresh_status_command(
+            "jj workspace update-stale; touch outside && jj st"
+        ));
+        assert!(!is_safe_jj_workspace_refresh_status_command(
+            "jj workspace update-stale && jj log"
+        ));
+    }
+
+    #[test]
+    fn jj_workspace_repo_dir_resolves_relative_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("ws");
+        let jj_dir = worktree.join(".jj");
+        let store_repo = dir.path().join("store").join(".jj").join("repo");
+        std::fs::create_dir_all(&jj_dir).unwrap();
+        std::fs::create_dir_all(&store_repo).unwrap();
+        std::fs::write(jj_dir.join("repo"), "../../store/.jj/repo\n").unwrap();
+
+        assert_eq!(
+            jj_workspace_repo_dir(&worktree).unwrap(),
+            store_repo.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn safe_jj_workspace_refresh_status_carveout_grants_only_repo_pointer_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("ws");
+        let jj_dir = worktree.join(".jj");
+        let store_repo = dir.path().join("store").join(".jj").join("repo");
+        std::fs::create_dir_all(&jj_dir).unwrap();
+        std::fs::create_dir_all(&store_repo).unwrap();
+        std::fs::write(jj_dir.join("repo"), "../../store/.jj/repo\n").unwrap();
+
+        let mut policy = sandbox::SandboxPolicy {
+            worktree: worktree.clone(),
+            writable_extra: vec![],
+            deny_read: vec![],
+            writable_regex: vec![],
+            worktree_writable: true,
+        };
+        apply_safe_jj_workspace_refresh_status_carveout(
+            &mut policy,
+            &worktree,
+            Some("jj workspace update-stale && jj st"),
+        );
+
+        assert_eq!(
+            policy.writable_extra,
+            vec![store_repo.canonicalize().unwrap()]
+        );
+    }
+
+    #[test]
+    fn safe_jj_workspace_refresh_status_carveout_rejects_other_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join("ws");
+        let jj_dir = worktree.join(".jj");
+        let store_repo = dir.path().join("store").join(".jj").join("repo");
+        std::fs::create_dir_all(&jj_dir).unwrap();
+        std::fs::create_dir_all(&store_repo).unwrap();
+        std::fs::write(jj_dir.join("repo"), "../../store/.jj/repo\n").unwrap();
+
+        let mut policy = sandbox::SandboxPolicy {
+            worktree: worktree.clone(),
+            writable_extra: vec![],
+            deny_read: vec![],
+            writable_regex: vec![],
+            worktree_writable: true,
+        };
+        apply_safe_jj_workspace_refresh_status_carveout(
+            &mut policy,
+            &worktree,
+            Some("jj workspace update-stale && jj st && touch outside"),
+        );
+
+        assert!(policy.writable_extra.is_empty());
+    }
+
     // ── redact_command tests ───────────────────────────────────────────────
 
     #[test]
@@ -4368,7 +4573,54 @@ mod tests {
             body: body.to_string(),
             succeeded,
             suspended: false,
+            images: Vec::new(),
         }
+    }
+
+    #[test]
+    fn run_envelope_round_trips_text_and_images() {
+        // The run result is serialized as a RunBatchEnvelope so the transport
+        // edge can lift each image into its own content block. Round-trip an
+        // image-bearing result to prove the carrier preserves both.
+        let image = ImageBlock {
+            mime_type: "image/png".to_string(),
+            data: "b64".to_string(),
+        };
+        let json = run_envelope("=== look ===\nAX tree".to_string(), vec![image.clone()]);
+        let parsed: RunBatchEnvelope = serde_json::from_str(&json).expect("valid envelope JSON");
+        assert_eq!(parsed.text, "=== look ===\nAX tree");
+        assert_eq!(parsed.images, vec![image]);
+    }
+
+    #[test]
+    fn collect_run_images_gathers_in_item_order() {
+        let img_a = ImageBlock {
+            mime_type: "image/png".to_string(),
+            data: "a".to_string(),
+        };
+        let img_b = ImageBlock {
+            mime_type: "image/png".to_string(),
+            data: "b".to_string(),
+        };
+        let outcomes = vec![
+            ItemOutcome {
+                header: "look".to_string(),
+                body: "tree".to_string(),
+                succeeded: true,
+                suspended: false,
+                images: vec![img_a.clone()],
+            },
+            // A text-only item contributes no images and is skipped.
+            ItemOutcome::failed("echo".to_string(), "out"),
+            ItemOutcome {
+                header: "look2".to_string(),
+                body: "tree2".to_string(),
+                succeeded: true,
+                suspended: false,
+                images: vec![img_b.clone()],
+            },
+        ];
+        assert_eq!(collect_run_images(outcomes), vec![img_a, img_b]);
     }
 
     #[test]
@@ -4842,6 +5094,64 @@ mod commit_barrier_tests {
         let no_msg = run_commit_barrier(&NonWorktreeVcs, wt(), None, true, Some(&before), None);
         assert!(!no_msg.worktree_changed);
         assert!(no_msg.message.is_empty());
+    }
+
+    #[test]
+    fn commit_msg_stale_seal_restores_worktree_to_head() {
+        // A stale-`@` seal failure routes through the (now stale-resilient)
+        // discard exactly like any other seal failure: the barrier restores and
+        // never claims a commit. The self-heal itself lives in `jj::discard`; here
+        // the FakeVcs feeds a genuine stale string so the path is exercised.
+        let vcs = FakeVcs::new().dirty(Ok(true)).seal(Err(
+            "Error: The working copy is stale (not updated since operation abc).".to_string(),
+        ));
+        let out = run_commit_barrier(&vcs, wt(), Some("write batch"), true, None, None);
+        assert_eq!(vcs.seals(), 1);
+        assert_eq!(vcs.discards(), 1, "a stale seal failure restores to HEAD");
+        assert!(!out.committed, "a failed stale seal must not set committed");
+        assert!(
+            out.message.contains("restored to HEAD"),
+            "got: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn none_commit_msg_reconciles_when_changed_since_is_stale() {
+        // No commit_msg + a stale `changed_since` read (jj can't snapshot a stale
+        // copy, so it errors rather than returning Ok(true)) must still reconcile
+        // to HEAD via the stale-resilient discard, not skip the revert and orphan
+        // the dirt. Classification flows through the real `crate::jj::is_stale_error`.
+        let before = VcsSnapshot("entry".to_string());
+        let vcs = FakeVcs::new().changed(Err(
+            "Error: The working copy is stale (not updated since operation abc).".to_string(),
+        ));
+        let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None);
+        assert_eq!(vcs.discards(), 1, "a stale read reconciles to HEAD");
+        assert!(out.worktree_changed);
+        assert!(!out.committed);
+        assert!(
+            out.message.contains("concurrent worktree advance"),
+            "got: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn none_commit_msg_stale_read_left_alone_when_backend_cannot_revert() {
+        // The non-revertable live checkout must NOT discard even on a stale read:
+        // reverting it could destroy the user's own work. The stale arm is gated
+        // on `can_revert`, so a false backend leaves the worktree untouched.
+        let before = VcsSnapshot("entry".to_string());
+        let vcs = FakeVcs::new()
+            .changed(Err(
+                "Error: The working copy is stale (not updated since operation abc).".to_string(),
+            ))
+            .can_revert(false);
+        let out = run_commit_barrier(&vcs, wt(), None, true, Some(&before), None);
+        assert_eq!(vcs.discards(), 0, "the live checkout is never reverted");
+        assert!(!out.worktree_changed);
+        assert!(out.message.is_empty(), "got: {}", out.message);
     }
 }
 

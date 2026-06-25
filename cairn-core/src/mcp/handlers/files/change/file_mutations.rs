@@ -133,28 +133,6 @@ async fn get_agent_commit_prefix_async(orch: &Orchestrator, cwd: &str) -> Result
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::changed_line_counts;
-
-    #[test]
-    fn line_counts_added_file() {
-        assert_eq!(changed_line_counts(None, Some("one\ntwo\n")), (2, 0));
-    }
-
-    #[test]
-    fn line_counts_deleted_file() {
-        assert_eq!(changed_line_counts(Some("one\ntwo\n"), None), (0, 2));
-    }
-
-    #[test]
-    fn line_counts_modified_file() {
-        let before = "keep\nremove\nold\n";
-        let after = "keep\nadd\nnew\n";
-        assert_eq!(changed_line_counts(Some(before), Some(after)), (2, 2));
-    }
-}
-
 async fn record_file_change_async(
     orch: &Orchestrator,
     cwd: &str,
@@ -299,6 +277,21 @@ pub(super) struct FileBatchSuccess {
     pub(super) applied: Vec<AppliedChange>,
     pub(super) affected_paths: Vec<String>,
     pub(super) recorded_changes: Vec<RecordFileChange>,
+}
+
+/// Outcome of [`finalize_file_commit`]'s seal attempt.
+///
+/// `Done` is the normal terminal state (sealed, or nothing to seal). `StaleRetry`
+/// means the seal hit a STALE working copy: a sibling rewrote `@` over the shared
+/// store between apply and seal. The edits are deliberately left ON DISK (not
+/// discarded), so `handle_change` can update-stale, re-apply against the advanced
+/// base, and re-seal — recovering the batch instead of losing it. It carries the
+/// seal error string so the giveup path can report what went wrong. Only the
+/// write+commit_msg path can recover (the handler can re-derive its intended
+/// content); the run path can't, so it reverts via the stale-resilient discard.
+pub(super) enum CommitOutcome {
+    Done(Option<CommitReport>),
+    StaleRetry { seal_error: String },
 }
 
 pub(super) struct RecordFileChange {
@@ -1194,9 +1187,9 @@ pub(super) async fn finalize_file_commit(
     recorded_changes: &[RecordFileChange],
     first_change: &IndexedChange<'_>,
     promoted_memory_uris: &[String],
-) -> IndexedResult<Option<CommitReport>> {
+) -> IndexedResult<CommitOutcome> {
     if affected_paths.is_empty() {
-        return Ok(None);
+        return Ok(CommitOutcome::Done(None));
     }
 
     // Record the file changes for this job as soon as they're applied — NOT only
@@ -1313,7 +1306,7 @@ pub(super) async fn finalize_file_commit(
             // File changes were already recorded above (on apply); committing
             // does not re-record them.
             emit_worktree_changed(orch, &request.cwd);
-            Ok(Some(CommitReport {
+            Ok(CommitOutcome::Done(Some(CommitReport {
                 status: if commit_msg == "^" {
                     "amended"
                 } else {
@@ -1323,7 +1316,16 @@ pub(super) async fn finalize_file_commit(
                 sha: Some(result.sha),
                 pr_number: result.pr_number,
                 message: None,
-            }))
+            })))
+        }
+        Err(e) if crate::jj::is_stale_error(&e) => {
+            // A sibling advanced `@` over the shared store between apply and seal.
+            // Do NOT discard here: the edits stay on disk so `handle_change` can
+            // update-stale, re-apply against the advanced base, and re-seal —
+            // recovering the batch rather than losing it. The fallback (if that
+            // recovery can't land) is the stale-resilient discard, which keeps the
+            // worktree==HEAD invariant regardless.
+            Ok(CommitOutcome::StaleRetry { seal_error: e })
         }
         Err(e) => {
             // The edits were applied but the commit failed. Restore the worktree
@@ -1354,5 +1356,27 @@ pub(super) async fn finalize_file_commit(
                 }),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changed_line_counts;
+
+    #[test]
+    fn line_counts_added_file() {
+        assert_eq!(changed_line_counts(None, Some("one\ntwo\n")), (2, 0));
+    }
+
+    #[test]
+    fn line_counts_deleted_file() {
+        assert_eq!(changed_line_counts(Some("one\ntwo\n"), None), (0, 2));
+    }
+
+    #[test]
+    fn line_counts_modified_file() {
+        let before = "keep\nremove\nold\n";
+        let after = "keep\nadd\nnew\n";
+        assert_eq!(changed_line_counts(Some(before), Some(after)), (2, 2));
     }
 }

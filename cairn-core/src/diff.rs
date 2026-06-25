@@ -22,7 +22,7 @@
 //! ## Change-group
 //!
 //! A worktree-owning node and its worktree-inheriting recipe children
-//! (QuickBuild/Documenter/Proctor) record their own `file_changes` rows under
+//! (Build/Documenter/Proctor) record their own `file_changes` rows under
 //! their own `job_id` but share one `worktree_path`. The change-group is thus
 //! every job in the execution sharing that path; an owner that delegated all of
 //! its writes has zero rows under its own `job_id`, so the aggregation must span

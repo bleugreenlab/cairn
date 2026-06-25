@@ -481,235 +481,6 @@ fn render_recent_project_issue_entries(
     output
 }
 
-#[cfg(test)]
-mod project_issues_query_tests {
-    use super::*;
-    use crate::labels::{
-        attach::replace_issue_labels,
-        crud::{create_label_conn, DEFAULT_WORKSPACE_ID},
-    };
-    use crate::models::CreateLabel;
-    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
-    use tempfile::tempdir;
-
-    fn param(key: &str, value: &str) -> QueryParam {
-        QueryParam {
-            key: key.to_string(),
-            value: value.to_string(),
-        }
-    }
-
-    #[test]
-    fn parses_status_limit_sort_and_ready() {
-        let query = ProjectIssuesQuery::parse(&[
-            param("status", "backlog,active"),
-            param("limit", "10"),
-            param("sort", "updated_desc"),
-            param("ready", "1"),
-        ])
-        .unwrap();
-
-        assert_eq!(
-            query.statuses,
-            Some(vec!["backlog".to_string(), "active".to_string()])
-        );
-        assert_eq!(query.limit, 10);
-        assert_eq!(query.sort_field, ProjectIssuesSortField::Updated);
-        assert_eq!(query.sort_dir, ProjectIssuesSortDir::Desc);
-        assert_eq!(query.ready, Some(true));
-    }
-
-    #[test]
-    fn defaults_limit_and_sort() {
-        let query = ProjectIssuesQuery::parse(&[]).unwrap();
-        assert_eq!(query.limit, 20);
-        assert_eq!(query.sort_field, ProjectIssuesSortField::Updated);
-        assert_eq!(query.sort_dir, ProjectIssuesSortDir::Desc);
-    }
-
-    #[test]
-    fn rejects_invalid_values() {
-        assert!(ProjectIssuesQuery::parse(&[param("sort", "number_desc")])
-            .unwrap_err()
-            .contains("Invalid sort query parameter"));
-        assert!(ProjectIssuesQuery::parse(&[param("limit", "0")])
-            .unwrap_err()
-            .contains("Invalid limit query parameter"));
-        assert!(ProjectIssuesQuery::parse(&[param("ready", "maybe")])
-            .unwrap_err()
-            .contains("Invalid ready query parameter"));
-        assert!(ProjectIssuesQuery::parse(&[param("status", "open")])
-            .unwrap_err()
-            .contains("Invalid status query parameter"));
-    }
-
-    #[test]
-    fn rejects_unknown_params_with_supported_list() {
-        let error = ProjectIssuesQuery::parse(&[param("foo", "bar")]).unwrap_err();
-        assert!(error.contains("Unsupported query parameter 'foo' for project issues"));
-        assert!(error
-            .contains("Supported parameters: status, limit, offset, sort, ready, label, labels"));
-    }
-
-    async fn test_db() -> LocalDb {
-        let temp = tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("project-labels.db"))
-            .await
-            .unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-        db
-    }
-
-    async fn seed_project(conn: &turso::Connection) {
-        conn.execute(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-labels', 'default', 'Labels', 'LBL', '/tmp/lbl', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn seed_issue(conn: &turso::Connection, issue_id: &str, number: i32, title: &str) {
-        conn.execute(
-            "INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at) VALUES (?1, 'p-labels', ?2, ?3, '', 'backlog', 'backlog', 'none', 0, ?2, ?2)",
-            params![issue_id, number, title],
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn seed_label(conn: &turso::Connection, name: &str) {
-        create_label_conn(
-            conn,
-            DEFAULT_WORKSPACE_ID,
-            CreateLabel {
-                name: name.to_string(),
-                color: None,
-            },
-            2,
-        )
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn filters_by_single_label_ref() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn).await;
-                seed_issue(conn, "i-bug", 1, "Bug issue").await;
-                seed_issue(conn, "i-ui", 2, "UI issue").await;
-                seed_label(conn, "Bug").await;
-                seed_label(conn, "UI").await;
-                replace_issue_labels(conn, "i-bug", &["bug".to_string()], 3)
-                    .await
-                    .unwrap();
-                replace_issue_labels(conn, "i-ui", &["ui".to_string()], 3)
-                    .await
-                    .unwrap();
-
-                let query = ProjectIssuesQuery::parse(&[param("label", "Bug")]).unwrap();
-                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
-                    .await
-                    .unwrap();
-                assert_eq!(total, 1);
-                assert_eq!(issues.len(), 1);
-                assert_eq!(issues[0].title, "Bug issue");
-                assert_eq!(issues[0].labels, vec!["Bug".to_string()]);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn filters_by_multiple_labels_with_and_semantics() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn).await;
-                seed_issue(conn, "i-bug", 1, "Bug only").await;
-                seed_issue(conn, "i-both", 2, "Bug and UI").await;
-                seed_label(conn, "Bug").await;
-                seed_label(conn, "UI").await;
-                replace_issue_labels(conn, "i-bug", &["bug".to_string()], 3)
-                    .await
-                    .unwrap();
-                replace_issue_labels(conn, "i-both", &["bug".to_string(), "ui".to_string()], 3)
-                    .await
-                    .unwrap();
-
-                let query = ProjectIssuesQuery::parse(&[param("labels", "bug,ui")]).unwrap();
-                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
-                    .await
-                    .unwrap();
-                assert_eq!(total, 1);
-                assert_eq!(issues.len(), 1);
-                assert_eq!(issues[0].title, "Bug and UI");
-                assert_eq!(issues[0].labels, vec!["Bug".to_string(), "UI".to_string()]);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn paging_limit_offset_returns_window_and_total() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn).await;
-                seed_issue(conn, "i-1", 1, "One").await;
-                seed_issue(conn, "i-2", 2, "Two").await;
-                seed_issue(conn, "i-3", 3, "Three").await;
-
-                let query = ProjectIssuesQuery::parse(&[param("limit", "1"), param("offset", "1")])
-                    .unwrap();
-                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
-                    .await
-                    .unwrap();
-                // The window is one issue but the total counts all three.
-                assert_eq!(total, 3);
-                assert_eq!(issues.len(), 1);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn unknown_label_filter_returns_no_matches() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn).await;
-                seed_issue(conn, "i-bug", 1, "Bug only").await;
-                seed_label(conn, "Bug").await;
-                replace_issue_labels(conn, "i-bug", &["bug".to_string()], 3)
-                    .await
-                    .unwrap();
-
-                let query = ProjectIssuesQuery::parse(&[param("label", "missing")]).unwrap();
-                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
-                    .await
-                    .unwrap();
-                assert_eq!(total, 0);
-                assert!(issues.is_empty());
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-}
-
 /// One item-windowed page of a project's `/issues` collection: the rendered
 /// list body plus the natural-unit counts the producer needs for a `Record`
 /// segment (`[shown of total issues]` header + paging continue URI).
@@ -1150,5 +921,234 @@ pub(super) async fn read_project_search(
             Some(project_ctx.project_key.as_str()),
         ),
         Err(error) => format!("Search failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod project_issues_query_tests {
+    use super::*;
+    use crate::labels::{
+        attach::replace_issue_labels,
+        crud::{create_label_conn, DEFAULT_WORKSPACE_ID},
+    };
+    use crate::models::CreateLabel;
+    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use tempfile::tempdir;
+
+    fn param(key: &str, value: &str) -> QueryParam {
+        QueryParam {
+            key: key.to_string(),
+            value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn parses_status_limit_sort_and_ready() {
+        let query = ProjectIssuesQuery::parse(&[
+            param("status", "backlog,active"),
+            param("limit", "10"),
+            param("sort", "updated_desc"),
+            param("ready", "1"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            query.statuses,
+            Some(vec!["backlog".to_string(), "active".to_string()])
+        );
+        assert_eq!(query.limit, 10);
+        assert_eq!(query.sort_field, ProjectIssuesSortField::Updated);
+        assert_eq!(query.sort_dir, ProjectIssuesSortDir::Desc);
+        assert_eq!(query.ready, Some(true));
+    }
+
+    #[test]
+    fn defaults_limit_and_sort() {
+        let query = ProjectIssuesQuery::parse(&[]).unwrap();
+        assert_eq!(query.limit, 20);
+        assert_eq!(query.sort_field, ProjectIssuesSortField::Updated);
+        assert_eq!(query.sort_dir, ProjectIssuesSortDir::Desc);
+    }
+
+    #[test]
+    fn rejects_invalid_values() {
+        assert!(ProjectIssuesQuery::parse(&[param("sort", "number_desc")])
+            .unwrap_err()
+            .contains("Invalid sort query parameter"));
+        assert!(ProjectIssuesQuery::parse(&[param("limit", "0")])
+            .unwrap_err()
+            .contains("Invalid limit query parameter"));
+        assert!(ProjectIssuesQuery::parse(&[param("ready", "maybe")])
+            .unwrap_err()
+            .contains("Invalid ready query parameter"));
+        assert!(ProjectIssuesQuery::parse(&[param("status", "open")])
+            .unwrap_err()
+            .contains("Invalid status query parameter"));
+    }
+
+    #[test]
+    fn rejects_unknown_params_with_supported_list() {
+        let error = ProjectIssuesQuery::parse(&[param("foo", "bar")]).unwrap_err();
+        assert!(error.contains("Unsupported query parameter 'foo' for project issues"));
+        assert!(error
+            .contains("Supported parameters: status, limit, offset, sort, ready, label, labels"));
+    }
+
+    async fn test_db() -> LocalDb {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("project-labels.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn seed_project(conn: &turso::Connection) {
+        conn.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-labels', 'default', 'Labels', 'LBL', '/tmp/lbl', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_issue(conn: &turso::Connection, issue_id: &str, number: i32, title: &str) {
+        conn.execute(
+            "INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at) VALUES (?1, 'p-labels', ?2, ?3, '', 'backlog', 'backlog', 'none', 0, ?2, ?2)",
+            params![issue_id, number, title],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_label(conn: &turso::Connection, name: &str) {
+        create_label_conn(
+            conn,
+            DEFAULT_WORKSPACE_ID,
+            CreateLabel {
+                name: name.to_string(),
+                color: None,
+            },
+            2,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn filters_by_single_label_ref() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn).await;
+                seed_issue(conn, "i-bug", 1, "Bug issue").await;
+                seed_issue(conn, "i-ui", 2, "UI issue").await;
+                seed_label(conn, "Bug").await;
+                seed_label(conn, "UI").await;
+                replace_issue_labels(conn, "i-bug", &["bug".to_string()], 3)
+                    .await
+                    .unwrap();
+                replace_issue_labels(conn, "i-ui", &["ui".to_string()], 3)
+                    .await
+                    .unwrap();
+
+                let query = ProjectIssuesQuery::parse(&[param("label", "Bug")]).unwrap();
+                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
+                    .await
+                    .unwrap();
+                assert_eq!(total, 1);
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].title, "Bug issue");
+                assert_eq!(issues[0].labels, vec!["Bug".to_string()]);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn filters_by_multiple_labels_with_and_semantics() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn).await;
+                seed_issue(conn, "i-bug", 1, "Bug only").await;
+                seed_issue(conn, "i-both", 2, "Bug and UI").await;
+                seed_label(conn, "Bug").await;
+                seed_label(conn, "UI").await;
+                replace_issue_labels(conn, "i-bug", &["bug".to_string()], 3)
+                    .await
+                    .unwrap();
+                replace_issue_labels(conn, "i-both", &["bug".to_string(), "ui".to_string()], 3)
+                    .await
+                    .unwrap();
+
+                let query = ProjectIssuesQuery::parse(&[param("labels", "bug,ui")]).unwrap();
+                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
+                    .await
+                    .unwrap();
+                assert_eq!(total, 1);
+                assert_eq!(issues.len(), 1);
+                assert_eq!(issues[0].title, "Bug and UI");
+                assert_eq!(issues[0].labels, vec!["Bug".to_string(), "UI".to_string()]);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn paging_limit_offset_returns_window_and_total() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn).await;
+                seed_issue(conn, "i-1", 1, "One").await;
+                seed_issue(conn, "i-2", 2, "Two").await;
+                seed_issue(conn, "i-3", 3, "Three").await;
+
+                let query = ProjectIssuesQuery::parse(&[param("limit", "1"), param("offset", "1")])
+                    .unwrap();
+                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
+                    .await
+                    .unwrap();
+                // The window is one issue but the total counts all three.
+                assert_eq!(total, 3);
+                assert_eq!(issues.len(), 1);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_label_filter_returns_no_matches() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn).await;
+                seed_issue(conn, "i-bug", 1, "Bug only").await;
+                seed_label(conn, "Bug").await;
+                replace_issue_labels(conn, "i-bug", &["bug".to_string()], 3)
+                    .await
+                    .unwrap();
+
+                let query = ProjectIssuesQuery::parse(&[param("label", "missing")]).unwrap();
+                let (issues, total) = load_project_issue_summaries(conn, "p-labels", &query)
+                    .await
+                    .unwrap();
+                assert_eq!(total, 0);
+                assert!(issues.is_empty());
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     }
 }

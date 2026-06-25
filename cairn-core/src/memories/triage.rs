@@ -839,6 +839,9 @@ mod tests {
         assert!(!description.contains("Threshold note:"));
     }
 
+    // Test seed helper mirrors the memories table's full column set; the long
+    // parameter list is inherent to inserting a complete row.
+    #[allow(clippy::too_many_arguments)]
     async fn insert_memory_with_status(
         test: &TestOrch,
         id: &str,

@@ -66,6 +66,7 @@ pub struct RunContext {
     pub project_id: String,
     pub project_key: String,
     pub job_name: Option<String>, // Human-readable job name from execution snapshot (e.g., "builder-1")
+    pub worktree_path: Option<String>, // The job's worktree checkout when it runs in one; None for project-level (manager/chat) runs
 }
 
 impl RunContext {

@@ -210,6 +210,25 @@ pub(super) fn write_codex_model_catalog_override(
     Ok(Some(catalog_path))
 }
 
+pub(super) fn disable_apply_patch_in_model_catalog(catalog_json: &str) -> Result<String, String> {
+    let mut catalog: Value = serde_json::from_str(catalog_json)
+        .map_err(|e| format!("Failed to parse Codex models catalog: {}", e))?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "Codex models catalog missing models array".to_string())?;
+
+    for model in models.iter_mut() {
+        let Some(model_obj) = model.as_object_mut() else {
+            return Err("Codex models catalog contains non-object model entry".to_string());
+        };
+        model_obj.insert("apply_patch_tool_type".to_string(), Value::Null);
+    }
+
+    serde_json::to_string(&catalog)
+        .map_err(|e| format!("Failed to serialize Codex model catalog override: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,23 +322,4 @@ mod tests {
             config
         );
     }
-}
-
-pub(super) fn disable_apply_patch_in_model_catalog(catalog_json: &str) -> Result<String, String> {
-    let mut catalog: Value = serde_json::from_str(catalog_json)
-        .map_err(|e| format!("Failed to parse Codex models catalog: {}", e))?;
-    let models = catalog
-        .get_mut("models")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| "Codex models catalog missing models array".to_string())?;
-
-    for model in models.iter_mut() {
-        let Some(model_obj) = model.as_object_mut() else {
-            return Err("Codex models catalog contains non-object model entry".to_string());
-        };
-        model_obj.insert("apply_patch_tool_type".to_string(), Value::Null);
-    }
-
-    serde_json::to_string(&catalog)
-        .map_err(|e| format!("Failed to serialize Codex model catalog override: {}", e))
 }

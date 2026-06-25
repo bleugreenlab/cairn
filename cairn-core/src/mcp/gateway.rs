@@ -17,9 +17,22 @@
 //! session, and torn down via `close_session` when the job completes.
 
 use async_trait::async_trait;
+use cairn_common::read::ImageBlock;
 use serde::{Deserialize, Serialize};
 
 use crate::config::mcp_servers::McpServerConfig;
+
+/// The result of a proxied external MCP `tools/call`.
+///
+/// `text` is the flattened textual content. `images` carries any image content
+/// blocks the server returned, preserved rather than flattened to a placeholder
+/// so they can reach the agent as real image content blocks — mirroring the read
+/// path's text/image split (`cairn_common::read`).
+#[derive(Debug, Clone, Default)]
+pub struct McpToolCallResult {
+    pub text: String,
+    pub images: Vec<ImageBlock>,
+}
 
 /// A tool advertised by an external MCP server.
 ///
@@ -82,7 +95,7 @@ pub trait McpGateway: Send + Sync {
     ) -> Result<String, String>;
 
     /// Proxy a `tools/call`. `args` is the tool's argument object. Returns the
-    /// composed textual result.
+    /// composed text plus any image content blocks the tool returned.
     async fn call_tool(
         &self,
         session_key: &str,
@@ -91,7 +104,7 @@ pub trait McpGateway: Send + Sync {
         tool: &str,
         args: serde_json::Value,
         timeout_ms: Option<u32>,
-    ) -> Result<String, String>;
+    ) -> Result<McpToolCallResult, String>;
 
     /// Tear down all pooled connections for a finished session.
     async fn close_session(&self, session_key: &str);

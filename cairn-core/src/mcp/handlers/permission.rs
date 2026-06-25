@@ -434,30 +434,39 @@ async fn emit_permission_attention(
         // Point the fact at the answerable permission segment
         // (`.../permissions/perm-N`) when we know it, so a handler (coordinator,
         // user, or programmatic driver) can go straight to the decision patch
-        // with no enumeration read of the collection. The permissions resource
-        // keys on the owning job's own `uri_segment`, so the flat node segment
-        // is the right address even for a sub-task job. Fall back to the node
-        // base URI only when no segment was assigned (no owning job).
+        // with no enumeration read of the collection. A sub-agent task job nests
+        // its permission under the parent node
+        // (`.../{parent}/task/{task}/permissions/perm-N`) so the URI resolves; a
+        // top-level node uses the flat node segment (issue #143). Fall back to
+        // the node/task base URI only when no segment was assigned (no owning
+        // job).
+        let parent_segment =
+            crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, &ctx.job_id).await;
         let detail_uri = match perm_segment {
-            Some(perm) => cairn_common::uri::build_node_permission_uri(
-                &ctx.project_key,
-                issue_number,
-                ctx.exec_seq.unwrap_or(1),
-                &segment,
-                perm,
-            ),
-            None => {
-                let parent_segment =
-                    crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, &ctx.job_id)
-                        .await;
-                cairn_common::uri::build_job_base_uri(
+            Some(perm) => match parent_segment.as_deref() {
+                Some(parent) => cairn_common::uri::build_task_permission_uri(
+                    &ctx.project_key,
+                    issue_number,
+                    ctx.exec_seq.unwrap_or(1),
+                    parent,
+                    &segment,
+                    perm,
+                ),
+                None => cairn_common::uri::build_node_permission_uri(
                     &ctx.project_key,
                     issue_number,
                     ctx.exec_seq.unwrap_or(1),
                     &segment,
-                    parent_segment.as_deref(),
-                )
-            }
+                    perm,
+                ),
+            },
+            None => cairn_common::uri::build_job_base_uri(
+                &ctx.project_key,
+                issue_number,
+                ctx.exec_seq.unwrap_or(1),
+                &segment,
+                parent_segment.as_deref(),
+            ),
         };
         if let Ok(issue_ctx) =
             crate::orchestrator::attention::read_issue_for_attention(&orch.db.local, issue_id).await

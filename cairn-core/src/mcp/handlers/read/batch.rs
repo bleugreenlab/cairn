@@ -114,12 +114,54 @@ async fn produce_segment(
         return crate::mcp::handlers::files::produce_file_segment(orch, request, &file_payload)
             .await;
     }
+    // Bare worktree-relative fallback (CAIRN-2030, bug #107): a scheme-less
+    // target is read as a `file:` target when — with its `?query` split off — it
+    // names a path that EXISTS within the worktree. The existence + in-worktree
+    // gate is what keeps the leniency safe: clear intent resolves, so a typo or an
+    // absolute path outside the worktree still falls through to the error below.
+    // Read-only by design — `write` keeps requiring an explicit `file:` so an
+    // accidental bare-path write stays hard.
+    if let Some(file_target) = bare_worktree_file_target(&request.cwd, target) {
+        let file_payload = crate::mcp::types::ReadFilePayload {
+            path: file_target,
+            offset: None,
+            limit: None,
+            issue_history: None,
+        };
+        return crate::mcp::handlers::files::produce_file_segment(orch, request, &file_payload)
+            .await;
+    }
     Produced::Segment(error_segment(
         target,
         format!(
             "Invalid target: expected cairn://…, file:…, an http(s) URL, or a local .pdf path, got '{target}'"
         ),
     ))
+}
+
+/// Resolve a scheme-less read target against the worktree, returning a
+/// `file:`-prefixed target (query preserved) when it names an existing path
+/// inside the worktree, else `None` so the caller errors as before.
+///
+/// The `?query` is split off before the existence check so `docs/x.md?limit=3`
+/// tests `docs/x.md` for existence and still carries `limit=3` to the file
+/// producer. Acceptance is strictly "exists AND does not escape the worktree":
+/// a missing bare path (a typo) or an absolute path resolving outside the
+/// worktree returns `None`.
+fn bare_worktree_file_target(cwd: &str, target: &str) -> Option<String> {
+    let identity = split_target_query(target)
+        .map(|split| split.identity)
+        .unwrap_or_else(|_| target.to_string());
+    if identity.is_empty() {
+        return None;
+    }
+    let worktree = std::path::Path::new(cwd);
+    let candidate = worktree.join(&identity);
+    if candidate.exists() && !crate::mcp::git::path_escapes_worktree(worktree, &candidate) {
+        Some(format!("file:{target}"))
+    } else {
+        None
+    }
 }
 
 fn is_web_target(target: &str) -> bool {
@@ -651,6 +693,146 @@ mod tests {
         assert_eq!(envelope.segments[0].total_units, Some(40));
         assert_eq!(envelope.segments[0].offset, 2);
         assert_eq!(envelope.segments[0].shown_units, 3);
+    }
+
+    /// Run a `read_batch` with an explicit worktree `cwd`, returning the
+    /// assembled envelope text. Mirrors `read_batch_text` but lets a test point
+    /// the worktree at a fixture directory so bare-path resolution can be
+    /// exercised against real files.
+    async fn read_batch_text_in(
+        orch: &Orchestrator,
+        cwd: &std::path::Path,
+        paths: serde_json::Value,
+    ) -> String {
+        let request = McpCallbackRequest {
+            cwd: cwd.display().to_string(),
+            run_id: None,
+            tool: "read_batch".to_string(),
+            payload: serde_json::json!({ "paths": paths }),
+            tool_use_id: None,
+        };
+        let cursors = Mutex::new(HashMap::new());
+        let result = handle_read_batch(orch, &request, &cursors).await;
+        let envelope: ReadBatchEnvelope = serde_json::from_str(&result).unwrap();
+        envelope.text
+    }
+
+    #[tokio::test]
+    async fn read_batch_bare_worktree_path_resolves_as_file() {
+        // CAIRN-2030: a scheme-less target that exists in the worktree is read as
+        // a `file:` target, yielding the same content `file:docs/...` would.
+        let orch = seeded_orch().await;
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join("docs")).unwrap();
+        let body: String = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(worktree.path().join("docs/uri-scheme.md"), &body).unwrap();
+
+        let bare = read_batch_text_in(
+            &orch,
+            worktree.path(),
+            serde_json::json!(["docs/uri-scheme.md"]),
+        )
+        .await;
+        let prefixed = read_batch_text_in(
+            &orch,
+            worktree.path(),
+            serde_json::json!(["file:docs/uri-scheme.md"]),
+        )
+        .await;
+        // The bare target is routed as `file:` (header and content match the
+        // explicit form).
+        assert!(bare.contains("=== file:docs/uri-scheme.md"), "{bare}");
+        assert!(bare.contains("line 1"), "{bare}");
+        assert!(bare.contains("line 10"), "{bare}");
+        assert_eq!(bare, prefixed);
+
+        // A leading `./` resolves the same way.
+        let dotted = read_batch_text_in(
+            &orch,
+            worktree.path(),
+            serde_json::json!(["./docs/uri-scheme.md"]),
+        )
+        .await;
+        assert!(dotted.contains("line 1"), "{dotted}");
+    }
+
+    #[tokio::test]
+    async fn read_batch_bare_worktree_path_honors_query() {
+        // The exact repro: `docs/uri-scheme.md?limit=3`. The query is split off
+        // before the existence check and still applied to the file read.
+        let orch = seeded_orch().await;
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join("docs")).unwrap();
+        let body: String = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(worktree.path().join("docs/uri-scheme.md"), &body).unwrap();
+
+        let text = read_batch_text_in(
+            &orch,
+            worktree.path(),
+            serde_json::json!(["docs/uri-scheme.md?limit=3"]),
+        )
+        .await;
+        assert!(
+            text.contains("=== file:docs/uri-scheme.md?limit=3 [lines 1\u{2013}3 of 10] ==="),
+            "{text}"
+        );
+        assert!(text.contains("line 3"), "{text}");
+        assert!(!text.contains("line 4"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_batch_bare_worktree_directory_resolves() {
+        // A bare path naming a directory resolves like a `file:` directory read.
+        let orch = seeded_orch().await;
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join("docs")).unwrap();
+        std::fs::write(worktree.path().join("docs/uri-scheme.md"), "x").unwrap();
+
+        let text = read_batch_text_in(&orch, worktree.path(), serde_json::json!(["docs"])).await;
+        assert!(text.contains("=== file:docs"), "{text}");
+        assert!(text.contains("uri-scheme.md"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_batch_bare_nonexistent_path_still_errors() {
+        // A bare path that does not exist (a typo) is not silently swallowed: it
+        // still produces the clear invalid-target error.
+        let orch = seeded_orch().await;
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(worktree.path().join("docs")).unwrap();
+
+        let text = read_batch_text_in(
+            &orch,
+            worktree.path(),
+            serde_json::json!(["docs/does-not-exist.md"]),
+        )
+        .await;
+        assert!(text.contains("Invalid target: expected cairn://"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_batch_bare_absolute_path_outside_worktree_still_errors() {
+        // An existing absolute path that resolves OUTSIDE the worktree is not the
+        // unambiguous in-worktree intent the leniency covers, so it still errors.
+        let orch = seeded_orch().await;
+        let worktree = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "nope").unwrap();
+
+        let text = read_batch_text_in(
+            &orch,
+            worktree.path(),
+            serde_json::json!([outside_file.display().to_string()]),
+        )
+        .await;
+        assert!(text.contains("Invalid target: expected cairn://"), "{text}");
     }
 
     async fn seeded_orch() -> Orchestrator {

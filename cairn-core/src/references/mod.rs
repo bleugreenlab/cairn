@@ -737,7 +737,7 @@ mod tests {
 
         save_reference_description(temp.path(), "repo", "").unwrap();
         let contents = load_contents(temp.path());
-        assert!(contents.0.get("repo").is_none());
+        assert!(!contents.0.contains_key("repo"));
     }
 
     #[test]

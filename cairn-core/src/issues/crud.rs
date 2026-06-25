@@ -43,134 +43,6 @@ pub async fn list_children(db: &LocalDb, parent_issue_id: &str) -> Result<Vec<Is
     .map_err(CairnError::from)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn delete_db_detaches_memories_before_deleting_jobs() {
-        let db = crate::storage::migrated_test_db("issue-delete-memory-detach.db").await;
-        db.execute_script(
-            "
-            INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1);
-            INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
-             VALUES ('issue-1', 'project-1', 1, 'Issue', 1, 1);
-            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-             VALUES ('exec-1', 'recipe', 'issue-1', 'project-1', 'running', 1, 1);
-            INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
-             VALUES ('job-1', 'exec-1', 'issue-1', 'project-1', 'builder', 'builder', 'complete', 1, 1);
-            INSERT INTO memories(id, name, project_id, content, status, scope, scope_value, job_id, node_seq, created_at, updated_at)
-             VALUES ('draft-1', 'Draft', 'project-1', 'draft content', 'draft', 'project', 'project-1', 'job-1', 1, 1, 1);
-            ",
-        )
-        .await
-        .unwrap();
-
-        delete_db(&db, "issue-1").await.unwrap();
-
-        let count = db
-            .query_one(
-                "SELECT COUNT(*) FROM memories WHERE id = 'draft-1'",
-                (),
-                |row| row.i64(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn delete_db_removes_full_run_subtree() {
-        // Regression: a worked-on issue has runs/sessions/turns plus a PR and a
-        // trigger source. Those reference the subtree without ON DELETE CASCADE,
-        // so a naive delete hit "foreign key constraint failed".
-        let db = crate::storage::migrated_test_db("issue-delete-full-subtree.db").await;
-        db.execute_script(
-            "
-            INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1);
-            INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
-             VALUES ('issue-1', 'project-1', 1, 'Issue', 1, 1);
-            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-             VALUES ('exec-1', 'recipe', 'issue-1', 'project-1', 'running', 1, 1);
-            INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
-             VALUES ('job-1', 'exec-1', 'issue-1', 'project-1', 'builder', 'builder', 'complete', 1, 1);
-            INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
-             VALUES ('run-1', 'project-1', 'issue-1', 'job-1', 'live', 'codex', 1, 1, 'resume');
-            INSERT INTO sessions(id, job_id, created_at, updated_at)
-             VALUES ('sess-1', 'job-1', 1, 1);
-            INSERT INTO turns(id, session_id, run_id, sequence, created_at, updated_at)
-             VALUES ('turn-1', 'sess-1', 'run-1', 1, 1, 1);
-            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
-             VALUES ('mr-1', 'job-1', 'project-1', 'issue-1', 'PR', 'src', 'dst', 'open', 1, 1);
-            INSERT INTO execution_trigger_sources(id, source_job_id, triggered_execution_id, created_at)
-             VALUES ('ets-1', 'job-1', 'exec-1', 1);
-            INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id)
-             VALUES ('ev-1', 'run-1', 1, 1, 'message', '{}', 1, 'turn-1');
-            INSERT INTO prompts(id, run_id, questions, created_at, turn_id)
-             VALUES ('prompt-1', 'run-1', '[]', 1, 'turn-1');
-            INSERT INTO permission_requests(id, run_id, tool_use_id, tool_name, tool_input, created_at, turn_id)
-             VALUES ('perm-1', 'run-1', 'tu-1', 'run', '{}', 1, 'turn-1');
-            INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
-             VALUES ('art-1', 'job-1', 'plan', '{}', 1, 1);
-            INSERT INTO artifacts(id, job_id, artifact_type, data, parent_version_id, created_at, updated_at)
-             VALUES ('art-2', 'job-1', 'plan', '{}', 'art-1', 1, 1);
-            UPDATE jobs SET current_turn_id = 'turn-1', resume_session_id = 'sess-1' WHERE id = 'job-1';
-            ",
-        )
-        .await
-        .unwrap();
-
-        delete_db(&db, "issue-1").await.unwrap();
-
-        for (table, sql) in [
-            ("issues", "SELECT COUNT(*) FROM issues WHERE id = 'issue-1'"),
-            (
-                "jobs",
-                "SELECT COUNT(*) FROM jobs WHERE issue_id = 'issue-1'",
-            ),
-            (
-                "runs",
-                "SELECT COUNT(*) FROM runs WHERE issue_id = 'issue-1'",
-            ),
-            (
-                "executions",
-                "SELECT COUNT(*) FROM executions WHERE issue_id = 'issue-1'",
-            ),
-            (
-                "sessions",
-                "SELECT COUNT(*) FROM sessions WHERE id = 'sess-1'",
-            ),
-            ("turns", "SELECT COUNT(*) FROM turns WHERE id = 'turn-1'"),
-            ("events", "SELECT COUNT(*) FROM events WHERE id = 'ev-1'"),
-            (
-                "prompts",
-                "SELECT COUNT(*) FROM prompts WHERE id = 'prompt-1'",
-            ),
-            (
-                "permission_requests",
-                "SELECT COUNT(*) FROM permission_requests WHERE id = 'perm-1'",
-            ),
-            (
-                "artifacts",
-                "SELECT COUNT(*) FROM artifacts WHERE job_id = 'job-1'",
-            ),
-            (
-                "merge_requests",
-                "SELECT COUNT(*) FROM merge_requests WHERE id = 'mr-1'",
-            ),
-            (
-                "execution_trigger_sources",
-                "SELECT COUNT(*) FROM execution_trigger_sources WHERE id = 'ets-1'",
-            ),
-        ] {
-            let count = db.query_one(sql, (), |row| row.i64(0)).await.unwrap();
-            assert_eq!(count, 0, "{table} rows should be gone after delete");
-        }
-    }
-}
-
 fn issue_from_row(row: &turso::Row) -> DbResult<Issue> {
     Ok(Issue {
         id: row.text(0)?,
@@ -685,4 +557,132 @@ pub async fn delete_db(db: &LocalDb, issue_id: &str) -> Result<(), CairnError> {
     })
     .await
     .map_err(CairnError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_db_detaches_memories_before_deleting_jobs() {
+        let db = crate::storage::migrated_test_db("issue-delete-memory-detach.db").await;
+        db.execute_script(
+            "
+            INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
+             VALUES ('issue-1', 'project-1', 1, 'Issue', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-1', 'recipe', 'issue-1', 'project-1', 'running', 1, 1);
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+             VALUES ('job-1', 'exec-1', 'issue-1', 'project-1', 'builder', 'builder', 'complete', 1, 1);
+            INSERT INTO memories(id, name, project_id, content, status, scope, scope_value, job_id, node_seq, created_at, updated_at)
+             VALUES ('draft-1', 'Draft', 'project-1', 'draft content', 'draft', 'project', 'project-1', 'job-1', 1, 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        delete_db(&db, "issue-1").await.unwrap();
+
+        let count = db
+            .query_one(
+                "SELECT COUNT(*) FROM memories WHERE id = 'draft-1'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_db_removes_full_run_subtree() {
+        // Regression: a worked-on issue has runs/sessions/turns plus a PR and a
+        // trigger source. Those reference the subtree without ON DELETE CASCADE,
+        // so a naive delete hit "foreign key constraint failed".
+        let db = crate::storage::migrated_test_db("issue-delete-full-subtree.db").await;
+        db.execute_script(
+            "
+            INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
+             VALUES ('issue-1', 'project-1', 1, 'Issue', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-1', 'recipe', 'issue-1', 'project-1', 'running', 1, 1);
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
+             VALUES ('job-1', 'exec-1', 'issue-1', 'project-1', 'builder', 'builder', 'complete', 1, 1);
+            INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
+             VALUES ('run-1', 'project-1', 'issue-1', 'job-1', 'live', 'codex', 1, 1, 'resume');
+            INSERT INTO sessions(id, job_id, created_at, updated_at)
+             VALUES ('sess-1', 'job-1', 1, 1);
+            INSERT INTO turns(id, session_id, run_id, sequence, created_at, updated_at)
+             VALUES ('turn-1', 'sess-1', 'run-1', 1, 1, 1);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES ('mr-1', 'job-1', 'project-1', 'issue-1', 'PR', 'src', 'dst', 'open', 1, 1);
+            INSERT INTO execution_trigger_sources(id, source_job_id, triggered_execution_id, created_at)
+             VALUES ('ets-1', 'job-1', 'exec-1', 1);
+            INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at, turn_id)
+             VALUES ('ev-1', 'run-1', 1, 1, 'message', '{}', 1, 'turn-1');
+            INSERT INTO prompts(id, run_id, questions, created_at, turn_id)
+             VALUES ('prompt-1', 'run-1', '[]', 1, 'turn-1');
+            INSERT INTO permission_requests(id, run_id, tool_use_id, tool_name, tool_input, created_at, turn_id)
+             VALUES ('perm-1', 'run-1', 'tu-1', 'run', '{}', 1, 'turn-1');
+            INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
+             VALUES ('art-1', 'job-1', 'plan', '{}', 1, 1);
+            INSERT INTO artifacts(id, job_id, artifact_type, data, parent_version_id, created_at, updated_at)
+             VALUES ('art-2', 'job-1', 'plan', '{}', 'art-1', 1, 1);
+            UPDATE jobs SET current_turn_id = 'turn-1', resume_session_id = 'sess-1' WHERE id = 'job-1';
+            ",
+        )
+        .await
+        .unwrap();
+
+        delete_db(&db, "issue-1").await.unwrap();
+
+        for (table, sql) in [
+            ("issues", "SELECT COUNT(*) FROM issues WHERE id = 'issue-1'"),
+            (
+                "jobs",
+                "SELECT COUNT(*) FROM jobs WHERE issue_id = 'issue-1'",
+            ),
+            (
+                "runs",
+                "SELECT COUNT(*) FROM runs WHERE issue_id = 'issue-1'",
+            ),
+            (
+                "executions",
+                "SELECT COUNT(*) FROM executions WHERE issue_id = 'issue-1'",
+            ),
+            (
+                "sessions",
+                "SELECT COUNT(*) FROM sessions WHERE id = 'sess-1'",
+            ),
+            ("turns", "SELECT COUNT(*) FROM turns WHERE id = 'turn-1'"),
+            ("events", "SELECT COUNT(*) FROM events WHERE id = 'ev-1'"),
+            (
+                "prompts",
+                "SELECT COUNT(*) FROM prompts WHERE id = 'prompt-1'",
+            ),
+            (
+                "permission_requests",
+                "SELECT COUNT(*) FROM permission_requests WHERE id = 'perm-1'",
+            ),
+            (
+                "artifacts",
+                "SELECT COUNT(*) FROM artifacts WHERE job_id = 'job-1'",
+            ),
+            (
+                "merge_requests",
+                "SELECT COUNT(*) FROM merge_requests WHERE id = 'mr-1'",
+            ),
+            (
+                "execution_trigger_sources",
+                "SELECT COUNT(*) FROM execution_trigger_sources WHERE id = 'ets-1'",
+            ),
+        ] {
+            let count = db.query_one(sql, (), |row| row.i64(0)).await.unwrap();
+            assert_eq!(count, 0, "{table} rows should be gone after delete");
+        }
+    }
 }

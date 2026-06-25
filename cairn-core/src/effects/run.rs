@@ -371,6 +371,29 @@ async fn evaluate_condition(
     }
 }
 
+async fn mark_outbox_done(orch: &Orchestrator, id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    let now = chrono::Utc::now().timestamp() as i32;
+    orch.db
+        .local
+        .write(|conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE effect_outbox
+                     SET state = 'done',
+                         updated_at = ?1
+                     WHERE id = ?2",
+                    (now, id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| format!("Failed to mark outbox entry done: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,27 +535,4 @@ mod tests {
         ));
         assert_eq!(recorded_runs(&orch, "job-3").await, 1);
     }
-}
-
-async fn mark_outbox_done(orch: &Orchestrator, id: &str) -> Result<(), String> {
-    let id = id.to_string();
-    let now = chrono::Utc::now().timestamp() as i32;
-    orch.db
-        .local
-        .write(|conn| {
-            let id = id.clone();
-            Box::pin(async move {
-                conn.execute(
-                    "UPDATE effect_outbox
-                     SET state = 'done',
-                         updated_at = ?1
-                     WHERE id = ?2",
-                    (now, id.as_str()),
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .map_err(|error| format!("Failed to mark outbox entry done: {error}"))
 }

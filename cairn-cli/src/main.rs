@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cairn_common::query::split_target_query;
-use cairn_common::read::ReadBatchEnvelope;
+use cairn_common::read::{ReadBatchEnvelope, RunBatchEnvelope};
 use cairn_common::uri::{parse_uri as parse_cairn_uri, CairnResource};
 
 /// Cairn MCP Server - tools for Claude to interact with Cairn
@@ -202,7 +202,6 @@ fn callback_timeout(request: &CallbackRequest) -> Duration {
 #[derive(Debug, Clone, Default)]
 struct CallbackOutcome {
     result: String,
-    artifact_uri: Option<String>,
     /// `<system-reminder>` bodies from the callback response, in delivery order.
     /// Assembled into the model-visible text at the transport edge by
     /// [`assemble_reminders`]; never spliced into `result`, which stays
@@ -722,6 +721,7 @@ fn split_uri_suffix(candidate: &str) -> (&str, &str) {
 
 #[tool_router]
 impl CairnMcp {
+    #[cfg(test)]
     fn new(
         callback_url: String,
         cwd: String,
@@ -754,7 +754,7 @@ impl CairnMcp {
             callback_url: Arc::new(callback_url),
             cwd: Arc::new(cwd),
             run_id: run_id.map(Arc::new),
-            mcp_secret: mcp_secret.map(|s| Arc::new(s)),
+            mcp_secret: mcp_secret.map(Arc::new),
             home_uri,
             base_uri,
             tool_router: Self::tool_router(),
@@ -762,6 +762,7 @@ impl CairnMcp {
         }
     }
 
+    #[cfg(test)]
     fn current_base_uri(&self) -> Option<String> {
         self.base_uri.lock().unwrap().clone()
     }
@@ -1168,15 +1169,33 @@ Partial failures never abort: a target that errors shows its message inline as t
             tool_use_id: None,
         };
 
-        let result = self.call_tauri(&request).await;
-        Ok(CallToolResult::success(vec![Content::text(
-            cap_run_result(&result),
-        )]))
+        let outcome = self.call_tauri_full(&request).await;
+        // The run handler returns a RunBatchEnvelope (composed text + image
+        // content blocks) like read_batch; parse it and lift each image into its
+        // own content block after the text so an image-bearing MCP tool result
+        // (e.g. an Axon look screenshot) reaches the agent. A transport/parse
+        // failure falls back to the raw text.
+        let envelope =
+            serde_json::from_str::<RunBatchEnvelope>(&outcome.result).unwrap_or_else(|_| {
+                RunBatchEnvelope {
+                    text: outcome.result.clone(),
+                    images: Vec::new(),
+                }
+            });
+        let text = assemble_reminders(cap_run_result(&envelope.text), &outcome.reminders);
+        let mut blocks: Vec<Content> = Vec::with_capacity(1 + envelope.images.len());
+        blocks.push(Content::text(text));
+        for image in envelope.images {
+            blocks.push(Content::image(image.data, image.mime_type));
+        }
+        Ok(CallToolResult::success(blocks))
     }
 }
 
 impl CairnMcp {
-    /// Like `call_tauri` but returns the full callback outcome (including `artifact_uri`).
+    /// Call the Tauri callback server and return the full outcome (handler
+    /// result plus augmentation reminders). Verbs assemble reminders into the
+    /// model-visible text at the edge, after parsing any structured result.
     async fn call_tauri_full(&self, request: &CallbackRequest) -> CallbackOutcome {
         let client = match reqwest::Client::builder()
             .timeout(callback_timeout(request))
@@ -1226,7 +1245,6 @@ impl CairnMcp {
                     Ok(text) => match serde_json::from_str::<CallbackResponse>(&text) {
                         Ok(r) => CallbackOutcome {
                             result: r.result,
-                            artifact_uri: r.artifact_uri,
                             reminders: r.reminders,
                             transport_ok: http_ok,
                         },
@@ -1258,16 +1276,6 @@ impl CairnMcp {
                 ..Default::default()
             },
         }
-    }
-
-    /// Convenience wrapper for verbs whose result is opaque text: returns the
-    /// handler content with augmentation reminders assembled in. Verbs that
-    /// parse the result as structured data (read-batch envelope, change report,
-    /// terminal poll) must call `call_tauri_full` and assemble reminders only
-    /// after parsing, so the data payload stays clean.
-    async fn call_tauri(&self, request: &CallbackRequest) -> String {
-        let outcome = self.call_tauri_full(request).await;
-        assemble_reminders(outcome.result, &outcome.reminders)
     }
 }
 
@@ -1308,128 +1316,121 @@ impl ServerHandler for CairnMcp {
         }
     }
 
-    fn list_tools(
+    async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ListToolsResult, rmcp::ErrorData>> + Send + '_ {
-        async move {
-            // Get static tools from the router
-            let mut tools = self.tool_router.list_all();
+    ) -> Result<ListToolsResult, rmcp::ErrorData> {
+        // Get static tools from the router
+        let mut tools = self.tool_router.list_all();
 
-            // Append available agents to the write tool description so task
-            // appends know which subagentType values are valid.
-            if !self.available_agents.is_empty() {
-                for tool in &mut tools {
-                    if tool.name == "write" {
-                        let mut desc = tool
-                            .description
-                            .as_ref()
-                            .map(|d| d.to_string())
-                            .unwrap_or_default();
-                        desc.push_str("\n\nAvailable agents for task appends (subagentType):\n");
-                        for agent in &self.available_agents {
-                            desc.push_str(&format!("- {}: {}\n", agent.name, agent.description));
-                        }
-                        tool.description = Some(std::borrow::Cow::Owned(desc));
-                        break;
+        // Append available agents to the write tool description so task
+        // appends know which subagentType values are valid.
+        if !self.available_agents.is_empty() {
+            for tool in &mut tools {
+                if tool.name == "write" {
+                    let mut desc = tool
+                        .description
+                        .as_ref()
+                        .map(|d| d.to_string())
+                        .unwrap_or_default();
+                    desc.push_str("\n\nAvailable agents for task appends (subagentType):\n");
+                    for agent in &self.available_agents {
+                        desc.push_str(&format!("- {}: {}\n", agent.name, agent.description));
                     }
+                    tool.description = Some(std::borrow::Cow::Owned(desc));
+                    break;
                 }
             }
-
-            Ok(ListToolsResult::with_all_items(tools))
         }
+
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
-    fn call_tool(
+    async fn call_tool(
         &self,
         request: CallToolRequestParam,
         context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<CallToolResult, rmcp::ErrorData>> + Send + '_ {
-        async move {
-            // Delegate to router for static tools
-            let tcc = ToolCallContext::new(self, request, context);
-            self.tool_router.call(tcc).await
-        }
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Delegate to router for static tools
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 
-    fn read_resource(
+    async fn read_resource(
         &self,
         request: ReadResourceRequestParam,
         _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = Result<ReadResourceResult, rmcp::ErrorData>> + Send + '_ {
-        async move {
-            let uri = &request.uri;
-            tracing::info!("read_resource called: uri={}", uri);
+    ) -> Result<ReadResourceResult, rmcp::ErrorData> {
+        let uri = &request.uri;
+        tracing::info!("read_resource called: uri={}", uri);
 
-            // Determine which callback to use based on URI scheme
-            let tool_name = if uri.starts_with("cairn://") {
-                // Parse cairn:// URI to determine resource type
-                match parse_cairn_uri(uri) {
-                    Some(resource) => {
-                        match resource {
-                            // Terminal resources use read_resource
-                            CairnResource::NodeTerminal { .. }
-                            | CairnResource::ProjectTerminal { .. } => "read_resource",
-                            // All other resources use read_issue_resource
-                            _ => "read_issue_resource",
-                        }
-                    }
-                    None => {
-                        return Err(rmcp::ErrorData::invalid_request(
-                            format!("Invalid cairn resource URI: {}", uri),
-                            None,
-                        ));
+        // Determine which callback to use based on URI scheme
+        let tool_name = if uri.starts_with("cairn://") {
+            // Parse cairn:// URI to determine resource type
+            match parse_cairn_uri(uri) {
+                Some(resource) => {
+                    match resource {
+                        // Terminal resources use read_resource
+                        CairnResource::NodeTerminal { .. }
+                        | CairnResource::ProjectTerminal { .. } => "read_resource",
+                        // All other resources use read_issue_resource
+                        _ => "read_issue_resource",
                     }
                 }
-            } else {
-                return Err(rmcp::ErrorData::invalid_request(
-                    format!("Unknown resource scheme: {}", uri),
-                    None,
-                ));
-            };
-
-            // Call Tauri callback
-            let callback_request = CallbackRequest {
-                cwd: self.cwd.to_string(),
-                run_id: self.run_id.as_ref().map(|r| r.to_string()),
-                tool: tool_name.to_string(),
-                payload: serde_json::json!({ "uri": uri }),
-                tool_use_id: None,
-            };
-
-            let response = self.call_tauri_full(&callback_request).await;
-            if self.should_update_base_uri_after_read(tool_name, &response) {
-                self.note_successful_resource_read(uri);
-            }
-
-            // For terminal resources, parse the structured response
-            if tool_name == "read_resource" {
-                match serde_json::from_str::<TerminalReadResult>(&response.result) {
-                    Ok(terminal_result) => {
-                        let rendered = self.relativize_cairn_uris_in_text(&terminal_result.output);
-                        let rendered = assemble_reminders(rendered, &response.reminders);
-                        let contents =
-                            vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
-                        return Ok(ReadResourceResult { contents });
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to parse terminal read result: {} - response: {}",
-                            e,
-                            response.result
-                        );
-                    }
+                None => {
+                    return Err(rmcp::ErrorData::invalid_request(
+                        format!("Invalid cairn resource URI: {}", uri),
+                        None,
+                    ));
                 }
             }
+        } else {
+            return Err(rmcp::ErrorData::invalid_request(
+                format!("Unknown resource scheme: {}", uri),
+                None,
+            ));
+        };
 
-            // For issue resources (or fallback), return the result directly
-            // The backend returns canonical content; display rendering can relativize URIs.
-            let rendered = self.relativize_cairn_uris_in_text(&response.result);
-            let rendered = assemble_reminders(rendered, &response.reminders);
-            let contents = vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
-            Ok(ReadResourceResult { contents })
+        // Call Tauri callback
+        let callback_request = CallbackRequest {
+            cwd: self.cwd.to_string(),
+            run_id: self.run_id.as_ref().map(|r| r.to_string()),
+            tool: tool_name.to_string(),
+            payload: serde_json::json!({ "uri": uri }),
+            tool_use_id: None,
+        };
+
+        let response = self.call_tauri_full(&callback_request).await;
+        if self.should_update_base_uri_after_read(tool_name, &response) {
+            self.note_successful_resource_read(uri);
         }
+
+        // For terminal resources, parse the structured response
+        if tool_name == "read_resource" {
+            match serde_json::from_str::<TerminalReadResult>(&response.result) {
+                Ok(terminal_result) => {
+                    let rendered = self.relativize_cairn_uris_in_text(&terminal_result.output);
+                    let rendered = assemble_reminders(rendered, &response.reminders);
+                    let contents = vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
+                    return Ok(ReadResourceResult { contents });
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to parse terminal read result: {} - response: {}",
+                        e,
+                        response.result
+                    );
+                }
+            }
+        }
+
+        // For issue resources (or fallback), return the result directly
+        // The backend returns canonical content; display rendering can relativize URIs.
+        let rendered = self.relativize_cairn_uris_in_text(&response.result);
+        let rendered = assemble_reminders(rendered, &response.reminders);
+        let contents = vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
+        Ok(ReadResourceResult { contents })
     }
 }
 
@@ -1437,9 +1438,6 @@ impl ServerHandler for CairnMcp {
 #[derive(Debug, Clone, Deserialize)]
 struct TerminalReadResult {
     output: String,
-    status: String,
-    #[serde(default)]
-    exit_code: Option<i32>,
 }
 
 #[tokio::main]
@@ -2307,9 +2305,8 @@ mod tests {
     fn test_cap_text_result_truncates_at_line_boundary() {
         // Build text that exceeds MAX_RESULT_CHARS
         let line = "x".repeat(100);
-        let lines: Vec<&str> = std::iter::repeat(line.as_str())
-            .take(MAX_RESULT_CHARS / 100 + 100)
-            .collect();
+        let lines: Vec<&str> =
+            std::iter::repeat_n(line.as_str(), MAX_RESULT_CHARS / 100 + 100).collect();
         let text = lines.join("\n");
         assert!(text.len() > MAX_RESULT_CHARS);
 
@@ -2329,9 +2326,8 @@ mod tests {
     #[test]
     fn test_cap_text_result_with_nonzero_offset() {
         let line = "x".repeat(100);
-        let lines: Vec<&str> = std::iter::repeat(line.as_str())
-            .take(MAX_RESULT_CHARS / 100 + 100)
-            .collect();
+        let lines: Vec<&str> =
+            std::iter::repeat_n(line.as_str(), MAX_RESULT_CHARS / 100 + 100).collect();
         let text = lines.join("\n");
 
         let result = cap_text_result(&text, 50);
@@ -2376,8 +2372,7 @@ mod tests {
         let line = format!("{}é", "z".repeat(99));
         assert_eq!(line.len(), 101); // 99 + 2 bytes for é
         let num_lines = MAX_RESULT_CHARS / 101 + 100;
-        let text = std::iter::repeat(line.as_str())
-            .take(num_lines)
+        let text = std::iter::repeat_n(line.as_str(), num_lines)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.len() > MAX_RESULT_CHARS);
@@ -2645,6 +2640,31 @@ mod tests {
         assert!(assembled.contains("[Direct message from planner] hello mid-turn"));
         assert!(assembled.contains("The worktree has uncommitted changes"));
         assert_eq!(assembled.matches("<system-reminder>").count(), 2);
+    }
+
+    #[test]
+    fn run_envelope_image_becomes_a_content_block() {
+        // The run tool parses a RunBatchEnvelope and lifts each image into its
+        // own content block after the text, so an image-bearing MCP tool result
+        // (e.g. an Axon look screenshot) reaches the agent. Exercise that lift.
+        let envelope = RunBatchEnvelope {
+            text: "=== look ===\nAX tree".to_string(),
+            images: vec![cairn_common::read::ImageBlock {
+                mime_type: "image/png".to_string(),
+                data: "b64".to_string(),
+            }],
+        };
+        let serialized = serde_json::to_string(&envelope).unwrap();
+        let parsed: RunBatchEnvelope = serde_json::from_str(&serialized).unwrap();
+
+        let mut blocks: Vec<Content> = vec![Content::text(parsed.text)];
+        for image in parsed.images {
+            blocks.push(Content::image(image.data, image.mime_type));
+        }
+        assert_eq!(blocks.len(), 2);
+        let image_block = blocks[1].raw.as_image().expect("second block is an image");
+        assert_eq!(image_block.mime_type, "image/png");
+        assert_eq!(image_block.data, "b64");
     }
 
     #[test]

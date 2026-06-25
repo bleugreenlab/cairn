@@ -32,7 +32,7 @@ async fn action_id_by_name(db: &LocalDb, name: &str) -> Option<String> {
                     params![name.as_str()],
                 )
                 .await?;
-            Ok(rows.next().await?.map(|r| r.text(0)).transpose()?)
+            rows.next().await?.map(|r| r.text(0)).transpose()
         })
     })
     .await

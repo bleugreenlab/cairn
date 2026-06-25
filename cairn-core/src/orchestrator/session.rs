@@ -631,6 +631,19 @@ fn build_messaging_context(
     out
 }
 
+/// Compose the per-run user message from the base task prompt and the dynamic
+/// messaging catch-up. Messaging rides the user turn (not the cached system
+/// prompt) so the system-prompt prefix stays byte-identical across resumes; an
+/// empty piece on either side collapses cleanly so a pure wake (no task text)
+/// or a quiet channel (no messaging) never injects stray separators.
+fn compose_user_message(prompt: &str, messaging: &str) -> String {
+    match (prompt.is_empty(), messaging.is_empty()) {
+        (_, true) => prompt.to_string(),
+        (true, false) => messaging.to_string(),
+        (false, false) => format!("{prompt}\n\n{messaging}"),
+    }
+}
+
 async fn issue_key(
     conn: &turso::Connection,
     project_key: &str,
@@ -1570,22 +1583,6 @@ pub fn start_agent_session(
                 }
             }
 
-            // Inject messaging context (peers + recent history)
-            if let Some(ref issue_id) = run_issue_id {
-                let messaging_section = build_messaging_context(
-                    orch,
-                    project_key.as_deref().unwrap_or(""),
-                    issue_id,
-                    run_id,
-                );
-                if !messaging_section.is_empty() {
-                    if !content.is_empty() {
-                        content.push_str("\n\n");
-                    }
-                    content.push_str(&messaging_section);
-                }
-            }
-
             // Inject the output-artifact instruction when this node produces one.
             // The schema is no longer a visible tool input, so the agent learns
             // the target URI, the fields, and the submit-then-stop protocol here.
@@ -1672,8 +1669,22 @@ pub fn start_agent_session(
             (Some(wrapped), Some(dynamic_tail))
         };
 
-        // Base prompt stays as user message
-        let resolved_prompt = prompt.to_string();
+        // Per-run messaging catch-up (active peers + channel messages newer
+        // than this session's injection cursor) is dynamic per-turn state, not
+        // durable instruction. It rides the user message instead of the cached
+        // system prompt, holding the system-prompt prefix byte-identical across
+        // every resume in a session so the provider can reuse the prompt cache
+        // rather than re-prime the whole context on each wake.
+        let messaging_section = match run_issue_id.as_deref() {
+            Some(issue_id) => build_messaging_context(
+                orch,
+                project_key.as_deref().unwrap_or(""),
+                issue_id,
+                run_id,
+            ),
+            None => String::new(),
+        };
+        let resolved_prompt = compose_user_message(prompt, &messaging_section);
 
         (
             allowed,
@@ -2179,6 +2190,24 @@ mod tests {
     /// The uniform assembly (cairn + workspace + project + agent) yields an
     /// ordered segment map whose concatenation is the composed prompt, and whose
     /// agent content is split into a static head and the inlined dynamic tail.
+    /// Messaging catch-up rides the user turn, not the cached system prompt.
+    /// The composer appends it after the task with a blank-line separator, and
+    /// collapses cleanly when either side is empty so a pure wake or a quiet
+    /// channel never injects stray whitespace.
+    #[test]
+    fn compose_user_message_appends_messaging_after_task() {
+        assert_eq!(
+            compose_user_message("do the thing", "## Agent Messaging\n\nhi"),
+            "do the thing\n\n## Agent Messaging\n\nhi"
+        );
+        assert_eq!(compose_user_message("do the thing", ""), "do the thing");
+        assert_eq!(
+            compose_user_message("", "## Agent Messaging\n\nhi"),
+            "## Agent Messaging\n\nhi"
+        );
+        assert_eq!(compose_user_message("", ""), "");
+    }
+
     #[test]
     fn assemble_prompt_segments_splits_static_head_from_dynamic_tail() {
         let agent = "<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>";

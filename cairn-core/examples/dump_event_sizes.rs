@@ -41,8 +41,8 @@ async fn main() {
 
     let (mut total_stub, mut total_blob, mut total_orig) = (0i64, 0i64, 0i64);
     println!(
-        "{:<9} {:<14} {:<9} {:>7} {:>7} {:>8}  {}",
-        "run", "type", "mode", "stub", "blob", "orig", "head"
+        "{:<9} {:<14} {:<9} {:>7} {:>7} {:>8}  head",
+        "run", "type", "mode", "stub", "blob", "orig"
     );
     while let Some(row) = rows.next().await.unwrap() {
         let run = text(&row.get_value(0).unwrap());

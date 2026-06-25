@@ -1963,7 +1963,7 @@ mod tests {
                     let mut rows = conn
                         .query("SELECT data FROM events WHERE id = 'e-r2'", ())
                         .await?;
-                    DbResult::Ok(rows.next().await?.unwrap().text(0)?)
+                    rows.next().await?.unwrap().text(0)
                 })
             })
             .await
@@ -2973,7 +2973,7 @@ mod tests {
                     let mut rows = conn
                         .query("SELECT data FROM events WHERE id = 'u1'", ())
                         .await?;
-                    DbResult::Ok(rows.next().await?.unwrap().text(0)?)
+                    rows.next().await?.unwrap().text(0)
                 })
             })
             .await
@@ -3050,7 +3050,7 @@ mod tests {
                 let mut rows = conn
                     .query("SELECT COUNT(*) FROM archival_blobs", ())
                     .await?;
-                DbResult::Ok(rows.next().await?.unwrap().i64(0)?)
+                rows.next().await?.unwrap().i64(0)
             })
         })
         .await
@@ -3063,7 +3063,7 @@ mod tests {
                 let mut rows = conn
                     .query("SELECT data FROM events WHERE id = ?1", (id,))
                     .await?;
-                DbResult::Ok(rows.next().await?.unwrap().text(0)?)
+                rows.next().await?.unwrap().text(0)
             })
         })
         .await

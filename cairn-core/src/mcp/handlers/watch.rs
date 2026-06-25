@@ -320,6 +320,174 @@ async fn latest_external_reply_event(
     }))
 }
 
+/// Handle a `watch` tool call. Long-polls until the issue is actionable.
+pub async fn handle_watch(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+    let Some(issue_uri) = request.payload.get("issue_uri").and_then(|v| v.as_str()) else {
+        return error_json("watch requires payload.issue_uri");
+    };
+    let since = request.payload.get("since").and_then(|v| v.as_i64());
+
+    let parsed = cairn_common::uri::parse_uri(issue_uri).and_then(|resource| {
+        match (
+            resource.project().map(str::to_string),
+            resource.issue_number(),
+        ) {
+            (Some(project), Some(number)) => Some((project, number)),
+            _ => None,
+        }
+    });
+    let Some((project_key, number)) = parsed else {
+        return error_json(&format!("Not an issue URI: {issue_uri}"));
+    };
+
+    let issue_ref = match resolve_issue_ref(&orch.db.local, &project_key, number).await {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+
+    // Subscribe BEFORE the catch-up read. The read has awaits after its SELECT
+    // runs, and `watch` is the one broadcast-await handler whose event source
+    // is fully concurrent (agents, webhooks, terminal resolve). Subscribing
+    // first means an emit that fires during the read is buffered and delivered
+    // to the loop below rather than dropped — closing the within-call twin of
+    // the between-calls gap the cursor handles.
+    let mut rx = orch.attention_changed.subscribe();
+
+    // Step 1: current-state check (catch-up between calls). Distinguish a real
+    // read error here, before committing to the long-poll.
+    match read_issue_state(&orch.db.local, &issue_ref.issue_id).await {
+        Ok((attention, status, updated_at)) => {
+            match evaluate(attention.clone(), status.clone(), updated_at, since) {
+                WatchOutcome::Resolved | WatchOutcome::Actionable => {
+                    // Prefer a buffered typed event over a synthesized one:
+                    // the buffered event carries inline content (question
+                    // text, artifact title/summary, PR state, ...) that the
+                    // projection-based synthesis cannot reconstruct. Drain
+                    // the broadcast non-blockingly for a matching, on-cursor
+                    // event; fall back to `synthesize_event` only when none
+                    // is queued. This preserves the no-follow-up-read promise
+                    // across the between-calls gap that the cursor handles.
+                    if let Some(json) = try_pop_actionable_for(&mut rx, &issue_ref.issue_id, since)
+                    {
+                        return json;
+                    }
+                    let event =
+                        synthesize_event(&orch.db.local, &issue_ref, attention, status, updated_at)
+                            .await;
+                    return event_to_watch_json(&event).to_string();
+                }
+                WatchOutcome::NotYet => {
+                    if let Ok(Some(event)) =
+                        latest_external_reply_event(&orch.db.local, &issue_ref, since).await
+                    {
+                        if event_is_actionable(&event, since) {
+                            if let Some(json) =
+                                try_pop_actionable_for(&mut rx, &issue_ref.issue_id, since)
+                            {
+                                return json;
+                            }
+                            return event_to_watch_json(&event).to_string();
+                        }
+                    }
+                    // The issue projection isn't actionable, but a freshly-opened
+                    // PR (GitHub state unknown, so attention is deliberately None)
+                    // is actionable work. Consult the shared idle path directly —
+                    // not `synthesize_event`, whose issue-URI fallback would
+                    // fabricate a spurious wake for a plain idle bump. Return only
+                    // a real fact (an open PR) that clears the caller's cursor.
+                    let ctx = IssueAttentionContext {
+                        project_key: issue_ref.project_key.clone(),
+                        number: issue_ref.number,
+                        attention,
+                        status,
+                        updated_at,
+                    };
+                    if let Some(idle) =
+                        idle_fact_for_issue(&orch.db.local, &issue_ref.issue_id, &ctx, None).await
+                    {
+                        let event = AttentionEvent {
+                            issue_id: issue_ref.issue_id.clone(),
+                            issue_uri: ctx.issue_uri(),
+                            fact: idle.fact,
+                            attention: ctx.attention,
+                            status: ctx.status,
+                            updated_at: idle.updated_at,
+                        };
+                        if event_is_actionable(&event, since) {
+                            if let Some(json) =
+                                try_pop_actionable_for(&mut rx, &issue_ref.issue_id, since)
+                            {
+                                return json;
+                            }
+                            return event_to_watch_json(&event).to_string();
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => return error_json(&e),
+    }
+
+    // Step 2: await typed events for this issue — no polling. On match, render
+    // the response directly from the event content (no follow-up DB read).
+    let target = issue_ref.issue_id.clone();
+    let db = &orch.db.local;
+    let result = tokio::time::timeout(SERVER_WATCH_BUDGET, async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.issue_id != target {
+                        continue;
+                    }
+                    // Filter by cursor: a stale-vs-cursor event (no newer
+                    // updated_at) is not what the caller is waiting for.
+                    // Terminal facts always win; other facts follow the shared
+                    // attention projection.
+                    if event_is_actionable(&event, since) {
+                        return Some(event_to_watch_json(&event).to_string());
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Missed events; re-read once rather than assume nothing
+                    // changed and synthesize an event from the live projection.
+                    if let Ok(Some(event)) =
+                        latest_external_reply_event(db, &issue_ref, since).await
+                    {
+                        return Some(event_to_watch_json(&event).to_string());
+                    }
+                    if let Ok((attention, status, updated_at)) = read_issue_state(db, &target).await
+                    {
+                        match evaluate(attention.clone(), status.clone(), updated_at, since) {
+                            WatchOutcome::NotYet => {}
+                            _ => {
+                                let event =
+                                    synthesize_event(db, &issue_ref, attention, status, updated_at)
+                                        .await;
+                                return Some(event_to_watch_json(&event).to_string());
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Some(json)) => json,
+        Ok(None) | Err(_) => {
+            // Budget expired or channel closed: pending sentinel carrying the
+            // current cursor so the CLI can re-issue with an accurate --since.
+            let updated_at = read_issue_state(&orch.db.local, &issue_ref.issue_id)
+                .await
+                .map(|(_, _, u)| u)
+                .unwrap_or(0);
+            json!({ "status": "pending", "updated_at": updated_at }).to_string()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,173 +802,5 @@ mod tests {
             ),
             WatchOutcome::NotYet
         ));
-    }
-}
-
-/// Handle a `watch` tool call. Long-polls until the issue is actionable.
-pub async fn handle_watch(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    let Some(issue_uri) = request.payload.get("issue_uri").and_then(|v| v.as_str()) else {
-        return error_json("watch requires payload.issue_uri");
-    };
-    let since = request.payload.get("since").and_then(|v| v.as_i64());
-
-    let parsed = cairn_common::uri::parse_uri(issue_uri).and_then(|resource| {
-        match (
-            resource.project().map(str::to_string),
-            resource.issue_number(),
-        ) {
-            (Some(project), Some(number)) => Some((project, number)),
-            _ => None,
-        }
-    });
-    let Some((project_key, number)) = parsed else {
-        return error_json(&format!("Not an issue URI: {issue_uri}"));
-    };
-
-    let issue_ref = match resolve_issue_ref(&orch.db.local, &project_key, number).await {
-        Ok(r) => r,
-        Err(e) => return error_json(&e),
-    };
-
-    // Subscribe BEFORE the catch-up read. The read has awaits after its SELECT
-    // runs, and `watch` is the one broadcast-await handler whose event source
-    // is fully concurrent (agents, webhooks, terminal resolve). Subscribing
-    // first means an emit that fires during the read is buffered and delivered
-    // to the loop below rather than dropped — closing the within-call twin of
-    // the between-calls gap the cursor handles.
-    let mut rx = orch.attention_changed.subscribe();
-
-    // Step 1: current-state check (catch-up between calls). Distinguish a real
-    // read error here, before committing to the long-poll.
-    match read_issue_state(&orch.db.local, &issue_ref.issue_id).await {
-        Ok((attention, status, updated_at)) => {
-            match evaluate(attention.clone(), status.clone(), updated_at, since) {
-                WatchOutcome::Resolved | WatchOutcome::Actionable => {
-                    // Prefer a buffered typed event over a synthesized one:
-                    // the buffered event carries inline content (question
-                    // text, artifact title/summary, PR state, ...) that the
-                    // projection-based synthesis cannot reconstruct. Drain
-                    // the broadcast non-blockingly for a matching, on-cursor
-                    // event; fall back to `synthesize_event` only when none
-                    // is queued. This preserves the no-follow-up-read promise
-                    // across the between-calls gap that the cursor handles.
-                    if let Some(json) = try_pop_actionable_for(&mut rx, &issue_ref.issue_id, since)
-                    {
-                        return json;
-                    }
-                    let event =
-                        synthesize_event(&orch.db.local, &issue_ref, attention, status, updated_at)
-                            .await;
-                    return event_to_watch_json(&event).to_string();
-                }
-                WatchOutcome::NotYet => {
-                    if let Ok(Some(event)) =
-                        latest_external_reply_event(&orch.db.local, &issue_ref, since).await
-                    {
-                        if event_is_actionable(&event, since) {
-                            if let Some(json) =
-                                try_pop_actionable_for(&mut rx, &issue_ref.issue_id, since)
-                            {
-                                return json;
-                            }
-                            return event_to_watch_json(&event).to_string();
-                        }
-                    }
-                    // The issue projection isn't actionable, but a freshly-opened
-                    // PR (GitHub state unknown, so attention is deliberately None)
-                    // is actionable work. Consult the shared idle path directly —
-                    // not `synthesize_event`, whose issue-URI fallback would
-                    // fabricate a spurious wake for a plain idle bump. Return only
-                    // a real fact (an open PR) that clears the caller's cursor.
-                    let ctx = IssueAttentionContext {
-                        project_key: issue_ref.project_key.clone(),
-                        number: issue_ref.number,
-                        attention,
-                        status,
-                        updated_at,
-                    };
-                    if let Some(idle) =
-                        idle_fact_for_issue(&orch.db.local, &issue_ref.issue_id, &ctx, None).await
-                    {
-                        let event = AttentionEvent {
-                            issue_id: issue_ref.issue_id.clone(),
-                            issue_uri: ctx.issue_uri(),
-                            fact: idle.fact,
-                            attention: ctx.attention,
-                            status: ctx.status,
-                            updated_at: idle.updated_at,
-                        };
-                        if event_is_actionable(&event, since) {
-                            if let Some(json) =
-                                try_pop_actionable_for(&mut rx, &issue_ref.issue_id, since)
-                            {
-                                return json;
-                            }
-                            return event_to_watch_json(&event).to_string();
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => return error_json(&e),
-    }
-
-    // Step 2: await typed events for this issue — no polling. On match, render
-    // the response directly from the event content (no follow-up DB read).
-    let target = issue_ref.issue_id.clone();
-    let db = &orch.db.local;
-    let result = tokio::time::timeout(SERVER_WATCH_BUDGET, async {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if event.issue_id != target {
-                        continue;
-                    }
-                    // Filter by cursor: a stale-vs-cursor event (no newer
-                    // updated_at) is not what the caller is waiting for.
-                    // Terminal facts always win; other facts follow the shared
-                    // attention projection.
-                    if event_is_actionable(&event, since) {
-                        return Some(event_to_watch_json(&event).to_string());
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Missed events; re-read once rather than assume nothing
-                    // changed and synthesize an event from the live projection.
-                    if let Ok(Some(event)) =
-                        latest_external_reply_event(db, &issue_ref, since).await
-                    {
-                        return Some(event_to_watch_json(&event).to_string());
-                    }
-                    if let Ok((attention, status, updated_at)) = read_issue_state(db, &target).await
-                    {
-                        match evaluate(attention.clone(), status.clone(), updated_at, since) {
-                            WatchOutcome::NotYet => {}
-                            _ => {
-                                let event =
-                                    synthesize_event(db, &issue_ref, attention, status, updated_at)
-                                        .await;
-                                return Some(event_to_watch_json(&event).to_string());
-                            }
-                        }
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    })
-    .await;
-
-    match result {
-        Ok(Some(json)) => json,
-        Ok(None) | Err(_) => {
-            // Budget expired or channel closed: pending sentinel carrying the
-            // current cursor so the CLI can re-issue with an accurate --since.
-            let updated_at = read_issue_state(&orch.db.local, &issue_ref.issue_id)
-                .await
-                .map(|(_, _, u)| u)
-                .unwrap_or(0);
-            json!({ "status": "pending", "updated_at": updated_at }).to_string()
-        }
     }
 }

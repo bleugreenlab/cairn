@@ -5,11 +5,11 @@ mod preview;
 mod types;
 
 use self::file_mutations::{
-    apply_file_batch, emit_worktree_changed, finalize_file_commit, FileBatchSuccess,
+    apply_file_batch, emit_worktree_changed, finalize_file_commit, CommitOutcome, FileBatchSuccess,
 };
 use self::preview::{handle_apply_change, preview_change};
 use self::types::{
-    build_failure, empty_change_report, resource_failure, AppliedChange, ChangeFailure,
+    build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, ChangeFailure,
     CommitReport, IndexedChange, IndexedFailure,
 };
 use super::target::{target_family, TargetFamily};
@@ -123,6 +123,143 @@ fn apply_file_changes<'a>(
             )
         })
         .collect()
+}
+
+/// Recover a write+commit_msg batch whose seal hit a STALE working copy
+/// ([`CommitOutcome::StaleRetry`]). A sibling advanced `@` over the shared store
+/// between apply and seal; the loose edits are still on disk. Clear the staleness
+/// (which discards those edits and re-bases `@` onto the advanced tip), re-apply
+/// the batch's file changes against that fresh base, and re-seal. Anchored edits
+/// re-match the advanced base — preserving a sibling's edits elsewhere in a
+/// touched file and failing cleanly when the sibling rewrote the anchored region
+/// itself. Every failure mode falls back to a stale-resilient discard, so the
+/// worktree==HEAD invariant holds even when recovery can't land the batch.
+async fn recover_stale_file_commit(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    payload: &ChangePayload,
+    allow_escape: bool,
+    promoted_memory_uris: &[String],
+    first_file_change: &IndexedChange<'_>,
+    seal_error: &str,
+) -> Result<Option<CommitReport>, Box<IndexedFailure>> {
+    let cwd = std::path::Path::new(&request.cwd);
+    let atomic = payload.atomic.unwrap_or(false);
+    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, cwd);
+
+    // Giveup failure: revert via the stale-resilient discard and report that the
+    // worktree was restored to HEAD (the Phase-1 invariant), with retry guidance.
+    // `detail` names the recovery step that couldn't proceed.
+    let give_up = |vcs: &dyn crate::mcp::vcs::WorktreeVcs, detail: &str| -> Box<IndexedFailure> {
+        let restore = vcs.discard(cwd);
+        let error = match restore {
+            Ok(()) => format!(
+                "Applied file changes but commit failed: {seal_error}; {detail}, so the worktree was restored to HEAD. Retry the write."
+            ),
+            Err(re) => format!(
+                "Applied file changes but commit failed: {seal_error}; {detail}, and restoring the worktree to HEAD also failed: {re}"
+            ),
+        };
+        Box::new(IndexedFailure {
+            failure: ChangeFailure {
+                index: first_file_change.index,
+                target: first_file_change.item.target.clone(),
+                mode: mode_name(first_file_change.item.mode).to_string(),
+                kind: "file".to_string(),
+                error: error.clone(),
+            },
+            commit: Some(CommitReport {
+                status: "failed".to_string(),
+                sha: None,
+                pr_number: None,
+                message: Some(error),
+            }),
+        })
+    };
+
+    // A rename in the batch can't be safely re-derived here (its edit set is a
+    // structural plan that would have to be recomputed against the advanced
+    // base), so re-applying only the non-rename items would seal an incomplete
+    // batch. Revert cleanly instead.
+    let has_rename = payload.changes.iter().any(|item| {
+        item.mode == ChangeMode::Rename
+            && matches!(target_family(&item.target), Ok(TargetFamily::File))
+    });
+    if has_rename {
+        let failure = give_up(
+            vcs.as_ref(),
+            "the batch includes a structural rename that can't be re-derived against the advanced base",
+        );
+        emit_worktree_changed(orch, &request.cwd);
+        return Err(failure);
+    }
+
+    // (a) Clear staleness: advances `@` onto the sibling's tip and discards the
+    // loose edits, so the on-disk base is now the advanced sibling state.
+    if let Err(e) = vcs.update_stale(cwd) {
+        let failure = give_up(
+            vcs.as_ref(),
+            &format!("recovering the stale worktree failed ({e})"),
+        );
+        emit_worktree_changed(orch, &request.cwd);
+        return Err(failure);
+    }
+
+    // (b) Re-apply the ordered non-rename file changes against the fresh base.
+    let file_batch: Vec<IndexedChange> = payload
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            matches!(target_family(&item.target), Ok(TargetFamily::File))
+                && item.mode != ChangeMode::Rename
+        })
+        .map(|(index, item)| IndexedChange { index, item })
+        .collect();
+
+    let mut affected_paths: Vec<String> = Vec::new();
+    let mut recorded_changes = Vec::new();
+    for result in apply_file_changes(request, &file_batch, allow_escape, atomic) {
+        match result {
+            Ok(success) => {
+                affected_paths.extend(success.affected_paths);
+                recorded_changes.extend(success.recorded_changes);
+            }
+            Err(_) => {
+                let failure = give_up(
+                    vcs.as_ref(),
+                    "an anchored edit no longer matched the advanced base",
+                );
+                emit_worktree_changed(orch, &request.cwd);
+                return Err(failure);
+            }
+        }
+    }
+
+    // (c) Re-seal against the advanced base.
+    match finalize_file_commit(
+        orch,
+        request,
+        payload.commit_msg.as_deref(),
+        &affected_paths,
+        &recorded_changes,
+        first_file_change,
+        promoted_memory_uris,
+    )
+    .await
+    {
+        Ok(CommitOutcome::Done(report)) => Ok(report),
+        Ok(CommitOutcome::StaleRetry { seal_error: e2 }) => {
+            let failure = give_up(
+                vcs.as_ref(),
+                &format!("the worktree advanced again during recovery ({e2})"),
+            );
+            emit_worktree_changed(orch, &request.cwd);
+            Err(failure)
+        }
+        // A non-stale re-seal error already discarded inside finalize.
+        Err(failure) => Err(failure),
+    }
 }
 
 /// Handle canonical change tool call.
@@ -679,6 +816,20 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         .collect();
 
     if let Some(first_file_change) = first_file_change {
+        // Serialize the seal/discard (and its stale-recovery: update-stale →
+        // re-apply → re-seal → fallback discard) on the per-store jj lock that
+        // base-advance reconcile and merge-fold hold, so a write-path seal never
+        // forks the shared store's operation log against a concurrent
+        // reconcile/fold. The guard must span the recovery too, so it is bound
+        // here across the whole finalize+recover branch. Disk-apply of edits
+        // happened earlier (pure FS writes, no shared-store mutation) and stays
+        // outside the lock. `None` for a non-worktree cwd. The held guard crosses
+        // `.await`s; tokio's MutexGuard is Send, so this is correct.
+        let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+        let _store_guard = match store_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         match finalize_file_commit(
             orch,
             request,
@@ -690,7 +841,44 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         )
         .await
         {
-            Ok(commit_report) => commit = commit_report,
+            Ok(CommitOutcome::Done(commit_report)) => commit = commit_report,
+            Ok(CommitOutcome::StaleRetry { seal_error }) => {
+                // A sibling advanced `@` between apply and seal. Try to land the
+                // batch on the advanced base rather than lose it; any failure
+                // falls back to a stale-resilient revert inside the recovery.
+                match recover_stale_file_commit(
+                    orch,
+                    request,
+                    &payload,
+                    allow_escape,
+                    &promoted_memory_uris,
+                    &first_file_change,
+                    &seal_error,
+                )
+                .await
+                {
+                    Ok(commit_report) => commit = commit_report,
+                    Err(failure) => {
+                        let IndexedFailure {
+                            failure,
+                            commit: failure_commit,
+                        } = *failure;
+                        if atomic {
+                            rollback_promoted_memory_decisions(orch, &promoted_memories).await;
+                            return change_report_json(
+                                applied,
+                                vec![failure],
+                                failure_commit,
+                                atomic,
+                            );
+                        }
+                        if let Some(failure_commit) = failure_commit {
+                            commit = Some(failure_commit);
+                        }
+                        failures.push(failure);
+                    }
+                }
+            }
             Err(failure) => {
                 let IndexedFailure {
                     failure,

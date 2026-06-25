@@ -185,7 +185,7 @@ async fn summaries_for_action_runs_preserve_action_run_id() {
     )
     .await;
 
-    let summaries = queries::get_summaries_for_action_runs(&db, &[action_run.clone()])
+    let summaries = queries::get_summaries_for_action_runs(&db, std::slice::from_ref(&action_run))
         .await
         .unwrap();
     assert_eq!(summaries.len(), 1);

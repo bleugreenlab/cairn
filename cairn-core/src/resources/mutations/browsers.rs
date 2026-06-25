@@ -329,6 +329,27 @@ async fn wait_for_navigation(
     }
 }
 
+pub(super) async fn apply_browser_delete(
+    orch: &Orchestrator,
+    resource: &CairnResource,
+) -> Result<String, String> {
+    let (scope, slug) = resolve_browser_scope(&orch.db.local, resource).await?;
+    let browser = find_browser_by_scope_and_slug(&orch.db.local, scope, &slug)
+        .await?
+        .ok_or_else(|| format!("No browser open at slug '{slug}'"))?;
+    let now = chrono::Utc::now().timestamp();
+    mark_browser_closed(&orch.db.local, &browser.id, now).await?;
+    send_command(
+        orch,
+        BrowserCommand::Close {
+            id: browser.id.clone(),
+            label: browser.webview_label.clone(),
+        },
+    );
+    emit_db_change(orch, "delete");
+    Ok(format!("Closed browser '{slug}'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,25 +731,4 @@ mod tests {
             "{msg}"
         );
     }
-}
-
-pub(super) async fn apply_browser_delete(
-    orch: &Orchestrator,
-    resource: &CairnResource,
-) -> Result<String, String> {
-    let (scope, slug) = resolve_browser_scope(&orch.db.local, resource).await?;
-    let browser = find_browser_by_scope_and_slug(&orch.db.local, scope, &slug)
-        .await?
-        .ok_or_else(|| format!("No browser open at slug '{slug}'"))?;
-    let now = chrono::Utc::now().timestamp();
-    mark_browser_closed(&orch.db.local, &browser.id, now).await?;
-    send_command(
-        orch,
-        BrowserCommand::Close {
-            id: browser.id.clone(),
-            label: browser.webview_label.clone(),
-        },
-    );
-    emit_db_change(orch, "delete");
-    Ok(format!("Closed browser '{slug}'"))
 }

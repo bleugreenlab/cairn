@@ -350,28 +350,6 @@ pub fn backend_for_model(model: &str) -> Option<&'static str> {
 pub(crate) mod tests {
     use super::*;
 
-    pub(crate) fn make_config(session_start: SessionStart) -> SessionConfig {
-        SessionConfig {
-            run_id: "run-1".into(),
-            working_dir: "/tmp".into(),
-            prompt: "hello".into(),
-            system_prompt_content: None,
-            system_prompt_dynamic_tail: None,
-            model: None,
-            session_start,
-            allowed_tools: vec![],
-            disallowed_tools: vec![],
-            mcp_config_json: "{\"mcpServers\":{}}".into(),
-            home_uri: "cairn://p/TEST/1/1/node".into(),
-            max_thinking_tokens: None,
-            reasoning_effort: None,
-            service_tier: None,
-            permissions: AgentPermissions::new(Fence::default()),
-            bidirectional: false,
-            identity: None,
-        }
-    }
-
     // =========================================================================
     // AgentPermissions::to_legacy_str
     // =========================================================================

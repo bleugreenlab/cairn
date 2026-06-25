@@ -23,7 +23,7 @@ pub mod skills;
 pub mod wakes;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::broadcast;
@@ -310,6 +310,7 @@ impl OrchestratorBuilder {
             provider_usage_snapshots: self.provider_usage_snapshots,
             context_token_snapshots: self.context_token_snapshots,
             execution_locks: Arc::new(Mutex::new(HashMap::new())),
+            jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
@@ -484,6 +485,14 @@ pub struct Orchestrator {
     /// Prevents concurrent `persist_task_packet` calls from losing packets.
     pub execution_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
 
+    /// Per-store locks serializing base-advance reconcile and merge-fold
+    /// mutations on a shared jj project store, keyed by the store directory.
+    /// Concurrent jj rebase/import ops on one store from forked operation logs
+    /// mint divergent conflicted copies of the same change-id; this single-writer
+    /// discipline closes that window. Keyed by store path (not execution/job) so
+    /// reconciles from different executions on the same project store serialize.
+    pub jj_store_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+
     /// In-flight worktree/setup preparation handles, keyed by job id.
     pub setup_registry: Arc<Mutex<HashMap<String, SetupHandle>>>,
 
@@ -542,6 +551,18 @@ impl Orchestrator {
     pub fn execution_lock(&self, execution_id: &str) -> Arc<TokioMutex<()>> {
         let mut map = self.execution_locks.lock().unwrap();
         map.entry(execution_id.to_string())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
+    }
+
+    /// Get or create a per-store lock serializing base-advance reconcile and
+    /// merge-fold mutations on a shared jj project store. Acquire it once per
+    /// logical operation at exactly one level — `TokioMutex` is not reentrant, so
+    /// the inner reconcile helpers must never re-acquire it while it is held.
+    pub fn jj_store_lock(&self, store_dir: &Path) -> Arc<TokioMutex<()>> {
+        let key = store_dir.to_string_lossy().into_owned();
+        let mut map = self.jj_store_locks.lock().unwrap();
+        map.entry(key)
             .or_insert_with(|| Arc::new(TokioMutex::new(())))
             .clone()
     }
@@ -764,6 +785,28 @@ impl Orchestrator {
                     crate::memories::triage::reconcile_memory_triage(orch.clone()).await
                 {
                     log::warn!("memory triage reconcile failed: {error}");
+                }
+            }
+        });
+    }
+
+    /// Spawn the Memory Review delivery reconciliation sweep: once immediately at
+    /// startup, then periodically. This backstops jobs that were already marked
+    /// `memory_review_state = 'sent'` before the direct-delivery path moved to
+    /// attention pushes. It is conservative and idempotent; errors are logged.
+    pub fn spawn_memory_review_reconcile(&self) {
+        const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            loop {
+                interval.tick().await;
+                match crate::memories::commands::reconcile_stranded_memory_reviews(orch.clone()) {
+                    Ok(count) if count > 0 => {
+                        log::info!("memory review reconcile resumed {count} stranded review(s)");
+                    }
+                    Ok(_) => {}
+                    Err(error) => log::warn!("memory review reconcile failed: {error}"),
                 }
             }
         });

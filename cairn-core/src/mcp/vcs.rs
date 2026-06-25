@@ -60,6 +60,11 @@ pub trait WorktreeVcs: Send + Sync {
     ) -> Result<CommitResult, String>;
     /// Discard working-copy changes, returning the worktree to its committed state.
     fn discard(&self, worktree: &Path) -> Result<(), String>;
+    /// Clear a STALE working copy by advancing `@` onto the rewritten/advanced
+    /// commit (the one jj op staleness does not block). The stale-resilient
+    /// `discard` leans on it internally; the write-path recovery calls it
+    /// explicitly to re-base the worktree before re-applying a batch.
+    fn update_stale(&self, worktree: &Path) -> Result<(), String>;
     /// Whether this backend can revert the working copy to its committed state.
     ///
     /// True for a real worktree (`discard` rolls `@` back). False for the
@@ -141,6 +146,10 @@ impl WorktreeVcs for JjBackend {
 
     fn discard(&self, worktree: &Path) -> Result<(), String> {
         crate::jj::discard(&self.jj, worktree)
+    }
+
+    fn update_stale(&self, worktree: &Path) -> Result<(), String> {
+        crate::jj::update_stale(&self.jj, worktree)
     }
 }
 
@@ -230,6 +239,11 @@ impl WorktreeVcs for NonWorktreeVcs {
         Ok(())
     }
 
+    fn update_stale(&self, _worktree: &Path) -> Result<(), String> {
+        // A plain checkout over one git repo is never a stale jj workspace.
+        Ok(())
+    }
+
     fn can_revert(&self) -> bool {
         // The live checkout is never reverted (it holds the user's own work);
         // the barrier warns about stray dirt instead.
@@ -254,6 +268,98 @@ pub fn resolve_worktree_vcs(
     }
 }
 
+/// Resolve the per-store serialization lock for an agent cwd, keyed identically
+/// to base-advance reconcile and merge-fold
+/// (`project_store_dir(config_dir, repo_path)`), so the agent seal/discard path
+/// serializes on the SAME lock instance those store mutators hold. An agent seal
+/// running `jj` ops on a shared store concurrently with a reconcile/fold can fork
+/// the operation log and mint divergent conflicted copies; holding this lock
+/// across the seal closes that window.
+///
+/// Returns `None` for a non-worktree cwd (the project's live checkout behind a
+/// no-worktree agent never mutates a shared store, so there is nothing to
+/// serialize) or when the project store cannot be resolved. The `None` fallback
+/// is best-effort by design: the seal still proceeds without the guard, matching
+/// today's behavior — every real agent worktree resolves a run + repo_path, so
+/// the fallback only fires where there is no shared store to protect.
+pub async fn resolve_store_lock(
+    orch: &crate::orchestrator::Orchestrator,
+    request: &cairn_common::protocol::CallbackRequest,
+) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
+    let cwd = Path::new(&request.cwd);
+    if !crate::jj::is_jj_dir(cwd) {
+        return None; // NonWorktreeVcs — never touches a shared store.
+    }
+    let run = crate::mcp::handlers::run_context::lookup_run(&orch.db.local, request)
+        .await
+        .ok()?;
+    let repo_path =
+        crate::mcp::handlers::run_context::project_path(&orch.db.local, &run.project_id)
+            .await
+            .ok()??;
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+    Some(orch.jj_store_lock(&store))
+}
+
+/// Env that makes a bare `git`/`jj` shell command run through the run tool
+/// behave correctly inside a jj-only agent worktree. Empty for a non-worktree
+/// cwd (the project's live checkout, where bare git correctly resolves the
+/// checkout), so that path is untouched.
+///
+/// Two distinct fixes compose here, both scoped to a `.jj` worktree:
+///
+/// 1. **Managed jj identity** ([`crate::jj::JjEnv::shell_env`]). A non-colocated
+///    jj workspace has no `.git`, so a bare `jj` shell command that never saw
+///    `JJ_CONFIG` would commit with an empty/wrong committer and be unpushable.
+///    This injects exactly the env managed jj already runs with, giving a bare
+///    `jj` the managed fallback identity (`Cairn Agent <agent@cairn.local>`) —
+///    a valid, pushable committer. The *per-project* author used on managed
+///    seals is injected only as `--config user.{name,email}=…` args on each
+///    seal (`JjEnv::author_args`); a bare jj command cannot carry those, and
+///    that is correct — do NOT "fix" it by leaking project identity into the
+///    global jj config; the managed fallback is itself a valid committer.
+/// 2. **`GIT_CEILING_DIRECTORIES`**. A non-colocated workspace has no `.git`, so
+///    a bare `git` walks *up* the tree and silently resolves the `~/.cairn`
+///    HOME repo (`git rev-parse --show-toplevel` returns `~/.cairn`,
+///    `git status` reports `On branch main`) — answering about the wrong repo
+///    with no error. A ceiling stops git's upward repo discovery at the
+///    worktree boundary, so a bare `git` in a non-colocated workspace fails
+///    loudly ("not a git repository") instead.
+///
+///    The ceiling is the worktree root's **parent**, not the worktree root
+///    itself. git's `longest_ancestor_length` (setup.c) only honors a ceiling
+///    entry that is a *strict* ancestor of the cwd — a prefix followed by `/` —
+///    so a ceiling equal to the cwd is ignored. A bare `git` most often runs
+///    *from* the worktree root (cwd == worktree root), so a worktree-root
+///    ceiling would be inert there and git would ascend to `~/.cairn` anyway.
+///    The parent is a strict ancestor of both the worktree root and any subdir
+///    an agent `cd`-ed into, so git examines the worktree subtree, finds no
+///    `.git`, and stops at the parent without ever reaching `~/.cairn`.
+///
+///    jj's own git-backend ops (`jj git push`/`fetch`, seal, log) address the
+///    store by absolute path via libgit2/gitoxide, not by the git CLI's
+///    cwd-anchored discovery walk, so this knob is inert for them — see the
+///    bare-`jj git push` non-regression test in `mcp_run_commit_hygiene`. (The
+///    jj store lives under `~/.cairn/jj-stores`, never between a worktree and
+///    this parent ceiling, so even a discovery-based op could not be trapped.)
+pub fn worktree_shell_vcs_env(
+    orch: &crate::orchestrator::Orchestrator,
+    cwd: &Path,
+) -> Vec<(String, String)> {
+    if !crate::jj::is_jj_dir(cwd) {
+        return Vec::new();
+    }
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let mut env = jj.shell_env();
+    // Parent, not cwd: git ignores a ceiling equal to the cwd (see doc above).
+    let ceiling = cwd.parent().unwrap_or(cwd);
+    env.push((
+        "GIT_CEILING_DIRECTORIES".into(),
+        ceiling.to_string_lossy().into_owned(),
+    ));
+    env
+}
+
 /// In-memory [`WorktreeVcs`] double for deterministic, binary-free coverage of
 /// the commit barrier's control flow (the "a wrong edit breaks every agent"
 /// code). Each query returns a programmed result; the mutation counters let a
@@ -268,6 +374,7 @@ pub(crate) struct FakeVcs {
     can_revert: bool,
     seal_calls: std::sync::atomic::AtomicUsize,
     discard_calls: std::sync::atomic::AtomicUsize,
+    update_stale_calls: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -284,6 +391,7 @@ impl FakeVcs {
             can_revert: true,
             seal_calls: std::sync::atomic::AtomicUsize::new(0),
             discard_calls: std::sync::atomic::AtomicUsize::new(0),
+            update_stale_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -313,6 +421,11 @@ impl FakeVcs {
 
     pub fn discards(&self) -> usize {
         self.discard_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn update_stales(&self) -> usize {
+        self.update_stale_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -357,6 +470,12 @@ impl WorktreeVcs for FakeVcs {
         self.discard_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.discard_result.clone()
+    }
+
+    fn update_stale(&self, _worktree: &Path) -> Result<(), String> {
+        self.update_stale_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
     fn can_revert(&self) -> bool {
@@ -605,6 +724,347 @@ mod tests {
         assert!(
             !vcs.changed_since(repo, &before).unwrap(),
             "pre-existing user dirt must not be attributed to the batch"
+        );
+    }
+
+    /// The FakeVcs double counts `update_stale` calls, mirroring seals/discards,
+    /// so the stale-recovery path can be asserted to have invoked it.
+    #[test]
+    fn fake_vcs_counts_update_stale() {
+        let vcs = FakeVcs::new();
+        assert_eq!(vcs.update_stales(), 0);
+        vcs.update_stale(Path::new("/tmp/x")).unwrap();
+        vcs.update_stale(Path::new("/tmp/x")).unwrap();
+        assert_eq!(vcs.update_stales(), 2);
+    }
+
+    /// Run `git rev-parse --show-toplevel` in `cwd` with an optional
+    /// `GIT_CEILING_DIRECTORIES`, returning `(success, trimmed_stdout)`. Does NOT
+    /// assert success — the whole point is to observe git failing under the
+    /// ceiling.
+    fn git_toplevel(cwd: &Path, ceiling: Option<&Path>) -> (bool, String) {
+        let mut cmd = crate::env::git();
+        cmd.args(["rev-parse", "--show-toplevel"]).current_dir(cwd);
+        if let Some(ceiling) = ceiling {
+            cmd.env("GIT_CEILING_DIRECTORIES", ceiling);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        )
+    }
+
+    /// The load-bearing empirical confirmation of the `GIT_CEILING_DIRECTORIES`
+    /// hypothesis, with no orchestrator and no jj binary. Models production
+    /// faithfully: an outer git repo (the `~/.cairn` HOME repo), a `worktrees`
+    /// dir under it, and a non-colocated jj workspace `ws` (only a `.jj`, no
+    /// `.git`) under that. A bare `git` from `ws` walks UP past `worktrees` to
+    /// the HOME repo and answers about the wrong repository (the #146/#153 bug).
+    /// The ceiling at the workspace's PARENT (`worktrees`) makes git stop at the
+    /// boundary and fail loudly instead — and crucially binds even when git runs
+    /// from the workspace root itself (cwd == root), which a worktree-root
+    /// ceiling would NOT (git ignores a ceiling equal to the cwd).
+    #[test]
+    fn git_ceiling_directories_stops_upward_repo_resolution() {
+        let home = TempDir::new().unwrap();
+        init_project(home.path()); // the outer ~/.cairn-style HOME repo (.git)
+        let home_top = std::fs::canonicalize(home.path()).unwrap();
+
+        let worktrees = home.path().join("worktrees");
+        let ws = worktrees.join("ws");
+        std::fs::create_dir_all(ws.join(".jj")).unwrap(); // non-colocated: .jj, no .git
+        let sub = ws.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        // Production ceiling = parent of the worktree root (`worktrees`).
+        let ceiling = std::fs::canonicalize(&worktrees).unwrap();
+
+        // Bug reproduces: with no ceiling, bare git resolves UP to the HOME repo
+        // from both the workspace root and a nested subdir.
+        let (ok_root, top_root) = git_toplevel(&ws, None);
+        assert!(ok_root, "bare git resolves up to the HOME repo (the bug)");
+        assert_eq!(
+            std::fs::canonicalize(&top_root).unwrap(),
+            home_top,
+            "without the ceiling, bare git in the .jj workspace answers about the ~/.cairn HOME repo"
+        );
+        let (ok_sub, top_sub) = git_toplevel(&sub, None);
+        assert!(ok_sub && std::fs::canonicalize(&top_sub).unwrap() == home_top);
+
+        // Fix works: the parent ceiling stops the upward walk, so git fails to
+        // find a repo instead of lying about the HOME repo — from the workspace
+        // root (the cwd == ceiling-would-fail case) AND a nested subdir.
+        let (ok_fixed_root, top_fixed_root) = git_toplevel(&ws, Some(&ceiling));
+        assert!(
+            !ok_fixed_root,
+            "with the parent ceiling, bare git from the worktree root must fail, not resolve up: {top_fixed_root}"
+        );
+        let (ok_fixed_sub, top_fixed_sub) = git_toplevel(&sub, Some(&ceiling));
+        assert!(
+            !ok_fixed_sub,
+            "the parent ceiling also stops the walk from a subdir the agent cd-ed into: {top_fixed_sub}"
+        );
+    }
+
+    /// `worktree_shell_vcs_env` is empty for a non-`.jj` cwd (the live checkout,
+    /// left untouched) and, for a `.jj` worktree, carries the managed jj env
+    /// (`JJ_CONFIG` under the orchestrator config dir) plus
+    /// `GIT_CEILING_DIRECTORIES` pinned to the worktree root. Needs an
+    /// orchestrator but no jj binary: `shell_env` only ensures the managed config
+    /// file exists.
+    #[test]
+    fn worktree_shell_vcs_env_shape() {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let db = rt.block_on(crate::storage::migrated_test_db("vcs_shell_env.db"));
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch =
+            crate::orchestrator::Orchestrator::builder(db_state, services, config_dir.clone())
+                .build();
+
+        // Non-`.jj` cwd: empty, so the live-checkout path is untouched.
+        let plain = temp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(
+            worktree_shell_vcs_env(&orch, &plain).is_empty(),
+            "a non-worktree cwd injects no VCS env"
+        );
+
+        // `.jj` worktree: managed JJ_CONFIG + ceiling at the worktree root.
+        let ws = temp.path().join("ws");
+        std::fs::create_dir_all(ws.join(".jj")).unwrap();
+        let env: std::collections::HashMap<String, String> =
+            worktree_shell_vcs_env(&orch, &ws).into_iter().collect();
+        assert_eq!(
+            env.get("GIT_CEILING_DIRECTORIES").map(String::as_str),
+            Some(temp.path().to_string_lossy().as_ref()),
+            "the ceiling is pinned to the worktree root's parent (a strict ancestor git honors)"
+        );
+        let jj_config = env.get("JJ_CONFIG").expect("managed JJ_CONFIG injected");
+        assert!(
+            jj_config.starts_with(config_dir.to_string_lossy().as_ref()),
+            "JJ_CONFIG points at the managed config under the orchestrator config dir: {jj_config}"
+        );
+        assert_eq!(env.get("JJ_EDITOR").map(String::as_str), Some("true"));
+    }
+
+    // ---- resolve_store_lock: the agent seal/discard serialization seam ----
+
+    use crate::orchestrator::Orchestrator;
+    use crate::storage::LocalDb;
+    use cairn_common::protocol::CallbackRequest;
+    use std::sync::Arc;
+
+    /// Build an Orchestrator rooted at `config_dir` (the dir whose `jj-stores`
+    /// subtree `project_store_dir` keys off). No jj binary required: the lock key
+    /// is pure path + map logic.
+    async fn orch_with_config(db_name: &str, config_dir: std::path::PathBuf) -> Orchestrator {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        let db = crate::storage::migrated_test_db(db_name).await;
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        crate::orchestrator::Orchestrator::builder(db_state, services, config_dir).build()
+    }
+
+    /// Seed the minimum rows so `lookup_run`/`project_path` resolve a worktree
+    /// `cwd` to its project repo_path (mirrors the live worktree-run shape: a
+    /// `live` run on a job whose `worktree_path` is the agent cwd).
+    async fn seed_worktree_run(
+        db: &LocalDb,
+        project_id: String,
+        repo_path: String,
+        worktree: String,
+    ) {
+        db.write(move |conn| {
+            let project_id = project_id.clone();
+            let repo_path = repo_path.clone();
+            let worktree = worktree.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES (?1, 'default', 'Project', 'PROJ', ?2, 'main', 1, 1)",
+                    (project_id.as_str(), repo_path.as_str()),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                     VALUES ('issue-1', ?1, 1, 'Issue', 'active', 1, 1)",
+                    (project_id.as_str(),),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-1', 'recipe-default', 'issue-1', ?1, 'running', 1, 1)",
+                    (project_id.as_str(),),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, base_branch, created_at, updated_at)
+                     VALUES ('job-1', 'exec-1', 'node', 'issue-1', ?1, 'running', ?2, 'main', 1, 1)",
+                    (project_id.as_str(), worktree.as_str()),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+                     VALUES ('run-1', 'issue-1', ?1, 'job-1', 'live', 1, 1)",
+                    (project_id.as_str(),),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Provision a config dir, a project repo path, and a `.jj` worktree cwd, plus
+    /// the DB rows resolving that cwd to the project. Returns the orchestrator, a
+    /// run-tool `CallbackRequest` whose `cwd` is the worktree, the project
+    /// repo_path string (for computing the expected store key), and the owning
+    /// TempDir (held by the caller so the tree survives the test).
+    async fn worktree_run_fixture(
+        db_name: &str,
+    ) -> (Orchestrator, CallbackRequest, String, TempDir) {
+        let root = TempDir::new().unwrap();
+        let config_dir = root.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let ws = root.path().join("ws");
+        std::fs::create_dir_all(ws.join(".jj")).unwrap(); // is_jj_dir(cwd) == true
+        let repo_path = repo.to_string_lossy().into_owned();
+        let ws_path = ws.to_string_lossy().into_owned();
+
+        let orch = orch_with_config(db_name, config_dir).await;
+        seed_worktree_run(
+            &orch.db.local,
+            "proj-1".to_string(),
+            repo_path.clone(),
+            ws_path.clone(),
+        )
+        .await;
+
+        let request = CallbackRequest {
+            cwd: ws_path,
+            run_id: None,
+            tool: "run".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        };
+        (orch, request, repo_path, root)
+    }
+
+    /// Test A — key identity (the load-bearing wiring guarantee). The seal-side
+    /// `resolve_store_lock` must return the SAME `Arc<Mutex>` instance that
+    /// base-advance reconcile and merge-fold acquire via
+    /// `jj_store_lock(project_store_dir(config_dir, repo_path))`. If these keys
+    /// ever drift, serialization silently breaks with no error — this is the
+    /// regression guard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_store_lock_matches_reconcile_lock_instance() {
+        let (orch, request, repo_path, _root) =
+            worktree_run_fixture("vcs_store_lock_key_identity.db").await;
+
+        let seal_lock = crate::mcp::vcs::resolve_store_lock(&orch, &request)
+            .await
+            .expect("a worktree cwd resolves a store lock");
+        // The exact key reconcile/fold derive.
+        let reconcile_lock = orch.jj_store_lock(&crate::jj::project_store_dir(
+            &orch.config_dir,
+            Path::new(&repo_path),
+        ));
+        assert!(
+            Arc::ptr_eq(&seal_lock, &reconcile_lock),
+            "seal/discard must serialize on the SAME lock instance as reconcile/fold"
+        );
+    }
+
+    /// Test B — mutual exclusion through the real lock. With an in-flight
+    /// reconcile holding the store lock, a seal-side acquisition via
+    /// `resolve_store_lock(...).lock()` must block until the reconcile guard
+    /// drops, then proceed. Proves serialization is exercised through the real
+    /// `jj_store_lock`, not merely keyed the same.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_store_lock_serializes_behind_in_flight_reconcile() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let (orch, request, repo_path, _root) =
+            worktree_run_fixture("vcs_store_lock_mutual_exclusion.db").await;
+
+        // Simulate an in-flight reconcile/fold holding the store lock.
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+        let reconcile_lock = orch.jj_store_lock(&store);
+        let reconcile_guard = reconcile_lock.lock().await;
+
+        let acquired = Arc::new(AtomicBool::new(false));
+        let seal_side = {
+            let orch = orch.clone();
+            let request = request.clone();
+            let acquired = acquired.clone();
+            tokio::spawn(async move {
+                let lock = crate::mcp::vcs::resolve_store_lock(&orch, &request)
+                    .await
+                    .expect("a worktree cwd resolves a store lock");
+                let _guard = lock.lock().await;
+                acquired.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // While reconcile holds the lock, the seal side cannot proceed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !acquired.load(Ordering::SeqCst),
+            "seal must block while a reconcile holds the store lock"
+        );
+
+        // Releasing the reconcile guard lets the seal side acquire and proceed.
+        drop(reconcile_guard);
+        seal_side.await.unwrap();
+        assert!(
+            acquired.load(Ordering::SeqCst),
+            "seal proceeds once the reconcile releases the store lock"
+        );
+    }
+
+    /// Test C — a non-worktree cwd resolves no lock. The project's live checkout
+    /// (NonWorktreeVcs) never mutates a shared store, so it must not acquire (or
+    /// block on) a store lock. Returns `None` before any DB lookup.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_store_lock_is_none_for_non_worktree_cwd() {
+        let root = TempDir::new().unwrap();
+        let config_dir = root.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let plain = root.path().join("plain"); // no `.jj` — a live checkout
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let orch = orch_with_config("vcs_store_lock_non_worktree.db", config_dir).await;
+        let request = CallbackRequest {
+            cwd: plain.to_string_lossy().into_owned(),
+            run_id: None,
+            tool: "run".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        };
+        assert!(
+            crate::mcp::vcs::resolve_store_lock(&orch, &request)
+                .await
+                .is_none(),
+            "a non-worktree cwd must not resolve a store lock"
         );
     }
 }

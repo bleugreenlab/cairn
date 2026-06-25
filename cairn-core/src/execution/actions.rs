@@ -880,14 +880,17 @@ async fn handle_merge_pr(
     // Merge boundary: refuse a jj-conflicted source bookmark before merging.
     // Trusts jj's recorded conflict state, not the GitHub mergeable bit (which is
     // false for a jj-conflicted commit).
-    if crate::pr_data::actions::jj_source_branch_conflicted(
+    if let Some(report) = crate::pr_data::actions::source_conflict_report(
         &orch.jj_binary_path,
         &orch.config_dir,
         &repo_path,
         &branch_name,
+        None,
     ) {
         return Err(format!(
-            "Refusing to merge: the jj source bookmark `{branch_name}` has a recorded conflict; resolve it first."
+            "Refusing to merge: the jj source bookmark `{branch_name}` carries a recorded conflict — a conflicted history cannot merge.\n{commits}\n{recovery}",
+            commits = crate::pr_data::actions::format_conflicted_commits(&report.commits),
+            recovery = crate::pr_data::actions::conflict_recovery_hint(&branch_name, None),
         ));
     }
 

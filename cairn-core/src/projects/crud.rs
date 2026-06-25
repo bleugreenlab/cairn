@@ -612,7 +612,7 @@ mod tests {
                         .query("SELECT hidden FROM projects WHERE id = 'workspace'", ())
                         .await?;
                     let row = rows.next().await?.expect("workspace row");
-                    Ok(row.i64(0)?)
+                    row.i64(0)
                 })
             })
             .await

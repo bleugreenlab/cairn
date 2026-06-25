@@ -262,6 +262,27 @@ pub enum CairnResource {
         node_id: String,
         segment: String,
     },
+    /// Permission requests raised by a sub-agent task job (collection): the task
+    /// analogue of `NodePermissions`. `node_id` is the parent node, `task_name`
+    /// the task's own segment.
+    TaskPermissions {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+    },
+    /// A single permission request raised by a sub-agent task job, addressed by
+    /// its stored segment (e.g. `perm-1`); answerable with `{decision, scope}`.
+    /// The task analogue of `NodePermission`.
+    TaskPermission {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: String,
+        segment: String,
+    },
     /// Messages addressed to a node job (collection). The canonical messaging
     /// target for a node, symmetric with project/issue `/messages`: append
     /// delivers a direct message to the node agent; read returns the node's
@@ -775,6 +796,31 @@ pub fn build_node_permission_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "permissions", segment)
 }
 
+pub fn build_task_permissions_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+) -> String {
+    build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "permissions")
+}
+
+pub fn build_task_permission_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: &str,
+    segment: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "permissions"),
+        segment
+    )
+}
+
 pub fn build_project_terminal_uri(project: &str, slug: &str) -> String {
     format!("{}/terminal/{}", build_project_uri(project), slug)
 }
@@ -1147,6 +1193,23 @@ impl CairnResource {
                 node_id,
                 segment,
             } => build_node_permission_uri(project, *number, *exec_seq, node_id, segment),
+            Self::TaskPermissions {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_task_permissions_uri(project, *number, *exec_seq, node_id, task_name),
+            Self::TaskPermission {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                segment,
+            } => {
+                build_task_permission_uri(project, *number, *exec_seq, node_id, task_name, segment)
+            }
             Self::NodeMessages {
                 project,
                 number,
@@ -1396,6 +1459,8 @@ impl CairnResource {
             | Self::NodeQuestion { .. }
             | Self::NodePermissions { .. }
             | Self::NodePermission { .. }
+            | Self::TaskPermissions { .. }
+            | Self::TaskPermission { .. }
             | Self::NodeMessages { .. }
             | Self::TaskMessages { .. }
             | Self::ProjectIssues { .. }
@@ -1469,6 +1534,8 @@ impl CairnResource {
             | Self::NodeQuestion { project, .. }
             | Self::NodePermissions { project, .. }
             | Self::NodePermission { project, .. }
+            | Self::TaskPermissions { project, .. }
+            | Self::TaskPermission { project, .. }
             | Self::NodeMessages { project, .. }
             | Self::TaskMessages { project, .. }
             | Self::ProjectMessages { project }
@@ -1542,6 +1609,8 @@ impl CairnResource {
             | Self::NodeQuestion { number, .. }
             | Self::NodePermissions { number, .. }
             | Self::NodePermission { number, .. }
+            | Self::TaskPermissions { number, .. }
+            | Self::TaskPermission { number, .. }
             | Self::NodeMessages { number, .. }
             | Self::TaskMessages { number, .. }
             | Self::IssueMessages { number, .. }
@@ -1614,6 +1683,8 @@ impl CairnResource {
             | Self::NodeQuestion { node_id, .. }
             | Self::NodePermissions { node_id, .. }
             | Self::NodePermission { node_id, .. }
+            | Self::TaskPermissions { node_id, .. }
+            | Self::TaskPermission { node_id, .. }
             | Self::NodeMessages { node_id, .. }
             | Self::TaskMessages { node_id, .. }
             | Self::NodeChanged { node_id, .. }
@@ -1669,6 +1740,8 @@ impl CairnResource {
             Self::NodeQuestion { .. } => ResourceKind::NodeQuestion,
             Self::NodePermissions { .. } => ResourceKind::NodePermissions,
             Self::NodePermission { .. } => ResourceKind::NodePermission,
+            Self::TaskPermissions { .. } => ResourceKind::TaskPermissions,
+            Self::TaskPermission { .. } => ResourceKind::TaskPermission,
             Self::Db => ResourceKind::Db,
             Self::Dev => ResourceKind::Dev,
             Self::DevDb => ResourceKind::DevDb,
@@ -2187,6 +2260,25 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 exec_seq: parse_positive_i32(exec_seq)?,
                 node_id: (*node_id).to_string(),
                 task_name: (*task_name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "permissions"] => {
+            Some(CairnResource::TaskPermissions {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "permissions", segment] => {
+            Some(CairnResource::TaskPermission {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: (*task_name).to_string(),
+                segment: (*segment).to_string(),
             })
         }
         // Type-named artifact under a task: a trailing non-reserved segment.
@@ -3132,6 +3224,21 @@ mod tests {
                 exec_seq: 2,
                 node_id: "builder".to_string(),
                 task_name: Some("Explore".to_string()),
+            },
+            CairnResource::TaskPermissions {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+            },
+            CairnResource::TaskPermission {
+                project: "CAIRN".to_string(),
+                number: 1,
+                exec_seq: 2,
+                node_id: "builder".to_string(),
+                task_name: "Explore".to_string(),
+                segment: "perm-1".to_string(),
             },
             CairnResource::Bug,
         ];

@@ -981,7 +981,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            stamp_delivered(&db, &[first.clone()], "event-1")
+            stamp_delivered(&db, std::slice::from_ref(&first), "event-1")
                 .await
                 .unwrap(),
             1
@@ -1076,12 +1076,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            stamp_delivered(&db, &[id.clone()], "ev-1").await.unwrap(),
+            stamp_delivered(&db, std::slice::from_ref(&id), "ev-1")
+                .await
+                .unwrap(),
             1
         );
         // Second stamp is a no-op; the original event id stands.
         assert_eq!(
-            stamp_delivered(&db, &[id.clone()], "ev-2").await.unwrap(),
+            stamp_delivered(&db, std::slice::from_ref(&id), "ev-2")
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(delivered_event(&db, &id).await, Some("ev-1".to_string()));

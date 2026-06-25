@@ -1503,7 +1503,7 @@ nodes:
   name: Builder
   position: 0@100
   config:
-    agent: quickbuild
+    agent: build
 - id: ci-1
   type: checkpoint
   name: CI

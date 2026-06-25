@@ -28,147 +28,6 @@ fn persist_system_direct(
     Ok(msg.id)
 }
 
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use crate::storage::LocalDb;
-
-    async fn migrated_db() -> LocalDb {
-        crate::storage::migrated_test_db("parent-wake.db").await
-    }
-
-    async fn seed_parent_child(db: &LocalDb, parent_status: &str) {
-        let parent_status = parent_status.to_string();
-        db.write(|conn| {
-            let parent_status = parent_status.clone();
-            Box::pin(async move {
-                conn.execute(
-                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
-                     VALUES('parent', 'p', 1, 'Parent', 'backlog', 'backlog', 'none', 1, 1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id)
-                     VALUES('child', 'p', 2, 'Child', 'backlog', 'backlog', 'none', 2, 2, 'parent')",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-                     VALUES('parent-job', 'p', 'parent', ?1, 'session-parent', 3, 3)",
-                    params![parent_status.as_str()],
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn load_parent_job_includes_completed_parent_jobs() {
-        let db = migrated_db().await;
-        seed_parent_child(&db, "complete").await;
-
-        assert_eq!(
-            load_parent_job(&db, "child").unwrap().as_deref(),
-            Some("parent-job")
-        );
-    }
-
-    #[tokio::test]
-    async fn load_parent_job_ignores_failed_parent_jobs() {
-        let db = migrated_db().await;
-        seed_parent_child(&db, "failed").await;
-
-        assert!(load_parent_job(&db, "child").unwrap().is_none());
-    }
-
-    /// Regression for CAIRN-1302: once the coordinator spawns a delegated
-    /// sub-task, that sub-task job shares the coordinator's `issue_id` and is
-    /// newer than the coordinator job. The wake target must remain the
-    /// coordinator's own job (`parent_job_id IS NULL`), not the sub-task job.
-    #[tokio::test]
-    async fn load_parent_job_ignores_delegated_sub_task_jobs() {
-        let db = migrated_db().await;
-        seed_parent_child(&db, "complete").await;
-
-        // Delegated sub-task job on the SAME issue as the coordinator, newer,
-        // with its own session and `parent_job_id` pointing at the coordinator.
-        db.execute(
-            "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, parent_job_id, created_at, updated_at)
-             VALUES('subtask-job', 'p', 'parent', 'complete', 'session-subtask', 'parent-job', 9, 9)",
-            (),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            load_parent_job(&db, "child").unwrap().as_deref(),
-            Some("parent-job"),
-        );
-    }
-
-    /// The recorded spawning job (`issues.parent_job_id`) is the wake target
-    /// directly — even when a newer coordinator-shaped job also sits on the
-    /// parent issue, which the recency-ordered fallback would otherwise pick.
-    #[tokio::test]
-    async fn load_parent_job_prefers_recorded_spawning_job() {
-        let db = migrated_db().await;
-        seed_parent_child(&db, "complete").await;
-        db.execute_script(
-            "
-            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-            VALUES('other-root', 'p', 'parent', 'running', 'session-other', 50, 50);
-            UPDATE issues SET parent_job_id = 'parent-job' WHERE id = 'child';
-            ",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            load_parent_job(&db, "child").unwrap().as_deref(),
-            Some("parent-job"),
-        );
-    }
-
-    /// When the recorded spawner is no longer resumable (failed / no session),
-    /// resolution falls back to the coordinator job on the parent issue.
-    #[tokio::test]
-    async fn load_parent_job_edge_falls_back_when_spawner_unresumable() {
-        let db = migrated_db().await;
-        seed_parent_child(&db, "complete").await;
-        db.execute_script(
-            "
-            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-            VALUES('dead-job', 'p', 'parent', 'failed', 'session-dead', 40, 40);
-            UPDATE issues SET parent_job_id = 'dead-job' WHERE id = 'child';
-            ",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            load_parent_job(&db, "child").unwrap().as_deref(),
-            Some("parent-job"),
-        );
-    }
-}
-
 pub(crate) fn load_parent_job(
     db: &LocalDb,
     child_issue_id: &str,
@@ -315,5 +174,146 @@ pub(crate) fn queue_or_resume_parent(
             &parent_job_id[..parent_job_id.len().min(8)],
             error
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::storage::LocalDb;
+
+    async fn migrated_db() -> LocalDb {
+        crate::storage::migrated_test_db("parent-wake.db").await
+    }
+
+    async fn seed_parent_child(db: &LocalDb, parent_status: &str) {
+        let parent_status = parent_status.to_string();
+        db.write(|conn| {
+            let parent_status = parent_status.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+                     VALUES('parent', 'p', 1, 'Parent', 'backlog', 'backlog', 'none', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id)
+                     VALUES('child', 'p', 2, 'Child', 'backlog', 'backlog', 'none', 2, 2, 'parent')",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+                     VALUES('parent-job', 'p', 'parent', ?1, 'session-parent', 3, 3)",
+                    params![parent_status.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_parent_job_includes_completed_parent_jobs() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "complete").await;
+
+        assert_eq!(
+            load_parent_job(&db, "child").unwrap().as_deref(),
+            Some("parent-job")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_parent_job_ignores_failed_parent_jobs() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "failed").await;
+
+        assert!(load_parent_job(&db, "child").unwrap().is_none());
+    }
+
+    /// Regression for CAIRN-1302: once the coordinator spawns a delegated
+    /// sub-task, that sub-task job shares the coordinator's `issue_id` and is
+    /// newer than the coordinator job. The wake target must remain the
+    /// coordinator's own job (`parent_job_id IS NULL`), not the sub-task job.
+    #[tokio::test]
+    async fn load_parent_job_ignores_delegated_sub_task_jobs() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "complete").await;
+
+        // Delegated sub-task job on the SAME issue as the coordinator, newer,
+        // with its own session and `parent_job_id` pointing at the coordinator.
+        db.execute(
+            "INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, parent_job_id, created_at, updated_at)
+             VALUES('subtask-job', 'p', 'parent', 'complete', 'session-subtask', 'parent-job', 9, 9)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_parent_job(&db, "child").unwrap().as_deref(),
+            Some("parent-job"),
+        );
+    }
+
+    /// The recorded spawning job (`issues.parent_job_id`) is the wake target
+    /// directly — even when a newer coordinator-shaped job also sits on the
+    /// parent issue, which the recency-ordered fallback would otherwise pick.
+    #[tokio::test]
+    async fn load_parent_job_prefers_recorded_spawning_job() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "complete").await;
+        db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+            VALUES('other-root', 'p', 'parent', 'running', 'session-other', 50, 50);
+            UPDATE issues SET parent_job_id = 'parent-job' WHERE id = 'child';
+            ",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_parent_job(&db, "child").unwrap().as_deref(),
+            Some("parent-job"),
+        );
+    }
+
+    /// When the recorded spawner is no longer resumable (failed / no session),
+    /// resolution falls back to the coordinator job on the parent issue.
+    #[tokio::test]
+    async fn load_parent_job_edge_falls_back_when_spawner_unresumable() {
+        let db = migrated_db().await;
+        seed_parent_child(&db, "complete").await;
+        db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
+            VALUES('dead-job', 'p', 'parent', 'failed', 'session-dead', 40, 40);
+            UPDATE issues SET parent_job_id = 'dead-job' WHERE id = 'child';
+            ",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            load_parent_job(&db, "child").unwrap().as_deref(),
+            Some("parent-job"),
+        );
     }
 }

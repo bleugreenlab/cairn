@@ -50,29 +50,6 @@ fn temp_git_repo() -> TempDir {
     dir
 }
 
-/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
-fn jj_bin() -> Option<String> {
-    let bin = std::env::var("CAIRN_JJ_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "jj".to_string());
-    Command::new(&bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then_some(bin)
-}
-
-fn head_sha(repo: &Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// A throwaway git project with a committed `main`, suitable for backing a jj
 /// store (no remote: the local fold path never pushes).
 fn temp_jj_project() -> TempDir {
@@ -99,12 +76,9 @@ fn temp_jj_project() -> TempDir {
 /// `config_dir` matches the orchestrator's config dir so `merge_pr_for_job`
 /// resolves the same store.
 fn provision_jj_merge(config_dir: &Path, repo: &Path) {
-    let jj = JjEnv::resolve("jj", config_dir);
-    let store = jj::project_store_dir(config_dir, repo);
-    jj::ensure_project_store(&jj, &store, repo).unwrap();
-    let base = head_sha(repo);
     let ws = config_dir.join("feature-ws");
-    jj::add_workspace(&jj, &store, &ws, "feature", &base, None).unwrap();
+    common::provision_jj_workspace(config_dir, repo, &ws, "feature");
+    let jj = JjEnv::resolve("jj", config_dir);
     std::fs::write(ws.join("change.txt"), "feature change\n").unwrap();
     jj::seal(&jj, &ws, "feature work", None).unwrap();
 }
@@ -112,16 +86,70 @@ fn provision_jj_merge(config_dir: &Path, repo: &Path) {
 /// Like `provision_jj_merge`, but seals THREE commits on `feature` so a merge
 /// can be checked for squash (one commit lands) vs. real fold (all three land).
 fn provision_jj_merge_multi(config_dir: &Path, repo: &Path) {
-    let jj = JjEnv::resolve("jj", config_dir);
-    let store = jj::project_store_dir(config_dir, repo);
-    jj::ensure_project_store(&jj, &store, repo).unwrap();
-    let base = head_sha(repo);
     let ws = config_dir.join("feature-ws");
-    jj::add_workspace(&jj, &store, &ws, "feature", &base, None).unwrap();
+    common::provision_jj_workspace(config_dir, repo, &ws, "feature");
+    let jj = JjEnv::resolve("jj", config_dir);
     for i in 1..=3 {
         std::fs::write(ws.join(format!("change{i}.txt")), format!("change {i}\n")).unwrap();
         jj::seal(&jj, &ws, &format!("feature work {i}"), None).unwrap();
     }
+}
+
+/// Provision a jj store whose `feature` bookmark carries a RECORDED conflict on
+/// `shared.txt`: feature edits the file, `main` then advances with a conflicting
+/// edit to the same path, and feature is rebased onto the advanced main — the
+/// out-of-band conflicted-history state the pre-flight diagnostic must report.
+fn provision_jj_conflict(bin: &str, config_dir: &Path, repo: &Path) {
+    let ws = config_dir.join("feature-ws");
+    common::provision_jj_workspace(config_dir, repo, &ws, "feature");
+    let jj = JjEnv::resolve(bin, config_dir);
+    std::fs::write(ws.join("shared.txt"), "feature-side\n").unwrap();
+    jj::seal(&jj, &ws, "feature edits shared", None).unwrap();
+
+    let store = jj::project_store_dir(config_dir, repo);
+    let cfg = config_dir.join("jj").join("config.toml");
+    let jj_cmd = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args(args)
+            .current_dir(&store)
+            .env("JJ_CONFIG", &cfg)
+            .env("EDITOR", "true")
+            .env("JJ_EDITOR", "true")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    // `main` advances with a conflicting change to the same file.
+    jj_cmd(&["new", "main"]);
+    std::fs::write(store.join("shared.txt"), "main-advanced\n").unwrap();
+    jj_cmd(&["describe", "-m", "main advances shared"]);
+    jj_cmd(&["bookmark", "set", "main", "-r", "@"]);
+    // Rebasing feature onto the advanced main records a conflict on `feature`.
+    jj::rebase_branch_onto(&jj, &store, "feature", "main").unwrap();
+    assert!(
+        jj::branch_has_conflict(&jj, &store, "feature").unwrap(),
+        "feature must carry a recorded conflict after rebase onto advanced main"
+    );
+}
+
+/// Point a project repo's `origin` at github so `get_owner_repo` resolves the
+/// live-PR rendering path to (octo, widget).
+fn add_github_origin(repo: &Path) {
+    let status = Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/octo/widget.git",
+        ])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git remote add origin failed");
 }
 
 /// Run a jj template query against a project's shared store and return trimmed
@@ -549,7 +577,7 @@ async fn mr_status(db: &LocalDb, mr_id: &str) -> String {
                     params![mr_id.as_str()],
                 )
                 .await?;
-            Ok(rows.next().await?.unwrap().text(0)?)
+            rows.next().await?.unwrap().text(0)
         })
     })
     .await
@@ -567,7 +595,7 @@ async fn issue_status(db: &LocalDb, issue_id: &str) -> String {
                     params![issue_id.as_str()],
                 )
                 .await?;
-            Ok(rows.next().await?.unwrap().text(0)?)
+            rows.next().await?.unwrap().text(0)
         })
     })
     .await
@@ -691,7 +719,7 @@ async fn refresh_pr_for_job_updates_cache() {
                         params![mr.as_str()],
                     )
                     .await?;
-                Ok(rows.next().await?.unwrap().opt_text(0)?)
+                rows.next().await?.unwrap().opt_text(0)
             })
         })
         .await
@@ -859,7 +887,7 @@ async fn reconcile_after_merge_for_action_run_owner_stores_files_under_parent_jo
 
 #[tokio::test]
 async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
-    let Some(_bin) = jj_bin() else {
+    let Some(_bin) = common::jj_bin() else {
         eprintln!("skipping merge_pr_for_job_marks_merged_and_resolves_issue: jj not resolvable");
         return;
     };
@@ -879,13 +907,105 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
     assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
 }
 
+/// A jj-conflicted source must be refused BEFORE the fold, and the refusal must
+/// name the offending file and the resolve-at-base recovery path — not a bare
+/// "has a recorded conflict". The PR stays open (the gate fired pre-fold).
+#[tokio::test]
+async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping merge_pr_for_job_refuses_conflicted_source_with_actionable_detail: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    let project = create_project(&db, "MGC", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    let job = create_job(&db, &project, &issue).await;
+    let mr = create_local_merge_request(&db, &job, &project, &issue).await;
+
+    let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
+    provision_jj_conflict(&bin, &cfg.path().join("config"), repo.path());
+
+    let err = actions::merge_pr_for_job(&orch, &job, None)
+        .await
+        .expect_err("a conflicted source must be refused");
+    assert!(
+        err.contains("recorded conflict"),
+        "names the conflict: {err}"
+    );
+    assert!(
+        err.contains("shared.txt"),
+        "names the conflicted file: {err}"
+    );
+    assert!(
+        err.contains("resolve-at-base"),
+        "names the recovery path: {err}"
+    );
+    // The refusal fires at the gate, before the fold: the PR is not merged.
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
+}
+
+/// Pre-flight: the live PR section surfaces a conflicted history BEFORE a merge.
+/// It renders CONFLICTING (over GitHub's false mergeable bit), enumerates the
+/// conflicted commit and file, and flags the inflated diff as stale.
+#[tokio::test]
+async fn render_live_pr_section_flags_conflicted_history() {
+    let Some(bin) = common::jj_bin() else {
+        eprintln!("skipping render_live_pr_section_flags_conflicted_history: jj not resolvable");
+        return;
+    };
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_jj_project();
+    add_github_origin(repo.path());
+    insert_github_app(&db).await;
+    let project = create_project(&db, "RVC", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    let job = create_job(&db, &project, &issue).await;
+    let _mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/pulls/5/reviews", empty_array_response())
+        .respond_to("/pulls/5/files", files_response())
+        .respond_to("/check-runs", check_runs_response())
+        .respond_to("/pulls/5", pr_response("open", false));
+    let (cfg, orch) = orchestrator_with_http(db, http).await;
+    provision_jj_conflict(&bin, &cfg.path().join("config"), repo.path());
+
+    let section =
+        actions::render_live_pr_section(&orch, &job, "cairn://p/RVC/1/1/builder/pr", false)
+            .await
+            .expect("PR artifact should yield a section");
+    // GitHub reports mergeable=true (+12/-3); jj overrides with the conflict reality.
+    assert!(
+        section.contains("Mergeable: CONFLICTING"),
+        "renders CONFLICTING over GitHub's false bit: {section}"
+    );
+    assert!(
+        section.contains("Conflicted history"),
+        "enumerates the conflicted history: {section}"
+    );
+    assert!(
+        section.contains("shared.txt"),
+        "names the conflicted file: {section}"
+    );
+    assert!(
+        section.contains("stale"),
+        "flags the inflated diff as stale: {section}"
+    );
+    assert!(
+        section.contains("resolve-at-base"),
+        "names the recovery path: {section}"
+    );
+}
+
 /// Regression guard for the post-jj-migration squash default: a PR branch with
 /// MULTIPLE sealed commits must land as exactly ONE squashed commit on the
 /// default branch — its only parent the pre-merge tip, its tree the source tree
 /// — not flood the branch with every per-change commit the agent sealed.
 #[tokio::test]
 async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
-    let Some(bin) = jj_bin() else {
+    let Some(bin) = common::jj_bin() else {
         eprintln!("skipping merge_pr_for_job_squashes_multiple_commits_to_one: jj not resolvable");
         return;
     };
@@ -937,7 +1057,7 @@ async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
 /// one empty commit, since the source already equals the default tip.
 #[tokio::test]
 async fn merge_pr_for_job_squash_retry_is_idempotent() {
-    let Some(bin) = jj_bin() else {
+    let Some(bin) = common::jj_bin() else {
         eprintln!("skipping merge_pr_for_job_squash_retry_is_idempotent: jj not resolvable");
         return;
     };
@@ -974,7 +1094,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
 /// the source's real per-commit history instead of squashing it.
 #[tokio::test]
 async fn merge_pr_for_job_workspace_keeps_real_commits() {
-    let Some(bin) = jj_bin() else {
+    let Some(bin) = common::jj_bin() else {
         eprintln!("skipping merge_pr_for_job_workspace_keeps_real_commits: jj not resolvable");
         return;
     };
@@ -1133,7 +1253,7 @@ async fn helper_is_idempotent_across_repeat_calls() {
 
 #[tokio::test]
 async fn merge_pr_for_job_advances_producing_execution() {
-    let Some(_bin) = jj_bin() else {
+    let Some(_bin) = common::jj_bin() else {
         eprintln!("skipping merge_pr_for_job_advances_producing_execution: jj not resolvable");
         return;
     };

@@ -139,73 +139,6 @@ fn resolve_file_filter(level: Option<LogLevel>) -> EnvFilter {
     EnvFilter::new(resolved.directives())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::str::FromStr;
-
-    #[test]
-    fn level_directives_are_stable() {
-        assert_eq!(LogLevel::Quiet.directives(), "warn,profiler=off");
-        assert_eq!(LogLevel::Standard.directives(), "info,profiler=off");
-        assert_eq!(
-            LogLevel::Verbose.directives(),
-            "info,cairn_lib=debug,cairn_core=debug,cairn_cli=debug,profiler=info"
-        );
-    }
-
-    #[test]
-    fn default_level_is_standard() {
-        assert_eq!(LogLevel::default(), LogLevel::Standard);
-    }
-
-    #[test]
-    fn level_name_parse_roundtrip() {
-        for level in [LogLevel::Quiet, LogLevel::Standard, LogLevel::Verbose] {
-            assert_eq!(LogLevel::from_str(level.as_str()), Ok(level));
-        }
-        assert_eq!(LogLevel::from_str("STANDARD"), Ok(LogLevel::Standard));
-        assert!(LogLevel::from_str("bogus").is_err());
-    }
-
-    // Single test owns the `CAIRN_FILE_LOG` / `CAIRN_LOG_LEVEL` env vars so it
-    // does not race other tests that read them in parallel.
-    #[test]
-    fn resolve_file_filter_precedence() {
-        std::env::remove_var("CAIRN_FILE_LOG");
-        std::env::remove_var("CAIRN_LOG_LEVEL");
-
-        // 4. Default → standard (light, no profiler/debug).
-        assert_eq!(
-            resolve_file_filter(None).to_string(),
-            EnvFilter::new(LogLevel::Standard.directives()).to_string()
-        );
-
-        // 3. LogConfig.level.
-        assert_eq!(
-            resolve_file_filter(Some(LogLevel::Quiet)).to_string(),
-            EnvFilter::new(LogLevel::Quiet.directives()).to_string()
-        );
-
-        // 2. CAIRN_LOG_LEVEL beats LogConfig.level.
-        std::env::set_var("CAIRN_LOG_LEVEL", "verbose");
-        assert_eq!(
-            resolve_file_filter(Some(LogLevel::Quiet)).to_string(),
-            EnvFilter::new(LogLevel::Verbose.directives()).to_string()
-        );
-
-        // 1. CAIRN_FILE_LOG (raw directive) beats CAIRN_LOG_LEVEL.
-        std::env::set_var("CAIRN_FILE_LOG", "warn,cairn_core=trace");
-        assert_eq!(
-            resolve_file_filter(Some(LogLevel::Quiet)).to_string(),
-            EnvFilter::new("warn,cairn_core=trace").to_string()
-        );
-
-        std::env::remove_var("CAIRN_FILE_LOG");
-        std::env::remove_var("CAIRN_LOG_LEVEL");
-    }
-}
-
 fn stderr_filter_from_env() -> EnvFilter {
     match std::env::var("RUST_LOG") {
         Ok(value) if !value.trim().is_empty() => value
@@ -281,4 +214,71 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
 fn atty_stderr() -> bool {
     use std::io::IsTerminal;
     std::io::stderr().is_terminal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn level_directives_are_stable() {
+        assert_eq!(LogLevel::Quiet.directives(), "warn,profiler=off");
+        assert_eq!(LogLevel::Standard.directives(), "info,profiler=off");
+        assert_eq!(
+            LogLevel::Verbose.directives(),
+            "info,cairn_lib=debug,cairn_core=debug,cairn_cli=debug,profiler=info"
+        );
+    }
+
+    #[test]
+    fn default_level_is_standard() {
+        assert_eq!(LogLevel::default(), LogLevel::Standard);
+    }
+
+    #[test]
+    fn level_name_parse_roundtrip() {
+        for level in [LogLevel::Quiet, LogLevel::Standard, LogLevel::Verbose] {
+            assert_eq!(LogLevel::from_str(level.as_str()), Ok(level));
+        }
+        assert_eq!(LogLevel::from_str("STANDARD"), Ok(LogLevel::Standard));
+        assert!(LogLevel::from_str("bogus").is_err());
+    }
+
+    // Single test owns the `CAIRN_FILE_LOG` / `CAIRN_LOG_LEVEL` env vars so it
+    // does not race other tests that read them in parallel.
+    #[test]
+    fn resolve_file_filter_precedence() {
+        std::env::remove_var("CAIRN_FILE_LOG");
+        std::env::remove_var("CAIRN_LOG_LEVEL");
+
+        // 4. Default → standard (light, no profiler/debug).
+        assert_eq!(
+            resolve_file_filter(None).to_string(),
+            EnvFilter::new(LogLevel::Standard.directives()).to_string()
+        );
+
+        // 3. LogConfig.level.
+        assert_eq!(
+            resolve_file_filter(Some(LogLevel::Quiet)).to_string(),
+            EnvFilter::new(LogLevel::Quiet.directives()).to_string()
+        );
+
+        // 2. CAIRN_LOG_LEVEL beats LogConfig.level.
+        std::env::set_var("CAIRN_LOG_LEVEL", "verbose");
+        assert_eq!(
+            resolve_file_filter(Some(LogLevel::Quiet)).to_string(),
+            EnvFilter::new(LogLevel::Verbose.directives()).to_string()
+        );
+
+        // 1. CAIRN_FILE_LOG (raw directive) beats CAIRN_LOG_LEVEL.
+        std::env::set_var("CAIRN_FILE_LOG", "warn,cairn_core=trace");
+        assert_eq!(
+            resolve_file_filter(Some(LogLevel::Quiet)).to_string(),
+            EnvFilter::new("warn,cairn_core=trace").to_string()
+        );
+
+        std::env::remove_var("CAIRN_FILE_LOG");
+        std::env::remove_var("CAIRN_LOG_LEVEL");
+    }
 }

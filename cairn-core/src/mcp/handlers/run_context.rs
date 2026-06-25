@@ -94,7 +94,7 @@ async fn lookup_run_by_id(db: &LocalDb, run_id: &str) -> Result<RunContext, Stri
                     "
                     SELECT r.id, r.job_id, j.execution_id, j.recipe_node_id,
                            r.issue_id, i.number, j.project_id, p.key, j.node_name,
-                           e.seq
+                           e.seq, j.worktree_path
                     FROM runs r
                     JOIN jobs j ON r.job_id = j.id
                     LEFT JOIN issues i ON r.issue_id = i.id
@@ -128,7 +128,7 @@ async fn lookup_run_by_cwd(db: &LocalDb, cwd: &str) -> Result<RunContext, String
                     "
                     SELECT r.id, r.job_id, j.execution_id, j.recipe_node_id,
                            r.issue_id, i.number, j.project_id, p.key, j.node_name,
-                           e.seq
+                           e.seq, j.worktree_path
                     FROM runs r
                     JOIN jobs j ON r.job_id = j.id
                     LEFT JOIN issues i ON r.issue_id = i.id
@@ -173,6 +173,7 @@ fn run_context_from_row(row: &turso::Row) -> DbResult<RunContext> {
         project_id: row.text(6)?,
         project_key: row.text(7)?,
         job_name,
+        worktree_path: row.opt_text(10)?,
     })
 }
 

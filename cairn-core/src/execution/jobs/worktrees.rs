@@ -63,13 +63,15 @@ pub(crate) fn prepare_worktree_for_job(
             message,
         }
     })?;
-    // Resolve the base to a commit id so jj always finds it in the shared
-    // backing object db, regardless of how the base ref is named.
-    let base_rev = git
-        .rev_parse(repo, vec![base_ref.to_string()])
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| base_ref.to_string());
+    // Resolve the base to a revision jj can always find in the shared store, so a
+    // local-only repo whose configured default branch has no matching ref (or an
+    // unborn/empty repo) still provisions instead of failing
+    // `Revision <x> doesn't exist`. See crate::jj::resolve_base_rev.
+    let base_rev = crate::jj::resolve_base_rev(&jj, &store, base_ref, |r| {
+        git.rev_parse(repo, vec![r.to_string()])
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     crate::jj::add_workspace(&jj, &store, worktree_path, branch, &base_rev, None).map_err(
         |message| crate::git::worktree::SetupError::Spawn {
             command: "jj workspace add".to_string(),

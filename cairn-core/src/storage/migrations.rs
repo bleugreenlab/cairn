@@ -1028,7 +1028,7 @@ mod tests {
         .await
         .unwrap();
 
-        MigrationRunner::new(vec![TURSO_MIGRATIONS[5].clone()])
+        MigrationRunner::new(vec![TURSO_MIGRATIONS[5]])
             .run(&db)
             .await
             .unwrap();
@@ -1220,7 +1220,7 @@ mod tests {
         .await
         .unwrap();
 
-        let applied = MigrationRunner::new(vec![TURSO_MIGRATIONS[41].clone()])
+        let applied = MigrationRunner::new(vec![TURSO_MIGRATIONS[41]])
             .run(&db)
             .await
             .unwrap();
@@ -1247,7 +1247,7 @@ mod tests {
             .unwrap(),
             "workspace:workspace:workspace"
         );
-        let applied_0043 = MigrationRunner::new(vec![TURSO_MIGRATIONS[42].clone()])
+        let applied_0043 = MigrationRunner::new(vec![TURSO_MIGRATIONS[42]])
             .run(&db)
             .await
             .unwrap();
@@ -1320,7 +1320,7 @@ mod tests {
             1
         );
 
-        let applied_0044 = MigrationRunner::new(vec![TURSO_MIGRATIONS[43].clone()])
+        let applied_0044 = MigrationRunner::new(vec![TURSO_MIGRATIONS[43]])
             .run(&db)
             .await
             .unwrap();
@@ -1328,7 +1328,7 @@ mod tests {
             applied_0044,
             vec!["0044_jobs_memory_review_state".to_string()]
         );
-        let applied_0045 = MigrationRunner::new(vec![TURSO_MIGRATIONS[44].clone()])
+        let applied_0045 = MigrationRunner::new(vec![TURSO_MIGRATIONS[44]])
             .run(&db)
             .await
             .unwrap();
@@ -1413,7 +1413,7 @@ mod tests {
         .unwrap();
 
         // Apply 0025 alone (the FK-off rebuild migration).
-        let applied = MigrationRunner::new(vec![TURSO_MIGRATIONS[24].clone()])
+        let applied = MigrationRunner::new(vec![TURSO_MIGRATIONS[24]])
             .run(&db)
             .await
             .unwrap();

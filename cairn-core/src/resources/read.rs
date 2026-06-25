@@ -22,7 +22,7 @@ use super::node::{
     read_node_chat_raw, read_node_chat_turn, read_node_permission, read_node_permissions,
     read_node_question, read_node_questions, read_node_tasks, read_node_wakes, read_task,
     read_task_artifact, read_task_chat, read_task_chat_event, read_task_chat_raw,
-    read_task_chat_turn,
+    read_task_chat_turn, read_task_permission, read_task_permissions,
 };
 use super::symbols::{read_node_symbols, read_project_symbols};
 
@@ -1477,6 +1477,50 @@ async fn render_resource_body(
                     number,
                     exec_seq,
                     &node_id,
+                    &segment,
+                )
+                .await
+            }
+        }
+        CairnResource::TaskPermissions {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => {
+            if let Some(error) = reject_query_params("task permissions", &params) {
+                error
+            } else {
+                read_task_permissions(
+                    &orch.db.local,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    &task_name,
+                )
+                .await
+            }
+        }
+        CairnResource::TaskPermission {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            segment,
+        } => {
+            if let Some(error) = reject_query_params("task permission", &params) {
+                error
+            } else {
+                read_task_permission(
+                    &orch.db.local,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    &task_name,
                     &segment,
                 )
                 .await

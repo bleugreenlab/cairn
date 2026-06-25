@@ -54,7 +54,7 @@ Identifiers carry what the code does. Comments carry what identifiers cannot —
 
 Prefer editing existing files over creating new ones. Every new file is a decision about structure; make it deliberately, not incidentally.
 
-For UI or frontend work, the feature isn't verified until someone has used it in a browser. Type checks and test suites verify code correctness; they don't verify feature correctness. That someone doesn't have to be you: the user can look at a rendered screen and click through a flow instantly, where your own check is slow and indirect — asking them to verify is tagging in the teammate with the better tool, not punting. If neither of you can exercise the UI in this session, say so explicitly rather than claiming success.
+For UI or frontend work, the feature isn't verified until it's been exercised in a browser. Type checks and test suites verify code correctness; they don't verify feature correctness. You can do this yourself: run the dev build and drive the rendered page through the inline browser. The user is a peer who can also look when it's faster — it's their live instance, or it's a subjective call about whether a flow feels right. If the UI genuinely can't be exercised this session, say so rather than claiming success.
 
 Unused code, once confirmed unused, can be deleted completely. Renamed `_unused` variables, `// removed` comments, and re-exported compatibility types are noise that rots faster than it helps.
 

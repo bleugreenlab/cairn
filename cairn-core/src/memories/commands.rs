@@ -164,24 +164,22 @@ pub fn send_memory_review_on_idle(
                     build_review_prompt(&prompt_db, &drafts).await?
                 };
 
-                conn.execute(
+                let updated = conn.execute(
                     "UPDATE jobs
                      SET memory_review_state = 'sent', updated_at = ?1
                      WHERE id = ?2 AND memory_review_state IS NULL",
                     params![chrono::Utc::now().timestamp(), job_id.as_str()],
                 )
                 .await?;
-                conn.execute(
-                    "INSERT INTO messages (
-                        id, channel_type, channel_id, sender_run_id, sender_name,
-                        recipient_run_id, content, created_at
-                     ) VALUES (?1, 'direct', NULL, NULL, 'system', ?2, ?3, ?4)",
-                    params![
-                        uuid::Uuid::new_v4().to_string().as_str(),
-                        run_id.as_str(),
-                        content.as_str(),
-                        chrono::Utc::now().timestamp(),
-                    ],
+                if updated == 0 {
+                    return Ok(false);
+                }
+                crate::messages::delivery::insert_system_direct_push_conn(
+                    conn,
+                    &job_id,
+                    &run_id,
+                    &content,
+                    crate::messages::queued::DeliveryUrgency::Queue,
                 )
                 .await?;
                 Ok(true)
@@ -190,6 +188,137 @@ pub fn send_memory_review_on_idle(
         .await
         .map_err(|e| e.to_string())
     })
+}
+
+#[derive(Debug, Clone)]
+struct StrandedMemoryReview {
+    job_id: String,
+    message_id: String,
+}
+
+fn memory_review_turn_count_for_job(
+    db: std::sync::Arc<LocalDb>,
+    job_id: &str,
+) -> Result<i64, String> {
+    let job_id = job_id.to_string();
+    crate::execution::advancement::run_advancement_db(async move {
+        db.query_one(
+            "SELECT COUNT(*) FROM turns WHERE job_id = ?1 AND start_reason = 'memory_review'",
+            (job_id,),
+            |row| row.i64(0),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn latest_memory_review_direct_message_id(
+    db: std::sync::Arc<LocalDb>,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    let job_id = job_id.to_string();
+    crate::execution::advancement::run_advancement_db(async move {
+        db.query_opt_text(
+            "SELECT m.id
+             FROM messages m
+             JOIN runs r ON r.id = m.recipient_run_id
+             WHERE r.job_id = ?1
+               AND m.channel_type = 'direct'
+               AND m.sender_name = 'system'
+               AND (
+                   m.content LIKE 'Before you finish, review the memories%'
+                   OR m.content LIKE 'Before you finish, take a moment to reflect:%'
+               )
+             ORDER BY m.created_at DESC
+             LIMIT 1",
+            (job_id,),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// Reconcile Memory Reviews that were marked `sent` before direct delivery moved
+/// to attention pushes. Conservative gates keep user-authored follow-ups and live
+/// turns in front: this only nudges idle jobs with an open current session, no
+/// queued user message, no active turn, and no existing memory-review turn.
+pub fn reconcile_stranded_memory_reviews(
+    orch: crate::orchestrator::Orchestrator,
+) -> Result<usize, String> {
+    let db = orch.db.local.clone();
+    let eligible_jobs = crate::execution::advancement::run_advancement_db(async move {
+        db.query_all(
+            "SELECT j.id
+             FROM jobs j
+             JOIN sessions s ON s.id = j.current_session_id AND s.status = 'open'
+             WHERE j.memory_review_state = 'sent'
+               AND NOT EXISTS (
+                   SELECT 1 FROM turns t
+                   WHERE t.job_id = j.id AND t.start_reason = 'memory_review'
+                   LIMIT 1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM queued_messages q
+                   WHERE q.job_id = j.id AND q.delivered_at IS NULL
+                   LIMIT 1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM turns live
+                   WHERE live.job_id = j.id AND live.state IN ('pending', 'running', 'yielded')
+                   LIMIT 1
+               )
+             ORDER BY j.updated_at ASC",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+
+    let mut stranded = Vec::new();
+    for job_id in eligible_jobs {
+        if let Some(message_id) =
+            latest_memory_review_direct_message_id(orch.db.local.clone(), &job_id)?
+        {
+            stranded.push(StrandedMemoryReview { job_id, message_id });
+        }
+    }
+
+    let mut resumed = 0;
+    for review in stranded {
+        if let Err(error) = crate::messages::delivery::enqueue_direct_push(
+            &orch,
+            &review.job_id,
+            &review.message_id,
+            crate::messages::queued::DeliveryUrgency::Queue,
+        ) {
+            log::warn!(
+                "memory review reconcile: failed to enqueue direct push for job {}: {}",
+                review.job_id,
+                error
+            );
+            continue;
+        }
+
+        let before = memory_review_turn_count_for_job(orch.db.local.clone(), &review.job_id)?;
+        match crate::execution::jobs::continue_job_impl(&orch, &review.job_id, None, None, None) {
+            Ok(_) => resumed += 1,
+            Err(error) => {
+                let after =
+                    memory_review_turn_count_for_job(orch.db.local.clone(), &review.job_id)?;
+                if after > before {
+                    resumed += 1;
+                } else {
+                    log::warn!(
+                        "memory review reconcile: failed to resume job {}: {}",
+                        review.job_id,
+                        error
+                    );
+                }
+            }
+        }
+    }
+    Ok(resumed)
 }
 
 async fn build_review_prompt(db: &LocalDb, drafts: &[Memory]) -> Result<String, DbError> {

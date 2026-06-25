@@ -1211,6 +1211,7 @@ async fn open_pr_review_arm(
         Option<String>,
         Option<i64>,
         Option<String>,
+        Option<String>,
     )> = db
         .read(|conn| {
             let issue_id = issue_id.clone();
@@ -1220,10 +1221,11 @@ async fn open_pr_review_arm(
                 let mut rows = conn
                     .query(
                         "SELECT mr.id, mr.additions, mr.deletions, mr.head_sha,
-                                e.seq, j.uri_segment
+                                e.seq, j.uri_segment, parent.uri_segment
                          FROM merge_requests mr
                          LEFT JOIN jobs j ON j.id = ?3
                          LEFT JOIN executions e ON j.execution_id = e.id
+                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                          WHERE mr.issue_id = ?1 AND mr.source_branch = ?2
                            AND mr.status = 'open'
                          ORDER BY mr.updated_at DESC
@@ -1243,6 +1245,7 @@ async fn open_pr_review_arm(
                         row.opt_text(3)?,
                         row.opt_i64(4)?,
                         row.opt_text(5)?,
+                        row.opt_text(6)?,
                     ))),
                     None => Ok(None),
                 }
@@ -1251,15 +1254,25 @@ async fn open_pr_review_arm(
         .await
         .map_err(|e| e.to_string())?;
     Ok(resolved.map(
-        |(mr_id, additions, deletions, head_sha, seq, uri_segment)| {
+        |(mr_id, additions, deletions, head_sha, seq, uri_segment, parent_segment)| {
             let content_ref = match (seq, uri_segment) {
-                (Some(seq), Some(node)) => cairn_common::uri::build_node_artifact_uri_named(
-                    project_key,
-                    number,
-                    seq as i32,
-                    &node,
-                    None,
-                ),
+                (Some(seq), Some(node)) => match parent_segment {
+                    Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                        project_key,
+                        number,
+                        seq as i32,
+                        &parent,
+                        &node,
+                        None,
+                    ),
+                    None => cairn_common::uri::build_node_artifact_uri_named(
+                        project_key,
+                        number,
+                        seq as i32,
+                        &node,
+                        None,
+                    ),
+                },
                 _ => format!("cairn://p/{project_key}/{number}"),
             };
             let fingerprint = match head_sha {
@@ -1288,16 +1301,18 @@ async fn review_artifact_ref(
     job_id: &str,
 ) -> Result<Option<(String, String)>, String> {
     let job_id = job_id.to_string();
-    let resolved: Option<(i64, String, Option<String>, i64, i64)> = db
+    #[allow(clippy::type_complexity)]
+    let resolved: Option<(i64, String, Option<String>, Option<String>, i64, i64)> = db
         .read(|conn| {
             let job_id = job_id.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT e.seq, j.uri_segment, a.output_name, a.version, a.updated_at
+                        "SELECT e.seq, j.uri_segment, parent.uri_segment, a.output_name, a.version, a.updated_at
                          FROM artifacts a
                          JOIN jobs j ON a.job_id = j.id
                          JOIN executions e ON j.execution_id = e.id
+                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                          WHERE a.job_id = ?1
                            AND (a.artifact_type = 'create-pr'
                                 OR (a.artifact_type = 'plan' AND a.confirmed = 0))
@@ -1311,8 +1326,9 @@ async fn review_artifact_ref(
                         row.i64(0)?,
                         row.text(1)?,
                         row.opt_text(2)?,
-                        row.i64(3)?,
+                        row.opt_text(3)?,
                         row.i64(4)?,
+                        row.i64(5)?,
                     ))),
                     None => Ok(None),
                 }
@@ -1320,18 +1336,31 @@ async fn review_artifact_ref(
         })
         .await
         .map_err(|e| e.to_string())?;
-    Ok(
-        resolved.map(|(seq, node, output_name, version, updated_at)| {
-            let uri = cairn_common::uri::build_node_artifact_uri_named(
-                project_key,
-                number,
-                seq as i32,
-                &node,
-                output_name.as_deref(),
-            );
+    // A sub-agent task job nests its artifact under the parent node
+    // (`.../{parent}/task/{task}/...`); a top-level node uses the flat node URI.
+    // The flat form does not resolve for a sub-task (issue #143).
+    Ok(resolved.map(
+        |(seq, node, parent_segment, output_name, version, updated_at)| {
+            let uri = match parent_segment {
+                Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                    project_key,
+                    number,
+                    seq as i32,
+                    &parent,
+                    &node,
+                    output_name.as_deref(),
+                ),
+                None => cairn_common::uri::build_node_artifact_uri_named(
+                    project_key,
+                    number,
+                    seq as i32,
+                    &node,
+                    output_name.as_deref(),
+                ),
+            };
             (uri, format!("artifact:{version}:{updated_at}"))
-        }),
-    )
+        },
+    ))
 }
 
 fn job_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
@@ -2299,14 +2328,15 @@ pub fn kill_session_with_reason(
 
 #[cfg(test)]
 mod memory_review_tests {
-    use super::finish_memory_review_if_due;
+    use super::{finish_memory_review_if_due, review_artifact_ref};
+    use crate::agent_process::process::{wrap_plain_stdin, RunHandle};
     use crate::db::DbState;
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{
         DbError, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
     };
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
@@ -2406,12 +2436,17 @@ mod memory_review_tests {
         db.write(|conn| {
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO sessions (id, job_id, status, created_at, updated_at) VALUES ('s-review','j-review','open',1,1)",
+                    "INSERT INTO sessions (id, job_id, status, backend_id, created_at, updated_at) VALUES ('s-review','j-review','open','backend-review',1,1)",
                     (),
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO runs (id, issue_id, project_id, job_id, status, session_id, created_at, updated_at) VALUES ('run-review','i-review','p-review','j-review','completed','s-review',1,1)",
+                    "UPDATE jobs SET current_session_id = 's-review' WHERE id = 'j-review'",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs (id, issue_id, project_id, job_id, status, session_id, created_at, updated_at) VALUES ('run-review','i-review','p-review','j-review','live','s-review',1,1)",
                     (),
                 )
                 .await?;
@@ -2498,6 +2533,75 @@ mod memory_review_tests {
             .unwrap()
     }
 
+    /// A sub-agent task's review artifact ref must nest under the parent node
+    /// (`.../{parent}/task/{task}/...`) so the wake's detail URI resolves; the
+    /// old code emitted a flat top-level node URI naming the task's own segment,
+    /// which does not resolve to the sub-task job (issue #143).
+    #[tokio::test]
+    async fn review_artifact_ref_nests_subtask_artifact_under_parent_task() {
+        use cairn_common::uri::{parse_uri, CairnResource};
+
+        // Top-level node job: the flat node artifact URI (unchanged behavior).
+        let db = test_db().await;
+        seed_job_row(&db, None, false).await;
+        insert_artifact(&db).await;
+        let (node_uri, _fp) = review_artifact_ref(&db, "PRJ", 2, "j-review")
+            .await
+            .unwrap()
+            .expect("artifact ref for node job");
+        assert_eq!(node_uri, "cairn://p/PRJ/2/1/builder/create-pr");
+        assert!(
+            matches!(
+                parse_uri(&node_uri),
+                Some(CairnResource::NodeArtifact { ref node_id, .. }) if node_id == "builder"
+            ),
+            "top-level node artifact URI should parse to NodeArtifact: {node_uri}"
+        );
+
+        // Sub-agent task job: the artifact nests under the parent node and
+        // parses to a TaskArtifact that resolves through the read path.
+        let task_db = test_db().await;
+        seed_job_row(&task_db, None, true).await;
+        insert_artifact(&task_db).await;
+        let (task_uri, _fp) = review_artifact_ref(&task_db, "PRJ", 2, "j-review")
+            .await
+            .unwrap()
+            .expect("artifact ref for task job");
+        assert_eq!(
+            task_uri,
+            "cairn://p/PRJ/2/1/coordinator/task/builder/create-pr"
+        );
+        assert!(
+            task_uri.contains("/task/"),
+            "sub-task URI must carry /task/"
+        );
+        match parse_uri(&task_uri) {
+            Some(CairnResource::TaskArtifact {
+                node_id,
+                task_name,
+                name,
+                ..
+            }) => {
+                assert_eq!(node_id, "coordinator");
+                assert_eq!(task_name, "builder");
+                assert_eq!(name.as_deref(), Some("create-pr"));
+            }
+            other => panic!("expected TaskArtifact, got {other:?}"),
+        }
+
+        // The old flat form named the task's own segment as a top-level node;
+        // that URI cannot resolve to the sub-task job.
+        let broken = cairn_common::uri::build_node_artifact_uri_named(
+            "PRJ",
+            2,
+            1,
+            "builder",
+            Some("create-pr"),
+        );
+        assert_eq!(broken, "cairn://p/PRJ/2/1/builder/create-pr");
+        assert_ne!(broken, task_uri);
+    }
+
     #[tokio::test]
     async fn null_with_drafts_sends_review_without_confirming() {
         let db = test_db().await;
@@ -2509,17 +2613,7 @@ mod memory_review_tests {
 
         assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
         assert_eq!(memory_status(&orch).await, "draft");
-        let messages = orch
-            .db
-            .local
-            .query_one(
-                "SELECT COUNT(*) FROM messages WHERE channel_type = 'direct' AND recipient_run_id = 'run-review' AND content LIKE '%Draft memories:%'",
-                (),
-                |row| row.i64(0),
-            )
-            .await
-            .unwrap();
-        assert_eq!(messages, 1);
+        assert_eq!(direct_push_count(&orch, "%Draft memories:%").await, 1);
     }
 
     #[tokio::test]
@@ -2602,6 +2696,66 @@ mod memory_review_tests {
         );
     }
 
+    async fn direct_push_count(orch: &crate::orchestrator::Orchestrator, like: &str) -> i64 {
+        let like = like.to_string();
+        orch.db
+            .local
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM attention_pushes p
+                 JOIN messages m ON p.key = 'direct:' || m.id
+                 WHERE p.recipient = 'j-review'
+                   AND p.delivered_event_id IS NULL
+                   AND m.channel_type = 'direct'
+                   AND m.recipient_run_id = 'run-review'
+                   AND m.content LIKE ?1",
+                (like,),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn memory_review_turn_count(orch: &crate::orchestrator::Orchestrator) -> i64 {
+        orch.db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM turns WHERE job_id = 'j-review' AND start_reason = 'memory_review'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn latest_memory_review_turn_state(orch: &crate::orchestrator::Orchestrator) -> String {
+        orch.db
+            .local
+            .query_one(
+                "SELECT state FROM turns WHERE job_id = 'j-review' AND start_reason = 'memory_review' ORDER BY sequence DESC LIMIT 1",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn register_warm_process(orch: &crate::orchestrator::Orchestrator) {
+        let mut processes = orch.process_state.processes.lock().unwrap();
+        let child = Arc::new(Mutex::new(None));
+        let stdin = Arc::new(Mutex::new(Some(wrap_plain_stdin(Box::new(
+            Vec::<u8>::new(),
+        )))));
+        let mut handle = RunHandle::new(
+            child,
+            stdin,
+            Some("s-review".to_string()),
+            Some("j-review".to_string()),
+        );
+        handle.transition_to_warm();
+        processes.register("run-review".to_string(), handle);
+    }
+
     async fn direct_message_count(orch: &crate::orchestrator::Orchestrator, like: &str) -> i64 {
         let like = like.to_string();
         orch.db
@@ -2644,8 +2798,8 @@ mod memory_review_tests {
 
         assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
         // A reflection prompt went out, and it is not the draft-review variant.
-        assert_eq!(direct_message_count(&orch, "%reflect%").await, 1);
-        assert_eq!(direct_message_count(&orch, "%Draft memories:%").await, 0);
+        assert_eq!(direct_push_count(&orch, "%reflect%").await, 1);
+        assert_eq!(direct_push_count(&orch, "%Draft memories:%").await, 0);
     }
 
     #[tokio::test]
@@ -2673,7 +2827,7 @@ mod memory_review_tests {
 
         // Review fires for tasks too when they captured drafts.
         assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
-        assert_eq!(direct_message_count(&orch, "%Draft memories:%").await, 1);
+        assert_eq!(direct_push_count(&orch, "%Draft memories:%").await, 1);
     }
 
     #[tokio::test]
@@ -2690,6 +2844,90 @@ mod memory_review_tests {
 
         assert_eq!(review_state(&orch).await.as_deref(), Some("sent"));
         assert_eq!(memory_status(&orch).await, "draft");
+    }
+
+    #[tokio::test]
+    async fn idle_flush_creates_memory_review_turn_from_pending_push() {
+        let db = test_db().await;
+        seed_job(&db, None).await;
+        insert_artifact(&db).await;
+        insert_run_session_with_turns(&db, 1).await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch);
+
+        finish_memory_review_if_due(&orch, "j-review", "run-review");
+        assert_eq!(direct_push_count(&orch, "%Draft memories:%").await, 1);
+        assert!(
+            crate::orchestrator::attention_push::has_pending_waking_live(
+                &orch.db.local,
+                "j-review"
+            )
+            .await
+            .unwrap()
+        );
+        crate::messages::delivery::flush_pending_directs_on_idle(&orch, "run-review");
+
+        assert_eq!(memory_review_turn_count(&orch).await, 1);
+        assert!(matches!(
+            latest_memory_review_turn_state(&orch).await.as_str(),
+            "pending" | "running"
+        ));
+    }
+
+    #[tokio::test]
+    async fn stranded_sent_reconcile_resumes_once() {
+        let db = test_db().await;
+        seed_job(&db, Some("sent")).await;
+        insert_artifact(&db).await;
+        insert_run_session_with_turns(&db, 1).await;
+        db.execute(
+            "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at)
+             VALUES ('msg-review', 'direct', 'system', 'run-review', 'Before you finish, review the memories you captured during this job. Draft memories:', 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch);
+        let first =
+            crate::memories::commands::reconcile_stranded_memory_reviews(orch.clone()).unwrap();
+        let second =
+            crate::memories::commands::reconcile_stranded_memory_reviews(orch.clone()).unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(second, 0);
+        assert_eq!(memory_review_turn_count(&orch).await, 1);
+    }
+
+    #[tokio::test]
+    async fn stranded_sent_reconcile_preserves_queued_user_followup() {
+        let db = test_db().await;
+        seed_job(&db, Some("sent")).await;
+        insert_artifact(&db).await;
+        insert_run_session_with_turns(&db, 1).await;
+        db.execute(
+            "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at)
+             VALUES ('msg-review', 'direct', 'system', 'run-review', 'Before you finish, review the memories you captured during this job. Draft memories:', 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        crate::messages::queued::enqueue_async(
+            &db,
+            "j-review",
+            "user has a follow-up",
+            crate::messages::queued::Delivery::Queue,
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch);
+
+        let resumed =
+            crate::memories::commands::reconcile_stranded_memory_reviews(orch.clone()).unwrap();
+
+        assert_eq!(resumed, 0);
+        assert_eq!(memory_review_turn_count(&orch).await, 0);
     }
 
     #[tokio::test]

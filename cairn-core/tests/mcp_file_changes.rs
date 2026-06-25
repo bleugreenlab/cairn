@@ -1,7 +1,6 @@
 mod common;
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
 use cairn_core::internal::db::DbState;
@@ -20,40 +19,6 @@ use turso::params;
 // tests resolve `jj` and self-skip with a note when it is unavailable, mirroring
 // `mcp::vcs`'s jj tests. Resource-only tests never touch the VCS and keep a
 // plain cwd.
-
-/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
-fn jj_bin() -> Option<String> {
-    let bin = std::env::var("CAIRN_JJ_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "jj".to_string());
-    Command::new(&bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then_some(bin)
-}
-
-fn head_sha(repo: &Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// Provision a `.jj` workspace at `ws` over a shared store backed by
-/// `project_repo`, using `config_dir` (the orchestrator's config dir) so the
-/// change handler's `JjEnv` resolves the same store.
-fn provision_jj_workspace(config_dir: &Path, project_repo: &Path, ws: &Path, branch: &str) {
-    let jj = JjEnv::resolve("jj", config_dir);
-    let store = jj::project_store_dir(config_dir, project_repo);
-    jj::ensure_project_store(&jj, &store, project_repo).unwrap();
-    let base = head_sha(project_repo);
-    jj::add_workspace(&jj, &store, ws, branch, &base, None).unwrap();
-}
 
 fn make_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
@@ -113,13 +78,13 @@ impl ChangeTestRepo {
     /// jj is unavailable. The cwd (`dir`) is a real `.jj` workspace over a shared
     /// store backed by a throwaway project git repo.
     async fn try_new() -> Option<Self> {
-        jj_bin()?;
+        common::jj_bin()?;
         let dir = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         init_git_repo(project.path());
         let config = tempfile::tempdir().unwrap();
         let orch = orchestrator_with_config(config.path()).await;
-        provision_jj_workspace(
+        common::provision_jj_workspace(
             config.path(),
             project.path(),
             dir.path(),
@@ -138,6 +103,18 @@ impl ChangeTestRepo {
     fn seal_base(&self, msg: &str) {
         let jj = JjEnv::resolve("jj", self.config.path());
         jj::seal(&jj, self.dir.path(), msg, None).unwrap();
+    }
+
+    /// Make this workspace OP-LOG stale via a sibling advance (the production
+    /// data-loss shape: a later seal AND its restore are both blocked by
+    /// staleness). See [`common::stale_sibling_advance`].
+    fn make_stale_via_sibling(&self) {
+        common::stale_sibling_advance(
+            self.config.path(),
+            self._project.path(),
+            self.dir.path(),
+            "agent/CHG-1-builder-0",
+        );
     }
 
     fn cwd(&self) -> &str {
@@ -1201,5 +1178,70 @@ async fn change_patches_issue_resource_without_nested_runtime_panic() {
         )
         .await,
         1
+    );
+}
+
+#[tokio::test]
+async fn stale_seal_recovers_or_reverts_multi_file_batch_cleanly() {
+    // The direct regression for the reported multi-patch write loss. The base
+    // advances mid-batch and rewrites this workspace's `@` out from under it, so
+    // the seal hits "working copy is stale" AND the old restore would too. The
+    // fix must either recover the batch onto the advanced base (Phase 2) or
+    // cleanly revert (Phase 1) — never strand the applied edits uncommitted.
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!(
+            "skipping stale_seal_recovers_or_reverts_multi_file_batch_cleanly: jj not resolvable"
+        );
+        return;
+    };
+    repo.seal_base("base");
+    repo.make_stale_via_sibling();
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                {"target": "file:alpha.rs", "mode": "create", "payload": {"content": "fn alpha() {}\n"}},
+                {"target": "file:beta.rs", "mode": "create", "payload": {"content": "fn beta() {}\n"}},
+                {"target": "file:gamma.rs", "mode": "create", "payload": {"content": "fn gamma() {}\n"}}
+            ],
+            "commit_msg": "add alpha beta gamma"
+        }))
+        .await;
+
+    let committed = report["commit"]["status"] == "committed";
+    if committed {
+        // Phase 2: the batch landed on the advanced base. Its files are present,
+        // and the sibling's file is too (recovery rebased onto the advanced tip).
+        assert_eq!(
+            failure_count(&report),
+            0,
+            "a recovered commit has no failures: {report:?}"
+        );
+        assert!(
+            repo.path("alpha.rs").exists()
+                && repo.path("beta.rs").exists()
+                && repo.path("gamma.rs").exists(),
+            "the recovered batch's files are present: {report:?}"
+        );
+        assert!(
+            repo.path("sibling-advance.txt").exists(),
+            "recovery rebased the batch onto the advanced sibling base"
+        );
+    } else {
+        // Phase 1 fallback: a clean revert leaves no orphaned uncommitted dirt.
+        assert!(
+            !repo.path("alpha.rs").exists(),
+            "a reverted batch must not strand its files on disk: {report:?}"
+        );
+    }
+
+    // In BOTH outcomes the worktree ends clean and non-stale — equal to a real
+    // commit, never orphaned dirt. `is_working_copy_dirty` errors if still stale,
+    // so Ok(false) also asserts staleness was cleared.
+    let jj = JjEnv::resolve("jj", repo.config.path());
+    assert_eq!(
+        jj::is_working_copy_dirty(&jj, repo.dir.path()),
+        Ok(false),
+        "worktree clean and non-stale after the batch"
     );
 }

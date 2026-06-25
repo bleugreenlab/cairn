@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn test_decode_secret_invalid_length() {
         use base64::Engine;
-        let short = base64::engine::general_purpose::STANDARD.encode(&[0u8; 16]);
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
         assert!(decode_secret(&short).is_none());
     }
 

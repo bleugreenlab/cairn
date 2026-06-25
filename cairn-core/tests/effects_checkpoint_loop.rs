@@ -182,20 +182,6 @@ async fn assert_latest_checkpoint_passed(h: &CheckpointLoop, passed: bool) {
 // blocked. A colocated `jj git init --colocate` repo would carry a `.git` and
 // mask exactly this git-vs-jj mismatch, so `try_new` asserts there is none.
 
-/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
-fn jj_bin() -> Option<String> {
-    let bin = std::env::var("CAIRN_JJ_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "jj".to_string());
-    Command::new(&bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then_some(bin)
-}
-
 /// Initialize a throwaway project git repo with one commit, the store's base.
 fn init_git_repo(repo: &Path) {
     let git = |args: &[&str]| {
@@ -218,15 +204,6 @@ fn init_git_repo(repo: &Path) {
     git(&["commit", "-q", "-m", "init"]);
 }
 
-fn git_head_sha(repo: &Path) -> String {
-    let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// A non-colocated jj agent workspace over a shared store, mirroring production
 /// worktree provisioning. The head advances only via [`Worktree::commit_file`]
 /// (a real agent seal), the same `jj log -r @-` the production gate reads.
@@ -241,23 +218,16 @@ impl Worktree {
     /// `config_dir` MUST be the orchestrator's config dir so the checkpoint
     /// gate's `JjEnv` resolves the same store.
     fn try_new(config_dir: &Path) -> Option<Self> {
-        jj_bin()?;
+        common::jj_bin()?;
         let project = tempdir().unwrap();
         init_git_repo(project.path());
         let dir = tempdir().unwrap();
-        let jj = JjEnv::resolve("jj", config_dir);
-        let store = jj::project_store_dir(config_dir, project.path());
-        jj::ensure_project_store(&jj, &store, project.path()).unwrap();
-        let base = git_head_sha(project.path());
-        jj::add_workspace(
-            &jj,
-            &store,
+        common::provision_jj_workspace(
+            config_dir,
+            project.path(),
             dir.path(),
             "agent/CKL-1-builder-0",
-            &base,
-            None,
-        )
-        .unwrap();
+        );
         // Non-colocated: a `.git` here would mask the git-vs-jj head mismatch
         // this harness exists to exercise.
         assert!(

@@ -2344,6 +2344,67 @@ pub(crate) async fn dispatch_resource_change(
                 }
             }
         }
+        (
+            CairnResource::TaskPermission {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                segment,
+            },
+            ChangeMode::Patch,
+        ) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| build_failure(index, item, "permission answer requires payload"))?;
+            let decision_str = payload_str(payload, "decision", &[]).ok_or_else(|| {
+                build_failure(index, item, "payload.decision is required (allow|deny)")
+            })?;
+            let decision = match decision_str {
+                "allow" => crate::mcp::handlers::permission::PermissionDecision::Allow,
+                "deny" => crate::mcp::handlers::permission::PermissionDecision::Deny,
+                other => {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        format!("invalid decision '{other}'; expected allow or deny"),
+                    ))
+                }
+            };
+            let scope = match payload_str(payload, "scope", &[]).unwrap_or("once") {
+                "once" => crate::mcp::handlers::permission::PermissionScope::Once,
+                "session" => crate::mcp::handlers::permission::PermissionScope::Session,
+                other => {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        format!("invalid scope '{other}'; expected once or session"),
+                    ))
+                }
+            };
+            if dry_run {
+                format!(
+                    "Would answer permission {} for {}-{}/{}/{}/task/{}",
+                    segment, project, number, exec_seq, node_id, task_name
+                )
+            } else {
+                // The permission resource keys on the OWNING job's own
+                // `uri_segment`; for a sub-agent task that is the task segment,
+                // so the task name addresses the request directly (issue #143).
+                let outcome = crate::mcp::handlers::permission::answer_node_permission(
+                    orch, project, *number, *exec_seq, task_name, segment, decision, scope,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                if outcome.duplicate {
+                    format!("Permission {} was already answered", segment)
+                } else {
+                    format!("Answered permission {}: {}", segment, decision_str)
+                }
+            }
+        }
         (CairnResource::NodeQuestions { .. }, ChangeMode::Append) => {
             let payload = item
                 .payload
@@ -3933,6 +3994,8 @@ mod issue_mutation_tests {
             K::NodeQuestions => "cairn://p/CAIRN/1/1/builder/questions",
             K::NodeQuestion => "cairn://p/CAIRN/1/1/builder/questions/q-1",
             K::NodePermission => "cairn://p/CAIRN/1/1/builder/permissions/perm-1",
+            K::TaskPermission => "cairn://p/CAIRN/1/1/builder/task/sub/permissions/perm-1",
+            K::TaskPermissions => "cairn://p/CAIRN/1/1/builder/task/sub/permissions",
             K::Bug => "cairn://bug",
             K::Skills => "cairn://skills",
             K::Skill => "cairn://skills/testing",

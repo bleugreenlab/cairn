@@ -21,6 +21,7 @@ use cairn_common::uri::{
     build_job_todos_uri, build_node_artifact_uri_named, build_node_chat_uri,
     build_node_permission_uri, build_node_question_uri, build_node_uri, build_node_wakes_uri,
     build_task_artifact_uri, build_task_artifact_uri_named, build_task_chat_uri,
+    build_task_permission_uri,
 };
 
 /// Resolve the job_id that owns the todos addressed by a `JobTodos` URI.
@@ -709,6 +710,99 @@ pub(super) async fn read_node_permission(
     output
 }
 
+/// Permissions raised by a sub-agent task job. The task analogue of
+/// [`read_node_permissions`]: resolves the task job (parent node + task
+/// segment) and reuses the same job-id-keyed permission loader, so a sub-task's
+/// permissions resolve at the canonical `.../task/{task}/permissions` URI
+/// instead of an unresolvable top-level-node URI (issue #143).
+pub(super) async fn read_task_permissions(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+) -> String {
+    let (conn, _parent_job, task_job) =
+        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
+
+    let requests = load_node_permissions(&conn, &task_job.id).await;
+
+    let mut output = format!("# Permissions — {}/{}\n\n", node_name, task_name);
+    if requests.is_empty() {
+        output.push_str("No permission requests yet.\n\n");
+    } else {
+        output.push_str(&format!("{} permission request(s)\n\n", requests.len()));
+        for request in &requests {
+            let icon = if request.status == "pending" {
+                "\u{23f3}"
+            } else {
+                "\u{2713}"
+            };
+            output.push_str(&format!(
+                "- [{}]({}) [{}] {}\n",
+                request.segment,
+                build_task_permission_uri(
+                    project_key,
+                    number,
+                    exec_seq,
+                    node_name,
+                    task_name,
+                    &request.segment
+                ),
+                icon,
+                request.summary,
+            ));
+            if request.status != "pending" {
+                output.push_str(&format!("  → {}\n", request.status));
+            }
+        }
+        output.push('\n');
+    }
+    output
+}
+
+pub(super) async fn read_task_permission(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+    segment: &str,
+) -> String {
+    let (conn, _parent_job, task_job) =
+        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
+
+    let requests = load_node_permissions(&conn, &task_job.id).await;
+    let Some(request) = requests.into_iter().find(|r| r.segment == segment) else {
+        return format!(
+            "Permission '{}' not found for task '{}' in node '{}' of issue {}-{}",
+            segment, task_name, node_name, project_key, number
+        );
+    };
+
+    let mut output = format!("# Permission {} — {}/{}\n\n", segment, node_name, task_name);
+    output.push_str(&format!("Status: {}\n\n", request.status));
+    output.push_str(&format!("## Request\n\n{}\n\n", request.summary));
+    match request.response.as_deref().filter(|r| !r.is_empty()) {
+        Some(response) => output.push_str(&format!("## Resolution\n\n{}\n\n", response)),
+        None => output.push_str("## Resolution\n\n(awaiting answer)\n\n"),
+    }
+
+    output
+}
+
 pub(super) async fn read_node(
     orch: &crate::orchestrator::Orchestrator,
     project_key: &str,
@@ -824,13 +918,18 @@ pub(super) async fn read_node(
         Option<String>,
         Option<i32>,
         Option<i32>,
+        String,
+        String,
+        String,
     )> = match conn
         .query(
             "
-            SELECT github_pr_number, github_pr_url, status, github_review,
-                   github_mergeable, checks_status, additions, deletions
-            FROM merge_requests
-            WHERE job_id = ?1
+            SELECT mr.github_pr_number, mr.github_pr_url, mr.status, mr.github_review,
+                   mr.github_mergeable, mr.checks_status, mr.additions, mr.deletions,
+                   mr.source_branch, mr.target_branch, p.repo_path
+            FROM merge_requests mr
+            JOIN projects p ON mr.project_id = p.id
+            WHERE mr.job_id = ?1
             LIMIT 1
             ",
             (job.id.as_str(),),
@@ -847,6 +946,9 @@ pub(super) async fn read_node(
                 row.opt_text(5).ok()?,
                 row.opt_i64(6).ok()?.map(|value| value as i32),
                 row.opt_i64(7).ok()?.map(|value| value as i32),
+                row.text(8).ok()?,
+                row.text(9).ok()?,
+                row.text(10).ok()?,
             ))
         }),
         Err(_) => None,
@@ -861,6 +963,9 @@ pub(super) async fn read_node(
         checks_status,
         additions,
         deletions,
+        source_branch,
+        target_branch,
+        repo_path,
     )) = pr
     {
         if let (Some(pr_num), Some(url)) = (pr_number, pr_url) {
@@ -868,10 +973,31 @@ pub(super) async fn read_node(
             output.push_str(&format!("PR #{}: {}\n", pr_num, url));
             output.push_str(&format!("Status: {}\n", pr_status));
 
+            // A jj-conflicted source carries garbage GitHub mergeable/diff state
+            // that can read as a clean, mergeable change here even when the branch
+            // cannot merge. The conflict can arise out-of-band (base advance /
+            // reconcile) with no subsequent PR refresh, so a cached bit would go
+            // stale; for an open PR, consult the jj store directly (its single
+            // source of truth) so the coordinator sees the blocker BEFORE
+            // attempting a merge.
+            let source_conflict = if pr_status == "open" {
+                crate::pr_data::actions::source_conflict_report(
+                    &orch.jj_binary_path,
+                    &orch.config_dir,
+                    &repo_path,
+                    &source_branch,
+                    Some(&target_branch),
+                )
+            } else {
+                None
+            };
+
             if let Some(review) = review_decision {
                 output.push_str(&format!("Review: {}\n", review));
             }
-            if let Some(merge) = mergeable {
+            if source_conflict.is_some() {
+                output.push_str("Mergeable: CONFLICTING\n");
+            } else if let Some(merge) = mergeable {
                 output.push_str(&format!("Mergeable: {}\n", merge));
             }
             if let Some(checks) = checks_status {
@@ -880,7 +1006,26 @@ pub(super) async fn read_node(
             if additions.is_some() || deletions.is_some() {
                 let adds = additions.unwrap_or(0);
                 let dels = deletions.unwrap_or(0);
-                output.push_str(&format!("Changes: +{} -{}\n", adds, dels));
+                if source_conflict.is_some() {
+                    output.push_str(&format!(
+                        "Changes: +{} -{} (stale — branch carries conflicts; resolve before trusting)\n",
+                        adds, dels
+                    ));
+                } else {
+                    output.push_str(&format!("Changes: +{} -{}\n", adds, dels));
+                }
+            }
+            if let Some(report) = &source_conflict {
+                output.push_str("\n⛔ Conflicted history — cannot merge:\n");
+                output.push_str(&crate::pr_data::actions::format_conflicted_commits(
+                    &report.commits,
+                ));
+                output.push('\n');
+                output.push_str(&crate::pr_data::actions::conflict_recovery_hint(
+                    &source_branch,
+                    Some(&target_branch),
+                ));
+                output.push('\n');
             }
         }
     }
@@ -1614,6 +1759,67 @@ pub(super) async fn read_node_chat_event(
 
     // Get the specific event
     get_single_event(&conn, &run_id, event_seq).await
+}
+
+#[cfg(test)]
+mod task_permission_tests {
+    use super::{read_node_permission, read_task_permission};
+    use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+
+    async fn test_db() -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("task-perm.db");
+        std::mem::forget(temp);
+        let db = LocalDb::open(path).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// Seed an issue with a top-level `builder` node and a `review` sub-agent
+    /// task under it, plus a pending fence-crossing permission on the task.
+    async fn seed(db: &LocalDb) {
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',2,'T','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-parent','e','i','p','running','builder','Builder',1,1)",
+            "INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-task','e','j-parent','i','p','running','review','Review',1,1)",
+            "INSERT INTO runs (id, job_id, issue_id, created_at, updated_at) VALUES ('run-task','j-task','i',1,1)",
+            "INSERT INTO permission_requests (id, run_id, job_id, tool_use_id, tool_name, tool_input, status, uri_segment, created_at) VALUES ('pr1','run-task','j-task','tu1','bash','{\"summary\":\"cross the fence\"}','pending','perm-1',1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+    }
+
+    /// A sub-task permission resolves at its canonical
+    /// `.../{parent}/task/{task}/permissions/{seg}` URI, while the old flat
+    /// top-level form names a node that does not exist (issue #143).
+    #[tokio::test]
+    async fn task_permission_resolves_under_parent_while_flat_node_does_not() {
+        let db = test_db().await;
+        seed(&db).await;
+
+        let resolved = read_task_permission(&db, "PRJ", 2, 1, "builder", "review", "perm-1").await;
+        assert!(
+            resolved.contains("Permission perm-1") && resolved.contains("cross the fence"),
+            "task permission should resolve: {resolved}"
+        );
+        assert!(
+            !resolved.contains("not found"),
+            "task permission should resolve: {resolved}"
+        );
+
+        // The pre-fix URI named the task's own segment as a top-level node.
+        let broken = read_node_permission(&db, "PRJ", 2, 1, "review", "perm-1").await;
+        assert!(
+            broken.contains("not found"),
+            "flat sub-task node URI must not resolve: {broken}"
+        );
+    }
 }
 
 #[cfg(test)]

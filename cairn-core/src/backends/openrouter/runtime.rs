@@ -800,10 +800,34 @@ fn execute_tool_call(
         payload,
         tool_use_id: Some(tool_call.id.clone()),
     };
+    // read_batch and run return a JSON batch envelope (composed text + image
+    // content blocks). The OpenAI tool-message format is text-only, so collapse
+    // the envelope to its text on this edge; image blocks cannot ride a
+    // chat-completions tool result.
+    let collapse_envelope = request.tool == "read_batch" || request.tool == "run";
     let read_cursors = Mutex::new(HashMap::new());
-    run_db_blocking(|| async move {
+    let mut output = run_db_blocking(|| async move {
         Ok(crate::dispatch::dispatch_tool(orch, &request, &read_cursors).await)
-    })
+    })?;
+    if collapse_envelope {
+        output.content = collapse_envelope_text(output.content);
+    }
+    Ok(output)
+}
+
+/// Collapse a read/run batch envelope to its composed text for the text-only
+/// OpenAI tool-message format. `read_batch` and `run` return a JSON envelope
+/// carrying text plus image content blocks; a chat-completions tool result
+/// cannot carry images, so this edge renders the text and drops the images.
+/// Non-envelope content (or a parse failure) passes through unchanged.
+fn collapse_envelope_text(content: String) -> String {
+    if let Ok(envelope) = serde_json::from_str::<cairn_common::read::RunBatchEnvelope>(&content) {
+        return envelope.text;
+    }
+    if let Ok(envelope) = serde_json::from_str::<cairn_common::read::ReadBatchEnvelope>(&content) {
+        return envelope.text;
+    }
+    content
 }
 
 fn normalize_tool_payload(tool_name: &str, payload: &mut Value, home_uri: &str) {
@@ -2099,7 +2123,7 @@ fn insert_transcript_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_provider_object, context_fit_budget, default_function_type,
+        build_provider_object, collapse_envelope_text, context_fit_budget, default_function_type,
         estimate_conversation_tokens, fit_conversation, normalize_tool_payload, prepare_tool_call,
         render_tool_result, reorder_tool_results_by_call_order, resolve_home_target,
         store_assistant_tool_call, store_tool_result, tool_call_usage, tool_schemas,
@@ -2168,6 +2192,28 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec!["read", "write", "run"]);
+    }
+
+    #[test]
+    fn collapse_envelope_text_extracts_run_text_and_drops_images() {
+        // The OpenAI tool-message format is text-only, so the run/read envelope
+        // collapses to its text on the OpenRouter edge; image blocks are dropped
+        // (they cannot ride a chat-completions tool result).
+        let envelope = cairn_common::read::RunBatchEnvelope {
+            text: "=== look ===\nAX tree".to_string(),
+            images: vec![cairn_common::read::ImageBlock {
+                mime_type: "image/png".to_string(),
+                data: "b64".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(collapse_envelope_text(json), "=== look ===\nAX tree");
+    }
+
+    #[test]
+    fn collapse_envelope_text_passes_through_non_envelope() {
+        let plain = "Exit code: 0".to_string();
+        assert_eq!(collapse_envelope_text(plain.clone()), plain);
     }
 
     #[test]

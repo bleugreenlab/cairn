@@ -3,9 +3,11 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use cairn_core::internal::db::DbState;
+use cairn_core::internal::jj::{self, JjEnv};
 use cairn_core::internal::mcp::handlers::files::handle_change;
 use cairn_core::internal::mcp::handlers::issue_resources::handle_read_issue_resource;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
@@ -224,6 +226,77 @@ pub async fn create_job(
 /// spawn a real `sandbox-exec` or depend on an undisturbed subprocess lifecycle
 /// cannot run nested inside the agent fence, so they call this to skip rather
 /// than fail. Unfenced CI still runs them for real coverage.
+/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
+/// jj-backed integration tests gate on this and print a skip note rather than
+/// fail when jj cannot be resolved (honoring `CAIRN_JJ_BIN` when set).
+pub fn jj_bin() -> Option<String> {
+    let bin = std::env::var("CAIRN_JJ_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "jj".to_string());
+    Command::new(&bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+        .then_some(bin)
+}
+
+/// The git `HEAD` commit sha of `repo`, used to base a jj workspace on the
+/// project repo's current tip.
+pub fn head_sha(repo: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Provision a NON-COLOCATED `.jj` workspace at `ws` over a shared store backed
+/// by `project_repo`, mirroring production worktree provisioning. The workspace
+/// is created with `jj workspace add` and carries no `.git`, so tests exercise
+/// the real jj/git-shelling seams rather than a colocated checkout that would
+/// mask them. `config_dir` is the orchestrator's config dir, so a handler's
+/// `JjEnv` resolves the same store and config.
+pub fn provision_jj_workspace(config_dir: &Path, project_repo: &Path, ws: &Path, branch: &str) {
+    let jj = JjEnv::resolve("jj", config_dir);
+    let store = jj::project_store_dir(config_dir, project_repo);
+    jj::ensure_project_store(&jj, &store, project_repo).unwrap();
+    let base = head_sha(project_repo);
+    jj::add_workspace(&jj, &store, ws, branch, &base, None).unwrap();
+}
+
+/// Drive `primary_ws` into the OP-LOG stale state that reproduces the commit
+/// barrier's data-loss bug. A sibling workspace over the same store seals a
+/// commit, then the primary branch is rebased onto it from the store
+/// (`--ignore-working-copy`, WITHOUT an `update_stale`) — rewriting the primary
+/// workspace's own `@` out from under it. This is the production shape where BOTH
+/// the seal and the restore are blocked by staleness, distinct from a mere
+/// bookmark advance (which leaves `jj restore` working). The primary workspace
+/// must already exist (via [`provision_jj_workspace`]); the sibling is created
+/// next to it, coupled only through the shared store.
+pub fn stale_sibling_advance(
+    config_dir: &Path,
+    project_repo: &Path,
+    primary_ws: &Path,
+    primary_branch: &str,
+) {
+    let jj = JjEnv::resolve("jj", config_dir);
+    let store = jj::project_store_dir(config_dir, project_repo);
+    let sibling_ws = primary_ws.parent().unwrap().join("sibling-advance-ws");
+    let sibling_branch = "agent/SIB-advance-0";
+    let base = head_sha(project_repo);
+    jj::add_workspace(&jj, &store, &sibling_ws, sibling_branch, &base, None).unwrap();
+    std::fs::write(sibling_ws.join("sibling-advance.txt"), "sibling advance\n").unwrap();
+    jj::seal(&jj, &sibling_ws, "sibling advance", None).unwrap();
+    // Rebase the whole primary branch (its working-copy commit included) onto the
+    // sibling tip from the store. Rewriting `@` from outside is what makes the
+    // primary workspace stale; we deliberately skip the `update_stale` that
+    // `advance_workspace_onto` would normally run, leaving it stale for the test.
+    jj::rebase_branch_onto(&jj, &store, primary_branch, sibling_branch).unwrap();
+}
+
 pub fn skip_if_fenced(test: &str) -> bool {
     if std::env::var_os("CAIRN_SANDBOXED").is_some() {
         eprintln!("skipping {test}: cannot run nested inside a Cairn worktree fence");

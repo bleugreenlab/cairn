@@ -1007,10 +1007,10 @@ mod tests {
         let file = repo.join("agents").join("planner.md");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "agent").unwrap();
-        commit_config_paths(&[file.clone()], "cairn: create agent planner");
+        commit_config_paths(std::slice::from_ref(&file), "cairn: create agent planner");
 
         std::fs::remove_file(&file).unwrap();
-        let shas = commit_config_paths(&[file.clone()], "cairn: delete agent planner");
+        let shas = commit_config_paths(std::slice::from_ref(&file), "cairn: delete agent planner");
         assert_eq!(shas.len(), 1, "deletion should produce a commit");
         assert_eq!(git_head_subject(repo), "cairn: delete agent planner");
         assert!(

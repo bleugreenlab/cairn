@@ -318,7 +318,7 @@ async fn monitor_workers(
 
         if config
             .checkpoint_every
-            .is_some_and(|every| poll > 0 && poll % every == 0)
+            .is_some_and(|every| poll > 0 && poll.is_multiple_of(every))
         {
             let checkpoint_db = open_probe_db(db_path)
                 .await
@@ -330,7 +330,7 @@ async fn monitor_workers(
         }
         if config
             .integrity_every
-            .is_some_and(|every| poll > 0 && poll % every == 0)
+            .is_some_and(|every| poll > 0 && poll.is_multiple_of(every))
         {
             let integrity_db = open_probe_db(db_path)
                 .await
@@ -365,7 +365,7 @@ async fn assert_final_counts(db: &LocalDb, config: &Config) -> Result<(), String
     }
 
     if config.delete_heavy {
-        let deleted_per_worker = ((config.iters + 2) / 3) as i64;
+        let deleted_per_worker = config.iters.div_ceil(3) as i64;
         let scratch_expected = expected - (config.workers as i64 * deleted_per_worker);
         let scratch_count = query_count(db, "SELECT COUNT(*) FROM worker_scratch")
             .await

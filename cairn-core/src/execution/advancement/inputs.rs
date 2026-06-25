@@ -279,7 +279,7 @@ mod tests {
                 ],
                 "event": {
                     "accumulated": true,
-                    "groupKey": "quickbuild",
+                    "groupKey": "build",
                     "threshold": 2,
                     "eventCount": 2,
                     "events": [],

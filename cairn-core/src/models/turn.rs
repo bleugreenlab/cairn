@@ -167,6 +167,26 @@ impl std::str::FromStr for TurnStartReason {
     }
 }
 
+impl From<crate::db_records::DbTurn> for Turn {
+    fn from(db: crate::db_records::DbTurn) -> Self {
+        Turn {
+            id: db.id,
+            session_id: db.session_id,
+            run_id: db.run_id,
+            job_id: db.job_id,
+            sequence: db.sequence,
+            predecessor_id: db.predecessor_id,
+            state: db.state.parse().unwrap_or(TurnState::Pending),
+            yield_reason: db.yield_reason.and_then(|r| r.parse().ok()),
+            start_reason: db.start_reason.parse().unwrap_or(TurnStartReason::Initial),
+            created_at: db.created_at as i64,
+            started_at: db.started_at.map(|t| t as i64),
+            ended_at: db.ended_at.map(|t| t as i64),
+            updated_at: db.updated_at as i64,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,25 +330,5 @@ mod tests {
         };
         let turn: Turn = db.into();
         assert!(turn.yield_reason.is_none());
-    }
-}
-
-impl From<crate::db_records::DbTurn> for Turn {
-    fn from(db: crate::db_records::DbTurn) -> Self {
-        Turn {
-            id: db.id,
-            session_id: db.session_id,
-            run_id: db.run_id,
-            job_id: db.job_id,
-            sequence: db.sequence,
-            predecessor_id: db.predecessor_id,
-            state: db.state.parse().unwrap_or(TurnState::Pending),
-            yield_reason: db.yield_reason.and_then(|r| r.parse().ok()),
-            start_reason: db.start_reason.parse().unwrap_or(TurnStartReason::Initial),
-            created_at: db.created_at as i64,
-            started_at: db.started_at.map(|t| t as i64),
-            ended_at: db.ended_at.map(|t| t as i64),
-            updated_at: db.updated_at as i64,
-        }
     }
 }

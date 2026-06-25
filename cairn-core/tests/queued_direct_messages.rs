@@ -203,7 +203,7 @@ async fn latest_direct_to(db: &LocalDb, recipient_run_id: &str) -> Option<String
                 .await?
                 .map(|row| {
                     use cairn_core::internal::storage::RowExt;
-                    Ok::<_, cairn_core::internal::storage::DbError>(row.text(0)?)
+                    row.text(0)
                 })
                 .transpose()
         })

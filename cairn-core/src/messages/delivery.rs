@@ -8,7 +8,6 @@
 //! the queued-direct injection paths (Claude `additionalContext` hook +
 //! tool-result augmentation) — see CAIRN-1196.
 
-use crate::messages::db as msg_db;
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::{ChannelType, Message};
 use crate::orchestrator::Orchestrator;
@@ -178,6 +177,91 @@ async fn node_uri_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     .flatten()
 }
 
+fn direct_wake_for_urgency(urgency: DeliveryUrgency) -> crate::orchestrator::attention_push::Wake {
+    use crate::orchestrator::attention_push::Wake;
+    if urgency == DeliveryUrgency::Interrupt {
+        Wake::Interrupt
+    } else if urgency.wakes_idle() {
+        Wake::Wake
+    } else {
+        Wake::Passive
+    }
+}
+
+async fn node_uri_for_job_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> Result<Option<String>, DbError> {
+    let mut rows = conn
+        .query(
+            "SELECT p.key, i.number, COALESCE(e.seq, 1), j.uri_segment
+             FROM jobs j
+             JOIN issues i ON i.id = j.issue_id
+             JOIN projects p ON p.id = i.project_id
+             LEFT JOIN executions e ON e.id = j.execution_id
+             WHERE j.id = ?1 LIMIT 1",
+            params![job_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let key = row.text(0)?;
+    let number = row.i64(1)? as i32;
+    let seq = row.i64(2)? as i32;
+    let segment = row.opt_text(3)?;
+    Ok(segment.map(|seg| cairn_common::uri::build_node_uri(&key, number, seq, &seg)))
+}
+
+/// Insert a system direct message and its `direct:{message_id}` attention push in
+/// one caller-owned transaction. This is the canonical durable shape for direct
+/// delivery: the message row stores the frozen body, and the push row is what the
+/// idle/event drain sees and stamps.
+pub(crate) async fn insert_system_direct_push_conn(
+    conn: &turso::Connection,
+    recipient_job_id: &str,
+    recipient_run_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+) -> Result<(String, crate::orchestrator::attention_push::Wake), DbError> {
+    use crate::orchestrator::attention_push::Boundary;
+
+    let now = chrono::Utc::now().timestamp();
+    let message_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO messages (
+            id, channel_type, channel_id, sender_run_id, sender_name,
+            recipient_run_id, content, created_at
+         ) VALUES (?1, 'direct', NULL, NULL, 'system', ?2, ?3, ?4)",
+        params![message_id.as_str(), recipient_run_id, content, now],
+    )
+    .await?;
+
+    let wake = direct_wake_for_urgency(urgency);
+    let content_ref = node_uri_for_job_conn(conn, recipient_job_id)
+        .await?
+        .unwrap_or_else(|| recipient_job_id.to_string());
+    let push_id = uuid::Uuid::new_v4().to_string();
+    let key = format!("direct:{message_id}");
+    conn.execute(
+        "INSERT INTO attention_pushes
+           (id, recipient, content_ref, wake, boundary, key, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            push_id.as_str(),
+            recipient_job_id,
+            content_ref.as_str(),
+            wake.as_str(),
+            Boundary::Event.as_str(),
+            key.as_str(),
+            now
+        ],
+    )
+    .await?;
+
+    Ok((message_id, wake))
+}
+
 /// Create a `direct:{message_id}` attention push so a system-originated direct
 /// message rides the push queue (CAIRN-1900) rather than the retired
 /// `delivered_at` pull path — without this the raw `messages` row is never
@@ -192,14 +276,8 @@ pub(crate) fn enqueue_direct_push(
     message_id: &str,
     urgency: DeliveryUrgency,
 ) -> Result<crate::orchestrator::attention_push::Wake, String> {
-    use crate::orchestrator::attention_push::{Boundary, Wake};
-    let requested = if urgency == DeliveryUrgency::Interrupt {
-        Wake::Interrupt
-    } else if urgency.wakes_idle() {
-        Wake::Wake
-    } else {
-        Wake::Passive
-    };
+    use crate::orchestrator::attention_push::Boundary;
+    let requested = direct_wake_for_urgency(urgency);
     let db = orch.db.local.clone();
     let recipient_job_id = recipient_job_id.to_string();
     let message_id = message_id.to_string();
@@ -223,54 +301,65 @@ pub(crate) fn enqueue_direct_push(
 
 /// Persist a system-originated direct message addressed to `recipient_run_id` and
 /// queue it on the attention push queue (CAIRN-1900). Used by orchestrator-internal
-/// callers (base-branch advance notices, PR conflict resolution, etc.). Idle
-/// recipients are nudged to resume; busy recipients drain the push at their next
-/// event boundary.
+/// callers (base-branch advance notices, PR conflict resolution, etc.). The
+/// `urgency` sets the wake level: a waking urgency (`Steer`/`Queue`/`Interrupt`)
+/// nudges an idle recipient to resume, while a `Passive` note never wakes an idle
+/// recipient and rides along into its next natural run. Busy recipients drain the
+/// push at their next event boundary regardless.
 pub fn queue_system_direct(
     orch: &Orchestrator,
     recipient_run_id: &str,
     content: &str,
+    urgency: DeliveryUrgency,
 ) -> Result<(), String> {
-    let msg = msg_db::insert_message(
-        &orch.db.local,
-        &ChannelType::Direct,
-        None,
-        None,
-        "system",
-        Some(recipient_run_id),
-        content,
-    )?;
+    let db = orch.db.local.clone();
+    let run = recipient_run_id.to_string();
+    let job_id = run_db_blocking({
+        let db = db.clone();
+        move || async move {
+            Ok::<_, String>(crate::messages::side_channel::job_id_for_run(&db, &run).await)
+        }
+    })
+    .ok()
+    .flatten();
+    let Some(job_id) = job_id else {
+        log::warn!(
+            "queue_system_direct: no job for run {recipient_run_id}; direct message undeliverable"
+        );
+        return Ok(());
+    };
+
+    let (message_id, effective) = run_db_blocking({
+        let db = orch.db.local.clone();
+        let job_id = job_id.clone();
+        let run_id = recipient_run_id.to_string();
+        let content = content.to_string();
+        move || async move {
+            db.write(|conn| {
+                let job_id = job_id.clone();
+                let run_id = run_id.clone();
+                let content = content.clone();
+                Box::pin(async move {
+                    insert_system_direct_push_conn(conn, &job_id, &run_id, &content, urgency).await
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    })?;
 
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "messages", "action": "insert"}),
     );
 
-    let db = orch.db.local.clone();
-    let run = recipient_run_id.to_string();
-    let job_id = run_db_blocking(move || async move {
-        Ok::<_, String>(crate::messages::side_channel::job_id_for_run(&db, &run).await)
-    })
-    .ok()
-    .flatten();
-    match job_id {
-        Some(job_id) => match enqueue_direct_push(orch, &job_id, &msg.id, DeliveryUrgency::Steer) {
-            Ok(effective) => {
-                if effective.wakes_idle() {
-                    if let Err(e) = nudge_job_for_urgency(orch, &job_id, DeliveryUrgency::Steer) {
-                        log::warn!("queue_system_direct: nudge failed for job {job_id}: {e}");
-                    }
-                }
-            }
-            Err(e) => log::warn!("queue_system_direct: failed to enqueue direct push: {e}"),
-        },
-        None => log::warn!(
-            "queue_system_direct: no job for run {recipient_run_id}; direct message {} undeliverable",
-            msg.id
-        ),
+    if effective.wakes_idle() {
+        if let Err(e) = nudge_job_for_urgency(orch, &job_id, urgency) {
+            log::warn!("queue_system_direct: nudge failed for job {job_id}: {e}");
+        }
     }
 
-    log::debug!("Queued system direct message {} for delivery", msg.id);
+    log::debug!("Queued system direct message {} for delivery", message_id);
     Ok(())
 }
 

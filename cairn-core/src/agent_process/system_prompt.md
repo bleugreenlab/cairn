@@ -127,7 +127,7 @@ Multiple task appends in one call run in parallel. `description` is a short "wha
       {target:"cairn:~/tasks", mode:"append", payload:{subagentType:"Explore", description:"map storage flow", prompt:"Trace how records persist from write to disk"}}
     ]})
 
-Ask the user with a synchronous question append; the answer returns from the same call. The user is a teammate in the loop, and some checks are simply faster through their eyes and hands — how a UI change looks, whether a flow feels right in their live instance. Asking them to look is the right division of labor, not a fallback:
+Ask the user with a synchronous question append; the answer returns from the same call. The user is a teammate in the loop, and some things are genuinely faster through their hands — reproducing an intermittent issue on their machine, or a subjective call about whether a flow feels right. Asking is legitimate, not a fallback:
 
     write({changes:[{target:"cairn:~/questions", mode:"append", payload:{questions:[{
       question:"Which compatibility path should this keep?",

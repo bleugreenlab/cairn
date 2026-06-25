@@ -22,76 +22,6 @@ fn scope_label(agent: &FileAgent) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-    use tempfile::tempdir;
-
-    fn write_agent(root: &Path, id: &str, name: &str) {
-        let agents_dir = root.join("agents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(
-            agents_dir.join(format!("{id}.md")),
-            format!(
-                "---\nname: {name}\ndescription: Description for {id}\ntools:\n  - Read\n---\n\nPrompt for {id}.\n"
-            ),
-        )
-        .unwrap();
-    }
-
-    fn write_project_agent(project_dir: &Path, id: &str, name: &str) {
-        let agents_dir = project_dir.join(".cairn").join("agents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(
-            agents_dir.join(format!("{id}.md")),
-            format!(
-                "---\nname: {name}\ndescription: Project description for {id}\ntools:\n  - Read\n---\n\nProject prompt for {id}.\n"
-            ),
-        )
-        .unwrap();
-    }
-
-    /// Render the collection directly from loaded agents, bypassing run-context
-    /// resolution (which needs a DB). Mirrors `read_agents_collection`'s body.
-    fn render_collection(config_dir: &Path, project_path: Option<&Path>) -> String {
-        let agents = config_agents::list_agents(config_dir, project_path).unwrap();
-        let mut by_id: BTreeMap<String, FileAgent> = BTreeMap::new();
-        for result in agents {
-            if let ConfigResult::Ok(agent) = result {
-                by_id.entry(agent.id.clone()).or_insert(agent);
-            }
-        }
-
-        let mut out = String::new();
-        for agent in by_id.values() {
-            out.push_str(&format!(
-                "- [{}]({}) [{}] — {}\n",
-                agent.id,
-                agent_link(agent, Some("CAIRN")),
-                scope_label(agent),
-                agent.name,
-            ));
-        }
-        out
-    }
-
-    #[test]
-    fn project_agent_shadows_workspace_by_id() {
-        let temp = tempdir().unwrap();
-        let config_dir = temp.path().join("config");
-        let project_dir = temp.path().join("project");
-        write_agent(&config_dir, "shared", "Workspace Version");
-        write_project_agent(&project_dir, "shared", "Project Version");
-
-        let rendered = render_collection(&config_dir, Some(&project_dir));
-        // Project version wins and links project-scoped.
-        assert!(rendered.contains("cairn://p/CAIRN/agents/shared"));
-        assert!(rendered.contains("[project] — Project Version"));
-        assert!(!rendered.contains("Workspace Version"));
-    }
-}
-
 /// Canonical URI for an agent: project-scoped when it lives in a project, else workspace.
 fn agent_link(agent: &FileAgent, project_key: Option<&str>) -> String {
     if agent.is_project_scoped {
@@ -230,5 +160,75 @@ fn not_found(agent_id: &str, explicit_project: Option<&str>) -> String {
             project.to_uppercase()
         ),
         None => format!("Agent not found: {agent_id}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn write_agent(root: &Path, id: &str, name: &str) {
+        let agents_dir = root.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join(format!("{id}.md")),
+            format!(
+                "---\nname: {name}\ndescription: Description for {id}\ntools:\n  - Read\n---\n\nPrompt for {id}.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_project_agent(project_dir: &Path, id: &str, name: &str) {
+        let agents_dir = project_dir.join(".cairn").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join(format!("{id}.md")),
+            format!(
+                "---\nname: {name}\ndescription: Project description for {id}\ntools:\n  - Read\n---\n\nProject prompt for {id}.\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Render the collection directly from loaded agents, bypassing run-context
+    /// resolution (which needs a DB). Mirrors `read_agents_collection`'s body.
+    fn render_collection(config_dir: &Path, project_path: Option<&Path>) -> String {
+        let agents = config_agents::list_agents(config_dir, project_path).unwrap();
+        let mut by_id: BTreeMap<String, FileAgent> = BTreeMap::new();
+        for result in agents {
+            if let ConfigResult::Ok(agent) = result {
+                by_id.entry(agent.id.clone()).or_insert(agent);
+            }
+        }
+
+        let mut out = String::new();
+        for agent in by_id.values() {
+            out.push_str(&format!(
+                "- [{}]({}) [{}] — {}\n",
+                agent.id,
+                agent_link(agent, Some("CAIRN")),
+                scope_label(agent),
+                agent.name,
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn project_agent_shadows_workspace_by_id() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let project_dir = temp.path().join("project");
+        write_agent(&config_dir, "shared", "Workspace Version");
+        write_project_agent(&project_dir, "shared", "Project Version");
+
+        let rendered = render_collection(&config_dir, Some(&project_dir));
+        // Project version wins and links project-scoped.
+        assert!(rendered.contains("cairn://p/CAIRN/agents/shared"));
+        assert!(rendered.contains("[project] — Project Version"));
+        assert!(!rendered.contains("Workspace Version"));
     }
 }

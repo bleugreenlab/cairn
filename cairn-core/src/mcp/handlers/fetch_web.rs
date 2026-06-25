@@ -160,6 +160,9 @@ pub(crate) async fn bmd_fetch_via(
             Some(120_000),
         )
         .await
+        // Web fetch is text-only; an image block from a fetch tool has no place
+        // in markdown output, so collapse to the composed text.
+        .map(|result| result.text)
 }
 
 fn bmd_setup_message() -> String {
@@ -225,7 +228,7 @@ pub(crate) fn convert_body(content_type: &str, body: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::gateway::{McpResourceDef, McpToolDef};
+    use crate::mcp::gateway::{McpResourceDef, McpToolCallResult, McpToolDef};
     use async_trait::async_trait;
     use std::sync::Mutex;
 
@@ -270,10 +273,13 @@ mod tests {
             tool: &str,
             args: serde_json::Value,
             _timeout: Option<u32>,
-        ) -> Result<String, String> {
+        ) -> Result<McpToolCallResult, String> {
             *self.last_tool.lock().unwrap() = Some(tool.to_string());
             *self.last_args.lock().unwrap() = Some(args.clone());
-            Ok("# bmd markdown".to_string())
+            Ok(McpToolCallResult {
+                text: "# bmd markdown".to_string(),
+                images: Vec::new(),
+            })
         }
         async fn close_session(&self, _: &str) {}
     }

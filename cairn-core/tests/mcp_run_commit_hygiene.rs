@@ -62,39 +62,22 @@ fn init_git_repo(repo: &Path) {
     git(repo, &["commit", "-m", "initial"]);
 }
 
-/// The jj binary for the test, or `None` to self-skip when jj is unavailable.
-fn jj_bin() -> Option<String> {
-    let bin = std::env::var("CAIRN_JJ_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "jj".to_string());
-    Command::new(&bin)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-        .then_some(bin)
-}
-
-fn head_sha(repo: &Path) -> String {
+// `jj_bin`, `head_sha`, and `provision_jj_workspace` live in `tests/common`
+// (the shared non-colocated jj fixture); call them as `common::*`. `git_stdout`
+// and `init_bare_origin` are local to this file's bare-origin push test.
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(args)
         .current_dir(repo)
         .output()
-        .unwrap();
+        .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+    assert!(out.status.success(), "git {args:?} failed");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Provision a `.jj` workspace at `ws` over a shared store backed by
-/// `project_repo`, mirroring production worktree provisioning. `config_dir` is
-/// the orchestrator's config dir, so the barrier's `JjEnv` resolves the same
-/// store and config.
-fn provision_jj_workspace(config_dir: &Path, project_repo: &Path, ws: &Path, branch: &str) {
-    let jj = JjEnv::resolve("jj", config_dir);
-    let store = jj::project_store_dir(config_dir, project_repo);
-    jj::ensure_project_store(&jj, &store, project_repo).unwrap();
-    let base = head_sha(project_repo);
-    jj::add_workspace(&jj, &store, ws, branch, &base, None).unwrap();
+fn init_bare_origin(origin: &Path) {
+    std::fs::create_dir_all(origin).unwrap();
+    git(origin, &["init", "--bare", "-b", "main"]);
 }
 
 /// Whether the jj workspace `@` is empty (equals its sealed parent).
@@ -216,7 +199,7 @@ async fn setup_with_sandbox(
     let ws = temp.path().join("ws");
     seed_run(&db, &project_id, &ws, run_id, sandbox, on_escape).await;
     let orch = orchestrator(&temp, db);
-    provision_jj_workspace(
+    common::provision_jj_workspace(
         &temp.path().join("config"),
         &project_repo,
         &ws,
@@ -228,6 +211,103 @@ async fn setup_with_sandbox(
 
 async fn setup(run_id: &str) -> (TempDir, Orchestrator, String) {
     setup_with_sandbox(run_id, LegacySandbox::Worktree, LegacyOnEscape::Allow).await
+}
+
+/// Like [`setup`], but nests the jj workspace UNDER an outer git repo (mimicking
+/// the `~/.cairn` HOME repo) so the bare-`git` upward-resolution bug can manifest
+/// and the injected `GIT_CEILING_DIRECTORIES` can be exercised end-to-end. The
+/// store dir is derived from `config_dir`, independent of the ws path, so the
+/// nesting is free. Returns the outer HOME repo path alongside the usual triple.
+async fn setup_nested_under_git_repo(
+    run_id: &str,
+) -> (TempDir, Orchestrator, String, std::path::PathBuf) {
+    let (temp, db) = common::migrated_db().await;
+    let project_repo = temp.path().join("project");
+    init_git_repo(&project_repo);
+    // The outer repo the bare-git walk would wrongly resolve to (the `~/.cairn`
+    // HOME repo in production). The workspace is provisioned under its
+    // `worktrees/` subdir, exactly the production layout.
+    let home = temp.path().join("home");
+    init_git_repo(&home);
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "RHG").await;
+    let ws = home.join("worktrees").join("ws");
+    // `jj workspace add` creates only the final dir, not intermediates.
+    std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
+    seed_run(
+        &db,
+        &project_id,
+        &ws,
+        run_id,
+        LegacySandbox::Worktree,
+        LegacyOnEscape::Allow,
+    )
+    .await;
+    let orch = orchestrator(&temp, db);
+    common::provision_jj_workspace(
+        &temp.path().join("config"),
+        &project_repo,
+        &ws,
+        "agent/RHG-1-builder-0",
+    );
+    let cwd = ws.display().to_string();
+    (temp, orch, cwd, home)
+}
+
+/// Like [`setup_nested_under_git_repo`], but the project repo also has an
+/// `origin` remote pointing at a bare repo, so a bare `jj git push` from the
+/// workspace has somewhere to land. Returns the bare origin path.
+async fn setup_nested_with_origin(
+    run_id: &str,
+) -> (TempDir, Orchestrator, String, std::path::PathBuf) {
+    let (temp, db) = common::migrated_db().await;
+    let origin = temp.path().join("origin");
+    init_bare_origin(&origin);
+    let project_repo = temp.path().join("project");
+    init_git_repo(&project_repo);
+    git(
+        &project_repo,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    );
+    git(&project_repo, &["push", "origin", "main"]);
+    let home = temp.path().join("home");
+    init_git_repo(&home);
+    let db = Arc::new(db);
+    let project_id = common::create_project(&db, "RHG").await;
+    let ws = home.join("worktrees").join("ws");
+    // `jj workspace add` creates only the final dir, not intermediates.
+    std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
+    seed_run(
+        &db,
+        &project_id,
+        &ws,
+        run_id,
+        LegacySandbox::Worktree,
+        LegacyOnEscape::Allow,
+    )
+    .await;
+    let orch = orchestrator(&temp, db);
+    common::provision_jj_workspace(
+        &temp.path().join("config"),
+        &project_repo,
+        &ws,
+        "agent/RHG-1-builder-0",
+    );
+    let cwd = ws.display().to_string();
+    (temp, orch, cwd, origin)
+}
+
+fn sequential_run_request(cwd: &str, run_id: &str, commands: Vec<&str>) -> McpCallbackRequest {
+    McpCallbackRequest {
+        cwd: cwd.to_string(),
+        run_id: Some(run_id.to_string()),
+        tool: "run".to_string(),
+        payload: json!({
+            "sequential": true,
+            "commands": commands.iter().map(|c| json!({ "command": c })).collect::<Vec<_>>(),
+        }),
+        tool_use_id: Some("toolu-run".to_string()),
+    }
 }
 
 /// Seed a run whose fence is `deny`, so the commit-hygiene gate is active.
@@ -262,7 +342,7 @@ async fn run_without_commit_msg_reverts_new_dirt() {
     if common::skip_if_fenced("run_without_commit_msg_reverts_new_dirt") {
         return;
     }
-    let Some(_bin) = jj_bin() else {
+    let Some(_bin) = common::jj_bin() else {
         eprintln!("skipping run_without_commit_msg_reverts_new_dirt: jj not resolvable");
         return;
     };
@@ -280,7 +360,7 @@ async fn run_without_commit_msg_reverts_new_dirt() {
 
 #[tokio::test]
 async fn full_sandbox_run_without_commit_msg_is_not_gated_or_reverted() {
-    let Some(_bin) = jj_bin() else {
+    let Some(_bin) = common::jj_bin() else {
         eprintln!("skipping full_sandbox_run_without_commit_msg_is_not_gated_or_reverted: jj not resolvable");
         return;
     };
@@ -313,7 +393,7 @@ async fn full_sandbox_run_without_commit_msg_is_not_gated_or_reverted() {
 
 #[tokio::test]
 async fn run_with_commit_msg_seals_and_cleans() {
-    let Some(_bin) = jj_bin() else {
+    let Some(_bin) = common::jj_bin() else {
         eprintln!("skipping run_with_commit_msg_seals_and_cleans: jj not resolvable");
         return;
     };
@@ -366,6 +446,129 @@ async fn run_with_commit_msg_in_non_worktree_cwd_is_rejected_before_spawning() {
     assert!(
         !dir.path().join("generated.txt").exists(),
         "the command must not run: no file may be left in the user's live checkout"
+    );
+}
+
+/// End-to-end (test B): a bare `git` run through the run tool inside a
+/// non-colocated jj worktree nested under an outer repo must NOT resolve up to
+/// that outer (`~/.cairn`-style) repo. The injected `GIT_CEILING_DIRECTORIES`
+/// stops the upward walk, so git fails loudly instead of silently answering
+/// about the wrong repository. Read-only command (no `commit_msg`, no dirt).
+#[tokio::test]
+async fn bare_git_in_jj_worktree_does_not_resolve_up_to_outer_repo() {
+    if common::skip_if_fenced("bare_git_in_jj_worktree_does_not_resolve_up_to_outer_repo") {
+        return;
+    }
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!(
+            "skipping bare_git_in_jj_worktree_does_not_resolve_up_to_outer_repo: jj not resolvable"
+        );
+        return;
+    };
+    let (_temp, orch, cwd, home) = setup_nested_under_git_repo("run-bare-git").await;
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            "run-bare-git",
+            "git rev-parse --show-toplevel 2>&1",
+            None,
+        ),
+    )
+    .await;
+
+    let home_top = std::fs::canonicalize(&home).unwrap().display().to_string();
+    assert!(
+        !result.contains(&home_top),
+        "bare git must NOT resolve to the outer HOME repo {home_top}: {result}"
+    );
+    assert!(
+        result.contains("not a git repository"),
+        "bare git must fail loudly (not a git repository): {result}"
+    );
+}
+
+/// End-to-end (test B, identity half): a bare `jj` commit through the run tool
+/// must carry the managed identity. `JJ_CONFIG` reaching the bare jj process is
+/// what gives its commit the `agent@cairn.local` committer instead of an
+/// empty/unpushable one.
+#[tokio::test]
+async fn bare_jj_commit_uses_managed_identity() {
+    if common::skip_if_fenced("bare_jj_commit_uses_managed_identity") {
+        return;
+    }
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!("skipping bare_jj_commit_uses_managed_identity: jj not resolvable");
+        return;
+    };
+    let (_temp, orch, cwd, _home) = setup_nested_under_git_repo("run-bare-jj").await;
+    // Seal a commit with a bare jj, then read its committer email back. The
+    // sequence leaves `@` empty (a `jj commit`), so the no-commit_msg barrier
+    // sees a clean working copy and never reverts.
+    let result = handle_run(
+        &orch,
+        &sequential_run_request(
+            &cwd,
+            "run-bare-jj",
+            vec![
+                "echo probe > probe.txt",
+                "jj commit -m probe",
+                "jj log -r @- --no-graph -T 'committer.email()'",
+            ],
+        ),
+    )
+    .await;
+
+    assert!(
+        result.contains("agent@cairn.local"),
+        "a bare jj commit must use the managed identity (JJ_CONFIG reached the process): {result}"
+    );
+}
+
+/// Non-regression (test C): the injected env hits EVERY run-tool shell command,
+/// including jj's own git-backend ops. A bare `jj git push` from inside the
+/// worktree must still land the bookmark on the bare origin — identical to the
+/// non-injected outcome — proving `GIT_CEILING_DIRECTORIES` is inert for jj's
+/// store ops (it addresses the store by absolute path, not cwd discovery).
+#[tokio::test]
+async fn bare_jj_git_push_survives_injected_ceiling_env() {
+    if common::skip_if_fenced("bare_jj_git_push_survives_injected_ceiling_env") {
+        return;
+    }
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!("skipping bare_jj_git_push_survives_injected_ceiling_env: jj not resolvable");
+        return;
+    };
+    let (_temp, orch, cwd, origin) = setup_nested_with_origin("run-bare-push").await;
+    let branch = "agent/RHG-1-builder-0";
+    let push_cmd = format!("jj git push --remote origin --bookmark {branch} 2>&1");
+    let set_cmd = format!("jj bookmark set {branch} -r @-");
+    let result = handle_run(
+        &orch,
+        &sequential_run_request(
+            &cwd,
+            "run-bare-push",
+            vec![
+                "echo pushed > pushed.txt",
+                "jj commit -m work",
+                &set_cmd,
+                &push_cmd,
+            ],
+        ),
+    )
+    .await;
+
+    // The load-bearing assertion: the bookmark reached the bare origin, so the
+    // ceiling did not break jj's git backend. (If it had, the push would fail
+    // and the ref would be absent.)
+    let refs = git_stdout(
+        &origin,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
+    );
+    assert!(
+        refs.contains(branch),
+        "bare `jj git push` must land {branch} on origin under the injected env\n\
+         push output:\n{result}\norigin refs:\n{refs}"
     );
 }
 

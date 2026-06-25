@@ -287,22 +287,63 @@ pub async fn pending_permission_uri(
     number: i32,
     issue_id: &str,
 ) -> Option<String> {
-    pending_node_detail_uri(
-        db,
-        project_key,
-        number,
-        issue_id,
-        "SELECT e.seq, j.uri_segment, pr.uri_segment
+    // Parent-aware: a sub-agent task's pending permission nests under the parent
+    // node (`.../{parent}/task/{task}/permissions/{seg}`) so the URI resolves; a
+    // top-level node uses the flat node permission URI (issue #143).
+    let issue_id = issue_id.to_string();
+    let project_key = project_key.to_string();
+    let resolved: Option<(i64, String, Option<String>, String)> = db
+        .read(|conn| {
+            let issue_id = issue_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT e.seq, j.uri_segment, parent.uri_segment, pr.uri_segment
                          FROM permission_requests pr
                          JOIN runs r ON pr.run_id = r.id
                          JOIN jobs j ON COALESCE(pr.job_id, r.job_id) = j.id
                          JOIN executions e ON j.execution_id = e.id
+                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                          WHERE j.issue_id = ?1 AND pr.status = 'pending'
                            AND pr.uri_segment IS NOT NULL
                          ORDER BY pr.created_at DESC LIMIT 1",
-        cairn_common::uri::build_node_permission_uri,
+                        (issue_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok::<_, DbError>(Some((
+                        row.i64(0)?,
+                        row.text(1)?,
+                        row.opt_text(2)?,
+                        row.text(3)?,
+                    ))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .ok()
+        .flatten();
+
+    resolved.map(
+        |(seq, node, parent_segment, segment)| match parent_segment {
+            Some(parent) => cairn_common::uri::build_task_permission_uri(
+                &project_key,
+                number,
+                seq as i32,
+                &parent,
+                &node,
+                &segment,
+            ),
+            None => cairn_common::uri::build_node_permission_uri(
+                &project_key,
+                number,
+                seq as i32,
+                &node,
+                &segment,
+            ),
+        },
     )
-    .await
 }
 
 /// Best-effort: resolve the blocked node's detail URI for an issue.
@@ -322,17 +363,19 @@ pub async fn blocked_node_artifact_uri(
 ) -> Option<String> {
     let issue_id = issue_id.to_string();
     let project_key = project_key.to_string();
-    // (seq, segment, output_name, is_action)
-    let resolved: Option<(i64, String, Option<String>, bool)> = db
+    // (seq, segment, parent_segment, output_name, is_action)
+    #[allow(clippy::type_complexity)]
+    let resolved: Option<(i64, String, Option<String>, Option<String>, bool)> = db
         .read(|conn| {
             let issue_id = issue_id.clone();
             Box::pin(async move {
                 // Most-recent blocked agent job, with its latest artifact name.
                 let mut job_rows = conn
                     .query(
-                        "SELECT e.seq, j.uri_segment, a.output_name, j.created_at
+                        "SELECT e.seq, j.uri_segment, parent.uri_segment, a.output_name, j.created_at
                          FROM jobs j
                          JOIN executions e ON j.execution_id = e.id
+                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                          LEFT JOIN artifacts a ON a.job_id = j.id
                          WHERE j.issue_id = ?1 AND j.status = 'blocked'
                          ORDER BY j.created_at DESC, a.version DESC LIMIT 1",
@@ -340,7 +383,13 @@ pub async fn blocked_node_artifact_uri(
                     )
                     .await?;
                 let job = match job_rows.next().await? {
-                    Some(row) => Some((row.i64(0)?, row.text(1)?, row.opt_text(2)?, row.i64(3)?)),
+                    Some(row) => Some((
+                        row.i64(0)?,
+                        row.text(1)?,
+                        row.opt_text(2)?,
+                        row.opt_text(3)?,
+                        row.i64(4)?,
+                    )),
                     None => None,
                 };
                 drop(job_rows);
@@ -365,15 +414,20 @@ pub async fn blocked_node_artifact_uri(
 
                 // Pick the most-recently-created blocked owner across both.
                 let result = match (job, action) {
-                    (Some((jseq, jseg, joutput, jcreated)), Some((aseq, aseg, acreated))) => {
+                    (
+                        Some((jseq, jseg, jparent, joutput, jcreated)),
+                        Some((aseq, aseg, acreated)),
+                    ) => {
                         if acreated >= jcreated {
-                            Some((aseq, aseg, None, true))
+                            Some((aseq, aseg, None, None, true))
                         } else {
-                            Some((jseq, jseg, joutput, false))
+                            Some((jseq, jseg, jparent, joutput, false))
                         }
                     }
-                    (Some((jseq, jseg, joutput, _)), None) => Some((jseq, jseg, joutput, false)),
-                    (None, Some((aseq, aseg, _))) => Some((aseq, aseg, None, true)),
+                    (Some((jseq, jseg, jparent, joutput, _)), None) => {
+                        Some((jseq, jseg, jparent, joutput, false))
+                    }
+                    (None, Some((aseq, aseg, _))) => Some((aseq, aseg, None, None, true)),
                     (None, None) => None,
                 };
                 Ok::<_, DbError>(result)
@@ -382,18 +436,30 @@ pub async fn blocked_node_artifact_uri(
         .await
         .ok()
         .flatten();
-    resolved.map(|(seq, segment, output_name, is_action)| {
+    resolved.map(|(seq, segment, parent_segment, output_name, is_action)| {
         if is_action {
             // Bare node URI — the pr action node has no artifact name.
             cairn_common::uri::build_node_uri(&project_key, number, seq as i32, &segment)
         } else {
-            cairn_common::uri::build_node_artifact_uri_named(
-                &project_key,
-                number,
-                seq as i32,
-                &segment,
-                output_name.as_deref(),
-            )
+            // A blocked sub-agent task nests under its parent node so the URI
+            // resolves (issue #143); a top-level node uses the flat node URI.
+            match parent_segment {
+                Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                    &project_key,
+                    number,
+                    seq as i32,
+                    &parent,
+                    &segment,
+                    output_name.as_deref(),
+                ),
+                None => cairn_common::uri::build_node_artifact_uri_named(
+                    &project_key,
+                    number,
+                    seq as i32,
+                    &segment,
+                    output_name.as_deref(),
+                ),
+            }
         }
     })
 }
@@ -430,7 +496,8 @@ pub async fn open_pr_work_for_issue(
     // Empty sentinel never matches a real job id, so a `None` hint simply leaves
     // ordering to `updated_at` (the CASE evaluates to 1 for every row).
     let job_hint = job_hint.unwrap_or("").to_string();
-    let resolved: Option<(i64, String, Option<String>, i64)> = db
+    #[allow(clippy::type_complexity)]
+    let resolved: Option<(i64, String, Option<String>, Option<String>, i64)> = db
         .read(|conn| {
             let issue_id = issue_id.clone();
             let job_hint = job_hint.clone();
@@ -441,10 +508,11 @@ pub async fn open_pr_work_for_issue(
                 // Mirrors `blocked_node_artifact_uri`'s untyped join.
                 let mut rows = conn
                     .query(
-                        "SELECT e.seq, j.uri_segment, a.output_name, mr.updated_at
+                        "SELECT e.seq, j.uri_segment, parent.uri_segment, a.output_name, mr.updated_at
                          FROM merge_requests mr
                          JOIN jobs j ON mr.job_id = j.id
                          JOIN executions e ON j.execution_id = e.id
+                         LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                          LEFT JOIN artifacts a ON a.job_id = j.id
                          WHERE mr.issue_id = ?1 AND mr.status = 'open'
                          ORDER BY CASE WHEN mr.job_id = ?2 THEN 0 ELSE 1 END,
@@ -458,7 +526,8 @@ pub async fn open_pr_work_for_issue(
                         row.i64(0)?,
                         row.text(1)?,
                         row.opt_text(2)?,
-                        row.i64(3)?,
+                        row.opt_text(3)?,
+                        row.i64(4)?,
                     ))),
                     None => Ok(None),
                 }
@@ -467,16 +536,28 @@ pub async fn open_pr_work_for_issue(
         .await
         .ok()
         .flatten();
-    resolved.map(|(seq, node, output_name, updated_at)| OpenPrWork {
-        detail_uri: cairn_common::uri::build_node_artifact_uri_named(
-            project_key,
-            number,
-            seq as i32,
-            &node,
-            output_name.as_deref(),
-        ),
-        updated_at,
-    })
+    resolved.map(
+        |(seq, node, parent_segment, output_name, updated_at)| OpenPrWork {
+            detail_uri: match parent_segment {
+                Some(parent) => cairn_common::uri::build_task_artifact_uri_named(
+                    project_key,
+                    number,
+                    seq as i32,
+                    &parent,
+                    &node,
+                    output_name.as_deref(),
+                ),
+                None => cairn_common::uri::build_node_artifact_uri_named(
+                    project_key,
+                    number,
+                    seq as i32,
+                    &node,
+                    output_name.as_deref(),
+                ),
+            },
+            updated_at,
+        },
+    )
 }
 
 /// A typed idle fact plus the cursor (`updated_at`) to stamp on the event the

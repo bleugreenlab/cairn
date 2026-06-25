@@ -144,3 +144,17 @@ pub struct ReadBatchEnvelope {
     /// Lossless per-segment metadata; never surfaced as its own content block.
     pub segments: Vec<SegmentMeta>,
 }
+
+/// The `run` callback result over the cairn-cli↔cairn-core boundary.
+///
+/// Mirrors [`ReadBatchEnvelope`]: the composed batch text plus any image content
+/// blocks an external MCP `tools/call` returned (e.g. `cairn://mcp/axon/look`
+/// with `screenshot:true`). The transport edge lifts each image into its own
+/// content block after the text, so an image-bearing tool result reaches the
+/// agent instead of being flattened to a text placeholder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunBatchEnvelope {
+    /// Fully composed batch text (the `=== <header> ===` item bodies).
+    pub text: String,
+    pub images: Vec<ImageBlock>,
+}
