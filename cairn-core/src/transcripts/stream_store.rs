@@ -218,6 +218,8 @@ pub struct StreamingToolWrite {
     pub name: String,
     pub input_chars: i32,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_preview: Option<String>,
 }
 
 #[derive(Debug, Clone)]

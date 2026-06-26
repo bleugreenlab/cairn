@@ -44,7 +44,10 @@ pub struct ProviderModelUsageRow {
     pub runs: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Derives `Default` so adding an optional field never forces edits at every
+/// struct-literal construction site; new optional fields fill in via
+/// `..Default::default()` only where they matter.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderUsageSnapshot {
     pub backend: String,

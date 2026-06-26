@@ -178,6 +178,86 @@ async fn resolve_ctx_self_schemas(
         .unwrap_or_default()
 }
 
+/// The resolved artifact contract for an addressed name: which schema a write
+/// validates against, plus the terminal-interrupt and confirm inputs. Resolving
+/// this once keeps the read-side affordance (which schema the agent is told to
+/// write) and the write-side validation (which schema is enforced) from drifting.
+pub(crate) struct ResolvedArtifactContract {
+    /// Confirm policy governing whether the written artifact auto-confirms.
+    pub confirm_policy: ConfirmPolicy,
+    /// Schema the addressed write validates against (`None` = no schema).
+    pub validation_schema: Option<crate::models::OutputSchema>,
+    /// Whether the addressed name is a `context-self` living doc.
+    pub is_ctx_self: bool,
+    /// Canonical name of the terminal (context-out) artifact, if any.
+    pub terminal_name: Option<String>,
+    /// Whether the terminal contract carries a schema.
+    pub terminal_has_schema: bool,
+}
+
+/// Resolve the terminal (context-out) contract and the ctx-self living-doc
+/// targets for a job, then route by the addressed artifact name.
+///
+/// The terminal contract is the schema of the node's single `context-out` edge
+/// target (an ArtifactNode or a `pr`/action input port). It drives the confirm
+/// policy, the arming decision, and the job-completion gate. A `pr` consumer
+/// auto-confirms — the PR lifecycle is the gate (CAIRN-1219). Task jobs have no
+/// recipe node: they validate against the `return` contract every child task is
+/// started with.
+///
+/// A `context-self` living doc validates against its OWN schema, always
+/// auto-confirms, and NEVER arms the terminal interrupt or satisfies the output
+/// contract (repeated create+patch across the run is normal). Anything else
+/// takes the terminal contract.
+pub(crate) async fn resolve_artifact_contract(
+    orch: &Orchestrator,
+    job_id: &str,
+    task_name: Option<&str>,
+    artifact_name: Option<&str>,
+) -> ResolvedArtifactContract {
+    let (node_id, execution_id) = job_node_execution(orch, job_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    let mut terminal_policy = ConfirmPolicy::Auto;
+    let mut terminal_schema: Option<crate::models::OutputSchema> = None;
+    let mut terminal_name: Option<String> = None;
+    let mut self_targets: Vec<crate::models::OutputSchemaInfo> = Vec::new();
+    if let (Some(node_id), Some(execution_id)) = (node_id.as_deref(), execution_id.as_deref()) {
+        if let Some(info) = resolve_artifact_schema(orch, node_id, execution_id).await {
+            terminal_policy = info.confirm_policy;
+            terminal_name = info.artifact_name;
+            terminal_schema = Some(info.schema);
+        }
+        self_targets = resolve_ctx_self_schemas(orch, node_id, execution_id).await;
+    } else if task_name.is_some() {
+        terminal_name = Some("result".to_string());
+        terminal_schema = Some(crate::models::OutputSchema::Preset("return".to_string()));
+    }
+
+    let ctx_self_target = artifact_name.and_then(|name| {
+        self_targets
+            .iter()
+            .find(|t| t.artifact_name.as_deref() == Some(name))
+    });
+    let is_ctx_self = ctx_self_target.is_some();
+    let terminal_has_schema = terminal_schema.is_some();
+    let (confirm_policy, validation_schema) = match ctx_self_target {
+        Some(target) => (ConfirmPolicy::Auto, Some(target.schema.clone())),
+        None => (terminal_policy, terminal_schema),
+    };
+
+    ResolvedArtifactContract {
+        confirm_policy,
+        validation_schema,
+        is_ctx_self,
+        terminal_name,
+        terminal_has_schema,
+    }
+}
+
 /// Store (or patch) a node/task artifact submitted through the `write` verb.
 ///
 /// ## Lifecycle design
@@ -219,57 +299,18 @@ pub(crate) async fn write_artifact_change(
     // 2. Resolve the terminal (context-out) contract and the ctx-self living-doc
     //    targets from the execution snapshot, then route the write by the
     //    addressed name.
-    let (node_id, execution_id) = match job_node_execution(orch, &job_id).await.ok().flatten() {
-        Some((node_id, execution_id)) => (node_id, execution_id),
-        None => (None, None),
-    };
-
-    // The terminal contract is the schema of the node's single `context-out` edge
-    // target (an ArtifactNode or a `pr`/action input port). It drives the confirm
-    // policy, the arming decision, and the job-completion gate. A `pr` consumer
-    // auto-confirms — the PR lifecycle is the gate (CAIRN-1219). Task jobs have no
-    // recipe node: they validate against the `return` contract every child task
-    // is started with.
-    let mut terminal_policy = ConfirmPolicy::Auto;
-    let mut terminal_schema: Option<crate::models::OutputSchema> = None;
-    let mut terminal_name: Option<String> = None;
-    let mut self_targets: Vec<crate::models::OutputSchemaInfo> = Vec::new();
-    if let (Some(node_id), Some(execution_id)) = (node_id.as_deref(), execution_id.as_deref()) {
-        if let Some(info) = resolve_artifact_schema(orch, node_id, execution_id).await {
-            terminal_policy = info.confirm_policy;
-            terminal_name = info.artifact_name;
-            terminal_schema = Some(info.schema);
-        }
-        self_targets = resolve_ctx_self_schemas(orch, node_id, execution_id).await;
-    } else if task_name.is_some() {
-        terminal_name = Some("result".to_string());
-        terminal_schema = Some(crate::models::OutputSchema::Preset("return".to_string()));
-    }
-
-    // Route by the addressed name. A `context-self` living doc validates against
-    // its OWN schema, always auto-confirms, and NEVER arms the terminal interrupt
-    // or satisfies the output contract (repeated create+patch across the run is
-    // normal). Anything else takes the terminal contract.
-    let ctx_self_target = artifact_name.and_then(|name| {
-        self_targets
-            .iter()
-            .find(|t| t.artifact_name.as_deref() == Some(name))
-    });
-    let is_ctx_self = ctx_self_target.is_some();
-    let (policy, validation_schema): (ConfirmPolicy, Option<crate::models::OutputSchema>) =
-        match ctx_self_target {
-            Some(target) => (ConfirmPolicy::Auto, Some(target.schema.clone())),
-            None => (terminal_policy, terminal_schema.clone()),
-        };
+    let contract = resolve_artifact_contract(orch, &job_id, task_name, artifact_name).await;
+    let policy = contract.confirm_policy;
+    let validation_schema = contract.validation_schema;
 
     // Only a fresh create of the terminal (context-out) artifact arms the boundary
     // interrupt; a ctx-self write never does.
-    let should_arm_terminal_interrupt = !is_ctx_self
+    let should_arm_terminal_interrupt = !contract.is_ctx_self
         && should_arm_output_artifact_interrupt(
             is_patch,
             artifact_name,
-            terminal_name.as_deref(),
-            terminal_schema.is_some(),
+            contract.terminal_name.as_deref(),
+            contract.terminal_has_schema,
         );
 
     // A `patch` resolves against the latest artifact's data; a `create`

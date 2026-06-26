@@ -1401,6 +1401,46 @@ pub(super) fn render_artifact_markdown(data: &str) -> String {
     }
 }
 
+/// Build the schema-aware affordance block for a node/task artifact, deriving
+/// the `create` example from the schema the addressed name actually validates
+/// against (shared with the write path via `resolve_artifact_contract`). Returns
+/// `None` when no schema resolves, leaving the caller to fall back to the static
+/// contract block. This is what makes a copied artifact example a valid write
+/// even for a custom schema (CAIRN #170).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn artifact_affordance_block(
+    orch: &crate::orchestrator::Orchestrator,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: Option<&str>,
+    artifact_name: Option<&str>,
+    kind: cairn_common::contract::ResourceKind,
+) -> Option<String> {
+    let job_id = resolve_todos_job_id(
+        &orch.db.local,
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+        task_name,
+    )
+    .await
+    .ok()?;
+    let contract = crate::mcp::handlers::implementation::resolve_artifact_contract(
+        orch,
+        &job_id,
+        task_name,
+        artifact_name,
+    )
+    .await;
+    let schema = contract.validation_schema?;
+    let schema_value =
+        crate::output_schemas::resolve_output_schema(orch.schema_dir.as_deref(), &schema).ok()?;
+    super::common::artifact_affordance_with_schema(kind, artifact_name, &schema_value)
+}
+
 pub(super) async fn read_node_artifact(
     orch: &crate::orchestrator::Orchestrator,
     project_key: &str,

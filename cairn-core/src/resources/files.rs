@@ -5,8 +5,10 @@ use super::common::{
     resolve_issue_id,
 };
 
+use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
+use std::path::Path;
 
 // ============================================================================
 // File Changes Readers
@@ -243,6 +245,81 @@ async fn load_job_file_changes(conn: &turso::Connection, job_id: &str) -> Vec<Fi
     results
 }
 
+/// The node job's VCS anchors `(worktree_path, base_branch, base_commit)`, the
+/// inputs [`crate::jj::node_changed_files`] needs to diff the workspace against
+/// its recorded base. All optional: a job may predate a column, carry an empty
+/// worktree, or have no recorded base — each case falls the projection back to
+/// the recorded `file_changes` cache.
+async fn load_job_vcs_anchors(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let Ok(mut rows) = conn
+        .query(
+            "SELECT worktree_path, base_branch, base_commit FROM jobs WHERE id = ?1 LIMIT 1",
+            (job_id,),
+        )
+        .await
+    else {
+        return (None, None, None);
+    };
+    match rows.next().await {
+        Ok(Some(row)) => (
+            row.opt_text(0).ok().flatten().filter(|s| !s.is_empty()),
+            row.opt_text(1).ok().flatten().filter(|s| !s.is_empty()),
+            row.opt_text(2).ok().flatten().filter(|s| !s.is_empty()),
+        ),
+        _ => (None, None, None),
+    }
+}
+
+/// The node's changed-file rows for the `/changed` projection, derived from the
+/// live sealed jj graph when the workspace is present, falling back to the
+/// recorded `file_changes` cache otherwise.
+///
+/// The graph is authoritative — it reflects exactly what the workspace sealed
+/// (plus loose `@` edits) — so a just-sealed commit's file is never omitted the
+/// way the best-effort async cache insert could lag or drop it (CAIRN-2101). The
+/// cache stays the fallback for a torn-down workspace (the DB is then the only
+/// record) and for a non-jj checkout. A jj workspace that resolves its base but
+/// has changed nothing returns an empty set from the graph and is NOT a fallback
+/// case: the graph correctly says "nothing changed," overriding any phantom
+/// cache rows from an abandoned seal.
+///
+/// The issue-level [`read_issue_changed`] deliberately keeps using the cache: it
+/// aggregates across executions including torn-down ones where the workspaces no
+/// longer exist, and the live-review lag this fixes bites at the node level.
+async fn load_node_changed_rows(
+    orch: &Orchestrator,
+    conn: &turso::Connection,
+    job_id: &str,
+) -> Vec<FileChangeRow> {
+    let (worktree_path, base_branch, base_commit) = load_job_vcs_anchors(conn, job_id).await;
+    if let Some(worktree_path) = worktree_path {
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        if let Some(changes) = crate::jj::node_changed_files(
+            &jj,
+            Path::new(&worktree_path),
+            base_branch.as_deref(),
+            base_commit.as_deref(),
+        ) {
+            return changes
+                .into_iter()
+                .map(|change| {
+                    (
+                        change.path,
+                        change.status,
+                        Some(change.additions),
+                        Some(change.deletions),
+                        change.previous_path,
+                    )
+                })
+                .collect();
+        }
+    }
+    load_job_file_changes(conn, job_id).await
+}
+
 fn merge_optional_counts(existing: Option<i32>, next: Option<i32>) -> Option<i32> {
     match (existing, next) {
         (Some(existing), Some(next)) => Some(existing + next),
@@ -412,19 +489,21 @@ pub(super) async fn read_issue_changed_projection(
 }
 
 pub(super) async fn read_node_changed(
-    db: &LocalDb,
+    orch: &Orchestrator,
     project_key: &str,
     number: i32,
     exec_seq: i32,
     node_name: &str,
 ) -> String {
     let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
+        match connect_and_find_node_job(&orch.db.local, project_key, number, exec_seq, node_name)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
 
-    let results = load_job_file_changes(&conn, &job.id).await;
+    let results = load_node_changed_rows(orch, &conn, &job.id).await;
 
     if results.is_empty() {
         return format!(
@@ -443,7 +522,7 @@ pub(super) async fn read_node_changed(
 }
 
 pub(super) async fn read_node_changed_projection(
-    db: &LocalDb,
+    orch: &Orchestrator,
     project_key: &str,
     number: i32,
     exec_seq: i32,
@@ -451,11 +530,13 @@ pub(super) async fn read_node_changed_projection(
     params: &[QueryParam],
 ) -> String {
     let (conn, job) =
-        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
+        match connect_and_find_node_job(&orch.db.local, project_key, number, exec_seq, node_name)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
-    let entries = file_projection_entries(load_job_file_changes(&conn, &job.id).await);
+    let entries = file_projection_entries(load_node_changed_rows(orch, &conn, &job.id).await);
 
     parse_file_projection_lines(params, entries, "node files").unwrap_or_else(|error| error)
 }

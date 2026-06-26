@@ -389,6 +389,46 @@ async fn reconcile_base_advance(
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
 
+    // Heal any PRE-EXISTING divergent twin on a sibling bookmark BEFORE the
+    // sibling rebase. New divergence is already prevented upstream (the per-store
+    // mutex + the idempotent `reconcile_siblings` skip); this collapses a twin
+    // that forked before that serialization landed, or via an external `jj` op.
+    // It is the locus of the #162 thrash: an orphaned conflicted twin keeps
+    // tripping `sealed_commit_is_lost` on every re-seal. A deterministic tangle
+    // (one clean twin) self-heals silently; an ambiguous one holds the store
+    // untouched and interrupts the sibling for manual resolution (never a
+    // force-push). Runs under the per-store lock every caller holds, so the
+    // collapse cannot itself race/fork.
+    let mut ambiguous: Vec<AmbiguousDivergence> = Vec::new();
+    for (branch, _) in &specs {
+        match crate::jj::collapse_divergent_bookmark(&jj, &store, branch) {
+            Ok(crate::jj::CollapseOutcome::NotDivergent) => {}
+            Ok(crate::jj::CollapseOutcome::Collapsed { kept, abandoned }) => {
+                log::info!(
+                    "jj collapse ({label}): sibling {branch} converged to {kept}; abandoned {}",
+                    abandoned.join(", ")
+                );
+            }
+            Ok(crate::jj::CollapseOutcome::Ambiguous { change_id, twins }) => {
+                log::warn!(
+                    "jj collapse ({label}): sibling {branch} divergent change {change_id} is ambiguous (twins {}); holding the store untouched for manual resolution",
+                    twins.join(", ")
+                );
+                ambiguous.push(AmbiguousDivergence {
+                    branch: branch.clone(),
+                    change_id,
+                    twins,
+                });
+            }
+            Err(error) => {
+                log::warn!("jj collapse ({label}): sibling {branch} failed: {error}");
+            }
+        }
+    }
+    if !ambiguous.is_empty() {
+        notify_ambiguous_divergence(orch, &siblings, &ambiguous)?;
+    }
+
     // Snapshot each sibling's commit id BEFORE the rebase, so we notify only
     // those this reconcile actually moved (the double-fire guard).
     let before: HashMap<String, String> = specs
@@ -552,9 +592,9 @@ fn build_jj_clean_note(
 /// non-blocking note rather than leaving it idle on a conflicted `@`.
 ///
 /// `branch == default_branch` needs no handling here: the workspace on the
-/// default branch is the user's main checkout, refreshed by `reconcile_after_merge`'s
-/// pull, and no agent job carries `branch = <default>` (jobs always branch as
-/// `agent/...`), so the on-branch query returns nothing for it.
+/// default branch is the user's main checkout, refreshed by the default-branch
+/// merge reconcile, and no agent job carries `branch = <default>` (jobs always
+/// branch as `agent/...`), so the on-branch query returns nothing for it.
 async fn advance_on_branch_workspaces(
     orch: &Orchestrator,
     project_id: &str,
@@ -575,6 +615,47 @@ async fn advance_on_branch_workspaces(
 
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+
+    // Collapse a pre-existing divergent twin on the integration bookmark ITSELF
+    // before re-parenting the on-branch coordinator onto it. A divergent dest is
+    // exactly what makes the coordinator's own re-seal trip `sealed_commit_is_lost`,
+    // and `reconcile_siblings` only ever heals the *children*, never the bookmark
+    // the coordinator sits on. A deterministic tangle self-heals; an ambiguous one
+    // interrupts every on-branch workspace and skips the advance — we must not
+    // advance onto an unresolved divergence. Runs under the per-store lock the
+    // caller (`reconcile_jj_downstream`) holds across this call.
+    match crate::jj::collapse_divergent_bookmark(&jj, &store, branch) {
+        Ok(crate::jj::CollapseOutcome::NotDivergent) => {}
+        Ok(crate::jj::CollapseOutcome::Collapsed { kept, abandoned }) => {
+            log::info!(
+                "jj collapse (on-branch {branch}): converged to {kept}; abandoned {}",
+                abandoned.join(", ")
+            );
+        }
+        Ok(crate::jj::CollapseOutcome::Ambiguous { change_id, twins }) => {
+            log::warn!(
+                "jj collapse (on-branch {branch}): divergent change {change_id} is ambiguous (twins {}); interrupting the on-branch workspace and skipping the advance",
+                twins.join(", ")
+            );
+            for workspace in &on_branch {
+                let Some(run_id) = latest_run_for_job(&orch.db.local, &workspace.id) else {
+                    continue;
+                };
+                let message = build_ambiguous_divergence_note(branch, &change_id, &twins);
+                if let Err(error) =
+                    queue_system_direct(orch, &run_id, &message, DeliveryUrgency::Interrupt)
+                {
+                    log::warn!(
+                        "on-branch advance: failed to interrupt {} for ambiguous divergence: {error}",
+                        workspace.id
+                    );
+                }
+            }
+            return;
+        }
+        Err(error) => log::warn!("jj collapse (on-branch {branch}): failed: {error}"),
+    }
+
     let Some(dest) = crate::jj::bookmark_commit(&jj, &store, branch) else {
         log::debug!("on-branch advance: bookmark {branch} did not resolve in store; skipping");
         return;
@@ -751,6 +832,67 @@ fn notify_conflicted_siblings(
         log::info!(
             "Interrupted jj sibling job {} to resolve a recorded conflict",
             sibling.id
+        );
+    }
+    Ok(())
+}
+
+/// One bookmark whose divergent change the collapse step refused to resolve
+/// automatically, carried from the collapse loop to the interrupt layer.
+struct AmbiguousDivergence {
+    branch: String,
+    change_id: String,
+    twins: Vec<String>,
+}
+
+/// The stop-the-line note for a bookmark carrying an AMBIGUOUS divergent change
+/// Cairn declined to collapse (every twin conflicts, or more than one carries
+/// edits — picking one automatically could lose work). Names the bookmark, the
+/// change-id, and the twin commit ids, and instructs MANUAL resolution +
+/// escalation, never a force-push: Cairn owns the deterministic collapse, and a
+/// genuinely ambiguous tangle is a human's call, not something the agent papers
+/// over by pushing a hand-picked twin.
+fn build_ambiguous_divergence_note(branch: &str, change_id: &str, twins: &[String]) -> String {
+    format!(
+        "⛔ BLOCKING [Divergent change] Your bookmark `{branch}` carries a divergent change `{change_id}` with multiple visible commits ({}) that Cairn could not safely collapse automatically — either every copy still conflicts or more than one carries edits, so picking one could lose work. Resolve it by hand over the shared store (keep the correct commit, abandon the rest), then verify build + tests. Do NOT force-push; if you cannot resolve it cleanly, escalate to a human.",
+        twins.join(", ")
+    )
+}
+
+/// Interrupt every sibling whose bookmark carries an ambiguous divergent change
+/// the collapse step refused to resolve. Mirror of `notify_conflicted_siblings`:
+/// map each ambiguous branch -> its sibling job -> latest run -> a stop-the-line
+/// `Interrupt`. The store was left untouched, so the message names the divergent
+/// twins and asks for manual resolution + escalation (never a force-push).
+fn notify_ambiguous_divergence(
+    orch: &Orchestrator,
+    siblings: &[SiblingJob],
+    ambiguous: &[AmbiguousDivergence],
+) -> Result<(), String> {
+    for divergence in ambiguous {
+        let Some(sibling) = siblings
+            .iter()
+            .find(|sibling| sibling_branch(sibling).as_deref() == Some(divergence.branch.as_str()))
+        else {
+            continue;
+        };
+        let Some(run_id) = latest_run_for_job(&orch.db.local, &sibling.id) else {
+            log::debug!(
+                "jj collapse: no run for ambiguous sibling {} to interrupt",
+                sibling.id
+            );
+            continue;
+        };
+        let message = build_ambiguous_divergence_note(
+            &divergence.branch,
+            &divergence.change_id,
+            &divergence.twins,
+        );
+        queue_system_direct(orch, &run_id, &message, DeliveryUrgency::Interrupt)?;
+        log::info!(
+            "Interrupted jj sibling job {} for an ambiguous divergent change on {}",
+            sibling.id,
+            divergence.branch
         );
     }
     Ok(())
@@ -1693,6 +1835,97 @@ mod tests {
         assert_eq!(
             wake, "interrupt",
             "a base-advance conflict interrupts the agent — stop-the-line, not a convenience note"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ambiguous_divergence_interrupts_only_the_affected_sibling() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+
+        let siblings = vec![
+            SiblingJob {
+                id: "job-overlap".to_string(),
+                worktree_path: "/wt/overlap".to_string(),
+                branch: Some("agent/PROJ-2-builder-0".to_string()),
+            },
+            SiblingJob {
+                id: "job-clean".to_string(),
+                worktree_path: "/wt/clean".to_string(),
+                branch: Some("agent/PROJ-3-builder-0".to_string()),
+            },
+        ];
+        let ambiguous = vec![AmbiguousDivergence {
+            branch: "agent/PROJ-2-builder-0".to_string(),
+            change_id: "qpvuntsmxyzw".to_string(),
+            twins: vec!["aaaa1111".to_string(), "bbbb2222".to_string()],
+        }];
+
+        notify_ambiguous_divergence(&orch, &siblings, &ambiguous).unwrap();
+
+        // Only the ambiguous sibling is messaged, and the note names the
+        // change-id, both twin commit ids, and the no-force-push instruction.
+        let messages: Vec<(String, String)> = orch
+            .db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT recipient_run_id, content FROM messages ORDER BY created_at",
+                            (),
+                        )
+                        .await?;
+                    let mut v = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        v.push((row.text(0)?, row.text(1)?));
+                    }
+                    Ok::<_, DbError>(v)
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "only the ambiguous sibling is interrupted; the healthy one is not"
+        );
+        assert_eq!(messages[0].0, "run-job-overlap");
+        assert!(
+            messages[0].1.contains("qpvuntsmxyzw"),
+            "names the change-id: {}",
+            messages[0].1
+        );
+        assert!(messages[0].1.contains("aaaa1111") && messages[0].1.contains("bbbb2222"));
+        assert!(messages[0].1.contains("Do NOT force-push"));
+
+        // Delivered as a stop-the-line interrupt (a divergent tangle wedges the
+        // branch the same way a recorded conflict does).
+        let wake: String = orch
+            .db
+            .local
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT wake FROM attention_pushes WHERE recipient = 'job-overlap'",
+                            (),
+                        )
+                        .await?;
+                    let row = rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| DbError::Row("no push for job-overlap".to_string()))?;
+                    row.text(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            wake, "interrupt",
+            "an ambiguous divergence interrupts the agent — stop-the-line"
         );
     }
 

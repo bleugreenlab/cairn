@@ -230,6 +230,14 @@ async fn timed_out_item_with_run_context_promotes_to_terminal() {
         result.contains("terminal/run-1"),
         "missing terminal URI: {result}"
     );
+    assert!(
+        result.contains("You will be notified when the command exits"),
+        "timeout result should report the automatic wake subscription: {result}"
+    );
+    assert!(
+        !result.contains("subscribe via cairn:~/wakes"),
+        "timeout result should not ask the agent to manually subscribe: {result}"
+    );
 
     // The job_terminals row exists.
     assert_eq!(
@@ -265,6 +273,25 @@ async fn timed_out_item_with_run_context_promotes_to_terminal() {
             "buffer missing live output: {content}"
         );
     }
+
+    // Promotion automatically subscribes the current job to the terminal exit,
+    // keyed on the canonical terminal URI, so the agent does not need to poll or
+    // append its own cairn:~/wakes mutation after ending the turn.
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM wake_subscriptions
+             WHERE job_id = 'job-run-promote'
+               AND source_kind = 'process'
+               AND source_ref LIKE '%/terminal/run-1'
+               AND fact_kinds_json = '[\"terminal_exit\"]'
+               AND state = 'active'
+               AND one_shot = 1"
+        )
+        .await,
+        1,
+        "promoted item must subscribe a one-shot terminal-exit wake"
+    );
 
     // The checkpoint cache must NOT record a detached item.
     assert_eq!(

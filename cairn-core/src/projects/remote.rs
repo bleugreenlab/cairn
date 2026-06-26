@@ -2,7 +2,9 @@ use crate::db_records::DbProject;
 use crate::error::CairnError;
 use crate::github::api::parse_repo_from_url;
 use crate::models::ProjectRemoteStatus;
-use crate::pr_data::helpers::reconcile_main_checkout_after_merge;
+use crate::pr_data::helpers::{
+    assert_main_checkout_clean_for_default_merge, reconcile_main_checkout_after_merge,
+};
 use crate::projects::crud;
 use crate::services::GitClient;
 use crate::storage::LocalDb;
@@ -108,25 +110,38 @@ pub async fn pull_project_on_default_branch_push(
         return Ok(PushRemoteSyncOutcome::NoMatchingProject);
     };
 
-    let default_branch = project
+    let stored_default = project
         .default_branch
         .as_deref()
-        .unwrap_or(event_default_branch)
-        .to_string();
-    // The main-checkout pull is best-effort: it can fail for reasons local to the
-    // user's checkout (uncommitted changes that won't stash/pop, a pull
-    // conflict) that have nothing to do with the externally-advanced tip on
-    // origin. A failure here must NOT abort processing — the in-flight sibling
-    // reconcile the caller runs on `Pulled` fetches origin into the shared store
-    // itself and is independent of the main checkout's state, so the dirty-
-    // checkout case is exactly when reconciliation still needs to happen.
-    if let Err(error) =
-        reconcile_main_checkout_after_merge(git, &project.repo_path, &default_branch, true)
-    {
-        log::warn!(
-            "Default-branch push for project {}: main checkout pull failed (continuing to sibling reconcile): {}",
-            project.id, error
-        );
+        .unwrap_or(event_default_branch);
+    let config =
+        crate::config::project_settings::load_project_settings(Path::new(&project.repo_path));
+    let default_branch =
+        crate::config::project_settings::resolve_default_branch(&config, Some(stored_default));
+
+    // The main-checkout update is best-effort: webhook processing cannot refuse an
+    // external push that already happened. Still run the same dirty-checkout gate
+    // used by in-app merges before any checkout mutation. Non-allowlisted tracked
+    // dirt skips only the user's main-checkout update; the caller still receives
+    // `Pulled` so it can fetch origin into the shared jj store and reconcile
+    // in-flight agent workspaces independently of the user's checkout state.
+    match assert_main_checkout_clean_for_default_merge(git, &project.repo_path) {
+        Ok(()) => {
+            if let Err(error) =
+                reconcile_main_checkout_after_merge(git, &project.repo_path, &default_branch, true)
+            {
+                log::warn!(
+                    "Default-branch push for project {}: main checkout reconcile failed (continuing to sibling reconcile): {}",
+                    project.id, error
+                );
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "Default-branch push for project {}: skipping main checkout reconcile (continuing to sibling reconcile): {}",
+                project.id, error
+            );
+        }
     }
 
     Ok(PushRemoteSyncOutcome::Pulled {
@@ -372,10 +387,10 @@ mod tests {
 
     #[tokio::test]
     async fn push_sync_returns_pulled_even_when_checkout_pull_fails() {
-        // A dirty/diverged main checkout can fail the best-effort pull, but the
-        // externally-advanced tip is still on origin and the sibling reconcile
-        // fetches it into the shared store itself. The outcome must still be
-        // `Pulled` so the caller reconciles in-flight workspaces.
+        // A clean-but-diverged main checkout can fail the best-effort pull, but
+        // the externally-advanced tip is still on origin and the sibling
+        // reconcile fetches it into the shared store itself. The outcome must
+        // still be `Pulled` so the caller reconciles in-flight workspaces.
         let db = migrated_db().await;
         insert_project(&db, "local", "/repos/local", None, None).await;
 
@@ -414,6 +429,86 @@ mod tests {
                 default_branch: "main".to_string(),
             },
             "a failed main-checkout pull must not suppress the sibling reconcile signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_sync_skips_main_checkout_reconcile_when_dirty_but_still_signals_pulled() {
+        let db = migrated_db().await;
+        insert_project(&db, "local", "/repos/local", None, None).await;
+
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok("https://github.com/acme/workspace.git".to_string()));
+        git.expect_status()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok(" M src/lib.rs".to_string()));
+        git.expect_current_branch().never();
+        git.expect_pull().never();
+        git.expect_run().never();
+
+        let outcome = pull_project_on_default_branch_push(
+            &db,
+            &git,
+            "acme/workspace",
+            "refs/heads/main",
+            "main",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            PushRemoteSyncOutcome::Pulled {
+                project_id: "local".to_string(),
+                default_branch: "main".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn push_sync_uses_resolved_default_branch_for_checkout_reconcile() {
+        let db = migrated_db().await;
+        insert_project(&db, "local", "/repos/local", None, None).await;
+        crud::set_default_branch_db(&db, "local", "develop")
+            .await
+            .unwrap();
+
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok("https://github.com/acme/workspace.git".to_string()));
+        git.expect_status()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok(String::new()));
+        git.expect_current_branch()
+            .with(function(|path: &Path| path == Path::new("/repos/local")))
+            .returning(|_| Ok("develop".to_string()));
+        git.expect_pull()
+            .with(
+                function(|path: &Path| path == Path::new("/repos/local")),
+                eq("origin"),
+                eq("develop"),
+            )
+            .returning(|_, _, _| Ok(()));
+
+        let outcome = pull_project_on_default_branch_push(
+            &db,
+            &git,
+            "acme/workspace",
+            "refs/heads/main",
+            "main",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            PushRemoteSyncOutcome::Pulled {
+                project_id: "local".to_string(),
+                default_branch: "develop".to_string(),
+            }
         );
     }
 

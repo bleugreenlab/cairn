@@ -533,17 +533,19 @@ pub(crate) async fn find_downstream_artifact_schema_conn(
 /// Resolve a node's effective terminal output contract against an already-loaded
 /// snapshot.
 ///
-/// Port model: the contract is the schema of the node's single `context-out`
+/// Port model: the contract is the schema of the node's terminal `context-out`
 /// edge target — an [`ArtifactNode`](crate::models::ArtifactNodeConfig) (carrying
-/// `name` + `schema` + `confirm_policy`) or an `action`/`pr` input port. `Some`
-/// here means "this node was told to produce a terminal artifact"; the
+/// `name` + `schema` + `confirm_policy`) or an `action`/`pr` input port. A
+/// `context-out` edge may also fan out directly to agent consumers; those edges
+/// carry the produced artifact as input but do not declare the terminal contract.
+/// `Some` here means "this node was told to produce a terminal artifact"; the
 /// job-completion gate keys on exactly that.
 ///
 /// Back-compat: old execution snapshots predate ArtifactNodes and carry an inline
 /// agent/action `outputSchema` plus a direct `context-out` edge to the consumer.
-/// When the ctx-out target carries no schema (it points straight at another
-/// agent), the node's own inline `outputSchema` is the contract. Splitting the
-/// snapshot load out lets the recompute sweep reuse its loaded snapshot.
+/// When no ctx-out target carries a schema (for example it points straight at
+/// another agent), the node's own inline `outputSchema` is the contract. Splitting
+/// the snapshot load out lets the recompute sweep reuse its loaded snapshot.
 pub(crate) async fn find_downstream_artifact_schema_with_snapshot_conn(
     conn: &turso::Connection,
     snapshot: &ExecutionSnapshot,
@@ -556,8 +558,10 @@ pub(crate) async fn find_downstream_artifact_schema_with_snapshot_conn(
         .map(|node| (node.id.as_str(), node))
         .collect();
 
-    // Port model: follow the single context-out edge to its target's schema.
-    if let Some(edge) = snapshot.recipe.edges.iter().find(|edge| {
+    // Port model: follow context-out edges until one declares a terminal schema.
+    // Direct agent consumers are fanout inputs, not terminal contract targets, so
+    // they are skipped rather than making contract resolution depend on edge order.
+    for edge in snapshot.recipe.edges.iter().filter(|edge| {
         edge.edge_type.to_string() == "context"
             && edge.source_node_id == node_id
             && edge.source_handle == crate::models::CONTEXT_OUT_HANDLE
@@ -957,6 +961,34 @@ mod port_model_tests {
             .expect("builder feeds the pr");
         assert_eq!(info.artifact_name.as_deref(), Some("create-pr"));
         // The pr input schema declared `user`, but the PR lifecycle is the gate.
+        assert_eq!(info.confirm_policy, ConfirmPolicy::Auto);
+    }
+
+    #[tokio::test]
+    async fn direct_agent_context_out_fanout_does_not_hide_terminal_contract() {
+        let db = test_db().await;
+        let snap = snapshot(
+            vec![
+                agent("builder"),
+                agent("reviewer"),
+                pr_node("pr", "create-pr"),
+            ],
+            vec![
+                ctx_edge("e1", "builder", "context-out", "reviewer", "context-in"),
+                ctx_edge("e2", "builder", "context-out", "pr", "context-in"),
+            ],
+        );
+        let info = db
+            .read(move |conn| {
+                let snap = snap.clone();
+                Box::pin(async move {
+                    find_downstream_artifact_schema_with_snapshot_conn(conn, &snap, "builder").await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("builder terminal contract survives fanout");
+        assert_eq!(info.artifact_name.as_deref(), Some("create-pr"));
         assert_eq!(info.confirm_policy, ConfirmPolicy::Auto);
     }
 

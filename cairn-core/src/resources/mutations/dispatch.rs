@@ -32,14 +32,26 @@ fn parse_todo_write_items(
     item: &ChangeItem,
     payload: &serde_json::Value,
 ) -> ResourceMutationResult<Vec<crate::todos::TodoWriteItem>> {
-    parse_required_payload_field(index, item, payload, "todos")
+    parse_required_payload_field_describing(
+        index,
+        item,
+        payload,
+        "todos",
+        crate::todos::TODO_WRITE_ITEM_KEYS,
+    )
 }
 
-fn parse_required_payload_field<T>(
+/// Parse a required payload field, enumerating the item's accepted keys when
+/// deserialization fails. A mis-keyed array item (e.g. a todo keyed `title`
+/// instead of `content`) yields a serde error that names at most the first
+/// missing field; appending the accepted-key list turns the rejection into a
+/// complete, self-correcting message (CAIRN #164).
+fn parse_required_payload_field_describing<T>(
     index: usize,
     item: &ChangeItem,
     payload: &serde_json::Value,
     key: &str,
+    accepted_keys: &str,
 ) -> ResourceMutationResult<T>
 where
     T: DeserializeOwned,
@@ -47,8 +59,13 @@ where
     let value = payload
         .get(key)
         .ok_or_else(|| build_failure(index, item, format!("payload.{key} is required")))?;
-    serde_json::from_value(value.clone())
-        .map_err(|e| build_failure(index, item, format!("Invalid payload.{key}: {e}")))
+    serde_json::from_value(value.clone()).map_err(|e| {
+        build_failure(
+            index,
+            item,
+            format!("Invalid payload.{key}: {e}. Each item accepts: {accepted_keys}."),
+        )
+    })
 }
 
 fn parse_string_array_field(
@@ -92,7 +109,13 @@ fn parse_todo_update_items(
     item: &ChangeItem,
     payload: &serde_json::Value,
 ) -> ResourceMutationResult<Vec<crate::todos::TodoUpdateItem>> {
-    parse_required_payload_field(index, item, payload, "updates")
+    parse_required_payload_field_describing(
+        index,
+        item,
+        payload,
+        "updates",
+        crate::todos::TODO_UPDATE_ITEM_KEYS,
+    )
 }
 
 fn append_payload(index: usize, item: &ChangeItem) -> ResourceMutationResult<&serde_json::Value> {
@@ -2930,6 +2953,24 @@ mod resource_gate_tests {
         assert!(failure.error.contains("Missing required payload key"));
         assert!(failure.error.contains("command"));
         assert!(failure.error.contains("Example:"));
+    }
+
+    #[test]
+    fn todo_append_mis_keyed_item_enumerates_accepted_keys() {
+        // A todo item keyed `title` (the message/artifact spelling) instead of
+        // `content` clears the top-level `todos` gate but fails item
+        // deserialization. The rejection must name the accepted item keys so the
+        // agent self-corrects without a discovery round-trip (CAIRN #164).
+        let payload = serde_json::json!({ "todos": [{ "title": "do the thing" }] });
+        let it = item("cairn:~/todos", ChangeMode::Append, Some(payload.clone()));
+        let failure = parse_todo_write_items(0, &it, &payload).unwrap_err();
+        assert!(
+            failure.error.contains("content"),
+            "rejection must name the canonical `content` key: {}",
+            failure.error
+        );
+        assert!(failure.error.contains("status"));
+        assert!(failure.error.contains("Each item accepts:"));
     }
 
     #[test]

@@ -922,8 +922,8 @@ mod tests {
         .await;
         exec(
             orch,
-            "INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
-             VALUES ('run-rb', 'proj-rb', 'issue-rb-1', 'job-rb', 'live', 'codex', 1, 1, 'resume')",
+            "INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode)
+             VALUES ('run-rb', 'proj-rb', 'issue-rb-1', 'job-rb', 'live', 1, 1, 'resume')",
         )
         .await;
     }

@@ -16,8 +16,9 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::pr_data::helpers::{
-    compute_checks_status, compute_local_mergeable, fetch_checks_via_api, fetch_pr_via_api,
-    local_pr_files, reconcile_main_checkout_after_merge, ParsedPrDetails,
+    assert_main_checkout_clean_for_default_merge, compute_checks_status, compute_local_mergeable,
+    fetch_checks_via_api, fetch_pr_via_api, local_pr_files, reconcile_main_checkout_after_merge,
+    ParsedPrDetails,
 };
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::transitions::Resolution;
@@ -1491,19 +1492,14 @@ pub async fn render_live_pr_section(
 }
 
 /// Background post-merge reconciliation shared by the in-app merge
-/// (`merge_pr_for_job`) and the GitHub webhook merge path.
+/// (`merge_pr_for_job`) and the GitHub merge path.
 ///
 /// Runs the side effects that follow a PR landing, in order:
 /// 1. capture the merged file list for issue history,
-/// 2. pull the main repo when it is on the default branch (gated on the
-///    `pull_on_merge` setting),
-/// 3. fast-forward an active worktree on the PR's *target* branch — e.g. a
-///    Coordinator integration branch a sibling has checked out — always,
-///    regardless of `pull_on_merge`, since agent-owned worktrees must track a
-///    base that just advanced (the main-repo default-branch checkout is skipped
-///    here, owned by step 2),
-/// 4. tear down the merged issue's worktrees,
-/// 5. refresh the cached PR row.
+/// 2. reconcile the user's main checkout only when the merge advanced the project
+///    default branch,
+/// 3. tear down the merged issue's worktrees,
+/// 4. refresh the cached PR row.
 ///
 /// Every step is non-fatal: each logs and continues on failure so one broken
 /// step never strands the rest. The PR-merged state transition itself
@@ -1511,11 +1507,19 @@ pub async fn render_live_pr_section(
 /// caller's attention emit) has already happened by the time this runs. Takes
 /// owned values so callers can spawn it detached via `tokio::spawn`.
 /// `force_checkout_pull` forces the user's main-checkout fast-forward pull
-/// regardless of the `pull_on_merge` setting. The GitHub-API merge path sets it:
-/// nothing locally rewrote the checkout (no local fold), so a `git pull` of the
-/// PR base branch is the *only* way the checkout catches up to the just-merged
-/// tip. The local-fold path passes `false` — the fold already re-attached and
-/// fast-forwarded the checkout, and `pull_on_merge` governs only the extra pull.
+/// regardless of the `pull_on_merge` setting. The GitHub-API merge path sets it
+/// for default-branch PRs: nothing locally rewrote the checkout (no local fold),
+/// so a `git pull` of the PR base branch is the only way the checkout catches up
+/// to the just-merged tip. The local-fold path passes `false` — the fold already
+/// advanced the local default ref, and `pull_on_merge` governs only the extra
+/// pull.
+fn should_reconcile_main_checkout_after_merge(
+    target_branch: &str,
+    resolved_default_branch: &str,
+) -> bool {
+    target_branch == resolved_default_branch
+}
+
 pub async fn reconcile_after_merge(
     orch: Orchestrator,
     ctx: MergeMrContext,
@@ -1525,6 +1529,7 @@ pub async fn reconcile_after_merge(
     let repo_path = ctx.mr.repo_path.clone();
     let pr_number = ctx.mr.github_pr_number;
     let default_branch = ctx.default_branch.clone();
+    let resolved_default_branch = resolve_project_default_branch(&repo_path, &default_branch);
     let target_branch = ctx.target_branch.clone();
     let issue_id = ctx.issue_id.clone();
 
@@ -1608,16 +1613,23 @@ pub async fn reconcile_after_merge(
         }
     }
 
-    // 2. Reconcile the user's project checkout. The merge fold exported the
-    //    default branch into the backing `.git`, which advances
-    //    `refs/heads/<default>` but detaches the checkout's HEAD; re-attach it
-    //    and fast-forward to the merged tip (for BOTH local and remote merges).
-    //    A remote merge with `pull_on_merge` also pulls origin to absorb any
-    //    external advance of the default branch.
-    let git = &*orch.services.git;
-    let pull = force_checkout_pull || (pr_number.is_some() && pull_on_merge_setting());
-    if let Err(e) = reconcile_main_checkout_after_merge(git, &repo_path, &default_branch, pull) {
-        log::warn!("Failed to reconcile main checkout after merge: {}", e);
+    // 2. Reconcile the user's project checkout only for a real default-branch
+    //    advance. Child→integration merges never detach or move the main checkout;
+    //    resetting it there only creates races on unrelated work.
+    if should_reconcile_main_checkout_after_merge(&target_branch, &resolved_default_branch) {
+        let git = &*orch.services.git;
+        let pull = force_checkout_pull || (pr_number.is_some() && pull_on_merge_setting());
+        if let Err(e) =
+            reconcile_main_checkout_after_merge(git, &repo_path, &resolved_default_branch, pull)
+        {
+            log::warn!("Failed to reconcile main checkout after merge: {}", e);
+        }
+    } else {
+        log::debug!(
+            "Skipping main checkout reconcile after merge into non-default target '{}' (resolved default '{}')",
+            target_branch,
+            resolved_default_branch
+        );
     }
 
     // 3. Downstream-workspace reconciliation is spawned (not awaited) inside
@@ -2117,13 +2129,10 @@ async fn merge_remote_pr_via_github(
         log::warn!("Best-effort delete of merged source branch {source_branch} failed: {e}");
     }
 
-    // BEST-EFFORT, proactive local reconcile. Everything derives from the PR's
-    // real base (`target_branch`), never the possibly-stale stored default — so
-    // the checkout reconcile is a plain fast-forward of the PR base and can never
-    // land the checkout on `main`. Overriding `default_branch` here is what makes
-    // the shared `reconcile_after_merge` use the PR base for the checkout pull.
-    let mut reconcile_ctx = merge_context;
-    reconcile_ctx.default_branch = target_branch.clone();
+    // BEST-EFFORT, proactive local reconcile. This path only handles remote PRs
+    // whose real base is the project default branch, so the shared reconcile may
+    // safely update the user's main checkout.
+    let reconcile_ctx = merge_context;
     let orch_clone = orch.clone();
     tokio::spawn(async move {
         // In-flight siblings: fetch origin into the shared store and rebase each
@@ -2196,8 +2205,13 @@ pub async fn merge_pr_for_job(
             ),
         ));
     }
+    let resolved_default =
+        resolve_project_default_branch(&repo_path, &merge_context.default_branch);
+    if merge_context.target_branch == resolved_default {
+        assert_main_checkout_clean_for_default_merge(&*orch.services.git, &repo_path)?;
+    }
     log::info!(
-        "merge_pr_for_job[{job_id}]: conflict gate took {:?}",
+        "merge_pr_for_job[{job_id}]: merge gates took {:?}",
         gate_started.elapsed()
     );
 
@@ -2373,6 +2387,55 @@ mod tests {
         staging.target_branch = "staging".to_string();
         assert!(should_route_to_github(&staging, "staging"));
         assert!(!should_route_to_github(&staging, "main"));
+    }
+
+    #[test]
+    fn dirty_tracked_paths_parses_only_tracked_porcelain_entries() {
+        let paths = crate::pr_data::helpers::dirty_tracked_paths_from_porcelain(
+            " M src/lib.rs\n?? scratch.txt\n!! ignored.log\nR  old.rs -> new.rs\nA  src-tauri/Cargo.lock\n",
+        );
+        assert_eq!(
+            paths,
+            vec![
+                "src/lib.rs".to_string(),
+                "new.rs".to_string(),
+                "src-tauri/Cargo.lock".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn main_checkout_dirty_gate_allows_only_regenerable_lockfile_churn() {
+        use crate::services::testing::MockGitClient;
+
+        let mut clean = MockGitClient::new();
+        clean.expect_status().returning(|_| Ok(String::new()));
+        assert!(assert_main_checkout_clean_for_default_merge(&clean, "/repo").is_ok());
+
+        let mut lockfile_only = MockGitClient::new();
+        lockfile_only
+            .expect_status()
+            .returning(|_| Ok(" M src-tauri/Cargo.lock".to_string()));
+        assert!(assert_main_checkout_clean_for_default_merge(&lockfile_only, "/repo").is_ok());
+
+        let mut real_edit = MockGitClient::new();
+        real_edit
+            .expect_status()
+            .returning(|_| Ok(" M src-tauri/Cargo.lock\n M src/lib.rs".to_string()));
+        let error = assert_main_checkout_clean_for_default_merge(&real_edit, "/repo").unwrap_err();
+        assert!(error.contains("Refusing to merge"), "{error}");
+        assert!(error.contains("/repo"), "{error}");
+        assert!(error.contains("src/lib.rs"), "{error}");
+        assert!(!error.contains("src-tauri/Cargo.lock"), "{error}");
+    }
+
+    #[test]
+    fn main_checkout_reconcile_runs_only_for_default_branch_advances() {
+        assert!(should_reconcile_main_checkout_after_merge("main", "main"));
+        assert!(!should_reconcile_main_checkout_after_merge(
+            "agent/CAIRN-1-coordinator-0",
+            "main"
+        ));
     }
 
     /// A GitHub 405/409 refusal points at the PR (no local markers exist); any

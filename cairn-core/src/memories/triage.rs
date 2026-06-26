@@ -38,6 +38,7 @@ struct ScopeTarget {
     scope_value: String,
     project_id: String,
     project_key: String,
+    project_name: String,
 }
 
 pub(crate) fn role_home_project_id(orch: &Orchestrator, role: &str) -> Result<String, String> {
@@ -65,11 +66,15 @@ async fn scope_target(
     let project_key = crate::memories::db::project_key_by_id(&orch.db.local, &project_id)
         .await
         .map_err(|error| error.to_string())?;
+    let project_name = crate::memories::db::project_name_by_id(&orch.db.local, &project_id)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(ScopeTarget {
         scope: scope.to_string(),
         scope_value: scope_value.to_string(),
         project_id,
         project_key,
+        project_name,
     })
 }
 
@@ -193,6 +198,18 @@ async fn seed_description(
     out
 }
 
+fn triage_issue_title(target: &ScopeTarget, pending_count: usize) -> String {
+    let scope_value = if target.scope == "project" && !target.project_name.trim().is_empty() {
+        target.project_name.as_str()
+    } else {
+        target.scope_value.as_str()
+    };
+    format!(
+        "Memory triage: {}={} ({} pending)",
+        target.scope, scope_value, pending_count
+    )
+}
+
 async fn revert_claimed(orch: &Orchestrator, memories: &[Memory]) {
     let ids: Vec<String> = memories.iter().map(|memory| memory.id.clone()).collect();
     if let Err(error) =
@@ -260,12 +277,7 @@ async fn spawn_triage_for_scope(
         return Ok(None);
     }
     let description = seed_description(orch, &target, &claimed).await;
-    let title = format!(
-        "Memory triage: {}={} ({} pending)",
-        target.scope,
-        target.scope_value,
-        claimed.len()
-    );
+    let title = triage_issue_title(&target, claimed.len());
     let outcome = create_issue_in_project(
         orch,
         &target.project_key,
@@ -529,6 +541,19 @@ mod tests {
             .unwrap()
     }
 
+    async fn latest_triage_issue_title(test: &TestOrch) -> String {
+        test.orch
+            .db
+            .local
+            .query_one(
+                "SELECT title FROM issues WHERE title LIKE 'Memory triage:%' ORDER BY created_at DESC, number DESC LIMIT 1",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn memory_status_count(
         test: &TestOrch,
         status: &str,
@@ -692,6 +717,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_scope_spawned_issue_title_uses_project_name() {
+        let test = test_orch().await;
+        for idx in 0..5 {
+            insert_pending_memory(
+                &test,
+                &format!("project-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let spawned = super::maybe_spawn_triage(
+            test.orch.clone(),
+            vec![("project".to_string(), "project-1".to_string())],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spawned.len(), 1);
+        let title = latest_triage_issue_title(&test).await;
+        assert_eq!(title, "Memory triage: project=Project (5 pending)");
+        assert!(!title.contains("project-1"));
+    }
+
+    #[tokio::test]
     async fn below_threshold_scope_does_not_spawn_triage_issue() {
         let test = test_orch().await;
         for idx in 0..4 {
@@ -722,15 +775,35 @@ mod tests {
     }
 
     #[test]
-    fn scope_target_carries_scope_for_description_title() {
+    fn project_scope_triage_title_uses_project_name_instead_of_uuid() {
+        let target = ScopeTarget {
+            scope: "project".to_string(),
+            scope_value: "00ace0d0-24a5-4700-83ba-cc719c63f43c".to_string(),
+            project_id: "00ace0d0-24a5-4700-83ba-cc719c63f43c".to_string(),
+            project_key: "CAIRN".to_string(),
+            project_name: "Cairn".to_string(),
+        };
+
+        let title = super::triage_issue_title(&target, 5);
+
+        assert_eq!(title, "Memory triage: project=Cairn (5 pending)");
+        assert!(!title.contains("00ace0d0-24a5-4700-83ba-cc719c63f43c"));
+    }
+
+    #[test]
+    fn non_project_scope_triage_title_keeps_scope_value() {
         let target = ScopeTarget {
             scope: "role".to_string(),
             scope_value: "builder".to_string(),
             project_id: "workspace".to_string(),
             project_key: "WKS".to_string(),
+            project_name: "Workspace".to_string(),
         };
-        assert_eq!(target.scope, "role");
-        assert_eq!(target.scope_value, "builder");
+
+        assert_eq!(
+            super::triage_issue_title(&target, 5),
+            "Memory triage: role=builder (5 pending)"
+        );
     }
 
     #[tokio::test]
@@ -750,6 +823,7 @@ mod tests {
             scope_value: "builder".to_string(),
             project_id,
             project_key: "PRJ".to_string(),
+            project_name: "Project".to_string(),
         };
         let markdown = current_canon_markdown(&test.orch, &target);
         assert!(markdown.contains("Project role prompt."));
@@ -772,6 +846,7 @@ mod tests {
             scope_value: "builder".to_string(),
             project_id,
             project_key: "WKS".to_string(),
+            project_name: "Workspace".to_string(),
         };
         let markdown = current_canon_markdown(&test.orch, &target);
         assert!(markdown.contains("Workspace role prompt."));
@@ -820,6 +895,7 @@ mod tests {
             scope_value: "project-1".to_string(),
             project_id: "project-1".to_string(),
             project_key: "PRJ".to_string(),
+            project_name: "Project".to_string(),
         };
 
         let description = super::seed_description(&test.orch, &target, &[memory]).await;

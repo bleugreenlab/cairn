@@ -323,6 +323,51 @@ pub async fn fetch_failure_logs_via_api(
 
 // ── Main Repo Update ───────────────────────────────────────────
 
+// The main checkout can carry persistent tracked lockfile churn while the Dev
+// terminal or `bun dev:instance` runs from the project checkout. It is generated
+// by Cargo's two-workspace lockfile behavior and is safe to discard when a merge
+// advances the default branch. Keep this list deliberately tiny: every other
+// tracked change should stop or skip checkout mutation before reconcile can
+// hard-reset it.
+const REGENERABLE_DIRTY_CHECKOUT_PATHS: &[&str] = &["src-tauri/Cargo.lock"];
+
+pub fn dirty_tracked_paths_from_porcelain(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 || line.starts_with("??") || line.starts_with("!!") {
+                return None;
+            }
+            let path = line[3..].rsplit(" -> ").next().unwrap_or_default().trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect()
+}
+
+pub fn assert_main_checkout_clean_for_default_merge(
+    git: &dyn GitClient,
+    repo_path: &str,
+) -> Result<(), String> {
+    let dirty_paths = dirty_tracked_paths_from_porcelain(&git.status(Path::new(repo_path))?);
+    let blocking_paths: Vec<_> = dirty_paths
+        .into_iter()
+        .filter(|path| !REGENERABLE_DIRTY_CHECKOUT_PATHS.contains(&path.as_str()))
+        .collect();
+
+    if blocking_paths.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Refusing to merge: your project checkout at {repo_path} has uncommitted changes to {files}. Commit or discard them, then retry.",
+            files = blocking_paths.join(", ")
+        ))
+    }
+}
+
 /// Run a git subcommand and fail (with stderr) on a non-zero exit.
 fn run_git_checked(
     git: &dyn GitClient,
@@ -351,17 +396,17 @@ fn run_git_checked(
 /// detached, so it read "not on default" and skipped).
 ///
 /// Repair: when HEAD is detached, re-attach it to `refs/heads/<default>` and
-/// fast-forward the working tree to the merged tip the export already wrote to
-/// that ref. A checkout deliberately on a *different* branch is never detached by
-/// the export (jj only rewrites HEAD when it points at the branch being moved), so
-/// it is left untouched. `pull` (remote + `pull_on_merge`) adds a `git pull origin
+/// hard-reset the working tree to the merged tip the export already wrote to that
+/// ref. A checkout deliberately on a *different* branch is never detached by the
+/// export (jj only rewrites HEAD when it points at the branch being moved), so it
+/// is left untouched. `pull` (remote + `pull_on_merge`) adds a `git pull origin
 /// <default>` to also absorb an external advance; it never gates the re-attach,
 /// which must restore the invariant regardless of the pull preference.
 ///
-/// Uncommitted edits are stashed before the HEAD/working-tree mutation and popped
-/// after, so a user mid-edit keeps their work on top of the merged tip. The stash
-/// is exact because the detached HEAD equals the pre-merge tip the working tree
-/// was checked out from.
+/// This path deliberately does not stash. Merges that advance the default branch
+/// pass through a pre-merge dirty-checkout gate, so any remaining tracked dirt is
+/// the allowlisted, regenerable lockfile churn from the two-lockfile dev-build
+/// workflow and can be discarded by the hard reset.
 pub fn reconcile_main_checkout_after_merge(
     git: &dyn GitClient,
     repo_path: &str,
@@ -390,37 +435,7 @@ pub fn reconcile_main_checkout_after_merge(
         return Ok(());
     }
 
-    let has_changes = !git.status(repo)?.trim().is_empty();
-    let stashed = if has_changes {
-        log::info!("Main repo has uncommitted changes, stashing before reconcile...");
-        match git.stash_push(repo, None) {
-            Ok(_) => true,
-            Err(e) => {
-                log::warn!("Failed to stash changes: {}", e);
-                return Err(format!("Could not stash changes in main repo: {}", e));
-            }
-        }
-    } else {
-        false
-    };
-
-    let outcome = reconcile_checkout_inner(git, repo, default_branch, detached, pull);
-
-    if stashed {
-        match git.stash_pop(repo) {
-            Ok(_) => log::info!("Successfully popped stash after reconcile"),
-            Err(e) => {
-                log::error!("Failed to pop stash after reconcile: {}", e);
-                return Err(format!(
-                    "Reconciled main repo but stash pop failed (conflicts?). \
-                     Your changes are in 'git stash'. Error: {}",
-                    e
-                ));
-            }
-        }
-    }
-
-    outcome?;
+    reconcile_checkout_inner(git, repo, default_branch, detached, pull)?;
     log::info!(
         "Reconciled main repo at {} onto {}",
         repo_path,
@@ -429,10 +444,10 @@ pub fn reconcile_main_checkout_after_merge(
     Ok(())
 }
 
-/// The HEAD-mutating core, run between the stash/pop guard. Re-attaches a detached
-/// HEAD to the default branch and fast-forwards the working tree to its tip, then
-/// optionally pulls. The re-attach runs before the pull so the invariant is
-/// restored even if the pull (network) fails.
+/// The HEAD-mutating core. Re-attaches a detached HEAD to the default branch and
+/// hard-resets the working tree to its tip, then optionally pulls. The re-attach
+/// runs before the pull so the invariant is restored even if the pull (network)
+/// fails.
 fn reconcile_checkout_inner(
     git: &dyn GitClient,
     repo: &Path,
@@ -1039,7 +1054,7 @@ mod tests {
         let mut git = MockGitClient::new();
         git.expect_current_branch()
             .returning(|_| Ok("main".to_string()));
-        git.expect_status().returning(|_| Ok("".to_string()));
+        git.expect_status().never();
         git.expect_pull().returning(|_, _, _| Ok(()));
         // Not detached: no HEAD re-attach.
         git.expect_run().never();
@@ -1058,7 +1073,7 @@ mod tests {
         // with NO network pull. Before the fix this path was never reached.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status().returning(|_| Ok(String::new()));
+        git.expect_status().never();
         expect_git_verb(&mut git, "symbolic-ref");
         expect_git_verb(&mut git, "reset");
         git.expect_pull().never();
@@ -1075,7 +1090,7 @@ mod tests {
         // not gated on the pull preference.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status().returning(|_| Ok(String::new()));
+        git.expect_status().never();
         expect_git_verb(&mut git, "symbolic-ref");
         expect_git_verb(&mut git, "reset");
         git.expect_pull().times(1).returning(|_, _, _| Ok(()));
@@ -1085,57 +1100,21 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_detached_dirty_stashes_reattaches_and_pops() {
+    fn reconcile_detached_dirty_reset_does_not_stash() {
         use crate::services::testing::MockGitClient;
 
-        // A user mid-edit in their main checkout: stash before the HEAD mutation,
-        // re-attach + fast-forward, then pop the edits back onto the merged tip.
+        // The dirty-checkout gate runs before default-branch merges. Reconcile is
+        // therefore free to reset away any remaining allowlisted lockfile churn
+        // without touching the stash stack.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status()
-            .returning(|_| Ok(" M dirty-file.rs".to_string()));
-        git.expect_stash_push().times(1).returning(|_, _| Ok(()));
+        git.expect_status().never();
         expect_git_verb(&mut git, "symbolic-ref");
         expect_git_verb(&mut git, "reset");
-        git.expect_stash_pop().times(1).returning(|_| Ok(()));
+        git.expect_pull().never();
 
         let result = reconcile_main_checkout_after_merge(&git, "/repo", "main", false);
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn reconcile_returns_error_on_stash_pop_failure() {
-        use crate::services::testing::MockGitClient;
-
-        let mut git = MockGitClient::new();
-        git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status()
-            .returning(|_| Ok(" M dirty-file.rs".to_string()));
-        git.expect_stash_push().returning(|_, _| Ok(()));
-        expect_git_verb(&mut git, "symbolic-ref");
-        expect_git_verb(&mut git, "reset");
-        git.expect_stash_pop()
-            .returning(|_| Err("conflict".to_string()));
-
-        let result = reconcile_main_checkout_after_merge(&git, "/repo", "main", false);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("stash pop failed"));
-    }
-
-    #[test]
-    fn reconcile_returns_error_on_stash_push_failure() {
-        use crate::services::testing::MockGitClient;
-
-        let mut git = MockGitClient::new();
-        git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status()
-            .returning(|_| Ok(" M dirty-file.rs".to_string()));
-        git.expect_stash_push()
-            .returning(|_, _| Err("stash failed".to_string()));
-
-        let result = reconcile_main_checkout_after_merge(&git, "/repo", "main", false);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Could not stash"));
     }
 
     #[test]
@@ -1146,7 +1125,7 @@ mod tests {
         // not be silently swallowed.
         let mut git = MockGitClient::new();
         git.expect_current_branch().returning(|_| Ok(String::new()));
-        git.expect_status().returning(|_| Ok(String::new()));
+        git.expect_status().never();
         git.expect_run()
             .withf(|_, args| args.first().map(String::as_str) == Some("symbolic-ref"))
             .returning(|_, _| {

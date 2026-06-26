@@ -21,10 +21,21 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
 use crate::mcp::git::{CommitResult, GitAuthor};
 
 /// Filename of the non-snapshotted branch marker inside a workspace's `.jj` dir.
 const BRANCH_MARKER: &str = "cairn-branch";
+
+/// Filename of the non-snapshotted base marker inside a workspace's `.jj` dir.
+/// Records the integration base (branch name + resolved SHA) so in-fence check
+/// tooling can diff the agent's own commits against the base it branched from —
+/// the worktree otherwise has no on-disk record of its base (jj ancestry cannot
+/// tell the base apart from siblings that coincide at the branch point). See
+/// `scripts/lib/check-base.ts` and `docs/check-harness.md`.
+const BASE_MARKER: &str = "cairn-base";
 
 /// Fallback identity used when no per-call author is supplied. Per-commit author
 /// is injected via `--config user.{name,email}=…` on each seal.
@@ -35,6 +46,12 @@ const JJ_DEFAULT_USER_EMAIL: &str = "agent@cairn.local";
 pub struct JjEnv {
     bin: String,
     config_path: PathBuf,
+}
+
+#[cfg(test)]
+fn jj_subprocess_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 impl JjEnv {
@@ -142,6 +159,11 @@ impl JjEnv {
 
     /// Run a jj command, returning trimmed stdout or a contextual error.
     fn run(&self, cwd: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
+        #[cfg(test)]
+        let _guard = jj_subprocess_lock()
+            .lock()
+            .expect("jj subprocess test lock poisoned");
+
         let out = self
             .cmd(cwd)
             .args(args)
@@ -453,6 +475,28 @@ pub fn read_branch_marker(ws_path: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Record the integration base in the workspace's non-snapshotted marker: the
+/// base branch name on line 1 (it auto-advances with the integration tip, so a
+/// branch-keyed changed-file diff stays correct as the base moves) and the
+/// resolved base SHA on line 2 (a stable cache key for a future baseline). The
+/// `.jj` dir is never snapshotted, so the marker is invisible to the working
+/// copy commit — like [`write_branch_marker`].
+pub fn write_base_marker(ws_path: &Path, base_branch: &str, base_rev: &str) -> Result<(), String> {
+    let p = ws_path.join(".jj").join(BASE_MARKER);
+    std::fs::write(&p, format!("{base_branch}\n{base_rev}\n"))
+        .map_err(|e| format!("write base marker: {e}"))
+}
+
+/// Read the workspace's base marker as `(branch, rev)`, if present. Returns
+/// `None` when the marker is absent or its branch line is empty.
+pub fn read_base_marker(ws_path: &Path) -> Option<(String, String)> {
+    let content = std::fs::read_to_string(ws_path.join(".jj").join(BASE_MARKER)).ok()?;
+    let mut lines = content.lines();
+    let branch = lines.next().map(str::trim).filter(|s| !s.is_empty())?;
+    let rev = lines.next().map(str::trim).unwrap_or("");
+    Some((branch.to_string(), rev.to_string()))
+}
+
 /// Whether the working copy (`@`) carries changes versus its parent. Never
 /// consults `git status` (non-empty mid-work under jj because the change lives
 /// in `@`, not git's HEAD).
@@ -741,6 +785,16 @@ pub fn working_copy_dirty_paths(jj: &JjEnv, ws: &Path) -> Result<Vec<String>, St
         .collect())
 }
 
+/// Capture the working copy's diff vs its parent as a git-format unified patch
+/// (`jj diff --git`). The write-path stale-recovery captures this BEFORE any
+/// `update-stale`/`discard` so a give-up can persist the agent's would-be-lost
+/// edits to scratch — making "recoverable" true from the agent's seat, not just
+/// the jj operation log. Best-effort by contract: the caller treats any error as
+/// "nothing to preserve". Empty string when `@` is clean.
+pub fn working_copy_diff(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+    jj.run(ws, &["diff", "--git"], "jj diff --git")
+}
+
 /// Stop tracking `paths` in the working copy without deleting them from disk
 /// (`jj file untrack`). Used by populate's backstop to un-track a path a
 /// conservative glob translation failed to keep out of the snapshot, after the
@@ -797,6 +851,274 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
         &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
         "jj log -r @-",
     )
+}
+
+/// One changed file derived from the live sealed jj graph: its repo-relative
+/// path, status, and `+`/`-` line counts, plus the previous path for a rename.
+/// The substrate for the node `/changed` projection, which derives the changed
+/// set from the graph ([`node_changed_files`]) rather than the best-effort
+/// `file_changes` cache, so a just-sealed commit's file is never omitted the way
+/// the decoupled async cache insert could lag or drop it (CAIRN-2101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphFileChange {
+    pub path: String,
+    pub previous_path: Option<String>,
+    /// `added` | `modified` | `deleted` | `renamed` — the same vocabulary the
+    /// `file_changes` cache records, so the rendered table reads identically
+    /// whichever source produced it.
+    pub status: String,
+    pub additions: i32,
+    pub deletions: i32,
+}
+
+/// Cumulative changed files of a workspace against its recorded base, read from
+/// the live sealed jj graph rather than the side-channel `file_changes` cache.
+///
+/// Runs `jj diff --git -r '<base>..@'` from `ws`. The range revset is what makes
+/// this both correct and base-advance-resilient:
+///
+/// - It spans every sealed commit on the node's branch AND the loose edits in
+///   `@` (jj snapshots the working copy into `@`), so a just-sealed file can
+///   never lag the way the async cache insert could — the bug this fixes.
+/// - `base..@` is the node's OWN commits even when the base advanced and `@` has
+///   not yet rebased onto the new tip; a `--from base --to @` tree diff would
+///   instead pollute the result with the base-advance deltas (verified against
+///   jj 0.42).
+///
+/// `--ignore-working-copy` reads the last-recorded `@` without taking the
+/// working-copy lock, so this read-only projection never contends with the live
+/// agent's own jj operations (the same trade-off as [`list_files`]: an edit made
+/// since the last jj op won't show until the next snapshot, which the agent
+/// takes on nearly every operation).
+///
+/// Returns `None` when `ws` is not a jj workspace or neither base anchor
+/// resolves, so the caller falls back to the recorded cache (e.g. a torn-down
+/// workspace whose only surviving record is the DB).
+pub fn node_changed_files(
+    jj: &JjEnv,
+    ws: &Path,
+    base_branch: Option<&str>,
+    base_commit: Option<&str>,
+) -> Option<Vec<GraphFileChange>> {
+    if !is_jj_dir(ws) {
+        return None;
+    }
+    let base_rev = resolve_changed_base(jj, ws, base_branch, base_commit)?;
+    let revset = format!("{base_rev}..@");
+    let out = jj
+        .run(
+            ws,
+            &["diff", "--ignore-working-copy", "--git", "-r", &revset],
+            "jj diff --git (node changed)",
+        )
+        .ok()?;
+    Some(parse_git_diff(&out))
+}
+
+/// Resolve the base anchor for [`node_changed_files`] to a revset that resolves
+/// in the store, preferring the named base bookmark (resilient to a base
+/// advance: `bookmarks(exact:..)` tracks the current tip) over the recorded
+/// fork-point commit. Returns `None` when neither resolves, so the caller falls
+/// back to the cache rather than diffing against an empty set — which, as
+/// `<empty>..@`, would dump the workspace's entire history. Lock-free via
+/// `--ignore-working-copy`.
+fn resolve_changed_base(
+    jj: &JjEnv,
+    ws: &Path,
+    base_branch: Option<&str>,
+    base_commit: Option<&str>,
+) -> Option<String> {
+    if let Some(branch) = base_branch.filter(|s| !s.is_empty()) {
+        let rev = format!("bookmarks(exact:{branch:?})");
+        if changed_base_resolves(jj, ws, &rev) {
+            return Some(rev);
+        }
+    }
+    if let Some(commit) = base_commit.filter(|s| !s.is_empty()) {
+        if changed_base_resolves(jj, ws, commit) {
+            return Some(commit.to_string());
+        }
+    }
+    None
+}
+
+/// Whether `rev` resolves to a commit in the store, read lock-free. An exact
+/// bookmark that does not exist resolves to the empty set (empty stdout, exit
+/// 0), which this reports as unresolved.
+fn changed_base_resolves(jj: &JjEnv, ws: &Path, rev: &str) -> bool {
+    jj.run(
+        ws,
+        &[
+            "log",
+            "--ignore-working-copy",
+            "-r",
+            rev,
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+        "jj resolve (node changed base)",
+    )
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
+}
+
+/// Parse `jj diff --git` (standard git unified-diff) output into structured
+/// per-file changes. Status comes from the rename markers and the `/dev/null`
+/// side of the `---`/`+++` headers; `+`/`-` lines inside hunks are counted for
+/// the line totals. Pure (no jj invocation), so the risky bit carries its own
+/// unit tests.
+fn parse_git_diff(diff: &str) -> Vec<GraphFileChange> {
+    let mut files: Vec<GraphFileChange> = Vec::new();
+    let mut block: Option<DiffBlock> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some(done) = block.take() {
+                files.push(done.finish());
+            }
+            block = Some(DiffBlock::new(rest));
+            continue;
+        }
+        let Some(b) = block.as_mut() else { continue };
+        if line.starts_with("@@") {
+            // First hunk header: everything after is content, where a leading
+            // `+`/`-` is an added/removed line rather than a file header.
+            b.in_hunk = true;
+            continue;
+        }
+        if b.in_hunk {
+            if line.starts_with('+') {
+                b.additions += 1;
+            } else if line.starts_with('-') {
+                b.deletions += 1;
+            }
+            continue;
+        }
+        // Header region (before the first hunk): file-level metadata only.
+        if let Some(p) = line.strip_prefix("rename from ") {
+            b.renamed = true;
+            b.old_path = Some(unquote_diff_path(p));
+        } else if let Some(p) = line.strip_prefix("rename to ") {
+            b.renamed = true;
+            b.new_path = Some(unquote_diff_path(p));
+        } else if line.starts_with("new file mode") {
+            b.added = true;
+        } else if line.starts_with("deleted file mode") {
+            b.deleted = true;
+        } else if let Some(p) = line.strip_prefix("--- ") {
+            if p == "/dev/null" {
+                b.added = true;
+            } else {
+                b.old_path = Some(strip_diff_prefix(p));
+            }
+        } else if let Some(p) = line.strip_prefix("+++ ") {
+            if p == "/dev/null" {
+                b.deleted = true;
+            } else {
+                b.new_path = Some(strip_diff_prefix(p));
+            }
+        }
+    }
+    if let Some(done) = block.take() {
+        files.push(done.finish());
+    }
+    files
+}
+
+/// Accumulator for one `diff --git` file block while [`parse_git_diff`] scans.
+struct DiffBlock {
+    header_old: Option<String>,
+    header_new: Option<String>,
+    old_path: Option<String>,
+    new_path: Option<String>,
+    renamed: bool,
+    added: bool,
+    deleted: bool,
+    in_hunk: bool,
+    additions: i32,
+    deletions: i32,
+}
+
+impl DiffBlock {
+    fn new(header: &str) -> Self {
+        let (header_old, header_new) = parse_diff_header_paths(header);
+        DiffBlock {
+            header_old,
+            header_new,
+            old_path: None,
+            new_path: None,
+            renamed: false,
+            added: false,
+            deleted: false,
+            in_hunk: false,
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    fn finish(self) -> GraphFileChange {
+        let new_path = self.new_path.or(self.header_new);
+        let old_path = self.old_path.or(self.header_old);
+        let (status, path, previous_path) = if self.renamed {
+            (
+                "renamed",
+                new_path.or_else(|| old_path.clone()).unwrap_or_default(),
+                old_path,
+            )
+        } else if self.added {
+            ("added", new_path.or(old_path).unwrap_or_default(), None)
+        } else if self.deleted {
+            ("deleted", old_path.or(new_path).unwrap_or_default(), None)
+        } else {
+            ("modified", new_path.or(old_path).unwrap_or_default(), None)
+        };
+        GraphFileChange {
+            path,
+            previous_path,
+            status: status.to_string(),
+            additions: self.additions,
+            deletions: self.deletions,
+        }
+    }
+}
+
+/// Split a `diff --git a/X b/Y` header tail into (old, new) paths with the
+/// `a/`/`b/` prefixes stripped. Whitespace-split is unambiguous for the common
+/// no-space case; quoted/spaced paths fall back on the more reliable
+/// `---`/`+++`/`rename` lines, so this is only a backstop for hunkless entries
+/// (binary or pure mode changes).
+fn parse_diff_header_paths(header: &str) -> (Option<String>, Option<String>) {
+    let tokens: Vec<&str> = header.split_whitespace().collect();
+    if tokens.len() == 2 {
+        (
+            Some(strip_diff_prefix(tokens[0])),
+            Some(strip_diff_prefix(tokens[1])),
+        )
+    } else {
+        (None, None)
+    }
+}
+
+/// Strip a leading `a/`/`b/` diff prefix, then any surrounding quotes git adds
+/// for paths with special characters.
+fn strip_diff_prefix(path: &str) -> String {
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    unquote_diff_path(path)
+}
+
+/// Drop surrounding double quotes git adds around a path with special
+/// characters. C-escapes inside are left as-is (rare; the path still renders
+/// recognizably).
+fn unquote_diff_path(path: &str) -> String {
+    let trimmed = path.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|p| p.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 /// Export jj's state to the workspace's backing git refs (`jj git export`), so a
@@ -1473,6 +1795,180 @@ pub fn branch_descends_from(jj: &JjEnv, store: &Path, branch: &str, dest_commit:
     )
 }
 
+/// The change-id of a bookmark's tip over the store, or empty when the bookmark
+/// does not resolve. A jj *divergent* change's twins all share ONE change-id,
+/// and the bookmark points at exactly one of them, so this returns that shared
+/// id even mid-divergence. `--ignore-working-copy` keeps it store-driven.
+pub fn change_id_of(jj: &JjEnv, store: &Path, branch: &str) -> String {
+    jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            &format!("bookmarks(exact:{branch:?})"),
+            "--no-graph",
+            "-T",
+            "change_id",
+            "--ignore-working-copy",
+        ],
+        "change id of bookmark",
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default()
+}
+
+/// Every visible commit id sharing one change-id over the store. A healthy change
+/// resolves to exactly one commit; a jj *divergent* change (the `<id>/0 /1 ...`
+/// accumulation) resolves to several. The `change_id(...)` revset function is
+/// used (not the bare id) because jj refuses a bare divergent change-id symbol.
+pub fn visible_commit_ids_for_change(jj: &JjEnv, store: &Path, change_id: &str) -> Vec<String> {
+    jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            &format!("change_id({change_id})"),
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+            "--ignore-working-copy",
+        ],
+        "visible commits for change",
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(|l| l.trim().to_string())
+    .filter(|l| !l.is_empty())
+    .collect()
+}
+
+/// Count the visible commits sharing one change-id over the store. Thin wrapper
+/// over [`visible_commit_ids_for_change`].
+pub fn visible_commits_for_change(jj: &JjEnv, store: &Path, change_id: &str) -> usize {
+    visible_commit_ids_for_change(jj, store, change_id).len()
+}
+
+/// One twin of a (possibly) divergent change: its commit id and whether it
+/// carries a recorded conflict.
+struct Twin {
+    commit: String,
+    conflicted: bool,
+}
+
+/// The result of collapsing a (possibly) divergent change on a bookmark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollapseOutcome {
+    /// The change resolves to 0 or 1 visible commit — nothing to collapse.
+    NotDivergent,
+    /// Exactly one non-conflicted twin survived: the bookmark now points at it
+    /// and every other twin was abandoned.
+    Collapsed {
+        kept: String,
+        abandoned: Vec<String>,
+    },
+    /// Canonicalization is ambiguous — every twin conflicts, or more than one
+    /// carries edits. The store is left UNTOUCHED for a human to resolve.
+    Ambiguous {
+        change_id: String,
+        twins: Vec<String>,
+    },
+}
+
+/// Collapse a *pre-existing* divergent change on `branch` over the shared store.
+/// New divergence is already prevented upstream (the per-store mutex plus the
+/// idempotent [`reconcile_siblings`] skip); this heals a twin that forked BEFORE
+/// that serialization landed, or via an external `jj` op outside Cairn's lock —
+/// the cleanup `reconcile_siblings` never did, because it operates on each
+/// bookmark's single tip and never touches the orphaned twin sharing the
+/// change-id, so [`sealed_commit_is_lost`] keeps firing on every re-seal.
+///
+/// Resolves the bookmark tip's change-id, lists every visible commit sharing it,
+/// and:
+/// - 0 or 1 visible commit -> [`CollapseOutcome::NotDivergent`] (no-op);
+/// - exactly one NON-conflicted twin -> keep it, `bookmark set` the bookmark to
+///   it, abandon the conflicted twin(s) -> [`CollapseOutcome::Collapsed`];
+/// - otherwise (every twin conflicts, or more than one clean twin) ->
+///   [`CollapseOutcome::Ambiguous`] with NO mutation.
+///
+/// The single-clean-twin rule is the deliberate hybrid: the lone resolved commit
+/// the agent produced is the unambiguous keep, but choosing among several clean
+/// twins (or among only-conflicted ones) would be a guess on the shared store
+/// that could lose work, so those tangles surface to a human instead. There is
+/// deliberately NO descendancy tiebreak among multiple clean twins.
+///
+/// Mutations use `--ignore-working-copy` (store-driven, like `reconcile_siblings`).
+/// The caller MUST hold the per-store lock so the collapse cannot itself fork.
+pub fn collapse_divergent_bookmark(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+) -> Result<CollapseOutcome, String> {
+    // A bookmark that does not resolve to a local tip (missing, or a
+    // remote-tracking dest like `main@origin`) has nothing to collapse here.
+    if bookmark_commit(jj, store, branch).is_none() {
+        return Ok(CollapseOutcome::NotDivergent);
+    }
+    let change_id = change_id_of(jj, store, branch);
+    if change_id.is_empty() {
+        return Ok(CollapseOutcome::NotDivergent);
+    }
+
+    let commit_ids = visible_commit_ids_for_change(jj, store, &change_id);
+    if commit_ids.len() <= 1 {
+        return Ok(CollapseOutcome::NotDivergent);
+    }
+
+    // Classify each twin by whether it carries a recorded conflict. A transient
+    // check error falls to `false` (treat as clean) — the same
+    // liveness-over-strictness convention as the reconcile guards; the
+    // single-clean-twin rule below still surfaces anything genuinely ambiguous.
+    let twins: Vec<Twin> = commit_ids
+        .into_iter()
+        .map(|commit| {
+            let conflicted = revset_has_conflict(jj, store, &commit).unwrap_or(false);
+            Twin { commit, conflicted }
+        })
+        .collect();
+
+    let clean: Vec<&Twin> = twins.iter().filter(|twin| !twin.conflicted).collect();
+    if clean.len() != 1 {
+        return Ok(CollapseOutcome::Ambiguous {
+            change_id,
+            twins: twins.into_iter().map(|twin| twin.commit).collect(),
+        });
+    }
+
+    let kept = clean[0].commit.clone();
+    let abandoned: Vec<String> = twins
+        .iter()
+        .filter(|twin| twin.commit != kept)
+        .map(|twin| twin.commit.clone())
+        .collect();
+
+    // Point the bookmark at the surviving clean twin FIRST (so it never strands
+    // on a commit we are about to abandon), then drop every other twin.
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            &kept,
+            "--ignore-working-copy",
+        ],
+        "collapse: point bookmark at the clean twin",
+    )?;
+    for commit in &abandoned {
+        jj.run(
+            store,
+            &["abandon", commit, "--ignore-working-copy"],
+            "collapse: abandon divergent twin",
+        )?;
+    }
+    Ok(CollapseOutcome::Collapsed { kept, abandoned })
+}
+
 /// Reconcile in-flight siblings onto the locally-advanced integration tip: the
 /// store already owns the merge (the child's commit was folded into the
 /// integration bookmark by `merge_into_bookmark`), so there is no fetch or origin
@@ -1664,6 +2160,70 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false)
             .then_some(bin)
+    }
+
+    #[test]
+    fn base_marker_round_trips() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
+
+        // Absent marker reads as None.
+        assert_eq!(read_base_marker(dir.path()), None);
+
+        // Branch + rev round-trip through the two-line format, landing beside
+        // the branch marker in the non-snapshotted `.jj` dir.
+        write_base_marker(dir.path(), "agent/CAIRN-2091-coordinator-0", "e4555f70").unwrap();
+        assert_eq!(
+            read_base_marker(dir.path()),
+            Some((
+                "agent/CAIRN-2091-coordinator-0".to_string(),
+                "e4555f70".to_string()
+            ))
+        );
+        assert!(dir.path().join(".jj").join("cairn-base").exists());
+
+        // A branch-only marker yields an empty rev rather than failing.
+        write_base_marker(dir.path(), "main", "").unwrap();
+        assert_eq!(
+            read_base_marker(dir.path()),
+            Some(("main".to_string(), String::new()))
+        );
+    }
+
+    /// Provision a real non-colocated workspace, record the base marker as
+    /// production does (after `add_workspace`), and assert it persists across a
+    /// seal — the `.jj` dir is never snapshotted, so the marker is invisible to
+    /// the working-copy commit, exactly like the branch marker.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn base_marker_provisions_and_survives_a_seal() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping base_marker_provisions_and_survives_a_seal: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let ws = wts.path().join("job");
+        add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+        write_base_marker(&ws, "main", "deadbeef").unwrap();
+        assert_eq!(
+            read_base_marker(&ws),
+            Some(("main".to_string(), "deadbeef".to_string()))
+        );
+
+        // Seal real work; the marker still reads (non-snapshotted).
+        std::fs::write(ws.join("f.rs"), "code\n").unwrap();
+        seal(&jj, &ws, "work", None).unwrap();
+        assert_eq!(
+            read_base_marker(&ws),
+            Some(("main".to_string(), "deadbeef".to_string()))
+        );
     }
 
     #[test]
@@ -2015,6 +2575,179 @@ mod tests {
         discard(&jj, &b).unwrap();
         assert!(!is_working_copy_dirty(&jj, &b).unwrap());
         assert!(!b.join("scratch.rs").exists(), "discard removes the dirt");
+    }
+
+    /// The `--git` parser classifies modify/add/delete and counts `+`/`-` lines
+    /// per file. Input is verbatim `jj diff --git` output (jj 0.42).
+    #[test]
+    fn parse_git_diff_classifies_modify_add_delete_with_counts() {
+        let diff = "\
+diff --git a/a.txt b/a.txt
+index df967b96a5..f6474b4ea7 100644
+--- a/a.txt
++++ b/a.txt
+@@ -1,1 +1,3 @@
+ base
++more
++loose
+diff --git a/b.txt b/b.txt
+deleted file mode 100644
+index 3367afdbbf..0000000000
+--- a/b.txt
++++ /dev/null
+@@ -1,1 +0,0 @@
+-old
+diff --git a/c.txt b/c.txt
+new file mode 100644
+index 0000000000..fa49b07797
+--- /dev/null
++++ b/c.txt
+@@ -0,0 +1,1 @@
++new file
+";
+        let changes = parse_git_diff(diff);
+        assert_eq!(changes.len(), 3, "{changes:?}");
+
+        let a = &changes[0];
+        assert_eq!(a.path, "a.txt");
+        assert_eq!(a.status, "modified");
+        assert_eq!((a.additions, a.deletions), (2, 0));
+        assert_eq!(a.previous_path, None);
+
+        let b = &changes[1];
+        assert_eq!(b.path, "b.txt");
+        assert_eq!(b.status, "deleted");
+        assert_eq!((b.additions, b.deletions), (0, 1));
+
+        let c = &changes[2];
+        assert_eq!(c.path, "c.txt");
+        assert_eq!(c.status, "added");
+        assert_eq!((c.additions, c.deletions), (1, 0));
+    }
+
+    /// A rename carries the previous path and counts only real content lines
+    /// (the `rename from/to` headers are not edits).
+    #[test]
+    fn parse_git_diff_reports_rename_with_previous_path() {
+        let diff = "\
+diff --git a/orig.txt b/renamed.txt
+rename from orig.txt
+rename to renamed.txt
+index 83db48f84e..788e1a6204 100644
+--- a/orig.txt
++++ b/renamed.txt
+@@ -1,3 +1,4 @@
+ line1
+ line2
+ line3
++added
+";
+        let changes = parse_git_diff(diff);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let r = &changes[0];
+        assert_eq!(r.status, "renamed");
+        assert_eq!(r.path, "renamed.txt");
+        assert_eq!(r.previous_path.as_deref(), Some("orig.txt"));
+        assert_eq!((r.additions, r.deletions), (1, 0));
+    }
+
+    /// A removed line whose content begins with `-` (e.g. a markdown rule) must
+    /// count as a deletion, not be mistaken for a `--- ` file header. The header
+    /// `---`/`+++` lines only precede the first `@@`.
+    #[test]
+    fn parse_git_diff_counts_dashy_content_lines_inside_hunks() {
+        let diff = "\
+diff --git a/doc.md b/doc.md
+index 1111111111..2222222222 100644
+--- a/doc.md
++++ b/doc.md
+@@ -1,2 +1,2 @@
+ title
+---- old rule
++++ new rule
+";
+        let changes = parse_git_diff(diff);
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let d = &changes[0];
+        assert_eq!(d.path, "doc.md");
+        assert_eq!(d.status, "modified");
+        assert_eq!((d.additions, d.deletions), (1, 1));
+    }
+
+    #[test]
+    fn parse_git_diff_empty_is_empty() {
+        assert!(parse_git_diff("").is_empty());
+    }
+
+    /// A non-jj directory yields `None` so the projection falls back to the
+    /// recorded cache. No jj binary is invoked (the `.jj` probe short-circuits).
+    #[test]
+    fn node_changed_files_returns_none_for_non_jj_dir() {
+        let jj = JjEnv::resolve("jj", Path::new("/tmp"));
+        let dir = TempDir::new().unwrap();
+        assert!(node_changed_files(&jj, dir.path(), Some("main"), None).is_none());
+    }
+
+    /// The graph-derived change set lists a SEALED file (the omission this fixes)
+    /// AND a loose, un-sealed `@` edit, while leaving the unchanged base file
+    /// out. Drives the real shared-store seal path, mirroring the seal/discard
+    /// fixture.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn node_changed_files_derives_sealed_and_loose_against_base() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping node_changed_files_derives_sealed_and_loose_against_base: jj not resolvable via CAIRN_JJ_BIN/PATH"
+            );
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        let author = GitAuthor::new("Alice", "alice@example.com");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let a = wts.path().join("jobA");
+        add_workspace(
+            &jj,
+            &store,
+            &a,
+            "agent/CAIRN-1-builder-0",
+            "main",
+            Some(&author),
+        )
+        .unwrap();
+
+        // Seal a new file: it must appear in the graph-derived change set.
+        std::fs::write(a.join("mod.rs"), "code\n").unwrap();
+        let res = seal(&jj, &a, "agent work", Some(&author)).unwrap();
+        assert!(!res.sha.is_empty());
+
+        // A loose, un-sealed edit, snapshotted into `@` by a jj op (as the
+        // agent's own operations do before a reviewer reads `/changed`).
+        std::fs::write(a.join("loose.rs"), "wip\n").unwrap();
+        assert!(is_working_copy_dirty(&jj, &a).unwrap());
+
+        let changes = node_changed_files(&jj, &a, Some("main"), None)
+            .expect("jj workspace resolves the base bookmark");
+        let by_path: std::collections::HashMap<&str, &GraphFileChange> =
+            changes.iter().map(|c| (c.path.as_str(), c)).collect();
+
+        let sealed = by_path.get("mod.rs").expect("sealed file present in graph");
+        assert_eq!(sealed.status, "added");
+        assert_eq!(sealed.additions, 1);
+
+        let loose = by_path
+            .get("loose.rs")
+            .expect("loose @ edit present in graph");
+        assert_eq!(loose.status, "added");
+
+        assert!(
+            !by_path.contains_key("shared.rs"),
+            "the unchanged base file must not appear: {changes:?}"
+        );
     }
 
     /// `list_files` enumerates a non-colocated workspace's tracked files — the
@@ -2557,51 +3290,6 @@ mod tests {
             commit_overlap_after_first, commit_overlap_after_second,
             "a second reconcile at the same dest tip leaves the conflicted commit id unchanged (no redundant wake)"
         );
-    }
-
-    /// Count the visible commits sharing one change-id over the store. A healthy
-    /// change resolves to exactly one commit; a jj *divergent* change (the
-    /// `<id>/0 /1 ...` accumulation this fix prevents) resolves to several. The
-    /// `change_id(...)` revset function is used (not the bare id) because jj
-    /// refuses a bare divergent change-id symbol.
-    fn visible_commits_for_change(jj: &JjEnv, store: &Path, change_id: &str) -> usize {
-        jj.run(
-            store,
-            &[
-                "log",
-                "-r",
-                &format!("change_id({change_id})"),
-                "--no-graph",
-                "-T",
-                "commit_id ++ \"\\n\"",
-                "--ignore-working-copy",
-            ],
-            "visible commits for change",
-        )
-        .unwrap()
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count()
-    }
-
-    /// The change-id of a bookmark's tip over the store.
-    fn change_id_of(jj: &JjEnv, store: &Path, branch: &str) -> String {
-        jj.run(
-            store,
-            &[
-                "log",
-                "-r",
-                &format!("bookmarks(exact:{branch:?})"),
-                "--no-graph",
-                "-T",
-                "change_id",
-                "--ignore-working-copy",
-            ],
-            "change id of bookmark",
-        )
-        .unwrap()
-        .trim()
-        .to_string()
     }
 
     /// Acceptance: advancing the integration base with a conflicting change under
@@ -3282,6 +3970,530 @@ mod tests {
             visible_commits_for_change(&jj, &store, &cid_overlap),
             1,
             "the skip-guarded reconcile does not re-mint a divergent twin"
+        );
+    }
+
+    const DIV_INT: &str = "agent/CAIRN-2100-coordinator-0";
+    const DIV_SIBLING: &str = "agent/CAIRN-1-builder-0";
+
+    /// A project store with an integration bookmark and one `agent/...` sibling
+    /// branched from it, the sibling sealed editing `shared.rs`. The TempDirs are
+    /// kept alive by the returned struct.
+    struct DivergenceFixture {
+        _home: TempDir,
+        _proj: TempDir,
+        _wts: TempDir,
+        jj: JjEnv,
+        store: PathBuf,
+        ws_sibling: PathBuf,
+    }
+
+    fn setup_divergence_fixture(bin: &str) -> DivergenceFixture {
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        add_workspace(
+            &jj,
+            &store,
+            &wts.path().join("coord"),
+            DIV_INT,
+            "main",
+            None,
+        )
+        .unwrap();
+        let ws_sibling = wts.path().join("sibling");
+        add_workspace(&jj, &store, &ws_sibling, DIV_SIBLING, DIV_INT, None).unwrap();
+        std::fs::write(ws_sibling.join("shared.rs"), "sibling-edit\n").unwrap();
+        seal(&jj, &ws_sibling, "sibling edits shared", None).unwrap();
+        DivergenceFixture {
+            _home: home,
+            _proj: proj,
+            _wts: wts,
+            jj,
+            store,
+            ws_sibling,
+        }
+    }
+
+    /// Advance the integration tip with a `shared.rs` edit that conflicts with the
+    /// sibling's edit; returns the new tip commit id (a conflicting rebase dest).
+    fn advance_int_conflicting(jj: &JjEnv, store: &Path, content: &str) -> String {
+        jj.run(store, &["new", DIV_INT], "new on int").unwrap();
+        std::fs::write(store.join("shared.rs"), content).unwrap();
+        jj.run(
+            store,
+            &["describe", "-m", "int advances shared"],
+            "describe int",
+        )
+        .unwrap();
+        let tip = jj
+            .run(
+                store,
+                &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+                "int tip",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+        jj.run(
+            store,
+            &[
+                "bookmark",
+                "set",
+                DIV_INT,
+                "-r",
+                "@",
+                "--ignore-working-copy",
+            ],
+            "advance int bookmark",
+        )
+        .unwrap();
+        tip
+    }
+
+    /// Mint a divergent change on the sibling carrying one CONFLICTED twin (the
+    /// base-advance copy rebased onto a conflicting dest) and one CLEAN twin (the
+    /// original commit re-described, standing in for the agent's resolved
+    /// re-seal), via two forked ops from the same base operation. Returns
+    /// (shared change-id, conflicted twin id, clean twin id). The change-id is
+    /// captured BEFORE the fork (a single pre-fork commit) because the forked
+    /// bookmark itself goes divergent.
+    fn fork_conflicted_and_clean(
+        jj: &JjEnv,
+        store: &Path,
+        conflicting_dest: &str,
+    ) -> (String, String, String) {
+        let cid = change_id_of(jj, store, DIV_SIBLING);
+        let base_op = current_op_id(jj, store);
+        jj.run(
+            store,
+            &[
+                "rebase",
+                "-b",
+                DIV_SIBLING,
+                "-o",
+                conflicting_dest,
+                "--ignore-working-copy",
+                "--at-op",
+                &base_op,
+            ],
+            "fork conflicted twin",
+        )
+        .unwrap();
+        jj.run(
+            store,
+            &[
+                "describe",
+                DIV_SIBLING,
+                "-m",
+                "agent resolved re-seal",
+                "--ignore-working-copy",
+                "--at-op",
+                &base_op,
+            ],
+            "fork clean twin",
+        )
+        .unwrap();
+        // Any normal command merges the divergent op heads.
+        let _ = jj.run(
+            store,
+            &[
+                "log",
+                "-r",
+                "root()",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "trigger op merge",
+        );
+        let ids = visible_commit_ids_for_change(jj, store, &cid);
+        assert_eq!(ids.len(), 2, "fork mints exactly two twins");
+        let conflicted = ids
+            .iter()
+            .find(|c| revset_has_conflict(jj, store, c).unwrap())
+            .cloned()
+            .expect("one conflicted twin");
+        let clean = ids
+            .iter()
+            .find(|c| !revset_has_conflict(jj, store, c).unwrap())
+            .cloned()
+            .expect("one clean twin");
+        (cid, conflicted, clean)
+    }
+
+    /// (1) Self-heal: a divergent change with one conflicted twin (the
+    /// base-advance copy) and one clean twin (the agent's resolved re-seal)
+    /// collapses to the clean twin — the bookmark repoints, the conflicted twin is
+    /// abandoned, and the change resolves to a single visible commit.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn collapse_self_heals_one_conflicted_one_clean_twin() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping collapse_self_heals_one_conflicted_one_clean_twin: jj not resolvable"
+            );
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
+        let (cid, conflicted, clean) = fork_conflicted_and_clean(&fx.jj, &fx.store, &dest);
+
+        // Production: the agent's re-seal leaves the bookmark on the CLEAN twin
+        // while the base-advance conflicted twin orphans. Pin it there.
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    DIV_SIBLING,
+                    "-r",
+                    &clean,
+                    "--ignore-working-copy",
+                ],
+                "pin bookmark to clean twin",
+            )
+            .unwrap();
+
+        // Precondition: divergent, exactly one conflicted + one clean twin.
+        assert_eq!(visible_commits_for_change(&fx.jj, &fx.store, &cid), 2);
+        assert!(revset_has_conflict(&fx.jj, &fx.store, &conflicted).unwrap());
+        assert!(!revset_has_conflict(&fx.jj, &fx.store, &clean).unwrap());
+
+        let outcome = collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        assert_eq!(
+            outcome,
+            CollapseOutcome::Collapsed {
+                kept: clean.clone(),
+                abandoned: vec![conflicted.clone()],
+            }
+        );
+        assert_eq!(
+            visible_commits_for_change(&fx.jj, &fx.store, &cid),
+            1,
+            "the change resolves to a single visible commit after collapse"
+        );
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            clean,
+            "the bookmark points at the surviving clean twin"
+        );
+    }
+
+    /// (2) THE #162 closure: after collapsing the divergence, an agent re-seal on
+    /// the sibling workspace returns `Ok` — `sealed_commit_is_lost` no longer fires
+    /// (a single visible commit) and the re-sealed commit carries no resurfaced
+    /// conflict. This is the invariant the thrash violated.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn reseal_after_collapse_returns_ok_without_resurfaced_conflict() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping reseal_after_collapse_returns_ok_without_resurfaced_conflict: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        // Park the workspace `@` off the sibling's sealed change before forking, so
+        // ONLY the sealed change diverges. In production `@` is a fresh working
+        // copy on the sibling tip, never itself divergent; without this, the
+        // `--at-op` fork rewrites the whole subtree (including `@`) and corrupts
+        // the working-copy commit — a test artifact, not the real failure mode.
+        fx.jj
+            .run(
+                &fx.ws_sibling,
+                &["new", "main"],
+                "park workspace @ off the sibling",
+            )
+            .unwrap();
+        let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
+        let (cid, _conflicted, clean) = fork_conflicted_and_clean(&fx.jj, &fx.store, &dest);
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    DIV_SIBLING,
+                    "-r",
+                    &clean,
+                    "--ignore-working-copy",
+                ],
+                "pin bookmark to clean twin",
+            )
+            .unwrap();
+
+        let outcome = collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        assert!(matches!(outcome, CollapseOutcome::Collapsed { .. }));
+        assert_eq!(visible_commits_for_change(&fx.jj, &fx.store, &cid), 1);
+
+        // Bring the workspace current onto the collapsed tip (the production
+        // re-parent a reconcile performs), then drive an agent re-seal. Before the
+        // collapse this seal tripped the lost-seal backstop (still-divergent
+        // change) and returned `LOST_SEAL_MSG`; now it lands cleanly.
+        let conflicted =
+            advance_workspace_onto(&fx.jj, &fx.store, &fx.ws_sibling, DIV_SIBLING, &clean).unwrap();
+        assert!(
+            !conflicted,
+            "advancing onto the clean collapsed tip is conflict-free"
+        );
+        std::fs::write(fx.ws_sibling.join("resolved.rs"), "resolved\n").unwrap();
+        let result = seal(&fx.jj, &fx.ws_sibling, "re-seal after collapse", None);
+        assert!(
+            result.is_ok(),
+            "the re-seal returns Ok (no lost-seal thrash): {result:?}"
+        );
+        assert!(
+            !branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            "the re-sealed sibling carries no resurfaced conflict"
+        );
+    }
+
+    /// (3) Ambiguous — both twins conflicted: every twin still conflicts, so there
+    /// is no single clean keep. The helper holds and surfaces, mutating nothing.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn collapse_holds_when_all_twins_conflicted() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping collapse_holds_when_all_twins_conflicted: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        let d1 = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced-1\n");
+        // A second distinct conflicting tip off the same base, so the two forked
+        // rebases land the sibling on different parents (both conflicted).
+        let cid = change_id_of(&fx.jj, &fx.store, DIV_SIBLING);
+        fx.jj
+            .run(&fx.store, &["new", "main"], "new D2 off base")
+            .unwrap();
+        std::fs::write(fx.store.join("shared.rs"), "int-advanced-2\n").unwrap();
+        fx.jj
+            .run(&fx.store, &["describe", "-m", "advance 2"], "describe D2")
+            .unwrap();
+        let d2 = fx
+            .jj
+            .run(
+                &fx.store,
+                &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+                "D2 tip",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+        let base_op = current_op_id(&fx.jj, &fx.store);
+        for (dest, label) in [(&d1, "rebase onto D1"), (&d2, "rebase onto D2")] {
+            fx.jj
+                .run(
+                    &fx.store,
+                    &[
+                        "rebase",
+                        "-b",
+                        DIV_SIBLING,
+                        "-o",
+                        dest,
+                        "--ignore-working-copy",
+                        "--at-op",
+                        &base_op,
+                    ],
+                    label,
+                )
+                .unwrap();
+        }
+        let _ = fx.jj.run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                "root()",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "trigger op merge",
+        );
+        let ids = visible_commit_ids_for_change(&fx.jj, &fx.store, &cid);
+        assert_eq!(ids.len(), 2);
+        assert!(ids
+            .iter()
+            .all(|c| revset_has_conflict(&fx.jj, &fx.store, c).unwrap()));
+        // Pin the bookmark to one twin so it resolves to a single tip.
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    DIV_SIBLING,
+                    "-r",
+                    &ids[0],
+                    "--ignore-working-copy",
+                ],
+                "pin bookmark",
+            )
+            .unwrap();
+        let pinned = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+
+        let outcome = collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        match outcome {
+            CollapseOutcome::Ambiguous { change_id, twins } => {
+                assert_eq!(change_id, cid);
+                assert_eq!(twins.len(), 2);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        assert_eq!(
+            visible_commits_for_change(&fx.jj, &fx.store, &cid),
+            2,
+            "an ambiguous tangle leaves the store untouched"
+        );
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            pinned,
+            "the bookmark is not moved"
+        );
+    }
+
+    /// (4) Ambiguous — both twins clean (both carry edits): more than one clean
+    /// keep means picking one would guess. Hold and surface, mutating nothing.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn collapse_holds_when_multiple_clean_twins() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping collapse_holds_when_multiple_clean_twins: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        let cid = change_id_of(&fx.jj, &fx.store, DIV_SIBLING);
+        let base_op = current_op_id(&fx.jj, &fx.store);
+        // Two re-describes of the same change from one base op: two clean twins.
+        for (msg, label) in [("twin a", "fork clean a"), ("twin b", "fork clean b")] {
+            fx.jj
+                .run(
+                    &fx.store,
+                    &[
+                        "describe",
+                        DIV_SIBLING,
+                        "-m",
+                        msg,
+                        "--ignore-working-copy",
+                        "--at-op",
+                        &base_op,
+                    ],
+                    label,
+                )
+                .unwrap();
+        }
+        let _ = fx.jj.run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                "root()",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "trigger op merge",
+        );
+        let ids = visible_commit_ids_for_change(&fx.jj, &fx.store, &cid);
+        assert_eq!(ids.len(), 2);
+        assert!(ids
+            .iter()
+            .all(|c| !revset_has_conflict(&fx.jj, &fx.store, c).unwrap()));
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    DIV_SIBLING,
+                    "-r",
+                    &ids[0],
+                    "--ignore-working-copy",
+                ],
+                "pin bookmark",
+            )
+            .unwrap();
+        let pinned = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+
+        let outcome = collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        assert!(
+            matches!(outcome, CollapseOutcome::Ambiguous { .. }),
+            "two clean twins are ambiguous: {outcome:?}"
+        );
+        assert_eq!(visible_commits_for_change(&fx.jj, &fx.store, &cid), 2);
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            pinned
+        );
+    }
+
+    /// (5) A healthy single-commit bookmark is NotDivergent and mutates nothing.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn collapse_noops_on_healthy_bookmark() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping collapse_noops_on_healthy_bookmark: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        let cid = change_id_of(&fx.jj, &fx.store, DIV_SIBLING);
+        let before = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        assert_eq!(visible_commits_for_change(&fx.jj, &fx.store, &cid), 1);
+
+        let outcome = collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        assert_eq!(outcome, CollapseOutcome::NotDivergent);
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            before
+        );
+    }
+
+    /// (6) Idempotence: collapsing an already-collapsed bookmark is a no-op — the
+    /// second pass sees a single visible commit and returns NotDivergent.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn collapse_is_idempotent() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping collapse_is_idempotent: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
+        let (cid, _conflicted, clean) = fork_conflicted_and_clean(&fx.jj, &fx.store, &dest);
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "set",
+                    DIV_SIBLING,
+                    "-r",
+                    &clean,
+                    "--ignore-working-copy",
+                ],
+                "pin bookmark to clean twin",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            CollapseOutcome::Collapsed { .. }
+        ));
+        let after_first = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+
+        let second = collapse_divergent_bookmark(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        assert_eq!(second, CollapseOutcome::NotDivergent);
+        assert_eq!(visible_commits_for_change(&fx.jj, &fx.store, &cid), 1);
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            after_first
         );
     }
 
@@ -4158,6 +5370,102 @@ mod tests {
             is_working_copy_dirty(&jj, &ws_coord),
             Ok(false),
             "the worktree is clean and equals the advanced @ after self-heal"
+        );
+    }
+
+    /// The #158 recovery contract at the jj layer: a child folds into the
+    /// coordinator's integration base, leaving the coordinator workspace STALE.
+    /// The primitives `recover_stale_file_commit` chains — reconcile the stale
+    /// workspace onto the advanced base (the `update_stale` it calls, here via the
+    /// production `advance_workspace_onto`), re-apply the agent's edit, then
+    /// re-seal — must land the batch ON the advanced base, preserving BOTH the
+    /// merged sibling work and the agent's edit, never losing either. (The
+    /// loose-edits-during-rebase shape that mints a divergent twin — correctly
+    /// caught by the lost-seal guard — is a distinct failure tracked as a separate
+    /// follow-up; this pins the common clean case.)
+    #[test]
+    #[serial_test::serial(jj)]
+    fn stale_seal_recovers_batch_onto_advanced_base() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping stale_seal_recovers_batch_onto_advanced_base: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        // A child folds into the coordinator's integration bookmark, advancing the
+        // base and leaving the coordinator workspace STALE behind it — the
+        // post-advance race that routes a write into recovery.
+        let (int_tip, ws_coord, int) =
+            fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
+
+        // Recovery (a): reconcile the stale coordinator onto the advanced base.
+        // `advance_workspace_onto` performs the store-side rebase plus the same
+        // `update_stale` `recover_stale_file_commit` calls, materializing the
+        // merged sibling work. Re-parenting the empty `@` leaves no divergent twin.
+        advance_workspace_onto(&jj, &store, &ws_coord, &int, &int_tip).unwrap();
+        assert!(
+            ws_coord.join("child.rs").exists(),
+            "the merged sibling's work is materialized on the advanced base"
+        );
+
+        // Recovery (b): re-apply the agent's batch edit against the advanced base.
+        std::fs::write(ws_coord.join("feature.rs"), "agent feature\n").unwrap();
+
+        // Recovery (c): re-seal — lands a real commit on the advanced base.
+        let result = seal(&jj, &ws_coord, "agent feature", None).unwrap();
+        assert!(
+            !result.sha.is_empty(),
+            "the recovered batch seals a real commit"
+        );
+        assert_eq!(
+            is_working_copy_dirty(&jj, &ws_coord),
+            Ok(false),
+            "the worktree equals HEAD after the recovered seal"
+        );
+
+        // The sealed commit (`@-`) carries the agent's edit...
+        let sealed_names = jj
+            .run(
+                &ws_coord,
+                &["diff", "-r", "@-", "--name-only"],
+                "recovered seal contents",
+            )
+            .unwrap();
+        assert!(
+            sealed_names.contains("feature.rs"),
+            "the recovered seal commits the agent's edit: {sealed_names}"
+        );
+
+        // ...and the integration bookmark advanced FORWARD over the merged sibling
+        // tip, so neither the sibling's merged work nor the agent's edit was lost.
+        let int_after = bookmark_commit(&jj, &store, &int).unwrap();
+        let fwd = jj
+            .run(
+                &store,
+                &[
+                    "log",
+                    "-r",
+                    &format!("{int_tip} & ::{int_after}"),
+                    "--no-graph",
+                    "-T",
+                    "commit_id",
+                ],
+                "forward-only check",
+            )
+            .unwrap();
+        assert_eq!(
+            fwd, int_tip,
+            "the recovered seal advances the base forward over the merged sibling work, never backward"
+        );
+        assert!(
+            ws_coord.join("feature.rs").exists() && ws_coord.join("child.rs").exists(),
+            "both the agent's edit and the merged sibling work coexist after recovery"
         );
     }
 

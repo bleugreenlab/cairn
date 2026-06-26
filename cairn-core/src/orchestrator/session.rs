@@ -451,7 +451,10 @@ fn build_orientation_block(
         out.push_str(&format!("- Project: `{}`\n", key));
     }
     if let Some(root) = repo_root {
-        out.push_str(&format!("- Repository root: `{}`\n", root));
+        out.push_str(&format!(
+            "- Repository root (the project's primary checkout, on its own branch \u{2014} NOT your working tree; do not `cd` here): `{}`\n",
+            root
+        ));
     }
     if let Some(branch) = base_branch {
         out.push_str(&format!("- Base branch: `{}`\n", branch));
@@ -1760,7 +1763,10 @@ mod tests {
         assert!(block.contains("cairn://p/CAIRN/1288/1/builder"));
         assert!(block.contains("cairn:~/"));
         assert!(block.contains("Project: `CAIRN`"));
-        assert!(block.contains("Repository root: `/repos/cairn`"));
+        // Repository root is relabeled so it can't be mistaken for the working tree.
+        assert!(block.contains("Repository root"));
+        assert!(block.contains("do not `cd` here"));
+        assert!(block.contains("`/repos/cairn`"));
         assert!(block.contains("Base branch: `main`"));
         // Platform is always present, regardless of optional fields.
         assert!(block.contains(std::env::consts::OS));
@@ -1816,7 +1822,7 @@ mod tests {
         );
         assert!(block.contains("Working directory (cwd): `/work/wt`"));
         assert!(!block.contains("Project:"));
-        assert!(!block.contains("Repository root:"));
+        assert!(!block.contains("Repository root"));
         assert!(!block.contains("Base branch:"));
         assert!(!block.contains("Model:"));
         assert!(block.contains("Platform:"));

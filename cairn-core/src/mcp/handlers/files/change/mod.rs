@@ -126,6 +126,56 @@ fn apply_file_changes<'a>(
         .collect()
 }
 
+/// Persist a give-up discard's would-be-lost edits to the job scratch dir
+/// (`$TMPDIR`, in the sandbox writable set per `docs/worktree-fence.md`) so the
+/// agent can re-apply them after retrying — making the recovery invariant's
+/// "preserved/recoverable" clause true from the agent's seat, not just from the
+/// jj operation log an agent cannot realistically reach. `patch` is captured
+/// BEFORE any `update-stale`/`discard`, so it reflects the agent's full intended
+/// batch against the pre-advance base. Best-effort: a `None`/empty patch or a
+/// write failure yields `None` and the error simply omits the path.
+fn preserve_discarded_edits(patch: Option<&str>) -> Option<std::path::PathBuf> {
+    let patch = patch?;
+    if patch.trim().is_empty() {
+        return None;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("cairn-discarded-edits-{ts}.patch"));
+    std::fs::write(&path, patch).ok()?;
+    Some(path)
+}
+
+/// Build the give-up failure message: the seal failed, `detail` names the
+/// recovery step that couldn't proceed, the worktree was restored to HEAD (or
+/// that restore itself failed), and — when edits were preserved — the scratch
+/// path the agent can re-apply from. Pure, so the give-up contract is unit-tested
+/// without an Orchestrator or jj binary.
+fn give_up_error_message(
+    seal_error: &str,
+    detail: &str,
+    restore: &Result<(), String>,
+    preserved: Option<&std::path::Path>,
+) -> String {
+    let recovery = match preserved {
+        Some(path) => format!(
+            " Your edits were saved to {} — re-apply them after retrying.",
+            path.display()
+        ),
+        None => String::new(),
+    };
+    match restore {
+        Ok(()) => format!(
+            "Applied file changes but commit failed: {seal_error}; {detail}, so the worktree was restored to HEAD. Retry the write.{recovery}"
+        ),
+        Err(re) => format!(
+            "Applied file changes but commit failed: {seal_error}; {detail}, and restoring the worktree to HEAD also failed: {re}.{recovery}"
+        ),
+    }
+}
+
 /// Recover a write+commit_msg batch whose seal hit a STALE working copy
 /// ([`CommitOutcome::StaleRetry`]). A sibling advanced `@` over the shared store
 /// between apply and seal; the loose edits are still on disk. Clear the staleness
@@ -134,7 +184,9 @@ fn apply_file_changes<'a>(
 /// re-match the advanced base — preserving a sibling's edits elsewhere in a
 /// touched file and failing cleanly when the sibling rewrote the anchored region
 /// itself. Every failure mode falls back to a stale-resilient discard, so the
-/// worktree==HEAD invariant holds even when recovery can't land the batch.
+/// worktree==HEAD invariant holds even when recovery can't land the batch — and
+/// each give-up first persists the agent's would-be-lost edits to scratch (see
+/// [`preserve_discarded_edits`]) so "recoverable" is true from the agent's seat.
 async fn recover_stale_file_commit(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -148,19 +200,20 @@ async fn recover_stale_file_commit(
     let atomic = payload.atomic.unwrap_or(false);
     let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, cwd);
 
+    // Capture the agent's loose edits NOW, before any update-stale/discard can
+    // overwrite them, so a give-up can persist them to scratch (Fix B). This
+    // reflects the full intended batch against the pre-advance base regardless of
+    // which give-up branch fires later. Best-effort: `None` if jj can't diff.
+    let captured_patch = vcs.capture_patch(cwd);
+
     // Giveup failure: revert via the stale-resilient discard and report that the
     // worktree was restored to HEAD (the Phase-1 invariant), with retry guidance.
-    // `detail` names the recovery step that couldn't proceed.
+    // `detail` names the recovery step that couldn't proceed; the captured patch
+    // is persisted to scratch so the discarded edits are recoverable.
     let give_up = |vcs: &dyn crate::mcp::vcs::WorktreeVcs, detail: &str| -> Box<IndexedFailure> {
+        let preserved = preserve_discarded_edits(captured_patch.as_deref());
         let restore = vcs.discard(cwd);
-        let error = match restore {
-            Ok(()) => format!(
-                "Applied file changes but commit failed: {seal_error}; {detail}, so the worktree was restored to HEAD. Retry the write."
-            ),
-            Err(re) => format!(
-                "Applied file changes but commit failed: {seal_error}; {detail}, and restoring the worktree to HEAD also failed: {re}"
-            ),
-        };
+        let error = give_up_error_message(seal_error, detail, &restore, preserved.as_deref());
         Box::new(IndexedFailure {
             failure: ChangeFailure {
                 index: first_file_change.index,
@@ -1337,6 +1390,96 @@ mod change_preview_tests {
     }
 
     #[test]
+    fn prepare_file_changes_patch_non_unique_old_string_errors() {
+        // A literal old_string matching more than one site with replace_all
+        // unset is a footgun: silently editing the first match would let the
+        // caller believe they edited the unique site they meant. It must error.
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("dup.txt");
+        std::fs::write(&file, "x\nx\nx\n").unwrap();
+        let item = patch_item("file:dup.txt", "x", "y");
+        let changes = vec![IndexedChange {
+            index: 0,
+            item: &item,
+        }];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for non-unique old_string"),
+            Err(err) => err,
+        };
+        assert!(
+            err.failure.error.contains("matched 3 sites"),
+            "error should name the match count, got: {}",
+            err.failure.error
+        );
+        assert!(
+            err.failure.error.contains("replace_all"),
+            "error should mention replace_all, got: {}",
+            err.failure.error
+        );
+        // prepare_file_changes never writes; the on-disk file is untouched.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\nx\nx\n");
+    }
+
+    #[test]
+    fn prepare_file_changes_patch_single_match_applies() {
+        // The unique-match case is unchanged: exactly one occurrence applies.
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("single.txt");
+        std::fs::write(&file, "keep\nunique\nkeep\n").unwrap();
+        let item = patch_item("file:single.txt", "unique", "changed");
+        let changes = vec![IndexedChange {
+            index: 0,
+            item: &item,
+        }];
+
+        let (prepared, _) = prepare_file_changes(temp.path(), &changes, false).unwrap();
+        match &prepared[0] {
+            PreparedChange::Write { content, .. } => {
+                assert_eq!(content, "keep\nchanged\nkeep\n");
+            }
+            _ => panic!("expected write"),
+        }
+    }
+
+    #[test]
+    fn prepare_file_changes_patch_non_unique_after_earlier_item_errors() {
+        // Bug #81: a later item's old_string is unique on disk but becomes
+        // non-unique against the in-flight content an earlier item produced.
+        // The count runs against the working content the patch operates on, so
+        // item B errors with a clear count message instead of failing-and-
+        // reverting the whole batch with an empty error.
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("batch.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        // Item A makes a second "beta" appear in the in-flight content.
+        let item_a = patch_item("file:batch.txt", "gamma", "beta");
+        // Item B's old_string is unique on disk but non-unique after A.
+        let item_b = patch_item("file:batch.txt", "beta", "delta");
+        let changes = vec![
+            IndexedChange {
+                index: 0,
+                item: &item_a,
+            },
+            IndexedChange {
+                index: 1,
+                item: &item_b,
+            },
+        ];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for non-unique in-flight old_string"),
+            Err(err) => err,
+        };
+        assert_eq!(err.failure.index, 1, "item B should be the failing item");
+        assert!(
+            err.failure.error.contains("matched 2 sites"),
+            "error should name the in-flight match count, got: {}",
+            err.failure.error
+        );
+    }
+
+    #[test]
     fn prepare_file_changes_ignores_top_level_flat_keys() {
         // The flat file shape is gone. A top-level `content` with no `payload`
         // deserializes into an unknown (ignored) field, so create finds no
@@ -1573,5 +1716,80 @@ mod change_preview_tests {
         );
         // transactional stays false here, so it is still omitted.
         assert!(!object.contains_key("transactional"));
+    }
+
+    // ---- Fix B: give-up edit preservation (the #158 residual recoverability) ----
+
+    #[test]
+    fn preserve_discarded_edits_writes_patch_to_scratch() {
+        let patch = "diff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let path = preserve_discarded_edits(Some(patch))
+            .expect("a non-empty patch is persisted to scratch");
+        assert!(path.exists(), "the patch file is written");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), patch);
+        assert!(
+            path.starts_with(std::env::temp_dir()),
+            "the patch lands in the scratch/temp dir (in the sandbox writable set): {path:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn preserve_discarded_edits_skips_empty_or_absent() {
+        assert!(
+            preserve_discarded_edits(None).is_none(),
+            "nothing to preserve when no patch was captured"
+        );
+        assert!(
+            preserve_discarded_edits(Some("   \n")).is_none(),
+            "a whitespace-only patch is not worth a scratch file"
+        );
+    }
+
+    #[test]
+    fn give_up_error_message_cites_preserved_path_and_retry() {
+        let preserved = std::path::PathBuf::from("/tmp/scratch/cairn-discarded-edits-1.patch");
+        let msg = give_up_error_message(
+            "seal captured no change",
+            "an anchored edit no longer matched the advanced base",
+            &Ok(()),
+            Some(preserved.as_path()),
+        );
+        assert!(msg.contains("restored to HEAD"), "got: {msg}");
+        assert!(msg.contains("Retry the write"), "got: {msg}");
+        assert!(
+            msg.contains("cairn-discarded-edits-1.patch"),
+            "the scratch path is cited so the agent can re-apply: {msg}"
+        );
+        assert!(msg.contains("re-apply"), "got: {msg}");
+    }
+
+    #[test]
+    fn give_up_error_message_omits_path_when_nothing_preserved() {
+        let msg = give_up_error_message(
+            "the working copy is stale",
+            "recovering the stale worktree failed (x)",
+            &Ok(()),
+            None,
+        );
+        assert!(msg.contains("restored to HEAD"), "got: {msg}");
+        assert!(
+            !msg.contains("saved to"),
+            "no recovery clause without a preserved patch: {msg}"
+        );
+    }
+
+    #[test]
+    fn give_up_error_message_surfaces_failed_restore() {
+        let msg = give_up_error_message(
+            "seal failed",
+            "the batch includes a structural rename that can't be re-derived",
+            &Err("restore blew up".to_string()),
+            None,
+        );
+        assert!(
+            msg.contains("restoring the worktree to HEAD also failed: restore blew up"),
+            "got: {msg}"
+        );
     }
 }

@@ -42,6 +42,7 @@ use uuid::Uuid;
 use super::{AgentBackend, DiscoveredModel, ResolvedTools, SessionConfig};
 
 const CLAUDE_BACKEND_NAME: &str = "Claude";
+const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 512;
 
 /// State for tracking a durable streaming message.
 #[derive(Debug)]
@@ -232,12 +233,20 @@ impl StreamingState {
             name,
             input_chars: 0,
             status: "constructing".to_string(),
+            input_preview: Some(String::new()),
         });
     }
 
     fn push_tool_input_delta(&mut self, partial_json: &str) {
         if let Some(tool_write) = self.tool_write.as_mut() {
             tool_write.input_chars += partial_json.chars().count() as i32;
+            if let Some(preview) = tool_write.input_preview.as_mut() {
+                let remaining =
+                    TOOL_INPUT_PREVIEW_MAX_CHARS.saturating_sub(preview.chars().count());
+                if remaining > 0 {
+                    preview.extend(partial_json.chars().take(remaining));
+                }
+            }
         }
     }
 }

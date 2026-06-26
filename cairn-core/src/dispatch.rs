@@ -32,6 +32,7 @@ pub async fn dispatch_tool(
     let mut reminders = Vec::new();
     augment_with_queued_dms(orch, request, &mut reminders).await;
     augment_with_dirty_worktree_notice(orch, request, &mut reminders).await;
+    augment_with_terminal_poll_nudge(orch, request, &mut reminders).await;
     DispatchOutput { content, reminders }
 }
 
@@ -182,6 +183,12 @@ pub(crate) fn hash_content(content: &str) -> u64 {
 const NUDGE_COUNT: u32 = 3;
 const NUDGE_DISTINCT: usize = 3;
 
+/// Reads of the same terminal within one turn before nudging the agent to set a
+/// wake instead of polling. Re-fires every multiple thereafter (the 3rd, 6th,
+/// 9th… read). Conservative to start; tune from the `terminal_poll_nudge`
+/// telemetry, mirroring [`NUDGE_COUNT`].
+const TERMINAL_POLL_NUDGE_COUNT: u32 = 3;
+
 /// Canonical JSON for a value with every object's keys recursively sorted.
 ///
 /// Byte-identical payloads already produce the same string; sorting is cheap
@@ -285,6 +292,186 @@ fn dirty_notice_scope_cache() -> &'static std::sync::Mutex<std::collections::Has
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Nudge an agent that is busy-polling a still-running terminal toward setting a
+/// wake and ending its turn.
+///
+/// A terminal read can never trip the content-aware flail dedup: its status
+/// banner carries `elapsed`/`last output ... ago` fields that advance on every
+/// poll (and an actively compiling terminal's buffer changes too), so the
+/// content hash differs every call and the `Duplicate` branch never fires. The
+/// only reliable busy-poll signal is therefore a content-independent *call
+/// count* — "this agent read this terminal N times this turn" — tracked per turn
+/// via [`crate::agent_process::process::ProcessState::record_repeat`].
+///
+/// A poll loop is a single turn (an agent that reads a still-running terminal and
+/// *ends* its turn goes idle, and with no wake nothing resumes it), so the
+/// per-turn grain is exactly right. The nudge rides [`DispatchOutput::reminders`]
+/// as a `<system-reminder>`, leaving the structured read envelope untouched, and
+/// never blocks the read: the agent always gets the live terminal output plus the
+/// reminder, so a single confirming read is never penalized.
+async fn augment_with_terminal_poll_nudge(
+    orch: &crate::orchestrator::Orchestrator,
+    request: &crate::mcp::types::McpCallbackRequest,
+    reminders: &mut Vec<String>,
+) {
+    let Some(run_id) = request.run_id.as_deref() else {
+        return;
+    };
+    // Early-out on the hot path: only a read carrying a terminal target is a
+    // candidate. Collect terminal targets from the read-batch (`paths`) and
+    // single-read (`uri`/`path`) payload shapes; non-terminal calls return here.
+    let targets = collect_terminal_targets(&request.payload);
+    if targets.is_empty() {
+        return;
+    }
+
+    for (identity, slug) in targets {
+        // Content-independent: key on the query-stripped identity so `?new=true`
+        // and a plain read of the same terminal count as one target.
+        let fingerprint = format!("terminal_poll\u{1}{identity}");
+        let count = orch.process_state.record_repeat(run_id, &fingerprint);
+        // Fire on the Nth read and every multiple thereafter (3rd, 6th, 9th…),
+        // not on every read past the threshold.
+        if count < TERMINAL_POLL_NUDGE_COUNT || !count.is_multiple_of(TERMINAL_POLL_NUDGE_COUNT) {
+            continue;
+        }
+        // The agent that already subscribed a wake on this terminal is doing the
+        // right thing (a single confirming read) -> do not nudge.
+        if terminal_wake_active(orch, run_id, &slug).await {
+            continue;
+        }
+        log::info!("terminal_poll_nudge: run={run_id} slug={slug} count={count}");
+        reminders.push(build_terminal_poll_nudge(&slug, count));
+    }
+}
+
+/// Collect distinct terminal read targets from a tool payload as
+/// `(query-stripped identity, slug)` pairs. Reads the read-batch `paths` array
+/// and the single-read `uri`/`path` fields; any non-terminal target is skipped.
+fn collect_terminal_targets(payload: &serde_json::Value) -> Vec<(String, String)> {
+    let mut raw: Vec<String> = Vec::new();
+    if let Some(paths) = payload.get("paths").and_then(|value| value.as_array()) {
+        raw.extend(
+            paths
+                .iter()
+                .filter_map(|entry| entry.as_str().map(str::to_string)),
+        );
+    }
+    for key in ["uri", "path"] {
+        if let Some(target) = payload.get(key).and_then(|value| value.as_str()) {
+            raw.push(target.to_string());
+        }
+    }
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for target in raw {
+        if let Some((identity, slug)) = terminal_identity_and_slug(&target) {
+            // The same terminal listed twice in one call is one read of it.
+            if !out.iter().any(|(existing, _)| existing == &identity) {
+                out.push((identity, slug));
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a read target to its `(query-stripped identity, terminal slug)` when
+/// it names a terminal, else `None`.
+///
+/// Handles both the agent-facing home-relative `cairn:~/terminal/<slug>` form —
+/// which `parse_uri` does **not** resolve, yet is exactly what agents type — and
+/// a canonical `.../terminal/<slug>` URI (node, task, or project terminal).
+fn terminal_identity_and_slug(target: &str) -> Option<(String, String)> {
+    let identity = target.split('?').next().unwrap_or(target).trim();
+    if identity.is_empty() {
+        return None;
+    }
+    // Home-relative `cairn:~/terminal/<slug>` (exactly one trailing segment).
+    if let Some(rest) = identity.strip_prefix("cairn:~/terminal/") {
+        if rest.is_empty() || rest.contains('/') {
+            return None;
+        }
+        return Some((identity.to_string(), rest.to_string()));
+    }
+    // Canonical node/task/project terminal URIs.
+    match cairn_common::uri::parse_uri(identity) {
+        Some(
+            cairn_common::uri::CairnResource::NodeTerminal { slug, .. }
+            | cairn_common::uri::CairnResource::TaskTerminal { slug, .. }
+            | cairn_common::uri::CairnResource::ProjectTerminal { slug, .. },
+        ) => Some((identity.to_string(), slug)),
+        _ => None,
+    }
+}
+
+/// Whether the agent's job already holds an active wake subscription on this
+/// terminal. A best-effort, fail-open check: a slug-suffix match against the
+/// `process`-kind subscriptions avoids re-deriving the full canonical URI while
+/// staying specific (subscriptions store the canonical `.../terminal/<slug>` URI
+/// as `source_ref`). Any query error or unresolved job returns `false` so the
+/// nudge still fires rather than being silently swallowed.
+async fn terminal_wake_active(
+    orch: &crate::orchestrator::Orchestrator,
+    run_id: &str,
+    slug: &str,
+) -> bool {
+    let Some(job_id) = crate::messages::side_channel::job_id_for_run(&orch.db.local, run_id).await
+    else {
+        return false;
+    };
+    // Escape LIKE metacharacters in the slug so a slug containing `_` or `%`
+    // (e.g. `my_dev`) matches literally rather than as a wildcard — a raw slug
+    // here could otherwise suppress the nudge for a *different* terminal whose
+    // slug differs only at that position. (Two same-slug terminals across nodes
+    // in one job still cross-suppress via this suffix match; that is acceptable:
+    // the only failure direction is a missed nudge, never a wrong one, and it
+    // avoids re-deriving the full canonical URI here.)
+    let escaped = slug
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%/terminal/{escaped}");
+    orch.db
+        .local
+        .read(move |conn| {
+            let job_id = job_id.clone();
+            let pattern = pattern.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM wake_subscriptions
+                         WHERE job_id = ?1 AND state = 'active'
+                           AND source_kind = 'process'
+                           AND source_ref LIKE ?2 ESCAPE '\\'
+                         LIMIT 1",
+                        turso::params![job_id.as_str(), pattern.as_str()],
+                    )
+                    .await?;
+                Ok(rows.next().await?.is_some())
+            })
+        })
+        .await
+        .unwrap_or(false)
+}
+
+/// Build the terminal-poll nudge: name the terminal and the poll count, then give
+/// copy-pasteable subscribe calls for both the finishing-command (exit) and
+/// never-exiting-process (output phrase) cases. Uses the agent-facing
+/// `cairn:~/terminal/<slug>` form so the suggested calls paste directly.
+fn build_terminal_poll_nudge(slug: &str, count: u32) -> String {
+    format!(
+        "You've read `cairn:~/terminal/{slug}` {count} times this turn and it hasn't finished. \
+         Polling a terminal spends your turn waiting on it. Instead, set a wake and end your turn \
+         — you'll resume the moment it's ready, with the exit code and final output:\n\n  \
+         • a command that should finish — wake on exit:\n    \
+         write cairn:~/wakes {{subscribe:{{kind:\"terminal\", ref:\"cairn:~/terminal/{slug}\", \
+         on:\"exit\"}}}}\n  • a long-running process that never exits (a dev server) — wake on a \
+         readiness line:\n    write cairn:~/wakes {{subscribe:{{kind:\"terminal\", \
+         ref:\"cairn:~/terminal/{slug}\", on:\"output\", phrase:\"<line it prints when ready>\"}}}}\
+         \n\nSubscribe, then end your turn. Do not keep reading the terminal."
+    )
 }
 
 /// Stable key for a call: tool name plus the canonical JSON of the full
@@ -486,6 +673,7 @@ async fn augment_with_queued_dms(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::types::McpCallbackRequest;
 
     #[test]
     fn is_read_family_covers_static_reads_excludes_terminal_mutations_and_watch() {
@@ -577,5 +765,212 @@ mod tests {
         // Count below threshold, but many distinct fingerprints repeated.
         let stub = build_dup_stub("read", "x", 2, NUDGE_DISTINCT);
         assert!(stub.contains("retry loop"));
+    }
+
+    #[test]
+    fn terminal_identity_and_slug_handles_home_relative_and_canonical() {
+        // The agent-facing home-relative form (what agents actually type) is
+        // recognized even though `parse_uri` does not resolve it.
+        assert_eq!(
+            terminal_identity_and_slug("cairn:~/terminal/run-1"),
+            Some(("cairn:~/terminal/run-1".to_string(), "run-1".to_string()))
+        );
+        // Query is stripped from the identity; slug preserved.
+        assert_eq!(
+            terminal_identity_and_slug("cairn:~/terminal/dev?new=true"),
+            Some(("cairn:~/terminal/dev".to_string(), "dev".to_string()))
+        );
+        // Canonical node terminal URI.
+        assert_eq!(
+            terminal_identity_and_slug("cairn://p/CAIRN/1/1/builder/terminal/build"),
+            Some((
+                "cairn://p/CAIRN/1/1/builder/terminal/build".to_string(),
+                "build".to_string()
+            ))
+        );
+        // Non-terminal targets and deeper home-relative shapes are rejected.
+        assert_eq!(terminal_identity_and_slug("file:src/lib.rs"), None);
+        assert_eq!(terminal_identity_and_slug("cairn://p/CAIRN/1"), None);
+        assert_eq!(terminal_identity_and_slug("cairn:~/terminal/a/b"), None);
+        assert_eq!(terminal_identity_and_slug("cairn:~/todos"), None);
+    }
+
+    /// Build an orchestrator over a fresh migrated db with one tracked process
+    /// serving `turn_id`, the minimal state the nudge augmentation reads.
+    async fn orch_with_tracked_turn(
+        run_id: &str,
+        turn_id: &str,
+    ) -> crate::orchestrator::Orchestrator {
+        use crate::db::DbState;
+        use crate::orchestrator::Orchestrator;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let db = crate::storage::migrated_test_db("dispatch_terminal_nudge.db").await;
+        let dir = tempfile::tempdir().unwrap().keep();
+        let index = Arc::new(SearchIndex::open_or_create(dir.join("idx.db")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), index));
+        let orch =
+            Orchestrator::builder(db_state, Arc::new(TestServicesBuilder::new().build()), dir)
+                .build();
+        orch.process_state.processes.lock().unwrap().register(
+            run_id.to_string(),
+            crate::agent_process::process::RunHandle::test_handle(Some("s"), Some("j")),
+        );
+        orch.process_state
+            .set_current_turn_id(run_id, Some(turn_id));
+        orch
+    }
+
+    fn terminal_read_request(run_id: &str, paths: serde_json::Value) -> McpCallbackRequest {
+        McpCallbackRequest {
+            cwd: "/tmp".to_string(),
+            run_id: Some(run_id.to_string()),
+            tool: "read_batch".to_string(),
+            payload: serde_json::json!({ "paths": paths }),
+            tool_use_id: None,
+        }
+    }
+
+    async fn nudge_for(
+        orch: &crate::orchestrator::Orchestrator,
+        request: &McpCallbackRequest,
+    ) -> Vec<String> {
+        let mut reminders = Vec::new();
+        augment_with_terminal_poll_nudge(orch, request, &mut reminders).await;
+        reminders
+    }
+
+    #[tokio::test]
+    async fn terminal_poll_nudge_fires_on_third_read_not_before() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        let req = terminal_read_request("run-1", serde_json::json!(["cairn:~/terminal/run-1"]));
+
+        assert!(nudge_for(&orch, &req).await.is_empty(), "read 1");
+        assert!(nudge_for(&orch, &req).await.is_empty(), "read 2");
+        let fired = nudge_for(&orch, &req).await;
+        assert_eq!(fired.len(), 1, "read 3 should nudge");
+        let body = &fired[0];
+        assert!(body.contains("subscribe"));
+        assert!(body.contains("on:\"exit\""));
+        assert!(body.contains("cairn:~/terminal/run-1"));
+    }
+
+    #[tokio::test]
+    async fn no_nudge_for_single_read_or_distinct_terminals() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        let a = nudge_for(
+            &orch,
+            &terminal_read_request("run-1", serde_json::json!(["cairn:~/terminal/a"])),
+        )
+        .await;
+        let b = nudge_for(
+            &orch,
+            &terminal_read_request("run-1", serde_json::json!(["cairn:~/terminal/b"])),
+        )
+        .await;
+        assert!(a.is_empty() && b.is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_terminal_nudge_for_non_terminal_reads() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        let req = terminal_read_request(
+            "run-1",
+            serde_json::json!(["file:src/lib.rs", "cairn://p/CAIRN/1"]),
+        );
+        for _ in 0..5 {
+            assert!(nudge_for(&orch, &req).await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_poll_nudge_refires_on_every_third_read() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        let req = terminal_read_request("run-1", serde_json::json!(["cairn:~/terminal/dev"]));
+        let mut fired = Vec::new();
+        for _ in 1..=6 {
+            fired.push(!nudge_for(&orch, &req).await.is_empty());
+        }
+        // Fires on the 3rd and 6th read, not on 1, 2, 4, or 5.
+        assert_eq!(fired, vec![false, false, true, false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn active_subscription_suppresses_terminal_poll_nudge() {
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        // job_id_for_run reads the `runs` table; seed the parent chain plus a run
+        // mapping run-1 -> job j, then an active terminal-exit subscription whose
+        // canonical source_ref ends with /terminal/dev.
+        orch.db
+            .local
+            .execute_script(
+                "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
+                 INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
+                 INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES('j','p','i','running','s',1,1);
+                 INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at) VALUES('run-1','p','i','j','running',1,1);",
+            )
+            .await
+            .unwrap();
+        crate::orchestrator::wakes::subscribe_one_shot(
+            &orch.db.local,
+            "j",
+            "process",
+            Some("cairn://p/P/1/1/builder/terminal/dev"),
+            Some(&["terminal_exit".to_string()]),
+            "agent",
+        )
+        .await
+        .unwrap();
+
+        let req = terminal_read_request("run-1", serde_json::json!(["cairn:~/terminal/dev"]));
+        for _ in 0..3 {
+            assert!(
+                nudge_for(&orch, &req).await.is_empty(),
+                "an active wake on the terminal should suppress the nudge"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn underscore_slug_does_not_cross_match_via_like_wildcard() {
+        // A subscription on terminal `axb` must NOT suppress the nudge for a
+        // *different* terminal `a_b`: the `_` is a LIKE wildcard and would match
+        // `axb` unless it is escaped. Regression test for the suppression query.
+        let orch = orch_with_tracked_turn("run-1", "turn-1").await;
+        orch.db
+            .local
+            .execute_script(
+                "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
+                 INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
+                 INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES('j','p','i','running','s',1,1);
+                 INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at) VALUES('run-1','p','i','j','running',1,1);",
+            )
+            .await
+            .unwrap();
+        // Active subscription is on `axb`, not `a_b`.
+        crate::orchestrator::wakes::subscribe_one_shot(
+            &orch.db.local,
+            "j",
+            "process",
+            Some("cairn://p/P/1/1/builder/terminal/axb"),
+            Some(&["terminal_exit".to_string()]),
+            "agent",
+        )
+        .await
+        .unwrap();
+
+        let req = terminal_read_request("run-1", serde_json::json!(["cairn:~/terminal/a_b"]));
+        assert!(nudge_for(&orch, &req).await.is_empty(), "read 1");
+        assert!(nudge_for(&orch, &req).await.is_empty(), "read 2");
+        // The `axb` subscription must not match `a_b`, so the nudge still fires.
+        assert_eq!(
+            nudge_for(&orch, &req).await.len(),
+            1,
+            "an unrelated same-shape slug must not suppress via a LIKE wildcard"
+        );
     }
 }

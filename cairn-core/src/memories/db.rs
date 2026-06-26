@@ -903,6 +903,18 @@ pub async fn project_key_by_id(db: &LocalDb, project_id: &str) -> DbResult<Strin
     .await
 }
 
+pub async fn project_name_by_id(db: &LocalDb, project_id: &str) -> DbResult<String> {
+    let project_id = project_id.to_string();
+    db.query_one(
+        "SELECT name FROM projects \
+         WHERE id = ?1 OR (?1 = 'workspace' AND is_workspace = 1) \
+         ORDER BY CASE WHEN id = ?1 THEN 0 ELSE 1 END LIMIT 1",
+        params![project_id.as_str()],
+        |row| row.text(0),
+    )
+    .await
+}
+
 pub async fn backfill_workspace_project_id(db: &LocalDb) -> DbResult<u64> {
     db.execute(
         "UPDATE memories SET project_id = 'workspace' WHERE project_id IS NULL",
@@ -1544,5 +1556,18 @@ mod tests {
         let db = test_db().await;
         assert_eq!(project_key_by_id(&db, "workspace").await.unwrap(), "WKS");
         assert_eq!(project_key_by_id(&db, "project-1").await.unwrap(), "PRJ");
+    }
+
+    #[tokio::test]
+    async fn project_name_by_id_resolves_workspace_name_dynamically() {
+        let db = test_db().await;
+        assert_eq!(
+            project_name_by_id(&db, "workspace").await.unwrap(),
+            "Workspace"
+        );
+        assert_eq!(
+            project_name_by_id(&db, "project-1").await.unwrap(),
+            "Project"
+        );
     }
 }

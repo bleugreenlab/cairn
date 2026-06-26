@@ -1529,10 +1529,11 @@ fn finish_memory_review_if_due(orch: &Orchestrator, job_id: &str, run_id: &str) 
     };
 
     match state.state.as_deref() {
-        // Fire the end-step when the job has finished its real work (an
-        // artifact exists) and either captured drafts to review (any run,
-        // tasks included) or is a top-level node job worth a reflection nudge.
-        None if state.has_artifact && (state.draft_count > 0 || !state.is_task) => {
+        // Fire the end-step when the job has finished its real work (the
+        // declared output artifact exists) and either captured drafts to review
+        // (any run, tasks included) or is a top-level node job worth a
+        // reflection nudge.
+        None if state.has_output_artifact && (state.draft_count > 0 || !state.is_task) => {
             match crate::memories::commands::send_memory_review_on_idle(orch, job_id, run_id) {
                 Ok(true) => log::info!(
                     "Sent memory {} prompt for job {} ({} draft memor{})",
@@ -2748,7 +2749,7 @@ mod memory_review_tests {
                      FROM issues i
                      JOIN executions e ON e.issue_id = i.id
                      WHERE i.project_id = 'p-review'
-                       AND i.title LIKE 'Memory triage: project=p-review%'
+                       AND i.title LIKE 'Memory triage: project=P%'
                        AND e.recipe_id = 'memory-triage'",
                     (),
                     |row| row.i64(0),

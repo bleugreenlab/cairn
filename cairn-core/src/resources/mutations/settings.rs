@@ -337,6 +337,34 @@ mod tests {
     }
 
     #[test]
+    fn pref_keys_is_superset_of_uri_writable_update_settings_fields() {
+        // PREF_KEYS gates which keys a `cairn://settings` patch routes to
+        // `update_settings`. Every non-deprecated `UpdateSettings` field is meant
+        // to be URI-writable (docs/settings.md), so a field added to the DTO
+        // without a matching PREF_KEYS entry would be silently rejected as an
+        // "unknown settings key". Reflect the DTO's field names via serde and
+        // assert PREF_KEYS covers them, so that drift fails CI instead of
+        // shipping a dead key.
+        const DEPRECATED: &[&str] = &["systemPrompt", "autoStartJobs"];
+        let serialized = serde_json::to_value(UpdateSettings::default())
+            .expect("UpdateSettings serializes to JSON");
+        let fields = serialized
+            .as_object()
+            .expect("UpdateSettings serializes to an object");
+        for key in fields.keys() {
+            if DEPRECATED.contains(&key.as_str()) {
+                continue;
+            }
+            assert!(
+                PREF_KEYS.contains(&key.as_str()),
+                "UpdateSettings field '{key}' is URI-writable but missing from \
+                 PREF_KEYS; add it to the allowlist in \
+                 resources/mutations/settings.rs so cairn://settings accepts it"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_read_only_github_key() {
         let error = validate(&["github"]).unwrap_err();
         assert!(error.contains("read-only"), "{error}");

@@ -878,7 +878,50 @@ pub(crate) async fn produce_cairn_resource(
     };
 
     let affordance = {
-        let block = affordance_for_kind(resource.kind());
+        // Node/task artifacts derive their affordance example from the schema the
+        // addressed name actually validates against, so a copied example is a
+        // valid write even for a custom schema (CAIRN #170). Fall back to the
+        // static contract block when no schema resolves.
+        let block = match &resource {
+            CairnResource::NodeArtifact {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                name,
+            } => super::node::artifact_affordance_block(
+                orch,
+                project,
+                *number,
+                *exec_seq,
+                node_id,
+                None,
+                name.as_deref(),
+                resource.kind(),
+            )
+            .await
+            .unwrap_or_else(|| affordance_for_kind(resource.kind())),
+            CairnResource::TaskArtifact {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+                name,
+            } => super::node::artifact_affordance_block(
+                orch,
+                project,
+                *number,
+                *exec_seq,
+                node_id,
+                Some(task_name),
+                name.as_deref(),
+                resource.kind(),
+            )
+            .await
+            .unwrap_or_else(|| affordance_for_kind(resource.kind())),
+            _ => affordance_for_kind(resource.kind()),
+        };
         (!block.is_empty()).then_some(Affordance {
             kind: SegmentKind::Resource,
             block,
@@ -1565,17 +1608,10 @@ async fn render_resource_body(
             node_id,
         } => {
             if params.is_empty() {
-                read_node_changed(&orch.db.local, &project, number, exec_seq, &node_id).await
+                read_node_changed(orch, &project, number, exec_seq, &node_id).await
             } else {
-                read_node_changed_projection(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &params,
-                )
-                .await
+                read_node_changed_projection(orch, &project, number, exec_seq, &node_id, &params)
+                    .await
             }
         }
         CairnResource::ProjectMessages { project } => {

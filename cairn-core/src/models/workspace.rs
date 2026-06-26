@@ -110,8 +110,13 @@ pub struct Settings {
     pub openrouter_routing: OpenRouterRouting,
 }
 
-/// DTO for updating settings
-#[derive(Debug, Clone, Deserialize)]
+/// DTO for updating settings.
+///
+/// Also derives `Serialize` and `Default` so the `cairn://settings` allowlist
+/// (`PREF_KEYS`) can reflect this DTO's URI-writable field names in a drift-guard
+/// test: serializing `UpdateSettings::default()` enumerates the camelCase keys a
+/// settings patch must accept. See `resources/mutations/settings.rs`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettings {
     // === Preset fields ===

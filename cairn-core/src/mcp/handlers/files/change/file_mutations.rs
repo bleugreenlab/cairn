@@ -323,6 +323,18 @@ pub(crate) fn literal_not_found_diagnostic(old: &str, new: &str) -> String {
     msg
 }
 
+/// Build a message when a literal (non-wildcard) `old_string` matches more than
+/// one site and `replace_all` was not set. Editing the first match silently
+/// would let the caller believe they edited the unique site they meant, so this
+/// is an explicit, actionable error instead.
+pub(crate) fn non_unique_match_diagnostic(count: usize) -> String {
+    format!(
+        "old_string matched {count} sites in the file; refusing to edit just the first one. \
+         Add surrounding context so old_string uniquely identifies the one site you mean, \
+         or pass replace_all:true to rewrite all {count} matches."
+    )
+}
+
 /// Shorten a hint fragment so diagnostics stay readable.
 fn truncate_for_hint(s: &str) -> String {
     const MAX: usize = 40;
@@ -731,13 +743,25 @@ pub(super) fn prepare_file_changes(
                         // Not a wildcard edit: strip escaping backslashes so an
                         // escaped marker (`\\~~*~~`) targets a literal `~~*~~`.
                         let literal_old = crate::mcp::wildcard::unescape_literal(old);
-                        if !content.contains(literal_old.as_str()) {
+                        let replace_all = fp.replace_all.unwrap_or(false);
+                        // Count occurrences against the in-flight working content the
+                        // patch operates on, so an earlier item in the same batch that
+                        // made old_string non-unique surfaces a clear count error
+                        // instead of silently editing the first match.
+                        let matches = content.matches(literal_old.as_str()).count();
+                        if matches == 0 {
                             return Err(build_failure(
                                 change.index,
                                 item,
                                 literal_not_found_diagnostic(&literal_old, new),
                             ));
-                        } else if fp.replace_all.unwrap_or(false) {
+                        } else if matches > 1 && !replace_all {
+                            return Err(build_failure(
+                                change.index,
+                                item,
+                                non_unique_match_diagnostic(matches),
+                            ));
+                        } else if replace_all {
                             content.replace(literal_old.as_str(), new.as_str())
                         } else {
                             content.replacen(literal_old.as_str(), new.as_str(), 1)

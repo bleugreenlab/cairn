@@ -308,8 +308,28 @@ pub fn skip_if_fenced(test: &str) -> bool {
 
     if explicitly_sandboxed || run_tool_context {
         eprintln!("skipping {test}: cannot run nested inside a Cairn worktree fence");
+        record_fence_skip(test);
         true
     } else {
         false
+    }
+}
+
+// Best-effort: append a self-skipped test name to `$CAIRN_SKIP_LOG` (set by
+// `scripts/test-rust.ts`) so the runner can report how many tests skipped under
+// the fence. libtest swallows the skip message of a passing test, so without
+// this the skip is indistinguishable from a real pass. (#157)
+pub fn record_fence_skip(test: &str) {
+    if let Some(log) = std::env::var_os("CAIRN_SKIP_LOG") {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+        {
+            // One write_all (vs writeln!'s multiple syscalls) keeps the append
+            // atomic when parallel test threads all skip at once.
+            let _ = f.write_all(format!("{test}\n").as_bytes());
+        }
     }
 }

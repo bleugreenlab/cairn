@@ -429,7 +429,7 @@ const NEW_STRING: KeySpec = KeySpec::new(
 const REPLACE_ALL: KeySpec = KeySpec::new(
     "replace_all",
     KeyType::Bool,
-    "replace all old_string matches; default false",
+    "replace all old_string matches; default false errors if old_string is non-unique",
 );
 const SUBMIT: KeySpec = KeySpec::new(
     "submit",
@@ -2703,6 +2703,58 @@ mod tests {
             assert_eq!(matches, 1, "kind {:?} must have exactly one contract", kind);
         }
         assert_eq!(RESOURCE_CONTRACTS.len(), ResourceKind::ALL.len());
+    }
+
+    /// Every required key a mutation advertises must appear (by canonical name or
+    /// an alias) in its copy-paste `example`, so copying the example verbatim
+    /// produces a write that clears the required-key gate. Guards against the
+    /// affordance example drifting from the schema it documents (CAIRN #170).
+    #[test]
+    fn every_mutation_example_names_its_required_keys() {
+        for contract in RESOURCE_CONTRACTS {
+            for spec in contract.mutations {
+                for req in spec.required {
+                    let present = spec.example.contains(req.key)
+                        || req.aliases.iter().any(|a| spec.example.contains(a));
+                    assert!(
+                        present,
+                        "{:?} {:?} example must name required key `{}`: {}",
+                        contract.kind, spec.mode, req.key, spec.example
+                    );
+                }
+            }
+        }
+    }
+
+    /// Spot-check the inverse for a static-schema resource: every payload key the
+    /// label-create example uses is a declared key. This is the property the
+    /// schema-aware artifact affordance enforces dynamically (CAIRN #170); here
+    /// it is pinned for a representative contract whose keys are fully static.
+    #[test]
+    fn label_create_example_keys_are_all_declared() {
+        let spec = mutation_spec(ResourceKind::Labels, ChangeMode::Create)
+            .expect("labels must support create");
+        let declared: Vec<&str> = spec
+            .required
+            .iter()
+            .chain(spec.optional)
+            .flat_map(|k| std::iter::once(k.key).chain(k.aliases.iter().copied()))
+            .collect();
+        // Pull the keys out of the single `payload:{...}` object in the example.
+        let payload = spec
+            .example
+            .split_once("payload:{")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(inner, _)| inner)
+            .expect("label create example must contain a payload object");
+        for field in payload.split(',') {
+            let key = field.split(':').next().unwrap_or("").trim();
+            assert!(
+                declared.contains(&key),
+                "label create example key `{key}` is not a declared key: {}",
+                spec.example
+            );
+        }
     }
 
     #[test]

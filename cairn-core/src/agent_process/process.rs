@@ -775,6 +775,40 @@ impl AgentProcessState {
         }
     }
 
+    /// Increment and return this fingerprint's per-turn occurrence count,
+    /// independent of returned content. Returns 0 when there is no tracked
+    /// process or active turn (no nudge basis). Used by the terminal-poll
+    /// nudge, where the read result legitimately changes every call (the
+    /// status banner's elapsed/idle fields advance) so content-equality dedup
+    /// can never see a repeat.
+    ///
+    /// It shares [`TurnSeenCalls`] with [`Self::check_and_record_content`] but
+    /// only touches `count`, never `content_hash` / `is_dup`. Callers key it on
+    /// a distinct fingerprint namespace (`terminal_poll\u{1}...`), so it never
+    /// collides with the content-aware dedup's `read_batch_target\u{1}...`
+    /// records and never perturbs the broad-thrash (`is_dup`) signal.
+    pub fn record_repeat(&self, run_id: &str, fingerprint: &str) -> u32 {
+        let Ok(processes) = self.processes.lock() else {
+            return 0;
+        };
+        let Some(process) = processes.get(run_id) else {
+            return 0;
+        };
+        let Some(turn) = process.current_turn_id().map(str::to_string) else {
+            return 0; // Idle/Busy -> no turn, no count
+        };
+        let Ok(mut seen) = process.turn_seen_calls.lock() else {
+            return 0;
+        };
+        if seen.turn_id.as_deref() != Some(turn.as_str()) {
+            seen.turn_id = Some(turn);
+            seen.calls.clear();
+        }
+        let record = seen.calls.entry(fingerprint.to_string()).or_default();
+        record.count += 1;
+        record.count
+    }
+
     /// Get the current turn ID for a process by run_id.
     pub fn get_current_turn_id(&self, run_id: &str) -> Option<String> {
         let processes = self.processes.lock().ok()?;
@@ -1033,6 +1067,39 @@ mod tests {
         // After arming (an output-artifact write), the owned loop sees it.
         assert!(state.arm_terminal_tool("run-1"));
         assert!(state.terminal_tool_armed("run-1"));
+    }
+
+    #[test]
+    fn record_repeat_counts_per_turn_and_resets_across_turns() {
+        let state = AgentProcessState::default();
+        {
+            let mut processes = state.processes.lock().unwrap();
+            processes.register(
+                "run-1".to_string(),
+                RunHandle::test_handle(Some("s"), Some("j")),
+            );
+        }
+        let fp = "terminal_poll\u{1}cairn:~/terminal/dev";
+
+        // No active turn yet -> no count basis; unknown run -> 0.
+        assert_eq!(state.record_repeat("run-1", fp), 0);
+        assert_eq!(state.record_repeat("ghost", fp), 0);
+
+        // Within one turn the same fingerprint counts 1, 2, 3 regardless of any
+        // content (there is none to compare).
+        state.set_current_turn_id("run-1", Some("turn-1"));
+        assert_eq!(state.record_repeat("run-1", fp), 1);
+        assert_eq!(state.record_repeat("run-1", fp), 2);
+        assert_eq!(state.record_repeat("run-1", fp), 3);
+        // A distinct fingerprint counts independently in the same turn.
+        assert_eq!(
+            state.record_repeat("run-1", "terminal_poll\u{1}cairn:~/terminal/other"),
+            1
+        );
+
+        // A new turn resets the per-turn seen-set.
+        state.set_current_turn_id("run-1", Some("turn-2"));
+        assert_eq!(state.record_repeat("run-1", fp), 1);
     }
 
     #[test]

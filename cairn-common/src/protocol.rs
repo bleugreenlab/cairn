@@ -6,7 +6,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Request from MCP server to Tauri backend (HTTP callback).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Derives `Default` so adding an optional field never ripples across the ~70
+/// struct-literal construction sites: existing literals keep compiling, and new
+/// optional fields can be filled in only where they matter via `..Default::default()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CallbackRequest {
     /// Current working directory - fallback for run identification.
     pub cwd: String,

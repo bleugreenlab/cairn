@@ -4,7 +4,9 @@ use turso::params;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use cairn_common::contract::{contract_for, MutationSpec, ResourceContract, ResourceKind};
+use cairn_common::contract::{
+    contract_for, ChangeMode, KeyType, MutationSpec, ResourceContract, ResourceKind,
+};
 use cairn_common::query::QueryParam;
 
 #[derive(Debug)]
@@ -219,26 +221,8 @@ pub(super) fn affordance_for_kind(kind: ResourceKind) -> String {
 
     let mut sections = String::new();
 
-    if !contract.related.is_empty() {
-        sections.push_str("### links\n");
-        for spec in contract.related {
-            let target = contract_for(spec.kind)
-                .map(|related| related.uri_template)
-                .unwrap_or("");
-            sections.push_str(&format!("- [{}]({})\n", spec.label, target));
-        }
-        sections.push('\n');
-    }
-
-    // grep is a universal read filter over any rendered body, so every resource
-    // advertises it once here alongside its own pushdown projections (if any).
-    // The note dedupes per `(kind, block)` like the rest of the affordance.
-    sections.push_str("### filters\n");
-    for proj in contract.read_projections {
-        sections.push_str(&format!("- `{}={}`\n", proj.key, proj.values));
-    }
-    sections.push_str(UNIVERSAL_GREP_FILTER);
-    sections.push('\n');
+    push_links_section(&mut sections, contract);
+    push_filters_section(&mut sections, contract);
 
     let mut action_lines: Vec<String> = Vec::new();
     push_mutation_actions(&mut action_lines, contract);
@@ -283,6 +267,32 @@ pub(super) fn affordance_for_kind(kind: ResourceKind) -> String {
     format!("## {}\n\n{}", contract.name, sections)
 }
 
+fn push_links_section(sections: &mut String, contract: &ResourceContract) {
+    if contract.related.is_empty() {
+        return;
+    }
+    sections.push_str("### links\n");
+    for spec in contract.related {
+        let target = contract_for(spec.kind)
+            .map(|related| related.uri_template)
+            .unwrap_or("");
+        sections.push_str(&format!("- [{}]({})\n", spec.label, target));
+    }
+    sections.push('\n');
+}
+
+// grep is a universal read filter over any rendered body, so every resource
+// advertises it once here alongside its own pushdown projections (if any). The
+// note dedupes per `(kind, block)` like the rest of the affordance.
+fn push_filters_section(sections: &mut String, contract: &ResourceContract) {
+    sections.push_str("### filters\n");
+    for proj in contract.read_projections {
+        sections.push_str(&format!("- `{}={}`\n", proj.key, proj.values));
+    }
+    sections.push_str(UNIVERSAL_GREP_FILTER);
+    sections.push('\n');
+}
+
 fn push_mutation_actions(action_lines: &mut Vec<String>, contract: &ResourceContract) {
     for spec in contract.mutations {
         action_lines.push(format!(
@@ -316,6 +326,153 @@ fn action_summary(spec: &MutationSpec) -> String {
         parts.join("; ")
     };
     format!("{}. e.g. {}", head, spec.example)
+}
+
+/// Render a node/task artifact's affordance block, deriving the `create`
+/// example's payload keys from the artifact's resolved JSON Schema. The static
+/// contract example uses generic placeholder keys (`{title, content}`) that don't
+/// match a custom artifact's real schema, so copying it bounces (CAIRN #170).
+/// Returns `None` when the schema has no usable top-level `properties`, leaving
+/// the caller to fall back to the contract-derived `affordance_for_kind` block.
+pub(super) fn artifact_affordance_with_schema(
+    kind: ResourceKind,
+    addressed_name: Option<&str>,
+    schema: &serde_json::Value,
+) -> Option<String> {
+    let contract = contract_for(kind)?;
+    let props = schema.get("properties").and_then(|p| p.as_object())?;
+    if props.is_empty() {
+        return None;
+    }
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    // Required keys first (declared order), then the remaining properties — so a
+    // copied example leads with what the schema demands.
+    let mut ordered: Vec<&str> = Vec::new();
+    for key in &required {
+        if props.contains_key(*key) && !ordered.contains(key) {
+            ordered.push(key);
+        }
+    }
+    for key in props.keys() {
+        if !ordered.contains(&key.as_str()) {
+            ordered.push(key.as_str());
+        }
+    }
+
+    let key_display = |name: &str| -> String {
+        let ty = props
+            .get(name)
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+            .map(schema_type_label)
+            .unwrap_or(KeyType::Str.as_str());
+        format!("`{name}({ty})`")
+    };
+    let required_display: Vec<String> = ordered
+        .iter()
+        .filter(|k| required.contains(*k))
+        .map(|k| key_display(k))
+        .collect();
+    let optional_display: Vec<String> = ordered
+        .iter()
+        .filter(|k| !required.contains(*k))
+        .map(|k| key_display(k))
+        .collect();
+
+    let example_uri = match addressed_name {
+        Some(name) => format!("cairn:~/{name}"),
+        None => "cairn:~/<name>".to_string(),
+    };
+    let payload = schema_example_payload(props, &ordered);
+    let create_example = format!(
+        "write({{changes:[{{target:\"{example_uri}\",mode:\"create\",payload:{payload}}}]}})"
+    );
+
+    let mut head_parts: Vec<String> = Vec::new();
+    if !required_display.is_empty() {
+        head_parts.push(format!("required {}", required_display.join(", ")));
+    }
+    if !optional_display.is_empty() {
+        head_parts.push(format!("optional {}", optional_display.join(", ")));
+    }
+    let head = if head_parts.is_empty() {
+        "no payload".to_string()
+    } else {
+        head_parts.join("; ")
+    };
+
+    let mut sections = String::new();
+    push_links_section(&mut sections, contract);
+    push_filters_section(&mut sections, contract);
+    sections.push_str("### actions\n");
+    let create_label = contract
+        .mutation(ChangeMode::Create)
+        .map(|spec| spec.label)
+        .unwrap_or("write artifact");
+    sections.push_str(&format!(
+        "- [{create_label}]({example_uri}): {head}. e.g. {create_example}\n"
+    ));
+    // The patch action is schema-agnostic (field merge / text replacement /
+    // confirm / PR ops), so its contract example stands as written.
+    if let Some(patch) = contract.mutation(ChangeMode::Patch) {
+        sections.push_str(&format!(
+            "- [{}]({}): {}\n",
+            patch.label,
+            example_uri,
+            action_summary(patch)
+        ));
+    }
+    sections.push('\n');
+
+    Some(format!("## {}\n\n{}", contract.name, sections))
+}
+
+/// Map a JSON Schema `type` to the `KeyType` label used in affordance key specs.
+fn schema_type_label(json_type: &str) -> &'static str {
+    match json_type {
+        "string" => KeyType::Str.as_str(),
+        "boolean" => KeyType::Bool.as_str(),
+        "number" | "integer" => KeyType::Int.as_str(),
+        "array" => KeyType::Array.as_str(),
+        "object" => KeyType::Object.as_str(),
+        _ => KeyType::Str.as_str(),
+    }
+}
+
+/// A type-appropriate placeholder value for a schema property in an example
+/// payload.
+fn schema_placeholder(json_type: Option<&str>) -> &'static str {
+    match json_type {
+        Some("number") | Some("integer") => "0",
+        Some("boolean") => "true",
+        Some("array") => "[...]",
+        Some("object") => "{...}",
+        _ => "\"...\"",
+    }
+}
+
+/// Build a `{key:placeholder,...}` example payload from a schema's top-level
+/// properties, in the supplied key order.
+fn schema_example_payload(
+    props: &serde_json::Map<String, serde_json::Value>,
+    ordered: &[&str],
+) -> String {
+    let pairs: Vec<String> = ordered
+        .iter()
+        .map(|name| {
+            let ty = props
+                .get(*name)
+                .and_then(|p| p.get("type"))
+                .and_then(|t| t.as_str());
+            format!("{name}:{}", schema_placeholder(ty))
+        })
+        .collect();
+    format!("{{{}}}", pairs.join(","))
 }
 
 /// Get todo progress string like "3/5 todos"
@@ -784,6 +941,66 @@ mod tests {
         assert!(output.contains("- [changed](cairn://p/{project}/{number}/changed)"));
         assert!(output.contains("- [append comment](cairn://p/{project}/{number}):"));
         assert!(output.contains("- [append message](cairn://p/{project}/{number}/messages):"));
+    }
+
+    #[test]
+    fn artifact_affordance_uses_schema_keys_not_generic_example() {
+        // The coordinator board's custom schema: required `title`, plus `scratch`
+        // and `action_items`. The generic contract example (`{title, content}`)
+        // documents a `content` key the board never declares, so copying it
+        // bounced (CAIRN #170). The schema-aware block must instead lead with the
+        // board's own keys.
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+                "title": { "type": "string" },
+                "scratch": { "type": "string" },
+                "action_items": { "type": "array" }
+            }
+        });
+        let block =
+            artifact_affordance_with_schema(ResourceKind::NodeArtifact, Some("board"), &schema)
+                .expect("a schema with properties yields a block");
+
+        // The example addresses the artifact by its real name and lists the
+        // required key in the head.
+        assert!(block.contains("target:\"cairn:~/board\""));
+        assert!(block.contains("required `title(str)`"));
+
+        // Scope the key checks to the `create` example's payload (the `patch`
+        // example legitimately mentions operation keys like `content`).
+        let payload = block
+            .split_once("mode:\"create\",payload:{")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(inner, _)| inner)
+            .expect("create example must contain a payload object");
+        assert!(payload.contains("title:"));
+        assert!(
+            !payload.contains("content:"),
+            "schema-aware create example must not document undeclared keys: {payload}"
+        );
+        let declared = ["title", "scratch", "action_items"];
+        for field in payload.split(',') {
+            let key = field.split(':').next().unwrap_or("").trim();
+            assert!(
+                declared.contains(&key),
+                "create example key `{key}` is not a schema property: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_affordance_falls_back_without_properties() {
+        // A schema with no usable `properties` yields `None`, so the read path
+        // falls back to the static contract affordance.
+        let schema = serde_json::json!({ "type": "object" });
+        assert!(artifact_affordance_with_schema(
+            ResourceKind::NodeArtifact,
+            Some("board"),
+            &schema
+        )
+        .is_none());
     }
 
     #[test]

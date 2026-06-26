@@ -65,6 +65,15 @@ pub trait WorktreeVcs: Send + Sync {
     /// `discard` leans on it internally; the write-path recovery calls it
     /// explicitly to re-base the worktree before re-applying a batch.
     fn update_stale(&self, worktree: &Path) -> Result<(), String>;
+    /// Capture the working copy's current edits as a unified patch, for the
+    /// write-path stale-recovery to persist to scratch before a give-up discard
+    /// (so "recoverable" is true from the agent's seat, not just the jj operation
+    /// log). `None` when there is nothing to capture or the backend cannot
+    /// produce one — the default, since only a real worktree recovers a batch.
+    fn capture_patch(&self, worktree: &Path) -> Option<String> {
+        let _ = worktree;
+        None
+    }
     /// Whether this backend can revert the working copy to its committed state.
     ///
     /// True for a real worktree (`discard` rolls `@` back). False for the
@@ -150,6 +159,14 @@ impl WorktreeVcs for JjBackend {
 
     fn update_stale(&self, worktree: &Path) -> Result<(), String> {
         crate::jj::update_stale(&self.jj, worktree)
+    }
+
+    fn capture_patch(&self, worktree: &Path) -> Option<String> {
+        // Best-effort: a diff failure (e.g. jj refusing on a stale copy) yields
+        // `None`, so the give-up error simply omits the recovery path.
+        crate::jj::working_copy_diff(&self.jj, worktree)
+            .ok()
+            .filter(|patch| !patch.trim().is_empty())
     }
 }
 
@@ -372,6 +389,7 @@ pub(crate) struct FakeVcs {
     seal: Result<CommitResult, String>,
     discard_result: Result<(), String>,
     can_revert: bool,
+    capture: Option<String>,
     seal_calls: std::sync::atomic::AtomicUsize,
     discard_calls: std::sync::atomic::AtomicUsize,
     update_stale_calls: std::sync::atomic::AtomicUsize,
@@ -389,6 +407,7 @@ impl FakeVcs {
             }),
             discard_result: Ok(()),
             can_revert: true,
+            capture: None,
             seal_calls: std::sync::atomic::AtomicUsize::new(0),
             discard_calls: std::sync::atomic::AtomicUsize::new(0),
             update_stale_calls: std::sync::atomic::AtomicUsize::new(0),
@@ -397,6 +416,11 @@ impl FakeVcs {
 
     pub fn can_revert(mut self, v: bool) -> Self {
         self.can_revert = v;
+        self
+    }
+
+    pub fn capture(mut self, v: Option<String>) -> Self {
+        self.capture = v;
         self
     }
 
@@ -476,6 +500,10 @@ impl WorktreeVcs for FakeVcs {
         self.update_stale_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    fn capture_patch(&self, _worktree: &Path) -> Option<String> {
+        self.capture.clone()
     }
 
     fn can_revert(&self) -> bool {
@@ -724,6 +752,25 @@ mod tests {
         assert!(
             !vcs.changed_since(repo, &before).unwrap(),
             "pre-existing user dirt must not be attributed to the batch"
+        );
+    }
+
+    /// The FakeVcs double returns its programmed `capture_patch`, so the
+    /// write-path give-up preservation (Fix B) can be asserted to have captured
+    /// the batch's would-be-lost edits. Default is `None`, matching the trait
+    /// default where a backend produces no patch.
+    #[test]
+    fn fake_vcs_returns_programmed_capture_patch() {
+        let none = FakeVcs::new();
+        assert_eq!(
+            none.capture_patch(Path::new("/tmp/x")),
+            None,
+            "default capture is None"
+        );
+        let some = FakeVcs::new().capture(Some("diff --git a/x b/x\n".to_string()));
+        assert_eq!(
+            some.capture_patch(Path::new("/tmp/x")).as_deref(),
+            Some("diff --git a/x b/x\n")
         );
     }
 

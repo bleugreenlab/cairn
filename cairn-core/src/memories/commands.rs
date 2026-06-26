@@ -88,7 +88,7 @@ pub struct MemoryReviewCompletion {
 pub struct MemoryReviewIdleState {
     pub state: Option<String>,
     pub draft_count: usize,
-    pub has_artifact: bool,
+    pub has_output_artifact: bool,
     /// True when this job is a sub-agent task (it has a `parent_job_id`), as
     /// opposed to a top-level recipe node. Reflection prompts are skipped for
     /// tasks; review prompts still fire for them when they captured drafts.
@@ -112,22 +112,12 @@ pub fn send_memory_review_on_idle(
             let run_id = run_id.clone();
             let prompt_db = db.clone();
             Box::pin(async move {
-                let mut job_rows = conn
-                    .query(
-                        "SELECT memory_review_state,
-                                EXISTS (SELECT 1 FROM artifacts WHERE job_id = jobs.id LIMIT 1),
-                                parent_job_id IS NOT NULL
-                         FROM jobs WHERE id = ?1 LIMIT 1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                let Some(job_row) = job_rows.next().await? else {
-                    return Err(DbError::Row(format!("Job not found: {job_id}")));
-                };
-                let already_reviewed = job_row.opt_text(0)?.is_some();
-                let has_artifact = job_row.i64(1)? != 0;
-                let is_task = job_row.i64(2)? != 0;
-                if already_reviewed || !has_artifact {
+                let gate = memory_review_idle_state_conn(conn, &job_id)
+                    .await?
+                    .ok_or_else(|| DbError::Row(format!("Job not found: {job_id}")))?;
+                let already_reviewed = gate.state.is_some();
+                let is_task = gate.is_task;
+                if already_reviewed || !gate.has_output_artifact {
                     return Ok(false);
                 }
 
@@ -389,36 +379,103 @@ pub fn memory_review_idle_state_for_job(
         db.read(|conn| {
             let job_id = job_id.clone();
             Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT memory_review_state,
-                                (SELECT COUNT(*) FROM memories WHERE job_id = jobs.id AND status = 'draft'),
-                                EXISTS (SELECT 1 FROM artifacts WHERE job_id = jobs.id LIMIT 1),
-                                parent_job_id IS NOT NULL
-                         FROM jobs WHERE id = ?1 LIMIT 1",
-                        params![job_id.as_str()],
-                    )
-                    .await?;
-                let Some(row) = rows.next().await? else {
-                    return Ok(MemoryReviewIdleState {
-                        state: None,
-                        draft_count: 0,
-                        has_artifact: false,
-                        is_task: false,
-                    });
-                };
-                let draft_count = usize::try_from(row.i64(1)?).unwrap_or(0);
-                Ok(MemoryReviewIdleState {
-                    state: row.opt_text(0)?,
-                    draft_count,
-                    has_artifact: row.i64(2)? != 0,
-                    is_task: row.i64(3)? != 0,
-                })
+                memory_review_idle_state_conn(conn, &job_id)
+                    .await
+                    .map(|state| {
+                        state.unwrap_or(MemoryReviewIdleState {
+                            state: None,
+                            draft_count: 0,
+                            has_output_artifact: false,
+                            is_task: false,
+                        })
+                    })
             })
         })
         .await
         .map_err(|e| e.to_string())
     })
+}
+
+async fn memory_review_idle_state_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+) -> Result<Option<MemoryReviewIdleState>, DbError> {
+    let mut rows = conn
+        .query(
+            "SELECT memory_review_state,
+                    (SELECT COUNT(*) FROM memories WHERE job_id = jobs.id AND status = 'draft'),
+                    parent_job_id,
+                    recipe_node_id,
+                    execution_id
+             FROM jobs WHERE id = ?1 LIMIT 1",
+            params![job_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+
+    let draft_count = usize::try_from(row.i64(1)?).unwrap_or(0);
+    let parent_job_id = row.opt_text(2)?;
+    let recipe_node_id = row.opt_text(3)?;
+    let execution_id = row.opt_text(4)?;
+    let terminal_name = terminal_output_artifact_name_conn(
+        conn,
+        parent_job_id.as_deref(),
+        recipe_node_id.as_deref(),
+        execution_id.as_deref(),
+    )
+    .await?;
+
+    Ok(Some(MemoryReviewIdleState {
+        state: row.opt_text(0)?,
+        draft_count,
+        has_output_artifact: output_artifact_present_conn(conn, job_id, terminal_name.as_deref())
+            .await?,
+        is_task: parent_job_id.is_some(),
+    }))
+}
+
+async fn terminal_output_artifact_name_conn(
+    conn: &turso::Connection,
+    parent_job_id: Option<&str>,
+    recipe_node_id: Option<&str>,
+    execution_id: Option<&str>,
+) -> Result<Option<String>, DbError> {
+    if let (Some(node_id), Some(execution_id)) = (recipe_node_id, execution_id) {
+        return crate::execution::jobs::find_downstream_artifact_schema_conn(
+            conn,
+            node_id,
+            execution_id,
+        )
+        .await
+        .map(|info| info.and_then(|info| info.artifact_name));
+    }
+
+    // Delegated sub-agent tasks do not have a recipe node, but their terminal
+    // artifact is still addressed and stored under the task return contract.
+    if parent_job_id.is_some() {
+        return Ok(Some("result".to_string()));
+    }
+
+    Ok(None)
+}
+
+async fn output_artifact_present_conn(
+    conn: &turso::Connection,
+    job_id: &str,
+    terminal_name: Option<&str>,
+) -> Result<bool, DbError> {
+    let Some(name) = terminal_name else {
+        return Ok(false);
+    };
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM artifacts WHERE job_id = ?1 AND output_name = ?2 LIMIT 1",
+            params![job_id, name],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
 }
 
 pub fn complete_sent_memory_review(
@@ -563,9 +620,76 @@ mod tests {
                         (),
                     )
                     .await?;
+                    let snapshot = serde_json::json!({
+                        "recipe": {
+                            "id": "recipe",
+                            "name": "Recipe",
+                            "description": null,
+                            "trigger": "manual",
+                            "nodes": [
+                                {
+                                    "id": "agent",
+                                    "nodeType": "agent",
+                                    "name": "builder",
+                                    "position": { "x": 0.0, "y": 0.0 },
+                                    "agentConfig": { "agentConfigId": null }
+                                },
+                                {
+                                    "id": "output",
+                                    "nodeType": "artifact",
+                                    "name": "create-pr",
+                                    "position": { "x": 1.0, "y": 0.0 },
+                                    "artifactConfig": {
+                                        "name": "create-pr",
+                                        "schema": { "type": "object" },
+                                        "confirmPolicy": "auto"
+                                    }
+                                },
+                                {
+                                    "id": "board",
+                                    "nodeType": "artifact",
+                                    "name": "board",
+                                    "position": { "x": 0.0, "y": 1.0 },
+                                    "artifactConfig": {
+                                        "name": "board",
+                                        "schema": { "type": "object" },
+                                        "confirmPolicy": "auto"
+                                    }
+                                }
+                            ],
+                            "edges": [
+                                {
+                                    "id": "agent-output",
+                                    "edgeType": "context",
+                                    "sourceNodeId": "agent",
+                                    "sourceHandle": "context-out",
+                                    "targetNodeId": "output",
+                                    "targetHandle": "context-in"
+                                },
+                                {
+                                    "id": "agent-board",
+                                    "edgeType": "context",
+                                    "sourceNodeId": "agent",
+                                    "sourceHandle": "context-self",
+                                    "targetNodeId": "board",
+                                    "targetHandle": "context-in"
+                                }
+                            ]
+                        },
+                        "agents": {},
+                        "skills": {},
+                        "triggerContext": {
+                            "issueId": "issue-main",
+                            "projectId": "project-1",
+                            "triggerType": "manual"
+                        },
+                        "delegatedPackets": [],
+                        "createdAt": 1
+                    })
+                    .to_string();
                     conn.execute(
-                        "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('exec-main', 'recipe', 'issue-main', 'project-1', 'running', 1, 1)",
-                        (),
+                        "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('exec-main', 'recipe', 'issue-main', 'project-1', 'running', 1, 1, ?1)",
+                        params![snapshot.as_str()],
                     )
                     .await?;
                     Ok(())
@@ -583,13 +707,14 @@ mod tests {
     }
 
     async fn insert_job(test: &TestOrch, job_id: &str, parent_job_id: Option<&str>) {
+        let recipe_node_id = parent_job_id.is_none().then_some("agent");
         test.orch
             .db
             .local
             .execute(
-                "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, parent_job_id, created_at, updated_at)
-                 VALUES (?1, 'exec-main', 'issue-main', 'project-1', 'running', 'builder', 'builder', ?2, 1, 1)",
-                params![job_id, parent_job_id],
+                "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, node_name, uri_segment, parent_job_id, created_at, updated_at)
+                 VALUES (?1, 'exec-main', ?3, 'issue-main', 'project-1', 'running', 'builder', 'builder', ?2, 1, 1)",
+                params![job_id, parent_job_id, recipe_node_id],
             )
             .await
             .unwrap();
@@ -625,13 +750,21 @@ mod tests {
     }
 
     async fn insert_artifact(test: &TestOrch, job_id: &str) {
+        insert_named_artifact(test, job_id, "create-pr").await;
+    }
+
+    async fn insert_named_artifact(test: &TestOrch, job_id: &str, output_name: &str) {
         test.orch
             .db
             .local
             .execute(
-                "INSERT INTO artifacts (id, job_id, artifact_type, data, created_at, updated_at)
-                 VALUES (?1, ?2, 'create-pr', '{}', 1, 1)",
-                params![format!("{job_id}-artifact").as_str(), job_id],
+                "INSERT INTO artifacts (id, job_id, artifact_type, output_name, data, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3, '{}', 1, 1)",
+                params![
+                    format!("{job_id}-{output_name}-artifact").as_str(),
+                    job_id,
+                    output_name
+                ],
             )
             .await
             .unwrap();
@@ -706,6 +839,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn working_doc_artifact_does_not_trigger_reflection_nudge() {
+        let test = test_orch().await;
+        insert_job(&test, "job-board-only", None).await;
+        insert_run(&test, "run-board", "job-board-only", "session-1").await;
+        insert_events(&test, "run-board", 80).await;
+        insert_named_artifact(&test, "job-board-only", "board").await;
+
+        let sent = send_memory_review_on_idle(&test.orch, "job-board-only", "run-board").unwrap();
+        assert!(
+            !sent,
+            "a context-self working-doc artifact must not look like job completion"
+        );
+        assert_eq!(review_state(&test, "job-board-only").await, None);
+        assert_eq!(message_to_run(&test, "run-board").await, None);
+    }
+
+    #[tokio::test]
+    async fn working_doc_artifact_does_not_trigger_draft_review() {
+        let test = test_orch().await;
+        insert_job(&test, "job-board-drafts", None).await;
+        insert_run(&test, "run-board-drafts", "job-board-drafts", "session-1").await;
+        insert_events(&test, "run-board-drafts", 80).await;
+        insert_named_artifact(&test, "job-board-drafts", "board").await;
+        insert_draft_memory(&test, "job-board-drafts", "mem-board").await;
+
+        let sent =
+            send_memory_review_on_idle(&test.orch, "job-board-drafts", "run-board-drafts").unwrap();
+        assert!(
+            !sent,
+            "draft review must wait for the declared output artifact, not a working doc"
+        );
+        assert_eq!(review_state(&test, "job-board-drafts").await, None);
+        assert_eq!(message_to_run(&test, "run-board-drafts").await, None);
+    }
+
+    #[tokio::test]
     async fn trivial_job_is_not_nudged() {
         let test = test_orch().await;
         insert_job(&test, "job-trivial", None).await;
@@ -726,7 +895,7 @@ mod tests {
         insert_job(&test, "job-task", Some("job-parent")).await;
         insert_run(&test, "run-task", "job-task", "session-1").await;
         insert_events(&test, "run-task", 80).await;
-        insert_artifact(&test, "job-task").await;
+        insert_named_artifact(&test, "job-task", "result").await;
 
         let sent = send_memory_review_on_idle(&test.orch, "job-task", "run-task").unwrap();
         assert!(

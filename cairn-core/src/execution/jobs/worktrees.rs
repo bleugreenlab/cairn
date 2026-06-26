@@ -78,6 +78,14 @@ pub(crate) fn prepare_worktree_for_job(
             message,
         },
     )?;
+    // Record the integration base for in-fence check tooling (diff-vs-base
+    // attribution). The base BRANCH is what the changed-file diff resolves
+    // against — it auto-advances with the integration tip — while the resolved
+    // SHA is a stable cache key. Auxiliary metadata: a write failure must not
+    // fail provisioning. See scripts/lib/check-base.ts / docs/check-harness.md.
+    if let Err(error) = crate::jj::write_base_marker(worktree_path, base_ref, &base_rev) {
+        log::warn!("failed to write base marker for {branch}: {error}");
+    }
     setup_progress::emit(
         sink,
         job_id,

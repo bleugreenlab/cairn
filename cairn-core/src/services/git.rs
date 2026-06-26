@@ -74,12 +74,6 @@ pub trait GitClient: Send + Sync {
     /// Get the current branch name.
     fn current_branch(&self, repo: &Path) -> Result<String, String>;
 
-    /// Stash changes with an optional message.
-    fn stash_push(&self, repo: &Path, message: Option<String>) -> Result<(), String>;
-
-    /// Pop the most recent stash.
-    fn stash_pop(&self, repo: &Path) -> Result<(), String>;
-
     /// Pull from a remote branch.
     fn pull(&self, repo: &Path, remote: &str, branch: &str) -> Result<(), String>;
 
@@ -439,29 +433,6 @@ impl GitClient for RealGitClient {
                 "git branch --show-current failed: {}",
                 output.stderr
             ))
-        }
-    }
-
-    fn stash_push(&self, repo: &Path, message: Option<String>) -> Result<(), String> {
-        let mut args = vec!["stash", "push"];
-        if let Some(msg) = &message {
-            args.push("-m");
-            args.push(msg.as_str());
-        }
-        let output = self.run_git_strs(repo, &args)?;
-        if output.success {
-            Ok(())
-        } else {
-            Err(format!("git stash push failed: {}", output.stderr))
-        }
-    }
-
-    fn stash_pop(&self, repo: &Path) -> Result<(), String> {
-        let output = self.run_git_strs(repo, &["stash", "pop"])?;
-        if output.success {
-            Ok(())
-        } else {
-            Err(format!("git stash pop failed: {}", output.stderr))
         }
     }
 
