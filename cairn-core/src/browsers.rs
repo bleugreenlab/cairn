@@ -30,6 +30,13 @@ pub struct JobBrowser {
     pub status: String,
     pub created_at: i64,
     pub closed_at: Option<i64>,
+    /// Wall-clock of the last USER-initiated activation (create/navigate/focus).
+    /// A non-NULL value is the load-bearing signal that a HUMAN activated this
+    /// pane: only such rows are focus-following candidates for the bare/default
+    /// browser URI. `None` means "never user-activated" — covering both rows
+    /// predating the column and agent-created rows — and is deliberately never
+    /// set by agent reads/actions or by generic storage insertion.
+    pub last_active_at: Option<i64>,
 }
 
 pub const STATUS_OPEN: &str = "open";
@@ -64,13 +71,20 @@ impl JobBrowser {
             status: STATUS_OPEN.to_string(),
             created_at: now,
             closed_at: None,
+            // Storage-level construction does NOT imply user activation: this
+            // constructor backs `ensure_open_browser`, which agent reads/actions
+            // call to materialize a missing row. Stamping here would let an agent
+            // create steal the focus-following alias from the user's active tab.
+            // The user-facing create/navigate/focus paths stamp explicitly via
+            // `touch_browser_active`.
+            last_active_at: None,
         }
     }
 }
 
 const BROWSER_SELECT: &str = "
     SELECT id, job_id, project_id, slug, webview_label, url, title, status,
-           created_at, closed_at
+           created_at, closed_at, last_active_at
     FROM job_browsers";
 
 fn browser_from_row(row: &turso::Row) -> DbResult<JobBrowser> {
@@ -85,6 +99,7 @@ fn browser_from_row(row: &turso::Row) -> DbResult<JobBrowser> {
         status: row.text(7)?,
         created_at: row.i64(8)?,
         closed_at: row.opt_i64(9)?,
+        last_active_at: row.opt_i64(10)?,
     })
 }
 
@@ -96,9 +111,9 @@ pub async fn insert_browser(db: &LocalDb, browser: JobBrowser) -> Result<(), Str
                 "
                 INSERT INTO job_browsers (
                     id, job_id, project_id, slug, webview_label, url, title,
-                    status, created_at, closed_at
+                    status, created_at, closed_at, last_active_at
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ",
                 params![
                     browser.id.as_str(),
@@ -110,7 +125,8 @@ pub async fn insert_browser(db: &LocalDb, browser: JobBrowser) -> Result<(), Str
                     browser.title.as_deref(),
                     browser.status.as_str(),
                     browser.created_at,
-                    browser.closed_at
+                    browser.closed_at,
+                    browser.last_active_at
                 ],
             )
             .await?;
@@ -212,6 +228,68 @@ pub async fn find_browser_by_scope_and_slug(
     .map_err(|error| error.to_string())
 }
 
+/// Find the most-recently USER-active OPEN browser in a scope, if any. Only rows
+/// with a non-NULL `last_active_at` — ones a human actually activated — are
+/// candidates; ties break by `created_at`. This is the focus-following lookup
+/// behind the bare/default `cairn:~/browser` resource: it lands the agent on the
+/// tab the user is looking at.
+///
+/// The `IS NOT NULL` filter is what makes focus-following safe alongside agent
+/// activity. Agent-created rows (and rows predating the column) carry NULL and
+/// are never picked, so an agent reading or creating an explicit missing browser
+/// can't outrank the user's active tab. When no user-activated row exists the
+/// caller falls back to the literal `default` slug — no worse than the prior
+/// always-default behavior, and self-healing the moment the user activates a tab.
+pub async fn find_most_recently_active_open_browser(
+    db: &LocalDb,
+    scope: BrowserScope,
+) -> Result<Option<JobBrowser>, String> {
+    db.read(|conn| {
+        let scope = scope.clone();
+        Box::pin(async move {
+            let (where_clause, key) = match &scope {
+                BrowserScope::Job(job_id) => ("WHERE job_id = ?1", job_id.clone()),
+                BrowserScope::Project(project_id) => (
+                    "WHERE project_id = ?1 AND job_id IS NULL",
+                    project_id.clone(),
+                ),
+            };
+            let sql = format!(
+                "{BROWSER_SELECT} {where_clause} AND status = '{STATUS_OPEN}' \
+                 AND last_active_at IS NOT NULL \
+                 ORDER BY last_active_at DESC, created_at DESC LIMIT 1"
+            );
+            let mut rows = conn.query(&sql, params![key.as_str()]).await?;
+            rows.next()
+                .await?
+                .map(|row| browser_from_row(&row))
+                .transpose()
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Stamp a browser's `last_active_at`. Called only from USER-initiated paths
+/// (pane create/focus, URL-bar navigate) so focus-following resolution reflects
+/// the user's attention; agent reads/actions never call this.
+pub async fn touch_browser_active(db: &LocalDb, id: &str, now: i64) -> Result<(), String> {
+    let id = id.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE job_browsers SET last_active_at = ?1 WHERE id = ?2",
+                params![now, id.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// Atomically ensure an OPEN browser row exists for `(scope, slug)`, returning
 /// the resolved row plus whether it was newly inserted (so callers can pick the
 /// right db-change action). This is the zero-ceremony primitive behind the
@@ -280,9 +358,9 @@ pub async fn ensure_open_browser(
                         "
                         INSERT INTO job_browsers (
                             id, job_id, project_id, slug, webview_label, url, title,
-                            status, created_at, closed_at
+                            status, created_at, closed_at, last_active_at
                         )
-                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                         ",
                         params![
                             browser.id.as_str(),
@@ -294,7 +372,8 @@ pub async fn ensure_open_browser(
                             browser.title.as_deref(),
                             browser.status.as_str(),
                             browser.created_at,
-                            browser.closed_at
+                            browser.closed_at,
+                            browser.last_active_at
                         ],
                     )
                     .await?;
@@ -478,6 +557,19 @@ pub enum BrowserCommand {
         label: String,
         url: Option<String>,
     },
+    /// Like [`BrowserCommand::Open`] but for a READ: the app replies on the
+    /// reqId-keyed `browser_bridge_responses` broadcast once its open closure has
+    /// run — the webview is now in the registry and, for a freshly created one,
+    /// flagged loading. The readiness gate awaits this ack so it samples the
+    /// loading flag AFTER the async open, closing the cold-rehydrate race where
+    /// the drain would otherwise check liveness/loading before the open landed
+    /// (and prime/ bridge a not-yet-registered, not-yet-loaded webview).
+    OpenForRead {
+        id: String,
+        label: String,
+        url: Option<String>,
+        request_id: String,
+    },
     Navigate {
         id: String,
         url: String,
@@ -490,6 +582,12 @@ pub enum BrowserCommand {
     },
     Reload {
         id: String,
+        /// The page the row last settled on (`job_browsers.url`). The native
+        /// handler reloads in place when the live webview is already on this page
+        /// (preserving back/forward history) and re-navigates to it when the live
+        /// location has drifted off the page, so a reload never strands the tab on
+        /// the app shell `/`. `None` falls back to a bare native reload.
+        url: Option<String>,
     },
     /// A page-content read or interaction request routed to the live webview's
     /// injected content script. `request_json` is a serialized [`BridgeRequest`];
@@ -518,6 +616,22 @@ pub enum BrowserCommand {
         id: String,
         request_id: String,
         kinds: Vec<String>,
+    },
+    /// Begin holding a hidden webview realized off-screen-but-visible for the
+    /// lifetime of a content-script bridge round-trip, so a backgrounded pane's
+    /// throttled `requestAnimationFrame`/timers run and the bridge's `postResult`
+    /// can fire. Idempotent and refcounted host-side (paired Begin/End nest), so
+    /// no `request_id`. On macOS the 0→1 transition realizes a hidden view
+    /// off-screen and the 1→0 transition restores it; on a visible (on-screen)
+    /// pane it is a no-op. Non-macOS hosts treat it as a no-op.
+    BeginRenderPriming {
+        id: String,
+    },
+    /// End one [`BrowserCommand::BeginRenderPriming`] hold (see its docs). The
+    /// `dispatch_browser_bridge` RAII guard emits this on EVERY exit path so a
+    /// webview can never be left rendering off-screen.
+    EndRenderPriming {
+        id: String,
     },
     Close {
         id: String,
@@ -759,6 +873,34 @@ pub struct BridgeResponse {
     pub elements: Option<Vec<InteractiveElement>>,
 }
 
+/// RAII bracket around a content-script bridge round-trip. Sends
+/// [`BrowserCommand::BeginRenderPriming`] on construction and
+/// [`BrowserCommand::EndRenderPriming`] on drop, so the off-screen render hold is
+/// released on every exit path of [`dispatch_browser_bridge`] — a leaked Begin
+/// would keep a hidden webview rendering off-screen indefinitely.
+struct RenderPrimingGuard<'a> {
+    tx: &'a BrowserCommandTx,
+    id: String,
+}
+
+impl<'a> RenderPrimingGuard<'a> {
+    fn begin(tx: &'a BrowserCommandTx, id: &str) -> Self {
+        let _ = tx.send(BrowserCommand::BeginRenderPriming { id: id.to_string() });
+        Self {
+            tx,
+            id: id.to_string(),
+        }
+    }
+}
+
+impl Drop for RenderPrimingGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.tx.send(BrowserCommand::EndRenderPriming {
+            id: self.id.clone(),
+        });
+    }
+}
+
 /// Send a typed [`BridgeRequest`] to a live browser webview and await the
 /// matching response (keyed by a freshly generated request id). The single
 /// round-trip implementation: the resource read path and the Tauri app's
@@ -779,6 +921,12 @@ pub async fn dispatch_browser_bridge(
         .map_err(|error| format!("failed to encode bridge request: {error}"))?;
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut rx = orch.browser_bridge_responses.subscribe();
+    // Hold the webview realized off-screen for the whole round-trip so a
+    // backgrounded pane still pumps frames and the page can `postResult`. The
+    // guard's Drop emits EndRenderPriming on every exit path below (success,
+    // page error, timeout, channel close, parse error) so the hold can't leak.
+    // Begin is sent before Bridge; the in-order drain lands the realize first.
+    let _priming = RenderPrimingGuard::begin(tx, browser_id);
     tx.send(BrowserCommand::Bridge {
         id: browser_id.to_string(),
         request_id: request_id.clone(),
@@ -954,6 +1102,115 @@ mod tests {
         assert_eq!(got.status, STATUS_CLOSED);
         assert_eq!(got.closed_at, Some(20));
         let _ = scope;
+    }
+
+    #[tokio::test]
+    async fn ensure_never_stamps_last_active() {
+        let db = test_db().await;
+        seed_project(&db, "p-brw").await;
+        let scope = BrowserScope::Project("p-brw".to_string());
+
+        // The insert branch does NOT stamp: ensure_open_browser is the shared
+        // agent path, so a fresh row is never user-active until a user path
+        // (create/navigate/focus) calls touch_browser_active.
+        let (browser, inserted) = ensure_open_browser(&db, scope.clone(), "main", None, 10)
+            .await
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(browser.last_active_at, None, "insert does not stamp");
+
+        // A later user activation stamps it.
+        touch_browser_active(&db, &browser.id, 50).await.unwrap();
+        // The reuse branch leaves the stamped value untouched (an agent ensure
+        // must not move the user's activity signal).
+        let (_, inserted) = ensure_open_browser(&db, scope, "main", None, 99)
+            .await
+            .unwrap();
+        assert!(!inserted);
+        let got = get_browser(&db, &browser.id).await.unwrap().unwrap();
+        assert_eq!(got.last_active_at, Some(50), "reuse does not re-stamp");
+    }
+
+    /// The review's failure mode: an agent creating an explicit missing browser
+    /// must not steal the focus-following alias from the user's active tab, even
+    /// though it is created later (higher created_at). The NULL last_active_at on
+    /// the agent row keeps it out of the candidate set entirely.
+    #[tokio::test]
+    async fn agent_insert_does_not_steal_focus_from_user_tab() {
+        let db = test_db().await;
+        seed_project(&db, "p-brw").await;
+        let scope = BrowserScope::Project("p-brw".to_string());
+
+        // User-active tab at t=100.
+        let (user_tab, _) = ensure_open_browser(&db, scope.clone(), "browser-a", None, 5)
+            .await
+            .unwrap();
+        touch_browser_active(&db, &user_tab.id, 100).await.unwrap();
+
+        // Agent creates an explicit missing browser LATER (t=200) — NULL stamp.
+        let (scratch, _) = ensure_open_browser(&db, scope.clone(), "scratch", None, 200)
+            .await
+            .unwrap();
+        assert_eq!(scratch.last_active_at, None);
+
+        let found = find_most_recently_active_open_browser(&db, scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, user_tab.id, "agent insert must not steal focus");
+    }
+
+    #[tokio::test]
+    async fn touch_browser_active_updates_timestamp() {
+        let db = test_db().await;
+        seed_project(&db, "p-brw").await;
+        let scope = BrowserScope::Project("p-brw".to_string());
+        let (browser, _) = ensure_open_browser(&db, scope, "main", None, 10)
+            .await
+            .unwrap();
+        touch_browser_active(&db, &browser.id, 50).await.unwrap();
+        let got = get_browser(&db, &browser.id).await.unwrap().unwrap();
+        assert_eq!(got.last_active_at, Some(50));
+    }
+
+    #[tokio::test]
+    async fn find_most_recently_active_picks_recent_open_ignoring_closed() {
+        let db = test_db().await;
+        seed_project(&db, "p-brw").await;
+        let scope = BrowserScope::Project("p-brw".to_string());
+
+        let (older, _) = ensure_open_browser(&db, scope.clone(), "tab-a", None, 10)
+            .await
+            .unwrap();
+        let (newer, _) = ensure_open_browser(&db, scope.clone(), "tab-b", None, 20)
+            .await
+            .unwrap();
+        // Stamp both as user-active (ensure no longer stamps on insert).
+        touch_browser_active(&db, &older.id, 10).await.unwrap();
+        touch_browser_active(&db, &newer.id, 20).await.unwrap();
+        // tab-b is the most-recently active open browser.
+        let found = find_most_recently_active_open_browser(&db, scope.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, newer.id);
+        assert_eq!(found.slug, "tab-b");
+
+        // A closed-but-more-recent browser is ignored (status filter): close the
+        // newest and the open older one wins.
+        mark_browser_closed(&db, &newer.id, 30).await.unwrap();
+        let found = find_most_recently_active_open_browser(&db, scope.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, older.id);
+
+        // No open browser at all ⇒ None.
+        mark_browser_closed(&db, &older.id, 40).await.unwrap();
+        let found = find_most_recently_active_open_browser(&db, scope)
+            .await
+            .unwrap();
+        assert!(found.is_none());
     }
 
     #[test]

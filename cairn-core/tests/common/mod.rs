@@ -298,7 +298,15 @@ pub fn stale_sibling_advance(
 }
 
 pub fn skip_if_fenced(test: &str) -> bool {
-    if std::env::var_os("CAIRN_SANDBOXED").is_some() {
+    let explicitly_sandboxed = std::env::var_os("CAIRN_SANDBOXED").is_some();
+    // Cargo can be launched from an agent run-tool without preserving the
+    // explicit sandbox marker into the test process. The MCP run-tool envelope is
+    // still enough evidence that this process is nested under the worktree fence.
+    let run_tool_context = std::env::var_os("CAIRN_CALLBACK_URL").is_some()
+        && std::env::var_os("CAIRN_RUN_ID").is_some()
+        && std::env::var_os("CAIRN_WORKTREE").is_some();
+
+    if explicitly_sandboxed || run_tool_context {
         eprintln!("skipping {test}: cannot run nested inside a Cairn worktree fence");
         true
     } else {

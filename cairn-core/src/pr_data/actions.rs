@@ -1510,7 +1510,17 @@ pub async fn render_live_pr_section(
 /// (`resolve_pr_node`, which also fires base-advance notifications, plus the
 /// caller's attention emit) has already happened by the time this runs. Takes
 /// owned values so callers can spawn it detached via `tokio::spawn`.
-pub async fn reconcile_after_merge(orch: Orchestrator, ctx: MergeMrContext) {
+/// `force_checkout_pull` forces the user's main-checkout fast-forward pull
+/// regardless of the `pull_on_merge` setting. The GitHub-API merge path sets it:
+/// nothing locally rewrote the checkout (no local fold), so a `git pull` of the
+/// PR base branch is the *only* way the checkout catches up to the just-merged
+/// tip. The local-fold path passes `false` — the fold already re-attached and
+/// fast-forwarded the checkout, and `pull_on_merge` governs only the extra pull.
+pub async fn reconcile_after_merge(
+    orch: Orchestrator,
+    ctx: MergeMrContext,
+    force_checkout_pull: bool,
+) {
     let owner_id = ctx.mr.job_id.clone();
     let repo_path = ctx.mr.repo_path.clone();
     let pr_number = ctx.mr.github_pr_number;
@@ -1605,7 +1615,7 @@ pub async fn reconcile_after_merge(orch: Orchestrator, ctx: MergeMrContext) {
     //    A remote merge with `pull_on_merge` also pulls origin to absorb any
     //    external advance of the default branch.
     let git = &*orch.services.git;
-    let pull = pr_number.is_some() && pull_on_merge_setting();
+    let pull = force_checkout_pull || (pr_number.is_some() && pull_on_merge_setting());
     if let Err(e) = reconcile_main_checkout_after_merge(git, &repo_path, &default_branch, pull) {
         log::warn!("Failed to reconcile main checkout after merge: {}", e);
     }
@@ -1983,6 +1993,164 @@ fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<S
     }
 }
 
+/// Resolve a project's effective (config-aware) default branch from its stored
+/// value. Mirrors how worktree creation resolves the default, so the merge
+/// routing and the post-merge checkout reconcile can never disagree with where
+/// worktrees were based — stopping short of trusting the raw DB column the merge
+/// used to read directly.
+fn resolve_project_default_branch(repo_path: &str, stored_default: &str) -> String {
+    let config = crate::config::project_settings::load_project_settings(Path::new(repo_path));
+    crate::config::project_settings::resolve_default_branch(&config, Some(stored_default))
+}
+
+/// Whether this merge should go through GitHub's merge API rather than the local
+/// jj fold. Pure so the routing is unit-testable without an `Orchestrator`:
+/// `resolved_default` is the config-aware default resolved by the caller.
+///
+/// True only for a real remote PR (`github_pr_number` present, not a local-only
+/// project) that lands on the default branch and is neither a workspace nor a
+/// memory-triage PR. A Coordinator child→integration PR (`target_branch` is the
+/// integration branch, not the default) and a local-only project both stay on the
+/// local fold; workspace / memory-triage PRs that force the keep-every-commit
+/// `merge` method are out of scope and also stay local.
+fn should_route_to_github(ctx: &MergeMrContext, resolved_default: &str) -> bool {
+    ctx.mr.github_pr_number.is_some()
+        && !ctx.mr.is_local
+        && !ctx.is_workspace
+        && !ctx.has_triage_batch
+        && ctx.target_branch == resolved_default
+}
+
+/// `should_route_to_github` against the project's config-aware default branch.
+fn should_merge_via_github(ctx: &MergeMrContext) -> bool {
+    let resolved_default = resolve_project_default_branch(&ctx.mr.repo_path, &ctx.default_branch);
+    should_route_to_github(ctx, &resolved_default)
+}
+
+/// Map a `github::api::merge_pr` failure to user-facing guidance. GitHub returns
+/// 405 ("not mergeable") or 409 (head changed / merge conflict) when it refuses
+/// the merge; in that case the source was clean *locally* (the conflict gate
+/// passed), so there are no local markers to point at — the guidance points at
+/// the PR instead, distinct from the local-fold conflict message.
+fn map_github_merge_error(source_branch: &str, target_branch: &str, error: String) -> String {
+    if error.contains("PR: 405") || error.contains("PR: 409") {
+        format!(
+            "GitHub refused the merge of `{source_branch}` into `{target_branch}` — the PR has conflicts or failing required checks on GitHub's side. Resolve them on the PR, then retry the merge. (GitHub: {error})"
+        )
+    } else {
+        format!("Failed to merge `{source_branch}` into `{target_branch}` via GitHub: {error}")
+    }
+}
+
+/// Merge a remote PR through GitHub's merge API, then reconcile locally.
+///
+/// GitHub performs the squash-merge, closes the PR, and advances the base branch
+/// on origin. The ordering is fail-closed: the GitHub call is the load-bearing
+/// step, and only once it succeeds do we mark the merge request merged / resolve
+/// the issue locally (`resolve_pr_node`). Local reconciliation is then proactive
+/// and best-effort — origin is already authoritative, the GitHub `push` webhook
+/// and the local sweep also perform this work, and the before/after commit-id
+/// guards in `base_advance` make the double-fire a no-op.
+async fn merge_remote_pr_via_github(
+    orch: &Orchestrator,
+    job_id: &str,
+    merge_context: MergeMrContext,
+    merge_method: Option<String>,
+    merge_started: std::time::Instant,
+) -> Result<String, String> {
+    let repo_path = merge_context.mr.repo_path.clone();
+    let issue_id = merge_context.issue_id.clone();
+    let source_branch = merge_context.source_branch.clone();
+    let target_branch = merge_context.target_branch.clone();
+    let pr_number = merge_context
+        .mr
+        .github_pr_number
+        .ok_or_else(|| "GitHub merge requires a PR number".to_string())?;
+
+    // Squash is the default landing shape (one commit per PR on the default
+    // branch). The workspace / memory-triage forcing in `effective_merge_method`
+    // does not apply here — those PRs never take this branch.
+    let method = merge_method.unwrap_or_else(|| "squash".to_string());
+
+    let (owner, repo) = get_owner_repo(&repo_path)?;
+    let creds = get_credentials_for_owner(&orch.db.local, &owner).await?;
+    let http = &*orch.services.http;
+
+    // FAIL-CLOSED: on any failure, surface it and mark/advance NOTHING locally.
+    let github_started = std::time::Instant::now();
+    api::merge_pr(http, &creds, &owner, &repo, pr_number, &method)
+        .await
+        .map_err(|e| map_github_merge_error(&source_branch, &target_branch, e))?;
+    log::info!(
+        "merge_pr_for_job[{job_id}]: GitHub merge_pr took {:?}",
+        github_started.elapsed()
+    );
+
+    // GitHub merged: mark the merge request merged, resolve the issue, close
+    // sessions. Runs only after the GitHub call succeeded.
+    let resolve_started = std::time::Instant::now();
+    let closed_sessions = resolve_pr_node(orch, job_id, PrNodeResolution::Merge)
+        .await
+        .map_err(|error| {
+            log::error!(
+                "GitHub merged PR but failed to mark merge request merged for job {job_id}: {error}"
+            );
+            error
+        })?;
+    log::info!(
+        "merge_pr_for_job[{job_id}]: resolve_pr_node took {:?}",
+        resolve_started.elapsed()
+    );
+    for session_id in &closed_sessions {
+        orch.process_state.remove_by_session(session_id);
+    }
+
+    if let Some(issue_id) = issue_id.as_deref() {
+        // Terminal transition — wake any in-flight `cairn watch` on this issue,
+        // matching the PR-webhook merge path.
+        orch.wake_for_issue(issue_id).await;
+    }
+
+    // BEST-EFFORT: delete the merged source branch on GitHub. Nothing downstream
+    // depends on it.
+    if let Err(e) = api::delete_branch(http, &creds, &owner, &repo, &source_branch).await {
+        log::warn!("Best-effort delete of merged source branch {source_branch} failed: {e}");
+    }
+
+    // BEST-EFFORT, proactive local reconcile. Everything derives from the PR's
+    // real base (`target_branch`), never the possibly-stale stored default — so
+    // the checkout reconcile is a plain fast-forward of the PR base and can never
+    // land the checkout on `main`. Overriding `default_branch` here is what makes
+    // the shared `reconcile_after_merge` use the PR base for the checkout pull.
+    let mut reconcile_ctx = merge_context;
+    reconcile_ctx.default_branch = target_branch.clone();
+    let orch_clone = orch.clone();
+    tokio::spawn(async move {
+        // In-flight siblings: fetch origin into the shared store and rebase each
+        // onto the advanced `<base>@origin` tip. This is the external-advance
+        // reconcile the `push` webhook would also drive; the commit-id guard makes
+        // the double-fire idempotent.
+        if let Err(e) = crate::orchestrator::base_advance::reconcile_external_default_advance(
+            &orch_clone,
+            &reconcile_ctx.project_id,
+            &target_branch,
+        )
+        .await
+        {
+            log::warn!("Post-GitHub-merge sibling reconcile failed: {e}");
+        }
+        // File capture, user-checkout fast-forward pull (forced — no local fold
+        // moved it), worktree teardown, PR refresh.
+        reconcile_after_merge(orch_clone, reconcile_ctx, true).await;
+    });
+
+    log::info!(
+        "merge_pr_for_job[{job_id}]: GitHub merge path took {:?}",
+        merge_started.elapsed()
+    );
+    Ok("PR merged via GitHub".to_string())
+}
+
 /// Merge a PR, mark the issue merged, and run post-merge reconciliation (file
 /// capture, optional main-repo pull, active-worktree fast-forward, teardown, PR
 /// refresh) in the background via `reconcile_after_merge`.
@@ -2032,6 +2200,25 @@ pub async fn merge_pr_for_job(
         "merge_pr_for_job[{job_id}]: conflict gate took {:?}",
         gate_started.elapsed()
     );
+
+    // Route a real remote PR landing on the project default branch through
+    // GitHub's merge API (GitHub squash-merges, closes the PR, and advances the
+    // base on origin; Cairn then reconciles locally). The local jj fold below is
+    // kept only where there is no GitHub PR to merge through: local-only projects
+    // and Coordinator child→integration PRs, plus workspace / memory-triage PRs
+    // that deliberately preserve every commit. The conflict gate above has
+    // already run for both paths.
+    if should_merge_via_github(&merge_context) {
+        return merge_remote_pr_via_github(
+            orch,
+            job_id,
+            merge_context,
+            merge_method,
+            merge_started,
+        )
+        .await;
+    }
+
     // The shared jj store owns the merge: fold the child's commit into the
     // integration bookmark and (for a remote project) push it, which advances
     // origin and marks the child PR Merged out-of-band. A no-remote jj project
@@ -2084,8 +2271,10 @@ pub async fn merge_pr_for_job(
         orch.wake_for_issue(issue_id).await;
     }
 
-    // Background reconciliation, shared with the GitHub webhook merge path.
-    tokio::spawn(reconcile_after_merge(orch.clone(), merge_context));
+    // Background reconciliation, shared with the GitHub webhook merge path. The
+    // local fold already re-attached and fast-forwarded the checkout, so the pull
+    // is governed by `pull_on_merge` (not forced).
+    tokio::spawn(reconcile_after_merge(orch.clone(), merge_context, false));
 
     log::info!(
         "merge_pr_for_job[{job_id}]: synchronous merge path took {:?} (downstream reconcile deferred)",
@@ -2146,11 +2335,87 @@ mod tests {
         );
     }
 
+    /// A remote PR landing on the default branch routes to GitHub; everything
+    /// else (local-only, child→integration, workspace, memory-triage) stays on
+    /// the local jj fold.
+    #[test]
+    fn should_route_to_github_only_for_remote_default_branch_pr() {
+        // Base case: a real remote PR on the default branch.
+        let mut ctx = merge_context(false, false);
+        ctx.mr.github_pr_number = Some(7);
+        assert!(should_route_to_github(&ctx, "main"));
+
+        // Local-only project (no GitHub PR) stays on the local fold.
+        let mut local = ctx.clone();
+        local.mr.github_pr_number = None;
+        assert!(!should_route_to_github(&local, "main"));
+        let mut is_local = ctx.clone();
+        is_local.mr.is_local = true;
+        assert!(!should_route_to_github(&is_local, "main"));
+
+        // Coordinator child→integration PR (target ≠ default) stays local.
+        let mut child = ctx.clone();
+        child.target_branch = "agent/CAIRN-1-coordinator-0".to_string();
+        assert!(!should_route_to_github(&child, "main"));
+
+        // Workspace and memory-triage PRs stay on the local fold (keep-every-commit).
+        let mut workspace = ctx.clone();
+        workspace.is_workspace = true;
+        assert!(!should_route_to_github(&workspace, "main"));
+        let mut triage = ctx.clone();
+        triage.has_triage_batch = true;
+        assert!(!should_route_to_github(&triage, "main"));
+
+        // A stale stored default that disagrees with the real base routes off the
+        // PR's actual base: target "staging" against resolved "staging" routes,
+        // against a stale "main" does not.
+        let mut staging = ctx.clone();
+        staging.target_branch = "staging".to_string();
+        assert!(should_route_to_github(&staging, "staging"));
+        assert!(!should_route_to_github(&staging, "main"));
+    }
+
+    /// A GitHub 405/409 refusal points at the PR (no local markers exist); any
+    /// other failure is reported as a plain GitHub merge error.
+    #[test]
+    fn map_github_merge_error_distinguishes_refusal_from_other_failures() {
+        let refusal = map_github_merge_error(
+            "feature",
+            "main",
+            "Failed to merge PR: 405 - not mergeable".to_string(),
+        );
+        assert!(refusal.contains("GitHub refused"), "{refusal}");
+        assert!(
+            refusal.contains("feature") && refusal.contains("main"),
+            "{refusal}"
+        );
+
+        let conflict = map_github_merge_error(
+            "feature",
+            "main",
+            "Failed to merge PR: 409 - head changed".to_string(),
+        );
+        assert!(conflict.contains("GitHub refused"), "{conflict}");
+
+        let other = map_github_merge_error(
+            "feature",
+            "main",
+            "Failed to merge PR: 500 - server error".to_string(),
+        );
+        assert!(!other.contains("GitHub refused"), "{other}");
+        assert!(other.contains("via GitHub"), "{other}");
+    }
+
     /// The merge gate trusts jj's recorded conflict state: a sibling whose
     /// auto-rebase recorded a conflict is reported (with its commits and files),
     /// a cleanly-rebased sibling is not, and a non-jj project never gates.
     /// Self-skips when jj is unresolvable.
+    ///
+    /// Serialized on the shared `jj` key: like every test that drives the real
+    /// jj binary, it must not run concurrently with another, or the spawned jj
+    /// subprocesses contend and a `jj config set --repo` intermittently panics.
     #[test]
+    #[serial_test::serial(jj)]
     fn source_conflict_report_gates_and_enumerates_recorded_conflicts() {
         let bin = match std::env::var("CAIRN_JJ_BIN")
             .ok()

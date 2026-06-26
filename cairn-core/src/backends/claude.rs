@@ -2273,9 +2273,9 @@ mod flush_pending_tests {
                 Box::pin(async move {
                     conn.execute(
                         "INSERT INTO runs(
-                             id, status, session_id, created_at, updated_at, backend
+                             id, status, session_id, created_at, updated_at
                          )
-                         VALUES (?1, 'live', 'session-1', ?2, ?3, 'claude')",
+                         VALUES (?1, 'live', 'session-1', ?2, ?3)",
                         params![id.as_str(), now, now],
                     )
                     .await?;

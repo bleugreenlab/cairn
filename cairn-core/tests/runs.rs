@@ -81,10 +81,10 @@ async fn insert_run(
             conn.execute(
                 "INSERT INTO runs(
                     id, project_id, issue_id, job_id, chat_id, status, session_id,
-                    backend, exit_reason, error_message, started_at, exited_at,
+                    exit_reason, error_message, started_at, exited_at,
                     created_at, updated_at, start_mode
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'codex', NULL, NULL, ?8, NULL, ?9, ?10, 'resume')",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, NULL, ?9, ?10, 'resume')",
                 params![
                     id.as_str(),
                     project_id.as_deref(),
@@ -329,7 +329,6 @@ async fn get_run_maps_runtime_fields() {
 
     let run = queries::get_run(db.clone(), "run-1").unwrap().unwrap();
     assert_eq!(run.status, RunStatus::Live);
-    assert_eq!(run.backend.as_deref(), Some("codex"));
     assert_eq!(run.started_at, Some(42));
     assert_eq!(run.created_at, 42);
     assert_eq!(run.updated_at, 42);

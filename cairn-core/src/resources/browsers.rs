@@ -10,14 +10,15 @@ use std::time::Duration;
 
 use cairn_common::query::QueryParam;
 use cairn_common::read::ImageBlock;
-use cairn_common::uri::CairnResource;
+use cairn_common::uri::{CairnResource, DEFAULT_BROWSER_SLUG};
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::browsers::{
-    ensure_open_browser, find_browser_by_scope_and_slug, get_browser, BridgeFormat, BridgeRequest,
-    BridgeResponse, BrowserCommand, BrowserNavEvent, BrowserScope, ConsoleEntry,
-    InteractiveElement, NavPhase, NetworkEntry, STATUS_OPEN,
+    ensure_open_browser, find_browser_by_scope_and_slug, find_most_recently_active_open_browser,
+    get_browser, BridgeFormat, BridgeRequest, BridgeResponse, BrowserCommand, BrowserNavEvent,
+    BrowserScope, ConsoleEntry, InteractiveElement, JobBrowser, NavPhase, NetworkEntry,
+    STATUS_OPEN,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -25,6 +26,19 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// Default budget for an extract/interaction bridge round-trip with the page.
 /// A `waitFor` action passes a larger budget that must exceed its own timeout.
 pub(crate) const BRIDGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget for waiting for a still-loading page to become interactive before a
+/// content-script read. Distinct from — and larger than — [`BRIDGE_TIMEOUT`],
+/// which now measures only post-ready bridge responsiveness. A slow first
+/// compile (Vite dep-optimization, 5–15s) should read as "still loading" and be
+/// re-read, not be masked by an inflated bridge timeout.
+pub(crate) const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a read waits for the host to ack an `OpenForRead` before proceeding.
+/// Best-effort: on timeout the read continues (degrading to the pre-fix sampling
+/// behavior, still protected by the readiness wait + post-failure retry), so a
+/// wedged main thread can never hang a read indefinitely.
+pub(crate) const OPEN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolve a browser resource URI to its owning scope plus slug. Node/task
 /// browsers resolve to the backing job; project browsers to the project row.
@@ -91,6 +105,29 @@ pub(crate) async fn resolve_browser_scope(
     })
     .await
     .map_err(|error| error.to_string())
+}
+
+/// Resolve a browser resource URI to its owning scope plus a CONCRETE slug,
+/// applying focus-following for the bare/default form. The bare `cairn:~/browser`
+/// URI collapses to [`DEFAULT_BROWSER_SLUG`] at parse time, so resolution treats
+/// that slug as the scope's focus-following alias: it picks the most-recently
+/// user-active open browser in the scope, landing the agent on the tab the user
+/// is actually looking at. When none is open it falls back to the literal
+/// `default` slug, which the downstream `ensure_open_browser` creates — preserving
+/// the zero-ceremony contract. An explicit non-default slug resolves exactly,
+/// bypassing focus-following. Returning a concrete slug keeps every downstream
+/// `find_browser_by_scope_and_slug`/`ensure_open_browser` step unchanged.
+pub(crate) async fn resolve_browser_target(
+    db: &LocalDb,
+    resource: &CairnResource,
+) -> Result<(BrowserScope, String), String> {
+    let (scope, slug) = resolve_browser_scope(db, resource).await?;
+    if slug == DEFAULT_BROWSER_SLUG {
+        if let Some(active) = find_most_recently_active_open_browser(db, scope.clone()).await? {
+            return Ok((scope, active.slug));
+        }
+    }
+    Ok((scope, slug))
 }
 
 async fn find_node_job_id(
@@ -431,7 +468,7 @@ pub(crate) async fn render_browser_screenshot(
     resource: &CairnResource,
 ) -> (String, Option<ImageBlock>) {
     let db = &orch.db.local;
-    let (scope, slug) = match resolve_browser_scope(db, resource).await {
+    let (scope, slug) = match resolve_browser_target(db, resource).await {
         Ok(pair) => pair,
         Err(error) => return (error, None),
     };
@@ -464,16 +501,39 @@ pub(crate) async fn render_browser_screenshot(
         );
     }
 
-    // Ensure the webview is live before the capture round-trip (rehydrate after a
-    // restart wiped the registry; a live webview no-ops), exactly like the
-    // content read in `render_browser`.
-    if let Some(tx) = &orch.browser_command_tx {
-        let _ = tx.send(BrowserCommand::Open {
-            id: browser.id.clone(),
-            label: browser.webview_label.clone(),
-            url: browser.url.clone(),
-        });
-    }
+    // Sample the loading flag BEFORE the open so we can tell a cold-create open
+    // (the case this gate exists for) from a page that was already loading. The
+    // freshly-created webview path is the ONLY open path that flips the flag to
+    // loading synchronously inside the open closure; the reuse/no-window paths ack
+    // without touching it. Subscribe before the open too, so a fast cold-load
+    // Finished cannot race the awaiter.
+    let was_loading = orch.is_browser_loading(&browser.id);
+    let mut nav_rx = orch.browser_nav_events.subscribe();
+    open_for_read(orch, &browser, OPEN_ACK_TIMEOUT).await;
+
+    // A capture of a still-loading page is useful and already works, so the
+    // screenshot path is never gated into a hard failure. The two cases differ:
+    //   * Cold rehydrate: the open just CREATED the webview (not-loading → loading
+    //     across the ack), so wait the readiness budget for the first paint before
+    //     capturing — without it the frame would be blank. Note partiality only if
+    //     it never finishes in time.
+    //   * Already-loading live page: capture an immediate partial frame and note
+    //     it, preserving the screenshot's value as a quick visual sample of a slow
+    //     page rather than blocking on the readiness budget.
+    let now_loading = orch.is_browser_loading(&browser.id);
+    let cold_create = !was_loading && now_loading;
+    let partial = if cold_create {
+        await_browser_nav(&mut nav_rx, &browser.id, READINESS_TIMEOUT, true)
+            .await
+            .is_none()
+    } else {
+        now_loading
+    };
+    let header = if partial {
+        format!("{header}\n\n(Note: the page is still loading; this screenshot may be partial.)")
+    } else {
+        header
+    };
 
     match browser_capture_roundtrip(orch, &browser.id, BRIDGE_TIMEOUT).await {
         Ok(data) => (
@@ -490,6 +550,137 @@ pub(crate) async fn render_browser_screenshot(
     }
 }
 
+/// Soft "page still loading" message: a page that has not become interactive
+/// within the readiness budget. The promised recovery (read again) is something
+/// the agent can actually do, and the readiness wait already gave the page time,
+/// so this is deliberately NOT a hard error.
+fn still_loading_message(header: &str, url: &str) -> String {
+    format!(
+        "{header}\n\n(Page is still loading at {url} — it has not become interactive after {}s. Read again shortly once it settles.)",
+        READINESS_TIMEOUT.as_secs()
+    )
+}
+
+/// Hard "loaded but bridge failed" message: the page reached a loaded state yet
+/// the content-script bridge did not respond. Names the url and the bridge
+/// budget so the failure is actionable rather than a bare timeout string.
+fn bridge_failed_message(header: &str, url: &str) -> String {
+    format!(
+        "{header}\n\n(The page finished loading but its content bridge did not respond within {}s at {url}. Reload the pane and retry.)",
+        BRIDGE_TIMEOUT.as_secs()
+    )
+}
+
+/// Send a read-path `OpenForRead` and await the host's ack on the reqId
+/// broadcast, so the caller knows the rehydrated webview is registered and (for a
+/// fresh create) its loading flag is established before it samples readiness,
+/// primes, bridges, or captures. This closes the cold-rehydrate race: the bare
+/// `Open` only QUEUES async main-thread webview creation, so a caller that read
+/// the loading flag immediately could sample it before the open closure ran.
+/// Best-effort: returns on ack, on `ack_timeout`, or when no webview layer is
+/// wired (headless/server). The `{}` ack payload is intentionally ignored; only
+/// the reqId match matters, and a fresh uuid avoids cross-talk with concurrent
+/// bridge/capture awaiters on the same broadcast.
+async fn open_for_read(orch: &Orchestrator, browser: &JobBrowser, ack_timeout: Duration) {
+    let Some(tx) = &orch.browser_command_tx else {
+        return;
+    };
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut rx = orch.browser_bridge_responses.subscribe();
+    if tx
+        .send(BrowserCommand::OpenForRead {
+            id: browser.id.clone(),
+            label: browser.webview_label.clone(),
+            url: browser.url.clone(),
+            request_id: request_id.clone(),
+        })
+        .is_err()
+    {
+        return;
+    }
+    let _ = tokio::time::timeout(ack_timeout, async {
+        loop {
+            match rx.recv().await {
+                Ok((resp_id, _)) if resp_id == request_id => return,
+                Ok(_) => continue,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            }
+        }
+    })
+    .await;
+}
+
+/// Run a content-script bridge round-trip for an agent read, gating on page
+/// readiness so a still-compiling page reads as "still loading" rather than a
+/// hard bridge timeout — without inflating [`BRIDGE_TIMEOUT`]. Sends the
+/// rehydrate `Open`, waits (bounded) for a loading page to finish, runs the
+/// round-trip (which the dispatch layer brackets with off-screen render
+/// priming), and on a transport failure RE-checks the loading flag to close the
+/// rehydrate/cold-start race — a reload may have begun loading AFTER the first
+/// check. Returns the bridge response on a reply (the caller inspects
+/// `response.ok`), or a classified user-facing message (soft still-loading vs
+/// hard loaded-but-broken) already prefixed with `header`.
+///
+/// `readiness_timeout`/`bridge_timeout` are parameters rather than the consts
+/// directly so the soft/hard classification is unit-testable with tiny budgets.
+async fn read_bridge_with_readiness(
+    orch: &Orchestrator,
+    browser: &JobBrowser,
+    header: &str,
+    request: &BridgeRequest,
+    readiness_timeout: Duration,
+    bridge_timeout: Duration,
+    open_ack_timeout: Duration,
+) -> Result<BridgeResponse, String> {
+    let url = browser.url.as_deref().unwrap_or("(blank)");
+    // Subscribe BEFORE the rehydrate Open so a fast page-load Finished cannot
+    // race the readiness awaiter.
+    let mut nav_rx = orch.browser_nav_events.subscribe();
+
+    // Rehydrate the webview before the round-trip (recreate one a restart wiped,
+    // loading the stored url; a live webview no-ops). Awaiting the open ack makes
+    // the loading-flag sample below happen AFTER the host's open closure ran: on a
+    // cold rehydrate that closure both registers the webview (so BeginRenderPriming
+    // and the bridge find it) and flags a freshly created one loading (so the gate
+    // waits for the load instead of bridging a not-yet-loaded page).
+    open_for_read(orch, browser, open_ack_timeout).await;
+
+    // If the page is loading, wait (bounded) for it to become interactive before
+    // bridging. No Finished within the readiness budget → soft still-loading.
+    if orch.is_browser_loading(&browser.id)
+        && await_browser_nav(&mut nav_rx, &browser.id, readiness_timeout, true)
+            .await
+            .is_none()
+    {
+        return Err(still_loading_message(header, url));
+    }
+
+    match browser_bridge_roundtrip(orch, &browser.id, request, bridge_timeout).await {
+        Ok(response) => Ok(response),
+        Err(_) => {
+            // Transport failed. Re-check the loading flag to close the
+            // rehydrate/cold-start race: the Open above may have kicked off a
+            // reload that started loading AFTER the first check.
+            if orch.is_browser_loading(&browser.id) {
+                if await_browser_nav(&mut nav_rx, &browser.id, readiness_timeout, true)
+                    .await
+                    .is_none()
+                {
+                    return Err(still_loading_message(header, url));
+                }
+                // Retry once after a confirmed Finished; a second failure on a
+                // now-loaded page is a genuine bridge failure.
+                return browser_bridge_roundtrip(orch, &browser.id, request, bridge_timeout)
+                    .await
+                    .map_err(|_| bridge_failed_message(header, url));
+            }
+            // Not loading: the page loaded but the bridge genuinely failed.
+            Err(bridge_failed_message(header, url))
+        }
+    }
+}
+
 /// Render a browser resource read: the live url/title/status from the row plus,
 /// when a webview is live, an extraction of the current page content (markdown
 /// from `outerHTML` via the shared htmd converter, or raw `innerText` for text).
@@ -499,7 +690,7 @@ pub(crate) async fn render_browser(
     format: BridgeFormat,
 ) -> String {
     let db = &orch.db.local;
-    let (scope, slug) = match resolve_browser_scope(db, resource).await {
+    let (scope, slug) = match resolve_browser_target(db, resource).await {
         Ok(pair) => pair,
         Err(error) => return error,
     };
@@ -531,47 +722,43 @@ pub(crate) async fn render_browser(
         return format!("{header}\n\n(Browser is closed; no live page content.)");
     }
 
-    // Ensure the webview is live before the bridge round-trip. A host with a
-    // command channel but a webview wiped by a restart rehydrates here (Open is
-    // create-or-reuse), so the read retries against a live page rather than
-    // timing out; a live webview no-ops.
-    if let Some(tx) = &orch.browser_command_tx {
-        let _ = tx.send(BrowserCommand::Open {
-            id: browser.id.clone(),
-            label: browser.webview_label.clone(),
-            url: browser.url.clone(),
-        });
-    }
-
-    match browser_bridge_roundtrip(
+    // The readiness-gated round-trip sends the rehydrate Open, primes off-screen
+    // render inside the dispatch layer, and classifies a still-loading page vs a
+    // loaded-but-broken bridge.
+    let response = match read_bridge_with_readiness(
         orch,
-        &browser.id,
+        &browser,
+        &header,
         &BridgeRequest::Extract { format },
+        READINESS_TIMEOUT,
         BRIDGE_TIMEOUT,
+        OPEN_ACK_TIMEOUT,
     )
     .await
     {
-        Ok(response) if response.ok => {
-            let content = response.content.unwrap_or_default();
-            let body = if response.format.as_deref() == Some("html") {
-                crate::mcp::handlers::fetch_web::convert_body("text/html", content)
-            } else {
-                content
-            };
-            let body = body.trim();
-            if body.is_empty() {
-                format!("{header}\n\n(Page returned no content.)")
-            } else {
-                format!("{header}\n\n---\n\n{body}")
-            }
+        Ok(response) => response,
+        Err(message) => return message,
+    };
+    if response.ok {
+        let content = response.content.unwrap_or_default();
+        let body = if response.format.as_deref() == Some("html") {
+            crate::mcp::handlers::fetch_web::convert_body("text/html", content)
+        } else {
+            content
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            format!("{header}\n\n(Page returned no content.)")
+        } else {
+            format!("{header}\n\n---\n\n{body}")
         }
-        Ok(response) => format!(
+    } else {
+        format!(
             "{header}\n\n(Could not read page content: {})",
             response
                 .error
                 .unwrap_or_else(|| "unknown error".to_string())
-        ),
-        Err(error) => format!("{header}\n\n(Could not read page content: {error})"),
+        )
     }
 }
 
@@ -580,13 +767,18 @@ pub(crate) async fn render_browser(
 /// early message to surface to the agent (resolve error, headless host, or a
 /// closed pane). Mirrors the preamble [`render_browser`] runs inline.
 enum LiveBrowser {
-    Ready { id: String, header: String },
+    // Boxed so the populated variant doesn't bloat every `LiveBrowser` (the row
+    // is ~256 bytes vs the `Message` string's handful).
+    Ready {
+        browser: Box<JobBrowser>,
+        header: String,
+    },
     Message(String),
 }
 
 async fn prepare_live_browser(orch: &Orchestrator, resource: &CairnResource) -> LiveBrowser {
     let db = &orch.db.local;
-    let (scope, slug) = match resolve_browser_scope(db, resource).await {
+    let (scope, slug) = match resolve_browser_target(db, resource).await {
         Ok(pair) => pair,
         Err(error) => return LiveBrowser::Message(error),
     };
@@ -617,17 +809,10 @@ async fn prepare_live_browser(orch: &Orchestrator, resource: &CairnResource) -> 
         ));
     }
 
-    // Rehydrate the webview before the bridge round-trip (a restart may have
-    // wiped the registry); a live webview no-ops. Same pattern as render_browser.
-    if let Some(tx) = &orch.browser_command_tx {
-        let _ = tx.send(BrowserCommand::Open {
-            id: browser.id.clone(),
-            label: browser.webview_label.clone(),
-            url: browser.url.clone(),
-        });
-    }
+    // The rehydrate Open is sent by `read_bridge_with_readiness` so the readiness
+    // gate can subscribe to nav events BEFORE it (no fast-Finished race).
     LiveBrowser::Ready {
-        id: browser.id,
+        browser: Box::new(browser),
         header,
     }
 }
@@ -719,17 +904,36 @@ pub(crate) async fn render_browser_console(
     resource: &CairnResource,
     limit: Option<u32>,
 ) -> String {
-    let (id, header) = match prepare_live_browser(orch, resource).await {
-        LiveBrowser::Ready { id, header } => (id, header),
+    let (browser, header) = match prepare_live_browser(orch, resource).await {
+        LiveBrowser::Ready { browser, header } => (browser, header),
         LiveBrowser::Message(message) => return message,
     };
-    match console_roundtrip(orch, &id, limit).await {
-        Ok(entries) => format!(
-            "{header}\n\n---\n\n### Console ({} entries)\n\n{}",
-            entries.len(),
-            format_console_body(&entries)
+    match read_bridge_with_readiness(
+        orch,
+        &browser,
+        &header,
+        &BridgeRequest::GetConsole { limit },
+        READINESS_TIMEOUT,
+        BRIDGE_TIMEOUT,
+        OPEN_ACK_TIMEOUT,
+    )
+    .await
+    {
+        Ok(response) if response.ok => {
+            let entries = response.logs.unwrap_or_default();
+            format!(
+                "{header}\n\n---\n\n### Console ({} entries)\n\n{}",
+                entries.len(),
+                format_console_body(&entries)
+            )
+        }
+        Ok(response) => format!(
+            "{header}\n\n(Could not read console: {})",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
         ),
-        Err(error) => format!("{header}\n\n(Could not read console: {error})"),
+        Err(message) => message,
     }
 }
 
@@ -740,17 +944,36 @@ pub(crate) async fn render_browser_network(
     resource: &CairnResource,
     limit: Option<u32>,
 ) -> String {
-    let (id, header) = match prepare_live_browser(orch, resource).await {
-        LiveBrowser::Ready { id, header } => (id, header),
+    let (browser, header) = match prepare_live_browser(orch, resource).await {
+        LiveBrowser::Ready { browser, header } => (browser, header),
         LiveBrowser::Message(message) => return message,
     };
-    match network_roundtrip(orch, &id, limit).await {
-        Ok(entries) => format!(
-            "{header}\n\n---\n\n### Network ({} requests)\n\n{}",
-            entries.len(),
-            format_network_body(&entries)
+    match read_bridge_with_readiness(
+        orch,
+        &browser,
+        &header,
+        &BridgeRequest::GetNetwork { limit },
+        READINESS_TIMEOUT,
+        BRIDGE_TIMEOUT,
+        OPEN_ACK_TIMEOUT,
+    )
+    .await
+    {
+        Ok(response) if response.ok => {
+            let entries = response.requests.unwrap_or_default();
+            format!(
+                "{header}\n\n---\n\n### Network ({} requests)\n\n{}",
+                entries.len(),
+                format_network_body(&entries)
+            )
+        }
+        Ok(response) => format!(
+            "{header}\n\n(Could not read network: {})",
+            response
+                .error
+                .unwrap_or_else(|| "unknown error".to_string())
         ),
-        Err(error) => format!("{header}\n\n(Could not read network: {error})"),
+        Err(message) => message,
     }
 }
 
@@ -762,20 +985,23 @@ pub(crate) async fn render_browser_interactive(
     resource: &CairnResource,
     limit: Option<u32>,
 ) -> String {
-    let (id, header) = match prepare_live_browser(orch, resource).await {
-        LiveBrowser::Ready { id, header } => (id, header),
+    let (browser, header) = match prepare_live_browser(orch, resource).await {
+        LiveBrowser::Ready { browser, header } => (browser, header),
         LiveBrowser::Message(message) => return message,
     };
-    let response = match browser_bridge_roundtrip(
+    let response = match read_bridge_with_readiness(
         orch,
-        &id,
+        &browser,
+        &header,
         &BridgeRequest::ListInteractive { limit },
+        READINESS_TIMEOUT,
         BRIDGE_TIMEOUT,
+        OPEN_ACK_TIMEOUT,
     )
     .await
     {
         Ok(response) => response,
-        Err(error) => return format!("{header}\n\n(Could not read interactive elements: {error})"),
+        Err(message) => return message,
     };
     if !response.ok {
         return format!(
@@ -1005,6 +1231,94 @@ mod tests {
         .await
         .unwrap();
         assert!(found.is_some(), "read auto-created the row");
+    }
+
+    /// Insert an open project browser with an explicit `last_active_at`.
+    async fn seed_browser(orch: &Orchestrator, slug: &str, last_active: i64, open: bool) {
+        let scope = BrowserScope::Project("p-brw".to_string());
+        let mut browser = JobBrowser::new(&scope, slug, None, last_active);
+        browser.last_active_at = Some(last_active);
+        if !open {
+            browser.status = crate::browsers::STATUS_CLOSED.to_string();
+            browser.closed_at = Some(last_active);
+        }
+        insert_browser(&orch.db.local, browser).await.unwrap();
+    }
+
+    fn default_project_browser() -> CairnResource {
+        CairnResource::ProjectBrowser {
+            project: "BRW".to_string(),
+            slug: "default".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_target_focus_follows_most_recently_active() {
+        let (orch, _dir) = orch_with_db().await;
+        seed_browser(&orch, "tab-a", 10, true).await;
+        seed_browser(&orch, "tab-b", 20, true).await;
+        // The bare/default form lands on the most-recently user-active open tab.
+        let (_scope, slug) = resolve_browser_target(&orch.db.local, &default_project_browser())
+            .await
+            .unwrap();
+        assert_eq!(slug, "tab-b");
+    }
+
+    #[tokio::test]
+    async fn resolve_target_no_open_falls_back_to_default() {
+        let (orch, _dir) = orch_with_db().await;
+        // No open browser in scope ⇒ the literal `default` slug (created downstream).
+        let (_scope, slug) = resolve_browser_target(&orch.db.local, &default_project_browser())
+            .await
+            .unwrap();
+        assert_eq!(slug, "default");
+    }
+
+    #[tokio::test]
+    async fn resolve_target_ignores_closed_more_recent() {
+        let (orch, _dir) = orch_with_db().await;
+        seed_browser(&orch, "tab-a", 10, true).await;
+        seed_browser(&orch, "tab-b", 99, false).await; // closed but most recent
+        let (_scope, slug) = resolve_browser_target(&orch.db.local, &default_project_browser())
+            .await
+            .unwrap();
+        assert_eq!(slug, "tab-a", "a closed browser never focus-follows");
+    }
+
+    #[tokio::test]
+    async fn resolve_target_ignores_agent_created_null_row() {
+        let (orch, _dir) = orch_with_db().await;
+        // The user's active tab carries a real activation timestamp.
+        seed_browser(&orch, "browser-a", 100, true).await;
+        // An agent creates an explicit missing browser LATER via the shared
+        // ensure path, so it has a NULL last_active_at and must not steal focus.
+        ensure_open_browser(
+            &orch.db.local,
+            BrowserScope::Project("p-brw".to_string()),
+            "scratch",
+            None,
+            200,
+        )
+        .await
+        .unwrap();
+        let (_scope, slug) = resolve_browser_target(&orch.db.local, &default_project_browser())
+            .await
+            .unwrap();
+        assert_eq!(slug, "browser-a", "agent insert must not steal focus");
+    }
+
+    #[tokio::test]
+    async fn resolve_target_explicit_slug_bypasses_focus_following() {
+        let (orch, _dir) = orch_with_db().await;
+        seed_browser(&orch, "tab-a", 99, true).await; // a more-recent OTHER tab
+        let resource = CairnResource::ProjectBrowser {
+            project: "BRW".to_string(),
+            slug: "explicit".to_string(),
+        };
+        let (_scope, slug) = resolve_browser_target(&orch.db.local, &resource)
+            .await
+            .unwrap();
+        assert_eq!(slug, "explicit", "an explicit slug resolves exactly");
     }
 
     #[test]
@@ -1380,5 +1694,517 @@ mod tests {
         assert!(header.contains("# Browser main"), "{header}");
         assert!(header.contains("no webview layer"), "{header}");
         assert!(image.is_none(), "headless host yields no image");
+    }
+
+    // ===== Render priming + readiness classification (Parts 1 & 2) =====
+
+    fn browser_with_id(id: &str, url: &str) -> JobBrowser {
+        JobBrowser {
+            id: id.to_string(),
+            job_id: None,
+            project_id: Some("p-brw".to_string()),
+            slug: "main".to_string(),
+            webview_label: format!("browser:{id}"),
+            url: Some(url.to_string()),
+            title: None,
+            status: STATUS_OPEN.to_string(),
+            created_at: 1,
+            closed_at: None,
+            last_active_at: None,
+        }
+    }
+
+    /// Part 1: a content-script bridge round-trip brackets the dispatch with
+    /// BeginRenderPriming → Bridge → EndRenderPriming, in that order, so a
+    /// backgrounded webview is held realized off-screen for the round-trip.
+    #[tokio::test]
+    async fn bridge_roundtrip_brackets_with_render_priming() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected2 = collected.clone();
+        let responses = orch.browser_bridge_responses.clone();
+        let task = tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let BrowserCommand::Bridge { ref request_id, .. } = cmd {
+                    let _ = responses.send((
+                        request_id.clone(),
+                        "{\"ok\":true,\"content\":\"hi\",\"format\":\"text\"}".to_string(),
+                    ));
+                }
+                collected2.lock().unwrap().push(cmd);
+            }
+        });
+        let result = browser_bridge_roundtrip(
+            &orch,
+            "bid",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        // End is sent on the guard's drop after the round-trip returns.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(orch);
+        let _ = task.await;
+        let cmds = collected.lock().unwrap().clone();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [
+                    BrowserCommand::BeginRenderPriming { .. },
+                    BrowserCommand::Bridge { .. },
+                    BrowserCommand::EndRenderPriming { .. }
+                ]
+            ),
+            "expected Begin, Bridge, End in order, got {cmds:?}"
+        );
+    }
+
+    /// Part 1: EndRenderPriming is emitted even when the round-trip times out —
+    /// the RAII guard must release the off-screen hold on every exit path.
+    #[tokio::test]
+    async fn bridge_roundtrip_emits_end_priming_even_on_timeout() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let collected2 = collected.clone();
+        // Drain commands but never reply, so the round-trip times out.
+        let task = tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                collected2.lock().unwrap().push(cmd);
+            }
+        });
+        let err = browser_bridge_roundtrip(
+            &orch,
+            "bid",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            Duration::from_millis(80),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(orch);
+        let _ = task.await;
+        let cmds = collected.lock().unwrap().clone();
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, BrowserCommand::BeginRenderPriming { .. })),
+            "Begin must be emitted, got {cmds:?}"
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, BrowserCommand::EndRenderPriming { .. })),
+            "End must be emitted even on timeout, got {cmds:?}"
+        );
+    }
+
+    /// Part 2: a loading page that never becomes interactive within the
+    /// readiness budget reads as a SOFT still-loading message naming the url —
+    /// not a hard bridge failure.
+    #[tokio::test]
+    async fn read_readiness_still_loading_is_soft() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        orch.set_browser_loading("bid", true);
+        // Drain commands; never reply, never publish Finished.
+        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let browser = browser_with_id("bid", "http://localhost:5173/app");
+        let res = read_bridge_with_readiness(
+            &orch,
+            &browser,
+            "# Browser main",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            Duration::from_millis(60),
+            Duration::from_millis(60),
+            Duration::from_millis(20),
+        )
+        .await;
+        let err = res.unwrap_err();
+        assert!(err.contains("still loading"), "{err}");
+        assert!(err.contains("http://localhost:5173/app"), "{err}");
+        drop(orch);
+        let _ = task.await;
+    }
+
+    /// Part 2: a loading page that finishes within the readiness budget proceeds
+    /// to a successful bridge read.
+    #[tokio::test]
+    async fn read_readiness_finishes_then_succeeds() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        orch.set_browser_loading("bid", true);
+        let responses = orch.browser_bridge_responses.clone();
+        let task = tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                if let BrowserCommand::Bridge { request_id, .. } = cmd {
+                    let _ = responses.send((
+                        request_id,
+                        "{\"ok\":true,\"content\":\"hello\",\"format\":\"text\"}".to_string(),
+                    ));
+                }
+            }
+        });
+        // Publish Finished shortly after the helper subscribes.
+        let nav = orch.browser_nav_events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = nav.send(BrowserNavEvent {
+                browser_id: "bid".to_string(),
+                url: "http://x".to_string(),
+                phase: NavPhase::Finished,
+            });
+        });
+        let browser = browser_with_id("bid", "http://x");
+        let res = read_bridge_with_readiness(
+            &orch,
+            &browser,
+            "# Browser main",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+        )
+        .await;
+        let resp = res.expect("a finished page should read successfully");
+        assert!(resp.ok);
+        assert_eq!(resp.content.as_deref(), Some("hello"));
+        drop(orch);
+        let _ = task.await;
+    }
+
+    /// Part 2: a page that is NOT loading but whose bridge fails reads as a HARD
+    /// loaded-but-broken message — the still-loading path must never mask it.
+    #[tokio::test]
+    async fn read_readiness_loaded_but_broken_is_hard() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        // loading flag false (default). Drain but never reply → bridge times out.
+        let task = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let browser = browser_with_id("bid", "http://x/app");
+        let res = read_bridge_with_readiness(
+            &orch,
+            &browser,
+            "# Browser main",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            Duration::from_millis(60),
+            Duration::from_millis(60),
+            Duration::from_millis(20),
+        )
+        .await;
+        let err = res.unwrap_err();
+        assert!(
+            !err.contains("still loading"),
+            "a loaded page must not read as loading: {err}"
+        );
+        assert!(err.contains("did not respond"), "{err}");
+        assert!(err.contains("http://x/app"), "{err}");
+        drop(orch);
+        let _ = task.await;
+    }
+
+    /// Part 2: the rehydrate race — not loading at entry, but a reload starts
+    /// AFTER the first bridge attempt fails. The post-failure re-check waits for
+    /// the new load to finish and retries once, succeeding.
+    #[tokio::test]
+    async fn read_readiness_handles_rehydrate_race_then_retries() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        let responses = orch.browser_bridge_responses.clone();
+        let loading = orch.browser_loading.clone();
+        let task = tokio::spawn(async move {
+            let mut first = true;
+            while let Some(cmd) = rx.recv().await {
+                if let BrowserCommand::Bridge { request_id, .. } = cmd {
+                    if first {
+                        first = false;
+                        // A rehydrate reload begins AFTER the first readiness check.
+                        loading.lock().unwrap().insert("bid".to_string(), true);
+                        // No reply → the first attempt times out.
+                    } else {
+                        let _ = responses.send((
+                            request_id,
+                            "{\"ok\":true,\"content\":\"late\",\"format\":\"text\"}".to_string(),
+                        ));
+                    }
+                }
+            }
+        });
+        // Publish Finished after the first attempt has timed out and the
+        // post-failure re-check is awaiting readiness.
+        let nav = orch.browser_nav_events.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = nav.send(BrowserNavEvent {
+                browser_id: "bid".to_string(),
+                url: "http://x".to_string(),
+                phase: NavPhase::Finished,
+            });
+        });
+        let browser = browser_with_id("bid", "http://x");
+        let res = read_bridge_with_readiness(
+            &orch,
+            &browser,
+            "# Browser main",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(60),
+            Duration::from_millis(20),
+        )
+        .await;
+        let resp = res.expect("the retry after the race should succeed");
+        assert!(resp.ok);
+        assert_eq!(resp.content.as_deref(), Some("late"));
+        drop(orch);
+        let _ = task.await;
+    }
+
+    /// Part 3: the cold-creation ordering the OpenForRead ack exists to fix. On a
+    /// cold rehydrate the freshly created webview reads as loading only AFTER the
+    /// host's open closure runs; awaiting the ack makes the gate sample the loading
+    /// flag after that closure, so it waits for the load and bridges the loaded
+    /// page. The stand-in's Bridge arm answers ok only once the page has finished
+    /// loading, so an early bridge (the bug — sampling before the open ran) would
+    /// get ok:false and fail the read: this exercises the fix rather than passing
+    /// regardless.
+    #[tokio::test]
+    async fn read_readiness_cold_open_waits_for_registration_and_load() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        // Cold: the loading flag starts unset (registry wiped). The stand-in flags
+        // it only when OpenForRead arrives, mimicking open_browser's fresh-create
+        // path, then clears it and publishes Finished after a short delay.
+        let responses = orch.browser_bridge_responses.clone();
+        let nav = orch.browser_nav_events.clone();
+        let loading = orch.browser_loading.clone();
+        let task = tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    BrowserCommand::OpenForRead { request_id, .. } => {
+                        loading.lock().unwrap().insert("bid".to_string(), true);
+                        let _ = responses.send((request_id, "{}".to_string()));
+                        let (nav2, loading2) = (nav.clone(), loading.clone());
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(40)).await;
+                            loading2.lock().unwrap().insert("bid".to_string(), false);
+                            let _ = nav2.send(BrowserNavEvent {
+                                browser_id: "bid".to_string(),
+                                url: "http://x".to_string(),
+                                phase: NavPhase::Finished,
+                            });
+                        });
+                    }
+                    BrowserCommand::Bridge { request_id, .. } => {
+                        // ok only once the page has finished loading; an early
+                        // bridge sees an unloaded page and gets ok:false.
+                        let loaded = loading.lock().unwrap().get("bid").copied() == Some(false);
+                        let body = if loaded {
+                            "{\"ok\":true,\"content\":\"ready\",\"format\":\"text\"}"
+                        } else {
+                            "{\"ok\":false,\"format\":\"text\"}"
+                        };
+                        let _ = responses.send((request_id, body.to_string()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let browser = browser_with_id("bid", "http://x");
+        let res = read_bridge_with_readiness(
+            &orch,
+            &browser,
+            "# Browser main",
+            &BridgeRequest::Extract {
+                format: BridgeFormat::Text,
+            },
+            Duration::from_secs(2),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        )
+        .await;
+        let resp = res.expect("cold read should wait for the open ack + load, then bridge");
+        assert!(resp.ok);
+        assert_eq!(resp.content.as_deref(), Some("ready"));
+        drop(orch);
+        let _ = task.await;
+    }
+
+    /// Part 3: the screenshot cold path. A cold rehydrate waits for the load before
+    /// capturing, so it returns a real frame with NO partiality note. The stand-in
+    /// replies to Capture with image data only once the page has finished loading,
+    /// so an early capture (the bug) would yield no image and fail the assertion.
+    #[tokio::test]
+    async fn screenshot_cold_open_waits_for_load_then_captures_real_frame() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        // Seed the project + a known browser row so the screenshot path resolves to
+        // the id "bid" the stand-in keys on.
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        insert_browser(&orch.db.local, browser_with_id("bid", "http://x"))
+            .await
+            .unwrap();
+
+        let responses = orch.browser_bridge_responses.clone();
+        let nav = orch.browser_nav_events.clone();
+        let loading = orch.browser_loading.clone();
+        let task = tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    BrowserCommand::OpenForRead { request_id, .. } => {
+                        loading.lock().unwrap().insert("bid".to_string(), true);
+                        let _ = responses.send((request_id, "{}".to_string()));
+                        let (nav2, loading2) = (nav.clone(), loading.clone());
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(40)).await;
+                            loading2.lock().unwrap().insert("bid".to_string(), false);
+                            let _ = nav2.send(BrowserNavEvent {
+                                browser_id: "bid".to_string(),
+                                url: "http://x".to_string(),
+                                phase: NavPhase::Finished,
+                            });
+                        });
+                    }
+                    BrowserCommand::Capture { request_id, .. } => {
+                        // Image data only once the page has finished loading.
+                        let loaded = loading.lock().unwrap().get("bid").copied() == Some(false);
+                        let payload = if loaded {
+                            serde_json::json!({ "ok": true, "dataB64": "UE5HX0RBVEE=" }).to_string()
+                        } else {
+                            serde_json::json!({ "ok": false, "error": "not loaded" }).to_string()
+                        };
+                        let _ = responses.send((request_id, payload));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let resource = CairnResource::ProjectBrowser {
+            project: "BRW".to_string(),
+            slug: "main".to_string(),
+        };
+        let (header, image) = render_browser_screenshot(&orch, &resource).await;
+        assert!(
+            image.is_some(),
+            "cold screenshot should capture a real frame: {header}"
+        );
+        assert!(
+            !header.contains("still loading"),
+            "a waited-for cold capture must not be noted partial: {header}"
+        );
+        drop(orch);
+        let _ = task.await;
+    }
+
+    /// Part 3: a warm, already-loading live page must yield an IMMEDIATE partial
+    /// screenshot (the quick-visual-sample contract), not block on the readiness
+    /// budget. Only a cold-create open (not-loading → loading across the ack)
+    /// waits; a page already loading before the read captures at once with the
+    /// partiality note. The stand-in keeps the page loading forever and never
+    /// sends Finished, so a gate that wrongly waited would block the full
+    /// READINESS_TIMEOUT — the 5s bound trips that regression.
+    #[tokio::test]
+    async fn screenshot_warm_already_loading_returns_promptly_with_partial_note() {
+        let (orch, mut rx, _dir) = orch_with_browser_tx().await;
+        orch.db
+            .local
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        insert_browser(&orch.db.local, browser_with_id("bid", "http://x"))
+            .await
+            .unwrap();
+        // The live webview is already mid-load when the read arrives.
+        orch.set_browser_loading("bid", true);
+
+        let responses = orch.browser_bridge_responses.clone();
+        let task = tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                match cmd {
+                    // Reuse branch: ack without touching the loading flag and
+                    // without ever publishing Finished (the page keeps loading).
+                    BrowserCommand::OpenForRead { request_id, .. } => {
+                        let _ = responses.send((request_id, "{}".to_string()));
+                    }
+                    BrowserCommand::Capture { request_id, .. } => {
+                        let payload = serde_json::json!({ "ok": true, "dataB64": "UE5HX0RBVEE=" })
+                            .to_string();
+                        let _ = responses.send((request_id, payload));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let resource = CairnResource::ProjectBrowser {
+            project: "BRW".to_string(),
+            slug: "main".to_string(),
+        };
+        // If the gate wrongly waited the readiness budget (30s), this 5s bound trips.
+        let (header, image) = tokio::time::timeout(
+            Duration::from_secs(5),
+            render_browser_screenshot(&orch, &resource),
+        )
+        .await
+        .expect(
+            "warm already-loading screenshot must return promptly, not wait the readiness budget",
+        );
+        assert!(
+            image.is_some(),
+            "a partial frame is still captured: {header}"
+        );
+        assert!(
+            header.contains("still loading"),
+            "an already-loading screenshot must carry the partiality note: {header}"
+        );
+        drop(orch);
+        let _ = task.await;
+    }
+
+    /// Part 2: the classified messages name the url and the relevant budget so an
+    /// agent can act on them.
+    #[test]
+    fn classified_messages_name_url_and_budget() {
+        let soft = still_loading_message("# Browser main", "http://localhost:5173");
+        assert!(soft.contains("# Browser main"), "{soft}");
+        assert!(soft.contains("still loading"), "{soft}");
+        assert!(soft.contains("http://localhost:5173"), "{soft}");
+        assert!(
+            soft.contains(&format!("{}s", READINESS_TIMEOUT.as_secs())),
+            "{soft}"
+        );
+        let hard = bridge_failed_message("# Browser main", "http://localhost:5173");
+        assert!(hard.contains("# Browser main"), "{hard}");
+        assert!(hard.contains("finished loading"), "{hard}");
+        assert!(hard.contains("http://localhost:5173"), "{hard}");
+        assert!(
+            hard.contains(&format!("{}s", BRIDGE_TIMEOUT.as_secs())),
+            "{hard}"
+        );
     }
 }

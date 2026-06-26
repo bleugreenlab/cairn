@@ -208,8 +208,9 @@ fn git_commit_with_identity(repo_root: &Path, msg: &str) -> Option<String> {
 /// Best effort: the file write has already succeeded and is never rolled back,
 /// so a git failure is logged rather than surfaced as a mutation error. A path
 /// not inside any git work tree (an older install where `~/.cairn` is not a
-/// repo) is silently skipped. Returns the shas of the commits actually made.
-pub(crate) fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<String> {
+/// repo) is silently skipped. Returns the (work-tree root, sha) of each commit
+/// actually made, so callers can tell which repository committed.
+pub(crate) fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<(PathBuf, String)> {
     use std::collections::BTreeMap;
 
     // Map each repo's work-tree root to a directory inside it that we can run
@@ -249,13 +250,105 @@ pub(crate) fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<String> {
         }
     }
 
-    let mut shas = Vec::new();
-    for (_root, dir) in repos {
+    let mut commits = Vec::new();
+    for (root, dir) in repos {
         if let Some(sha) = git_commit_with_identity(&dir, msg) {
-            shas.push(sha);
+            commits.push((root, sha));
         }
     }
-    shas
+    commits
+}
+
+/// Commit `paths` (via [`commit_config_paths`]) and, when `push_root` names the
+/// workspace repo and that repo just received one of those commits, push it to
+/// `origin` in the background.
+///
+/// This is the single funnel every settings/config writer uses, so no write path
+/// can drift back to leaving `settings.yaml` / `config.yaml` dirty. Callers offer
+/// the workspace repo as `push_root` whenever a commit might land there, and the
+/// committed-repo check above decides whether it actually pushes: the fixed-scope
+/// `settings.yaml` writers pass `Some(config_dir)`, and the scope-flexible
+/// config-resource path passes it unconditionally so a workspace->project move
+/// still pushes the workspace-side deletion while a project-only change is a
+/// no-op (the workspace repo never committed). A purely project-scoped writer may
+/// pass `None`: a project's `origin` is the user's shared code remote, never
+/// auto-pushed on a settings toggle.
+///
+/// The push is fire-and-forget on a detached thread so a slow network round-trip
+/// never blocks the UI save, and is skipped entirely when nothing committed.
+pub(crate) fn commit_and_maybe_push(paths: &[PathBuf], msg: &str, push_root: Option<&Path>) {
+    let commits = commit_config_paths(paths, msg);
+    if commits.is_empty() {
+        return;
+    }
+    let Some(push_root) = push_root else {
+        return;
+    };
+    // Resolve through git's own toplevel so a symlinked temp dir matches the
+    // canonical roots `commit_config_paths` already returns.
+    let Some(canonical) = git_work_tree_root(push_root) else {
+        return;
+    };
+    if commits.iter().any(|(root, _)| *root == canonical) {
+        std::thread::spawn(move || push_workspace_repo_best_effort(&canonical));
+    }
+}
+
+/// Push the current branch of `repo_root` to its `origin` remote, best effort.
+///
+/// Returns silently when `repo_root` has no `origin` (nothing to push), when
+/// HEAD is detached, or when the push fails (offline, auth, non-fast-forward) —
+/// the local commit is authoritative and the remote is a sync convenience, so a
+/// push failure must never surface as an error or roll anything back.
+///
+/// Always a plain `git push`, **never** a force: a non-fast-forward means the
+/// remote advanced elsewhere, and force-pushing would destroy config history.
+/// Such divergence is logged and left for manual reconciliation.
+///
+/// Standalone and synchronous so it is unit-testable directly against a temp
+/// repo with a bare origin; production reaches it through the detached thread
+/// spawned by [`commit_and_maybe_push`].
+pub(crate) fn push_workspace_repo_best_effort(repo_root: &Path) {
+    // No origin configured -> nothing to push.
+    match crate::env::git()
+        .args(["remote", "get-url", "origin"])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            if String::from_utf8_lossy(&out.stdout).trim().is_empty() {
+                return;
+            }
+        }
+        _ => return,
+    }
+
+    // Resolve the current branch; bail on detached HEAD.
+    let branch = match crate::env::git()
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return,
+    };
+    if branch.is_empty() || branch == "HEAD" {
+        return;
+    }
+
+    // Plain push, never force.
+    match crate::env::git()
+        .args(["push", "origin", &branch])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => log::warn!(
+            "Best-effort push of workspace config to origin/{branch} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => log::warn!("Best-effort push of workspace config failed: {e}"),
+    }
 }
 
 /// Resolve the git work-tree root that contains `dir`, or None when it is not
@@ -1050,5 +1143,153 @@ mod tests {
         assert_eq!(shas.len(), 2, "each repo should get its own commit");
         assert_eq!(git_head_subject(&repo_a), "cairn: bulk");
         assert_eq!(git_head_subject(&repo_b), "cairn: bulk");
+    }
+
+    fn init_bare_origin(path: &Path) {
+        assert!(crate::env::git()
+            .args(["init", "--bare", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn set_origin(repo: &Path, origin: &Path) {
+        assert!(crate::env::git()
+            .args(["remote", "add", "origin"])
+            .arg(origin)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_rev(repo: &Path, rev: &str) -> String {
+        let out = crate::env::git()
+            .args(["rev-parse", rev])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn current_branch(repo: &Path) -> String {
+        let out = crate::env::git()
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Build a work repo whose `origin` is a fresh bare repo. Returns both roots.
+    fn repo_with_bare_origin(tmp: &Path) -> (PathBuf, PathBuf) {
+        let origin = tmp.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_bare_origin(&origin);
+        let repo = tmp.join("ws");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_git_repo(&repo);
+        set_origin(&repo, &origin);
+        (repo, origin)
+    }
+
+    #[test]
+    fn push_workspace_repo_best_effort_advances_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, origin) = repo_with_bare_origin(temp.path());
+
+        std::fs::write(repo.join("settings.yaml"), "a: 1\n").unwrap();
+        let commits = commit_config_paths(&[repo.join("settings.yaml")], "cairn: update settings");
+        assert_eq!(commits.len(), 1);
+
+        push_workspace_repo_best_effort(&repo);
+
+        let branch = current_branch(&repo);
+        assert_eq!(
+            git_rev(&origin, &format!("refs/heads/{branch}")),
+            git_rev(&repo, "HEAD"),
+            "origin branch should advance to the pushed commit"
+        );
+    }
+
+    #[test]
+    fn push_workspace_repo_best_effort_no_remote_is_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        init_git_repo(repo);
+        std::fs::write(repo.join("settings.yaml"), "a: 1\n").unwrap();
+        commit_config_paths(&[repo.join("settings.yaml")], "cairn: update settings");
+        // No origin configured: must return silently (nothing to assert but no panic).
+        push_workspace_repo_best_effort(repo);
+    }
+
+    #[test]
+    fn push_workspace_repo_best_effort_never_force_pushes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, origin) = repo_with_bare_origin(temp.path());
+
+        std::fs::write(repo.join("settings.yaml"), "a: 1\n").unwrap();
+        commit_config_paths(&[repo.join("settings.yaml")], "cairn: c1");
+        let c1 = git_rev(&repo, "HEAD");
+        push_workspace_repo_best_effort(&repo);
+
+        std::fs::write(repo.join("settings.yaml"), "a: 2\n").unwrap();
+        commit_config_paths(&[repo.join("settings.yaml")], "cairn: c2");
+        push_workspace_repo_best_effort(&repo);
+
+        let branch = current_branch(&repo);
+        let origin_tip = git_rev(&origin, &format!("refs/heads/{branch}"));
+        assert_eq!(
+            origin_tip,
+            git_rev(&repo, "HEAD"),
+            "origin at c2 before rewind"
+        );
+
+        // Rewind the work repo behind origin so any push would move origin
+        // backwards — a non-fast-forward git rejects unless forced.
+        assert!(crate::env::git()
+            .args(["reset", "--hard"])
+            .arg(&c1)
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success());
+
+        push_workspace_repo_best_effort(&repo);
+
+        assert_eq!(
+            git_rev(&origin, &format!("refs/heads/{branch}")),
+            origin_tip,
+            "origin tip must be unchanged; best-effort push must never force"
+        );
+    }
+
+    #[test]
+    fn commit_and_maybe_push_commits_only_touched_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        init_git_repo(repo);
+        std::fs::write(repo.join("settings.yaml"), "a: 1\n").unwrap();
+        // Unrelated dirty state in the same repo must be left alone.
+        std::fs::write(repo.join("unrelated.txt"), "dirty").unwrap();
+
+        // push_root = None: commit only, no push attempted.
+        commit_and_maybe_push(
+            &[repo.join("settings.yaml")],
+            "cairn: update settings",
+            None,
+        );
+
+        assert_eq!(git_head_subject(repo), "cairn: update settings");
+        let status = git_status(repo);
+        assert!(
+            status.contains("unrelated.txt"),
+            "unrelated file should remain dirty: {status:?}"
+        );
+        assert!(
+            !status.contains("settings.yaml"),
+            "settings.yaml should be committed: {status:?}"
+        );
     }
 }

@@ -60,6 +60,7 @@ fn active_stream_to_event(active: ActiveMessageStream) -> Event {
         output_tokens: None,
         turn_id: active.stream.turn_id.clone(),
         thinking_tokens: None,
+        cost_usd: None,
         storage_mode: None,
         content_commit: None,
         content_change_id: None,
@@ -107,19 +108,19 @@ fn insert_active_stream_by_created_at(events: &mut Vec<Event>, active: ActiveMes
 }
 
 const RUN_COLUMNS: &str = "id, issue_id, project_id, job_id, status, session_id, error_message,
-    started_at, exited_at, created_at, updated_at, chat_id, backend, exit_reason, start_mode";
+    started_at, exited_at, created_at, updated_at, chat_id, exit_reason, start_mode";
 
 pub(crate) const EVENT_COLUMNS: &str =
     "id, run_id, session_id, sequence, timestamp, event_type, data,
     parent_tool_use_id, created_at, input_tokens, cache_read_tokens, cache_create_tokens,
     output_tokens, turn_id, thinking_tokens, storage_mode, content_commit, content_render_sha,
-    data_blob, codec, content_change_id";
+    data_blob, codec, content_change_id, cost_usd";
 
 /// Number of columns `EVENT_COLUMNS` projects, and therefore the zero-based
 /// index of any extra column appended after it (e.g. `SELECT {EVENT_COLUMNS},
 /// rowid` puts `rowid` here). Keep in lockstep with `EVENT_COLUMNS`: adding a
 /// column there without bumping this read a trailing column at the wrong index.
-pub(crate) const EVENT_COLUMN_COUNT: usize = 21;
+pub(crate) const EVENT_COLUMN_COUNT: usize = 22;
 
 const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id";
 
@@ -135,7 +136,7 @@ pub fn list_runs(db: Arc<LocalDb>, issue_id: &str) -> Result<Vec<Run>, CairnErro
         load_runs_by_sql(
             &db,
             "SELECT id, issue_id, project_id, job_id, status, session_id, error_message,
-                    started_at, exited_at, created_at, updated_at, chat_id, backend, exit_reason,
+                    started_at, exited_at, created_at, updated_at, chat_id, exit_reason,
                     start_mode
              FROM runs
              WHERE issue_id = ?1
@@ -152,7 +153,7 @@ pub fn list_runs_for_job(db: Arc<LocalDb>, job_id: &str) -> Result<Vec<Run>, Cai
         load_runs_by_sql(
             &db,
             "SELECT id, issue_id, project_id, job_id, status, session_id, error_message,
-                    started_at, exited_at, created_at, updated_at, chat_id, backend, exit_reason,
+                    started_at, exited_at, created_at, updated_at, chat_id, exit_reason,
                     start_mode
              FROM runs
              WHERE job_id = ?1
@@ -989,14 +990,13 @@ fn run_from_row(row: &Row) -> DbResult<Run> {
             .unwrap_or(RunStatus::Starting),
         session_id: row.opt_text(5)?,
         chat_id: row.opt_text(11)?,
-        backend: row.opt_text(12)?,
-        exit_reason: row.opt_text(13)?,
+        exit_reason: row.opt_text(12)?,
         error_message: row.opt_text(6)?,
         started_at: row.opt_i64(7)?,
         exited_at: row.opt_i64(8)?,
         created_at: row.i64(9)?,
         updated_at: row.i64(10)?,
-        start_mode: row.opt_text(14)?.and_then(|mode| mode.parse().ok()),
+        start_mode: row.opt_text(13)?.and_then(|mode| mode.parse().ok()),
     })
 }
 
@@ -1023,6 +1023,7 @@ pub(crate) fn event_from_row(row: &Row) -> DbResult<Event> {
         data_blob: row.opt_blob(18)?,
         codec: row.opt_text(19)?,
         content_change_id: row.opt_text(20)?,
+        cost_usd: row.opt_f64(21)?,
         read_segments: None,
     })
 }
@@ -1138,6 +1139,44 @@ mod tests {
             thinking_ms: None,
             raw: None,
         }
+    }
+
+    #[tokio::test]
+    async fn event_read_surfaces_cost_usd() {
+        // Metered backends (OpenRouter) write `cost_usd` on the result event;
+        // subscription backends leave it NULL. The transcript read path must
+        // surface the value where present and `None` where absent.
+        let db = crate::storage::migrated_test_db("event-cost-usd.db").await;
+        seed_run(&db, "sess-1").await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO events(
+                        id, run_id, session_id, sequence, timestamp, event_type, data,
+                        created_at, cost_usd
+                     ) VALUES
+                        ('e-cost', 'run-1', 'sess-1', 1, 1, 'result:success', '{}', 1, 0.0023),
+                        ('e-free', 'run-1', 'sess-1', 2, 2, 'assistant', '{}', 2, NULL)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let events = load_events_for_run(&db, "run-1".to_string()).await.unwrap();
+        let cost = events
+            .iter()
+            .find(|e| e.id == "e-cost")
+            .expect("cost event");
+        let free = events
+            .iter()
+            .find(|e| e.id == "e-free")
+            .expect("free event");
+        assert_eq!(cost.cost_usd, Some(0.0023));
+        assert_eq!(free.cost_usd, None);
     }
 
     #[tokio::test]

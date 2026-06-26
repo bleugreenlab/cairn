@@ -138,10 +138,43 @@ fn ensure_initial_commit(repo_path: &Path) -> Result<(), CairnError> {
 
 /// Detect a repository's default branch.
 ///
-/// Prefers the remote HEAD (`refs/remotes/origin/HEAD` → e.g. "staging"), then
-/// the currently checked-out branch. Returns `None` when neither resolves, in
-/// which case callers keep the stored default.
+/// Prefers the remote's *real* default — `git ls-remote --symref origin HEAD`
+/// reports `ref: refs/heads/<branch>\tHEAD`, which is authoritative even when the
+/// local `refs/remotes/origin/HEAD` symref was never set. That unset-symref case
+/// is exactly what left a repo whose trunk is e.g. "staging" stuck on the stored
+/// "main". Falls back to the local symbolic-ref, then the currently checked-out
+/// branch. Returns `None` when none resolve, in which case callers keep the
+/// stored default.
 fn detect_default_branch(repo_path: &Path) -> Option<String> {
+    detect_default_branch_with_source(repo_path).map(|(branch, _)| branch)
+}
+
+/// Where a detected default branch came from. An *authoritative* detection (the
+/// remote's real HEAD, or the local record of it) names the actual trunk; the
+/// *checked-out-branch* fallback is a last resort that names whatever branch the
+/// working tree happens to be on. The checked-out branch is acceptable as a
+/// default only at create time / for a local-only repo with no remote signal —
+/// the startup backfill must NOT persist it, because the user may be on any
+/// feature or integration branch when the app starts, and persisting that would
+/// corrupt the stored default exactly as the stale `main` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefaultBranchSource {
+    /// `git ls-remote --symref origin HEAD`, or local `refs/remotes/origin/HEAD`.
+    Authoritative,
+    /// `git rev-parse --abbrev-ref HEAD` — the transient checked-out branch.
+    CheckedOut,
+}
+
+/// Detect a repository's default branch, tagging the result with its source so
+/// callers can decide whether it is trustworthy enough to persist.
+///
+/// Prefers the remote's *real* default — `git ls-remote --symref origin HEAD`
+/// reports `ref: refs/heads/<branch>\tHEAD`, authoritative even when the local
+/// `refs/remotes/origin/HEAD` symref was never set. Falls back to that local
+/// symbolic-ref (also authoritative — a deliberate record of the remote default),
+/// then to the currently checked-out branch (NOT authoritative). Returns `None`
+/// when none resolve, in which case callers keep the stored default.
+fn detect_default_branch_with_source(repo_path: &Path) -> Option<(String, DefaultBranchSource)> {
     let git_line = |args: &[&str]| -> Option<String> {
         let output = std::process::Command::new("git")
             .args(args)
@@ -159,15 +192,56 @@ fn detect_default_branch(repo_path: &Path) -> Option<String> {
         }
     };
 
+    // Authoritative: ask the remote for its HEAD symref. Resolves even when the
+    // local origin/HEAD was never set (the common cause of the stale "main").
+    if let Some(stdout) = git_output(repo_path, &["ls-remote", "--symref", "origin", "HEAD"]) {
+        if let Some(branch) = parse_ls_remote_symref(&stdout) {
+            return Some((branch, DefaultBranchSource::Authoritative));
+        }
+    }
+
+    // Authoritative: the local record of the remote default (origin/HEAD set
+    // locally by clone or `git remote set-head`).
     if let Some(head) = git_line(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
         if let Some(branch) = head.strip_prefix("origin/") {
             if !branch.is_empty() {
-                return Some(branch.to_string());
+                return Some((branch.to_string(), DefaultBranchSource::Authoritative));
             }
         }
     }
 
-    git_line(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|branch| branch != "HEAD")
+    // Last resort: the currently checked-out branch. NOT authoritative — a
+    // transient signal the backfill must never persist.
+    git_line(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|branch| branch != "HEAD")
+        .map(|branch| (branch, DefaultBranchSource::CheckedOut))
+}
+
+/// Run a git command and return its stdout (untrimmed) when it succeeds. Unlike
+/// the single-line helper inside `detect_default_branch`, this preserves the full
+/// multi-line output that `ls-remote --symref` produces.
+fn git_output(repo_path: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Parse the branch name out of `git ls-remote --symref origin HEAD` output. The
+/// relevant line is `ref: refs/heads/<branch>\tHEAD`; the SHA line that follows is
+/// ignored. Returns `None` when no symref line is present (e.g. a detached remote
+/// HEAD).
+fn parse_ls_remote_symref(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let rest = line.strip_prefix("ref: refs/heads/")?;
+        let branch = rest.split_whitespace().next()?.trim();
+        (!branch.is_empty()).then(|| branch.to_string())
+    })
 }
 
 /// Run a git command in a directory, returning an error with stderr if it fails.
@@ -373,6 +447,67 @@ pub async fn set_default_branch_db(db: &LocalDb, id: &str, branch: &str) -> Resu
     })
     .await?;
     Ok(())
+}
+
+/// Re-detect and persist the default branch for every project with a reachable
+/// local checkout, correcting rows left on the unverified `'main'` schema default
+/// (or any other stale value — e.g. a repo whose real trunk is `staging`).
+///
+/// Detection only runs at project-create time, and no SQL migration can shell out
+/// to git, so a project created before detection became authoritative — or one
+/// whose origin/HEAD was unset when it was created — keeps a wrong stored value
+/// forever. That wrong value is the shared root cause of merges dragging the
+/// checkout onto `main` and skipping the squash, so this one-time startup
+/// reconciliation is what repairs an already-broken project.
+///
+/// Best-effort and idempotent: a no-op when the stored value already matches the
+/// detected one, and a per-project detection or persist failure is logged and
+/// never aborts the sweep (the same discipline as the local default-advance
+/// sweep).
+pub async fn reconcile_default_branches(db: &LocalDb) {
+    let projects = match list_db(db).await {
+        Ok(projects) => projects,
+        Err(e) => {
+            log::warn!("default-branch backfill: failed to load projects: {e}");
+            return;
+        }
+    };
+    for project in projects {
+        if project.repo_path.is_empty() {
+            continue;
+        }
+        let repo_path = Path::new(&project.repo_path);
+        if !repo_path.exists() {
+            continue;
+        }
+        let stored = project.default_branch.unwrap_or_default();
+        let Some((detected, source)) = detect_default_branch_with_source(repo_path) else {
+            continue;
+        };
+        // Persist ONLY an authoritative detection. The checked-out-branch fallback
+        // names whatever branch the working tree happens to be on at startup (a
+        // feature or integration branch, or a stale checkout when the remote is
+        // unreachable) — overwriting the stored default with that would corrupt it
+        // the same way the unverified 'main' did, just in the other direction.
+        if source != DefaultBranchSource::Authoritative {
+            continue;
+        }
+        if detected == stored {
+            continue;
+        }
+        match set_default_branch_db(db, &project.id, &detected).await {
+            Ok(()) => log::info!(
+                "default-branch backfill: corrected project {} default '{}' -> '{}'",
+                project.id,
+                stored,
+                detected
+            ),
+            Err(e) => log::warn!(
+                "default-branch backfill: failed to persist default for project {}: {e}",
+                project.id
+            ),
+        }
+    }
 }
 
 pub async fn set_name_db(db: &LocalDb, id: &str, name: &str) -> Result<(), CairnError> {
@@ -619,5 +754,140 @@ mod tests {
             .unwrap();
 
         assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn parse_ls_remote_symref_extracts_branch_and_ignores_sha_line() {
+        let stdout = "ref: refs/heads/staging\tHEAD\nabc123def456\tHEAD\n";
+        assert_eq!(parse_ls_remote_symref(stdout).as_deref(), Some("staging"));
+
+        // A detached remote HEAD (no symref line) yields nothing.
+        let detached = "abc123def456\tHEAD\n";
+        assert_eq!(parse_ls_remote_symref(detached), None);
+
+        // A branch name with slashes survives.
+        let slashed = "ref: refs/heads/release/2.0\tHEAD\n";
+        assert_eq!(
+            parse_ls_remote_symref(slashed).as_deref(),
+            Some("release/2.0")
+        );
+    }
+
+    /// Build a "remote" repo whose trunk is `branch`, plus a local repo with an
+    /// `origin` pointing at it but `refs/remotes/origin/HEAD` deliberately unset.
+    fn remote_and_local_repos(branch: &str) -> (tempfile::TempDir, tempfile::TempDir) {
+        let remote = tempdir().unwrap();
+        run_git(&["init", "-q", "-b", branch], remote.path()).unwrap();
+        run_git(&["config", "user.email", "t@e.com"], remote.path()).unwrap();
+        run_git(&["config", "user.name", "T"], remote.path()).unwrap();
+        std::fs::write(remote.path().join("f.txt"), "x\n").unwrap();
+        run_git(&["add", "-A"], remote.path()).unwrap();
+        run_git(&["commit", "-q", "-m", "init"], remote.path()).unwrap();
+
+        let local = tempdir().unwrap();
+        run_git(&["init", "-q", "-b", "main"], local.path()).unwrap();
+        let remote_url = remote.path().to_string_lossy().to_string();
+        run_git(
+            &["remote", "add", "origin", remote_url.as_str()],
+            local.path(),
+        )
+        .unwrap();
+        // Deliberately do NOT set refs/remotes/origin/HEAD: ls-remote --symref
+        // must still resolve the remote's real default.
+        (remote, local)
+    }
+
+    #[test]
+    fn detect_default_branch_prefers_remote_head_when_origin_head_unset() {
+        let (_remote, local) = remote_and_local_repos("staging");
+        assert_eq!(
+            detect_default_branch(local.path()).as_deref(),
+            Some("staging")
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_default_branches_corrects_stale_main_and_is_idempotent() {
+        let db = migrated_db().await;
+        let (_remote, local) = remote_and_local_repos("staging");
+        let local_path = local.path().to_string_lossy().to_string();
+
+        // `create_db` hardcodes the schema default 'main' (no detection), so this
+        // reproduces a project left on the wrong stored default.
+        let project = create_db(
+            &db,
+            &FixedClock,
+            &CreateProject {
+                id: Some("p".to_string()),
+                name: "P".to_string(),
+                key: "P".to_string(),
+                repo_path: local_path,
+                remote_url: None,
+                server_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(project.default_branch.as_deref(), Some("main"));
+
+        reconcile_default_branches(&db).await;
+        let corrected = get_db(&db, "p").await.unwrap().unwrap();
+        assert_eq!(corrected.default_branch.as_deref(), Some("staging"));
+
+        // Idempotent: a second run leaves the corrected value in place.
+        reconcile_default_branches(&db).await;
+        let again = get_db(&db, "p").await.unwrap().unwrap();
+        assert_eq!(again.default_branch.as_deref(), Some("staging"));
+    }
+
+    /// The backfill must NOT persist the checked-out-branch fallback: when the
+    /// remote default is unreachable/unset and the user's checkout is on a feature
+    /// branch, the stored default stays put rather than being overwritten with the
+    /// transient branch. (The detection's last-resort fallback is authoritative
+    /// only at create time, not for startup backfill.)
+    #[tokio::test]
+    async fn reconcile_default_branches_ignores_checked_out_branch_fallback() {
+        let db = migrated_db().await;
+        // A local repo on `feature` with NO origin remote: ls-remote and
+        // origin/HEAD both fail, so detection falls back to the checked-out
+        // branch.
+        let repo = tempdir().unwrap();
+        run_git(&["init", "-q", "-b", "feature"], repo.path()).unwrap();
+        run_git(&["config", "user.email", "t@e.com"], repo.path()).unwrap();
+        run_git(&["config", "user.name", "T"], repo.path()).unwrap();
+        std::fs::write(repo.path().join("f.txt"), "x\n").unwrap();
+        run_git(&["add", "-A"], repo.path()).unwrap();
+        run_git(&["commit", "-q", "-m", "init"], repo.path()).unwrap();
+        let repo_path = repo.path().to_string_lossy().to_string();
+
+        // Sanity: detection returns `feature`, tagged as the non-authoritative
+        // checked-out fallback.
+        assert_eq!(
+            detect_default_branch_with_source(repo.path()),
+            Some(("feature".to_string(), DefaultBranchSource::CheckedOut))
+        );
+
+        create_db(
+            &db,
+            &FixedClock,
+            &CreateProject {
+                id: Some("p2".to_string()),
+                name: "P2".to_string(),
+                key: "P2".to_string(),
+                repo_path,
+                remote_url: None,
+                server_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        reconcile_default_branches(&db).await;
+        let after = get_db(&db, "p2").await.unwrap().unwrap();
+        assert_eq!(
+            after.default_branch.as_deref(),
+            Some("main"),
+            "the transient checkout branch must not be persisted as the default"
+        );
     }
 }

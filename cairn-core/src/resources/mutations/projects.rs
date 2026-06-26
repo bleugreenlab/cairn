@@ -384,11 +384,8 @@ pub(super) async fn apply_project_settings_patch(
     }
 
     if file_changed && !dry_run {
+        // `save_project_settings` commits the `config.yaml` rewrite, scoped.
         save_project_settings(repo, &config)?;
-        crate::config::commit_project_config_change(
-            repo,
-            &format!("cairn: update project settings for {project_key}"),
-        );
     }
     if !dry_run {
         let _ = orch

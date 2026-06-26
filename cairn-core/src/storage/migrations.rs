@@ -396,6 +396,26 @@ pub const TURSO_MIGRATIONS: &[Migration] = &[
         "event_content_change_id",
         include_str!("../../../../turso_migrations/0077_event_content_change_id.sql"),
     ),
+    Migration::new(
+        "0078",
+        "browser_last_active_at",
+        include_str!("../../../../turso_migrations/0078_browser_last_active_at.sql"),
+    ),
+    Migration::new(
+        "0079",
+        "index_runs_session_id_created_at",
+        include_str!("../../../../turso_migrations/0079_index_runs_session_id_created_at.sql"),
+    ),
+    Migration::new(
+        "0080",
+        "token_rollup",
+        include_str!("../../../../turso_migrations/0080_token_rollup.sql"),
+    ),
+    Migration::new(
+        "0081",
+        "drop_runs_backend",
+        include_str!("../../../../turso_migrations/0081_drop_runs_backend.sql"),
+    ),
 ];
 
 #[cfg(test)]
@@ -491,10 +511,68 @@ mod tests {
                 "0074_drop_attention_ledger".to_string(),
                 "0075_drop_messages_delivered_at".to_string(),
                 "0076_terminal_output_wakes".to_string(),
-                "0077_event_content_change_id".to_string()
+                "0077_event_content_change_id".to_string(),
+                "0078_browser_last_active_at".to_string(),
+                "0079_index_runs_session_id_created_at".to_string(),
+                "0080_token_rollup".to_string(),
+                "0081_drop_runs_backend".to_string()
             ]
         );
         Ok(db)
+    }
+
+    async fn explain_plan(db: &LocalDb, sql: &str) -> Vec<String> {
+        db.query_all(format!("EXPLAIN QUERY PLAN {sql}"), (), |row| row.text(3))
+            .await
+            .unwrap()
+    }
+
+    /// 0078 indexes the session-transcript loader's hottest query. This asserts
+    /// the planner actually changes its plan when the index is present, against
+    /// the real schema, so the index cannot silently become dead weight: without
+    /// it the query is a full scan plus a sort; with it the query is an index
+    /// seek that also satisfies the ORDER BY.
+    #[tokio::test]
+    async fn migration_0079_indexes_session_runs_query() {
+        const SESSION_RUNS: &str =
+            "SELECT id FROM runs WHERE session_id = 'x' ORDER BY created_at ASC";
+
+        // Without the 0079 index migration (every other migration applied): no
+        // session_id index, so the planner does a full table scan and sorts for
+        // ORDER BY. Filter by version rather than slicing the last migration, so
+        // the test stays valid as later migrations are appended.
+        let before = {
+            let temp = tempdir().unwrap();
+            let path = temp.keep().join("cairn-runs-index-before.db");
+            let db = LocalDb::open(path).await.unwrap();
+            let without_index: Vec<_> = TURSO_MIGRATIONS
+                .iter()
+                .filter(|m| m.version != "0079")
+                .copied()
+                .collect();
+            MigrationRunner::new(without_index).run(&db).await.unwrap();
+            explain_plan(&db, SESSION_RUNS).await
+        };
+        assert!(
+            before.iter().any(|step| step.contains("SCAN runs"))
+                && before.iter().any(|step| step.contains("SORTER")),
+            "expected full scan + sort before the index, got {before:?}"
+        );
+
+        // After 0078: the composite (session_id, created_at) index turns the
+        // query into an index seek that also satisfies the ORDER BY.
+        let db = migrated_db().await.unwrap();
+        let after = explain_plan(&db, SESSION_RUNS).await;
+        assert!(
+            after
+                .iter()
+                .any(|step| step.contains("SEARCH runs USING INDEX idx_runs_session_id_created_at")),
+            "expected an index seek after 0078, got {after:?}"
+        );
+        assert!(
+            !after.iter().any(|step| step.contains("SORTER")),
+            "the index should satisfy ORDER BY without a sort, got {after:?}"
+        );
     }
 
     async fn query_i64(db: &LocalDb, sql: &'static str) -> DbResult<i64> {

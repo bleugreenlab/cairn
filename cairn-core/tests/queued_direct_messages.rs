@@ -140,8 +140,8 @@ async fn insert_dm_recipient(db: &LocalDb, project_key: &str, turn_state: &str) 
             )
             .await?;
             conn.execute(
-                "INSERT INTO runs (id, project_id, job_id, chat_id, status, session_id, backend, created_at, updated_at, start_mode)
-                 VALUES ('run-1', 'proj-1', 'job-1', NULL, 'live', 'session-1', 'codex', 1, 1, 'resume')",
+                "INSERT INTO runs (id, project_id, job_id, chat_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-1', 'proj-1', 'job-1', NULL, 'live', 'session-1', 1, 1, 'resume')",
                 (),
             )
             .await?;
@@ -332,8 +332,8 @@ async fn insert_node_and_subtask(db: &LocalDb, project_key: &str) {
                 ("run-review", "job-review", "session-review"),
             ] {
                 conn.execute(
-                    "INSERT INTO runs (id, project_id, job_id, issue_id, chat_id, status, session_id, backend, created_at, updated_at, start_mode)
-                     VALUES (?1, 'proj-1', ?2, 'issue-1', NULL, 'live', ?3, 'codex', 1, 1, 'resume')",
+                    "INSERT INTO runs (id, project_id, job_id, issue_id, chat_id, status, session_id, created_at, updated_at, start_mode)
+                     VALUES (?1, 'proj-1', ?2, 'issue-1', NULL, 'live', ?3, 1, 1, 'resume')",
                     params![run_id, job_id, session_id],
                 )
                 .await?;

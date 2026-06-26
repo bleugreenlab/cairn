@@ -593,6 +593,27 @@ pub(super) fn run_commit_barrier(
                         // Tree was (or became) clean; already equals HEAD.
                         log::info!("run commit_msg given but nothing to commit: {}", e);
                     }
+                    Err(e)
+                        if crate::jj::is_lost_seal_error(&e) || crate::jj::is_stale_error(&e) =>
+                    {
+                        // A concurrent store advance reset `@` out from under the
+                        // seal (the lost-seal case, already backed out in
+                        // `seal_paths`) or left the workspace stale. The run can't
+                        // re-derive command side effects, so revert-and-retry is the
+                        // ceiling: discard to HEAD and tell the agent to re-run.
+                        let restore = vcs.discard(worktree_path);
+                        worktree_changed = true;
+                        match restore {
+                            Ok(()) => message.push_str(&format!(
+                                "\u{26a0}\u{fe0f} Hit a concurrent store advance: {}; the worktree was restored to HEAD and nothing was committed. Retry the run with commit_msg to land the changes.",
+                                e
+                            )),
+                            Err(re) => message.push_str(&format!(
+                                "\u{26a0}\u{fe0f} Hit a concurrent store advance: {}; additionally failed to restore the worktree to HEAD: {}",
+                                e, re
+                            )),
+                        }
+                    }
                     Err(e) => {
                         let restore = vcs.discard(worktree_path);
                         worktree_changed = true;

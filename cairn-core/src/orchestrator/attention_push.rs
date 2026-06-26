@@ -35,9 +35,11 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 /// Wake level: where a push sits on the wake axis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wake {
-    /// Never wakes an idle agent; rides along whenever it next runs.
+    /// Never wakes an idle agent. On an active agent it still rides along at
+    /// its `boundary` like any other push — wake level governs idle-waking, not
+    /// whether a running agent sees the push.
     Passive,
-    /// Wakes an idle agent; lands at the next event boundary on a busy one.
+    /// Wakes an idle agent; on an active agent lands at its `boundary`.
     Wake,
     /// Breaks the running turn now.
     Interrupt,
@@ -405,7 +407,7 @@ pub async fn latest_push_fingerprint(
 
 /// All undelivered pushes for a recipient, oldest first. The general drain
 /// primitive; wake/boundary filtering for specific drain sites is a caller
-/// concern (see [`pending_waking`] for the common rousing-only view).
+/// concern (see [`pending_at_boundary`] for the per-boundary view).
 pub async fn list_pending(db: &LocalDb, recipient: &str) -> DbResult<Vec<Push>> {
     let recipient = recipient.to_string();
     db.read(|conn| {
@@ -430,10 +432,11 @@ pub async fn list_pending(db: &LocalDb, recipient: &str) -> DbResult<Vec<Push>> 
     .await
 }
 
-/// Undelivered *rousing* pushes (`wake`/`interrupt`) for a recipient at a given
-/// boundary, oldest first. A thin filtered view over [`list_pending`] for drain
-/// sites that act only on pushes that wake.
-pub async fn pending_waking(
+/// Undelivered pushes for a recipient at a given boundary, oldest first —
+/// **every** wake level, including `passive`. A thin filtered view over
+/// [`list_pending`] scoped to one boundary: wake level governs whether an *idle*
+/// agent is roused, not whether a push lands at this boundary on an active one.
+pub async fn pending_at_boundary(
     db: &LocalDb,
     recipient: &str,
     boundary: Boundary,
@@ -447,7 +450,7 @@ pub async fn pending_waking(
                     "SELECT id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id
                      FROM attention_pushes
                      WHERE recipient=?1 AND delivered_event_id IS NULL
-                       AND wake IN ('wake','interrupt') AND boundary=?2
+                       AND boundary=?2
                      ORDER BY created_at ASC, id ASC",
                     params![recipient.as_str(), boundary.as_str()],
                 )
@@ -477,15 +480,17 @@ pub async fn list_pending_live(db: &LocalDb, recipient: &str) -> DbResult<Vec<Pu
     Ok(live)
 }
 
-/// Undelivered *rousing* (`wake`/`interrupt`) pushes for a recipient at a given
-/// boundary that are still **live**. The busy-agent event-boundary drain: a thin
-/// [`lazy_resolve_live`] filter over [`pending_waking`].
-pub async fn pending_waking_live(
+/// Undelivered pushes for a recipient at a given boundary that are still
+/// **live** — **every** wake level, including `passive`. The busy-agent boundary
+/// drain: a thin [`lazy_resolve_live`] filter over [`pending_at_boundary`]. Wake
+/// level governs idle-waking, not whether an active agent sees a push, so a
+/// passive push rides along at its boundary on an agent that is already running.
+pub async fn pending_deliverable_live(
     db: &LocalDb,
     recipient: &str,
     boundary: Boundary,
 ) -> DbResult<Vec<Push>> {
-    let pending = pending_waking(db, recipient, boundary).await?;
+    let pending = pending_at_boundary(db, recipient, boundary).await?;
     let mut live = Vec::with_capacity(pending.len());
     for push in pending {
         if lazy_resolve_live(db, &push).await? {
@@ -1093,7 +1098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_waking_filters_passive_and_boundary() {
+    async fn pending_at_boundary_keeps_passive_filters_boundary() {
         let db = migrated_db().await;
         seed(&db).await;
         push(
@@ -1120,11 +1125,14 @@ mod tests {
             .await
             .unwrap();
 
-        let waking = pending_waking(&db, "watcher", Boundary::Event)
+        // Boundary still filters (the Turn push is excluded), but the wake axis no
+        // longer does: both Event-boundary pushes come back, passive included.
+        let at_event = pending_at_boundary(&db, "watcher", Boundary::Event)
             .await
             .unwrap();
-        assert_eq!(waking.len(), 1);
-        assert_eq!(waking[0].key, "review:a");
+        let mut keys: Vec<&str> = at_event.iter().map(|p| p.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["catchup:b", "review:a"]);
     }
 
     #[tokio::test]
@@ -1352,7 +1360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_waking_live_drains_event_boundary_filters_passive_and_resolved() {
+    async fn pending_deliverable_live_includes_passive_excludes_turn_and_resolved() {
         let db = migrated_db().await;
         seed(&db).await;
         open_mr(&db).await;
@@ -1367,7 +1375,8 @@ mod tests {
         )
         .await
         .unwrap();
-        // passive -> excluded (rides along, never wakes a busy boundary drain).
+        // passive + event -> NOW included: it rides along inline on the active
+        // turn (wake level governs idle-waking, not the busy boundary drain).
         push(
             &db,
             "watcher",
@@ -1378,7 +1387,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // wake but turn boundary -> not an event-boundary push.
+        // wake but turn boundary -> excluded: not an event-boundary push.
         push(
             &db,
             "watcher",
@@ -1389,14 +1398,36 @@ mod tests {
         )
         .await
         .unwrap();
+        // wake + event but referent resolved (no pending prompt for this question)
+        // -> excluded: lazy_resolve drops a dead push.
+        push(
+            &db,
+            "watcher",
+            "cairn://p/PROJ/2",
+            Wake::Wake,
+            Boundary::Event,
+            "question:cairn://p/PROJ/2",
+        )
+        .await
+        .unwrap();
 
-        let drained = pending_waking_live(&db, "watcher", Boundary::Event)
+        let drained = pending_deliverable_live(&db, "watcher", Boundary::Event)
             .await
             .unwrap();
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].key, "review:cairn://p/PROJ/2");
-        // Rendered into a non-empty reminder line for the agent.
-        assert!(!render_push(&drained[0]).is_empty());
+        let mut keys: Vec<&str> = drained.iter().map(|p| p.key.as_str()).collect();
+        keys.sort_unstable();
+        // Both live Event-boundary pushes, every wake level; Turn and resolved out.
+        assert_eq!(
+            keys,
+            vec![
+                "catchup:cairn://p/PROJ/2/1/child",
+                "review:cairn://p/PROJ/2"
+            ]
+        );
+        // Rendered into non-empty reminder lines for the agent.
+        for p in &drained {
+            assert!(!render_push(p).is_empty());
+        }
     }
 
     #[tokio::test]
@@ -1464,6 +1495,68 @@ mod tests {
         assert!(has_pending_waking_live(&db, "watcher").await.unwrap());
     }
 
+    /// The motivating CAIRN-2028 scenario: a passive `direct:` note (the clean
+    /// auto-rebase notice) addressed to a busy recipient. It must drain at the
+    /// recipient's next event boundary, yet never count as a reason to wake an
+    /// idle agent. Both halves of the contract are locked here.
+    #[tokio::test]
+    async fn passive_direct_delivers_at_event_boundary_without_waking_idle() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        // Mirror insert_system_direct_push_conn: wake='passive', boundary='event',
+        // key='direct:{id}'. A `direct:` referent is always live.
+        let (id, _) = push(
+            &db,
+            "watcher",
+            "cairn://p/PROJ/2",
+            Wake::Passive,
+            Boundary::Event,
+            "direct:msg-1",
+        )
+        .await
+        .unwrap();
+
+        // (a) A busy recipient drains it at the event boundary despite being passive.
+        let drained = pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].key, "direct:msg-1");
+        // (c) ...but it is never a reason to wake an idle agent.
+        assert!(!has_pending_waking_live(&db, "watcher").await.unwrap());
+
+        // (b) Carrying event + stamp in one transaction marks it delivered.
+        let pid = id.clone();
+        db.write(|conn| {
+            let pid = pid.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES('carry-direct','run-1',1,1,'system:message','{}',1)",
+                    (),
+                )
+                .await?;
+                let n = stamp_delivered_conn(conn, std::slice::from_ref(&pid), "carry-direct").await?;
+                assert_eq!(n, 1);
+                Ok::<(), DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            delivered_event(&db, &id).await,
+            Some("carry-direct".to_string())
+        );
+        // Delivered row leaves the queue -> a second drain finds nothing.
+        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap()
+            .is_empty());
+        // (c) still holds after delivery: never woke an idle agent.
+        assert!(!has_pending_waking_live(&db, "watcher").await.unwrap());
+    }
+
     #[tokio::test]
     async fn stamp_commits_atomically_with_carrying_event() {
         let db = migrated_db().await;
@@ -1503,7 +1596,7 @@ mod tests {
 
         assert_eq!(delivered_event(&db, &id).await, Some("carry-1".to_string()));
         // Delivered row leaves the queue -> a second drain finds nothing.
-        assert!(pending_waking_live(&db, "watcher", Boundary::Event)
+        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
             .await
             .unwrap()
             .is_empty());
@@ -1565,7 +1658,7 @@ mod tests {
         .await
         .unwrap();
 
-        let first = pending_waking_live(&db, "watcher", Boundary::Event)
+        let first = pending_deliverable_live(&db, "watcher", Boundary::Event)
             .await
             .unwrap();
         assert_eq!(first.len(), 1);
@@ -1573,7 +1666,7 @@ mod tests {
         assert_eq!(stamp_delivered(&db, &[id], "carry-1").await.unwrap(), 1);
 
         // A second drain finds nothing to re-render or re-stamp.
-        assert!(pending_waking_live(&db, "watcher", Boundary::Event)
+        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
             .await
             .unwrap()
             .is_empty());

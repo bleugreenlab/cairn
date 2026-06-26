@@ -22,8 +22,8 @@ async fn insert_project_job_run_turn(db: &LocalDb) {
             )
             .await?;
             conn.execute(
-                "INSERT INTO runs(id, project_id, job_id, chat_id, status, session_id, backend, created_at, updated_at, start_mode)
-                 VALUES ('run-1', ?1, 'job-1', NULL, 'live', 'session-1', 'claude', 1, 1, 'resume')",
+                "INSERT INTO runs(id, project_id, job_id, chat_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-1', ?1, 'job-1', NULL, 'live', 'session-1', 1, 1, 'resume')",
                 params![project_id.as_str()],
             )
             .await?;

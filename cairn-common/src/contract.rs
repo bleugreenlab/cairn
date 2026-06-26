@@ -949,9 +949,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         kind: ResourceKind::Db,
         uri_template: "cairn://db",
         name: "Live database SQL projection",
-        description: "Read-only SQL against the running app's existing local database connection. Requires ?sql=... and supports offset/limit row windows.",
+        description: "Read-only SQL against the running app's existing local database connection. Requires ?sql=... and supports offset/limit row windows. EXPLAIN and EXPLAIN QUERY PLAN are permitted for inspecting query plans.",
         read_projections: &[
-            ProjectionSpec { key: "sql", values: "read-only SELECT/WITH or schema PRAGMA" },
+            ProjectionSpec { key: "sql", values: "read-only SELECT/WITH, EXPLAIN [QUERY PLAN], or schema PRAGMA" },
             ProjectionSpec { key: "offset", values: "N rows to skip (default 0)" },
             ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },
         ],
@@ -973,9 +973,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         kind: ResourceKind::DevDb,
         uri_template: "cairn://dev/db",
         name: "Dev instance database SQL projection",
-        description: "Read-only SQL against a running `bun run dev:instance` database (the per-branch dev build you launched), not the host app's own DB. The instance holds a process lock on its database file, so this queries the instance's own MCP callback server, which means the instance must be running. Same statement policy as cairn://db (SELECT, read-only WITH, schema PRAGMAs) with offset/limit row windows. read cairn://dev/db with no ?sql lists registered instances and their running state; ?at=<branch-or-key> selects one (optional when exactly one is registered, or exactly one is running).",
+        description: "Read-only SQL against a running `bun run dev:instance` database (the per-branch dev build you launched), not the host app's own DB. The instance holds a process lock on its database file, so this queries the instance's own MCP callback server, which means the instance must be running. Same statement policy as cairn://db (SELECT, read-only WITH, EXPLAIN [QUERY PLAN], schema PRAGMAs) with offset/limit row windows. read cairn://dev/db with no ?sql lists registered instances and their running state; ?at=<branch-or-key> selects one (optional when exactly one is registered, or exactly one is running).",
         read_projections: &[
-            ProjectionSpec { key: "sql", values: "read-only SELECT/WITH or schema PRAGMA; omit to list dev instances" },
+            ProjectionSpec { key: "sql", values: "read-only SELECT/WITH, EXPLAIN [QUERY PLAN], or schema PRAGMA; omit to list dev instances" },
             ProjectionSpec { key: "at", values: "branch name or slug key of the dev instance to query" },
             ProjectionSpec { key: "offset", values: "N rows to skip (default 0)" },
             ProjectionSpec { key: "limit", values: "N rows (default 100, max 1000)" },

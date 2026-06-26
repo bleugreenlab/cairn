@@ -353,7 +353,9 @@ pub(super) fn handle_turn_completed(
                 session_id,
                 &format!("Codex turn failed: {}", status),
             );
-            crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Crashed);
+            // A genuine turn failure: finalize task-aware so a delegated child
+            // fails terminally (its parent resumes) rather than stranding it.
+            crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
         }
     }
 }

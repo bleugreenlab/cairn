@@ -133,7 +133,7 @@ async fn get_agent_commit_prefix_async(orch: &Orchestrator, cwd: &str) -> Result
     }
 }
 
-async fn record_file_change_async(
+pub(crate) async fn record_file_change_async(
     orch: &Orchestrator,
     cwd: &str,
     file_path: &str,
@@ -201,7 +201,7 @@ async fn record_file_change_async(
         .map_err(|e| e.to_string())
 }
 
-fn changed_line_counts(before: Option<&str>, after: Option<&str>) -> (i32, i32) {
+pub(crate) fn changed_line_counts(before: Option<&str>, after: Option<&str>) -> (i32, i32) {
     let before_lines = before
         .map(|content| content.lines().collect::<Vec<_>>())
         .unwrap_or_default();
@@ -999,7 +999,7 @@ pub(super) fn apply_prepared(
     })
 }
 
-pub(super) fn emit_worktree_changed(orch: &Orchestrator, cwd: &str) {
+pub(crate) fn emit_worktree_changed(orch: &Orchestrator, cwd: &str) {
     let _ = orch.services.emitter.emit(
         "worktree-changed",
         serde_json::json!({"worktree_path": cwd}),
@@ -1318,13 +1318,16 @@ pub(super) async fn finalize_file_commit(
                 message: None,
             })))
         }
-        Err(e) if crate::jj::is_stale_error(&e) => {
-            // A sibling advanced `@` over the shared store between apply and seal.
-            // Do NOT discard here: the edits stay on disk so `handle_change` can
-            // update-stale, re-apply against the advanced base, and re-seal —
-            // recovering the batch rather than losing it. The fallback (if that
-            // recovery can't land) is the stale-resilient discard, which keeps the
-            // worktree==HEAD invariant regardless.
+        Err(e) if crate::jj::is_stale_error(&e) || crate::jj::is_lost_seal_error(&e) => {
+            // A sibling advanced `@` over the shared store between apply and seal,
+            // either going stale (refused) or letting the seal capture an
+            // empty/divergent commit (the lost-seal case, already backed out in
+            // `seal_paths`). Both recover the same way: do NOT discard here — the
+            // recorded edits drive a re-apply, so `handle_change` can update-stale
+            // (a no-op when not stale), re-apply against the current base, and
+            // re-seal, recovering the batch rather than losing it. The fallback (if
+            // that recovery can't land) is the stale-resilient discard, which keeps
+            // the worktree==HEAD invariant regardless.
             Ok(CommitOutcome::StaleRetry { seal_error: e })
         }
         Err(e) => {

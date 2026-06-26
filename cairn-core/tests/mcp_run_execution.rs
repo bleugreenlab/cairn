@@ -138,8 +138,8 @@ async fn seed_run(db: &LocalDb, project_id: &str, worktree: &Path, run_id: &str)
             )
             .await?;
             conn.execute(
-                "INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
-                 VALUES (?1, ?2, ?3, ?4, 'live', 'codex', 1, 1, 'resume')",
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode)
+                 VALUES (?1, ?2, ?3, ?4, 'live', 1, 1, 'resume')",
                 params![run_id.as_str(), project_id.as_str(), issue_id.as_str(), job_id.as_str()],
             )
             .await?;
@@ -154,6 +154,11 @@ async fn setup(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
     let (temp, db) = common::migrated_db().await;
     let repo = temp.path().join("repo");
     init_git_repo(&repo);
+    // These run-execution tests model commands launched from an agent worktree.
+    // Keep the Git repository for simple `git grep` assertions, but add the jj
+    // marker that makes the run handler treat the cwd as a worktree rather than
+    // the read-only live checkout.
+    std::fs::create_dir_all(repo.join(".jj")).unwrap();
     let db = Arc::new(db);
     let project_id = common::create_project(&db, "RHG").await;
     seed_run(&db, &project_id, &repo, run_id).await;
@@ -299,8 +304,8 @@ async fn timed_out_item_in_subtask_job_kills_instead_of_promoting() {
             )
             .await?;
             conn.execute(
-                "INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
-                 SELECT 'run-subtask-sub', project_id, issue_id, 'job-sub', 'live', 'codex', 1, 1, 'resume' FROM runs WHERE id = 'run-subtask'",
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode)
+                 SELECT 'run-subtask-sub', project_id, issue_id, 'job-sub', 'live', 1, 1, 'resume' FROM runs WHERE id = 'run-subtask'",
                 (),
             )
             .await?;
@@ -364,6 +369,12 @@ async fn sequential_stop_on_error_halts_after_promoted_item() {
 
 #[tokio::test]
 async fn timed_out_item_without_run_context_kills_and_returns() {
+    // Depends on the same real subprocess timeout-kill lifecycle as the sub-task
+    // timeout case. Under the agent worktree fence, an inherited sandbox denial
+    // can win before the timeout path this test is meant to exercise.
+    if common::skip_if_fenced("timed_out_item_without_run_context_kills_and_returns") {
+        return;
+    }
     let (_temp, db, orch, _cwd) = setup("run-nokill").await;
     // A cwd that maps to no job (and run_id None) yields no run context, so the
     // timeout falls back to a kill rather than promotion. The seeded repo is a

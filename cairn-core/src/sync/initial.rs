@@ -214,7 +214,7 @@ async fn load_runs(db: &LocalDb) -> Result<Vec<SyncRun>, String> {
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT r.id, r.job_id, r.issue_id, r.status, r.backend, r.exit_reason,
+                    "SELECT r.id, r.job_id, r.issue_id, r.status, r.exit_reason,
                             r.error_message, r.started_at, r.exited_at, r.created_at
                      FROM runs r
                      LEFT JOIN projects run_project ON run_project.id = r.project_id
@@ -234,12 +234,11 @@ async fn load_runs(db: &LocalDb) -> Result<Vec<SyncRun>, String> {
                     job_id: row.opt_text(1)?,
                     issue_id: row.opt_text(2)?,
                     status: row.opt_text(3)?,
-                    backend: row.opt_text(4)?,
-                    exit_reason: row.opt_text(5)?,
-                    error_message: row.opt_text(6)?,
-                    started_at: row.opt_i64(7)?,
-                    exited_at: row.opt_i64(8)?,
-                    created_at: Some(row.i64(9)?),
+                    exit_reason: row.opt_text(4)?,
+                    error_message: row.opt_text(5)?,
+                    started_at: row.opt_i64(6)?,
+                    exited_at: row.opt_i64(7)?,
+                    created_at: Some(row.i64(8)?),
                 });
             }
             Ok(runs)
@@ -398,11 +397,11 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO runs(
-                        id, issue_id, project_id, job_id, status, backend, exit_reason,
+                        id, issue_id, project_id, job_id, status, exit_reason,
                         error_message, started_at, exited_at, created_at, updated_at
                      )
                      VALUES (
-                        'run-1', 'issue-1', 'project-1', 'job-1', 'running', 'claude',
+                        'run-1', 'issue-1', 'project-1', 'job-1', 'running',
                         NULL, NULL, 40, NULL, 41, 42
                      )",
                     (),
@@ -570,7 +569,6 @@ mod tests {
             })
             .unwrap();
         assert_eq!(run.job_id.as_deref(), Some("job-1"));
-        assert_eq!(run.backend.as_deref(), Some("claude"));
 
         let comment = messages
             .iter()

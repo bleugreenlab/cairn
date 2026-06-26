@@ -12,8 +12,7 @@ use turso::params;
 use crate::db_records::{db_job_from_row, DbActionRun, DbExecution, DbJob, JOB_COLUMNS};
 use crate::models::{
     ActionRun, Execution, ExecutionDetail, ExecutionFilters, ExecutionListItem,
-    ExecutionListResult, ExecutionSnapshot, ExecutionStatus, Job, NodeAttempt, RecipeNode,
-    TriggerType,
+    ExecutionListResult, ExecutionSnapshot, ExecutionStatus, Job, RecipeNode, TriggerType,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -83,52 +82,6 @@ pub(crate) async fn node_statuses_conn(
 /// to newest, **including** archived (`cancelled`) attempts. Powers the
 /// attempt-lineage view: a restarted node keeps its prior attempts reachable and
 /// comparable rather than dropping them from history.
-pub fn list_node_attempts(
-    db: Arc<LocalDb>,
-    execution_id: &str,
-    recipe_node_id: &str,
-) -> Result<Vec<NodeAttempt>, String> {
-    let execution_id = execution_id.to_string();
-    let recipe_node_id = recipe_node_id.to_string();
-    run_query_db(async move {
-        db.read(|conn| {
-            let execution_id = execution_id.clone();
-            let recipe_node_id = recipe_node_id.clone();
-            Box::pin(
-                async move { list_node_attempts_conn(conn, &execution_id, &recipe_node_id).await },
-            )
-        })
-        .await
-        .map_err(|e| format!("Failed to load node attempts: {e}"))
-    })
-}
-
-pub(crate) async fn list_node_attempts_conn(
-    conn: &turso::Connection,
-    execution_id: &str,
-    recipe_node_id: &str,
-) -> DbResult<Vec<NodeAttempt>> {
-    let mut rows = conn
-        .query(
-            "SELECT id, status, created_at, current_session_id
-             FROM jobs
-             WHERE execution_id = ?1 AND recipe_node_id = ?2
-             ORDER BY created_at ASC",
-            params![execution_id, recipe_node_id],
-        )
-        .await?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next().await? {
-        out.push(NodeAttempt {
-            id: row.text(0)?,
-            status: row.text(1)?,
-            created_at: row.i64(2)? as i32,
-            current_session_id: row.opt_text(3)?,
-        });
-    }
-    Ok(out)
-}
-
 pub fn get_execution_for_issue(
     db: Arc<LocalDb>,
     issue_id: &str,

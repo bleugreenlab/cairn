@@ -56,14 +56,6 @@ pub trait GitClient: Send + Sync {
     /// Prune stale worktree administrative files.
     fn worktree_prune(&self, repo: &Path) -> Result<(), String>;
 
-    /// Add a worktree at a detached HEAD (no branch).
-    fn worktree_add_detached(
-        &self,
-        repo: &Path,
-        worktree_path: &Path,
-        commit_ref: &str,
-    ) -> Result<(), String>;
-
     /// Push a branch to origin.
     fn push_branch(&self, repo: &Path, branch_name: &str) -> Result<(), String>;
 
@@ -387,27 +379,6 @@ impl GitClient for RealGitClient {
             Ok(())
         } else {
             Err(format!("git worktree prune failed: {}", output.stderr))
-        }
-    }
-
-    fn worktree_add_detached(
-        &self,
-        repo: &Path,
-        worktree_path: &Path,
-        commit_ref: &str,
-    ) -> Result<(), String> {
-        let wt_path = worktree_path.to_string_lossy();
-        // --detach creates worktree at detached HEAD
-        let output =
-            self.run_git_strs(repo, &["worktree", "add", "--detach", &wt_path, commit_ref])?;
-
-        if output.success {
-            Ok(())
-        } else {
-            Err(format!(
-                "git worktree add --detach failed: {}",
-                output.stderr
-            ))
         }
     }
 

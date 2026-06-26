@@ -301,24 +301,6 @@ async fn remove_server(
     Ok(())
 }
 
-/// Commit a project-scope MCP config change in the canonical checkout. A no-op
-/// for workspace scope (its `settings.yaml` is not in a project repo, and is
-/// gated through the worktree fence) and best effort for project scope: the file
-/// write already succeeded, so a failed commit is a warning, never an error.
-async fn commit_project_mcp_change(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    scope: McpWriteScope,
-    msg: &str,
-) {
-    if scope != McpWriteScope::Project {
-        return;
-    }
-    if let Ok(project_path) = resolve_project_path(orch, request).await {
-        crate::config::commit_project_config_change(&project_path, msg);
-    }
-}
-
 /// `write cairn://mcp` create — add a new server to the registry.
 pub(super) async fn apply_mcp_create(
     orch: &Orchestrator,
@@ -347,13 +329,6 @@ pub(super) async fn apply_mcp_create(
         ));
     }
     write_server(orch, request, scope, &name, &config).await?;
-    commit_project_mcp_change(
-        orch,
-        request,
-        scope,
-        &format!("cairn: create mcp server {name}"),
-    )
-    .await;
     Ok(format!("Added {} MCP server '{name}'", scope_label(scope)))
 }
 
@@ -383,13 +358,6 @@ pub(super) async fn apply_mcp_patch(
         ));
     }
     write_server(orch, request, scope, server, &config).await?;
-    commit_project_mcp_change(
-        orch,
-        request,
-        scope,
-        &format!("cairn: update mcp server {server}"),
-    )
-    .await;
     Ok(format!(
         "Updated {} MCP server '{server}'",
         scope_label(scope)
@@ -422,13 +390,6 @@ pub(super) async fn apply_mcp_delete(
         ));
     }
     remove_server(orch, request, scope, server).await?;
-    commit_project_mcp_change(
-        orch,
-        request,
-        scope,
-        &format!("cairn: delete mcp server {server}"),
-    )
-    .await;
     Ok(format!(
         "Removed {} MCP server '{server}'",
         scope_label(scope)

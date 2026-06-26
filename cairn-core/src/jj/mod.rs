@@ -44,16 +44,34 @@ impl JjEnv {
         let bin = std::env::var("CAIRN_JJ_BIN")
             .ok()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| {
-                if bundled_bin.trim().is_empty() {
-                    "jj".to_string()
-                } else {
-                    bundled_bin.to_string()
-                }
-            });
+            .unwrap_or_else(|| Self::resolve_bundled_or_path(bundled_bin));
         Self {
             bin,
             config_path: config_dir.join("jj").join("config.toml"),
+        }
+    }
+
+    fn resolve_bundled_or_path(bundled_bin: &str) -> String {
+        let bundled_bin = bundled_bin.trim();
+        if bundled_bin.is_empty() {
+            return "jj".to_string();
+        }
+
+        match crate::env::command(bundled_bin).arg("--version").output() {
+            Ok(output) if output.status.success() => bundled_bin.to_string(),
+            Ok(output) => {
+                log::warn!(
+                    "Bundled jj at `{bundled_bin}` failed --version with status {}; falling back to PATH jj",
+                    output.status
+                );
+                "jj".to_string()
+            }
+            Err(error) => {
+                log::warn!(
+                    "Bundled jj at `{bundled_bin}` could not be spawned ({error}); falling back to PATH jj"
+                );
+                "jj".to_string()
+            }
         }
     }
 
@@ -453,6 +471,75 @@ pub fn snapshot_change_id(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     )
 }
 
+/// Whether the seal's scoped paths carry uncommitted changes in `@`. A whole-`@`
+/// seal (empty `paths`) reuses [`is_working_copy_dirty`]; a path-scoped seal
+/// diffs only those filesets, because [`seal_paths`] deliberately leaves
+/// unrelated un-sealed dirt in `@`, so the empty-seal expectation must be measured
+/// against the scoped paths only — otherwise a legitimately no-op scoped write
+/// (whose unrelated dirt makes the whole `@` look dirty) would false-positive.
+pub(crate) fn scoped_dirty(jj: &JjEnv, ws: &Path, paths: &[&str]) -> Result<bool, String> {
+    if paths.is_empty() {
+        return is_working_copy_dirty(jj, ws);
+    }
+    let mut args: Vec<String> = vec!["diff".into(), "-r".into(), "@".into(), "--summary".into()];
+    for path in paths {
+        args.push(quote_fileset(path));
+    }
+    let argref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    Ok(!jj
+        .run(ws, &argref, "jj diff -r @ --summary (scoped)")?
+        .is_empty())
+}
+
+/// Whether the just-sealed `@-` commit is the empty/divergent data-loss shape: a
+/// `jj commit` that returned a real sha but silently captured nothing because a
+/// concurrent op reset `@` out from under it. `pre_dirty` is the seal's measured
+/// pre-commit dirt over the same scoped paths. Returns `true` when either:
+///
+/// - `pre_dirty && empty`: the working copy had scoped changes to seal, but `@-`
+///   has no diff vs its parent — the dirt was reset away before the commit
+///   captured it (jj's `empty` keyword, correct for both seal modes since only
+///   the scoped paths were committed into `@-`); or
+/// - divergent: the sealed change resolves to more than one visible commit
+///   (`<id>/0../n`), the shape a concurrent-op merge leaves when both forked
+///   rewrites are kept.
+///
+/// Two cheap `jj log` reads on the just-sealed commit; runs only on the seal path.
+fn sealed_commit_is_lost(jj: &JjEnv, ws: &Path, pre_dirty: bool) -> Result<bool, String> {
+    let empty = jj
+        .run(
+            ws,
+            &["log", "-r", "@-", "--no-graph", "-T", "empty"],
+            "jj seal empty check",
+        )?
+        .contains("true");
+    if pre_dirty && empty {
+        return Ok(true);
+    }
+    let cid = jj.run(
+        ws,
+        &["log", "-r", "@-", "--no-graph", "-T", "change_id.short()"],
+        "jj seal change id",
+    )?;
+    let cid = cid.trim();
+    if cid.is_empty() {
+        return Ok(false);
+    }
+    let twins = jj.run(
+        ws,
+        &[
+            "log",
+            "-r",
+            &format!("change_id({cid})"),
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+        "jj seal divergence check",
+    )?;
+    Ok(twins.lines().filter(|l| !l.trim().is_empty()).count() > 1)
+}
+
 /// Seal the whole `@` into one addressable commit (the run-path seal: seals the
 /// entire working copy). See [`seal_paths`].
 pub fn seal(
@@ -516,12 +603,40 @@ pub fn seal_paths(
         }
     }
 
+    // Measure the scoped dirt BEFORE committing so an EMPTY seal (the working copy
+    // reset out from under the commit) can be told apart from a legitimately no-op
+    // scoped write. Best-effort: if the probe can't run we conservatively skip the
+    // empty-anomaly arm (divergence is still checked) rather than fail a good seal.
+    // Skipped for an amend (`^`): its emptiness semantics differ and it is not the
+    // observed failure mode.
+    let pre_dirty = if msg == "^" {
+        false
+    } else {
+        scoped_dirty(jj, ws, paths).unwrap_or(false)
+    };
+
     jj.run(ws, &argref, "jj commit")?;
     let sha = jj.run(
         ws,
         &["log", "-r", "@-", "--no-graph", "-T", "commit_id.short()"],
         "jj log -r @-",
     )?;
+
+    // Detection backstop: a concurrent store advance can reset `@` out from under
+    // the commit so `jj commit` succeeds but seals an EMPTY or DIVERGENT commit —
+    // silent data loss otherwise reported as a real sha. Check only on a real
+    // commit (the amend path is excluded above via `pre_dirty`/`msg`). On the
+    // anomaly, back the bad commit out so `@` returns to its pre-seal parent and a
+    // retry lands cleanly, then return the typed, recoverable lost-seal error. The
+    // bookmark has NOT moved yet (that runs only on the clean path below), so
+    // `jj abandon @-` reparents `@` onto the original parent and drops the commit
+    // without stranding the bookmark on a twin.
+    if msg != "^" && sealed_commit_is_lost(jj, ws, pre_dirty).unwrap_or(false) {
+        if let Err(e) = jj.run(ws, &["abandon", "@-"], "jj abandon lost seal") {
+            log::warn!("failed to back out lost-seal commit (still reporting the loss): {e}");
+        }
+        return Err(LOST_SEAL_MSG.to_string());
+    }
     // Advance the project's git branch ref to the sealed commit so push and
     // git-side reads stay current. The pre-commit fast-forward check above
     // guarantees this is a forward move, so it stays best-effort: a transient ref
@@ -552,8 +667,17 @@ pub fn seal_paths(
 /// [`seal_paths`] checks this BEFORE `jj commit` so a stale seal is refused
 /// without ever creating the orphan. A bookmark that does not resolve yet (never
 /// created) is treated as fast-forwardable — the post-commit `bookmark set` will
-/// create it. The revset `(<bookmark>) & ::@-` is non-empty iff the bookmark
-/// commit is an ancestor-or-self of `@-`.
+/// create it. The revset `(<bookmark>) & ::@` is non-empty iff the bookmark
+/// commit is an ancestor-or-self of `@` (the working copy) — i.e. `@` descends
+/// from the bookmark, so sealing fast-forwards it.
+///
+/// `::@` (not `::@-`) is deliberate: it also accepts the bookmark sitting ON `@`
+/// itself — the legitimate state when the worktree's working-copy commit IS the
+/// branch tip (e.g. an agent's last commit is the working copy, or any worktree
+/// where the bookmark was set to `@`). Sealing there is a clean fast-forward (the
+/// edit commits into `@` and the bookmark advances), so it must not be refused.
+/// A genuinely-ahead bookmark on a divergent line (the Coordinator-fold case) is
+/// still rejected, because it is not an ancestor of `@`.
 fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, String> {
     let Some(bookmark) = bookmark_commit(jj, ws, branch) else {
         return Ok(true);
@@ -563,7 +687,7 @@ fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, Str
         &[
             "log",
             "-r",
-            &format!("({bookmark}) & ::@-"),
+            &format!("({bookmark}) & ::@"),
             "--no-graph",
             "-T",
             "commit_id",
@@ -781,12 +905,20 @@ pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) {
 /// exact form is unambiguous), and an empty revset exits 0 with empty output.
 pub fn bookmark_commit(jj: &JjEnv, store: &Path, branch: &str) -> Option<String> {
     let revset = format!("bookmarks(exact:{:?})", branch);
+    revset_commit(jj, store, &revset)
+}
+
+/// Resolve a single revset to a commit id over the shared store, or `None` when
+/// it does not resolve. Used for both exact local bookmarks and remote-tracking
+/// bookmarks such as `main@origin`.
+pub fn revset_commit(jj: &JjEnv, store: &Path, revset: &str) -> Option<String> {
     jj.run(
         store,
-        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
-        "jj log bookmark commit",
+        &["log", "-r", revset, "--no-graph", "-T", "commit_id"],
+        "jj log revset commit",
     )
     .ok()
+    .map(|s| s.trim().to_string())
     .filter(|s| !s.is_empty())
 }
 
@@ -1124,6 +1256,12 @@ pub fn push_store_bookmark(jj: &JjEnv, store: &Path, branch: &str) -> Result<(),
 /// `--ignore-working-copy` because this is driven from the store, not the
 /// sibling's workspace. A resulting conflict is recorded in the rebased commit
 /// (the command still succeeds); the sibling's descendant `@` auto-rebases.
+///
+/// After the rebase, export the store's bookmarks back to git immediately. jj
+/// moves the local bookmark during the rebase, and leaving the backing git ref at
+/// the old commit produces a local-vs-`@git` conflicted bookmark; once conflicted,
+/// idempotent descendant checks stop being reliable and later reconciles can keep
+/// rewriting the branch. Exporting here keeps the two ref views in lockstep.
 pub fn rebase_branch_onto(
     jj: &JjEnv,
     store: &Path,
@@ -1134,6 +1272,11 @@ pub fn rebase_branch_onto(
         store,
         &["rebase", "-b", branch, "-o", dest, "--ignore-working-copy"],
         "jj rebase",
+    )?;
+    jj.run(
+        store,
+        &["git", "export", "--ignore-working-copy"],
+        "jj git export (rebase)",
     )
     .map(|_| ())
 }
@@ -1155,6 +1298,23 @@ pub fn rebase_branch_onto(
 /// future jj rewording is a one-line change.
 pub fn is_stale_error(msg: &str) -> bool {
     msg.contains("working copy is stale") || msg.contains("behind its branch tip")
+}
+
+/// Stable marker phrase for a seal that captured no change because the working
+/// copy was reset under a concurrent store advance — the empty/divergent-seal
+/// data-loss mode. Carried in the `Err` [`seal_paths`] returns when its
+/// post-commit anomaly check fires, so the routing sites can recognize it.
+const LOST_SEAL_MSG: &str =
+    "seal captured no change (the working copy was reset under a concurrent store advance)";
+
+/// Classify a jj error as the LOST-SEAL family: a `jj commit` that returned a sha
+/// but sealed an empty or divergent commit because a concurrent op reset `@` out
+/// from under it (silent data loss reported as a real commit). Kept distinct from
+/// [`is_stale_error`] — the cause and jj phrasing differ — and OR'd with it at the
+/// routing sites, because both are recoverable the same way: re-apply the batch
+/// against the current base and re-seal.
+pub fn is_lost_seal_error(msg: &str) -> bool {
+    msg.contains(LOST_SEAL_MSG)
 }
 
 /// Refresh a workspace whose `@` was rebased out from under it. A rebased live
@@ -1504,6 +1664,39 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false)
             .then_some(bin)
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn resolve_falls_back_to_path_when_bundled_jj_is_unspawnable() {
+        let original = std::env::var("CAIRN_JJ_BIN").ok();
+        std::env::remove_var("CAIRN_JJ_BIN");
+
+        let home = TempDir::new().unwrap();
+        let jj = JjEnv::resolve("/definitely/not/a/spawnable/jj", home.path());
+
+        if let Some(value) = original {
+            std::env::set_var("CAIRN_JJ_BIN", value);
+        }
+
+        assert_eq!(jj.bin, "jj");
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn resolve_keeps_explicit_env_override() {
+        let original = std::env::var("CAIRN_JJ_BIN").ok();
+        std::env::set_var("CAIRN_JJ_BIN", "/explicit/jj");
+
+        let home = TempDir::new().unwrap();
+        let jj = JjEnv::resolve("/definitely/not/a/spawnable/jj", home.path());
+
+        match original {
+            Some(value) => std::env::set_var("CAIRN_JJ_BIN", value),
+            None => std::env::remove_var("CAIRN_JJ_BIN"),
+        }
+
+        assert_eq!(jj.bin, "/explicit/jj");
     }
 
     fn git(repo: &Path, args: &[&str]) {
@@ -3440,6 +3633,61 @@ mod tests {
         );
     }
 
+    /// A store-side rebase must export the moved bookmark back to the backing git
+    /// ref. Otherwise jj leaves the bookmark conflicted between the local tip and
+    /// the stale `@git` tracking ref, which makes later descendant checks stop
+    /// seeing the branch as already reconciled.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn rebase_branch_exports_git_ref_to_rebased_tip() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping rebase_branch_exports_git_ref_to_rebased_tip: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let branch = "agent/CAIRN-2078-builder-0";
+        let ws = wts.path().join("job");
+        add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+        std::fs::write(ws.join("agent.rs"), "agent work\n").unwrap();
+        seal(&jj, &ws, "agent work", None).unwrap();
+        let git_before = git_stdout(proj.path(), &["rev-parse", branch]);
+        assert_eq!(
+            git_before,
+            bookmark_commit(&jj, &store, branch).unwrap(),
+            "seal exports the initial branch ref"
+        );
+
+        advance_project(proj.path());
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap();
+        let rebased_tip = bookmark_commit(&jj, &store, branch).unwrap();
+        let git_after = git_stdout(proj.path(), &["rev-parse", branch]);
+
+        assert_ne!(git_before, rebased_tip, "the rebase moved the branch tip");
+        assert_eq!(
+            git_after, rebased_tip,
+            "rebase_branch_onto exports the moved bookmark to the backing git ref"
+        );
+        let bookmarks = jj
+            .run(
+                &store,
+                &["bookmark", "list", branch],
+                "jj bookmark list branch",
+            )
+            .unwrap();
+        assert!(
+            !bookmarks.contains("@git"),
+            "the branch must not remain conflicted against a stale @git ref: {bookmarks}"
+        );
+    }
+
     /// After a fold, the project's backing git ref for the integration branch must
     /// track the advanced tip, so a later child — provisioned the way
     /// `execution/jobs/worktrees.rs` does (rev-parse the base ref in the project
@@ -3560,6 +3808,257 @@ mod tests {
         ));
         assert!(!is_stale_error("nothing to commit, working tree clean"));
         assert!(!is_stale_error("error: pre-commit hook failed"));
+        // The lost-seal marker is its OWN family, not folded into the stale one:
+        // the cause and remediation differ, so the predicates stay distinct.
+        assert!(!is_stale_error(LOST_SEAL_MSG));
+    }
+
+    /// `is_lost_seal_error` recognizes the lost-seal marker (even wrapped in the
+    /// write-path's surrounding text) and rejects unrelated jj errors, including
+    /// the stale family it is OR'd with at the routing sites.
+    #[test]
+    fn is_lost_seal_error_classifies_the_lost_seal_marker() {
+        assert!(is_lost_seal_error(LOST_SEAL_MSG));
+        assert!(is_lost_seal_error(&format!(
+            "Applied file changes but commit failed: {LOST_SEAL_MSG}; the worktree was restored."
+        )));
+        assert!(!is_lost_seal_error("working copy is stale"));
+        assert!(!is_lost_seal_error("nothing to commit"));
+        assert!(!is_lost_seal_error(
+            "seal refused: workspace `agent/x` is behind its branch tip"
+        ));
+    }
+
+    /// Fork a committed change into a DIVERGENT twin via two `--at-op` describes
+    /// from the same base operation: each rewrites the change to a distinct
+    /// commit, and merging the divergent op heads keeps BOTH (`<id>/0 /1`). This
+    /// is the op-fork shape a concurrent, unserialized store advance leaves —
+    /// reused from the `forked_op_rebase_*` tests, scoped to a single change.
+    fn fork_into_divergent(jj: &JjEnv, ws: &Path, change_id: &str) {
+        let base_op = jj
+            .run(
+                ws,
+                &["op", "log", "--no-graph", "-n", "1", "-T", "id"],
+                "op id",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+        for (i, msg) in ["twin a", "twin b"].iter().enumerate() {
+            jj.run(
+                ws,
+                &[
+                    "describe",
+                    change_id,
+                    "-m",
+                    msg,
+                    "--at-op",
+                    &base_op,
+                    "--ignore-working-copy",
+                ],
+                &format!("fork twin {i}"),
+            )
+            .unwrap();
+        }
+        // Any normal command merges the divergent op heads.
+        let _ = jj.run(
+            ws,
+            &[
+                "log",
+                "-r",
+                "root()",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "trigger op merge",
+        );
+    }
+
+    /// `scoped_dirty` measures the WHOLE working copy for an empty path slice and
+    /// only the named filesets when scoped. The scoped case is what keeps a
+    /// legitimately no-op scoped seal (whose unrelated dirt makes the whole `@`
+    /// look dirty) from false-positiving as a lost seal.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn scoped_dirty_measures_whole_and_scoped_paths() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping scoped_dirty_measures_whole_and_scoped_paths: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let ws = wts.path().join("w");
+        add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+
+        // Clean working copy: nothing dirty either way.
+        assert!(!scoped_dirty(&jj, &ws, &[]).unwrap());
+        assert!(!scoped_dirty(&jj, &ws, &["a.txt"]).unwrap());
+
+        // Dirt in a.txt: whole-`@` is dirty and a check scoped to a.txt is dirty,
+        // but a check scoped to an UNTOUCHED path is NOT — the no-op-scoped guard.
+        std::fs::write(ws.join("a.txt"), "change\n").unwrap();
+        assert!(scoped_dirty(&jj, &ws, &[]).unwrap());
+        assert!(scoped_dirty(&jj, &ws, &["a.txt"]).unwrap());
+        assert!(
+            !scoped_dirty(&jj, &ws, &["shared.rs"]).unwrap(),
+            "a scoped check on an untouched path is clean even when the whole `@` is dirty"
+        );
+    }
+
+    /// `sealed_commit_is_lost` flags the empty-with-pre-dirt and divergent shapes
+    /// and clears a genuine no-op (empty, no pre-dirt) and a real non-empty seal —
+    /// the true/false-positive matrix the seal-path detection depends on.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn sealed_commit_is_lost_flags_empty_and_divergent_not_clean() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping sealed_commit_is_lost_flags_empty_and_divergent_not_clean: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let ws = wts.path().join("w");
+        add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+
+        // A real, non-empty seal is NOT lost even with pre-commit dirt measured.
+        std::fs::write(ws.join("a.txt"), "v1\n").unwrap();
+        seal(&jj, &ws, "real work", None).unwrap();
+        assert!(
+            !sealed_commit_is_lost(&jj, &ws, true).unwrap(),
+            "a real non-empty seal is not the lost shape"
+        );
+
+        // An EMPTY `@-`: a bare `jj commit` on a clean `@` seals nothing. With
+        // pre-commit dirt it is the lost shape; from a genuine no-op (no
+        // pre-dirt) it is NOT flagged.
+        jj.run(&ws, &["commit", "-m", "empty seal"], "empty commit")
+            .unwrap();
+        assert!(
+            sealed_commit_is_lost(&jj, &ws, true).unwrap(),
+            "an empty `@-` despite pre-commit dirt is the lost shape"
+        );
+        assert!(
+            !sealed_commit_is_lost(&jj, &ws, false).unwrap(),
+            "an empty `@-` from a genuine no-op (no pre-dirt) is not flagged"
+        );
+
+        // A DIVERGENT `@-`: fork the just-sealed change into a twin. Flagged
+        // regardless of pre-dirt (a concurrent-op merge, never a clean seal).
+        std::fs::write(ws.join("b.txt"), "v2\n").unwrap();
+        seal(&jj, &ws, "seal to fork", None).unwrap();
+        let cid = jj
+            .run(
+                &ws,
+                &["log", "-r", "@-", "--no-graph", "-T", "change_id.short()"],
+                "@- change id",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+        fork_into_divergent(&jj, &ws, &cid);
+        assert_eq!(
+            visible_commits_for_change(&jj, &ws, &cid),
+            2,
+            "precondition: `@-` resolves to a divergent change"
+        );
+        assert!(
+            sealed_commit_is_lost(&jj, &ws, false).unwrap(),
+            "a divergent `@-` is the lost shape regardless of pre-dirt"
+        );
+    }
+
+    /// End-to-end: a `seal_paths` whose commit lands on a divergent change DETECTS
+    /// the anomaly, returns a typed lost-seal `Err` (not `Ok` with a phantom sha),
+    /// and backs the bad commit out so `@` reparents onto its pre-seal parent —
+    /// the silent-data-loss-as-success regression this fix closes. A normal seal
+    /// in the same workspace shape still succeeds (no false positive).
+    #[test]
+    #[serial_test::serial(jj)]
+    fn seal_paths_detects_and_backs_out_a_lost_seal() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping seal_paths_detects_and_backs_out_a_lost_seal: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let ws = wts.path().join("w");
+        add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+
+        // A clean seal succeeds normally (the no-false-positive baseline).
+        std::fs::write(ws.join("a.txt"), "v1\n").unwrap();
+        let ok = seal_paths(&jj, &ws, "seal1", None, &[]).expect("a clean seal succeeds");
+        assert!(!ok.sha.is_empty());
+        let parent_cid = jj
+            .run(
+                &ws,
+                &["log", "-r", "@-", "--no-graph", "-T", "change_id.short()"],
+                "@- change id",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Fork the sealed parent into a divergent twin. A subsequent seal's own
+        // commit then inherits the divergence — the empty/divergent shape a
+        // concurrent store advance leaves.
+        fork_into_divergent(&jj, &ws, &parent_cid);
+        // The fork rewrote the bookmarked commit; repoint the bookmark to the live
+        // parent twin so the seal's fast-forward precheck (an orthogonal concern,
+        // covered by its own test) passes and this test exercises the ANOMALY path.
+        jj.run(
+            &ws,
+            &[
+                "bookmark",
+                "set",
+                "agent/CAIRN-1-builder-0",
+                "-r",
+                "@-",
+                "--ignore-working-copy",
+            ],
+            "repoint bookmark to live twin",
+        )
+        .unwrap();
+
+        std::fs::write(ws.join("b.txt"), "v2\n").unwrap();
+        let err = seal_paths(&jj, &ws, "seal2", None, &[])
+            .expect_err("a lost seal must surface as Err, not Ok with a phantom sha");
+        assert!(
+            is_lost_seal_error(&err),
+            "the seal error is classified lost-seal: {err}"
+        );
+
+        // Backout: `jj abandon @-` reparented `@` onto the original seal1 parent,
+        // so the bad seal2 commit is gone rather than reported as committed.
+        let after = jj
+            .run(
+                &ws,
+                &["log", "-r", "@-", "--no-graph", "-T", "change_id.short()"],
+                "@- after backout",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(
+            after, parent_cid,
+            "the backed-out seal returns `@` to its pre-seal parent"
+        );
     }
 
     /// The data-loss regression guard: `discard` on a STALE workspace carrying

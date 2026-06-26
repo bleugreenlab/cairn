@@ -139,16 +139,10 @@ pub fn load_project_settings(project_path: &Path) -> ProjectSettingsFile {
                     "Migrating project config at {:?} (removing deprecated fields)",
                     project_path
                 );
-                match save_project_settings(project_path, &file) {
-                    Ok(()) => {
-                        // The rewrite lands in the project's canonical checkout;
-                        // commit it so the migration does not float as dirt.
-                        super::commit_project_config_change(
-                            project_path,
-                            "cairn: migrate project config",
-                        );
-                    }
-                    Err(e) => log::warn!("Failed to migrate project settings: {}", e),
+                // `save_project_settings` commits the rewrite (scoped to
+                // `config.yaml`) so the migration does not float as dirt.
+                if let Err(e) = save_project_settings(project_path, &file) {
+                    log::warn!("Failed to migrate project settings: {}", e);
                 }
             }
             file
@@ -275,7 +269,13 @@ pub fn save_project_settings(
     let content = format!("# Cairn Project Configuration\n{}", yaml);
 
     std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write project config file: {}", e))
+        .map_err(|e| format!("Failed to write project config file: {}", e))?;
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        "cairn: update project config",
+        None,
+    );
+    Ok(())
 }
 
 /// Create a default project config file with commented template
@@ -483,6 +483,99 @@ copyFiles:
         let loaded = load_project_settings(project_path);
         assert_eq!(loaded.setup_commands, settings.setup_commands);
         assert_eq!(loaded.default_branch, settings.default_branch);
+    }
+
+    fn git_init(path: &Path) {
+        assert!(crate::env::git()
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_bare(path: &Path) {
+        assert!(crate::env::git()
+            .args(["init", "--bare", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_set_origin(repo: &Path, origin: &Path) {
+        assert!(crate::env::git()
+            .args(["remote", "add", "origin"])
+            .arg(origin)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_commit_count(path: &Path) -> usize {
+        let out = crate::env::git()
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    fn git_branch(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn origin_has_branch(origin: &Path, branch: &str) -> bool {
+        crate::env::git()
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .current_dir(origin)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn save_project_settings_commits_scoped_and_does_not_push() {
+        let temp = TempDir::new().unwrap();
+        let origin = temp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_bare(&origin);
+        let proj = temp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        git_init(&proj);
+        git_set_origin(&proj, &origin);
+        std::fs::write(proj.join("unrelated.txt"), "dirty").unwrap();
+
+        let settings = ProjectSettingsFile {
+            setup_commands: Some(vec!["npm install".to_string()]),
+            ..Default::default()
+        };
+        save_project_settings(&proj, &settings).unwrap();
+
+        assert_eq!(git_head_subject(&proj), "cairn: update project config");
+        // Exactly one scoped commit (no migration/double commit).
+        assert_eq!(git_commit_count(&proj), 1);
+        let status = git_status(&proj);
+        assert!(
+            status.contains("unrelated.txt"),
+            "unrelated stays dirty: {status:?}"
+        );
+        assert!(
+            !status.contains("config.yaml"),
+            "config.yaml committed: {status:?}"
+        );
+        // Project scope is commit-only: nothing pushed to origin.
+        assert!(!origin_has_branch(&origin, &git_branch(&proj)));
     }
 
     #[test]
@@ -842,7 +935,8 @@ activeBackend: codex
         .unwrap();
         commit_all(project_path, "seed legacy config");
 
-        // Loading migrates the file (drops ciCommands) and commits the rewrite.
+        // Loading migrates the file (drops ciCommands) and commits the rewrite
+        // through `save_project_settings`, which is the scoped commit funnel.
         let loaded = load_project_settings(project_path);
         assert_eq!(loaded.setup_commands, Some(vec!["npm install".to_string()]));
 
@@ -854,7 +948,7 @@ activeBackend: codex
         );
         assert_eq!(
             git_head_subject(project_path),
-            "cairn: migrate project config"
+            "cairn: update project config"
         );
     }
 }

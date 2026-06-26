@@ -302,10 +302,13 @@ pub(crate) fn enqueue_direct_push(
 /// Persist a system-originated direct message addressed to `recipient_run_id` and
 /// queue it on the attention push queue (CAIRN-1900). Used by orchestrator-internal
 /// callers (base-branch advance notices, PR conflict resolution, etc.). The
-/// `urgency` sets the wake level: a waking urgency (`Steer`/`Queue`/`Interrupt`)
-/// nudges an idle recipient to resume, while a `Passive` note never wakes an idle
-/// recipient and rides along into its next natural run. Busy recipients drain the
-/// push at their next event boundary regardless.
+/// `urgency` sets the wake level, which governs only whether an *idle* recipient
+/// is roused: a waking urgency (`Steer`/`Queue`/`Interrupt`) nudges an idle
+/// recipient to resume, while a `Passive` note never wakes an idle recipient. The
+/// wake level does not gate delivery on a *busy* recipient — a recipient already
+/// mid-turn drains the push at its next event boundary regardless of wake level,
+/// so a passive note rides along inline on the active turn while never having
+/// woken an idle agent.
 pub fn queue_system_direct(
     orch: &Orchestrator,
     recipient_run_id: &str,

@@ -518,14 +518,20 @@ fn write_settings_key(
     let yaml =
         serde_yaml::to_string(&root).map_err(|e| format!("Failed to serialize settings: {e}"))?;
     std::fs::write(&path, format!("# Cairn Workspace Settings\n{yaml}"))
-        .map_err(|e| format!("Failed to write settings file: {e}"))
+        .map_err(|e| format!("Failed to write settings file: {e}"))?;
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        "cairn: update settings",
+        Some(config_dir),
+    );
+    Ok(())
 }
 
 /// Resolve the template variables for build-service config expansion.
 ///
-/// `{worktrees}` is always `~/.cairn/worktrees` (the canonical worktree root,
-/// matching `git::worktree::worktree_base_dir`), independent of the dev/prod
-/// `config_dir`, because worktrees live there in both modes.
+/// `{worktrees}` is always `~/.cairn/worktrees` (the canonical worktree root),
+/// independent of the dev/prod `config_dir`, because worktrees live there in
+/// both modes.
 pub fn build_service_templates(
     config_dir: &std::path::Path,
     worktree: Option<std::path::PathBuf>,
@@ -636,7 +642,13 @@ pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Resul
         serde_yaml::to_string(&file).map_err(|e| format!("Failed to serialize settings: {}", e))?;
     let content = format!("# Cairn Workspace Settings\n{}", yaml);
 
-    std::fs::write(&path, content).map_err(|e| format!("Failed to write settings file: {}", e))
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write settings file: {}", e))?;
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        "cairn: update settings",
+        Some(config_dir),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -655,6 +667,135 @@ mod tests {
     {
         let temp = TempDir::new().unwrap();
         f(&temp);
+    }
+
+    fn git_init(path: &std::path::Path) {
+        assert!(crate::env::git()
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_bare(path: &std::path::Path) {
+        assert!(crate::env::git()
+            .args(["init", "--bare", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_set_origin(repo: &std::path::Path, origin: &std::path::Path) {
+        assert!(crate::env::git()
+            .args(["remote", "add", "origin"])
+            .arg(origin)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_status(path: &std::path::Path) -> String {
+        let out = crate::env::git()
+            .args(["status", "--porcelain"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_head_subject(path: &std::path::Path) -> String {
+        let out = crate::env::git()
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_rev(path: &std::path::Path, rev: &str) -> String {
+        let out = crate::env::git()
+            .args(["rev-parse", rev])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_branch(path: &std::path::Path) -> String {
+        let out = crate::env::git()
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn save_settings_commits_and_pushes_with_origin() {
+        let temp = TempDir::new().unwrap();
+        let origin = temp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_bare(&origin);
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        git_init(&home);
+        git_set_origin(&home, &origin);
+
+        save_settings(&home, &test_settings()).unwrap();
+
+        assert!(
+            git_status(&home).is_empty(),
+            "settings save left repo dirty"
+        );
+        assert_eq!(git_head_subject(&home), "cairn: update settings");
+
+        // The writer's push is fire-and-forget; drive it synchronously to assert
+        // the workspace remote advanced.
+        crate::config::push_workspace_repo_best_effort(&home);
+        let branch = git_branch(&home);
+        assert_eq!(
+            git_rev(&origin, &format!("refs/heads/{branch}")),
+            git_rev(&home, "HEAD"),
+            "workspace origin should advance to the settings commit"
+        );
+    }
+
+    #[test]
+    fn save_settings_commits_without_remote() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        git_init(home);
+        save_settings(home, &test_settings()).unwrap();
+        assert!(
+            git_status(home).is_empty(),
+            "no-remote save left repo dirty"
+        );
+        assert_eq!(git_head_subject(home), "cairn: update settings");
+    }
+
+    #[test]
+    fn write_settings_key_commits_scoped() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        git_init(home);
+        // Build-service / fence saves funnel through write_settings_key.
+        std::fs::write(home.join("unrelated.txt"), "dirty").unwrap();
+
+        write_settings_key(home, "buildServices", serde_yaml::Value::Null).unwrap();
+
+        assert_eq!(git_head_subject(home), "cairn: update settings");
+        let status = git_status(home);
+        assert!(
+            status.contains("unrelated.txt"),
+            "unrelated stays dirty: {status:?}"
+        );
+        assert!(
+            !status.contains("settings.yaml"),
+            "settings.yaml committed: {status:?}"
+        );
     }
 
     #[test]

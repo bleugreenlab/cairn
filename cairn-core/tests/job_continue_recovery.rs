@@ -27,8 +27,8 @@ async fn insert_job_session_run_turn(db: &LocalDb, turn_state: &str, run_id: Opt
             .await?;
             if let Some(run_id) = run_id.as_deref() {
                 conn.execute(
-                    "INSERT INTO runs(id, project_id, job_id, chat_id, status, session_id, backend, created_at, updated_at, start_mode)
-                     VALUES (?1, ?2, 'job-1', NULL, 'live', 'session-1', 'codex', 1, 1, 'resume')",
+                    "INSERT INTO runs(id, project_id, job_id, chat_id, status, session_id, created_at, updated_at, start_mode)
+                     VALUES (?1, ?2, 'job-1', NULL, 'live', 'session-1', 1, 1, 'resume')",
                     params![run_id, project_id.as_str()],
                 )
                 .await?;

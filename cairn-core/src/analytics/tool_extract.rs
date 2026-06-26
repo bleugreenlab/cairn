@@ -330,6 +330,7 @@ mod tests {
             output_tokens: None,
             turn_id: None,
             thinking_tokens: None,
+            cost_usd: None,
             storage_mode: None,
             content_commit: None,
             content_change_id: None,

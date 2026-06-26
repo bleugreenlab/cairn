@@ -173,8 +173,8 @@ async fn seed_run(
             )
             .await?;
             conn.execute(
-                "INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
-                 VALUES (?1, ?2, ?3, ?4, 'live', 'codex', 1, 1, 'resume')",
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode)
+                 VALUES (?1, ?2, ?3, ?4, 'live', 1, 1, 'resume')",
                 params![run_id.as_str(), project_id.as_str(), issue_id.as_str(), job_id.as_str()],
             )
             .await?;

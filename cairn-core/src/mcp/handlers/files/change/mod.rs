@@ -1,6 +1,7 @@
 //! Change-tool MCP handler.
 
 pub(crate) mod file_mutations;
+pub(crate) mod host_edit;
 mod preview;
 mod types;
 

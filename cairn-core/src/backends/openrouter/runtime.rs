@@ -124,25 +124,47 @@ pub(super) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
     let run_id = config.run_id.clone();
     let error_session_id = session_id.clone();
     std::thread::spawn(move || {
-        let result = run_http_turn(
-            &orch_clone,
-            config,
-            api_key,
-            session_id,
-            initial_sequence,
-            None,
-            cancel,
-            system_prompt,
-        );
-        if let Err(error) = result {
-            log::error!("OpenRouter turn failed: {error}");
-            insert_error_event(
+        // Catch a panic in the owned loop. Without this, a panic silently kills
+        // the thread: `finish_run` is never called, the `run_completions`
+        // broadcast never fires, and a delegated child's packet stays `running`
+        // forever. Both the `Err` and panic arms route through
+        // `finish_run_failed`, which fails a delegated task terminally so its
+        // suspended parent resumes instead of hanging.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_http_turn(
                 &orch_clone,
-                &run_id,
-                Some(&error_session_id),
-                &format!("OpenRouter turn failed: {error}"),
-            );
-            finish_run(&orch_clone, &run_id, RunStatus::Crashed);
+                config,
+                api_key,
+                session_id,
+                initial_sequence,
+                None,
+                cancel,
+                system_prompt,
+            )
+        }));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::error!("OpenRouter turn failed: {error}");
+                insert_error_event(
+                    &orch_clone,
+                    &run_id,
+                    Some(&error_session_id),
+                    &format!("OpenRouter turn failed: {error}"),
+                );
+                finish_run_failed(&orch_clone, &run_id, "turn_failed");
+            }
+            Err(panic) => {
+                let detail = panic_message(panic.as_ref());
+                log::error!("OpenRouter turn panicked: {detail}");
+                insert_error_event(
+                    &orch_clone,
+                    &run_id,
+                    Some(&error_session_id),
+                    &format!("OpenRouter turn panicked: {detail}"),
+                );
+                finish_run_failed(&orch_clone, &run_id, "turn_panicked");
+            }
         }
     });
 
@@ -268,6 +290,21 @@ fn run_http_turn(
         let tool_calls = assistant_message.tool_calls.clone().unwrap_or_default();
         let reasoning_details = assistant_message.reasoning_details.clone();
         conversation.push(assistant_message);
+
+        // Observability: surface output-token truncation per model so its
+        // frequency is visible. The last tool call is the one that can be cut
+        // off; name it when present.
+        if generation_truncated {
+            let truncated_tool = tool_calls
+                .last()
+                .map(|call| call.function.name.as_str())
+                .unwrap_or("<none>");
+            log::warn!(
+                "OpenRouter generation truncated (finish_reason=length) model={} tool={}",
+                model,
+                truncated_tool
+            );
+        }
 
         if tool_calls.is_empty() {
             if !assistant_text.is_empty() {
@@ -467,6 +504,27 @@ fn finalize_suspended(orch: &Orchestrator, run_id: &str, kind: SuspendKind) -> R
 fn finish_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     crate::orchestrator::lifecycle::finalize_run(orch, run_id, status);
     let _ = orch.process_state.stop_and_remove(run_id);
+}
+
+/// Finalize an owned-loop turn that hit a genuinely fatal failure (an `Err`
+/// return or a caught panic). Mirrors `finish_run` but routes through the
+/// task-aware `fail_run`: a delegated task is finalized terminally `Failed` (so
+/// its suspended parent resumes with the error), while a top-level job stays a
+/// resumable interruption.
+fn finish_run_failed(orch: &Orchestrator, run_id: &str, reason: &str) {
+    crate::orchestrator::lifecycle::fail_run(orch, run_id, reason);
+    let _ = orch.process_state.stop_and_remove(run_id);
+}
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// Push a context-token snapshot to the frontend so the live occupancy gauge
@@ -744,6 +802,13 @@ fn prepare_tool_call(tool_call: &ToolCall, suspected_truncated: bool) -> Prepare
             (value, true)
         }
         repair::ParsedArguments::Unrecoverable => {
+            // A severely cut-off large call (the generation hit the output-token
+            // cap) is the common cause of unrepairable JSON. Give the
+            // truncation-specific guidance so the model splits it up rather than
+            // the generic "not valid JSON" message.
+            if suspected_truncated {
+                return PreparedCall::Reject(truncated_args_message(verb));
+            }
             return PreparedCall::Reject(DispatchOutput {
                 content: format!(
                     "OpenRouter tool arguments for {verb} were not valid JSON, even after repair. \
@@ -2631,8 +2696,8 @@ mod tests {
             .write(|conn| {
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT INTO runs(id, status, session_id, created_at, updated_at, backend)
-                         VALUES ('run-1', 'live', 'session-1', ?1, ?2, 'openrouter')",
+                        "INSERT INTO runs(id, status, session_id, created_at, updated_at)
+                         VALUES ('run-1', 'live', 'session-1', ?1, ?2)",
                         params![now, now],
                     )
                     .await?;
@@ -3028,5 +3093,24 @@ mod tests {
             prepare_tool_call(&call, true),
             PreparedCall::Dispatch { .. }
         ));
+    }
+
+    #[test]
+    fn prepare_tool_call_unrecoverable_truncated_gives_split_guidance() {
+        // Unrepairable JSON that was ALSO cut off at the output-token cap
+        // (suspected_truncated) gets the truncation-specific message that tells
+        // the model to split the call, not the generic invalid-JSON message.
+        let call = tool_call("write", r#"{"changes": [{"target": "file:x", "mode":"#);
+        match prepare_tool_call(&call, true) {
+            PreparedCall::Reject(output) => {
+                assert!(output.content.contains("appear truncated"));
+                assert!(output
+                    .content
+                    .contains("split it into several smaller calls"));
+            }
+            PreparedCall::Dispatch { .. } => {
+                panic!("unrecoverable + truncated args should reject")
+            }
+        }
     }
 }

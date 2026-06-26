@@ -237,6 +237,31 @@ fn validate_read_only_sql(sql: &str) -> Result<(), String> {
     }
     reject_statement_chain(trimmed)?;
     let tokens = sql_tokens(trimmed);
+    // EXPLAIN and EXPLAIN QUERY PLAN describe a statement's bytecode / query
+    // plan without ever executing it, so both are read-only regardless of the
+    // inner statement. Strip the prefix and validate the described statement is
+    // itself a permitted read shape: this keeps the contract's spirit (no
+    // mutation ever reaches the engine) while enabling query-plan inspection.
+    let statement = match tokens.first().map(String::as_str) {
+        Some("EXPLAIN") => {
+            let rest = if tokens.get(1).map(String::as_str) == Some("QUERY")
+                && tokens.get(2).map(String::as_str) == Some("PLAN")
+            {
+                &tokens[3..]
+            } else {
+                &tokens[1..]
+            };
+            if rest.is_empty() {
+                return Err("EXPLAIN requires a statement to explain".to_string());
+            }
+            rest
+        }
+        _ => &tokens[..],
+    };
+    validate_statement_tokens(statement)
+}
+
+fn validate_statement_tokens(tokens: &[String]) -> Result<(), String> {
     let first = tokens
         .first()
         .map(String::as_str)
@@ -254,9 +279,9 @@ fn validate_read_only_sql(sql: &str) -> Result<(), String> {
                 Ok(())
             }
         }
-        "PRAGMA" => validate_schema_pragma(&tokens),
+        "PRAGMA" => validate_schema_pragma(tokens),
         other => Err(format!(
-            "Unsupported SQL statement '{other}'; cairn://db permits SELECT, read-only WITH, and schema PRAGMAs"
+            "Unsupported SQL statement '{other}'; cairn://db permits SELECT, read-only WITH, EXPLAIN, and schema PRAGMAs"
         )),
     }
 }
@@ -1910,6 +1935,15 @@ mod tests {
             .unwrap();
         validate_read_only_sql("PRAGMA table_list").unwrap();
         validate_read_only_sql("PRAGMA table_info(issues)").unwrap();
+        // EXPLAIN and EXPLAIN QUERY PLAN describe a read statement without
+        // executing it; both are permitted for query-plan inspection.
+        validate_read_only_sql("EXPLAIN SELECT id FROM issues").unwrap();
+        validate_read_only_sql("EXPLAIN QUERY PLAN SELECT id FROM runs WHERE session_id = 'x'")
+            .unwrap();
+        validate_read_only_sql(
+            "EXPLAIN QUERY PLAN WITH recent AS (SELECT id FROM issues) SELECT * FROM recent",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1924,6 +1958,12 @@ mod tests {
             "ATTACH 'other.db' AS other",
             "SELECT 1; SELECT 2",
             "WITH changed AS (DELETE FROM issues RETURNING id) SELECT * FROM changed",
+            // EXPLAIN does not execute, but the described statement must still be
+            // a read shape so no mutation ever reaches the engine.
+            "EXPLAIN DELETE FROM issues",
+            "EXPLAIN QUERY PLAN UPDATE issues SET title = 'x'",
+            "EXPLAIN",
+            "EXPLAIN QUERY PLAN",
         ] {
             assert!(
                 validate_read_only_sql(sql).is_err(),

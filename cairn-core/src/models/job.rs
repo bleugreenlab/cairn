@@ -29,20 +29,6 @@ pub enum JobStatus {
     Cancelled,
 }
 
-/// One attempt in a recipe node's job lineage (oldest→newest), including
-/// archived (`cancelled`) attempts. Restart-node archives the prior job and
-/// creates a fresh one, so a node can own several attempts; this is the
-/// “Attempt N of M” view, with each attempt's transcript reachable via its
-/// session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeAttempt {
-    pub id: String,
-    pub status: String,
-    pub created_at: i32,
-    pub current_session_id: Option<String>,
-}
-
 impl JobStatus {
     /// Whether the job is in a terminal state.
     pub fn is_terminal(&self) -> bool {

@@ -9,9 +9,10 @@
 //!    read cursor. Question and permission pushes are created at their own emit
 //!    sites (where the producing node is known) through
 //!    [`push_to_issue_watchers`].
-//! 2. **Render pushes at resume time.** [`render_pushes_resolved`] resolves each
-//!    drained push's `content_ref` to its rendered resource content so a resumed
-//!    agent acts on it without a round-trip read.
+//! 2. **Render pushes at resume time.** [`render_pushes_resolved`] resolves most
+//!    drained push `content_ref`s to rendered resource content so a resumed agent
+//!    acts without a round-trip read. Terminal `resolved:` pushes are rendered as
+//!    concise confirmations instead of dumping the resolved issue body.
 
 use turso::params;
 
@@ -297,13 +298,35 @@ async fn resolve_uri_to_markdown(orch: &Orchestrator, uri: &str) -> Option<Strin
 /// keep the `content_ref` URI so the agent can follow it for the rest.
 const PUSH_CONTENT_CAP: usize = 4000;
 
+async fn resolved_issue_confirmation(orch: &Orchestrator, issue_uri: &str) -> Option<String> {
+    let issue_uri = issue_uri.to_string();
+    orch.db
+        .local
+        .read(|conn| {
+            let issue_uri = issue_uri.clone();
+            Box::pin(async move {
+                let issue = crate::issues::relations::resolve_issue_uri(conn, &issue_uri).await?;
+                let status = issue.map(|issue| issue.status);
+                let message = match status {
+                    Some(crate::models::IssueStatus::Merged) => "Issue Merged Successfully",
+                    Some(crate::models::IssueStatus::Closed) => "Issue Closed Successfully",
+                    _ => "Issue Resolved Successfully",
+                };
+                Ok(message.to_string())
+            })
+        })
+        .await
+        .ok()
+}
+
 /// Render a drained attention push with its referent content resolved inline
 /// (CAIRN-1891), so the agent acts without a round-trip read. The header carries
 /// the wake level and the `content_ref` URI; the body is the rendered resource
 /// (the PR summary/diff, plan, question, or permission), capped. Resolution uses
 /// the same in-process read that backs `cairn read {uri}` (and the briefing).
-/// Falls back to the bare header line when resolution yields nothing, so the
-/// agent still has the URI to follow.
+/// Terminal `resolved:` pushes are intentionally concise confirmations instead
+/// of a full issue read. Falls back to the bare header line when resolution
+/// yields nothing, so the agent still has the URI to follow.
 pub async fn render_push_resolved(
     orch: &Orchestrator,
     push: &crate::orchestrator::attention_push::Push,
@@ -313,6 +336,13 @@ pub async fn render_push_resolved(
         push.wake.as_str(),
         push.content_ref
     );
+    if push.key.starts_with("resolved:") {
+        let body = resolved_issue_confirmation(orch, &push.content_ref)
+            .await
+            .unwrap_or_else(|| "Issue Resolved Successfully".to_string());
+        return format!("{header}\n\n{body}");
+    }
+
     // A `direct:` push carries frozen message content, not an idempotent
     // resolvable referent. Resolve it from the durable `messages` row by the
     // message id in the key (`direct:{message_id}`) rather than from
@@ -470,6 +500,37 @@ mod tests {
         let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
         let services = Arc::new(TestServicesBuilder::new().build());
         OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    #[tokio::test]
+    async fn render_resolved_push_uses_concise_confirmation_not_issue_body() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        db.execute_script(
+            "UPDATE issues
+             SET status='merged', description='This long child issue description should not be inlined.'
+             WHERE id='issue-1';",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+        let push = crate::orchestrator::attention_push::Push {
+            id: "push-1".into(),
+            recipient: "watcher".into(),
+            content_ref: CHILD_URI.into(),
+            wake: Wake::Passive,
+            boundary: Boundary::Event,
+            key: format!("resolved:{CHILD_URI}"),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(rendered.contains("Attention update (passive): cairn://p/PROJ/2"));
+        assert!(rendered.contains("Issue Merged Successfully"));
+        assert!(!rendered.contains("Description"));
+        assert!(!rendered.contains("This long child issue description"));
     }
 
     /// Subscribe `job_id` to the child issue (`CHILD_URI`).

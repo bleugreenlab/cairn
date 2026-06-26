@@ -769,6 +769,15 @@ pub async fn resolve_permission_request(
         orch.wake_for_issue(issue_id).await;
     }
 
+    // Snapshot the live-wait state before broadcasting. The broadcast can wake
+    // an inline waiter immediately; that waiter then transitions the process out
+    // of `AwaitingHost` while this resolver is still running. If we checked after
+    // the send, the slow-path guard could misread the inline wakeup as a durable
+    // suspend and try to resume the same permission a second time.
+    let inline_waiter_was_present = orch
+        .process_state
+        .is_awaiting_host(&resume.run_id, resume.predecessor_turn_id.as_deref());
+
     // Broadcast: wakes a handler still in its inline wait (fast path).
     if !resume.duplicate {
         let _ = orch
@@ -787,16 +796,10 @@ pub async fn resolve_permission_request(
         );
     }
 
-    // Slow path: the inline waiter is gone (run durably suspended). A successor
-    // turn exists and the process is no longer awaiting host — resume it.
-    let should_resume = !crossing
-        .as_ref()
-        .is_some_and(CrossingDetail::is_terminal_origin)
-        && !resume.duplicate
-        && resume.successor_turn_id.is_some()
-        && !orch
-            .process_state
-            .is_awaiting_host(&resume.run_id, resume.predecessor_turn_id.as_deref());
+    // Slow path: no inline waiter was present before the answer was broadcast,
+    // so the run durably suspended and must be resumed from the stored response.
+    let should_resume =
+        should_resume_permission_response(crossing.as_ref(), &resume, inline_waiter_was_present);
     if should_resume {
         if let Err(e) = resume_suspended_permission(
             orch,
@@ -933,6 +936,17 @@ fn build_permission_response_json(
             .unwrap_or(serde_json::json!({}));
         allow_response(&original_input)
     }
+}
+
+fn should_resume_permission_response(
+    crossing: Option<&CrossingDetail>,
+    resume: &PermissionResponseResume,
+    inline_waiter_was_present: bool,
+) -> bool {
+    !crossing.is_some_and(CrossingDetail::is_terminal_origin)
+        && !resume.duplicate
+        && resume.successor_turn_id.is_some()
+        && !inline_waiter_was_present
 }
 
 /// Resume a run that durably suspended on a permission request.
@@ -1730,6 +1744,57 @@ mod tests {
         assert_eq!(parsed.verb, "read");
         assert_eq!(parsed.descriptor, "/etc/hosts");
         assert_eq!(parsed.request.tool, "read");
+    }
+
+    #[test]
+    fn permission_response_does_not_cold_resume_when_inline_waiter_was_present() {
+        let resume = PermissionResponseResume {
+            run_id: "run-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            issue_id: None,
+            predecessor_turn_id: Some("turn-1".to_string()),
+            successor_turn_id: Some("turn-2".to_string()),
+            job_id: Some("job-1".to_string()),
+            duplicate: false,
+        };
+
+        assert!(should_resume_permission_response(None, &resume, false));
+        assert!(!should_resume_permission_response(None, &resume, true));
+    }
+
+    #[test]
+    fn terminal_origin_permission_response_never_resumes_agent_turn() {
+        let detail = serde_json::json!({
+            "kind": "shell_escape",
+            "verb": "run",
+            "descriptor": "ps aux",
+            "summary": "command blocked by the worktree sandbox: ps aux",
+            "origin": "terminal",
+            "request": {
+                "cwd": "/wt",
+                "run_id": "r1",
+                "tool": "run",
+                "payload": {"commands": [{"command": "ps aux"}]},
+                "tool_use_id": "tu1"
+            }
+        })
+        .to_string();
+        let crossing = parse_crossing_detail(&detail).expect("terminal crossing should parse");
+        let resume = PermissionResponseResume {
+            run_id: "run-1".to_string(),
+            session_id: Some("session-1".to_string()),
+            issue_id: None,
+            predecessor_turn_id: Some("turn-1".to_string()),
+            successor_turn_id: Some("turn-2".to_string()),
+            job_id: Some("job-1".to_string()),
+            duplicate: false,
+        };
+
+        assert!(!should_resume_permission_response(
+            Some(&crossing),
+            &resume,
+            false
+        ));
     }
 
     #[test]

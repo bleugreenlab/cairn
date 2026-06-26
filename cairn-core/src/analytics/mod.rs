@@ -537,7 +537,7 @@ fn title_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::{MigrationRunner, RowExt, TURSO_MIGRATIONS};
     use tempfile::tempdir;
 
     async fn fixture_db() -> LocalDb {
@@ -564,10 +564,10 @@ mod tests {
              VALUES ('sess-claude', 'job-claude', 'claude', 'open', 1, 1, 1);
             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
              VALUES ('sess-codex', 'job-codex', 'codex', 'open', 1, 1, 1);
-            INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-             VALUES ('run-claude', 'proj', 'job-claude', 'exited', 'sess-claude', 'claude', 1, 1);
-            INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-             VALUES ('run-codex', 'proj', 'job-codex', 'exited', 'sess-codex', 'codex', 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-claude', 'proj', 'job-claude', 'exited', 'sess-claude', 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-codex', 'proj', 'job-codex', 'exited', 'sess-codex', 1, 1);
 
             -- Claude: two assistant events count (135 + 20 = 155); result skipped.
             INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
@@ -652,8 +652,8 @@ mod tests {
              VALUES ('job-task', 'proj', 'running', 'sonnet', 'Trace the parser flow', 'explore', 1, 1);
             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
              VALUES ('sess-task', 'job-task', 'claude', 'open', 1, 1, 1);
-            INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-             VALUES ('run-task', 'proj', 'job-task', 'exited', 'sess-task', 'claude', 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-task', 'proj', 'job-task', 'exited', 'sess-task', 1, 1);
             INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens)
@@ -721,8 +721,8 @@ mod tests {
         // run), plus a tool_result marking the read as an error.
         db.execute_script(
             "
-            INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-             VALUES ('run-tools', 'proj', 'job-claude', 'exited', 'sess-claude', 'claude', 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-tools', 'proj', 'job-claude', 'exited', 'sess-claude', 1, 1);
             INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at)
              VALUES ('ev-a', 'run-tools', 'sess-claude', 1, 1, 'assistant',
@@ -775,8 +775,8 @@ mod tests {
         // tool_invocations rows, so the session has 2 tool calls.
         db.execute_script(
             "
-            INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-             VALUES ('run-tools', 'proj', 'job-claude', 'exited', 'sess-claude', 'claude', 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-tools', 'proj', 'job-claude', 'exited', 'sess-claude', 1, 1);
             INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at)
              VALUES ('ev-a', 'run-tools', 'sess-claude', 1, 1, 'assistant',
@@ -842,8 +842,8 @@ mod tests {
               VALUES ('job-{s}', 'proj', 'running', '{model}', 'builder', 'builder', 1, 1);
              INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
               VALUES ('sess-{s}', 'job-{s}', '{backend}', 'open', 1, 1, 1);
-             INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-              VALUES ('run-{s}', 'proj', 'job-{s}', 'exited', 'sess-{s}', '{backend}', 1, 1);",
+             INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+              VALUES ('run-{s}', 'proj', 'job-{s}', 'exited', 'sess-{s}', 1, 1);",
             s = suffix,
             model = model,
             backend = backend
@@ -870,7 +870,7 @@ mod tests {
             "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                 parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                 cache_create_tokens, output_tokens, thinking_tokens, cost_usd)
-             VALUES ('{id}', 'run-{suffix}', NULL, 1, {ts}, '{etype}', '{{}}',
+             VALUES ('{id}', 'run-{suffix}', 'sess-{suffix}', 1, {ts}, '{etype}', '{{}}',
                 NULL, {ts}, {input}, 0, 0, {output}, 0, {cost_sql});"
         ))
         .await
@@ -1221,5 +1221,603 @@ mod tests {
             .iter()
             .find(|p| p.bucket_start == bucket_start)
             .unwrap_or_else(|| panic!("missing cost point @ {bucket_start}"))
+    }
+
+    // --- Tier A token/cost rollup: oracle equality, idempotency, concurrency ---
+
+    /// Two UTC days used by the rollup oracle seed (day floors 86400 / 172800).
+    const DAY1: i64 = 100_000;
+    const DAY2: i64 = 180_000;
+
+    /// A workspace spanning two projects, two days, and the Claude / codex /
+    /// OpenRouter backends, including the two cost-population edge cases the
+    /// rollup must reproduce: a metered settlement event that is NOT a billable
+    /// token event (OpenRouter), and a (model, backend) group that has cost but
+    /// no billable tokens at all (the tok-side guard).
+    async fn oracle_db() -> LocalDb {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("rollup-oracle.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p1', 'default', 'P1', 'P1', '/tmp/p1', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p2', 'default', 'P2', 'P2', '/tmp/p2', 1, 1);
+
+            -- claude (p1, sonnet, builder): two billable assistant turns spanning
+            -- two days, plus a cumulative result the claude rule must skip.
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('jc', 'p1', 'merged', 'sonnet', 'builder', 'builder', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sc', 'jc', 'claude', 'open', 1, 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('rc', 'p1', 'jc', 'exited', 'sc', 1, 1);
+
+            -- codex (p1, gpt-5, planner): two billable result turns, plus an
+            -- assistant the codex rule must skip.
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('jx', 'p1', 'running', 'gpt-5', 'planner-0', 'planner-0', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sx', 'jx', 'codex', 'open', 1, 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('rx', 'p1', 'jx', 'exited', 'sx', 1, 1);
+
+            -- openrouter (p1, sonnet, builder): a billable assistant on day 1, a
+            -- settlement result carrying real cost on day 1 (same group, not a
+            -- billable token event), and a cost-only settlement on day 2 (a
+            -- group with cost but no billable tokens on that day).
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('jo', 'p1', 'running', 'sonnet', 'builder', 'builder', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('so', 'jo', 'openrouter', 'open', 1, 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('ro', 'p1', 'jo', 'exited', 'so', 1, 1);
+
+            -- openrouter (p1, gemini, explore): ONLY a cost settlement event, no
+            -- billable tokens. Locks the tok-side guard: this (model, backend)
+            -- group must never surface in the token-driven views.
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('jg', 'p1', 'running', 'gemini', 'explore', 'explore', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sg', 'jg', 'openrouter', 'open', 1, 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('rg', 'p1', 'jg', 'exited', 'sg', 1, 1);
+
+            -- p2 claude (opus, builder): a second project for scope filtering.
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('jp2', 'p2', 'merged', 'opus', 'builder', 'builder', 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sp2', 'jp2', 'claude', 'open', 1, 1, 1);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('rp2', 'p2', 'jp2', 'exited', 'sp2', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+
+        // claude: c1 (day1) billable 160, c2 (day2) billable 240, c3 result skipped.
+        ins_ev(
+            &db,
+            "c1",
+            "rc",
+            "sc",
+            1,
+            "assistant",
+            DAY1,
+            100,
+            10,
+            20,
+            30,
+            5,
+            None,
+        )
+        .await;
+        ins_ev(
+            &db,
+            "c2",
+            "rc",
+            "sc",
+            2,
+            "assistant",
+            DAY2,
+            200,
+            0,
+            0,
+            40,
+            2,
+            None,
+        )
+        .await;
+        ins_ev(
+            &db,
+            "c3",
+            "rc",
+            "sc",
+            3,
+            "result:success",
+            DAY1,
+            9999,
+            9999,
+            9999,
+            9999,
+            0,
+            None,
+        )
+        .await;
+        // codex: x1 (day1) billable 110, x2 (day2) billable 220, x3 assistant skipped.
+        ins_ev(
+            &db,
+            "x1",
+            "rx",
+            "sx",
+            1,
+            "result:success",
+            DAY1,
+            100,
+            50,
+            0,
+            10,
+            0,
+            None,
+        )
+        .await;
+        ins_ev(
+            &db,
+            "x2",
+            "rx",
+            "sx",
+            2,
+            "result:success",
+            DAY2,
+            200,
+            80,
+            0,
+            20,
+            0,
+            None,
+        )
+        .await;
+        ins_ev(
+            &db,
+            "x3",
+            "rx",
+            "sx",
+            3,
+            "assistant",
+            DAY1,
+            8888,
+            0,
+            0,
+            8888,
+            0,
+            None,
+        )
+        .await;
+        // openrouter sonnet: o1 (day1) billable 2000; o2 (day1) settlement $0.42 on
+        // a non-billable result; o3 (day2) cost-only $0.10 (no billable that day).
+        ins_ev(
+            &db,
+            "o1",
+            "ro",
+            "so",
+            1,
+            "assistant",
+            DAY1,
+            1000,
+            0,
+            0,
+            1000,
+            0,
+            None,
+        )
+        .await;
+        ins_ev(
+            &db,
+            "o2",
+            "ro",
+            "so",
+            2,
+            "result:success",
+            DAY1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(0.42),
+        )
+        .await;
+        ins_ev(
+            &db,
+            "o3",
+            "ro",
+            "so",
+            3,
+            "result:success",
+            DAY2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(0.10),
+        )
+        .await;
+        // openrouter gemini: cost-only, no billable tokens anywhere.
+        ins_ev(
+            &db,
+            "g1",
+            "rg",
+            "sg",
+            1,
+            "result:success",
+            DAY1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(0.05),
+        )
+        .await;
+        // p2 claude opus: billable 550 on day1.
+        ins_ev(
+            &db,
+            "p1e",
+            "rp2",
+            "sp2",
+            1,
+            "assistant",
+            DAY1,
+            500,
+            0,
+            0,
+            50,
+            0,
+            None,
+        )
+        .await;
+
+        // Merge requests for tokens_per_loc: jc opened day1, jo opened day2.
+        db.execute_script(
+            "
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                target_branch, status, opened_at, updated_at, additions, deletions)
+             VALUES ('mrc', 'jc', 'p1', NULL, 'PR c', 'agent/c', 'main', 'merged', 100000, 100000, 100, 60);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                target_branch, status, opened_at, updated_at, additions, deletions)
+             VALUES ('mro', 'jo', 'p1', NULL, 'PR o', 'agent/o', 'main', 'merged', 180000, 180000, 50, 50);
+            ",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    /// Insert one event with all token columns, a session id, and an optional
+    /// real `cost_usd`.
+    #[allow(clippy::too_many_arguments)]
+    async fn ins_ev(
+        db: &LocalDb,
+        id: &str,
+        run: &str,
+        sess: &str,
+        seq: i64,
+        etype: &str,
+        ts: i64,
+        input: i64,
+        cread: i64,
+        ccreate: i64,
+        output: i64,
+        thinking: i64,
+        cost: Option<f64>,
+    ) {
+        let cost_sql = cost.map_or_else(|| "NULL".to_string(), |c| c.to_string());
+        db.execute_script(&format!(
+            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
+                cache_create_tokens, output_tokens, thinking_tokens, cost_usd)
+             VALUES ('{id}', '{run}', '{sess}', {seq}, {ts}, '{etype}', '{{}}',
+                NULL, {ts}, {input}, {cread}, {ccreate}, {output}, {thinking}, {cost_sql});"
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn assert_cost_components_eq(
+        rollup: Vec<queries::CostComponentRow>,
+        live: Vec<queries::CostComponentRow>,
+        ctx: &str,
+    ) {
+        let key = |r: &queries::CostComponentRow| {
+            (
+                r.bucket_start,
+                r.model.clone().unwrap_or_default(),
+                r.backend.clone(),
+            )
+        };
+        let mut r = rollup;
+        let mut l = live;
+        r.sort_by_key(key);
+        l.sort_by_key(key);
+        assert_eq!(
+            r.len(),
+            l.len(),
+            "cost_components len ({ctx}):\n{r:#?}\nvs\n{l:#?}"
+        );
+        for (a, b) in r.iter().zip(l.iter()) {
+            assert_eq!(a.bucket_start, b.bucket_start, "{ctx}");
+            assert_eq!(a.model, b.model, "{ctx}");
+            assert_eq!(a.backend, b.backend, "{ctx}");
+            assert_eq!(a.input, b.input, "{ctx}");
+            assert_eq!(a.cache_read, b.cache_read, "{ctx}");
+            assert_eq!(a.cache_create, b.cache_create, "{ctx}");
+            assert_eq!(a.output, b.output, "{ctx}");
+            assert_eq!(a.billable, b.billable, "{ctx}");
+            assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
+            assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
+        }
+    }
+
+    fn assert_provider_eq(
+        rollup: Vec<queries::ProviderModelComponentRow>,
+        live: Vec<queries::ProviderModelComponentRow>,
+        ctx: &str,
+    ) {
+        let key = |r: &queries::ProviderModelComponentRow| {
+            (r.model.clone().unwrap_or_default(), r.backend.clone())
+        };
+        let mut r = rollup;
+        let mut l = live;
+        r.sort_by_key(key);
+        l.sort_by_key(key);
+        assert_eq!(
+            r.len(),
+            l.len(),
+            "provider len ({ctx}):\n{r:#?}\nvs\n{l:#?}"
+        );
+        for (a, b) in r.iter().zip(l.iter()) {
+            assert_eq!(a.model, b.model, "{ctx}");
+            assert_eq!(a.backend, b.backend, "{ctx}");
+            assert_eq!(a.input, b.input, "{ctx}");
+            assert_eq!(a.cache_read, b.cache_read, "{ctx}");
+            assert_eq!(a.cache_create, b.cache_create, "{ctx}");
+            assert_eq!(a.output, b.output, "{ctx}");
+            assert_eq!(a.billable, b.billable, "{ctx}");
+            assert_eq!(a.runs, b.runs, "{ctx}");
+            assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
+            assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
+        }
+    }
+
+    fn assert_granular_eq(
+        rollup: Vec<queries::GranularRow>,
+        live: Vec<queries::GranularRow>,
+        ctx: &str,
+    ) {
+        let key = |r: &queries::GranularRow| {
+            (
+                r.model.clone().unwrap_or_default(),
+                r.agent_config_id.clone().unwrap_or_default(),
+                r.backend.clone(),
+            )
+        };
+        let mut r = rollup;
+        let mut l = live;
+        r.sort_by_key(key);
+        l.sort_by_key(key);
+        assert_eq!(
+            r.len(),
+            l.len(),
+            "granular len ({ctx}):\n{r:#?}\nvs\n{l:#?}"
+        );
+        for (a, b) in r.iter().zip(l.iter()) {
+            assert_eq!(a.model, b.model, "{ctx}");
+            assert_eq!(a.agent_config_id, b.agent_config_id, "{ctx}");
+            assert_eq!(a.backend, b.backend, "{ctx}");
+            assert_eq!(a.input, b.input, "{ctx}");
+            assert_eq!(a.cache_read, b.cache_read, "{ctx}");
+            assert_eq!(a.cache_create, b.cache_create, "{ctx}");
+            assert_eq!(a.output, b.output, "{ctx}");
+            assert_eq!(a.thinking, b.thinking, "{ctx}");
+            assert_eq!(a.billable, b.billable, "{ctx}");
+            assert_eq!(a.runs, b.runs, "{ctx}");
+        }
+    }
+
+    fn assert_session_eq(
+        rollup: Vec<queries::SessionBucketRow>,
+        live: Vec<queries::SessionBucketRow>,
+        ctx: &str,
+    ) {
+        let mut r = rollup;
+        let mut l = live;
+        r.sort_by_key(|s| s.bucket_start);
+        l.sort_by_key(|s| s.bucket_start);
+        assert_eq!(r.len(), l.len(), "session len ({ctx}):\n{r:#?}\nvs\n{l:#?}");
+        for (a, b) in r.iter().zip(l.iter()) {
+            assert_eq!(a.bucket_start, b.bucket_start, "{ctx}");
+            assert_eq!(a.session_count, b.session_count, "{ctx}");
+            assert!((a.avg_tokens - b.avg_tokens).abs() < 1e-9, "{ctx} avg");
+        }
+    }
+
+    fn assert_loc_eq(rollup: Vec<queries::LocRow>, live: Vec<queries::LocRow>, ctx: &str) {
+        let mut r = rollup;
+        let mut l = live;
+        r.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+        l.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+        assert_eq!(r.len(), l.len(), "loc len ({ctx}):\n{r:#?}\nvs\n{l:#?}");
+        for (a, b) in r.iter().zip(l.iter()) {
+            assert_eq!(a.job_id, b.job_id, "{ctx}");
+            assert_eq!(a.ts, b.ts, "{ctx}");
+            assert_eq!(a.billable, b.billable, "{ctx}");
+            assert_eq!(a.lines, b.lines, "{ctx}");
+            assert_eq!(a.model, b.model, "{ctx}");
+            assert_eq!(a.node_name, b.node_name, "{ctx}");
+        }
+    }
+
+    /// A stable snapshot of the rollup table (floats stringified for `Eq`).
+    async fn dump_rollup(db: &LocalDb) -> Vec<(String, i64, i64, String, i64)> {
+        db.query_all(
+            "SELECT id, billable_tokens, token_event_count, exact_cost, exact_cost_count
+             FROM token_rollup ORDER BY id",
+            (),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.i64(1)?,
+                    row.i64(2)?,
+                    format!("{:.6}", row.opt_f64(3)?.unwrap_or(0.0)),
+                    row.i64(4)?,
+                ))
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rollup_matches_live_oracle() {
+        let db = oracle_db().await;
+        let scopes = [Scope::new(None), Scope::new(Some("p1".to_string()))];
+        // Every range start is UTC-day-aligned so the day-grain rollup matches the
+        // per-event live scan exactly: unbounded, day-1 only, and day-2 onward.
+        let ranges = [
+            TimeRange::new(None, None),
+            TimeRange::new(Some(86_400), Some(172_800)),
+            TimeRange::new(Some(172_800), None),
+        ];
+        let buckets = [Bucket::Day, Bucket::Week, Bucket::Month];
+
+        for scope in &scopes {
+            for range in &ranges {
+                for &bucket in &buckets {
+                    let ctx = format!(
+                        "scope={:?} range={:?} bucket={:?}",
+                        scope.project_id,
+                        (range.start, range.end),
+                        bucket
+                    );
+                    assert_cost_components_eq(
+                        queries::cost_components(&db, scope, range, bucket)
+                            .await
+                            .unwrap(),
+                        queries::cost_components_live(&db, scope, range, bucket)
+                            .await
+                            .unwrap(),
+                        &ctx,
+                    );
+                    assert_session_eq(
+                        queries::avg_tokens_per_session(&db, scope, range, bucket)
+                            .await
+                            .unwrap(),
+                        queries::avg_tokens_per_session_live(&db, scope, range, bucket)
+                            .await
+                            .unwrap(),
+                        &ctx,
+                    );
+                }
+                let ctx = format!(
+                    "scope={:?} range={:?}",
+                    scope.project_id,
+                    (range.start, range.end)
+                );
+                assert_granular_eq(
+                    queries::economics_granular(&db, scope, range)
+                        .await
+                        .unwrap(),
+                    queries::economics_granular_live(&db, scope, range)
+                        .await
+                        .unwrap(),
+                    &ctx,
+                );
+                for backend in ["claude", "codex", "openrouter"] {
+                    assert_provider_eq(
+                        queries::provider_model_components(&db, backend, scope, range)
+                            .await
+                            .unwrap(),
+                        queries::provider_model_components_live(&db, backend, scope, range)
+                            .await
+                            .unwrap(),
+                        &format!("{ctx} backend={backend}"),
+                    );
+                }
+                assert_loc_eq(
+                    queries::tokens_per_loc(&db, scope, range).await.unwrap(),
+                    queries::tokens_per_loc_live(&db, scope, range)
+                        .await
+                        .unwrap(),
+                    &ctx,
+                );
+            }
+        }
+
+        // The tok-side guard: the cost-only (gemini, openrouter) group never
+        // appears in any token-driven view, even though it carries real cost.
+        let costs =
+            queries::cost_components(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+                .await
+                .unwrap();
+        assert!(
+            !costs.iter().any(|r| r.model.as_deref() == Some("gemini")),
+            "cost-only group must be dropped from the token-driven view"
+        );
+        let provider = queries::provider_model_components(
+            &db,
+            "openrouter",
+            &Scope::new(None),
+            &TimeRange::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !provider
+                .iter()
+                .any(|r| r.model.as_deref() == Some("gemini")),
+            "cost-only group must be dropped from the provider view"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_token_rollup_is_idempotent() {
+        let db = oracle_db().await;
+        queries::fold_token_rollup(&db).await.unwrap();
+        let first = dump_rollup(&db).await;
+        assert!(!first.is_empty());
+        queries::fold_token_rollup(&db).await.unwrap();
+        let second = dump_rollup(&db).await;
+        assert_eq!(first, second, "a second fold must change nothing");
+    }
+
+    #[tokio::test]
+    async fn fold_token_rollup_concurrent_matches_single() {
+        // A single fold defines the expected rollup contents.
+        let single = oracle_db().await;
+        queries::fold_token_rollup(&single).await.unwrap();
+        let baseline = dump_rollup(&single).await;
+
+        // Several folds racing on a cold rollup (as an analytics page's parallel
+        // queries do) must converge on exactly the same rows -- no double
+        // delete-then-reinsert, no PK conflict, no partial state.
+        let concurrent = oracle_db().await;
+        let (a, b, c, d) = tokio::join!(
+            queries::fold_token_rollup(&concurrent),
+            queries::fold_token_rollup(&concurrent),
+            queries::fold_token_rollup(&concurrent),
+            queries::fold_token_rollup(&concurrent),
+        );
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+        d.unwrap();
+        assert_eq!(dump_rollup(&concurrent).await, baseline);
     }
 }

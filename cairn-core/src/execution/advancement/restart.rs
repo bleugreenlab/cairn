@@ -455,41 +455,4 @@ mod tests {
         .await
         .unwrap();
     }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn list_node_attempts_returns_lineage_oldest_to_newest() {
-        let db = migrated_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                let snap = snapshot(
-                    vec![
-                        node("trigger", RecipeNodeType::Trigger),
-                        node("work", RecipeNodeType::Agent),
-                    ],
-                    vec![control_edge("e1", "trigger", "work")],
-                );
-                seed_project_issue_execution(conn, &snap).await;
-                seed_job(conn, "attempt-1", "work", "cancelled", None, false, 10).await;
-                seed_job(conn, "attempt-2", "work", "cancelled", None, false, 20).await;
-                seed_job(conn, "attempt-3", "work", "running", None, true, 30).await;
-
-                let attempts =
-                    crate::execution::queries::list_node_attempts_conn(conn, "exec-1", "work")
-                        .await?;
-                let ids: Vec<&str> = attempts.iter().map(|a| a.id.as_str()).collect();
-                assert_eq!(
-                    ids,
-                    vec!["attempt-1", "attempt-2", "attempt-3"],
-                    "lineage includes archives, oldest→newest"
-                );
-                assert_eq!(
-                    attempts[2].current_session_id.as_deref(),
-                    Some("sess-attempt-3")
-                );
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
 }

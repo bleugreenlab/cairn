@@ -612,8 +612,8 @@ mod tests {
              VALUES ('exec-1', 'recipe', 'issue-1', 'project-1', 'running', 1, 1);
             INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at)
              VALUES ('job-1', 'exec-1', 'issue-1', 'project-1', 'builder', 'builder', 'complete', 1, 1);
-            INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
-             VALUES ('run-1', 'project-1', 'issue-1', 'job-1', 'live', 'codex', 1, 1, 'resume');
+            INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at, start_mode)
+             VALUES ('run-1', 'project-1', 'issue-1', 'job-1', 'live', 1, 1, 'resume');
             INSERT INTO sessions(id, job_id, created_at, updated_at)
              VALUES ('sess-1', 'job-1', 1, 1);
             INSERT INTO turns(id, session_id, run_id, sequence, created_at, updated_at)

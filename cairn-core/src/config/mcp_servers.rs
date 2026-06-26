@@ -269,7 +269,13 @@ pub fn upsert_workspace_mcp_server(
     config: &McpServerConfig,
 ) -> Result<(), String> {
     let path = super::settings::get_settings_path(config_dir);
-    upsert_mcp_server_in_file(&path, WORKSPACE_HEADER, name, config)
+    upsert_mcp_server_in_file(&path, WORKSPACE_HEADER, name, config)?;
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        "cairn: update mcp servers",
+        Some(config_dir),
+    );
+    Ok(())
 }
 
 /// Remove one workspace MCP server by `name`. Succeeds even if the server (or
@@ -277,7 +283,13 @@ pub fn upsert_workspace_mcp_server(
 /// becomes empty so the file stays clean.
 pub fn delete_workspace_mcp_server(config_dir: &Path, name: &str) -> Result<(), String> {
     let path = super::settings::get_settings_path(config_dir);
-    delete_mcp_server_from_file(&path, WORKSPACE_HEADER, name)
+    delete_mcp_server_from_file(&path, WORKSPACE_HEADER, name)?;
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        "cairn: update mcp servers",
+        Some(config_dir),
+    );
+    Ok(())
 }
 
 /// Insert or replace one project MCP server in `[project]/.cairn/config.yaml`.
@@ -291,14 +303,26 @@ pub fn upsert_project_mcp_server(
     config: &McpServerConfig,
 ) -> Result<(), String> {
     let path = super::project_settings::get_project_config_path(project_path);
-    upsert_mcp_server_in_file(&path, PROJECT_HEADER, name, config)
+    upsert_mcp_server_in_file(&path, PROJECT_HEADER, name, config)?;
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        "cairn: update mcp servers",
+        None,
+    );
+    Ok(())
 }
 
 /// Remove one project MCP server by `name` from `[project]/.cairn/config.yaml`.
 /// Succeeds even if the server (or the file) does not exist.
 pub fn delete_project_mcp_server(project_path: &Path, name: &str) -> Result<(), String> {
     let path = super::project_settings::get_project_config_path(project_path);
-    delete_mcp_server_from_file(&path, PROJECT_HEADER, name)
+    delete_mcp_server_from_file(&path, PROJECT_HEADER, name)?;
+    super::commit_and_maybe_push(
+        std::slice::from_ref(&path),
+        "cairn: update mcp servers",
+        None,
+    );
+    Ok(())
 }
 
 const WORKSPACE_HEADER: &str = "# Cairn Workspace Settings";
@@ -549,6 +573,124 @@ args: ["@playwright/mcp@latest"]
             enabled: true,
             oauth: None,
         }
+    }
+
+    fn git_init(path: &Path) {
+        assert!(crate::env::git()
+            .args(["init", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_bare(path: &Path) {
+        assert!(crate::env::git()
+            .args(["init", "--bare", "-q"])
+            .current_dir(path)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_set_origin(repo: &Path, origin: &Path) {
+        assert!(crate::env::git()
+            .args(["remote", "add", "origin"])
+            .arg(origin)
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    fn git_status(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["status", "--porcelain"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_head_subject(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn git_commit_count(path: &Path) -> usize {
+        let out = crate::env::git()
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    fn git_branch(path: &Path) -> String {
+        let out = crate::env::git()
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn origin_has_branch(origin: &Path, branch: &str) -> bool {
+        crate::env::git()
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .current_dir(origin)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn workspace_mcp_writes_commit_scoped() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path();
+        git_init(home);
+        std::fs::write(home.join("unrelated.txt"), "dirty").unwrap();
+
+        upsert_workspace_mcp_server(home, "axon", &axon_config()).unwrap();
+        assert_eq!(git_head_subject(home), "cairn: update mcp servers");
+
+        delete_workspace_mcp_server(home, "axon").unwrap();
+        assert_eq!(git_head_subject(home), "cairn: update mcp servers");
+
+        // One commit per write (no double-commit); unrelated dirt untouched.
+        assert_eq!(git_commit_count(home), 2);
+        let status = git_status(home);
+        assert!(status.contains("unrelated.txt"));
+        assert!(!status.contains("settings.yaml"));
+    }
+
+    #[test]
+    fn project_mcp_upsert_commits_once_and_does_not_push() {
+        let temp = TempDir::new().unwrap();
+        let origin = temp.path().join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_bare(&origin);
+        let proj = temp.path().join("proj");
+        std::fs::create_dir_all(proj.join(".cairn")).unwrap();
+        git_init(&proj);
+        git_set_origin(&proj, &origin);
+
+        upsert_project_mcp_server(&proj, "axon", &axon_config()).unwrap();
+
+        assert!(git_status(&proj).is_empty(), "project save left repo dirty");
+        assert_eq!(git_head_subject(&proj), "cairn: update mcp servers");
+        // Exactly one scoped commit — the removed mcp.rs commit no longer doubles up.
+        assert_eq!(git_commit_count(&proj), 1);
+        // Project scope is commit-only: origin must not have received a push.
+        assert!(!origin_has_branch(&origin, &git_branch(&proj)));
     }
 
     #[test]

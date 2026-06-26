@@ -304,6 +304,7 @@ impl OrchestratorBuilder {
             api_config: self.api_config,
             effect_tx: self.effect_tx,
             browser_command_tx: self.browser_command_tx,
+            browser_loading: Arc::new(Mutex::new(HashMap::new())),
             executor: Arc::new(OnceLock::new()),
             mcp_gateway: Arc::new(OnceLock::new()),
             model_catalog: self.model_catalog,
@@ -460,6 +461,15 @@ pub struct Orchestrator {
     /// without a webview layer (headless/server).
     pub browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
 
+    /// In-memory per-browser page-loading flag, keyed by browser id. The
+    /// app-side nav handlers set it `true` on navigation start / page-load start
+    /// and `false` on page-load finish. The browser read path consults it to
+    /// distinguish "the page is still loading / not yet interactive" from "the
+    /// page loaded but the content-script bridge failed", so a slow first compile
+    /// reads as still-loading rather than a misleading hard timeout. Volatile by
+    /// nature: in-memory, never persisted, reset cleanly on restart.
+    pub browser_loading: Arc<Mutex<HashMap<String, bool>>>,
+
     /// Host-specific effect executor for `StartAgentJobs` and `ExecuteAction`.
     ///
     /// Wrapped in `Arc<OnceLock<...>>` so it's Clone-compatible (Orchestrator
@@ -535,6 +545,26 @@ impl Orchestrator {
         executor: Arc<dyn EffectExecutor>,
     ) -> Result<(), Arc<dyn EffectExecutor>> {
         self.executor.set(executor)
+    }
+
+    /// Record whether a browser's page is currently loading. Called from the
+    /// app-side navigation handlers on the canonical nav-start / load-finish
+    /// transitions; the browser read path reads it back via
+    /// [`is_browser_loading`](Self::is_browser_loading).
+    pub fn set_browser_loading(&self, browser_id: &str, loading: bool) {
+        if let Ok(mut map) = self.browser_loading.lock() {
+            map.insert(browser_id.to_string(), loading);
+        }
+    }
+
+    /// Whether a browser's page is currently loading (defaults to `false` for an
+    /// id never seen — a webview that has never navigated is treated as idle).
+    pub fn is_browser_loading(&self, browser_id: &str) -> bool {
+        self.browser_loading
+            .lock()
+            .ok()
+            .and_then(|map| map.get(browser_id).copied())
+            .unwrap_or(false)
     }
 
     /// Set the external MCP gateway after construction (mirrors `set_executor`).
@@ -812,32 +842,25 @@ impl Orchestrator {
         });
     }
 
-    /// Periodically reconcile in-flight default-branch workspaces against a
-    /// **non-webhook** default-branch advance — a local-only project (no GitHub
-    /// remote/webhook) or a manual `git pull` on the default branch, neither of
-    /// which delivers a GitHub `push` event. The push webhook covers the
-    /// remote-push case; this timer is the only trigger for those local cases
-    /// (and is idempotent with the webhook when both fire). The first tick fires
-    /// immediately so an advance that landed while the app was closed is picked
-    /// up at startup. Each sweep gates on in-flight siblings before touching jj,
-    /// so idle projects cost only a cheap query. Errors are logged, never fatal.
+    /// Reconcile in-flight default-branch workspaces once at startup for remote
+    /// advances that landed while the app was closed. Live default-branch pushes
+    /// are handled by the GitHub webhook, and no-remote projects have no external
+    /// source of default-branch movement to poll, so there is deliberately no
+    /// recurring timer here.
+    ///
     /// Must be called from within a tokio runtime context.
     pub fn spawn_default_advance_reconcile(&self) {
-        /// Sweep cadence after the immediate startup pass. The GitHub `push`
-        /// webhook is the fast path for remote pushes; this timer backstops the
-        /// no-webhook cases, so a minute's latency before an in-flight agent
-        /// picks up a locally advanced default branch is fine.
-        const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let orch = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(SWEEP_INTERVAL);
-            loop {
-                // The first tick fires immediately, so the sweep runs once at
-                // startup, then every SWEEP_INTERVAL.
-                interval.tick().await;
-                crate::orchestrator::base_advance::reconcile_all_local_default_advances(&orch)
-                    .await;
-            }
+            // One-time at startup, before the catch-up: re-detect and persist each
+            // local project's real default branch, correcting any row left on the
+            // unverified 'main' schema default. The catch-up and merges resolve
+            // onto the stored default, so this repair must land first. Best-effort
+            // and logged per project.
+            crate::projects::crud::reconcile_default_branches(&orch.db.local).await;
+
+            crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
+                .await;
         });
     }
 
@@ -1247,8 +1270,8 @@ mod tests {
                  VALUES ('job-ctx', 'project-ctx', 'running', 'gpt-5', 1, 1);
                 INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
                  VALUES ('session-ctx', 'job-ctx', 'codex', 'open', 1, 1, 1);
-                INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-                 VALUES ('run-ctx', 'project-ctx', 'job-ctx', 'exited', 'session-ctx', 'codex', 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+                 VALUES ('run-ctx', 'project-ctx', 'job-ctx', 'exited', 'session-ctx', 1, 1);
                 INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                     parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                     cache_create_tokens, output_tokens, thinking_tokens)
@@ -1319,8 +1342,8 @@ mod tests {
                  VALUES ('job-claude-ctx', 'project-claude-ctx', 'running', 'claude-sonnet-4-20250514', 1, 1);
                 INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
                  VALUES ('session-claude-ctx', 'job-claude-ctx', 'claude', 'open', 1, 1, 1);
-                INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-                 VALUES ('run-claude-ctx', 'project-claude-ctx', 'job-claude-ctx', 'exited', 'session-claude-ctx', 'claude', 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+                 VALUES ('run-claude-ctx', 'project-claude-ctx', 'job-claude-ctx', 'exited', 'session-claude-ctx', 1, 1);
                 INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                     parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                     cache_create_tokens, output_tokens, thinking_tokens)
@@ -1369,8 +1392,8 @@ mod tests {
                  VALUES ('job-or', 'project-or', 'running', 'anthropic/claude-sonnet-4.5', 1, 1);
                 INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
                  VALUES ('session-or', 'job-or', 'openrouter', 'open', 1, 1, 1);
-                INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at)
-                 VALUES ('run-or', 'project-or', 'job-or', 'exited', 'session-or', 'openrouter', 1, 1);
+                INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+                 VALUES ('run-or', 'project-or', 'job-or', 'exited', 'session-or', 1, 1);
                 INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
                     parent_tool_use_id, created_at, input_tokens, cache_read_tokens,
                     cache_create_tokens, output_tokens, thinking_tokens)

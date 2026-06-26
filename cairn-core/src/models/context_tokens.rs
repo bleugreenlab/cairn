@@ -80,7 +80,7 @@ pub(crate) async fn get_latest_context_token_event(
     db.query_opt(
         "SELECT e.run_id,
                 e.session_id,
-                COALESCE(r.backend, s.backend, 'claude') AS backend,
+                COALESCE(s.backend, 'claude') AS backend,
                 j.model,
                 e.input_tokens,
                 e.cache_read_tokens,
@@ -96,7 +96,7 @@ pub(crate) async fn get_latest_context_token_event(
          WHERE e.session_id = ?1
            AND e.parent_tool_use_id IS NULL
            AND NOT (
-                LOWER(COALESCE(r.backend, s.backend, 'claude')) = 'claude'
+                LOWER(COALESCE(s.backend, 'claude')) = 'claude'
             AND e.event_type LIKE 'result%'
            )
            AND (

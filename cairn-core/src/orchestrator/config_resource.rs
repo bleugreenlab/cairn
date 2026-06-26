@@ -419,9 +419,13 @@ pub(crate) fn create_config<R: ConfigResource>(
     let file = R::build_create_file(input, id.clone(), is_project_scoped, now);
 
     let dest_path = R::save_file(&orch.config_dir, &file, project_path.as_deref())?;
-    crate::config::commit_config_paths(
+    // Always offer the workspace repo as the push target; commit_and_maybe_push
+    // only pushes when that repo actually received one of these commits, so a
+    // project-scoped create stays commit-only.
+    crate::config::commit_and_maybe_push(
         &R::stage_paths(&dest_path),
         &config_commit_message::<R>("create", &id),
+        Some(orch.config_dir.as_path()),
     );
 
     emit_config_change::<R>(orch, "created", &id);
@@ -471,7 +475,15 @@ pub(crate) fn update_config<R: ConfigResource>(
         // deletion commits in whichever repo (workspace or project) held it.
         commit_targets.extend(R::stage_paths(&R::primary_path(&existing)));
     }
-    crate::config::commit_config_paths(&commit_targets, &config_commit_message::<R>("update", id));
+    // Offer the workspace repo unconditionally: a workspace->project move commits
+    // the workspace-side deletion into `~/.cairn`, and that deletion must push
+    // when the workspace has a remote. commit_and_maybe_push pushes only if the
+    // workspace repo actually committed, so project-only updates stay commit-only.
+    crate::config::commit_and_maybe_push(
+        &commit_targets,
+        &config_commit_message::<R>("update", id),
+        Some(orch.config_dir.as_path()),
+    );
 
     emit_config_change::<R>(orch, "modified", id);
     emit_db_change::<R>(orch, "update");
@@ -495,9 +507,10 @@ pub(crate) fn delete_config<R: ConfigResource>(
     let existing = R::get_file(&orch.config_dir, id, project_path.as_deref())?;
     R::delete_file(&orch.config_dir, id, project_path.as_deref())?;
     if let Some(file) = &existing {
-        crate::config::commit_config_paths(
+        crate::config::commit_and_maybe_push(
             &R::stage_paths(&R::primary_path(file)),
             &config_commit_message::<R>("delete", id),
+            Some(orch.config_dir.as_path()),
         );
     }
 
@@ -666,9 +679,10 @@ pub(crate) fn copy_config<R: ConfigResource>(
     let project_path = is_project_scoped.then_some(target_root.as_path());
     let dest_path = R::save_file(&orch.config_dir, &file, project_path)?;
     R::post_save_copy(&source, &dest_path)?;
-    crate::config::commit_config_paths(
+    crate::config::commit_and_maybe_push(
         &R::stage_paths(&dest_path),
         &config_commit_message::<R>("create", target_id),
+        Some(orch.config_dir.as_path()),
     );
 
     emit_config_change::<R>(orch, "created", target_id);
@@ -849,6 +863,181 @@ mod tests {
         assert!(
             status.contains("settings.yaml") && !status.contains("planner.md"),
             "delete should commit only the agent file: {status:?}"
+        );
+    }
+
+    /// Regression: moving a workspace-scoped config into a project commits the
+    /// workspace-side deletion into `~/.cairn` AND pushes it to the workspace
+    /// remote, while the project repo's origin is never touched. Guards the
+    /// asymmetry where keying push_root on the *new* (project) scope dropped the
+    /// push of the workspace deletion.
+    #[tokio::test]
+    async fn workspace_to_project_move_pushes_workspace_deletion_only() {
+        use crate::db::DbState;
+        use crate::models::{CreateAgentConfig, UpdateAgentConfig};
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+        use std::path::Path;
+        use std::sync::Arc;
+
+        fn git(args: &[&str], dir: &Path) -> std::process::Output {
+            crate::env::git()
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap()
+        }
+        fn rev(dir: &Path, r: &str) -> String {
+            String::from_utf8_lossy(&git(&["rev-parse", r], dir).stdout)
+                .trim()
+                .to_string()
+        }
+        fn branch(dir: &Path) -> String {
+            String::from_utf8_lossy(&git(&["rev-parse", "--abbrev-ref", "HEAD"], dir).stdout)
+                .trim()
+                .to_string()
+        }
+        fn head_subject(dir: &Path) -> String {
+            String::from_utf8_lossy(&git(&["log", "-1", "--pretty=%s"], dir).stdout)
+                .trim()
+                .to_string()
+        }
+        fn origin_ref(origin: &Path, branch: &str) -> Option<String> {
+            let out = git(
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ],
+                origin,
+            );
+            out.status
+                .success()
+                .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        fn init_repo(dir: &Path) {
+            assert!(git(&["init", "-q"], dir).status.success());
+        }
+        fn init_bare(dir: &Path) {
+            std::fs::create_dir_all(dir).unwrap();
+            assert!(git(&["init", "--bare", "-q"], dir).status.success());
+        }
+        fn set_origin(repo: &Path, origin: &Path) {
+            assert!(
+                git(&["remote", "add", "origin", origin.to_str().unwrap()], repo)
+                    .status
+                    .success()
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        // Workspace repo (~/.cairn) with a bare origin.
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        init_repo(&config_dir);
+        let ws_origin = root.join("ws-origin.git");
+        init_bare(&ws_origin);
+        set_origin(&config_dir, &ws_origin);
+
+        // Project repo with its own bare origin, to prove it is never pushed.
+        let project_repo = root.join("project");
+        std::fs::create_dir_all(&project_repo).unwrap();
+        init_repo(&project_repo);
+        let proj_origin = root.join("proj-origin.git");
+        init_bare(&proj_origin);
+        set_origin(&project_repo, &proj_origin);
+
+        let db = LocalDb::open(root.join("test.db")).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        // Register the project so orch.project_path("project") resolves to its repo.
+        let repo_path = project_repo.to_str().unwrap().to_string();
+        db.write(move |conn| {
+            let repo_path = repo_path.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
+                     VALUES ('project', 'default', 'Project', 'PROJ', ?1, 1, 1, 0)",
+                    (repo_path.as_str(),),
+                ).await?;
+                Ok(())
+            })
+        }).await.unwrap();
+
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch = OrchestratorBuilder::new(db_state, services, config_dir.clone()).build();
+
+        orch.create_agent_config(CreateAgentConfig {
+            id: "planner".to_string(),
+            name: "Planner".to_string(),
+            description: "Plans things".to_string(),
+            prompt: "Plan.".to_string(),
+            tools: vec!["Read".to_string()],
+            tier: None,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            disallowed_tools: None,
+            skills: None,
+            fence: None,
+            sandbox: None,
+            on_escape: None,
+            backend_preference: None,
+        })
+        .unwrap();
+
+        // Move it into the project: the workspace file is deleted+committed in
+        // `~/.cairn`, and the new project file is committed in the project repo.
+        orch.update_agent_config(
+            "planner",
+            UpdateAgentConfig {
+                project_id: Some(Some("project".to_string())),
+                ..Default::default()
+            },
+            Some("project"),
+        )
+        .unwrap();
+
+        let ws_branch = branch(&config_dir);
+        let ws_head = rev(&config_dir, "HEAD");
+        assert_eq!(
+            head_subject(&config_dir),
+            "cairn: update agent planner",
+            "workspace repo should hold the scope-change deletion commit"
+        );
+        assert_eq!(
+            head_subject(&project_repo),
+            "cairn: update agent planner",
+            "project repo should hold the new project-scoped file"
+        );
+
+        // The workspace deletion must reach the workspace origin. The push is a
+        // detached best-effort thread, so poll briefly for it to land.
+        let mut pushed = false;
+        for _ in 0..120 {
+            if origin_ref(&ws_origin, &ws_branch).as_deref() == Some(ws_head.as_str()) {
+                pushed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            pushed,
+            "workspace origin should advance to the deletion commit {ws_head}"
+        );
+
+        // The project origin must never receive a push: project scope is commit-only.
+        let proj_branch = branch(&project_repo);
+        assert!(
+            origin_ref(&proj_origin, &proj_branch).is_none(),
+            "project origin must not be pushed on a config scope change"
         );
     }
 }

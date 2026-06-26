@@ -1046,6 +1046,7 @@ mod tests {
             output_tokens: None,
             turn_id: None,
             thinking_tokens: None,
+            cost_usd: None,
             storage_mode: storage_mode.map(str::to_string),
             content_commit: content_commit.map(str::to_string),
             content_change_id: None,

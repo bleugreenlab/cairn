@@ -219,8 +219,8 @@ async fn insert_preview_event(db: &LocalDb, input: serde_json::Value) {
             )
             .await?;
             conn.execute(
-                "INSERT INTO runs(id, project_id, job_id, status, session_id, backend, created_at, updated_at, start_mode)
-                 VALUES ('run-preview', ?1, 'job-preview', 'live', 'session-preview', 'codex', 1, 1, 'resume')",
+                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-preview', ?1, 'job-preview', 'live', 'session-preview', 1, 1, 'resume')",
                 params![project_id.as_str()],
             )
             .await?;

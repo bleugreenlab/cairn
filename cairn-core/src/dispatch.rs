@@ -383,13 +383,14 @@ async fn augment_with_queued_dms(
         None => Vec::new(),
     };
 
-    // CAIRN-1881: drain this busy agent's rousing pushes at the event boundary —
-    // the one new delivery site for `wake`/`interrupt` pushes that must land at
-    // the next tool-call return rather than wait for turn end. The running job is
-    // the recipient. Lazy-resolved so a push whose referent already resolved is
-    // skipped; `passive` pushes are excluded here (they ride along on resume).
+    // Drain every live push for this busy agent at the event boundary, regardless
+    // of wake level. The running job is the recipient. Wake level governs whether
+    // an *idle* agent is roused, not whether an active one sees a push: `passive`
+    // pushes never *woke* this agent (it is already running), but they ride along
+    // at the next tool-call return just like rousing pushes. Lazy-resolved so a
+    // push whose referent already resolved is skipped.
     let pushes = match job_id.as_deref() {
-        Some(job_id) => crate::orchestrator::attention_push::pending_waking_live(
+        Some(job_id) => crate::orchestrator::attention_push::pending_deliverable_live(
             &orch.db.local,
             job_id,
             crate::orchestrator::attention_push::Boundary::Event,

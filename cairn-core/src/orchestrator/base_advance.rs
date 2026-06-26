@@ -1,7 +1,7 @@
 //! Proactive base-branch advance notifications for downstream jobs.
 //!
-//! When a base branch advances (a Cairn PR merges, or the default branch moves
-//! externally/locally), every in-flight sibling branched from that base is
+//! When a base branch advances (a Cairn PR merges, or a remote default branch
+//! moves externally), every in-flight sibling branched from that base is
 //! auto-rebased onto the new tip over the shared jj store. Each rebased sibling
 //! is then told its branch moved, split by outcome:
 //!
@@ -48,6 +48,13 @@ struct MergeRequestInfo {
 struct IssueInfo {
     project_key: String,
     number: i64,
+}
+
+#[derive(Debug)]
+struct DefaultReconcileProject {
+    id: String,
+    repo_path: String,
+    default_branch: String,
 }
 
 /// Queue non-waking notifications for in-flight siblings whose changes overlap
@@ -160,40 +167,8 @@ async fn reconcile_jj_downstream(
     .await
 }
 
-/// Where the advanced default-branch tip comes from. Selects how the tip is
-/// brought into the shared store and which revset the siblings rebase onto — the
-/// only two differences between the webhook and non-webhook reconcile paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DefaultAdvanceSource {
-    /// The advance landed on origin — a non-Cairn merge or a direct push,
-    /// detected via the GitHub `push` webhook. The local checkout may not have
-    /// pulled, so origin is the source of truth: fetch it into the store and
-    /// rebase siblings onto the remote-tracking `<default>@origin` tip.
-    Remote,
-    /// The advance happened in the backing git locally with no `push` webhook —
-    /// a local-only project (no remote/webhook subscription) or a manual
-    /// `git pull` on the default branch. `ensure_project_store`'s `import_git`
-    /// already imports the moved local ref, so rebase siblings onto the local
-    /// `<default>` bookmark; no origin fetch is involved (and a local-only
-    /// project has no origin to fetch).
-    Local,
-}
-
-impl DefaultAdvanceSource {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Remote => "external advance",
-            Self::Local => "local advance",
-        }
-    }
-
-    /// The `jj rebase` destination revset for an advance on `default_branch`.
-    fn rebase_dest(self, default_branch: &str) -> String {
-        match self {
-            Self::Remote => format!("{default_branch}@origin"),
-            Self::Local => default_branch.to_string(),
-        }
-    }
+fn remote_default_revset(default_branch: &str) -> String {
+    format!("{default_branch}@origin")
 }
 
 /// Reconcile in-flight siblings after the project's default branch advanced
@@ -205,72 +180,32 @@ pub async fn reconcile_external_default_advance(
     project_id: &str,
     default_branch: &str,
 ) -> Result<(), String> {
-    reconcile_default_advance(
-        orch,
-        project_id,
-        default_branch,
-        DefaultAdvanceSource::Remote,
-    )
-    .await
+    reconcile_default_advance(orch, project_id, default_branch).await
 }
 
-/// Reconcile in-flight siblings after the project's default branch advanced
-/// **locally with no GitHub `push` webhook** — a local-only project (no
-/// remote/webhook subscription) or a manual `git pull` on the default branch.
-/// The webhook path never fires for these, so without this trigger the shared
-/// store's view of the default branch stays stale and in-flight siblings remain
-/// based on the old tip until something else (a Cairn merge) advances it. Thin
-/// wrapper over [`reconcile_default_advance`] with the `Local` source: it imports
-/// the moved local ref into the store and rebases each sibling onto the local
-/// `<default>` bookmark. Driven by the periodic sweep
-/// ([`reconcile_all_local_default_advances`]).
-pub async fn reconcile_local_default_advance(
-    orch: &Orchestrator,
-    project_id: &str,
-    default_branch: &str,
-) -> Result<(), String> {
-    reconcile_default_advance(
-        orch,
-        project_id,
-        default_branch,
-        DefaultAdvanceSource::Local,
-    )
-    .await
-}
-
-/// Shared body for both default-branch-advance reconcile paths (webhook `Remote`
-/// and non-webhook `Local`). Mirrors the Cairn-merge path: gate on in-flight
-/// siblings, bring the advanced tip into the shared store, then auto-rebase every
-/// in-flight sibling on that branch onto the new tip over the shared store — push
-/// the cleanly-rebased ones, record conflicts non-blocking, and notify the
-/// siblings this reconcile actually rewrote — a waking `Steer` note to a
-/// conflicted sibling, a passive ride-along note to a cleanly-rebased one (the
-/// before/after commit-id guard in `reconcile_base_advance` gates both, which also
-/// makes the webhook/sweep double-fire on a remote-then-local advance
-/// idempotent). Runs regardless of the project's
+/// Shared body for live default-branch-advance reconcile. Mirrors the Cairn-merge
+/// path: gate on in-flight siblings, bring the advanced tip into the shared store,
+/// then auto-rebase every in-flight sibling on that branch onto the new tip over
+/// the shared store — push the cleanly-rebased ones, record conflicts
+/// non-blocking, and notify the siblings this reconcile actually rewrote — a
+/// waking `Steer` note to a conflicted sibling, a passive ride-along note to a
+/// cleanly-rebased one (the before/after commit-id guard in
+/// `reconcile_base_advance` gates both). Runs regardless of the project's
 /// `pull_on_merge` setting: that gates the user's main-checkout pull, not
 /// agent-workspace reconciliation. Non-fatal end to end — every failure is logged
-/// and swallowed so neither the webhook handler nor the periodic sweep errors on
-/// it.
+/// and swallowed so the webhook handler does not error on it.
 async fn reconcile_default_advance(
     orch: &Orchestrator,
     project_id: &str,
     default_branch: &str,
-    source: DefaultAdvanceSource,
 ) -> Result<(), String> {
     let Some(repo_path) = load_project_repo_path(orch, project_id).await? else {
-        log::debug!(
-            "Skipping {} reconcile: no repo_path for project {project_id}",
-            source.label()
-        );
+        log::debug!("Skipping external advance reconcile: no repo_path for project {project_id}");
         return Ok(());
     };
     let siblings = load_sibling_jobs(orch, project_id, default_branch, EXCLUDE_NONE).await?;
     if siblings.is_empty() {
-        log::debug!(
-            "{} on {default_branch}: no in-flight siblings to reconcile",
-            source.label()
-        );
+        log::debug!("external advance on {default_branch}: no in-flight siblings to reconcile");
         return Ok(());
     }
 
@@ -281,40 +216,30 @@ async fn reconcile_default_advance(
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
     // Serialize the store import/fetch + sibling reconcile behind the per-store
-    // mutex, held across the rest of the body. The external (webhook) and local
-    // (sweep) default-advance paths can fire for the same advance and overlap a
-    // Cairn merge's reconcile; without this they race jj ops on the shared store
-    // and mint divergent conflicted copies. The inner helpers take no lock.
+    // mutex, held across the rest of the body. The live webhook, startup catch-up,
+    // and Cairn-merge reconcile paths can overlap for the same advance; without
+    // this they race jj ops on the shared store and mint divergent conflicted
+    // copies. The inner helpers take no lock.
     let store_lock = orch.jj_store_lock(&store);
     let _store_guard = store_lock.lock().await;
     if let Err(error) = crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path)) {
-        log::warn!(
-            "{} on {default_branch}: ensure store failed: {error}",
-            source.label()
-        );
+        log::warn!("external advance on {default_branch}: ensure store failed: {error}");
         return Ok(());
     }
-    // The webhook advance lives on origin, not in the local checkout, so it
-    // additionally fetches origin to advance the `<default>@origin` tracking
-    // bookmark. The local path needs no fetch — the import above already brought
-    // the moved local ref in.
-    if source == DefaultAdvanceSource::Remote {
-        if let Err(error) = crate::jj::fetch_remote(&jj, &store, "origin") {
-            log::warn!(
-                "{} on {default_branch}: jj git fetch failed: {error}",
-                source.label()
-            );
-            return Ok(());
-        }
+    // The webhook advance lives on origin, not in the local checkout, so fetch
+    // origin to advance the `<default>@origin` tracking bookmark before rebasing.
+    if let Err(error) = crate::jj::fetch_remote(&jj, &store, "origin") {
+        log::warn!("external advance on {default_branch}: jj git fetch failed: {error}");
+        return Ok(());
     }
 
     let conflict_note = build_external_advance_conflict_note(default_branch);
     let clean_note = build_external_advance_clean_note(default_branch);
     reconcile_base_advance(
         orch,
-        &format!("{} on {default_branch}", source.label()),
+        &format!("external advance on {default_branch}"),
         &repo_path,
-        &source.rebase_dest(default_branch),
+        &remote_default_revset(default_branch),
         siblings,
         conflict_note,
         clean_note,
@@ -322,27 +247,108 @@ async fn reconcile_default_advance(
     .await
 }
 
-/// Sweep every locally-checked-out project for a non-webhook default-branch
-/// advance and reconcile its in-flight default-branch siblings. Drives
-/// [`reconcile_local_default_advance`] per project; that call gates on in-flight
-/// siblings before touching jj, so a project with no active default-branch work
-/// costs only a cheap DB query. Errors per project are logged, never propagated —
-/// one project's failure must not abort the sweep.
-pub async fn reconcile_all_local_default_advances(orch: &Orchestrator) {
+/// One-time startup catch-up for remote default-branch advances that landed while
+/// Cairn was closed. This is intentionally not a sweep: no-remote projects are
+/// skipped because nothing outside Cairn can advance them, and remote projects
+/// only reconcile when fetching `origin` actually changes the stored remote
+/// default tip. An unchanged base never reaches the sibling rebase path.
+pub async fn reconcile_startup_remote_default_advances(orch: &Orchestrator) {
     let projects = match load_projects_for_default_reconcile(orch).await {
         Ok(projects) => projects,
         Err(error) => {
-            log::warn!("local default-advance sweep: failed to load projects: {error}");
+            log::warn!("startup default-advance catch-up: failed to load projects: {error}");
             return;
         }
     };
-    for (project_id, default_branch) in projects {
-        if let Err(error) =
-            reconcile_local_default_advance(orch, &project_id, &default_branch).await
-        {
-            log::warn!("local default-advance reconcile for project {project_id} failed: {error}");
+    for project in projects {
+        if !project_has_origin(orch, Path::new(&project.repo_path)) {
+            log::debug!(
+                "startup default-advance catch-up: skipping project {} with no origin remote",
+                project.id
+            );
+            continue;
+        }
+        if let Err(error) = reconcile_startup_remote_default_advance(orch, &project).await {
+            log::warn!(
+                "startup default-advance catch-up for project {} failed: {error}",
+                project.id
+            );
         }
     }
+}
+
+async fn reconcile_startup_remote_default_advance(
+    orch: &Orchestrator,
+    project: &DefaultReconcileProject,
+) -> Result<(), String> {
+    let siblings =
+        load_sibling_jobs(orch, &project.id, &project.default_branch, EXCLUDE_NONE).await?;
+    if siblings.is_empty() {
+        log::debug!(
+            "startup remote advance on {}: no in-flight siblings to reconcile",
+            project.default_branch
+        );
+        return Ok(());
+    }
+
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let repo_path = Path::new(&project.repo_path);
+    let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
+    let store_lock = orch.jj_store_lock(&store);
+    let _store_guard = store_lock.lock().await;
+    if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path) {
+        log::warn!(
+            "startup remote advance on {}: ensure store failed: {error}",
+            project.default_branch
+        );
+        return Ok(());
+    }
+
+    let remote_default = remote_default_revset(&project.default_branch);
+    let before = crate::jj::revset_commit(&jj, &store, &remote_default);
+    if let Err(error) = crate::jj::fetch_remote(&jj, &store, "origin") {
+        log::warn!(
+            "startup remote advance on {}: jj git fetch failed: {error}",
+            project.default_branch
+        );
+        return Ok(());
+    }
+    let after = crate::jj::revset_commit(&jj, &store, &remote_default);
+    if before == after {
+        log::debug!(
+            "startup remote advance on {}: origin tip unchanged; skipping sibling reconcile",
+            project.default_branch
+        );
+        return Ok(());
+    }
+    if after.is_none() {
+        log::debug!(
+            "startup remote advance on {}: origin tip did not resolve after fetch; skipping",
+            project.default_branch
+        );
+        return Ok(());
+    }
+
+    let conflict_note = build_external_advance_conflict_note(&project.default_branch);
+    let clean_note = build_external_advance_clean_note(&project.default_branch);
+    reconcile_base_advance(
+        orch,
+        &format!("startup external advance on {}", project.default_branch),
+        &project.repo_path,
+        &remote_default,
+        siblings,
+        conflict_note,
+        clean_note,
+    )
+    .await
+}
+
+fn project_has_origin(orch: &Orchestrator, repo_path: &Path) -> bool {
+    orch.services
+        .git
+        .remote_get_url(repo_path)
+        .ok()
+        .is_some_and(|url| !url.trim().is_empty())
 }
 
 /// Shared reconcile body for both base-advance paths (Cairn merge and external
@@ -1174,20 +1180,20 @@ async fn load_project_repo_path(
         .map_err(|error| error.to_string())
 }
 
-/// Projects eligible for the local default-advance sweep: those with a local git
-/// checkout (`repo_path`) and a known `default_branch`. A project with no local
-/// checkout (cloud-only) has no backing git ref to advance, and one with no
-/// default branch has no branch to reconcile onto.
+/// Projects eligible for startup default-advance catch-up: those with a local git
+/// checkout (`repo_path`) and a known `default_branch`. Remote presence is checked
+/// against live git config after this query so local-only projects stay cheap to
+/// skip and cloud-only projects never enter the path.
 async fn load_projects_for_default_reconcile(
     orch: &Orchestrator,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<DefaultReconcileProject>, String> {
     orch.db
         .local
         .read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT id, default_branch FROM projects
+                        "SELECT id, repo_path, default_branch FROM projects
                          WHERE repo_path IS NOT NULL AND repo_path != ''
                            AND default_branch IS NOT NULL AND default_branch != ''",
                         (),
@@ -1195,7 +1201,11 @@ async fn load_projects_for_default_reconcile(
                     .await?;
                 let mut projects = Vec::new();
                 while let Some(row) = rows.next().await? {
-                    projects.push((row.text(0)?, row.text(1)?));
+                    projects.push(DefaultReconcileProject {
+                        id: row.text(0)?,
+                        repo_path: row.text(1)?,
+                        default_branch: row.text(2)?,
+                    });
                 }
                 Ok(projects)
             })
@@ -1758,17 +1768,42 @@ mod tests {
     }
 
     #[test]
-    fn default_advance_source_selects_dest_and_label() {
-        // The Remote (webhook) path rebases onto the remote-tracking bookmark;
-        // the Local (non-webhook) path rebases onto the local bookmark imported
-        // from the backing git — the one structural difference between the paths.
-        assert_eq!(
-            DefaultAdvanceSource::Remote.rebase_dest("main"),
-            "main@origin"
-        );
-        assert_eq!(DefaultAdvanceSource::Local.rebase_dest("main"), "main");
-        assert_eq!(DefaultAdvanceSource::Remote.label(), "external advance");
-        assert_eq!(DefaultAdvanceSource::Local.label(), "local advance");
+    fn remote_default_revset_targets_origin() {
+        assert_eq!(remote_default_revset("main"), "main@origin");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_has_origin_uses_live_git_config() {
+        let db = migrated_db().await;
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .with(mockall::predicate::function(|path: &Path| {
+                path == Path::new("/repo/remote")
+            }))
+            .returning(|_| Ok("https://github.com/acme/repo.git".to_string()));
+        let orch = test_orchestrator(db, git);
+
+        assert!(project_has_origin(&orch, Path::new("/repo/remote")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_has_origin_skips_missing_or_empty_origin() {
+        let db = migrated_db().await;
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .with(mockall::predicate::function(|path: &Path| {
+                path == Path::new("/repo/no-remote")
+            }))
+            .returning(|_| Err("No such remote 'origin'".to_string()));
+        git.expect_remote_get_url()
+            .with(mockall::predicate::function(|path: &Path| {
+                path == Path::new("/repo/empty")
+            }))
+            .returning(|_| Ok("   ".to_string()));
+        let orch = test_orchestrator(db, git);
+
+        assert!(!project_has_origin(&orch, Path::new("/repo/no-remote")));
+        assert!(!project_has_origin(&orch, Path::new("/repo/empty")));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1791,7 +1826,7 @@ mod tests {
 
         let projects = load_projects_for_default_reconcile(&orch).await.unwrap();
         let ids: std::collections::HashSet<&str> =
-            projects.iter().map(|(id, _)| id.as_str()).collect();
+            projects.iter().map(|project| project.id.as_str()).collect();
 
         assert!(
             ids.contains("p-ok"),
@@ -1805,9 +1840,16 @@ mod tests {
             !ids.contains("p-no-branch"),
             "a project with no default branch is skipped"
         );
-        let ok = projects.iter().find(|(id, _)| id == "p-ok").unwrap();
+        let ok = projects
+            .iter()
+            .find(|project| project.id == "p-ok")
+            .unwrap();
         assert_eq!(
-            ok.1, "main",
+            ok.repo_path, "/repo/ok",
+            "the repository path is returned for live remote detection"
+        );
+        assert_eq!(
+            ok.default_branch, "main",
             "the default branch is returned alongside the id"
         );
     }

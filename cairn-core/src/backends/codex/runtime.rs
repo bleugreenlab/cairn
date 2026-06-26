@@ -16,7 +16,7 @@ use super::permissions::{
 use super::protocol::StreamingState;
 use super::CodexBackend;
 use crate::agent_process::stream::{OutputTokensDetails, ToolUseInfo, TranscriptEvent, Usage};
-use crate::models::{ContextTokenState, RunStatus};
+use crate::models::ContextTokenState;
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::transcripts::stream_store::append_chunks;
@@ -920,11 +920,10 @@ impl CodexBackend {
                                 session_id.as_deref(),
                                 &format!("Turn aborted: {}", reason),
                             );
-                            crate::orchestrator::lifecycle::finalize_run(
-                                orch,
-                                run_id,
-                                RunStatus::Crashed,
-                            );
+                            // Not one of the recoverable aborts handled above
+                            // (interrupted/replaced/review_ended): this is an
+                            // unrecoverable failure, so finalize task-aware.
+                            crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_aborted");
                         }
                     }
                     if let Ok(mut guard) = current_turn_id.lock() {
@@ -960,11 +959,9 @@ impl CodexBackend {
                             session_id.as_deref(),
                             &format!("Codex error: {}", message),
                         );
-                        crate::orchestrator::lifecycle::finalize_run(
-                            orch,
-                            run_id,
-                            RunStatus::Crashed,
-                        );
+                        // Non-retryable fatal error: finalize task-aware so a
+                        // delegated child fails terminally and resumes its parent.
+                        crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
                     }
                 }
                 Some("thread/tokenUsage/updated") => {

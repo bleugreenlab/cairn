@@ -255,6 +255,8 @@ pub async fn handle_pr_node(
     let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
     let has_remote = vcs.has_remote();
 
+    commit_triage_ledger_if_needed(orch, action_run, &worktree_path, &repo_path).await?;
+
     // Seed the merge_requests row with the create-pr title/body before the slow
     // push + GitHub open below. The PR facet appears as soon as this action run
     // exists, so without the row the tab shows an empty "no data" state for the
@@ -559,6 +561,87 @@ impl PrVcs {
     fn head_sha(&self, worktree: &str) -> Result<String, String> {
         crate::jj::head_commit(&self.jj, Path::new(worktree))
     }
+}
+
+const TRIAGE_LEDGER_DIR: &str = "docs/memory-triage";
+
+fn triage_ledger_relative_path(issue_number: i32) -> String {
+    format!("{TRIAGE_LEDGER_DIR}/{issue_number}.md")
+}
+
+async fn commit_triage_ledger_if_needed(
+    orch: &Orchestrator,
+    action_run: &ActionRun,
+    worktree_path: &str,
+    repo_path: &str,
+) -> Result<(), String> {
+    let Some(issue_id) = action_run.issue_id.as_deref() else {
+        return Ok(());
+    };
+
+    let memories = crate::memories::db::triage_batch_memories_for_issue(&orch.db.local, issue_id)
+        .await
+        .map_err(|error| format!("Failed to load memory triage batch: {error}"))?;
+    if memories.is_empty() {
+        return Ok(());
+    }
+
+    let issue = crate::issues::crud::get(&orch.db.local, issue_id)
+        .await
+        .map_err(|error| format!("Failed to load memory triage issue: {error}"))?
+        .ok_or_else(|| format!("Memory triage issue not found: {issue_id}"))?;
+    let (scope, scope_value) = memories
+        .first()
+        .map(|memory| (memory.scope.to_string(), memory.scope_value.clone()))
+        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+    let rendered = crate::memories::ledger::render_triage_ledger(
+        &issue.title,
+        &scope,
+        &scope_value,
+        &memories,
+    );
+    let relative_path = triage_ledger_relative_path(issue.number);
+    let worktree = Path::new(worktree_path);
+    let full_path = worktree.join(&relative_path);
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Failed to create memory triage ledger directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::write(&full_path, rendered).map_err(|error| {
+        format!(
+            "Failed to write memory triage ledger {}: {error}",
+            full_path.display()
+        )
+    })?;
+
+    if !crate::jj::is_jj_dir(worktree) {
+        return Err(format!(
+            "Memory triage ledger was written to {}, but the implementation context is not a jj worktree and cannot be sealed",
+            full_path.display()
+        ));
+    }
+
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    if !crate::jj::scoped_dirty(&jj, worktree, &[relative_path.as_str()])? {
+        return Ok(());
+    }
+
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+    let store_lock = orch.jj_store_lock(&store);
+    let _store_guard = store_lock.lock().await;
+    if !crate::jj::scoped_dirty(&jj, worktree, &[relative_path.as_str()])? {
+        return Ok(());
+    }
+
+    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, worktree);
+    let commit_msg = format!("memory triage ledger: {scope}={scope_value}");
+    vcs.seal_files(worktree, &[relative_path.as_str()], &commit_msg, None)
+        .map(|_| ())
+        .map_err(|error| format!("Failed to seal memory triage ledger commit: {error}"))
 }
 
 /// Load a project's repo checkout path (the git-backed checkout that carries

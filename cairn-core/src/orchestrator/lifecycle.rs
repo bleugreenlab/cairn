@@ -657,9 +657,8 @@ fn run_from_row(row: &turso::Row) -> DbResult<Run> {
         created_at: row.i64(9)?,
         updated_at: row.i64(10)?,
         chat_id: row.opt_text(11)?,
-        backend: row.opt_text(12)?,
-        exit_reason: row.opt_text(13)?,
-        start_mode: row.opt_text(14)?.and_then(|mode| mode.parse().ok()),
+        exit_reason: row.opt_text(12)?,
+        start_mode: row.opt_text(13)?.and_then(|mode| mode.parse().ok()),
     })
 }
 
@@ -673,7 +672,7 @@ fn run_for_sync(orch: &Orchestrator, run_id: &str) -> Option<Run> {
                     .query(
                         "SELECT id, issue_id, project_id, job_id, status, session_id,
                                 error_message, started_at, exited_at, created_at, updated_at,
-                                chat_id, backend, exit_reason, start_mode
+                                chat_id, exit_reason, start_mode
                          FROM runs
                          WHERE id = ?1",
                         (run_id.as_str(),),
@@ -1675,6 +1674,70 @@ fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
             e
         );
     }
+}
+
+/// True when the run belongs to a delegated task (its job has a `parent_job_id`).
+///
+/// Mirrors `is_task_spawned_run` (`backends/run_state.rs`), which is
+/// `pub(in crate::backends)` and so not reachable from `orchestrator`. A
+/// delegated task is the only kind of run with a suspended parent blocked on
+/// the resume gate, so it is the only kind whose genuine turn failure must be
+/// finalized terminally rather than left resumable.
+fn run_is_delegated_task(orch: &Orchestrator, run_id: &str) -> bool {
+    blocking_text_lookup(
+        orch,
+        run_id,
+        "SELECT jobs.parent_job_id
+         FROM runs
+         JOIN jobs ON runs.job_id = jobs.id
+         WHERE runs.id = ?1
+           AND jobs.parent_job_id IS NOT NULL",
+        TextColumn::Optional,
+    )
+    .is_some()
+}
+
+/// Finalize a run that hit an unrecoverable backend turn failure.
+///
+/// For a delegated TASK run (the job has a `parent_job_id`), the turn is marked
+/// terminally `Failed` so the job derives `Failed`, the delegated packet
+/// resolves `Failed`, and the suspended parent resumes with the error instead
+/// of hanging in `running` forever. For a top-level JOB run, the failure is a
+/// resumable interruption (the existing `finalize_run(Crashed)` path,
+/// unchanged): a job can be resumed by the user or by re-advancement, and only
+/// a task has a blocked parent that needs a terminal answer.
+///
+/// Backends call this on a *genuinely fatal* turn failure (an `Err` from the
+/// owned loop, an unrecoverable Codex error). Recoverable crashes (rate limits,
+/// process death) keep calling `finalize_run(Crashed)` directly and stay
+/// resumable regardless of task-vs-job.
+pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
+    if !run_is_delegated_task(orch, run_id) {
+        // Top-level job: keep the resumable-interrupt behavior unchanged.
+        finalize_run(orch, run_id, RunStatus::Crashed);
+        return;
+    }
+
+    // Mark the live turn terminally Failed before finalize. `apply_turn_outcome`
+    // accepts Running or Pending; once the turn is `failed` (terminal),
+    // `finalize_run`'s `turn_state == "running"` branch is false and its `else`
+    // re-applies Failed as a no-op (`from == outcome`).
+    let turn_id = orch
+        .process_state
+        .get_current_turn_id(run_id)
+        .or_else(|| current_turn_id_for_run(orch, run_id));
+    if let Some(turn_id) = turn_id {
+        if let Err(e) = apply_turn_outcome(orch, &turn_id, TurnState::Failed) {
+            log::warn!(
+                "fail_run: failed to mark turn {} as Failed for run {}: {}",
+                turn_id,
+                run_id,
+                e
+            );
+        }
+    }
+    let _ = set_exit_reason(orch, run_id, reason);
+    finalize_run(orch, run_id, RunStatus::Crashed);
 }
 
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
@@ -3293,6 +3356,146 @@ mod warm_completion_tests {
         // produces. Before the fix this stayed 'pending' forever and the parent
         // batch hung.
         assert_eq!(turn_state(&orch, "succ").await, "complete");
+    }
+
+    /// Seed a parent suspended on a delegated wait (anchor turn + pending
+    /// `dependency_unblock` successor) and a delegated child that is still
+    /// *running* — a live run, a `running` job, and a `running` current turn.
+    /// This is the durable-suspend shape: the parent finalized its own run and
+    /// is blocked on the resume gate, waiting on this child. A genuine turn
+    /// failure of the child must fail it terminally and fire the gate.
+    async fn seed_suspended_parent_with_running_child(db: &LocalDb, snapshot: String) {
+        db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-warm','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-warm','p-warm',1,'T','active','none',1,1)", ()).await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-warm','recipe','i-warm','p-warm','running',1,1,?1)",
+                    (snapshot.as_str(),),
+                ).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('anchor','s-parent','j-parent',1,'yielded','dependency_wait','initial',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at) VALUES ('succ','s-parent','j-parent',2,'anchor','pending','dependency_unblock',1,1)", ()).await?;
+                // Parent job stays `running` while suspended on the delegated
+                // wait (it is the issue that is `waiting`, not the job). A valid
+                // JobStatus matters: the execution sweep loads every job in the
+                // execution and parses its status.
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, current_turn_id, created_at, updated_at) VALUES ('j-parent','e-warm','i-warm','p-warm','running','succ',1,1)", ()).await?;
+                // Delegated child still running: live run + running current turn.
+                // It carries a recipe_node_id for its synthetic node so the
+                // execution sweep recomputes its status (production shape).
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, parent_job_id, issue_id, project_id, status, created_at, updated_at) VALUES ('j-child','e-warm','child-node','j-parent','i-warm','p-warm','running',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','live',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('child-turn','s-child','j-child',1,'running','initial',1,1)", ()).await?;
+                conn.execute("UPDATE jobs SET current_turn_id = 'child-turn' WHERE id = 'j-child'", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    }
+
+    fn running_child_snapshot() -> String {
+        // The delegated child materializes as a synthetic Agent node in the
+        // execution snapshot, which is what makes the execution sweep recompute
+        // its status from its turn outcome. A bare node with no edges is
+        // dag-ready and has no downstream artifact contract.
+        let child_node = serde_json::json!({
+            "id": "child-node",
+            "nodeType": "agent",
+            "name": "Child",
+            "position": {"x": 0.0, "y": 0.0},
+            "parentId": null,
+            "triggerConfig": null,
+            "agentConfig": null,
+            "actionConfig": null,
+            "checkpointConfig": null,
+            "artifactConfig": null,
+            "conditionConfig": null,
+            "contextConfig": null
+        });
+        serde_json::json!({
+            "recipe": {"id": "r", "name": "R", "description": null, "trigger": "manual", "nodes": [child_node], "edges": []},
+            "agents": {},
+            "skills": {},
+            "triggerContext": {"issueId": "i-warm", "projectId": "p-warm", "triggerType": "manual"},
+            "delegatedPackets": [{
+                "id": "pkt-1",
+                "parentJobId": "j-parent",
+                "parentTurnId": "anchor",
+                "parentToolUseId": "tool-1",
+                "origin": "task_tool",
+                "title": "Explore",
+                "problemStatement": "x",
+                "agentConfigId": "Explore",
+                "ownership": {"cwd": "/tmp"},
+                "outputContract": {"schemaType": "return"},
+                "resultArtifactJobId": "j-child",
+                "status": "running",
+                "taskIndex": 0,
+                "createdAt": 0
+            }],
+            "createdAt": 0
+        })
+        .to_string()
+    }
+
+    /// The durable-suspend hang, fixed: a genuine turn failure of a *running*
+    /// delegated child finalizes it terminally `Failed` (not a resumable
+    /// interrupt), so its packet resolves `Failed` and the suspended parent's
+    /// resume gate fires (the pending successor is claimed). Before the fix the
+    /// child's turn was interrupted, the packet stayed `Materialized`, and the
+    /// parent hung in `running` forever.
+    #[tokio::test]
+    async fn fail_run_on_delegated_task_resumes_suspended_parent() {
+        let db = test_db().await;
+        seed_suspended_parent_with_running_child(&db, running_child_snapshot()).await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch, "run-child", Some("j-child"));
+        orch.process_state
+            .set_current_turn_id("run-child", Some("child-turn"));
+
+        assert_eq!(turn_state(&orch, "succ").await, "pending");
+
+        super::fail_run(&orch, "run-child", "turn_failed");
+
+        // The child's turn is terminally Failed (not interrupted).
+        assert_eq!(turn_state(&orch, "child-turn").await, "failed");
+        // The child job derives Failed from the failed turn.
+        assert_eq!(
+            scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+                .await
+                .as_deref(),
+            Some("failed"),
+        );
+        // The resume gate fired: the parent's pending successor was claimed.
+        assert_eq!(turn_state(&orch, "succ").await, "complete");
+    }
+
+    /// A genuine turn failure of a *top-level* job (no `parent_job_id`) stays a
+    /// resumable interruption — `fail_run` falls back to the unchanged
+    /// `finalize_run(Crashed)` path: the running turn is interrupted, not
+    /// failed, and the job is not driven terminal. Only a delegated task has a
+    /// blocked parent that needs a terminal answer.
+    #[tokio::test]
+    async fn fail_run_on_top_level_job_stays_resumable() {
+        let db = test_db().await;
+        seed_top_level_run(&db, "run-top", "job-top", "turn-top", "none").await;
+        let orch = test_orchestrator(db);
+        register_warm_process(&orch, "run-top", Some("job-top"));
+        orch.process_state
+            .set_current_turn_id("run-top", Some("turn-top"));
+
+        super::fail_run(&orch, "run-top", "turn_failed");
+
+        // The running turn is interrupted (resumable), not failed.
+        assert_eq!(turn_state(&orch, "turn-top").await, "interrupted");
+        // The job is not terminally failed.
+        assert_ne!(
+            scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "job-top")
+                .await
+                .as_deref(),
+            Some("failed"),
+        );
     }
 
     async fn scalar_text(orch: &Orchestrator, sql: &'static str, id: &str) -> Option<String> {

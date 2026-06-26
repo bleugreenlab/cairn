@@ -663,6 +663,19 @@ fn files_response() -> HttpResponse {
     }
 }
 
+/// A GitHub PUT `/merge` response with the given status. 200 is the success
+/// shape; 405 is GitHub's "not mergeable" refusal.
+fn merge_response(status: u16) -> HttpResponse {
+    HttpResponse {
+        status,
+        body: serde_json::to_vec(&serde_json::json!({
+            "merged": status == 200,
+            "message": "Pull Request is not mergeable"
+        }))
+        .unwrap(),
+    }
+}
+
 #[tokio::test]
 async fn try_resolve_and_render_are_none_for_non_pr_job() {
     let (_temp, db) = common::migrated_db().await;
@@ -869,7 +882,7 @@ async fn reconcile_after_merge_for_action_run_owner_stores_files_under_parent_jo
         .await
         .unwrap();
 
-    actions::reconcile_after_merge(orch.clone(), ctx).await;
+    actions::reconcile_after_merge(orch.clone(), ctx, false).await;
 
     assert_eq!(
         file_change_count_for_job(&orch.db.local, &parent_job).await,
@@ -905,6 +918,68 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
     assert!(msg.contains("merged"));
     assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
     assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+}
+
+/// A real remote PR landing on the default branch merges through GitHub's merge
+/// API — not the local jj fold. The repo has NO jj store provisioned, so success
+/// here can only come from the GitHub path; the local fold would have errored
+/// resolving the store. GitHub's success advances the base out of band, and Cairn
+/// then marks the merge request merged and resolves the issue.
+#[tokio::test]
+async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_git_repo();
+    insert_github_app(&db).await;
+    let project = create_project(&db, "GH", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    let job = create_job(&db, &project, &issue).await;
+    let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/pulls/5/merge", merge_response(200))
+        // Best-effort source-branch delete + background reconcile endpoints.
+        .respond_to("/git/refs/heads/feature", merge_response(200))
+        .respond_to("/pulls/5/files", files_response())
+        .respond_to("/pulls/5/reviews", empty_array_response())
+        .respond_to("/check-runs", check_runs_response())
+        .respond_to("/pulls/5", pr_response("closed", true));
+    let (_cfg, orch) = orchestrator_with_http(db, http).await;
+
+    let msg = actions::merge_pr_for_job(&orch, &job, None).await.unwrap();
+    assert!(msg.contains("merged"), "reports a merge: {msg}");
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "merged");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "merged");
+}
+
+/// FAIL-CLOSED: when GitHub refuses the merge (405 not-mergeable), Cairn surfaces
+/// an actionable error and marks NOTHING — the merge request stays open and the
+/// issue stays active. The error points at the PR (no local markers exist, since
+/// the local conflict gate passed).
+#[tokio::test]
+async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
+    let (_temp, db) = common::migrated_db().await;
+    let repo = temp_git_repo();
+    insert_github_app(&db).await;
+    let project = create_project(&db, "GHF", repo.path().to_str().unwrap()).await;
+    let issue = create_issue(&db, &project, 1).await;
+    let job = create_job(&db, &project, &issue).await;
+    let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
+
+    let http = MockHttpClient::new()
+        .respond_to("access_tokens", token_response())
+        .respond_to("/pulls/5/merge", merge_response(405));
+    let (_cfg, orch) = orchestrator_with_http(db, http).await;
+
+    let err = actions::merge_pr_for_job(&orch, &job, None)
+        .await
+        .expect_err("a GitHub-refused merge must fail closed");
+    assert!(
+        err.contains("GitHub refused"),
+        "points at the PR, not local markers: {err}"
+    );
+    assert_eq!(mr_status(&orch.db.local, &mr).await, "open");
+    assert_eq!(issue_status(&orch.db.local, &issue).await, "active");
 }
 
 /// A jj-conflicted source must be refused BEFORE the fold, and the refusal must

@@ -48,8 +48,8 @@ async fn seed(db: &LocalDb) {
             )
             .await?;
             conn.execute(
-                "INSERT INTO runs(id, project_id, issue_id, job_id, status, session_id, backend, created_at, updated_at, start_mode)
-                 VALUES ('run-1', ?1, 'issue-1', 'job-1', 'live', 'session-1', 'openrouter', 1, 1, 'new')",
+                "INSERT INTO runs(id, project_id, issue_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-1', ?1, 'issue-1', 'job-1', 'live', 'session-1', 1, 1, 'new')",
                 params![project_id.as_str()],
             )
             .await?;

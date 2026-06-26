@@ -17,7 +17,7 @@ use crate::browsers::{
 use crate::orchestrator::Orchestrator;
 use crate::resources::browsers::{
     await_browser_nav, browser_bridge_roundtrip, browser_clear_data_roundtrip,
-    resolve_browser_scope, BRIDGE_TIMEOUT,
+    resolve_browser_target, BRIDGE_TIMEOUT,
 };
 
 /// Default page-side budget for a `waitFor` poll when the caller omits one.
@@ -75,7 +75,7 @@ pub(super) async fn apply_browser_ensure(
     resource: &CairnResource,
     url: Option<String>,
 ) -> Result<String, String> {
-    let (scope, slug) = resolve_browser_scope(&orch.db.local, resource).await?;
+    let (scope, slug) = resolve_browser_target(&orch.db.local, resource).await?;
     let now = chrono::Utc::now().timestamp();
     let (browser, inserted) =
         ensure_open_browser(&orch.db.local, scope, &slug, url.clone(), now).await?;
@@ -118,7 +118,7 @@ pub(crate) async fn apply_browser_action(
     action: String,
     args: BrowserInteractionArgs,
 ) -> Result<String, String> {
-    let (scope, slug) = resolve_browser_scope(&orch.db.local, resource).await?;
+    let (scope, slug) = resolve_browser_target(&orch.db.local, resource).await?;
     let now = chrono::Utc::now().timestamp();
     let (browser, _) = ensure_open_browser(&orch.db.local, scope, &slug, None, now).await?;
     send_command(
@@ -141,7 +141,15 @@ pub(crate) async fn apply_browser_action(
             Ok(format!("Browser '{slug}': forward"))
         }
         "reload" => {
-            send_command(orch, BrowserCommand::Reload { id: browser.id.clone() });
+            // Carry the stored page so the host reloads the navigated url rather
+            // than whatever the live webview drifted to (e.g. the app shell `/`).
+            send_command(
+                orch,
+                BrowserCommand::Reload {
+                    id: browser.id.clone(),
+                    url: browser.url.clone(),
+                },
+            );
             Ok(format!("Browser '{slug}': reload"))
         }
         "click" | "type" | "scroll" | "waitFor" => {
@@ -333,7 +341,10 @@ pub(super) async fn apply_browser_delete(
     orch: &Orchestrator,
     resource: &CairnResource,
 ) -> Result<String, String> {
-    let (scope, slug) = resolve_browser_scope(&orch.db.local, resource).await?;
+    // Focus-follow the bare/default form here too, so closing `cairn:~/browser`
+    // targets the same tab a bare read/action resolves to rather than a literal
+    // `default` row.
+    let (scope, slug) = resolve_browser_target(&orch.db.local, resource).await?;
     let browser = find_browser_by_scope_and_slug(&orch.db.local, scope, &slug)
         .await?
         .ok_or_else(|| format!("No browser open at slug '{slug}'"))?;
@@ -660,6 +671,38 @@ mod tests {
         assert!(
             err.contains("unknown browser action"),
             "an unadvertised verb must be rejected, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_carries_the_stored_url_so_it_never_drifts_to_root() {
+        let (orch, mut rx, _dir) = orch_with_tx().await;
+        let resource = default_browser();
+        // Navigate the tab to a real page so the row stores that url.
+        apply_browser_ensure(&orch, &resource, Some("https://example.com/login".into()))
+            .await
+            .unwrap();
+        drain(&mut rx);
+
+        // A reload must carry the stored page, not an empty url that would let the
+        // live webview reload wherever it drifted (e.g. the app shell `/`).
+        apply_browser_action(
+            &orch,
+            &resource,
+            "reload".into(),
+            BrowserInteractionArgs::default(),
+        )
+        .await
+        .unwrap();
+        let cmds = drain(&mut rx);
+        let reload_url = cmds.iter().find_map(|cmd| match cmd {
+            BrowserCommand::Reload { url, .. } => Some(url.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            reload_url,
+            Some(Some("https://example.com/login".to_string())),
+            "reload must carry the stored url, got {cmds:?}"
         );
     }
 

@@ -99,7 +99,7 @@ async fn produce_segment(
     if is_web_target(target) {
         return Produced::Segment(produce_web_segment(orch, request, target).await);
     }
-    if target.starts_with("cairn://") {
+    if is_cairn_resource_target(target) {
         return Produced::Segment(
             produce_resource_segment(orch, request, read_cursors, target).await,
         );
@@ -172,6 +172,10 @@ fn is_web_target(target: &str) -> bool {
         .map(|split| split.identity)
         .unwrap_or_else(|_| target.to_string());
     base.to_lowercase().ends_with(".pdf")
+}
+
+fn is_cairn_resource_target(target: &str) -> bool {
+    target.starts_with("cairn://") || target == "cairn:~" || target.starts_with("cairn:~/")
 }
 
 fn is_browser_resource_target(target: &str) -> bool {
@@ -894,6 +898,68 @@ mod tests {
              VALUES ('proj-rb', 'default', 'RB', 'RB', '/tmp/repo', 1, 1)",
         )
         .await;
+    }
+
+    async fn seed_home_run(orch: &Orchestrator) {
+        seed_project(orch).await;
+        exec(
+            orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-rb-1', 'proj-rb', 1, 'First', 'active', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-rb', 'recipe', 'issue-rb-1', 'proj-rb', 'running', 1, 1)",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, worktree_path)
+             VALUES ('job-rb', 'exec-rb', 'issue-rb-1', 'proj-rb', 'Builder', 'running', 1, 1, 'builder', '/tmp/repo-builder')",
+        )
+        .await;
+        exec(
+            orch,
+            "INSERT INTO runs(id, project_id, issue_id, job_id, status, backend, created_at, updated_at, start_mode)
+             VALUES ('run-rb', 'proj-rb', 'issue-rb-1', 'job-rb', 'live', 'codex', 1, 1, 'resume')",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn read_batch_bare_home_resolves_to_node_summary() {
+        let orch = seeded_orch().await;
+        seed_home_run(&orch).await;
+
+        let envelope =
+            read_batch_envelope_for_run(&orch, serde_json::json!(["cairn:~"]), Some("run-rb"))
+                .await;
+
+        assert!(envelope.text.contains("=== cairn:~"), "{}", envelope.text);
+        assert!(envelope.text.contains("# builder [◐]"), "{}", envelope.text);
+        assert!(envelope.text.contains("## Resources"), "{}", envelope.text);
+        assert!(
+            envelope.text.contains("cairn://p/RB/1/1/builder/chat"),
+            "{}",
+            envelope.text
+        );
+        assert!(
+            !envelope.text.contains("Invalid target"),
+            "{}",
+            envelope.text
+        );
+        assert_eq!(envelope.segments[0].kind, SegmentKind::Resource);
+    }
+
+    #[test]
+    fn cairn_home_targets_are_classified_as_resources() {
+        assert!(is_cairn_resource_target("cairn://p/X/1"));
+        assert!(is_cairn_resource_target("cairn:~"));
+        assert!(is_cairn_resource_target("cairn:~/todos"));
+        assert!(!is_cairn_resource_target("cairn:other"));
+        assert!(!is_cairn_resource_target("file:src/lib.rs"));
     }
 
     #[tokio::test]

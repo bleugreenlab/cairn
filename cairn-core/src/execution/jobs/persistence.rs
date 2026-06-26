@@ -16,14 +16,13 @@ pub(super) fn run_from_row(row: &turso::Row) -> DbResult<Run> {
             .unwrap_or(RunStatus::Starting),
         session_id: row.opt_text(5)?,
         chat_id: row.opt_text(11)?,
-        backend: row.opt_text(12)?,
-        exit_reason: row.opt_text(13)?,
+        exit_reason: row.opt_text(12)?,
         error_message: row.opt_text(6)?,
         started_at: row.opt_i64(7)?,
         exited_at: row.opt_i64(8)?,
         created_at: row.i64(9)?,
         updated_at: row.i64(10)?,
-        start_mode: row.opt_text(14)?.and_then(|mode| mode.parse().ok()),
+        start_mode: row.opt_text(13)?.and_then(|mode| mode.parse().ok()),
     })
 }
 
@@ -679,9 +678,9 @@ pub(super) async fn insert_run(db: Arc<LocalDb>, input: RunInsert) -> Result<i64
                 "INSERT INTO runs(
                     id, issue_id, project_id, job_id, chat_id, status, session_id,
                     error_message, started_at, exited_at, created_at, updated_at,
-                    backend, exit_reason, start_mode
+                    exit_reason, start_mode
                 )
-                VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, ?7, NULL, ?8, ?9, NULL, NULL, ?10)",
+                VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, NULL, ?7, NULL, ?8, ?9, NULL, ?10)",
                 params![
                     input.run_id.as_str(),
                     input.issue_id.as_deref(),
@@ -831,9 +830,9 @@ pub(super) async fn insert_child_job_session_run(
                 "INSERT INTO runs(
                     id, issue_id, project_id, job_id, chat_id, status, session_id,
                     error_message, started_at, exited_at, created_at, updated_at,
-                    backend, exit_reason, start_mode
+                    exit_reason, start_mode
                 )
-                VALUES (?1, ?2, ?3, ?4, NULL, 'starting', ?5, NULL, ?6, NULL, ?6, ?6, NULL, NULL, 'fresh')",
+                VALUES (?1, ?2, ?3, ?4, NULL, 'starting', ?5, NULL, ?6, NULL, ?6, ?6, NULL, 'fresh')",
                 params![
                     input.run_id.as_str(),
                     input.issue_id.as_deref(),

@@ -6,12 +6,13 @@
 //! - `event_vibes`: persisted per-event vibe color. The event vector itself is
 //!   transient — computed by the async worker, used to assign a color, discarded.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use crate::config::slugify_resource_segment;
 use crate::storage::{DbResult, LocalDb, RowExt};
-use turso::{params, Connection, Row};
+use turso::{params, Connection, Row, Value};
 
 #[derive(Debug, Clone)]
 pub struct ResourceEmbeddingRecord {
@@ -268,27 +269,47 @@ pub async fn get_event_vibes_for_events_async(
         return Ok(Vec::new());
     }
 
-    db.read(|conn| {
-        let event_ids = event_ids.to_vec();
-        Box::pin(async move {
-            let mut out = Vec::new();
-            for event_id in event_ids {
-                let mut rows = conn
-                    .query(
+    // One batched read on the event_vibes PRIMARY KEY (event_id), replacing the
+    // former per-event N+1 loop (one round-trip per id). Chunked to stay clear
+    // of the SQL bind-variable limit for large id sets; every chunk's rows merge
+    // into one map, then we emit in the caller's input order. Output is
+    // byte-for-byte identical to the old loop: input order preserved, ids
+    // without a vibe skipped, and a repeated input id yields its row once per
+    // occurrence.
+    const CHUNK: usize = 500;
+
+    let fetched: Vec<EventVibeRecord> = db
+        .read(|conn| {
+            let event_ids = event_ids.to_vec();
+            Box::pin(async move {
+                let mut rows_out = Vec::new();
+                for chunk in event_ids.chunks(CHUNK) {
+                    let placeholders = vec!["?"; chunk.len()].join(", ");
+                    let sql = format!(
                         "SELECT event_id, css_color, phase, friction, model, created_at
                          FROM event_vibes
-                         WHERE event_id = ?1",
-                        params![event_id.as_str()],
-                    )
-                    .await?;
-                if let Some(row) = rows.next().await? {
-                    out.push(event_vibe_from_row(&row)?);
+                         WHERE event_id IN ({placeholders})"
+                    );
+                    let params: Vec<Value> =
+                        chunk.iter().map(|id| Value::Text(id.clone())).collect();
+                    let mut rows = conn.query(&sql, params).await?;
+                    while let Some(row) = rows.next().await? {
+                        rows_out.push(event_vibe_from_row(&row)?);
+                    }
                 }
-            }
-            Ok(out)
+                Ok(rows_out)
+            })
         })
-    })
-    .await
+        .await?;
+
+    // event_id is the table PRIMARY KEY, so at most one row per id.
+    let by_id: HashMap<&str, &EventVibeRecord> =
+        fetched.iter().map(|r| (r.event_id.as_str(), r)).collect();
+
+    Ok(event_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()).map(|r| (*r).clone()))
+        .collect())
 }
 
 // ===== sessions.current_pos (live semantic position) =====
@@ -537,6 +558,118 @@ mod tests {
             resolve_session_owner_uri_async(&db, "ghost").await.unwrap(),
             None
         );
+    }
+
+    /// The original per-event implementation, kept verbatim as a test oracle so
+    /// the batched query is provably output-equivalent to the loop it replaced.
+    async fn vibes_per_event_loop(db: &LocalDb, event_ids: &[String]) -> Vec<EventVibeRecord> {
+        db.read(|conn| {
+            let event_ids = event_ids.to_vec();
+            Box::pin(async move {
+                let mut out = Vec::new();
+                for event_id in event_ids {
+                    let mut rows = conn
+                        .query(
+                            "SELECT event_id, css_color, phase, friction, model, created_at
+                             FROM event_vibes
+                             WHERE event_id = ?1",
+                            params![event_id.as_str()],
+                        )
+                        .await?;
+                    if let Some(row) = rows.next().await? {
+                        out.push(event_vibe_from_row(&row)?);
+                    }
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    // f32 fields compared by bit pattern: same stored row, so exact, and no
+    // float-equality lint.
+    fn as_tuples(records: &[EventVibeRecord]) -> Vec<(String, String, u32, u32, String, i64)> {
+        records
+            .iter()
+            .map(|r| {
+                (
+                    r.event_id.clone(),
+                    r.css_color.clone(),
+                    r.phase.to_bits(),
+                    r.friction.to_bits(),
+                    r.model.clone(),
+                    r.created_at,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn vibes_for_events_batched_matches_per_event_loop() {
+        let db = migrated_db().await;
+
+        // event_vibes.event_id has a FOREIGN KEY onto events(id), so seed a run
+        // and the parent events before inserting vibes.
+        exec(
+            &db,
+            "INSERT INTO runs(id, created_at, updated_at) VALUES ('run-1', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+             VALUES
+                ('e1', 'run-1', 'sess-1', 1, 1, 'assistant', '{}', 1),
+                ('e2', 'run-1', 'sess-1', 2, 1, 'assistant', '{}', 1),
+                ('e3', 'run-1', 'sess-1', 3, 1, 'assistant', '{}', 1),
+                ('e4', 'run-1', 'sess-1', 4, 1, 'assistant', '{}', 1),
+                ('e5', 'run-1', 'sess-1', 5, 1, 'assistant', '{}', 1)",
+        )
+        .await;
+
+        // Seed vibes for several events.
+        let seeded = ["e1", "e2", "e3", "e4", "e5"];
+        for (i, id) in seeded.iter().enumerate() {
+            upsert_event_vibe_async(
+                &db,
+                id,
+                Some("sess-1"),
+                &format!("#0000{i:02}"),
+                0.1 * i as f32,
+                0.2 * i as f32,
+                "vibe-model",
+            )
+            .await
+            .unwrap();
+        }
+
+        // Input mixes out-of-insertion order, an id with no vibe ("ghost"), and a
+        // duplicate id ("e2") — exactly the positional cases the old loop handled.
+        let input: Vec<String> = ["e3", "ghost", "e1", "e2", "e5", "e2"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+
+        let batched = get_event_vibes_for_events_async(&db, &input).await.unwrap();
+        let oracle = vibes_per_event_loop(&db, &input).await;
+        assert_eq!(as_tuples(&batched), as_tuples(&oracle));
+
+        // Spell out the contract the oracle encodes: input order kept, ghost
+        // skipped, duplicate e2 emitted twice.
+        assert_eq!(
+            batched
+                .iter()
+                .map(|r| r.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e3", "e1", "e2", "e5", "e2"]
+        );
+
+        // Empty input short-circuits to empty output.
+        assert!(get_event_vibes_for_events_async(&db, &[])
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

@@ -67,7 +67,7 @@ pub use issue::{
 pub use label::{CreateLabel, Label, UpdateLabel};
 
 // Job types (replaces timeline_nodes)
-pub use job::{Job, JobStatus, NodeAttempt};
+pub use job::{Job, JobStatus};
 
 // Execution types (recipe instances)
 pub use execution::{

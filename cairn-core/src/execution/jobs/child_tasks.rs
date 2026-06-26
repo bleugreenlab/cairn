@@ -159,7 +159,6 @@ pub fn create_child_task(
         job_id: Some(job_id.clone()),
         issue_id: issue_id.clone(),
         status: Some("starting".to_string()),
-        backend: None,
         exit_reason: None,
         error_message: None,
         started_at: Some(now as i64),

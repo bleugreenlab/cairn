@@ -3,6 +3,11 @@
 //! Handles: edit (unified file mutations), read
 
 pub(crate) mod change;
+
+/// Host-driven user file edit, reusing the agent `write` verb's VCS seal seam.
+/// Re-exported here so the Tauri `save_worktree_file` command can reach it
+/// through `cairn_core::internal::mcp::handlers::files`.
+pub use change::host_edit::commit_user_file_edit;
 mod read;
 mod target;
 

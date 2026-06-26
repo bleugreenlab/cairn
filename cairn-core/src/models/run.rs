@@ -16,7 +16,6 @@ pub struct Run {
     pub chat_id: Option<String>,
     pub status: RunStatus,
     pub session_id: Option<String>,
-    pub backend: Option<String>,
     pub exit_reason: Option<String>,
     pub error_message: Option<String>,
     pub started_at: Option<i64>,
@@ -135,6 +134,13 @@ pub struct Event {
     pub output_tokens: Option<i32>,
     pub turn_id: Option<String>,
     pub thinking_tokens: Option<i32>,
+    /// Metered per-event cost in USD. Written only on a metered backend's
+    /// `result:success` event (OpenRouter); `None` for subscription backends
+    /// (Claude/Codex) and for streamed assistant messages, where cost lands on
+    /// the result event. Read-only here — surfaced in the event detail; the
+    /// write path lives in the backend runtime.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost_usd: Option<f64>,
     /// Archival storage mode (CAIRN-1538): `full` (or absent) for a live inline
     /// event, `gitcoord`/`zstd` for one rewritten at worktree teardown. These
     /// coordinate fields drive `archival::reconstruct_events` and are skipped

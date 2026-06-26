@@ -4,4 +4,5 @@ pub mod canon;
 pub mod commands;
 pub mod db;
 pub mod hooks;
+pub mod ledger;
 pub mod triage;
