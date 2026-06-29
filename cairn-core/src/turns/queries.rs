@@ -3,6 +3,7 @@
 use crate::models::{Turn, TurnStartReason, TurnState, TurnYieldReason};
 use crate::services::EventEmitter;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use cairn_common::ids;
 use turso::params;
 
 #[derive(Debug, Clone)]
@@ -683,7 +684,7 @@ async fn ensure_resume_successor_conn(
 
     let successor = create_successor_turn_conn(
         conn,
-        &uuid::Uuid::new_v4().to_string(),
+        &ids::mint_child(job_id),
         session_id,
         job_id,
         predecessor_id,

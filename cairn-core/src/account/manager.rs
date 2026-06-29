@@ -171,7 +171,12 @@ impl AccountManager {
         block_on_account_db(async move { get_account_connection(&db).await })
     }
 
-    /// Get the decrypted JWT for API calls.
+    /// Get the decrypted JWT for API calls, or `None` when no token is stored
+    /// or the stored token has expired. Mirrors
+    /// `AnonDeviceManager::get_anon_jwt`: an expired token is useless for API
+    /// calls (every gateway 401s it) and would shadow the anonymous `/embed`
+    /// fallback, so it is treated as absent. The background refresh loop reads
+    /// the raw token via `get_jwt_data`, so it can still renew an expired token.
     pub fn get_jwt(&self) -> Result<Option<String>, String> {
         let db = self.db.clone();
         block_on_account_db(async move { get_jwt_from_db(&db).await })
@@ -509,6 +514,13 @@ async fn get_jwt_data(db: &DbState) -> Result<Option<(String, Option<i64>)>, Str
 
 async fn get_jwt_from_db(db: &DbState) -> Result<Option<String>, String> {
     match get_jwt_data(db).await? {
+        // An expired token is treated as absent: callers get `None` rather than
+        // a credential every gateway rejects with 401. Critically, this lets
+        // `resolve_embed_token` fall through to the anonymous device token
+        // instead of letting a lapsed account JWT shadow it and silently kill
+        // vibe coloring. A token with no recorded expiry is returned as-is (the
+        // legacy posture — we can't prove it stale).
+        Some((_encrypted, Some(exp))) if exp <= chrono::Utc::now().timestamp() => Ok(None),
         Some((encrypted, _)) => decrypt_jwt_from_storage(&encrypted).map(Some),
         None => Ok(None),
     }

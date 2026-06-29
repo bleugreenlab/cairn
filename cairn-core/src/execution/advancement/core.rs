@@ -6,8 +6,16 @@ use super::*;
 /// db-change events and returns the claimed jobs for the host to spawn / for
 /// `reduce_dag` to dispatch by node type.
 pub fn advance_execution_impl(orch: &Orchestrator, execution_id: &str) -> Result<Vec<Job>, String> {
-    let db = orch.db.local.clone();
     let execution_id = execution_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let newly_ready = run_advancement_db(async move {
         db.write(|conn| {
             let execution_id = execution_id.clone();

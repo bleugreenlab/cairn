@@ -55,6 +55,11 @@ pub async fn handle_search(orch: &Orchestrator, request: &McpCallbackRequest) ->
         limit,
     };
 
+    // Drain every open database's outbox so team-replica writes are indexed
+    // before the query, not only at startup.
+    if let Err(error) = orch.db.apply_pending_search().await {
+        return format!("Search failed: {error}");
+    }
     match crate::search::search_content(
         &orch.db.local,
         &orch.db.search_index,

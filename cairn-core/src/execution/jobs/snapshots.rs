@@ -82,7 +82,7 @@ fn store_transcript_event_with_turn(
     transcript_event: TranscriptEvent,
     push_ids: &[String],
 ) -> Result<(), String> {
-    let event_id = Uuid::new_v4().to_string();
+    let event_id = ids::mint_child(run_id);
     let event_type = transcript_event.event_type.clone();
     let event_data = serde_json::to_string(&transcript_event).unwrap_or_default();
     let turn_id = turn_id.map(str::to_string);
@@ -105,33 +105,33 @@ fn store_transcript_event_with_turn(
         turn_id: turn_id.clone(),
         cost_usd: None,
     };
+    // Route the event INSERT to the run's owning replica (fail-closed): a team
+    // run's transcript lives wholly in its synced DB, never private.
+    let owning = crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     // CAIRN-1881: when this event carries attention pushes, stamp them delivered
     // in the same transaction as the event INSERT (atomic delivery seam).
     if push_ids.is_empty() {
-        insert_event(orch.db.local.clone(), event)?;
+        insert_event(owning, event)?;
     } else {
-        insert_event_stamping_pushes(orch.db.local.clone(), event, push_ids.to_vec())?;
+        insert_event_stamping_pushes(owning, event, push_ids.to_vec())?;
     }
-
-    orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
-        id: event_id,
-        run_id: run_id.to_string(),
-        session_id: Some(session_id.to_string()),
-        sequence: Some(sequence),
-        event_type,
-        data: Some(event_data),
-        input_tokens: None,
-        output_tokens: None,
-        cache_read_tokens: None,
-        cache_create_tokens: None,
-        thinking_tokens: None,
-        created_at: Some(now as i64),
-        turn_id,
-    }));
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        crate::notify::event_db_change(run_id, Some(session_id), "insert"),
+        crate::notify::event_db_change_for_run(
+            orch.db.local.clone(),
+            run_id,
+            Some(session_id),
+            "insert",
+        ),
     );
 
     Ok(())
@@ -150,7 +150,16 @@ pub(crate) fn store_user_event_with_turn(
     let sequence = if sequence >= 0 {
         sequence
     } else {
-        get_next_sequence(orch.db.local.clone(), run_id)?
+        let owning = crate::storage::run_db_blocking({
+            let dbs = orch.db.clone();
+            let run_id = run_id.to_string();
+            move || async move {
+                crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })?;
+        get_next_sequence(owning, run_id)?
     };
     let transcript_event = TranscriptEvent {
         event_type: "user".to_string(),
@@ -197,7 +206,16 @@ pub fn store_tool_result_event_with_turn(
     now: i32,
     turn_id: Option<&str>,
 ) -> Result<(), String> {
-    let sequence = get_next_sequence(orch.db.local.clone(), run_id)?;
+    let owning = crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let sequence = get_next_sequence(owning, run_id)?;
     let transcript_event = TranscriptEvent {
         event_type: "tool_result".to_string(),
         session_id: Some(session_id.to_string()),
@@ -238,7 +256,16 @@ pub(crate) fn store_attention_push_event(
     now: i32,
     turn_id: Option<&str>,
 ) -> Result<(), String> {
-    let sequence = get_next_sequence(orch.db.local.clone(), run_id)?;
+    let owning = crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let sequence = get_next_sequence(owning, run_id)?;
     // CAIRN-1891: the carrying event for a resumed-into wake renders through the
     // wake-card formatter; `content` is the structured `{active, catchup}` JSON.
     let transcript_event = TranscriptEvent {

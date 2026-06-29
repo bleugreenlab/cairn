@@ -202,6 +202,7 @@ struct DiffCoords {
     execution_id: Option<String>,
     repo_path: String,
     default_branch: String,
+    base_branch: Option<String>,
     base_anchor: Option<String>,
 }
 
@@ -212,7 +213,7 @@ async fn load_diff_coords(db: &LocalDb, job_id: &str) -> DbResult<Option<DiffCoo
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.worktree_path, j.execution_id, p.repo_path, p.default_branch
+                    "SELECT j.worktree_path, j.execution_id, p.repo_path, p.default_branch, j.base_branch
                      FROM jobs j JOIN projects p ON j.project_id = p.id
                      WHERE j.id = ?1 LIMIT 1",
                     (job_id.as_str(),),
@@ -225,6 +226,7 @@ async fn load_diff_coords(db: &LocalDb, job_id: &str) -> DbResult<Option<DiffCoo
             let execution_id = row.opt_text(1)?;
             let repo_path = row.text(2)?;
             let default_branch = row.opt_text(3)?.unwrap_or_else(|| "main".to_string());
+            let base_branch = row.opt_text(4)?;
 
             // Base anchor: the fork point recorded on the earliest job sharing
             // this worktree (the inheriting children come later), mirroring how
@@ -252,6 +254,7 @@ async fn load_diff_coords(db: &LocalDb, job_id: &str) -> DbResult<Option<DiffCoo
                 execution_id,
                 repo_path,
                 default_branch,
+                base_branch,
                 base_anchor,
             }))
         })
@@ -319,24 +322,33 @@ pub async fn node_base_tip_diff(
         // repo up the directory tree. Resolve both base and tip jj-natively for
         // those, and keep the git path only for genuine plain-git worktrees.
         let is_jj = crate::jj::is_jj_dir(wt);
-        let base = match coords.base_anchor.clone() {
-            Some(base) => base,
-            None if is_jj => {
-                // A jj workspace captures its base anchor jj-natively at job
-                // creation, so a missing anchor here is a degenerate state — and
-                // the git merge-base fallback can't run in a `.jj`-only worktree.
-                log::warn!("node diff: jj workspace {worktree_path} has no recorded base anchor");
-                return Ok(None);
-            }
-            None => match merge_base_fallback(&worktree_path, &coords.default_branch) {
-                Some(base) => base,
-                None => return Ok(None),
-            },
+        let jj = is_jj.then(|| crate::jj::JjEnv::resolve(jj_binary_path, config_dir));
+        let base = if let Some(jj) = jj.as_ref() {
+            crate::jj::resolve_node_fork_point(
+                jj,
+                wt,
+                coords.base_branch.as_deref().or(Some(coords.default_branch.as_str())),
+                coords.base_anchor.as_deref(),
+            )
+            .or_else(|| coords.base_anchor.clone())
+            .or_else(|| {
+                log::warn!(
+                    "node diff: jj workspace {worktree_path} has no resolvable fork point or recorded base anchor"
+                );
+                None
+            })
+        } else {
+            coords
+                .base_anchor
+                .clone()
+                .or_else(|| merge_base_fallback(&worktree_path, &coords.default_branch))
         };
-        let tip = if is_jj {
+        let Some(base) = base else {
+            return Ok(None);
+        };
+        let tip = if let Some(jj) = jj.as_ref() {
             // `@-` is the latest sealed commit — the jj analogue of git HEAD.
-            let jj = crate::jj::JjEnv::resolve(jj_binary_path, config_dir);
-            match crate::jj::head_commit(&jj, wt) {
+            match crate::jj::head_commit(jj, wt) {
                 Ok(sha) if !sha.trim().is_empty() => sha.trim().to_string(),
                 Ok(_) => return Ok(None),
                 Err(e) => {
@@ -487,7 +499,7 @@ mod tests {
 
     mod db {
         use super::super::*;
-        use crate::archival::testutil::{commit_all, init_repo, write_file};
+        use crate::archival::testutil::{commit_all, git, init_repo, write_file};
         use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
         async fn migrated_db() -> LocalDb {
@@ -736,6 +748,80 @@ mod tests {
             );
             assert_eq!(diff.commits_ahead, 1);
             assert!(diff.total_additions >= 1);
+        }
+
+        /// Regression for base-advance pollution in the two-tree PR/node diff.
+        /// The node is rebased onto an externally advanced `main@origin` that
+        /// deleted a base file; diffing from the live effective fork point must
+        /// show only the node's own addition, not that base deletion.
+        #[tokio::test]
+        #[serial_test::serial(jj)]
+        async fn node_base_tip_diff_excludes_rebased_external_base_deletion() {
+            let Some(bin) = jj_bin() else {
+                eprintln!("skipping node_base_tip_diff_excludes_rebased_external_base_deletion: jj not resolvable via CAIRN_JJ_BIN/PATH");
+                return;
+            };
+            let home = tempfile::tempdir().unwrap();
+            let origin = tempfile::tempdir().unwrap();
+            let proj = tempfile::tempdir().unwrap();
+            let wts = tempfile::tempdir().unwrap();
+
+            git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+            init_repo(proj.path());
+            write_file(proj.path(), "shared.rs", b"base\n");
+            write_file(proj.path(), "base-only.rs", b"base-only\n");
+            let base = commit_all(proj.path(), "base");
+            git(
+                proj.path(),
+                &["remote", "add", "origin", &origin.path().to_string_lossy()],
+            );
+            git(proj.path(), &["push", "-q", "origin", "main"]);
+
+            let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+            let store = home.path().join("jj-stores").join("proj");
+            crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+            let ws = wts.path().join("job");
+            let branch = "agent/CAIRN-1-builder-0";
+            crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+
+            std::fs::write(ws.join("node.rs"), "node\n").unwrap();
+            crate::jj::seal(&jj, &ws, "node work", None).unwrap();
+
+            std::fs::remove_file(proj.path().join("base-only.rs")).unwrap();
+            git(proj.path(), &["add", "-A"]);
+            git(
+                proj.path(),
+                &["commit", "-q", "-m", "external base deletion"],
+            );
+            git(proj.path(), &["push", "-q", "origin", "main"]);
+            crate::jj::fetch_remote(&jj, &store, "origin").unwrap();
+            crate::jj::reconcile_siblings(
+                &jj,
+                &store,
+                "main@origin",
+                &[(branch.to_string(), ws.clone())],
+            )
+            .unwrap();
+
+            let db = migrated_db().await;
+            seed_worktree_group(
+                &db,
+                proj.path().to_str().unwrap(),
+                ws.to_str().unwrap(),
+                Some(&base),
+            )
+            .await;
+
+            let diff = node_base_tip_diff(&db, "owner", &bin, home.path())
+                .await
+                .unwrap()
+                .expect("live jj diff present");
+            let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+            assert_eq!(
+                paths,
+                vec!["node.rs"],
+                "base deletion must be absent: {paths:?}"
+            );
         }
     }
 }

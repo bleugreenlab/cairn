@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod sync_server;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -297,6 +299,17 @@ pub fn stale_sibling_advance(
     jj::rebase_branch_onto(&jj, &store, primary_branch, sibling_branch).unwrap();
 }
 
+/// True when the unfenced sync CI lane has demanded these tests actually RUN.
+/// Set via `CAIRN_REQUIRE_SYNC_TESTS=1` by `.github/workflows/sync-tests.yml`.
+/// In that mode a would-be skip — a fenced process (here) or a missing `tursodb`
+/// (see `sync_server::SyncServer::locate_or_spawn`) — is a HARD FAILURE rather
+/// than a vacuous green, because the whole point of that lane is to exercise the
+/// Turso-sync integration tests for real. (CAIRN-2170: these self-skips are
+/// exactly how a sync misdiagnosis stood unrefuted — a skip is NOT a pass.)
+pub fn sync_tests_required() -> bool {
+    std::env::var_os("CAIRN_REQUIRE_SYNC_TESTS").is_some()
+}
+
 pub fn skip_if_fenced(test: &str) -> bool {
     let explicitly_sandboxed = std::env::var_os("CAIRN_SANDBOXED").is_some();
     // Cargo can be launched from an agent run-tool without preserving the
@@ -307,6 +320,14 @@ pub fn skip_if_fenced(test: &str) -> bool {
         && std::env::var_os("CAIRN_WORKTREE").is_some();
 
     if explicitly_sandboxed || run_tool_context {
+        // In the unfenced sync lane a fenced process can't run these tests, so
+        // skipping would read green while proving nothing — fail loudly instead.
+        assert!(
+            !sync_tests_required(),
+            "{test}: CAIRN_REQUIRE_SYNC_TESTS is set but this process is fenced — the \
+             unfenced sync lane must run with the CAIRN_SANDBOXED / CAIRN_CALLBACK_URL / \
+             CAIRN_RUN_ID / CAIRN_WORKTREE fence vars UNSET. A skip is NOT a pass."
+        );
         eprintln!("skipping {test}: cannot run nested inside a Cairn worktree fence");
         record_fence_skip(test);
         true

@@ -19,20 +19,16 @@ pub(crate) async fn read_node_memories_collection(
     exec_seq: i32,
     node_id: &str,
 ) -> String {
+    let db = orch.db.for_project(project).await;
     let job_id = match crate::resources::node::resolve_todos_job_id(
-        &orch.db.local,
-        project,
-        number,
-        exec_seq,
-        node_id,
-        None,
+        &db, project, number, exec_seq, node_id, None,
     )
     .await
     {
         Ok(job_id) => job_id,
         Err(error) => return error,
     };
-    let memories = match crate::memories::db::load_memories_for_job(&orch.db.local, &job_id).await {
+    let memories = match crate::memories::db::load_memories_for_job(&db, &job_id).await {
         Ok(memories) => memories,
         Err(error) => return format!("Error listing node memories: {error}"),
     };
@@ -69,13 +65,9 @@ pub(crate) async fn read_node_memory(
     node_id: &str,
     memory_seq: i32,
 ) -> String {
+    let db = orch.db.for_project(project).await;
     let memory_id = match crate::memories::db::resolve_node_memory_id(
-        &orch.db.local,
-        project,
-        number,
-        exec_seq,
-        node_id,
-        memory_seq,
+        &db, project, number, exec_seq, node_id, memory_seq,
     )
     .await
     {
@@ -83,7 +75,7 @@ pub(crate) async fn read_node_memory(
         Ok(None) => return format!("Memory not found at {node_id}/memories/{memory_seq}"),
         Err(error) => return format!("Error resolving node memory: {error}"),
     };
-    let memory = match crate::memories::db::load_memory(&orch.db.local, &memory_id).await {
+    let memory = match crate::memories::db::load_memory(&db, &memory_id).await {
         Ok(memory) => memory,
         Err(_) => return format!("Memory not found at {node_id}/memories/{memory_seq}"),
     };

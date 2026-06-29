@@ -14,7 +14,7 @@
 //! It lives here rather than on the seeded checkpoint artifact because re-arming
 //! deletes that artifact (so the projection falls back through to Pending).
 
-use uuid::Uuid;
+use cairn_common::ids;
 
 use crate::execution::advancement::run_advancement_db;
 use crate::execution::conditions::CheckpointRunOutput;
@@ -69,7 +69,15 @@ pub fn record_checkpoint_run(
     commit_sha: Option<&str>,
     output: &CheckpointRunOutput,
 ) -> Result<i64, String> {
-    let db = orch.db.local.clone();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let job_id = job_id.to_string();
     let command = command.to_string();
     let commit_sha = commit_sha.map(str::to_string);
@@ -99,7 +107,7 @@ pub fn record_checkpoint_run(
                         .unwrap_or(0)
                         + 1
                 };
-                let id = Uuid::new_v4().to_string();
+                let id = ids::mint_child(job_id.as_str());
                 let now = chrono::Utc::now().timestamp();
                 conn.execute(
                     "INSERT INTO checkpoint_runs (
@@ -131,7 +139,15 @@ pub fn record_checkpoint_run(
 
 /// Number of recorded runs (= attempts) for a checkpoint job.
 pub fn checkpoint_attempt_count(orch: &Orchestrator, job_id: &str) -> Result<i64, String> {
-    let db = orch.db.local.clone();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let job_id = job_id.to_string();
     run_advancement_db(async move {
         db.read(|conn| {
@@ -161,7 +177,15 @@ pub fn latest_checkpoint_run(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<Option<CheckpointRunRow>, String> {
-    let db = orch.db.local.clone();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let job_id = job_id.to_string();
     run_advancement_db(async move {
         db.read(|conn| {
@@ -203,7 +227,15 @@ pub fn latest_checkpoint_run(
 /// Delete all recorded runs for a checkpoint job. Used by the manual Re-run
 /// button to start a fresh attempt cycle (resets the cap).
 pub fn reset_checkpoint_runs(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let job_id = job_id.to_string();
     run_advancement_db(async move {
         db.write(|conn| {

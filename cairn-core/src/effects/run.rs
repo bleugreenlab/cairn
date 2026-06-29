@@ -74,8 +74,15 @@ pub async fn execute_effects(
                     port,
                     error_msg,
                 } => {
+                    // The condition evaluation row lands in the execution's
+                    // owning database (CAIRN-2197) — the synced replica for a
+                    // team execution, the private DB otherwise.
+                    let db =
+                        crate::execution::routing::owning_db_for_execution(&orch.db, &execution_id)
+                            .await
+                            .map_err(|e| e.to_string())?;
                     crate::execution::conditions::store_condition_evaluation(
-                        &orch.db.local,
+                        &db,
                         &execution_id,
                         &node_id,
                         &port,
@@ -314,37 +321,44 @@ async fn evaluate_condition(
     node_id: &str,
     node_name: &str,
 ) -> Option<EffectResult> {
-    let node = match crate::execution::conditions::load_condition_node(
-        &orch.db.local,
-        execution_id,
-        node_id,
-    )
-    .await
+    // Condition nodes read the execution snapshot + upstream artifacts; for a
+    // team execution those rows live in the synced replica, so resolve the
+    // owning database rather than reading the private DB (CAIRN-2197).
+    let db = match crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await
     {
-        Ok(node) => node,
-        Err(error) => {
-            log::error!("Failed to load condition node '{}': {}", node_name, error);
-            return None;
-        }
-    };
-
-    let context = match crate::execution::conditions::gather_condition_context(
-        &orch.db.local,
-        execution_id,
-        node_id,
-    )
-    .await
-    {
-        Ok(context) => context,
+        Ok(db) => db,
         Err(error) => {
             log::error!(
-                "Failed to gather context for condition node '{}': {}",
+                "Failed to resolve owning database for condition node '{}': {}",
                 node_name,
                 error
             );
             return None;
         }
     };
+    let node =
+        match crate::execution::conditions::load_condition_node(&db, execution_id, node_id).await {
+            Ok(node) => node,
+            Err(error) => {
+                log::error!("Failed to load condition node '{}': {}", node_name, error);
+                return None;
+            }
+        };
+
+    let context =
+        match crate::execution::conditions::gather_condition_context(&db, execution_id, node_id)
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                log::error!(
+                    "Failed to gather context for condition node '{}': {}",
+                    node_name,
+                    error
+                );
+                return None;
+            }
+        };
 
     match crate::execution::conditions::evaluate_condition_node(
         orch.services.completion.as_ref(),

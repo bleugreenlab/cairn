@@ -20,8 +20,17 @@ pub(super) fn load_agent_config(
             exec_id,
             aid
         );
+        let exec_db = run_db({
+            let dbs = orch.db.clone();
+            let exec_id = exec_id.clone();
+            async move {
+                crate::execution::routing::owning_db_for_execution(&dbs, &exec_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })?;
         let snapshot_data = run_db(load_agent_snapshot_data(
-            orch.db.local.clone(),
+            exec_db,
             exec_id.clone(),
             aid.clone(),
         ))?;
@@ -104,10 +113,6 @@ pub(super) fn load_agent_config(
 
     Ok(agent)
 }
-
-pub(super) const RUN_COLUMNS: &str =
-    "id, issue_id, project_id, job_id, status, session_id, error_message,
-    started_at, exited_at, created_at, updated_at, chat_id, backend, exit_reason, start_mode";
 
 pub(super) const SESSION_COLUMNS: &str = "id, job_id, chat_id, backend, status, parent_session_id,
     replaced_by_id, terminal_reason, sequence, created_at, closed_at, updated_at, backend_id";

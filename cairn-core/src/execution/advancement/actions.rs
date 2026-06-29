@@ -49,8 +49,16 @@ pub async fn advance_execution_with_actions(
 pub fn block_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
     // Ensure the blockable job has an (unconfirmed) checkpoint artifact so the
     // confirmed gate has a row to flip, then let the projection derive Blocked.
-    let db = orch.db.local.clone();
     let job_id_owned = job_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id_owned = job_id_owned.clone();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id_owned)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_advancement_db(async move {
         db.write(|conn| {
             let job_id = job_id_owned.clone();
@@ -66,7 +74,16 @@ pub fn block_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
 
 pub fn mark_job_failed(orch: &Orchestrator, job_id: &str, error: &str) -> Result<(), String> {
     // Record the failure as a turn fact; the projection derives Failed and cascades.
-    let fail_db = orch.db.local.clone();
+    let owning_db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let fail_db = owning_db.clone();
     let fail_job_id = job_id.to_string();
     run_advancement_db(async move {
         fail_db
@@ -78,7 +95,7 @@ pub fn mark_job_failed(orch: &Orchestrator, job_id: &str, error: &str) -> Result
             .map_err(|e| e.to_string())
     })?;
 
-    let db = orch.db.local.clone();
+    let db = owning_db.clone();
     let job_id_owned = job_id.to_string();
     let run_id = run_advancement_db(async move {
         db.query_text(
@@ -125,9 +142,17 @@ pub fn create_action_run(
     });
 
     let now = chrono::Utc::now().timestamp() as i32;
-    let action_run_id = Uuid::new_v4().to_string();
-    let db = orch.db.local.clone();
+    let action_run_id = ids::mint_child(execution_id);
     let execution_id_owned = execution_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id_owned = execution_id_owned.clone();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id_owned)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let node_id = node.id.clone();
     let node_name = node.name.clone();
     let action_run_id_for_db = action_run_id.clone();
@@ -332,8 +357,16 @@ fn load_checkpoint_parent_and_name(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<(Option<String>, Option<String>), String> {
-    let db = orch.db.local.clone();
     let job_id = job_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_advancement_db(async move {
         db.read(|conn| {
             let job_id = job_id.clone();
@@ -358,8 +391,16 @@ fn load_checkpoint_parent_and_name(
 }
 
 fn job_has_session(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
-    let db = orch.db.local.clone();
     let job_id = job_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_advancement_db(async move {
         db.read(|conn| {
             let job_id = job_id.clone();
@@ -391,7 +432,16 @@ fn job_has_session(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
 /// command against the new worktree HEAD. A cheap no-op when nothing is eligible.
 pub fn rearm_blocked_checkpoints(orch: &Orchestrator, execution_id: &str) -> Result<(), String> {
     // Map checkpoint node ids from the execution snapshot.
-    let nodes = load_nodes_from_execution(orch.db.local.clone(), execution_id)?;
+    let exec_db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let nodes = load_nodes_from_execution(exec_db, execution_id)?;
     let checkpoint_node_ids: HashSet<String> = nodes
         .iter()
         .filter(|n| n.node_type == "checkpoint")
@@ -455,7 +505,16 @@ pub async fn rerun_checkpoint_job(orch: &Orchestrator, job_id: &str) -> Result<V
     let execution_id = execution_id.ok_or_else(|| "Checkpoint job has no execution".to_string())?;
     let node_id = recipe_node_id.ok_or_else(|| "Checkpoint job has no recipe node".to_string())?;
 
-    let nodes = load_nodes_from_execution(orch.db.local.clone(), &execution_id)?;
+    let exec_db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let nodes = load_nodes_from_execution(exec_db, &execution_id)?;
     let is_checkpoint = nodes
         .iter()
         .any(|n| n.id == node_id && n.node_type == "checkpoint");
@@ -478,8 +537,16 @@ fn load_blocked_checkpoint_jobs(
     execution_id: &str,
     checkpoint_node_ids: &HashSet<String>,
 ) -> Result<Vec<BlockedCheckpointJob>, String> {
-    let db = orch.db.local.clone();
     let execution_id = execution_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let node_ids: HashSet<String> = checkpoint_node_ids.clone();
     run_advancement_db(async move {
         db.read(|conn| {
@@ -520,8 +587,16 @@ fn resolve_checkpoint_worktree(
     execution_id: &str,
     parent_job_id: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let db = orch.db.local.clone();
     let execution_id = execution_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let parent_job_id = parent_job_id.map(str::to_string);
     run_advancement_db(async move {
         db.read(|conn| {
@@ -556,8 +631,16 @@ fn resolve_checkpoint_worktree(
 }
 
 fn job_is_running(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
-    let db = orch.db.local.clone();
     let job_id = job_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_advancement_db(async move {
         db.read(|conn| {
             let job_id = job_id.clone();
@@ -580,7 +663,16 @@ fn job_is_running(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
 }
 
 fn reset_checkpoint_job_to_pending(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let owning_db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let db = owning_db.clone();
     let job_id_for_emit = job_id.to_string();
     let job_id = job_id_for_emit.clone();
     run_advancement_db(async move {
@@ -609,7 +701,7 @@ fn reset_checkpoint_job_to_pending(orch: &Orchestrator, job_id: &str) -> Result<
         .map_err(|e| format!("Failed to reset checkpoint job: {e}"))
     })?;
     let job = run_advancement_db({
-        let db = orch.db.local.clone();
+        let db = owning_db.clone();
         let job_id = job_id_for_emit.clone();
         async move {
             crate::jobs::queries::get_job(&db, &job_id)
@@ -629,8 +721,16 @@ fn load_rerun_job_fields(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<(String, Option<String>, Option<String>, Option<String>), String> {
-    let db = orch.db.local.clone();
     let job_id = job_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_advancement_db(async move {
         db.read(|conn| {
             let job_id = job_id.clone();
@@ -665,8 +765,16 @@ pub fn mark_action_run_failed(
     error: &str,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp() as i32;
-    let db = orch.db.local.clone();
     let action_run_id = action_run_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let action_run_id = action_run_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_action_run(&dbs, &action_run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let error = error.to_string();
     let log_action_run_id = action_run_id.clone();
     let log_error = error.clone();

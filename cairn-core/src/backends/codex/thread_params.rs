@@ -1,9 +1,9 @@
 use super::CODEX_BACKEND_NAME;
 use crate::backends::run_state::run_backend_db;
 use crate::models::{Fence, Model};
-use crate::orchestrator::Orchestrator;
-use crate::storage::RowExt;
+use crate::storage::{LocalDb, RowExt};
 use serde_json::Value;
+use std::sync::Arc;
 use turso::params;
 
 const RESUME_FALLBACK_TRANSCRIPT_CHARS: usize = 24_000;
@@ -125,11 +125,11 @@ pub(super) fn is_missing_rollout_error(err: &str, thread_id: &str) -> bool {
 }
 
 pub(super) fn build_resume_fallback_prompt(
-    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     stale_session_id: &str,
     latest_user_message: &str,
 ) -> Option<String> {
-    let db = orch.db.local.clone();
+    let db = run_db.clone();
     let stale_session_id = stale_session_id.to_string();
     let event_rows: Vec<(String, i32, String, String)> =
         run_backend_db(CODEX_BACKEND_NAME, async move {

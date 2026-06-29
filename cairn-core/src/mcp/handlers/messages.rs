@@ -241,7 +241,14 @@ pub async fn append_project_or_issue_message(
         return Err("Message content cannot be empty".to_string());
     }
 
-    let channel_id = resolve_channel_id(&orch.db.local, project_key, issue_number).await?;
+    // Channel resolution and the message row live in the database that owns the
+    // project (CAIRN-2181): a team project's projects/issues/messages rows live
+    // in its team replica, and reads are already routed there, so the append must
+    // route too or posted messages disappear from the team-replica view.
+    let owning_db = orch.db.for_project(project_key).await;
+    let channel_id = resolve_channel_id(&owning_db, project_key, issue_number).await?;
+    // content→execution boundary (CAIRN-2181): sender/run resolution is job-keyed
+    // and stays private until CAIRN-2182.
     let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;
 
     let (channel_type, success_message) = match issue_number {
@@ -264,7 +271,7 @@ pub async fn append_project_or_issue_message(
     };
 
     let msg = msg_db::insert_message(
-        &orch.db.local,
+        &owning_db,
         &channel_type,
         Some(channel_id.as_str()),
         sender_run_id.as_deref(),

@@ -25,6 +25,7 @@ pub mod dispatch;
 pub mod jobs;
 pub mod queries;
 pub mod recipe;
+pub mod routing;
 pub mod snapshot_edit;
 pub mod step_behavior;
 pub mod teardown;

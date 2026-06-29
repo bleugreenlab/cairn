@@ -4,8 +4,9 @@ use crate::error::CairnError;
 use crate::models::{Comment, CommentSource, CreateComment};
 use crate::services::Clock;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use cairn_common::ids;
+use std::sync::Arc;
 use turso::params;
-use uuid::Uuid;
 
 const COMMENT_COLUMNS: &str = "id, issue_id, content, source, created_at, seq";
 
@@ -65,6 +66,22 @@ pub async fn id_for_issue_seq(
     .map_err(CairnError::from)
 }
 
+/// Resolve the database that owns the comment with this `id`. An O(1) prefix
+/// parse, fail-closed (CAIRN-2184).
+///
+/// Delegates to [`crate::execution::routing::routing_db_for_id`]: a bare (local)
+/// comment id routes to the private database exactly as the prior `&db.local`
+/// path did, while a `{team}~…` id routes to that team's open replica.
+/// Fail-closed — a team-prefixed id whose replica is not open returns an error
+/// rather than silently falling back to the private database (the CAIRN-2170
+/// split-brain class).
+pub async fn owning_db_for_comment(
+    dbs: &crate::db::DbState,
+    comment_id: &str,
+) -> Result<Arc<LocalDb>, CairnError> {
+    crate::execution::routing::routing_db_for_id(dbs, comment_id).await
+}
+
 async fn load_conn(conn: &turso::Connection, id: &str) -> DbResult<Comment> {
     let sql = format!("SELECT {COMMENT_COLUMNS} FROM comments WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
@@ -108,7 +125,7 @@ pub async fn create(
         content,
         source,
     } = input;
-    let id = Uuid::new_v4().to_string();
+    let id = ids::mint_child(&issue_id);
     let created_at = clock.now();
     let source_text = source.to_string();
 

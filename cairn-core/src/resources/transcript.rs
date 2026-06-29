@@ -42,6 +42,7 @@ impl EventRow {
 pub(super) async fn load_job_events_ordered(
     conn: &turso::Connection,
     job_id: &str,
+    store: Option<&dyn crate::archival::store::ContentStore>,
 ) -> Vec<EventRow> {
     // 1. Load run_ids ordered by creation time
     let mut ordered_run_ids: Vec<String> = Vec::new();
@@ -86,7 +87,7 @@ pub(super) async fn load_job_events_ordered(
         }
     }
 
-    crate::archival::reconstruct::reconstruct_events_with_conn(conn, events)
+    crate::archival::reconstruct::reconstruct_events_with_conn(conn, events, store)
         .await
         .into_iter()
         .map(|event| EventRow {
@@ -103,6 +104,7 @@ pub(super) async fn load_job_events_ordered(
 pub(super) async fn load_turn_events(
     conn: &turso::Connection,
     turn_id: &str,
+    store: Option<&dyn crate::archival::store::ContentStore>,
 ) -> Vec<(String, i32, String, String)> {
     let columns = crate::runs::queries::EVENT_COLUMNS;
     let sql = format!("SELECT {columns} FROM events WHERE turn_id = ?1 ORDER BY sequence ASC");
@@ -114,7 +116,7 @@ pub(super) async fn load_turn_events(
             }
         }
     }
-    crate::archival::reconstruct::reconstruct_events_with_conn(conn, events)
+    crate::archival::reconstruct::reconstruct_events_with_conn(conn, events, store)
         .await
         .into_iter()
         .map(|event| (event.run_id, event.sequence, event.event_type, event.data))
@@ -153,6 +155,7 @@ pub(super) async fn get_single_event(
     conn: &turso::Connection,
     run_id: &str,
     event_seq: i32,
+    store: Option<&dyn crate::archival::store::ContentStore>,
 ) -> String {
     let columns = crate::runs::queries::EVENT_COLUMNS;
     let sql = format!(
@@ -182,7 +185,7 @@ pub(super) async fn get_single_event(
     };
 
     let mut events =
-        crate::archival::reconstruct::reconstruct_events_with_conn(conn, vec![event]).await;
+        crate::archival::reconstruct::reconstruct_events_with_conn(conn, vec![event], store).await;
     let event = events.remove(0);
     let resolved_tool_name =
         resolve_single_event_tool_name(conn, run_id, &event.event_type, &event.data).await;
@@ -1504,7 +1507,7 @@ mod tests {
             .read(|conn| {
                 Box::pin(async move {
                     Ok::<Vec<(String, i32, String, String)>, crate::storage::DbError>(
-                        load_turn_events(conn, "turn-1").await,
+                        load_turn_events(conn, "turn-1", None).await,
                     )
                 })
             })
@@ -1620,7 +1623,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rendered = get_single_event(&conn, "run-1", 2).await;
+        let rendered = get_single_event(&conn, "run-1", 2, None).await;
 
         assert!(rendered.contains("**Tool Result (read):**"));
         assert!(rendered.contains("body"));

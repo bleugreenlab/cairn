@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::config::agents as config_agents;
 use crate::config::derive_unique_task_slug;
@@ -60,6 +61,23 @@ pub fn reduce_dag(
 ) -> Result<(Vec<Job>, Vec<WorkflowEffect>), String> {
     let mut effects = Vec::new();
 
+    // Resolve the execution's OWNING database once (CAIRN-2197). A team
+    // execution's rows live in its synced replica, not the private DB; every
+    // snapshot/job/node read below threads this handle so the DAG actually
+    // advances for team executions instead of failing with "Execution has no
+    // snapshot". Fail-closed: a team replica that is not open errors rather than
+    // silently resolving the private DB. For a local execution the private DB
+    // owns the row, so this is a strict no-op.
+    let owning_db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+
     // Step 0: Re-arm any Blocked command checkpoints whose upstream agent has
     // committed a fix since the last run. This re-pends them so the pending-scan
     // below re-runs the command against the new worktree HEAD. Gated by the
@@ -68,7 +86,7 @@ pub fn reduce_dag(
     crate::execution::advancement::rearm_blocked_checkpoints(orch, execution_id)?;
 
     // Step 1: Materialize pending delegated packets, then advance the DAG.
-    expand_delegated_packets(orch, execution_id)?;
+    expand_delegated_packets(orch, &owning_db, execution_id)?;
     let ready_jobs = advance_execution_impl(orch, execution_id)?;
 
     // Step 2: Categorize jobs by their node type
@@ -79,7 +97,7 @@ pub fn reduce_dag(
         let mut node_map: HashMap<String, DbRecipeNode> = HashMap::new();
         if let Some(first_job) = ready_jobs.first() {
             if let Some(exec_id) = &first_job.execution_id {
-                if let Ok(nodes) = load_nodes_from_execution(orch.db.local.clone(), exec_id) {
+                if let Ok(nodes) = load_nodes_from_execution(owning_db.clone(), exec_id) {
                     for node in nodes {
                         node_map.insert(node.id.clone(), node);
                     }
@@ -90,7 +108,7 @@ pub fn reduce_dag(
         for job in ready_jobs {
             if let Some(node_id) = &job.recipe_node_id {
                 if let Some(node) = node_map.get(node_id) {
-                    let db_job = load_job(orch.db.local.clone(), &job.id)?
+                    let db_job = load_job(owning_db.clone(), &job.id)?
                         .ok_or_else(|| format!("Failed to load job: {}", job.id))?;
                     node_jobs.push((db_job, node.clone()));
                     continue;
@@ -104,7 +122,14 @@ pub fn reduce_dag(
     for (db_job, node) in node_jobs {
         match node.node_type.as_str() {
             "checkpoint" => {
-                handle_checkpoint_node(orch, &db_job, &node, execution_id, &mut effects)?;
+                handle_checkpoint_node(
+                    orch,
+                    &owning_db,
+                    &db_job,
+                    &node,
+                    execution_id,
+                    &mut effects,
+                )?;
             }
             "agent" => {
                 agent_jobs.push(Job::try_from(db_job)?);
@@ -123,7 +148,7 @@ pub fn reduce_dag(
     // Step 4: Dispatch ready action nodes
     {
         let ready_action_nodes = crate::execution::advancement::find_ready_action_nodes(
-            orch.db.local.clone(),
+            owning_db.clone(),
             execution_id,
         )?;
 
@@ -147,12 +172,11 @@ pub fn reduce_dag(
 
     // Step 5: Dispatch ready condition nodes
     {
-        let ready_condition_nodes =
-            find_ready_condition_nodes(orch.db.local.clone(), execution_id)?;
+        let ready_condition_nodes = find_ready_condition_nodes(owning_db.clone(), execution_id)?;
 
         for node in ready_condition_nodes {
             run_advancement_db({
-                let db = orch.db.local.clone();
+                let db = owning_db.clone();
                 let execution_id = execution_id.to_string();
                 let node_id = node.id.clone();
                 async move {
@@ -537,5 +561,200 @@ mod tests {
         let (tool_use, idx) = job_link(&db, "child").await;
         assert_eq!(tool_use.as_deref(), Some("toolu_solo"));
         assert_eq!(idx, Some(0));
+    }
+
+    // ── CAIRN-2197: team-execution advancement + display route to the replica ──
+
+    use crate::db::DbState;
+    use crate::models::{RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType};
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::SearchIndex;
+
+    /// Minimal snapshot: trigger -> agent("builder"), so the agent job is ready
+    /// to claim the moment the DAG advances.
+    fn team_exec_snapshot() -> String {
+        let trigger = RecipeNode {
+            id: "trigger-1".to_string(),
+            node_type: RecipeNodeType::Trigger,
+            name: "Trigger".to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        };
+        let builder = RecipeNode {
+            id: "builder".to_string(),
+            node_type: RecipeNodeType::Agent,
+            name: "builder".to_string(),
+            position: NodePosition { x: 200.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: Some(AgentNodeConfig {
+                agent_config_id: Some("builder".to_string()),
+                output_schema: None,
+                git_config: None,
+            }),
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        };
+        let edge = RecipeEdge {
+            id: "edge-1".to_string(),
+            edge_type: RecipeEdgeType::Control,
+            source_node_id: "trigger-1".to_string(),
+            source_handle: "control-out".to_string(),
+            target_node_id: "builder".to_string(),
+            target_handle: "control-in".to_string(),
+        };
+        let snap = ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: "recipe-1".to_string(),
+                name: "Recipe".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![trigger, builder],
+                edges: vec![edge],
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: Some("team1~00000000-0000-4000-8000-000000000004".to_string()),
+                project_id: "p-team".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 1,
+        };
+        snap.to_json().unwrap()
+    }
+
+    async fn seed_team_execution(db: &LocalDb) {
+        let snapshot = team_exec_snapshot();
+        db.write(move |conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-team','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-team','w-team','Team','TEAM','/tmp/team-repo',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('team1~00000000-0000-4000-8000-000000000004','p-team',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('team1~00000000-0000-4000-8000-000000000003','recipe-1','team1~00000000-0000-4000-8000-000000000004','p-team','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-builder','team1~00000000-0000-4000-8000-000000000003','builder','team1~00000000-0000-4000-8000-000000000004','p-team','pending','builder','builder',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn job_status(db: &LocalDb, job_id: &str) -> String {
+        let job_id = job_id.to_string();
+        db.read(move |conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT status FROM jobs WHERE id = ?1", (job_id.as_str(),))
+                    .await?;
+                rows.next().await?.unwrap().text(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// CAIRN-2197: a team execution lives ONLY in its synced replica. The effect
+    /// driver must resolve that owning database to advance the DAG — it used to
+    /// read the private DB and fail with "Execution has no snapshot", so the
+    /// execution never advanced and no jobs ran. The display readers must resolve
+    /// the same replica so the execution shows on the issue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn team_execution_advances_and_displays_from_replica() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let local = Arc::new(crate::storage::migrated_test_db("cairn2197-local.db").await);
+        let team = Arc::new(crate::storage::migrated_test_db("cairn2197-team.db").await);
+        seed_team_execution(&team).await;
+
+        let index =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let dbs = Arc::new(DbState::new(local, index));
+        dbs.insert_team_db_for_test("team1", team.clone()).await;
+        // The team execution AND the issue carry their team prefix, so routing
+        // parses each back to the replica. The project row stays bare (no
+        // resolver parses it in this test).
+        let e_team = "team1~00000000-0000-4000-8000-000000000003";
+
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch = OrchestratorBuilder::new(dbs, services, config_dir).build();
+
+        // Precondition: the execution exists ONLY in the team replica.
+        assert!(
+            orch.db
+                .local
+                .query_text("SELECT id FROM executions WHERE id = ?1", (e_team,))
+                .await
+                .unwrap()
+                .is_none(),
+            "execution must live only in the team replica, not the private DB"
+        );
+
+        // Advance: previously errored with "Execution has no snapshot"; now the
+        // DAG advances and claims the pending agent job.
+        let agent_jobs =
+            crate::execution::advancement::advance_execution_with_actions(&orch, e_team)
+                .await
+                .expect("team execution must advance without 'no snapshot'");
+        assert!(
+            agent_jobs.iter().any(|j| j.id == "j-builder"),
+            "the pending agent job must be claimed ready: {:?}",
+            agent_jobs.iter().map(|j| j.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(job_status(&team, "j-builder").await, "running");
+
+        // Display: the execution-snapshot reader routes to the replica.
+        let exec_db = crate::execution::routing::owning_db_for_execution(&orch.db, e_team)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&exec_db, &team));
+        assert!(
+            crate::execution::queries::get_execution_snapshot(exec_db, e_team)
+                .unwrap()
+                .is_some()
+        );
+
+        // Display: the issue-overview execution readers route to the replica.
+        let issue_db = crate::issues::crud::owning_db_for_issue(
+            &orch.db,
+            "team1~00000000-0000-4000-8000-000000000004",
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&issue_db, &team));
+        assert!(crate::execution::queries::get_execution_for_issue(
+            issue_db.clone(),
+            "team1~00000000-0000-4000-8000-000000000004"
+        )
+        .unwrap()
+        .is_some());
+        assert_eq!(
+            crate::execution::queries::list_executions_for_issue(
+                issue_db,
+                "team1~00000000-0000-4000-8000-000000000004"
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 }

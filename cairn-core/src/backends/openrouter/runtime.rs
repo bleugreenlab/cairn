@@ -4,7 +4,9 @@ use super::{
 };
 use crate::agent_process::process::{RunHandle, SuspendKind};
 use crate::agent_process::stream::{TokenCounts, ToolUseInfo, TranscriptEvent};
-use crate::backends::run_state::{run_job_id, set_session_backend_id, transition_run_to_live};
+use crate::backends::run_state::{
+    resolve_run_db, run_job_id, set_session_backend_id, transition_run_to_live,
+};
 use crate::backends::{SessionConfig, SessionStart};
 use crate::dispatch::DispatchOutput;
 use crate::models::{ContextTokenState, OpenRouterRouting, OpenRouterSort, RunStatus};
@@ -13,6 +15,7 @@ use crate::orchestrator::session::{
     persist_system_prompt_event,
 };
 use crate::orchestrator::Orchestrator;
+use crate::storage::LocalDb;
 use crate::storage::{run_db_blocking, RowExt};
 use crate::transcripts::stream_store::{
     append_chunks, finalize_stream_emit, get_next_sequence, insert_event_emit, open_stream,
@@ -69,6 +72,18 @@ pub(super) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
         config.system_prompt_content.as_deref(),
         config.system_prompt_dynamic_tail.as_deref(),
     );
+    // Resolve the run's owning DB ONCE (CAIRN-2208) and thread it through the
+    // run-state and streaming-transcript writes below. A team run lives wholly in
+    // its synced replica; targeting the private DB would fail the
+    // message_streams→runs foreign key. Fail-closed.
+    let run_db = match resolve_run_db(OPENROUTER_BACKEND_NAME, orch, &config.run_id) {
+        Ok(db) => db,
+        Err(error) => {
+            insert_error_event(orch, &config.run_id, Some(&session_id), &error);
+            return Err(error);
+        }
+    };
+
     let initial_sequence = if matches!(
         config.session_start,
         SessionStart::New { .. } | SessionStart::Fork { .. }
@@ -81,7 +96,7 @@ pub(super) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
             &prompt_segments,
         )
     } else {
-        get_next_sequence(orch.db.local.clone(), &config.run_id).unwrap_or(0)
+        get_next_sequence(run_db.clone(), &config.run_id).unwrap_or(0)
     };
     // Flatten the same segments that were (or would be) persisted. Each OpenRouter
     // HTTP turn re-sends the whole message array with no server-side system-prompt
@@ -90,15 +105,17 @@ pub(super) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
     let system_prompt = flatten_prompt_segments(&prompt_segments);
 
     if let Err(error) =
-        set_session_backend_id(OPENROUTER_BACKEND_NAME, orch, &session_id, &session_id)
+        set_session_backend_id(OPENROUTER_BACKEND_NAME, &run_db, &session_id, &session_id)
     {
         log::warn!("Failed to set OpenRouter backend id: {error}");
     }
-    if let Err(error) = transition_run_to_live(OPENROUTER_BACKEND_NAME, orch, &config.run_id) {
+    if let Err(error) =
+        transition_run_to_live(OPENROUTER_BACKEND_NAME, orch, &run_db, &config.run_id)
+    {
         log::warn!("Failed to transition OpenRouter run to live: {error}");
     }
 
-    let process_job_id = run_job_id(OPENROUTER_BACKEND_NAME, orch, &config.run_id);
+    let process_job_id = run_job_id(OPENROUTER_BACKEND_NAME, &run_db, &config.run_id);
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut handle = RunHandle::new(
@@ -133,6 +150,7 @@ pub(super) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_http_turn(
                 &orch_clone,
+                run_db,
                 config,
                 api_key,
                 session_id,
@@ -174,6 +192,7 @@ pub(super) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
 #[allow(clippy::too_many_arguments)]
 fn run_http_turn(
     orch: &Orchestrator,
+    run_db: Arc<LocalDb>,
     config: SessionConfig,
     api_key: String,
     session_id: String,
@@ -214,6 +233,7 @@ fn run_http_turn(
         let outgoing = fit_conversation(&conversation, context_window);
         let response = post_chat_completion(
             orch,
+            &run_db,
             &api_key,
             &model,
             &session_id,
@@ -313,6 +333,7 @@ fn run_http_turn(
                 } else {
                     store_assistant_message(
                         orch,
+                        &run_db,
                         &config.run_id,
                         &session_id,
                         turn_id.as_deref(),
@@ -328,6 +349,7 @@ fn run_http_turn(
             }
             store_success_result(
                 orch,
+                &run_db,
                 &config.run_id,
                 &session_id,
                 turn_id.as_deref(),
@@ -349,6 +371,7 @@ fn run_http_turn(
         };
         store_assistant_tool_call(
             orch,
+            &run_db,
             &config.run_id,
             &session_id,
             turn_id.as_deref(),
@@ -379,6 +402,7 @@ fn run_http_turn(
             }
             store_tool_result(
                 orch,
+                &run_db,
                 &config.run_id,
                 &session_id,
                 turn_id.as_deref(),
@@ -406,6 +430,7 @@ fn run_http_turn(
             for tool_call in tool_calls.iter().skip(suspended_at + 1) {
                 store_tool_result(
                     orch,
+                    &run_db,
                     &config.run_id,
                     &session_id,
                     turn_id.as_deref(),
@@ -429,6 +454,7 @@ fn run_http_turn(
         if orch.process_state.terminal_tool_armed(&config.run_id) {
             store_success_result(
                 orch,
+                &run_db,
                 &config.run_id,
                 &session_id,
                 turn_id.as_deref(),
@@ -452,6 +478,7 @@ fn run_http_turn(
     // run stays resumable.
     store_assistant_message(
         orch,
+        &run_db,
         &config.run_id,
         &session_id,
         turn_id.as_deref(),
@@ -465,6 +492,7 @@ fn run_http_turn(
     sequence += 1;
     store_success_result(
         orch,
+        &run_db,
         &config.run_id,
         &session_id,
         turn_id.as_deref(),
@@ -1092,6 +1120,7 @@ fn trim_conversation_to_budget(messages: &[ChatMessage], budget: i64) -> Vec<Cha
 #[allow(clippy::too_many_arguments)]
 fn post_chat_completion(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     api_key: &str,
     model: &str,
     session_id: &str,
@@ -1115,13 +1144,14 @@ fn post_chat_completion(
     }
     body["provider"] = provider.clone();
     post_chat_completion_streaming(
-        orch, api_key, body, run_id, session_id, turn_id, sequence, cancel,
+        orch, run_db, api_key, body, run_id, session_id, turn_id, sequence, cancel,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn post_chat_completion_streaming(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     api_key: &str,
     body: Value,
     run_id: &str,
@@ -1222,6 +1252,7 @@ fn post_chat_completion_streaming(
             let state = open_stream_state(
                 &mut stream_state,
                 orch,
+                run_db,
                 run_id,
                 session_id,
                 turn_id,
@@ -1233,6 +1264,7 @@ fn post_chat_completion_streaming(
             let state = open_stream_state(
                 &mut stream_state,
                 orch,
+                run_db,
                 run_id,
                 session_id,
                 turn_id,
@@ -1260,9 +1292,11 @@ fn post_chat_completion_streaming(
     Ok(aggregate.into_response(streamed_text))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_stream_state<'a>(
     state: &'a mut Option<AssistantStreamState>,
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
@@ -1270,7 +1304,12 @@ fn open_stream_state<'a>(
 ) -> Result<&'a mut AssistantStreamState, String> {
     if state.is_none() {
         *state = Some(AssistantStreamState::open(
-            orch, run_id, session_id, turn_id, sequence,
+            orch,
+            run_db.clone(),
+            run_id,
+            session_id,
+            turn_id,
+            sequence,
         )?);
     }
     Ok(state.as_mut().expect("stream state just initialized"))
@@ -1725,18 +1764,21 @@ struct AssistantStreamState {
     stream_id: String,
     version: i32,
     acc: StreamAccumulator,
+    run_db: Arc<LocalDb>,
 }
 
 impl AssistantStreamState {
+    #[allow(clippy::too_many_arguments)]
     fn open(
         orch: &Orchestrator,
+        run_db: Arc<LocalDb>,
         run_id: &str,
         session_id: &str,
         turn_id: Option<&str>,
         sequence: i32,
     ) -> Result<Self, String> {
         let stream = open_stream(
-            orch.db.local.clone(),
+            run_db.clone(),
             run_id,
             Some(session_id),
             turn_id,
@@ -1745,12 +1787,18 @@ impl AssistantStreamState {
         )?;
         let _ = orch.services.emitter.emit(
             "db-change",
-            crate::notify::event_db_change(run_id, Some(session_id), "insert"),
+            crate::notify::event_db_change_for_run(
+                orch.db.local.clone(),
+                run_id,
+                Some(session_id),
+                "insert",
+            ),
         );
         Ok(Self {
             stream_id: stream.stream_id().to_string(),
             version: stream.version(),
             acc: StreamAccumulator::new(),
+            run_db,
         })
     }
 
@@ -1758,7 +1806,7 @@ impl AssistantStreamState {
         self.acc.push_content(text);
         let now = std::time::Instant::now();
         if self.acc.should_flush(now) {
-            self.flush(orch)?;
+            self.flush()?;
         }
         if self.acc.should_emit(now) {
             let delta = self.acc.take_emit_delta();
@@ -1776,7 +1824,7 @@ impl AssistantStreamState {
         self.acc.push_thinking(text);
         let now = std::time::Instant::now();
         if self.acc.should_flush(now) {
-            self.flush(orch)?;
+            self.flush()?;
         }
         if self.acc.should_emit(now) {
             let delta = self.acc.take_emit_delta();
@@ -1785,17 +1833,12 @@ impl AssistantStreamState {
         Ok(())
     }
 
-    fn flush(&mut self, orch: &Orchestrator) -> Result<(), String> {
+    fn flush(&mut self) -> Result<(), String> {
         if self.acc.pending_is_empty() {
             return Ok(());
         }
         let pending = self.acc.take_pending();
-        let appended = append_chunks(
-            orch.db.local.clone(),
-            &self.stream_id,
-            self.version,
-            &pending,
-        )?;
+        let appended = append_chunks(self.run_db.clone(), &self.stream_id, self.version, &pending)?;
         self.version = appended.version;
         Ok(())
     }
@@ -1813,7 +1856,7 @@ impl AssistantStreamState {
         generation_id: Option<&str>,
         model: Option<&str>,
     ) -> Result<(), String> {
-        self.flush(orch)?;
+        self.flush()?;
         if self.acc.has_unemitted() {
             let delta = self.acc.take_emit_delta();
             emit_streaming_delta(orch, run_id, &self.stream_id, &delta);
@@ -1843,6 +1886,7 @@ impl AssistantStreamState {
             })),
         };
         let finalized = finalize_stream_emit(
+            self.run_db.clone(),
             orch.db.local.clone(),
             &orch.services.emitter,
             &self.stream_id,
@@ -1900,6 +1944,7 @@ impl OpenRouterUsage {
 #[allow(clippy::too_many_arguments)]
 fn store_assistant_message(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
@@ -1911,7 +1956,7 @@ fn store_assistant_message(
     total_cost: Option<f64>,
 ) -> Result<(), String> {
     let stream = open_stream(
-        orch.db.local.clone(),
+        run_db.clone(),
         run_id,
         Some(session_id),
         turn_id,
@@ -1919,7 +1964,7 @@ fn store_assistant_message(
         Some(sequence),
     )?;
     let appended = append_chunks(
-        orch.db.local.clone(),
+        run_db.clone(),
         stream.stream_id(),
         stream.version(),
         &[StreamChunkInput::content(text.to_string())],
@@ -1946,6 +1991,7 @@ fn store_assistant_message(
         })),
     };
     let finalized = finalize_stream_emit(
+        run_db.clone(),
         orch.db.local.clone(),
         &orch.services.emitter,
         stream.stream_id(),
@@ -2017,6 +2063,7 @@ fn tool_call_usage(
 #[allow(clippy::too_many_arguments)]
 fn store_assistant_tool_call(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
@@ -2032,6 +2079,7 @@ fn store_assistant_tool_call(
     let (tool_name, tool_input) = single_tool_summary(&tool_uses);
     insert_transcript_event(
         orch,
+        run_db,
         run_id,
         session_id,
         turn_id,
@@ -2068,8 +2116,10 @@ fn store_assistant_tool_call(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn store_tool_result(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
@@ -2079,6 +2129,7 @@ fn store_tool_result(
 ) -> Result<(), String> {
     insert_transcript_event(
         orch,
+        run_db,
         run_id,
         session_id,
         turn_id,
@@ -2106,6 +2157,7 @@ fn store_tool_result(
 #[allow(clippy::too_many_arguments)]
 fn store_success_result(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
@@ -2117,6 +2169,7 @@ fn store_success_result(
 ) -> Result<(), String> {
     insert_transcript_event(
         orch,
+        run_db,
         run_id,
         session_id,
         turn_id,
@@ -2150,6 +2203,7 @@ fn store_success_result(
 #[allow(clippy::too_many_arguments)]
 fn insert_transcript_event(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: &str,
     turn_id: Option<&str>,
@@ -2161,7 +2215,7 @@ fn insert_transcript_event(
     let now = chrono::Utc::now().timestamp() as i32;
     let data = serde_json::to_string(&event).map_err(|error| error.to_string())?;
     insert_event_emit(
-        orch.db.local.clone(),
+        run_db.clone(),
         &orch.services.emitter,
         EventInsert {
             id: Uuid::new_v4().to_string(),
@@ -2709,7 +2763,9 @@ mod tests {
 
         // Sequence S: the streamed reasoning event, finalized exactly as the live
         // SSE reader does (open stream, append thinking deltas, finalize).
-        let mut state = AssistantStreamState::open(&orch, "run-1", "session-1", None, 2).unwrap();
+        let mut state =
+            AssistantStreamState::open(&orch, orch.db.local.clone(), "run-1", "session-1", None, 2)
+                .unwrap();
         state
             .append_thinking(&orch, "run-1", "Let me read the file.")
             .unwrap();
@@ -2738,6 +2794,7 @@ mod tests {
         };
         store_assistant_tool_call(
             &orch,
+            &orch.db.local,
             "run-1",
             "session-1",
             None,
@@ -2754,6 +2811,7 @@ mod tests {
         // Sequence S+2: the tool result.
         store_tool_result(
             &orch,
+            &orch.db.local,
             "run-1",
             "session-1",
             None,

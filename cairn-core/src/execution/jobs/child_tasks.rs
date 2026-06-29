@@ -12,9 +12,19 @@ pub fn create_child_task(
     orch: &Orchestrator,
     input: CreateChildTaskInput,
 ) -> Result<CreateChildTaskResult, String> {
+    // Resolve the parent job's owning database (a team run lives in its replica).
+    let db = run_db({
+        let dbs = orch.db.clone();
+        let parent_job_id = input.parent_job_id.clone();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &parent_job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     // ---- Load parent job ------------------------------------------------
     let parent_job = run_db(load_job(
-        orch.db.local.clone(),
+        db.clone(),
         input.parent_job_id.clone(),
         "Parent job not found",
     ))?;
@@ -31,7 +41,7 @@ pub fn create_child_task(
         .ok_or("Parent job has no worktree")?
         .clone();
 
-    let project_path = run_db(load_project_path(orch.db.local.clone(), project_id.clone()))?;
+    let project_path = run_db(load_project_path(db.clone(), project_id.clone()))?;
 
     // ---- Load agent config from files -----------------------------------
     let config_dir = config::get_config_dir()?;
@@ -89,9 +99,9 @@ pub fn create_child_task(
     };
 
     // ---- Create job + run -----------------------------------------------
-    let job_id = Uuid::new_v4().to_string();
-    let run_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
+    let job_id = ids::mint_child(&project_id);
+    let run_id = ids::mint_child(&job_id);
+    let session_id = ids::mint_session_id().into_string();
     let now = chrono::Utc::now().timestamp() as i32;
 
     let presets = load_effective_presets(&config_dir, project_path.as_deref());
@@ -120,7 +130,7 @@ pub fn create_child_task(
     let base_commit = worktree_head_commit(orch, Path::new(&worktree_path));
 
     run_db(insert_child_job_session_run(
-        orch.db.local.clone(),
+        db.clone(),
         ChildInsert {
             job_id: job_id.clone(),
             run_id: run_id.clone(),
@@ -137,34 +147,6 @@ pub fn create_child_task(
             now,
         },
     ))?;
-
-    // Sync new job and run
-    orch.sync(SyncMessage::Job(crate::sync::SyncJob {
-        id: job_id.clone(),
-        issue_id: issue_id.clone(),
-        project_id: Some(project_id.clone()),
-        execution_id: execution_id.clone(),
-        node_name: None,
-        task_description: Some(input.description.clone()),
-        status: Some("running".to_string()),
-        model: selected_model.as_ref().map(|m| m.to_string()),
-        branch: None,
-        created_at: Some(now as i64),
-        updated_at: Some(now as i64),
-        started_at: Some(now as i64),
-        completed_at: None,
-    }));
-    orch.sync(SyncMessage::Run(crate::sync::SyncRun {
-        id: run_id.clone(),
-        job_id: Some(job_id.clone()),
-        issue_id: issue_id.clone(),
-        status: Some("starting".to_string()),
-        exit_reason: None,
-        error_message: None,
-        started_at: Some(now as i64),
-        exited_at: None,
-        created_at: Some(now as i64),
-    }));
 
     let _ = orch.services.emitter.emit(
         "db-change",

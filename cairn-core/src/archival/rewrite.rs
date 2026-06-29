@@ -60,7 +60,8 @@ use sha2::{Digest, Sha256};
 use super::encoding::{
     init_placeholder, ArchivedShape, ARCHIVED_SYSTEM_INIT, ARCHIVED_SYSTEM_PROMPT, INIT_TOOLS_TAG,
 };
-use super::{build_execution_pack, compress, reconstruct, ObjectStore};
+use super::store::{content_hash, frame_pack, ContentStore};
+use super::{build_execution_pack, compress, decompress, reconstruct, ObjectStore, CODEC_ZSTD_V1};
 use crate::jj::JjEnv;
 use crate::models::Event;
 use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
@@ -176,7 +177,15 @@ pub async fn archive_target(
     if updates.is_empty() && history.is_none() && blobs.is_empty() {
         return Ok(summary);
     }
-    apply(db, updates, history, blobs).await?;
+    // A team replica carries a content store: offload the heavy pack and system
+    // blobs to the shared per-team store by hash, and write only pointers into
+    // the synced replica. The private DB has no store, so a local run keeps the
+    // inline path byte-for-byte. Detection is on the resolved handle itself, not
+    // a separate team lookup.
+    match db.content_store() {
+        Some(store) => apply_offloaded(db, store.as_ref(), updates, history, blobs).await?,
+        None => apply(db, updates, history, blobs).await?,
+    }
     Ok(summary)
 }
 
@@ -193,6 +202,7 @@ struct Loaded {
     /// whole execution zstd-only — 1540's contract never guesses an anchor.
     pack_anchor: Option<String>,
     default_branch: String,
+    base_branch: Option<String>,
     /// Every event across all the execution's runs (including sub-agent task
     /// runs) in global chronological order, so interleaved task commits replay
     /// in the order they actually landed on the shared branch.
@@ -233,18 +243,18 @@ async fn load(db: &LocalDb, worktree_path: &str, job_ids: &[String]) -> DbResult
 
             // Replay + pack anchors from the root job for this worktree (earliest
             // created; the inheriting children and tasks come later).
-            let (base_commit, pack_anchor) = {
+            let (base_commit, pack_anchor, base_branch) = {
                 let mut rows = conn
                     .query(
-                        "SELECT base_commit, pack_anchor FROM jobs
+                        "SELECT base_commit, pack_anchor, base_branch FROM jobs
                          WHERE execution_id = ?1 AND worktree_path = ?2
                          ORDER BY created_at ASC LIMIT 1",
                         (execution_id.as_str(), worktree_path.as_str()),
                     )
                     .await?;
                 match rows.next().await? {
-                    Some(row) => (row.opt_text(0)?, row.opt_text(1)?),
-                    None => (None, None),
+                    Some(row) => (row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?),
+                    None => (None, None, None),
                 }
             };
 
@@ -284,6 +294,7 @@ async fn load(db: &LocalDb, worktree_path: &str, job_ids: &[String]) -> DbResult
                 base_commit,
                 pack_anchor,
                 default_branch,
+                base_branch,
                 events,
             }))
         })
@@ -374,6 +385,30 @@ fn classify(
             }
         }
         let pack_anchor = loaded.pack_anchor.as_deref().unwrap();
+        let history_base = jj
+            .filter(|_| crate::jj::is_jj_dir(worktree))
+            .and_then(|jj| {
+                crate::jj::resolve_node_fork_point(
+                    jj,
+                    worktree,
+                    loaded
+                        .base_branch
+                        .as_deref()
+                        .or(Some(loaded.default_branch.as_str())),
+                    loaded
+                        .pack_anchor
+                        .as_deref()
+                        .or(loaded.base_commit.as_deref()),
+                )
+            })
+            .unwrap_or_else(|| pack_anchor.to_string());
+        // `history_base` may intentionally differ from `pack_anchor` after a jj
+        // auto-rebase onto an advanced base. That remains reachable after
+        // teardown: if it is on the base-branch lineage, the project object DB
+        // keeps it durably; if it is below the execution tip and not excluded by
+        // the base branch, `build_execution_pack(pack_anchor..tip)` includes it.
+        // This lets archived diffs use the same effective fork point as live
+        // diffs without requiring the live jj graph later.
         // A production jj workspace is `.jj`-only (no `.git`), so git cannot run
         // in the worktree; after the export above the execution's objects live in
         // the project repo's object database, and the tip is jj's `@-`. Plain git
@@ -391,7 +426,7 @@ fn classify(
             .map(|base| forward_map(worktree, jj, base));
         history = Some(ExecHistory {
             execution_id: loaded.execution_id.clone(),
-            base_sha: pack_anchor.to_string(),
+            base_sha: history_base,
             tip_sha,
             pack: pack_pair,
         });
@@ -1172,44 +1207,134 @@ async fn apply(
                     }
                 }
             }
-            for EventUpdate {
-                id,
-                shape,
-                change_id,
-            } in &updates
-            {
-                // The shape encodes to its exact six column values; one uniform
-                // UPDATE binds them so the writer can never set a combination the
-                // reader's `decode` would reject. `content_change_id` rides along
-                // as orthogonal provenance, outside that six-column contract.
-                let cols = shape.encode();
-                let blob_value = match &cols.data_blob {
-                    Some(blob) => turso::Value::Blob(blob.clone()),
-                    None => turso::Value::Null,
-                };
-                conn.execute(
-                    "UPDATE events SET storage_mode = ?1, content_commit = ?2,
-                         content_render_sha = ?3, data = ?4, data_blob = ?5, codec = ?6,
-                         content_change_id = ?7
-                     WHERE id = ?8",
-                    (
-                        cols.storage_mode.as_deref(),
-                        cols.content_commit.as_deref(),
-                        cols.content_render_sha.as_deref(),
-                        cols.data.as_str(),
-                        blob_value,
-                        cols.codec.as_deref(),
-                        change_id.as_deref(),
-                        id.as_str(),
-                    ),
-                )
-                .await?;
-            }
+            write_event_updates(conn, &updates).await?;
             Ok(())
         })
     })
     .await
     .map_err(|e| format!("archival transaction failed: {e}"))
+}
+
+/// Apply each event's archived-shape UPDATE within an already-open transaction.
+/// The single writer of the six-column storage contract
+/// ([`super::encoding::ArchivedShape::encode`]), shared by the inline ([`apply`])
+/// and offloaded ([`apply_offloaded`]) paths so the two can never diverge on how
+/// a row is rewritten. `content_change_id` rides along as orthogonal provenance.
+async fn write_event_updates(conn: &turso::Connection, updates: &[EventUpdate]) -> DbResult<()> {
+    for EventUpdate {
+        id,
+        shape,
+        change_id,
+    } in updates
+    {
+        // The shape encodes to its exact six column values; one uniform UPDATE
+        // binds them so the writer can never set a combination the reader's
+        // `decode` would reject.
+        let cols = shape.encode();
+        let blob_value = match &cols.data_blob {
+            Some(blob) => turso::Value::Blob(blob.clone()),
+            None => turso::Value::Null,
+        };
+        conn.execute(
+            "UPDATE events SET storage_mode = ?1, content_commit = ?2,
+                 content_render_sha = ?3, data = ?4, data_blob = ?5, codec = ?6,
+                 content_change_id = ?7
+             WHERE id = ?8",
+            (
+                cols.storage_mode.as_deref(),
+                cols.content_commit.as_deref(),
+                cols.content_render_sha.as_deref(),
+                cols.data.as_str(),
+                blob_value,
+                cols.codec.as_deref(),
+                change_id.as_deref(),
+                id.as_str(),
+            ),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Archive a TEAM run: offload the heavy bytes to the shared per-team content
+/// store by hash, then write only pointers into the synced replica.
+///
+/// Put-before-commit is the load-bearing ordering: every blob and the framed
+/// pack are `put` to the store BEFORE the DB transaction, so the replica never
+/// records a `pack_hash`/segment-hash pointer whose object is absent. A put
+/// failure aborts here and the caller leaves the rows `full` (the teardown
+/// fail-soft contract); a put that succeeds before a failed commit leaves
+/// harmless content-addressed orphans in the store (GC-able — store GC is out of
+/// scope, matching `archival_blobs`).
+///
+/// Unlike [`apply`], this writes NO `archival_blobs` rows (the team replica has
+/// no such table and must carry no blob bytes) and sets `execution_history`
+/// `pack`/`pack_idx` to NULL with `pack_hash` pointing at the framed pack object.
+async fn apply_offloaded(
+    db: &LocalDb,
+    store: &dyn ContentStore,
+    updates: Vec<EventUpdate>,
+    history: Option<ExecHistory>,
+    blobs: Vec<SegmentBlob>,
+) -> Result<(), String> {
+    // 1. Offload heavy bytes. A blob's content hash is the sha256 of its
+    //    UNCOMPRESSED segment bytes (`archival_blobs` stores the compressed form
+    //    keyed by that same hash). The content store is fetched over an untrusted
+    //    network, so its object MUST hash to its key for a get to verify
+    //    integrity — therefore store the uncompressed bytes (whose sha256 is the
+    //    key), not the compressed `content`. Reconstruct's team path uses them
+    //    directly; the local path keeps decompressing `archival_blobs`.
+    for (hash, content) in &blobs {
+        let original = decompress(CODEC_ZSTD_V1, content)
+            .map_err(|e| format!("decompressing archival blob {hash} for offload: {e}"))?;
+        store
+            .put(hash, &original)
+            .await
+            .map_err(|e| format!("offloading archival blob {hash}: {e}"))?;
+    }
+    // The pack (when the range was non-empty) becomes one framed store object
+    // keyed by the sha256 of its framed bytes — `pack_hash` addresses exactly
+    // what is stored, so a fetch can verify integrity.
+    let pack_hash = match history.as_ref().and_then(|h| h.pack.as_ref()) {
+        Some((pack, idx)) => {
+            let framed = frame_pack(pack, idx);
+            let hash = content_hash(&framed);
+            store
+                .put(&hash, &framed)
+                .await
+                .map_err(|e| format!("offloading execution pack {hash}: {e}"))?;
+            Some(hash)
+        }
+        None => None,
+    };
+
+    // 2. One DB transaction: the pointer row + the event UPDATEs. No
+    //    `archival_blobs` insert.
+    db.write(move |conn| {
+        let updates = updates.clone();
+        let history = history.clone();
+        let pack_hash = pack_hash.clone();
+        Box::pin(async move {
+            if let Some(history) = history {
+                conn.execute(
+                    "INSERT OR REPLACE INTO execution_history
+                     (execution_id, base_sha, tip_sha, pack, pack_idx, pack_hash)
+                     VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+                    (
+                        history.execution_id.as_str(),
+                        history.base_sha.as_str(),
+                        history.tip_sha.as_str(),
+                        pack_hash.as_deref(),
+                    ),
+                )
+                .await?;
+            }
+            write_event_updates(conn, &updates).await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("archival transaction (offloaded) failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -3190,6 +3315,330 @@ mod tests {
         assert_eq!(blob_count(&db).await, 4, "second pass adds zero blob rows");
     }
 
+    /// Read the `execution_history` pointer: whether `pack`/`pack_idx` are both
+    /// NULL (the offloaded shape) and the `pack_hash` pointer.
+    async fn pack_pointer(db: &LocalDb) -> (bool, Option<String>) {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT pack, pack_idx, pack_hash FROM execution_history
+                         WHERE execution_id = 'exec'",
+                        (),
+                    )
+                    .await?;
+                let row = rows.next().await?.expect("execution_history row present");
+                let pack_null = row.opt_blob(0)?.is_none() && row.opt_blob(1)?.is_none();
+                DbResult::Ok((pack_null, row.opt_text(2)?))
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn event_storage_mode(db: &LocalDb, id: &'static str) -> Option<String> {
+        db.read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT storage_mode FROM events WHERE id = ?1", (id,))
+                    .await?;
+                let row = rows.next().await?.expect("event present");
+                row.opt_text(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A team run (the handle carries a content store) offloads system-prompt
+    /// segment blobs to the shared store by hash, writes NO `archival_blobs` rows
+    /// to the synced replica, and reconstructs byte-identically by fetching the
+    /// segment bytes back from the store.
+    #[tokio::test]
+    async fn team_run_offloads_system_blobs_and_reconstructs_from_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        write_file(repo, "a.txt", b"x\n");
+        commit_all(repo, "base");
+
+        let mut db = migrated_test_db("archival-team-blobs.db").await;
+        seed_chain(
+            &db,
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .await;
+
+        let store = crate::archival::store::InMemoryContentStore::new();
+        db.set_team_context(crate::archival::store::TeamReplicaContext {
+            team_id: "team-x".to_string(),
+            store: std::sync::Arc::new(store.clone()),
+        });
+
+        let backend_base = "CLAUDE-BASE ".repeat(800);
+        let cairn = format!("\n\n{}", "CAIRN-PROMPT ".repeat(700));
+        let workspace = "\n\n## Workspace Instructions\n\nworkspace doctrine".to_string();
+        let agent = "\n\n<agent_role>\nbuilder role body".to_string();
+        let dyn1 = "\n\n## Orientation\n\ncwd=/work/run-1\n</agent_role>".to_string();
+        let statics: [(&str, &str); 4] = [
+            ("backend_base", &backend_base),
+            ("cairn", &cairn),
+            ("workspace", &workspace),
+            ("agent", &agent),
+        ];
+        let (data1, content1) = system_prompt(
+            &statics
+                .iter()
+                .copied()
+                .chain([("dynamic", dyn1.as_str())])
+                .collect::<Vec<_>>(),
+        );
+        insert_event(&db, "sp1", "run", 1, 1, "system:prompt", &data1).await;
+
+        let summary = archive_target(
+            &db,
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            &["job".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.system_prompt, 1);
+        assert_eq!(
+            blob_count(&db).await,
+            0,
+            "team run writes NO archival_blobs to the replica"
+        );
+        assert_eq!(
+            store.len().await,
+            4,
+            "the four static segments are offloaded to the shared store"
+        );
+
+        let events = load_events(&db).await;
+        let recon = reconstruct_events(&db, events).await;
+        let sp = recon.iter().find(|e| e.id == "sp1").unwrap();
+        let value: Value = serde_json::from_str(&sp.data).unwrap();
+        assert_eq!(
+            value["content"].as_str().unwrap(),
+            content1,
+            "segments fetched from the store reconstruct byte-identically"
+        );
+    }
+
+    /// A team run offloads the range pack to the store as a single framed object
+    /// and writes only a `pack_hash` pointer (pack/pack_idx NULL) into the synced
+    /// replica. A gitcoord read reconstructs byte-identically by fetching the pack
+    /// from the store; a store that lacks the object degrades to a labeled stub.
+    #[tokio::test]
+    async fn team_run_offloads_pack_and_reconstructs_gitcoord_from_store() {
+        let fx = build_fixture();
+        let mut db = migrated_test_db("archival-team-pack.db").await;
+        seed_chain(
+            &db,
+            fx.origin.to_str().unwrap(),
+            fx.clone.to_str().unwrap(),
+            Some(&fx.anchor),
+            Some(&fx.anchor),
+            false,
+        )
+        .await;
+
+        let store = crate::archival::store::InMemoryContentStore::new();
+        db.set_team_context(crate::archival::store::TeamReplicaContext {
+            team_id: "team-x".to_string(),
+            store: std::sync::Arc::new(store.clone()),
+        });
+
+        let v2: &[u8] = b"ALPHA\nbeta\ngamma\ndelta\nepsilon\n";
+        let w1_short = short(&fx.clone, &fx.w1);
+        let targets: Vec<(&str, &[u8])> = vec![("file:a.txt", v2)];
+        let stored_w1 = rendered(&targets);
+
+        // Write advances the replay tracker to W1; the post-write read of
+        // a.txt=v2 resolves only from the range pack (W1's blob is absent from the
+        // origin ODB), so it is the pack-dependent gitcoord read.
+        insert_event(
+            &db,
+            "a-w1",
+            "run",
+            1,
+            1,
+            "assistant",
+            &assistant_write("w1"),
+        )
+        .await;
+        insert_event(
+            &db,
+            "e-w1",
+            "run",
+            2,
+            2,
+            "tool_result",
+            &write_result("w1", &w1_short),
+        )
+        .await;
+        insert_event(
+            &db,
+            "a-r2",
+            "run",
+            3,
+            3,
+            "assistant",
+            &assistant_read("r2", &["file:a.txt"]),
+        )
+        .await;
+        insert_event(
+            &db,
+            "e-r2",
+            "run",
+            4,
+            4,
+            "tool_result",
+            &read_result("r2", &stored_w1),
+        )
+        .await;
+
+        let summary = archive_target(
+            &db,
+            fx.clone.to_str().unwrap(),
+            fx.origin.to_str().unwrap(),
+            &["job".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            summary.gitcoord_read, 1,
+            "the post-write read is git-addressed"
+        );
+
+        let (pack_null, pack_hash) = pack_pointer(&db).await;
+        assert!(pack_null, "pack/pack_idx are NULL on the team replica");
+        let pack_hash = pack_hash.expect("pack_hash pointer written");
+        assert!(
+            store.contains(&pack_hash).await,
+            "the framed pack is offloaded to the store under pack_hash"
+        );
+
+        let events = load_events(&db).await;
+        let recon = reconstruct_events(&db, events).await;
+        let r2 = recon.iter().find(|e| e.id == "e-r2").unwrap();
+        assert_eq!(
+            tool_result_of(r2),
+            stored_w1,
+            "gitcoord read reconstructs byte-identically via the store-fetched pack"
+        );
+
+        // A store missing the object (a teammate without it, or a dropped object)
+        // degrades to a labeled stub rather than erroring.
+        let empty = crate::archival::store::InMemoryContentStore::new();
+        db.set_team_context(crate::archival::store::TeamReplicaContext {
+            team_id: "team-x".to_string(),
+            store: std::sync::Arc::new(empty),
+        });
+        let events = load_events(&db).await;
+        let recon = reconstruct_events(&db, events).await;
+        let r2 = recon.iter().find(|e| e.id == "e-r2").unwrap();
+        assert!(
+            tool_result_of(r2).contains(STUB_PREFIX),
+            "a missing pack object degrades to a labeled stub"
+        );
+
+        // Integrity: a store object whose bytes do NOT hash to pack_hash (corrupt
+        // object, broker/backend bug, tampering) is rejected and treated as
+        // absent, so a teammate never reconstructs from bytes that are not the
+        // object the pointer names.
+        let corrupt = crate::archival::store::InMemoryContentStore::new();
+        corrupt
+            .put(&pack_hash, b"these bytes do not hash to pack_hash")
+            .await
+            .unwrap();
+        db.set_team_context(crate::archival::store::TeamReplicaContext {
+            team_id: "team-x".to_string(),
+            store: std::sync::Arc::new(corrupt),
+        });
+        let events = load_events(&db).await;
+        let recon = reconstruct_events(&db, events).await;
+        let r2 = recon.iter().find(|e| e.id == "e-r2").unwrap();
+        assert!(
+            tool_result_of(r2).contains(STUB_PREFIX),
+            "a corrupt pack object (wrong bytes under pack_hash) degrades to a stub"
+        );
+    }
+
+    /// Fail-soft: a store `put` failure aborts archival before any DB write
+    /// (put-before-commit), so the event rows stay `full` and no `archival_blobs`
+    /// row is written. The teardown caller logs the error and proceeds.
+    #[tokio::test]
+    async fn team_run_store_put_failure_leaves_rows_full() {
+        struct FailingStore;
+        #[async_trait::async_trait]
+        impl crate::archival::store::ContentStore for FailingStore {
+            async fn put(&self, _: &str, _: &[u8]) -> Result<(), String> {
+                Err("store unavailable".to_string())
+            }
+            async fn get(&self, _: &str) -> Result<Option<Vec<u8>>, String> {
+                Ok(None)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        init_repo(repo);
+        write_file(repo, "a.txt", b"x\n");
+        commit_all(repo, "base");
+        let mut db = migrated_test_db("archival-team-failsoft.db").await;
+        seed_chain(
+            &db,
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            None,
+            None,
+            false,
+        )
+        .await;
+        db.set_team_context(crate::archival::store::TeamReplicaContext {
+            team_id: "team-x".to_string(),
+            store: std::sync::Arc::new(FailingStore),
+        });
+
+        let backend_base = "CLAUDE-BASE ".repeat(800);
+        let cairn = format!("\n\n{}", "CAIRN-PROMPT ".repeat(700));
+        let agent = "\n\n<agent_role>\nbuilder role body".to_string();
+        let (data1, _content1) = system_prompt(&[
+            ("backend_base", backend_base.as_str()),
+            ("cairn", cairn.as_str()),
+            ("agent", agent.as_str()),
+            ("dynamic", "\n\n## Orientation\n\ntail\n</agent_role>"),
+        ]);
+        insert_event(&db, "sp1", "run", 1, 1, "system:prompt", &data1).await;
+
+        let result = archive_target(
+            &db,
+            repo.to_str().unwrap(),
+            repo.to_str().unwrap(),
+            &["job".to_string()],
+            None,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a store put failure fails archival so teardown leaves the rows full"
+        );
+        assert_eq!(blob_count(&db).await, 0, "no archival_blobs written");
+        assert_eq!(
+            event_storage_mode(&db, "sp1").await.as_deref(),
+            Some("full"),
+            "the event row is left full when the offload fails"
+        );
+    }
+
     /// Corrupted boundary metadata (spans that no longer tile the content) fails
     /// the byte-exact verify and the event keeps its whole bytes as zstd.
     #[tokio::test]
@@ -3521,6 +3970,113 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Post-teardown counterpart to the live node-diff base-advance regression.
+    /// Archival must persist the effective fork point as `execution_history.base_sha`
+    /// so an archived diff can be rendered after the jj graph and worktree are gone.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn archived_node_diff_excludes_rebased_external_base_deletion() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping archived_node_diff_excludes_rebased_external_base_deletion: jj not resolvable"
+            );
+            return;
+        };
+        let home = tempfile::tempdir().unwrap();
+        let origin = tempfile::tempdir().unwrap();
+        let proj_dir = tempfile::tempdir().unwrap();
+        let wts = tempfile::tempdir().unwrap();
+        let proj = proj_dir.path().to_str().unwrap().to_string();
+
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        init_repo(proj_dir.path());
+        write_file(proj_dir.path(), "shared.rs", b"base\n");
+        write_file(proj_dir.path(), "base-only.rs", b"base-only\n");
+        let base = commit_all(proj_dir.path(), "base");
+        git(
+            proj_dir.path(),
+            &["remote", "add", "origin", &origin.path().to_string_lossy()],
+        );
+        git(proj_dir.path(), &["push", "-q", "origin", "main"]);
+
+        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        crate::jj::ensure_project_store(&jj, &store, proj_dir.path()).unwrap();
+        let ws = wts.path().join("job");
+        let branch = "agent/CAIRN-1-builder-0";
+        crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+
+        std::fs::write(ws.join("node.rs"), "node\n").unwrap();
+        crate::jj::seal(&jj, &ws, "node work", None).unwrap();
+
+        std::fs::remove_file(proj_dir.path().join("base-only.rs")).unwrap();
+        git(proj_dir.path(), &["add", "-A"]);
+        git(
+            proj_dir.path(),
+            &["commit", "-q", "-m", "external base deletion"],
+        );
+        let advanced_base = git(proj_dir.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        git(proj_dir.path(), &["push", "-q", "origin", "main"]);
+        crate::jj::fetch_remote(&jj, &store, "origin").unwrap();
+        crate::jj::reconcile_siblings(
+            &jj,
+            &store,
+            "main@origin",
+            &[(branch.to_string(), ws.clone())],
+        )
+        .unwrap();
+
+        let ws_str = ws.to_str().unwrap().to_string();
+        let db = migrated_test_db("archival-base-advance-diff.db").await;
+        seed_chain(&db, &proj, &ws_str, Some(&base), Some(&base), false).await;
+        insert_event(
+            &db,
+            "a-text",
+            "run",
+            1,
+            1,
+            "assistant",
+            &assistant_text("archival trigger"),
+        )
+        .await;
+        archive_target(&db, &ws_str, &proj, &["job".to_string()], Some(&jj))
+            .await
+            .unwrap();
+
+        let archived_base = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT base_sha FROM execution_history WHERE execution_id = 'exec'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await?.map(|row| row.text(0)).transpose()
+                })
+            })
+            .await
+            .unwrap()
+            .expect("execution_history row present");
+        assert_eq!(archived_base, advanced_base);
+
+        crate::jj::forget_workspace(&jj, &store, branch).unwrap();
+        std::fs::remove_dir_all(&ws).unwrap();
+
+        let diff = crate::diff::node_base_tip_diff(&db, "job", &bin, home.path())
+            .await
+            .unwrap()
+            .expect("archived diff present");
+        let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["node.rs"],
+            "archived diff must not attribute the base deletion to the node: {paths:?}"
+        );
     }
 
     async fn event_coord(db: &LocalDb, id: &str) -> (Option<String>, Option<String>) {

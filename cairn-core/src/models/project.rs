@@ -20,12 +20,8 @@ pub struct Project {
     pub worktree_populate: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    /// When set, this project is a remote bookmark pointing to a cairn-server instance.
-    pub remote_url: Option<String>,
     /// Whether this project is hidden from the sidebar.
     pub hidden: bool,
-    /// Server this project belongs to (for remote projects).
-    pub server_id: Option<String>,
     /// Whether this project represents the Cairn workspace config root.
     pub is_workspace: bool,
 }
@@ -61,17 +57,21 @@ pub struct TerminalCommand {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateProject {
-    /// Optional ID to use instead of generating a new UUID.
-    /// Used when creating a local bookmark for a remote project so the local
-    /// entry shares the same UUID as the server's project.
+    /// Optional ID to use instead of generating a new UUID. Set when a project's
+    /// row must adopt a specific UUID (e.g. a team-synced project created from an
+    /// existing record).
     pub id: Option<String>,
     pub name: String,
     pub key: String,
     pub repo_path: String,
-    /// When set, creates a remote project bookmark instead of a local project.
-    pub remote_url: Option<String>,
-    /// Server ID for remote projects (replaces remote_url for routing).
-    pub server_id: Option<String>,
+    /// Routes the project to a team's synced database (CAIRN-2132). `None` (the
+    /// default for every existing caller) creates a local project whose data
+    /// lives in the private database; `Some(team_id)` writes the `projects` row
+    /// to that team's already-open replica and records a `project_routes` stub.
+    /// Seeded by tests/settings this slice; the api/ control plane populates it
+    /// later.
+    #[serde(default)]
+    pub team_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -268,6 +268,7 @@ async fn produce_web_segment(
             let window = view::window_text_lines(&markdown, offset, limit);
             let mut meta = SegmentMeta::new(target, SegmentKind::Web, NaturalUnit::Line);
             meta.total_units = Some(window.total);
+            meta.shown_units = window.shown;
             meta.offset = window.offset;
             meta.limit = limit;
             ReadSegment::text(window.body, meta)
@@ -373,6 +374,7 @@ async fn produce_resource_segment(
                 view::window_text_lines(&rendered.content, rendered.offset, rendered.limit);
             let mut meta = SegmentMeta::new(target, SegmentKind::Resource, NaturalUnit::Line);
             meta.total_units = Some(window.total);
+            meta.shown_units = window.shown;
             meta.offset = window.offset;
             meta.limit = rendered.limit;
             ReadSegment {

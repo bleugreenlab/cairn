@@ -4,6 +4,8 @@
 //! jobs start, complete, or fail — giving other agents passive awareness
 //! of what's happening on the issue.
 
+use std::sync::Arc;
+
 use crate::models::ChannelType;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, LocalDb, RowExt};
@@ -18,7 +20,14 @@ use turso::params;
 /// the `sender_run_id` on the message so that delivery filters can exclude
 /// the message from being shown back to the same agent.
 pub fn emit_job_event(orch: &Orchestrator, job_id: &str, run_id: Option<&str>, event: JobEvent) {
-    let ctx = match lookup_job_context(orch, job_id) {
+    // Lifecycle messages live in the job's OWNING database (CAIRN-2197): a team
+    // job's rows are in the synced replica, so looking up context and inserting
+    // the message against the private DB would silently drop the message for
+    // every team execution. Best-effort — a closed replica skips the message.
+    let Some(db) = owning_db_for_job(orch, job_id) else {
+        return;
+    };
+    let ctx = match lookup_job_context(db.clone(), job_id) {
         Some(ctx) => ctx,
         None => return, // No issue context — standalone job, skip
     };
@@ -39,7 +48,7 @@ pub fn emit_job_event(orch: &Orchestrator, job_id: &str, run_id: Option<&str>, e
     };
 
     let msg = super::db::insert_message(
-        &orch.db.local,
+        &db,
         &ChannelType::Issue,
         Some(&ctx.issue_key),
         run_id, // Identifies which agent this event is about
@@ -75,8 +84,34 @@ struct JobContext {
     uri: Option<String>,
 }
 
-fn lookup_job_context(orch: &Orchestrator, job_id: &str) -> Option<JobContext> {
-    let db = orch.db.local.clone();
+/// Resolve the database that owns a job (CAIRN-2197): the synced replica for a
+/// team job, the private DB for a local one. Best-effort — a closed team replica
+/// yields None and the (best-effort) lifecycle message is simply skipped.
+fn owning_db_for_job(orch: &Orchestrator, job_id: &str) -> Option<Arc<LocalDb>> {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .ok()
+}
+
+/// Resolve the database that owns a run (CAIRN-2197), same contract as
+/// [`owning_db_for_job`].
+fn owning_db_for_run(orch: &Orchestrator, run_id: &str) -> Option<Arc<LocalDb>> {
+    let dbs = orch.db.clone();
+    let run_id = run_id.to_string();
+    run_db_blocking(move || async move {
+        crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .ok()
+}
+
+fn lookup_job_context(db: Arc<LocalDb>, job_id: &str) -> Option<JobContext> {
     let job_id = job_id.to_string();
     run_db_blocking(move || async move { lookup_job_context_async(&db, &job_id).await })
         .ok()
@@ -147,7 +182,10 @@ async fn lookup_job_context_async(
 /// Emit a system message when a user creates a terminal for a job.
 /// Tells the agent about the terminal's URI so it can read output.
 pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, title: &str) {
-    let ctx = match lookup_job_context(orch, job_id) {
+    let Some(db) = owning_db_for_job(orch, job_id) else {
+        return;
+    };
+    let ctx = match lookup_job_context(db.clone(), job_id) {
         Some(ctx) => ctx,
         None => return, // No issue context — standalone job, skip
     };
@@ -164,7 +202,7 @@ pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, titl
     );
 
     let msg = super::db::insert_message(
-        &orch.db.local,
+        &db,
         &ChannelType::Issue,
         Some(&ctx.issue_key),
         None, // No sender_run_id — user-initiated, all agents should see it
@@ -184,10 +222,13 @@ pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, titl
 
 /// Emit a system message for a run being continued (follow-up message sent).
 pub fn emit_run_continued(orch: &Orchestrator, run_id: &str) {
-    let job_id = lookup_run_job_id(orch, run_id);
+    let Some(db) = owning_db_for_run(orch, run_id) else {
+        return;
+    };
+    let job_id = lookup_run_job_id(db.clone(), run_id);
 
     if let Some(job_id) = job_id {
-        let ctx = match lookup_job_context(orch, &job_id) {
+        let ctx = match lookup_job_context(db.clone(), &job_id) {
             Some(ctx) => ctx,
             None => return,
         };
@@ -199,7 +240,7 @@ pub fn emit_run_continued(orch: &Orchestrator, run_id: &str) {
         let content = format!("{} received a follow-up message", label);
 
         let msg = super::db::insert_message(
-            &orch.db.local,
+            &db,
             &ChannelType::Issue,
             Some(&ctx.issue_key),
             Some(run_id),
@@ -218,8 +259,7 @@ pub fn emit_run_continued(orch: &Orchestrator, run_id: &str) {
     }
 }
 
-fn lookup_run_job_id(orch: &Orchestrator, run_id: &str) -> Option<String> {
-    let db = orch.db.local.clone();
+fn lookup_run_job_id(db: Arc<LocalDb>, run_id: &str) -> Option<String> {
     let run_id = run_id.to_string();
     run_db_blocking(move || async move { lookup_run_job_id_async(&db, &run_id).await })
         .ok()

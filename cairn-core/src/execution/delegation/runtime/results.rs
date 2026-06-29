@@ -59,6 +59,60 @@ pub(super) async fn build_task_callback_response(
     }
 }
 
+/// The task artifact URI for a delegated child job, derived entirely from the
+/// child's own job row. The background-completion push uses this for a
+/// single-task batch, where there is no live `ParentRunContext` in hand (the
+/// finalize path holds only the settled child job id). It reconstructs the
+/// minimal context [`compute_artifact_uri`] reads — project key, issue number,
+/// and execution seq — and delegates, so both paths build the same URI.
+pub(super) async fn compute_artifact_uri_for_child_job(
+    db: &LocalDb,
+    child_job_id: &str,
+) -> Option<String> {
+    let (project_key, issue_number, exec_seq) = job_context_fields(db, child_job_id).await?;
+    // Only project_key / issue_number / exec_seq are read by
+    // `compute_artifact_uri`; the remaining fields are inert placeholders.
+    let parent_ctx = ParentRunContext {
+        run_id: String::new(),
+        job_id: String::new(),
+        execution_id: None,
+        exec_seq: Some(exec_seq),
+        issue_id: None,
+        issue_number: Some(issue_number),
+        project_id: String::new(),
+        project_key,
+    };
+    compute_artifact_uri(db, &parent_ctx, child_job_id).await
+}
+
+/// `(project_key, issue_number, exec_seq)` for a job, joining issue, project, and
+/// execution. `exec_seq` defaults to 1 when the job has no execution.
+async fn job_context_fields(db: &LocalDb, job_id: &str) -> Option<(String, i32, i32)> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT p.key, i.number, COALESCE(e.seq, 1)
+                     FROM jobs j
+                     JOIN issues i ON i.id = j.issue_id
+                     JOIN projects p ON p.id = i.project_id
+                     LEFT JOIN executions e ON e.id = j.execution_id
+                     WHERE j.id = ?1 LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok((row.text(0)?, row.i64(1)? as i32, row.i64(2)? as i32)))
+                .transpose()
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 pub(super) async fn compute_artifact_uri(
     db: &LocalDb,
     parent_ctx: &ParentRunContext,

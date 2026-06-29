@@ -12,6 +12,7 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::models::{Fence, TurnStartReason, TurnState, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use cairn_common::ids;
 use turso::params;
 
 use super::{emit_attention, AttentionEvent};
@@ -54,12 +55,21 @@ pub(crate) async fn await_permission_decision(
     tool_input: &serde_json::Value,
 ) -> PermissionWait {
     let services = &orch.services;
-    let request_id = uuid::Uuid::new_v4().to_string();
+    // Intrinsic prefixing (CAIRN-2210): a team run's permission_request is FK'd to
+    // a replica-resident run, so its id must carry the run's team prefix or the
+    // response path's routing_db_for_id would fail-close. Inherit the run's scope.
+    let request_id = ids::mint_child(run_id);
     let now = chrono::Utc::now().timestamp() as i32;
-    let current_turn_id = orch.process_state.get_current_turn_id(run_id);
+    // Capture the live turn from the process. During the warm-reuse race window
+    // this can be None even though the job's turn is already DB-visible
+    // (CAIRN-2123); the closure below falls back to jobs.current_turn_id for a
+    // job-owned request so the stored row never carries turn_id = NULL when the
+    // turn is recoverable. The resume-time fallback in record_permission_response
+    // is the load-bearing recovery; this is defensive at capture time.
+    let process_turn_id = orch.process_state.get_current_turn_id(run_id);
     let tool_input_json = serde_json::to_string(tool_input).unwrap_or_default();
 
-    let (yielded_turn, perm_segment) = match orch
+    let (yielded_turn, perm_segment, current_turn_id) = match orch
         .db
         .local
         .write(|conn| {
@@ -68,7 +78,7 @@ pub(crate) async fn await_permission_decision(
             let tool_use_id = tool_use_id.to_string();
             let tool_name = tool_name.to_string();
             let tool_input_json = tool_input_json.clone();
-            let current_turn_id = current_turn_id.clone();
+            let process_turn_id = process_turn_id.clone();
             Box::pin(async move {
                 // Owning node job for this run; None for project-chat runs.
                 let job_id = {
@@ -82,6 +92,30 @@ pub(crate) async fn await_permission_decision(
                         Some(row) => row.opt_text(0)?,
                         None => None,
                     }
+                };
+
+                // CAIRN-2123: prefer the live process turn; when it is absent
+                // (the warm-reuse `Busy`-without-turn window) fall back to the
+                // job's persisted turn so a job-owned request never stores
+                // turn_id = NULL while the turn is recoverable. Project-chat runs
+                // (no owning job) legitimately have no turn and keep None.
+                let current_turn_id = match process_turn_id {
+                    Some(turn_id) => Some(turn_id),
+                    None => match job_id.as_deref() {
+                        Some(owning_job_id) => {
+                            let mut turn_rows = conn
+                                .query(
+                                    "SELECT current_turn_id FROM jobs WHERE id = ?1 LIMIT 1",
+                                    params![owning_job_id],
+                                )
+                                .await?;
+                            match turn_rows.next().await? {
+                                Some(turn_row) => turn_row.opt_text(0)?,
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    },
                 };
 
                 // Stable per-node ordinal: count this node's existing requests.
@@ -154,12 +188,12 @@ pub(crate) async fn await_permission_decision(
                     Err(e) => log::warn!("Failed to look up issue for run {}: {}", run_id, e),
                 }
 
-                Ok((yielded_turn, uri_segment))
+                Ok((yielded_turn, uri_segment, current_turn_id))
             })
         })
         .await
     {
-        Ok(pair) => pair,
+        Ok(values) => values,
         Err(e) => {
             return PermissionWait::Decided(deny_response(&format!(
                 "Failed to store request: {}",
@@ -283,7 +317,9 @@ pub(crate) async fn create_background_permission_request(
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> Result<String, String> {
-    let request_id = uuid::Uuid::new_v4().to_string();
+    // Intrinsic prefixing (CAIRN-2210): inherit the owning run's scope so a team
+    // background permission_request routes back to the replica.
+    let request_id = ids::mint_child(run_id);
     let now = chrono::Utc::now().timestamp() as i32;
     let tool_input_json = serde_json::to_string(tool_input).unwrap_or_default();
 
@@ -694,15 +730,18 @@ impl CrossingDetail {
     }
 }
 
+/// Live-wait state captured while recording a permission answer. Public for the
+/// suspend/resume regression tests, which call [`record_permission_response`]
+/// directly to assert the NULL-turn predecessor recovery.
 #[derive(Debug)]
-struct PermissionResponseResume {
-    run_id: String,
-    session_id: Option<String>,
-    issue_id: Option<String>,
-    predecessor_turn_id: Option<String>,
-    successor_turn_id: Option<String>,
-    job_id: Option<String>,
-    duplicate: bool,
+pub struct PermissionResponseResume {
+    pub run_id: String,
+    pub session_id: Option<String>,
+    pub issue_id: Option<String>,
+    pub predecessor_turn_id: Option<String>,
+    pub successor_turn_id: Option<String>,
+    pub job_id: Option<String>,
+    pub duplicate: bool,
 }
 
 /// Resolve a pending permission request: record the answer, record any session
@@ -722,7 +761,19 @@ pub async fn resolve_permission_request(
     scope: PermissionScope,
 ) -> Result<ResolveOutcome, String> {
     let now = chrono::Utc::now().timestamp() as i32;
-    let record = get_permission_request_record(&orch.db.local, request_id)
+    // Resolve the owning database ONCE (fail-closed, CAIRN-2227): a team
+    // execution's permission_requests/runs/turns/issue rows live WHOLLY in its
+    // synced replica, so the response record, the successor turn, and the
+    // issue-status recompute must all land there. Reading the private DB instead
+    // returns no row — the answer errors `Permission request not found` and
+    // returns before the resume, leaving the run parked at the approval gate.
+    // The resume mechanics (store_tool_result_event_with_turn / continue_job_impl)
+    // already self-route by run/job, so threading this handle covers the rest.
+    let owning_db =
+        crate::execution::routing::owning_db_for_permission_request(&orch.db, request_id)
+            .await
+            .map_err(|e| format!("Permission request not found: {}", e))?;
+    let record = get_permission_request_record(&owning_db, request_id)
         .await
         .map_err(|e| format!("Permission request not found: {}", e))?;
 
@@ -739,10 +790,9 @@ pub async fn resolve_permission_request(
 
     let response_json = build_permission_response_json(&record, behavior, crossing.as_ref());
 
-    let resume =
-        record_permission_response(&orch.db.local, request_id, status, &response_json, now)
-            .await
-            .map_err(|e| e.to_string())?;
+    let resume = record_permission_response(&owning_db, request_id, status, &response_json, now)
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Session grant bookkeeping (only on allow + session).
     if matches!(decision, PermissionDecision::Allow) && matches!(scope, PermissionScope::Session) {
@@ -763,9 +813,10 @@ pub async fn resolve_permission_request(
     }
 
     if let Some(issue_id) = resume.issue_id.as_deref() {
-        if let Err(e) = recompute_issue_status_for_issue(&orch.db.local, issue_id).await {
+        if let Err(e) = recompute_issue_status_for_issue(&owning_db, issue_id).await {
             log::warn!("Failed to recompute issue status {}: {}", issue_id, e);
         }
+        // Attention bookkeeping is host-local (CAIRN-2186), so wake stays on orch.
         orch.wake_for_issue(issue_id).await;
     }
 
@@ -803,6 +854,7 @@ pub async fn resolve_permission_request(
     if should_resume {
         if let Err(e) = resume_suspended_permission(
             orch,
+            &owning_db,
             &record,
             &resume,
             &response_json,
@@ -814,6 +866,25 @@ pub async fn resolve_permission_request(
         {
             log::warn!("Failed to resume after permission {}: {}", request_id, e);
         }
+    } else if !resume.duplicate
+        && !inline_waiter_was_present
+        && resume.successor_turn_id.is_none()
+        && !crossing
+            .as_ref()
+            .is_some_and(CrossingDetail::is_terminal_origin)
+    {
+        // Park-forever signature (CAIRN-2123): the run durably suspended (no
+        // inline waiter), this is the first answer (not a duplicate), and yet no
+        // successor turn was created — so the run has no turn to resume into. The
+        // resume-time predecessor fallback should have recovered one; if this
+        // fires, a permission was answered but its run stays parked. Logged at
+        // warn so a recurrence is diagnosable from logs, not just a live DB peek.
+        log::warn!(
+            "permission {request_id}: durably suspended but no successor turn was created \
+             (predecessor turn missing); run {} may stay parked. job_id={:?}",
+            resume.run_id,
+            resume.job_id
+        );
     }
 
     Ok(ResolveOutcome {
@@ -958,6 +1029,7 @@ fn should_resume_permission_response(
 #[allow(clippy::too_many_arguments)]
 async fn resume_suspended_permission(
     orch: &Orchestrator,
+    owning_db: &LocalDb,
     record: &PermissionRequestRecord,
     resume: &PermissionResponseResume,
     response_json: &str,
@@ -966,9 +1038,21 @@ async fn resume_suspended_permission(
     scope: PermissionScope,
 ) -> Result<(), String> {
     let Some(session_id) = resume.session_id.as_deref() else {
+        log::warn!(
+            "permission {}: skipping durable resume — run {} has no session_id; \
+             the run will not be resumed",
+            record.id,
+            resume.run_id
+        );
         return Ok(());
     };
     let Some(job_id) = resume.job_id.as_deref() else {
+        log::warn!(
+            "permission {}: skipping durable resume — request on run {} has no owning \
+             job; the run will not be resumed",
+            record.id,
+            resume.run_id
+        );
         return Ok(());
     };
     let now = chrono::Utc::now().timestamp() as i32;
@@ -1002,7 +1086,7 @@ async fn resume_suspended_permission(
                 // attach the (suspend-marker) result or continue the run here,
                 // which would hand the agent a misleading result and race the
                 // new request's resume.
-                if has_pending_permission_request(&orch.db.local, &resume.run_id).await {
+                if has_pending_permission_request(owning_db, &resume.run_id).await {
                     return Ok(());
                 }
                 (result, false)
@@ -1136,7 +1220,7 @@ async fn get_permission_request_record(
     .await
 }
 
-async fn record_permission_response(
+pub async fn record_permission_response(
     db: &LocalDb,
     request_id: &str,
     status: &str,
@@ -1169,10 +1253,46 @@ async fn record_permission_response(
                 })?;
                 let run_id = row.text(0)?;
                 let issue_id = row.opt_text(1)?;
-                let predecessor_turn_id = row.opt_text(2)?;
                 let session_id = row.opt_text(3)?;
                 let job_id = row.opt_text(4)?;
                 let current_status = row.text(5)?;
+                // CAIRN-2123: a fence crossing raised during the warm-reuse
+                // `Busy`-without-turn window stored `turn_id = NULL`. By the time
+                // the answer arrives (past the inline budget) the job's turn is
+                // long since persisted in `jobs.current_turn_id` and interrupted
+                // to a terminal state by the durable suspend, so recover it as
+                // the predecessor. Without this the successor turn is never
+                // created, `should_resume_permission_response` stays false, and
+                // the run parks forever (allow and deny both no-ops). A request
+                // with no owning job (project chat) legitimately has no turn and
+                // must NOT be force-resumed, so the fallback is gated on job
+                // ownership.
+                let predecessor_turn_id = match row.opt_text(2)? {
+                    Some(turn_id) => Some(turn_id),
+                    None => match job_id.as_deref() {
+                        Some(owning_job_id) => {
+                            let mut turn_rows = conn
+                                .query(
+                                    "SELECT current_turn_id FROM jobs WHERE id = ?1 LIMIT 1",
+                                    params![owning_job_id],
+                                )
+                                .await?;
+                            let recovered = match turn_rows.next().await? {
+                                Some(turn_row) => turn_row.opt_text(0)?,
+                                None => None,
+                            };
+                            if recovered.is_some() {
+                                log::warn!(
+                                    "permission {request_id}: stored turn_id was NULL; \
+                                     recovered predecessor from jobs.current_turn_id \
+                                     (warm-reuse race, CAIRN-2123)"
+                                );
+                            }
+                            recovered
+                        }
+                        None => None,
+                    },
+                };
 
                 let duplicate = if current_status != "pending" {
                     true
@@ -1528,7 +1648,7 @@ async fn ensure_successor_turn(
     }
 
     let sequence = next_turn_sequence(conn, session_id).await?;
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = ids::mint_child(job_id);
     let start_reason = start_reason.to_string();
     let now = chrono::Utc::now().timestamp() as i32;
 

@@ -1,24 +1,21 @@
-//! Unified sync-and-emit helpers for write operations.
+//! Frontend-emit helpers for write operations.
 //!
-//! Every DB write that needs frontend invalidation and/or cloud sync currently
-//! repeats a 2–3 line pattern: `orch.sync(SyncMessage::Foo(…))` then
-//! `emitter.emit("db-change", json!({"table":"foos"}))`.
-//!
-//! `Notifier` combines both into a single typed call:
+//! Every DB write that needs frontend invalidation emits a `db-change` event
+//! through the shared [`EventEmitter`]. `Notifier` wraps the emitter so call
+//! sites express intent with a typed call:
 //!
 //! ```ignore
-//! orch.notifier.issue(&issue);          // sync + emit
-//! orch.notifier.emit_change("todos");   // emit only (local-only table)
+//! orch.notifier.issue(&issue);          // emit an `issues` db-change
+//! orch.notifier.emit_change("todos");   // emit an arbitrary table change
 //! ```
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
 
 use crate::models;
 use crate::services::EventEmitter;
-use crate::sync::message::*;
+use crate::storage::{run_db_blocking, LocalDb};
 
 /// Build a fully-scoped `jobs` db-change payload.
 ///
@@ -102,6 +99,43 @@ pub fn run_db_change(run: &models::Run, action: &str) -> Value {
 /// can't be forgotten. Both camel- and snake-cased keys are emitted because the
 /// frontend `parseScopeIds` reads either.
 pub fn event_db_change(run_id: &str, session_id: Option<&str>, action: &str) -> Value {
+    event_db_change_scoped(run_id, session_id, None, action)
+}
+
+fn event_issue_id_for_run(db: Arc<LocalDb>, run_id: &str) -> Result<Option<String>, String> {
+    let run_id = run_id.to_string();
+    run_db_blocking(move || async move {
+        db.query_opt_text(
+            "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
+            turso::params![run_id.as_str()],
+        )
+        .await
+        .map_err(|e| format!("Failed to load issue id for event db-change: {e}"))
+    })
+}
+
+pub fn event_db_change_for_run(
+    db: Arc<LocalDb>,
+    run_id: &str,
+    session_id: Option<&str>,
+    action: &str,
+) -> Value {
+    let issue_id = match event_issue_id_for_run(db, run_id) {
+        Ok(issue_id) => issue_id,
+        Err(error) => {
+            log::warn!("{error}");
+            None
+        }
+    };
+    event_db_change_scoped(run_id, session_id, issue_id.as_deref(), action)
+}
+
+pub fn event_db_change_scoped(
+    run_id: &str,
+    session_id: Option<&str>,
+    issue_id: Option<&str>,
+    action: &str,
+) -> Value {
     json!({
         "table": "events",
         "action": action,
@@ -109,106 +143,73 @@ pub fn event_db_change(run_id: &str, session_id: Option<&str>, action: &str) -> 
         "run_id": run_id,
         "sessionId": session_id,
         "session_id": session_id,
+        "issueId": issue_id,
+        "issue_id": issue_id,
     })
 }
 
-/// Combines cloud sync and frontend event emission into a single call.
+/// Emits frontend `db-change` events for write operations.
 ///
 /// Created once during Orchestrator construction; shared via `Arc` clone.
-/// All methods are fire-and-forget — errors are silently dropped, matching
-/// the existing `orch.sync()` behavior.
+/// All methods are fire-and-forget — emit errors are silently dropped.
 #[derive(Clone)]
 pub struct Notifier {
-    sync_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SyncMessage>>>>,
     emitter: Arc<dyn EventEmitter>,
 }
 
 impl Notifier {
-    pub fn new(
-        sync_tx: Arc<Mutex<Option<mpsc::UnboundedSender<SyncMessage>>>>,
-        emitter: Arc<dyn EventEmitter>,
-    ) -> Self {
-        Self { sync_tx, emitter }
+    pub fn new(emitter: Arc<dyn EventEmitter>) -> Self {
+        Self { emitter }
     }
 
-    // --- Syncable entities (cloud sync + frontend emit) ---
+    // --- Entity change notifications (frontend emit) ---
 
-    pub fn project(&self, p: &models::Project) {
-        self.sync_and_emit(SyncMessage::Project(p.into()), "projects");
+    pub fn project(&self, _p: &models::Project) {
+        self.emit_change("projects");
     }
 
-    pub fn issue(&self, i: &models::Issue) {
-        self.sync_and_emit(SyncMessage::Issue(i.into()), "issues");
+    pub fn issue(&self, _i: &models::Issue) {
+        self.emit_change("issues");
     }
 
     pub fn job(&self, j: &models::Job) {
-        // Route through the scoped builder so the abstraction stays correct if
-        // this (currently caller-less) method ever gains callers.
-        self.sync_and_emit_payload(SyncMessage::Job(j.into()), job_db_change(j, "update"));
+        // Route through the scoped builder so the precise job-list invalidation
+        // carries the full id set (see [`job_db_change`]).
+        let _ = self.emitter.emit("db-change", job_db_change(j, "update"));
     }
 
     pub fn run(&self, r: &models::Run) {
-        self.sync_and_emit_payload(SyncMessage::Run(r.into()), run_db_change(r, "update"));
+        let _ = self.emitter.emit("db-change", run_db_change(r, "update"));
     }
 
     pub fn event(&self, _e: &models::Event) {
         self.emit_change("events");
     }
 
-    pub fn artifact(&self, a: &models::Artifact) {
-        self.sync_and_emit(SyncMessage::Artifact(a.into()), "artifacts");
+    pub fn artifact(&self, _a: &models::Artifact) {
+        self.emit_change("artifacts");
     }
 
-    pub fn comment(&self, c: &models::Comment) {
-        self.sync_and_emit(SyncMessage::Comment(c.into()), "comments");
+    pub fn comment(&self, _c: &models::Comment) {
+        self.emit_change("comments");
     }
 
-    // --- Delete (cloud sync + frontend emit) ---
+    // --- Delete ---
 
-    pub fn deleted(&self, table: &str, id: &str) {
-        self.sync(SyncMessage::Delete {
-            table: table.to_string(),
-            id: id.to_string(),
-        });
+    pub fn deleted(&self, table: &str, _id: &str) {
         self.emit_change(table);
     }
 
-    // --- Local-only entities (emit only, no cloud sync) ---
+    // --- Generic ---
 
-    /// Emit a `db-change` event for a table that doesn't sync to cloud.
+    /// Emit a `db-change` event for an arbitrary table.
     pub fn emit_change(&self, table: &str) {
         let _ = self.emitter.emit("db-change", json!({"table": table}));
-    }
-
-    // --- Raw sync+emit (for manual SyncMessage construction) ---
-
-    /// Send a sync message and emit a db-change event.
-    pub fn sync_and_emit(&self, msg: SyncMessage, table: &str) {
-        self.sync(msg);
-        self.emit_change(table);
-    }
-
-    /// Send a sync message and emit a db-change event with a pre-built payload.
-    /// Used to carry the fully-scoped builders ([`job_db_change`] /
-    /// [`run_db_change`]) instead of a bare `{table}` poke.
-    pub fn sync_and_emit_payload(&self, msg: SyncMessage, payload: Value) {
-        self.sync(msg);
-        let _ = self.emitter.emit("db-change", payload);
     }
 
     // --- Streaming (fire-and-forget, no emit) ---
 
     pub fn stream_delta(&self, _run_id: &str, _event_id: &str, _tokens: &str) {}
-
-    // --- Internal ---
-
-    fn sync(&self, msg: SyncMessage) {
-        if let Ok(guard) = self.sync_tx.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.send(msg);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -217,16 +218,10 @@ mod tests {
     use crate::models::IssueStatus;
     use crate::services::testing::CapturingEmitter;
 
-    fn test_notifier() -> (
-        Notifier,
-        mpsc::UnboundedReceiver<SyncMessage>,
-        Arc<CapturingEmitter>,
-    ) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sync_tx = Arc::new(Mutex::new(Some(tx)));
+    fn test_notifier() -> (Notifier, Arc<CapturingEmitter>) {
         let emitter = Arc::new(CapturingEmitter::new());
-        let notifier = Notifier::new(sync_tx, emitter.clone());
-        (notifier, rx, emitter)
+        let notifier = Notifier::new(emitter.clone());
+        (notifier, emitter)
     }
 
     fn test_issue() -> models::Issue {
@@ -258,45 +253,32 @@ mod tests {
     // ── Notifier tests ──
 
     #[test]
-    fn notifier_issue_syncs_and_emits() {
-        let (notifier, mut rx, emitter) = test_notifier();
-        let issue = test_issue();
+    fn notifier_issue_emits() {
+        let (notifier, emitter) = test_notifier();
 
-        notifier.issue(&issue);
+        notifier.issue(&test_issue());
 
-        // Sync message sent
-        let msg = rx.try_recv().unwrap();
-        assert!(matches!(msg, SyncMessage::Issue(_)));
-
-        // db-change emitted
         let events = emitter.events_named("db-change");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["table"], "issues");
     }
 
     #[test]
-    fn notifier_emit_change_no_sync() {
-        let (notifier, mut rx, emitter) = test_notifier();
+    fn notifier_emit_change_emits() {
+        let (notifier, emitter) = test_notifier();
 
         notifier.emit_change("todos");
 
-        // No sync message
-        assert!(rx.try_recv().is_err());
-
-        // db-change emitted
         let events = emitter.events_named("db-change");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["table"], "todos");
     }
 
     #[test]
-    fn notifier_deleted_syncs_and_emits() {
-        let (notifier, mut rx, emitter) = test_notifier();
+    fn notifier_deleted_emits() {
+        let (notifier, emitter) = test_notifier();
 
         notifier.deleted("issues", "i-1");
-
-        let msg = rx.try_recv().unwrap();
-        assert!(matches!(msg, SyncMessage::Delete { .. }));
 
         let events = emitter.events_named("db-change");
         assert_eq!(events.len(), 1);
@@ -305,25 +287,11 @@ mod tests {
 
     #[test]
     fn notifier_stream_delta_no_emit() {
-        let (notifier, mut rx, emitter) = test_notifier();
+        let (notifier, emitter) = test_notifier();
 
         notifier.stream_delta("run-1", "evt-1", "hello world");
 
-        assert!(rx.try_recv().is_err());
         assert!(emitter.events_named("db-change").is_empty());
-    }
-
-    #[test]
-    fn notifier_noop_when_sync_not_active() {
-        let sync_tx = Arc::new(Mutex::new(None));
-        let emitter = Arc::new(CapturingEmitter::new());
-        let notifier = Notifier::new(sync_tx, emitter.clone());
-
-        // Should not panic, emit still works
-        notifier.issue(&test_issue());
-
-        let events = emitter.events_named("db-change");
-        assert_eq!(events.len(), 1);
     }
 
     // ── Scoped payload builder tests ──
@@ -410,6 +378,14 @@ mod tests {
         assert_eq!(payload["run_id"], "run-1");
         assert_eq!(payload["sessionId"], "session-1");
         assert_eq!(payload["session_id"], "session-1");
+        assert!(payload["issueId"].is_null());
+    }
+
+    #[test]
+    fn event_db_change_scoped_carries_issue_id() {
+        let payload = event_db_change_scoped("run-1", Some("session-1"), Some("issue-1"), "insert");
+        assert_eq!(payload["issueId"], "issue-1");
+        assert_eq!(payload["issue_id"], "issue-1");
     }
 
     #[test]

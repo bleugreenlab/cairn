@@ -41,9 +41,13 @@ pub mod objects;
 pub mod packfile;
 pub mod reconstruct;
 pub mod rewrite;
+pub mod store;
 
-#[cfg(test)]
-pub(crate) mod event_fixture;
+// Exposed under `test-utils` (not just `cfg(test)`) so the unfenced integration
+// lane (`tests/turso_sync_roundtrip.rs`) can build the same real-anatomy event
+// fixtures the in-crate archival tests use.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod event_fixture;
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -54,3 +58,10 @@ pub use objects::{ObjectStore, ResolvePathError};
 pub use packfile::build_execution_pack;
 pub use reconstruct::reconstruct_events;
 pub use rewrite::{archive_target, ArchiveSummary};
+pub use store::{
+    BrokeredContentStore, BrokeredContentStoreFactory, ContentStore, ContentStoreFactory,
+    TeamReplicaContext,
+};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use store::InMemoryContentStore;

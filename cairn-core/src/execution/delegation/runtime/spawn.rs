@@ -30,6 +30,7 @@ async fn resolve_task_agent_config(
     project_path: Option<&std::path::Path>,
     payload: &DelegatedTaskPayload,
 ) -> Result<AgentConfig, String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id).await?;
     let config_dir = orch.config_dir.clone();
     let file_agent =
         match config_agents::get_agent(&config_dir, &payload.subagent_type, project_path) {
@@ -57,7 +58,7 @@ async fn resolve_task_agent_config(
         };
 
     let parent_backend = select_optional_text(
-        &orch.db.local,
+        &db,
         "SELECT model FROM jobs WHERE id = ?1",
         &parent_ctx.job_id,
     )
@@ -147,11 +148,19 @@ pub async fn spawn_task_packets(
         err!("No tasks provided".to_string());
     }
 
-    let parent_ctx = match lookup_run_context(&orch.db.local, input.run_id, input.cwd).await {
+    // Resolve the parent run's owning database (a team run lives in its replica).
+    // The cwd fallback (run_id None) stays on the private DB.
+    let db = match input.run_id {
+        Some(run_id) => crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+            .await
+            .unwrap_or_else(|_| orch.db.local.clone()),
+        None => orch.db.local.clone(),
+    };
+    let parent_ctx = match lookup_run_context(&db, input.run_id, input.cwd).await {
         Ok(ctx) => ctx,
         Err(e) => err!(e),
     };
-    let project_path = project_repo_path(&orch.db.local, &parent_ctx.project_id)
+    let project_path = project_repo_path(&db, &parent_ctx.project_id)
         .await
         .map(PathBuf::from);
     let execution_id = match ensure_task_execution_context(orch, &parent_ctx).await {
@@ -190,6 +199,7 @@ pub async fn spawn_task_packets(
             // value the transcript queries child jobs by; fall back to the
             // synthetic group id only when no tool-use id was forwarded.
             Some(input.parent_tool_use_id.unwrap_or(input.group_id)),
+            input.background,
         )
         .await
         {
@@ -289,10 +299,13 @@ async fn background_task_response(
     parent_ctx: &ParentRunContext,
     materialized: &[MaterializedTask],
 ) -> CallbackResponse {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
     let mut lines = Vec::with_capacity(materialized.len());
     let mut last_uri = None;
     for task in materialized {
-        let uri = compute_artifact_uri(&orch.db.local, parent_ctx, &task.job_id).await;
+        let uri = compute_artifact_uri(&db, parent_ctx, &task.job_id).await;
         if uri.is_some() {
             last_uri = uri.clone();
         }
@@ -403,10 +416,13 @@ async fn build_tasks_response(
     parent_ctx: &ParentRunContext,
     materialized: &[MaterializedTask],
 ) -> CallbackResponse {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
     if materialized.len() == 1 {
         let task = &materialized[0];
         return build_task_callback_response(
-            &orch.db.local,
+            &db,
             parent_ctx,
             &task.run_id,
             &task.job_id,
@@ -420,7 +436,7 @@ async fn build_tasks_response(
     let mut sections = Vec::with_capacity(materialized.len());
     for (index, task) in materialized.iter().enumerate() {
         let response = build_task_callback_response(
-            &orch.db.local,
+            &db,
             parent_ctx,
             &task.run_id,
             &task.job_id,

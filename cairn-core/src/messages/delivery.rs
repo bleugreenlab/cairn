@@ -146,7 +146,7 @@ pub fn head_turn_self_suspended_sync(db: &LocalDb, job_id: &str) -> bool {
 /// The recipient job's node URI, used as a `direct:` push's wake-card link. The
 /// message body resolves from the messages row at drain, so this is only the UI
 /// link; `None` when the job can't be resolved (the caller falls back).
-async fn node_uri_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
+pub(crate) async fn node_uri_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();

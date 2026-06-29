@@ -231,81 +231,85 @@ pub(crate) fn distinct_scopes_from_memories(memories: &[Memory]) -> Vec<(String,
     scopes
 }
 
-/// Claim a full threshold batch for one exact-scope pending pool and create a
-/// normal issue execution to triage it. Returns the created issue URI, or `None`
-/// when the pool is below threshold, already drained, or already covered by an
-/// open triage issue for that scope. Shared core for both the event-driven fast
-/// path (`maybe_spawn_triage`) and the reconciliation sweep
+/// Claim every full threshold batch for one exact-scope pending pool and create a
+/// normal issue execution to triage each. Returns one created issue URI per full
+/// batch, so a pool of N pending memories at threshold T drains as floor(N/T)
+/// issues in a single pass instead of one issue per reconcile check.
+///
+/// The atomic claim is the only guard against double-triage: each batch flips its
+/// memories to `claimed`, removing them from the pending pool, so a memory can
+/// never land in two batches. Consequently the existence or status of other
+/// triage issues for the scope is irrelevant and is never consulted — an
+/// already-running triage issue does not block spawning more for the remaining
+/// backlog. Shared core for both the event-driven fast path
+/// (`maybe_spawn_triage`) and the reconciliation sweep
 /// (`reconcile_pending_triage`), so the two can never diverge.
 async fn spawn_triage_for_scope(
     orch: &Orchestrator,
     scope: &str,
     scope_value: &str,
     threshold: i64,
-) -> Result<Option<String>, String> {
-    let count =
-        crate::memories::db::count_pending_memories_for_scope(&orch.db.local, scope, scope_value)
-            .await
-            .map_err(|error| error.to_string())?;
-    if count < threshold {
-        return Ok(None);
-    }
-
-    // Don't spawn a second issue for a scope already covered by a live triage
-    // issue. Catches both an in-flight batch and an orphan issue whose execution
-    // start failed (batch reverted, issue left open), so a scope that keeps
-    // getting re-fed pending memories does not churn duplicate issues.
-    if crate::memories::db::open_triage_issue_for_scope(&orch.db.local, scope, scope_value)
+) -> Result<Vec<String>, String> {
+    let mut spawned = Vec::new();
+    loop {
+        let count = crate::memories::db::count_pending_memories_for_scope(
+            &orch.db.local,
+            scope,
+            scope_value,
+        )
         .await
-        .map_err(|error| error.to_string())?
-        .is_some()
-    {
-        return Ok(None);
-    }
-
-    let target = scope_target(orch, scope, scope_value).await?;
-    let claimed = crate::memories::db::claim_pending_memories_for_scope(
-        &orch.db.local,
-        scope,
-        scope_value,
-        threshold,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-
-    if claimed.is_empty() {
-        return Ok(None);
-    }
-    let description = seed_description(orch, &target, &claimed).await;
-    let title = triage_issue_title(&target, claimed.len());
-    let outcome = create_issue_in_project(
-        orch,
-        &target.project_key,
-        title,
-        Some(description),
-        None,
-        Some(CreateExecutionSpec {
-            recipe: Some(MEMORY_TRIAGE_RECIPE.to_string()),
-            backend: None,
-        }),
-        None,
-        None,
-    )
-    .await;
-
-    match outcome {
-        Ok(outcome) => {
-            record_batch_or_revert(orch, &outcome.issue_id, &claimed).await?;
-            Ok(Some(outcome.uri))
+        .map_err(|error| error.to_string())?;
+        if count < threshold {
+            break;
         }
-        Err(error) => {
-            revert_claimed(orch, &claimed).await;
-            Err(error)
+
+        let target = scope_target(orch, scope, scope_value).await?;
+        let claimed = crate::memories::db::claim_pending_memories_for_scope(
+            &orch.db.local,
+            scope,
+            scope_value,
+            threshold,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        // Lost the race to another claimer between count and claim; the next
+        // iteration's count reflects the smaller pool and breaks if drained.
+        if claimed.is_empty() {
+            break;
+        }
+        let description = seed_description(orch, &target, &claimed).await;
+        let title = triage_issue_title(&target, claimed.len());
+        let outcome = create_issue_in_project(
+            orch,
+            &target.project_key,
+            title,
+            Some(description),
+            None,
+            Some(CreateExecutionSpec {
+                recipe: Some(MEMORY_TRIAGE_RECIPE.to_string()),
+                backend: None,
+            }),
+            None,
+            None,
+        )
+        .await;
+
+        match outcome {
+            Ok(outcome) => {
+                record_batch_or_revert(orch, &outcome.issue_id, &claimed).await?;
+                spawned.push(outcome.uri);
+            }
+            Err(error) => {
+                revert_claimed(orch, &claimed).await;
+                return Err(error);
+            }
         }
     }
+    Ok(spawned)
 }
 
-/// For each just-confirmed exact-scope pool, claim a full threshold batch of
+/// For each just-confirmed exact-scope pool, claim every full threshold batch of
 /// globally pending memories and create normal issue executions to triage them.
 /// The event-driven fast path; delegates to the shared `spawn_triage_for_scope`
 /// core. Returns an empty vec when no scoped pool meets the threshold.
@@ -316,16 +320,15 @@ pub async fn maybe_spawn_triage(
     let threshold = orch.get_settings().pending_memory_threshold.max(1) as i64;
     let mut spawned = Vec::new();
     for (scope, scope_value) in confirmed_scopes {
-        if let Some(uri) = spawn_triage_for_scope(&orch, &scope, &scope_value, threshold).await? {
-            spawned.push(uri);
-        }
+        spawned.extend(spawn_triage_for_scope(&orch, &scope, &scope_value, threshold).await?);
     }
     Ok(spawned)
 }
 
-/// Reconciliation step 3: spawn a triage issue for every at-threshold pending
-/// pool discovered directly from DB state. Idempotent — pools already covered by
-/// an open triage issue are skipped.
+/// Reconciliation step 3: spawn triage issues for every at-threshold pending
+/// pool discovered directly from DB state, one issue per full batch. Idempotent —
+/// already-claimed batches are no longer pending, so a re-run only spawns for
+/// backlog that has accumulated since.
 pub async fn reconcile_pending_triage(orch: &Orchestrator) -> Result<Vec<String>, String> {
     let threshold = orch.get_settings().pending_memory_threshold.max(1) as i64;
     let scopes = crate::memories::db::distinct_pending_scopes(&orch.db.local)
@@ -333,9 +336,7 @@ pub async fn reconcile_pending_triage(orch: &Orchestrator) -> Result<Vec<String>
         .map_err(|error| error.to_string())?;
     let mut spawned = Vec::new();
     for (scope, scope_value) in scopes {
-        if let Some(uri) = spawn_triage_for_scope(orch, &scope, &scope_value, threshold).await? {
-            spawned.push(uri);
-        }
+        spawned.extend(spawn_triage_for_scope(orch, &scope, &scope_value, threshold).await?);
     }
     Ok(spawned)
 }
@@ -1247,9 +1248,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_skips_scope_with_open_triage_issue() {
+    async fn reconcile_ignores_existing_open_triage_issue() {
         let test = test_orch().await;
-        // An open (non-terminal) triage issue already covers this scope.
+        // An open (non-terminal) triage issue already exists for this scope. It
+        // owns no pending memories itself; a fresh full pool accumulated since.
+        // The existence of that issue must NOT block triaging the new backlog —
+        // the atomic claim is the only double-triage guard.
         test.orch
             .db
             .local
@@ -1276,15 +1280,76 @@ mod tests {
             .await
             .unwrap();
 
-        // No duplicate issue, and the pool stays pending (no fresh claim).
-        assert_eq!(triage_issue_count(&test).await, 1);
+        // A second triage issue spawns and claims the whole new pool.
+        assert_eq!(triage_issue_count(&test).await, 2);
         assert_eq!(
-            memory_status_count(&test, "pending", "project", "project-1").await,
+            memory_status_count(&test, "claimed", "project", "project-1").await,
             5
         );
         assert_eq!(
-            memory_status_count(&test, "claimed", "project", "project-1").await,
+            memory_status_count(&test, "pending", "project", "project-1").await,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_spawns_one_issue_per_full_batch_in_a_single_pass() {
+        let test = test_orch().await;
+        // Ten pending memories at the default threshold of five must drain as two
+        // triage issues in one reconcile pass, not one issue per check.
+        for idx in 0..10 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();
+
+        assert_eq!(spawned.len(), 2);
+        assert_eq!(triage_issue_count(&test).await, 2);
+        assert_eq!(
+            memory_status_count(&test, "claimed", "project", "project-1").await,
+            10
+        );
+        assert_eq!(
+            memory_status_count(&test, "pending", "project", "project-1").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_leaves_sub_batch_remainder_pending() {
+        let test = test_orch().await;
+        // Seven pending at threshold five: one full batch triages, the remaining
+        // two stay pending until the pool grows back to a full batch.
+        for idx in 0..7 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();
+
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(
+            memory_status_count(&test, "claimed", "project", "project-1").await,
+            5
+        );
+        assert_eq!(
+            memory_status_count(&test, "pending", "project", "project-1").await,
+            2
         );
     }
 
@@ -1293,8 +1358,8 @@ mod tests {
         let test = test_orch().await;
         // A prior triage execution FAILED after its batch was claimed and linked:
         // status='failed', neither merged nor closed. Without recovery the batch
-        // stays 'claimed' and the failed issue keeps open_triage_issue_for_scope
-        // reporting a live cover, wedging the scope against every future spawn.
+        // stays 'claimed' forever, stranding those memories outside their pending
+        // pool so they are never re-triaged.
         test.orch
             .db
             .local

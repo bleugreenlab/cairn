@@ -158,8 +158,17 @@ pub(super) fn create_initial_turn(
     session_id: &str,
     job_id: &str,
 ) -> Result<(), String> {
+    let db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_db(create_initial_turn_db(
-        orch.db.local.clone(),
+        db,
         turn_id.to_string(),
         session_id.to_string(),
         job_id.to_string(),
@@ -274,10 +283,13 @@ pub(super) fn create_followup_turn(
     user_initiated: bool,
 ) -> Result<String, String> {
     let (turn_id, created) = run_db({
-        let db = orch.db.local.clone();
+        let dbs = orch.db.clone();
         let session_id = session_id.to_string();
         let job_id = job_id.to_string();
         async move {
+            let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())?;
             db.write(|conn| {
                 let session_id = session_id.clone();
                 let job_id = job_id.clone();
@@ -285,7 +297,7 @@ pub(super) fn create_followup_turn(
                     let head_turn = get_head_turn_conn(conn, &job_id).await?;
                     let start_reason =
                         followup_start_reason_conn(conn, &job_id, user_initiated).await?;
-                    let new_turn_id = uuid::Uuid::new_v4().to_string();
+                    let new_turn_id = ids::mint_child(&job_id);
                     if let Some(head) = head_turn {
                         if head.state == TurnState::Pending {
                             return Ok((head.id, false));
@@ -303,7 +315,7 @@ pub(super) fn create_followup_turn(
                             Ok(_) => Ok((new_turn_id, true)),
                             Err(error) => {
                                 log::warn!("Failed to create successor turn: {}", error);
-                                let fallback_id = uuid::Uuid::new_v4().to_string();
+                                let fallback_id = ids::mint_child(&job_id);
                                 create_turn_conn(
                                     conn,
                                     &fallback_id,
@@ -348,12 +360,22 @@ pub(super) fn create_followup_turn(
     Ok(turn_id)
 }
 
-pub(super) fn start_turn(orch: &Orchestrator, turn_id: &str, run_id: &str) -> Result<(), String> {
+/// Flip a job's pending turn to `running` and wire it to `run_id`. Resolves the
+/// run's owning database (fail-closed via `owning_db_for_run`) so a team job's
+/// turn lands in its synced replica, then emits the scoped `turns` db-change.
+///
+/// This is the canonical turn-start the host job-start paths call. It replaced a
+/// hand-rolled duplicate in the Tauri layer that wrote the `turns` UPDATE
+/// unconditionally to the private DB, stranding a team job's turn (CAIRN-2206).
+pub fn start_turn(orch: &Orchestrator, turn_id: &str, run_id: &str) -> Result<(), String> {
     let (session_id, job_id) = run_db({
-        let db = orch.db.local.clone();
+        let dbs = orch.db.clone();
         let turn_id = turn_id.to_string();
         let run_id = run_id.to_string();
         async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
             db.write(|conn| {
                 let turn_id = turn_id.clone();
                 let run_id = run_id.clone();
@@ -416,8 +438,17 @@ pub(super) fn valid_running_transition(from: &JobStatus) -> bool {
 }
 
 pub(super) fn transition_job_to_running(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+    let db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let (execution_id, issue_id) = run_db({
-        let db = orch.db.local.clone();
+        let db = db.clone();
         let job_id = job_id.to_string();
         async move {
             db.write(|conn| {
@@ -489,7 +520,7 @@ pub(super) fn transition_job_to_running(orch: &Orchestrator, job_id: &str) -> Re
     // Reload the full job so the jobs db-change carries the complete scoping
     // set (issue/execution/parent/project ids), not just the partial query.
     let job = run_db({
-        let db = orch.db.local.clone();
+        let db = db.clone();
         let job_id = job_id.to_string();
         async move {
             crate::jobs::queries::get_job(&db, &job_id)

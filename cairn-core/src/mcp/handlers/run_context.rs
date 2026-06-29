@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use cairn_common::protocol::CallbackRequest;
 
 use super::RunContext;
@@ -23,6 +25,78 @@ pub(crate) async fn lookup_home_uri(
     } else {
         let run = lookup_run_by_cwd(db, &request.cwd).await?;
         lookup_home_uri_by_run_id(db, &run.run_id).await
+    }
+}
+
+/// Resolve a run's context and the database that owns it (CAIRN-2132).
+///
+/// A run id is a globally-unique UUID and a project lives wholly in one
+/// database, so a run appears in at most one open database. This probes the
+/// private database first and short-circuits on a hit — the overwhelming
+/// majority of installs have no team databases and most runs are local — and
+/// only fans out across open team replicas on a private-DB miss. With no team
+/// DBs open it degenerates to a single private-DB lookup: a strict no-op for
+/// local-only installs. Returns the owning `Arc<LocalDb>` so every downstream
+/// write for the request targets the right replica instead of defaulting to the
+/// private database (which would silently misroute a shared-project run).
+pub(crate) async fn lookup_run_routed(
+    dbs: &crate::db::DbState,
+    request: &CallbackRequest,
+) -> Result<(RunContext, Arc<LocalDb>), String> {
+    // A run id is self-routing: parse its team prefix to the owning database in
+    // O(1) (CAIRN-2210) instead of scanning every open database. Only the
+    // cwd-keyed fallback (no run id to parse) still fans out.
+    if let Some(run_id) = request.run_id.as_deref() {
+        let db = crate::execution::routing::routing_db_for_id(dbs, run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let ctx = lookup_run(&db, request).await?;
+        return Ok((ctx, db));
+    }
+    match lookup_run(&dbs.local, request).await {
+        Ok(ctx) => Ok((ctx, dbs.local.clone())),
+        Err(private_err) => {
+            for db in dbs.all_dbs().await {
+                if Arc::ptr_eq(&db, &dbs.local) {
+                    continue;
+                }
+                if let Ok(ctx) = lookup_run(&db, request).await {
+                    return Ok((ctx, db));
+                }
+            }
+            Err(private_err)
+        }
+    }
+}
+
+/// The home base URI for the request's run, searching every open database the
+/// same way [`lookup_run_routed`] does (CAIRN-2132). Resolves `cairn:~/...`
+/// targets for a run whose rows live in a team replica.
+pub(crate) async fn lookup_home_uri_routed(
+    dbs: &crate::db::DbState,
+    request: &CallbackRequest,
+) -> Result<String, String> {
+    // Self-routing run id → O(1) prefix parse (CAIRN-2210); cwd-keyed lookup
+    // (no run id) still fans out across open databases.
+    if let Some(run_id) = request.run_id.as_deref() {
+        let db = crate::execution::routing::routing_db_for_id(dbs, run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        return lookup_home_uri(&db, request).await;
+    }
+    match lookup_home_uri(&dbs.local, request).await {
+        Ok(uri) => Ok(uri),
+        Err(private_err) => {
+            for db in dbs.all_dbs().await {
+                if Arc::ptr_eq(&db, &dbs.local) {
+                    continue;
+                }
+                if let Ok(uri) = lookup_home_uri(&db, request).await {
+                    return Ok(uri);
+                }
+            }
+            Err(private_err)
+        }
     }
 }
 
@@ -197,4 +271,73 @@ pub(crate) async fn project_path(db: &LocalDb, project_id: &str) -> Result<Optio
     )
     .await
     .map_err(|e| format!("Failed to load project path: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+
+    async fn local_dbs() -> std::sync::Arc<DbState> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = LocalDb::open(dir.join("p.turso.db")).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        let search = SearchIndex::open_or_create(dir.join("p.search")).unwrap();
+        std::sync::Arc::new(DbState::new(
+            std::sync::Arc::new(db),
+            std::sync::Arc::new(search),
+        ))
+    }
+
+    async fn seed_run(db: &LocalDb) {
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',7,'T','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, worktree_path) VALUES ('j','e','i','p','Builder','running',1,1,'builder','/tmp/wt')",
+            "INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at) VALUES ('r','i','p','j','live',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+    }
+
+    fn request_for_run(run_id: &str) -> CallbackRequest {
+        CallbackRequest {
+            run_id: Some(run_id.to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn lookup_run_routed_resolves_a_private_run_to_the_private_db() {
+        let dbs = local_dbs().await;
+        seed_run(&dbs.local).await;
+        let (ctx, db) = lookup_run_routed(&dbs, &request_for_run("r"))
+            .await
+            .expect("a seeded private run resolves");
+        assert_eq!(ctx.project_key, "PRJ");
+        assert_eq!(ctx.run_id, "r");
+        assert!(
+            Arc::ptr_eq(&db, &dbs.local),
+            "a private run resolves to the private database (strict no-op for local installs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_run_routed_errors_clearly_when_run_is_absent_everywhere() {
+        let dbs = local_dbs().await;
+        let err = match lookup_run_routed(&dbs, &request_for_run("ghost")).await {
+            Ok(_) => panic!("an unknown run must error, never silently misroute"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("ghost"),
+            "the error should name the missing run id: {err}"
+        );
+    }
 }

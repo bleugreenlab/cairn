@@ -14,6 +14,7 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_common::ids;
 use std::future::Future;
 use std::sync::Arc;
 use turso::params;
@@ -74,8 +75,26 @@ fn process_job_ended(
     issue_id: Option<String>,
     project_id: &str,
 ) {
+    let owning = match crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }) {
+        Ok(db) => db,
+        Err(error) => {
+            log::warn!(
+                "trigger-dispatch: failed to resolve owning db for job_ended: {}",
+                error
+            );
+            return;
+        }
+    };
     let context = match load_job_ended_dispatch_context(
-        orch.db.local.clone(),
+        owning,
         execution_id.as_deref(),
         issue_id.as_deref(),
         project_id,
@@ -184,7 +203,25 @@ fn process_skill_called(
 ) {
     let execution_context = match execution_id.as_ref() {
         Some(exec_id) => {
-            match load_execution_dispatch_context(orch.db.local.clone(), exec_id.as_str()) {
+            let owning = match crate::storage::run_db_blocking({
+                let dbs = orch.db.clone();
+                let exec_id = exec_id.to_string();
+                move || async move {
+                    crate::execution::routing::owning_db_for_execution(&dbs, &exec_id)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }) {
+                Ok(db) => db,
+                Err(error) => {
+                    log::warn!(
+                        "trigger-dispatch: failed to resolve owning db for skill_called: {}",
+                        error
+                    );
+                    return;
+                }
+            };
+            match load_execution_dispatch_context(owning, exec_id.as_str()) {
                 Ok(context) => Some(context),
                 Err(error) => {
                     log::warn!(
@@ -224,7 +261,7 @@ fn process_skill_called(
     };
 
     let enriched = SkillCalledEvent {
-        event_id: uuid::Uuid::new_v4().to_string(),
+        event_id: ids::mint_child(job_id),
         source_job_id: job_id.to_string(),
         skill_id: skill_id.to_string(),
         skill_name: skill_name.to_string(),

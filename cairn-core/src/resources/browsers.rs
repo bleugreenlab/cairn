@@ -467,7 +467,11 @@ pub(crate) async fn render_browser_screenshot(
     orch: &Orchestrator,
     resource: &CairnResource,
 ) -> (String, Option<ImageBlock>) {
-    let db = &orch.db.local;
+    let routed_db = match resource.project_key() {
+        Some(key) => orch.db.for_project(key).await,
+        None => orch.db.local.clone(),
+    };
+    let db = &*routed_db;
     let (scope, slug) = match resolve_browser_target(db, resource).await {
         Ok(pair) => pair,
         Err(error) => return (error, None),
@@ -689,7 +693,11 @@ pub(crate) async fn render_browser(
     resource: &CairnResource,
     format: BridgeFormat,
 ) -> String {
-    let db = &orch.db.local;
+    let routed_db = match resource.project_key() {
+        Some(key) => orch.db.for_project(key).await,
+        None => orch.db.local.clone(),
+    };
+    let db = &*routed_db;
     let (scope, slug) = match resolve_browser_target(db, resource).await {
         Ok(pair) => pair,
         Err(error) => return error,
@@ -777,7 +785,11 @@ enum LiveBrowser {
 }
 
 async fn prepare_live_browser(orch: &Orchestrator, resource: &CairnResource) -> LiveBrowser {
-    let db = &orch.db.local;
+    let routed_db = match resource.project_key() {
+        Some(key) => orch.db.for_project(key).await,
+        None => orch.db.local.clone(),
+    };
+    let db = &*routed_db;
     let (scope, slug) = match resolve_browser_target(db, resource).await {
         Ok(pair) => pair,
         Err(error) => return LiveBrowser::Message(error),

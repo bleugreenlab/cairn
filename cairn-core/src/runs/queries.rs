@@ -107,7 +107,13 @@ fn insert_active_stream_by_created_at(events: &mut Vec<Event>, active: ActiveMes
     events.insert(insert_at, active_event);
 }
 
-const RUN_COLUMNS: &str = "id, issue_id, project_id, job_id, status, session_id, error_message,
+/// Canonical column projection for the `runs` table, in the exact order
+/// [`run_from_row`] reads them. This is the single source of truth for the runs
+/// projection: every `SELECT ... FROM runs` that maps to a [`Run`] builds its
+/// column list from here, so a `runs`-column change (such as migration 0081
+/// dropping `backend`) cannot silently drift across duplicate copies.
+pub(crate) const RUN_COLUMNS: &str =
+    "id, issue_id, project_id, job_id, status, session_id, error_message,
     started_at, exited_at, created_at, updated_at, chat_id, exit_reason, start_mode";
 
 pub(crate) const EVENT_COLUMNS: &str =
@@ -220,6 +226,26 @@ pub fn list_events_for_session(
     }
 
     Ok(events)
+}
+
+/// Load full-body durable session events after the caller's cached event count.
+///
+/// Session events append monotonically in rowid order while a session is active,
+/// which is the same invariant used by `list_events_for_session_delta`. Unlike
+/// that transcript-facing delta, this keeps read result bodies intact so skyline
+/// bar widths can be computed without re-reading and re-parsing the whole session.
+pub fn list_events_for_session_after_count(
+    db: Arc<LocalDb>,
+    session_id: &str,
+    cached_event_count: i32,
+) -> Result<Vec<Event>, CairnError> {
+    let session_id = session_id.to_string();
+    let offset = i64::from(cached_event_count.max(0));
+    run_query_db(async move {
+        let mut events = load_events_for_session_after_count(&db, session_id, offset).await?;
+        events = crate::archival::reconstruct_events(&db, events).await;
+        Ok(events)
+    })
 }
 
 pub fn list_events_for_turn(db: Arc<LocalDb>, turn_id: &str) -> Result<Vec<Event>, CairnError> {
@@ -556,6 +582,26 @@ async fn load_events_for_session(
         indexed.into_iter().map(|(_, event)| event).collect(),
         run_position,
     ))
+}
+
+async fn load_events_for_session_after_count(
+    db: &LocalDb,
+    session_id: String,
+    offset: i64,
+) -> Result<Vec<Event>, CairnError> {
+    db.query_all(
+        format!(
+            "SELECT {EVENT_COLUMNS}
+             FROM events
+             WHERE session_id = ?1
+             ORDER BY rowid ASC
+             LIMIT -1 OFFSET ?2"
+        ),
+        params![session_id.as_str(), offset],
+        event_from_row,
+    )
+    .await
+    .map_err(CairnError::from)
 }
 
 async fn load_events_for_turn(db: &LocalDb, turn_id: String) -> Result<Vec<Event>, CairnError> {
@@ -978,7 +1024,10 @@ async fn reconcile_stale_runs_db(db: Arc<LocalDb>) -> Result<ReconcileResult, Ca
     .map_err(CairnError::from)
 }
 
-fn run_from_row(row: &Row) -> DbResult<Run> {
+/// Map a `runs` row projected by [`RUN_COLUMNS`] into a [`Run`]. Canonical
+/// mapper shared by every runs read path; these ordinals are the only place the
+/// `runs` projection's column order is interpreted.
+pub(crate) fn run_from_row(row: &Row) -> DbResult<Run> {
     Ok(Run {
         id: row.text(0)?,
         issue_id: row.opt_text(1)?,

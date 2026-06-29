@@ -49,7 +49,15 @@ pub fn get_checkpoint_cache_result_impl(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<Option<CheckpointCacheResult>, String> {
-    let db = orch.db.local.clone();
+    let db = run_checkpoint_cache_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let job_id = job_id.to_string();
     // Read the cache row first, then validate it against live worktree state
     // outside the DB closure — the jj-aware head/dirty checks need `orch`, which

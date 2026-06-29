@@ -4,8 +4,16 @@ pub async fn release_dependent_executions(
     orch: &Orchestrator,
     resolved_issue_id: &str,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
     let resolved_issue_id = resolved_issue_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let resolved_issue_id = resolved_issue_id.clone();
+        async move {
+            crate::issues::crud::owning_db_for_issue(&dbs, &resolved_issue_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let execution_ids = run_advancement_db(async move {
         db.read(|conn| {
             let resolved_issue_id = resolved_issue_id.clone();

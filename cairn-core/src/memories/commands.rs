@@ -2,10 +2,17 @@
 
 use crate::models::{CreateMemory, Memory, UpdateMemory};
 use crate::storage::{DbError, LocalDb, RowExt};
+use cairn_common::ids;
 use turso::params;
 
 pub async fn create(db: &LocalDb, input: CreateMemory) -> Result<Memory, String> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = ids::mint_child(
+        input
+            .project_id
+            .as_deref()
+            .or(input.job_id.as_deref())
+            .unwrap_or(""),
+    );
 
     crate::memories::db::create_memory(
         db,
@@ -443,13 +450,19 @@ async fn terminal_output_artifact_name_conn(
     execution_id: Option<&str>,
 ) -> Result<Option<String>, DbError> {
     if let (Some(node_id), Some(execution_id)) = (recipe_node_id, execution_id) {
-        return crate::execution::jobs::find_downstream_artifact_schema_conn(
+        return match crate::execution::jobs::find_downstream_artifact_schema_conn(
             conn,
             node_id,
             execution_id,
         )
         .await
-        .map(|info| info.and_then(|info| info.artifact_name));
+        {
+            Ok(info) => Ok(info.and_then(|info| info.artifact_name)),
+            Err(DbError::Row(message)) if message.starts_with("Execution has no snapshot:") => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        };
     }
 
     // Delegated sub-agent tasks do not have a recipe node, but their terminal
@@ -466,13 +479,18 @@ async fn output_artifact_present_conn(
     job_id: &str,
     terminal_name: Option<&str>,
 ) -> Result<bool, DbError> {
-    let Some(name) = terminal_name else {
-        return Ok(false);
-    };
     let mut rows = conn
         .query(
-            "SELECT 1 FROM artifacts WHERE job_id = ?1 AND output_name = ?2 LIMIT 1",
-            params![job_id, name],
+            "SELECT 1
+             FROM artifacts
+             WHERE job_id = ?1
+               AND (
+                   (?2 IS NOT NULL AND output_name = ?2)
+                   OR artifact_type = 'create-pr'
+                   OR (artifact_type = 'plan' AND confirmed = 0)
+               )
+             LIMIT 1",
+            params![job_id, terminal_name],
         )
         .await?;
     Ok(rows.next().await?.is_some())

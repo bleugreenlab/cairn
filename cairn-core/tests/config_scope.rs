@@ -47,8 +47,7 @@ async fn test_config_orchestrator() -> TestOrchestrator {
             name: "Test".to_string(),
             key: "TST".to_string(),
             repo_path: project_dir.to_string_lossy().to_string(),
-            remote_url: None,
-            server_id: None,
+            team_id: None,
         },
     )
     .await

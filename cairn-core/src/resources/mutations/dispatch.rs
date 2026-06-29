@@ -9,7 +9,10 @@ use super::memories::{
     apply_memory_triage_action, apply_node_memory_append, apply_node_memory_delete,
     apply_node_memory_patch, MemoryCreateTarget, MemoryResourceTarget,
 };
-use super::projects::{apply_project_patch, apply_project_settings_patch, apply_projects_create};
+use super::projects::{
+    apply_project_patch, apply_project_reference_create, apply_project_reference_delete,
+    apply_project_reference_patch, apply_project_settings_patch, apply_projects_create,
+};
 use super::recipes::{apply_recipe_create, apply_recipe_delete, apply_recipe_patch};
 use super::settings::apply_settings_patch;
 use super::skills::{apply_skill_create, apply_skill_delete, apply_skill_patch};
@@ -128,21 +131,18 @@ fn append_payload(index: usize, item: &ChangeItem) -> ResourceMutationResult<&se
 /// issue or comment to a clean not-found failure. The member URI embeds the
 /// issue number, so a seq that belongs to a different issue is rejected too.
 async fn resolve_issue_comment_id(
-    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
     index: usize,
     item: &ChangeItem,
     project: &str,
     number: i32,
     comment_seq: i32,
 ) -> ResourceMutationResult<String> {
-    let issue_id =
-        crate::issues::relations::issue_id_for_project_number(&orch.db.local, project, number)
-            .await
-            .map_err(|error| build_failure(index, item, error.to_string()))?
-            .ok_or_else(|| {
-                build_failure(index, item, format!("Issue {project}-{number} not found"))
-            })?;
-    crate::issues::comments::id_for_issue_seq(&orch.db.local, &issue_id, comment_seq as i64)
+    let issue_id = crate::issues::relations::issue_id_for_project_number(db, project, number)
+        .await
+        .map_err(|error| build_failure(index, item, error.to_string()))?
+        .ok_or_else(|| build_failure(index, item, format!("Issue {project}-{number} not found")))?;
+    crate::issues::comments::id_for_issue_seq(db, &issue_id, comment_seq as i64)
         .await
         .map_err(|error| build_failure(index, item, error.to_string()))?
         .ok_or_else(|| {
@@ -1076,10 +1076,13 @@ pub(crate) async fn dispatch_resource_change(
             if dry_run {
                 format!("Would edit comment {comment_seq} on issue {project}-{number}")
             } else {
+                // Route to the owning project's database (CAIRN-2132); a local
+                // project resolves to the private DB, a shared one to its replica.
+                let db = orch.db.for_project(project).await;
                 let comment_id =
-                    resolve_issue_comment_id(orch, index, item, project, *number, *comment_seq)
+                    resolve_issue_comment_id(&db, index, item, project, *number, *comment_seq)
                         .await?;
-                crate::issues::comments::update(&orch.db.local, &comment_id, content)
+                crate::issues::comments::update(&db, &comment_id, content)
                     .await
                     .map_err(|error| build_failure(index, item, error.to_string()))?;
                 format!("Edited comment {comment_seq} on issue {project}-{number}")
@@ -1103,10 +1106,11 @@ pub(crate) async fn dispatch_resource_change(
             if dry_run {
                 format!("Would delete comment {comment_seq} on issue {project}-{number}")
             } else {
+                let db = orch.db.for_project(project).await;
                 let comment_id =
-                    resolve_issue_comment_id(orch, index, item, project, *number, *comment_seq)
+                    resolve_issue_comment_id(&db, index, item, project, *number, *comment_seq)
                         .await?;
-                crate::issues::comments::delete(&orch.db.local, &comment_id)
+                crate::issues::comments::delete(&db, &comment_id)
                     .await
                     .map_err(|error| build_failure(index, item, error.to_string()))?;
                 format!("Deleted comment {comment_seq} on issue {project}-{number}")
@@ -1480,16 +1484,17 @@ pub(crate) async fn dispatch_resource_change(
                     "mode=delete does not accept payload",
                 ));
             }
-            let issue_id = crate::issues::relations::issue_id_for_project_number(
-                &orch.db.local,
-                project,
-                *number,
-            )
-            .await
-            .map_err(|error| build_failure(index, item, error.to_string()))?
-            .ok_or_else(|| {
-                build_failure(index, item, format!("Issue {project}-{number} not found"))
-            })?;
+            // Resolve against the owning DB (CAIRN-2181): a team project's issue
+            // row lives in its team replica, so the lookup must route there or a
+            // team-project delete would falsely report "not found".
+            let owning_db = orch.db.for_project(project).await;
+            let issue_id =
+                crate::issues::relations::issue_id_for_project_number(&owning_db, project, *number)
+                    .await
+                    .map_err(|error| build_failure(index, item, error.to_string()))?
+                    .ok_or_else(|| {
+                        build_failure(index, item, format!("Issue {project}-{number} not found"))
+                    })?;
             if dry_run {
                 format!("Would delete issue {project}-{number}")
             } else {
@@ -1536,6 +1541,47 @@ pub(crate) async fn dispatch_resource_change(
                     .as_ref()
                     .ok_or_else(|| build_failure(index, item, "mode=create requires payload"))?;
                 apply_skill_create(orch, request, payload, Some(project))
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+            }
+        }
+        (CairnResource::ProjectReferences { project }, ChangeMode::Create) => {
+            if dry_run {
+                let payload = item
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| build_failure(index, item, "mode=create requires payload"))?;
+                let name = payload_non_empty_str(payload, "name", &[])
+                    .ok_or_else(|| build_failure(index, item, "payload.name is required"))?;
+                format!("Would create project reference '{project}/{name}'")
+            } else {
+                let payload = item
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| build_failure(index, item, "mode=create requires payload"))?;
+                apply_project_reference_create(orch, project, payload, false)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+            }
+        }
+        (CairnResource::ProjectReference { project, name }, ChangeMode::Patch) => {
+            if dry_run {
+                format!("Would patch project reference '{project}/{name}'")
+            } else {
+                let payload = item
+                    .payload
+                    .as_ref()
+                    .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
+                apply_project_reference_patch(orch, project, name, payload, false)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?
+            }
+        }
+        (CairnResource::ProjectReference { project, name }, ChangeMode::Delete) => {
+            if dry_run {
+                format!("Would delete project reference '{project}/{name}'")
+            } else {
+                apply_project_reference_delete(orch, project, name, false)
                     .await
                     .map_err(|error| build_failure(index, item, error))?
             }
@@ -1779,8 +1825,11 @@ pub(crate) async fn dispatch_resource_change(
                     }
                 }
             } else {
+                // Route todos writes to the owning project's database (CAIRN-2132);
+                // resolution and all three mutations share the routed handle.
+                let db = orch.db.for_project(project).await;
                 let job_id = crate::resources::resolve_todos_job_id(
-                    &orch.db.local,
+                    &db,
                     project,
                     *number,
                     *exec_seq,
@@ -1793,7 +1842,7 @@ pub(crate) async fn dispatch_resource_change(
                 let summary = match mode {
                     ChangeMode::Replace => {
                         let items = parse_todo_write_items(index, item, payload)?;
-                        let todos = crate::todos::replace_todos(&orch.db.local, &job_id, &items)
+                        let todos = crate::todos::replace_todos(&db, &job_id, &items)
                             .await
                             .map_err(|error| build_failure(index, item, error))?;
                         let completed = todos.iter().filter(|t| t.status == "completed").count();
@@ -1809,7 +1858,7 @@ pub(crate) async fn dispatch_resource_change(
                     ChangeMode::Append => {
                         let items = parse_todo_write_items(index, item, payload)?;
                         let appended = items.len();
-                        let todos = crate::todos::append_todos(&orch.db.local, &job_id, &items)
+                        let todos = crate::todos::append_todos(&db, &job_id, &items)
                             .await
                             .map_err(|error| build_failure(index, item, error))?;
                         applied_data = Some(serde_json::to_value(&todos).unwrap_or_default());
@@ -1824,7 +1873,7 @@ pub(crate) async fn dispatch_resource_change(
                     ChangeMode::Patch => {
                         let updates = parse_todo_update_items(index, item, payload)?;
                         let patched = updates.len();
-                        let todos = crate::todos::update_todos(&orch.db.local, &job_id, &updates)
+                        let todos = crate::todos::update_todos(&db, &job_id, &updates)
                             .await
                             .map_err(|error| build_failure(index, item, error))?;
                         let completed = todos.iter().filter(|t| t.status == "completed").count();
@@ -3139,8 +3188,7 @@ mod issue_mutation_tests {
                 name: "Cairn".to_string(),
                 key: "CAIRN".to_string(),
                 repo_path,
-                remote_url: None,
-                server_id: None,
+                team_id: None,
             },
         )
         .await
@@ -3814,8 +3862,7 @@ mod issue_mutation_tests {
                 name: "Agg".to_string(),
                 key: "AGG".to_string(),
                 repo_path,
-                remote_url: None,
-                server_id: None,
+                team_id: None,
             },
         )
         .await
@@ -4042,6 +4089,8 @@ mod issue_mutation_tests {
             K::Skill => "cairn://skills/testing",
             K::ProjectSkills => "cairn://p/CAIRN/skills",
             K::ProjectSkill => "cairn://p/CAIRN/skills/testing",
+            K::ProjectReferences => "cairn://p/CAIRN/references",
+            K::ProjectReference => "cairn://p/CAIRN/references/openpnp",
             K::Labels => "cairn://labels",
             K::Label => "cairn://labels/bug",
             K::NodeMemories => "cairn://p/CAIRN/1/1/builder/memories",

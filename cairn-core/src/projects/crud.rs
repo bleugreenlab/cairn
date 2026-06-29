@@ -3,8 +3,9 @@ use crate::error::CairnError;
 use crate::models::CreateProject;
 use crate::services::Clock;
 use crate::storage::{DbError, LocalDb, RowExt};
+use cairn_common::ids;
 use std::path::Path;
-use uuid::Uuid;
+use std::sync::Arc;
 
 /// Full project creation: DB insert + filesystem setup.
 ///
@@ -19,9 +20,7 @@ pub async fn create(
     mut input: CreateProject,
     projects_dir: Option<&Path>,
 ) -> Result<DbProject, CairnError> {
-    let is_remote = input.remote_url.is_some() || input.server_id.is_some();
-
-    if !is_remote && input.repo_path.is_empty() {
+    if input.repo_path.is_empty() {
         if let Some(base) = projects_dir {
             let project_dir = base.join(input.key.to_lowercase());
             std::fs::create_dir_all(&project_dir)?;
@@ -40,7 +39,7 @@ pub async fn create(
 
     let mut db_project = create_db(db, clock, &input).await?;
 
-    if !is_remote && !input.repo_path.is_empty() {
+    if !input.repo_path.is_empty() {
         let repo_path = Path::new(&input.repo_path);
         if repo_path.exists() {
             // Persist the repository's actual default branch so worktrees are
@@ -269,43 +268,69 @@ pub async fn create_db(
     input: &CreateProject,
 ) -> Result<DbProject, CairnError> {
     let now = clock.now() as i32;
-    let id = input
-        .id
-        .clone()
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let remote_url = input.remote_url.clone();
-    let server_id = input.server_id.clone();
+    let id = input.id.clone().unwrap_or_else(|| {
+        let scope = match &input.team_id {
+            Some(t) => ids::RouteScope::Team(t.clone()),
+            None => ids::RouteScope::Local,
+        };
+        ids::mint(scope).into_string()
+    });
     let name = input.name.clone();
     let key = input.key.clone();
     let repo_path = input.repo_path.clone();
+    let team_id = input.team_id.clone();
 
     db.write(|conn| {
         let id = id.clone();
-        let remote_url = remote_url.clone();
-        let server_id = server_id.clone();
         let name = name.clone();
         let key = key.clone();
         let repo_path = repo_path.clone();
+        let team_id = team_id.clone();
         Box::pin(async move {
-            conn.execute(
-                "INSERT INTO projects(
-                    id, workspace_id, name, key, repo_path, context, docs_enabled,
-                    default_branch, next_issue_number, created_at, updated_at,
-                    remote_url, server_id, is_workspace
-                 )
-                 VALUES (?1, 'default', ?2, ?3, ?4, '', 1, 'main', 1, ?5, ?6, ?7, ?8, 0)",
-                (
-                    id.as_str(),
-                    name.as_str(),
-                    key.as_str(),
-                    repo_path.as_str(),
-                    now,
-                    now,
-                    remote_url.as_deref(),
-                    server_id.as_deref(),
-                ),
-            )
-            .await?;
+            match team_id {
+                // Team replica: `projects` re-roots at `team_id` (NOT NULL FK to
+                // `teams`) with no `workspace_id` column (CAIRN-2129 re-rooting).
+                Some(team_id) => {
+                    conn.execute(
+                        "INSERT INTO projects(
+                            id, team_id, name, key, repo_path, context, docs_enabled,
+                            default_branch, next_issue_number, created_at, updated_at,
+                            is_workspace
+                         )
+                         VALUES (?1, ?2, ?3, ?4, ?5, '', 1, 'main', 1, ?6, ?7, 0)",
+                        (
+                            id.as_str(),
+                            team_id.as_str(),
+                            name.as_str(),
+                            key.as_str(),
+                            repo_path.as_str(),
+                            now,
+                            now,
+                        ),
+                    )
+                    .await?;
+                }
+                // Private database: the original local-project insert, unchanged.
+                None => {
+                    conn.execute(
+                        "INSERT INTO projects(
+                            id, workspace_id, name, key, repo_path, context, docs_enabled,
+                            default_branch, next_issue_number, created_at, updated_at,
+                            is_workspace
+                         )
+                         VALUES (?1, 'default', ?2, ?3, ?4, '', 1, 'main', 1, ?5, ?6, 0)",
+                        (
+                            id.as_str(),
+                            name.as_str(),
+                            key.as_str(),
+                            repo_path.as_str(),
+                            now,
+                            now,
+                        ),
+                    )
+                    .await?;
+                }
+            }
             Ok(())
         })
     })
@@ -317,21 +342,116 @@ pub async fn create_db(
     })
 }
 
+/// Create a project, routing its row to the database its team selects.
+///
+/// This is the one place a project's home database is decided (CAIRN-2132). It
+/// resolves the target database from `input.team_id` — the private database for
+/// a local project (`None`), or the already-open team replica for a shared one —
+/// writes the full `projects` row there, then records a `project_routes` stub in
+/// the PRIVATE database and refreshes the in-memory route cache so subsequent
+/// `for_project` lookups resolve correctly. The write commits to the local
+/// replica only; sync propagation is a separate background concern.
+///
+/// For a local project this is a pure addition over [`create`]: the row still
+/// lands in the private DB and the route stub carries a NULL team, which
+/// `for_project` already treats as "private". Returns the created row alongside
+/// the database it landed in, so callers read it back from the right place.
+pub async fn create_routed(
+    dbs: &crate::db::DbState,
+    clock: &dyn Clock,
+    input: CreateProject,
+    projects_dir: Option<&Path>,
+) -> Result<(DbProject, Arc<LocalDb>), CairnError> {
+    let key = input.key.clone();
+    let team_id = input.team_id.clone();
+    let target_db = match &team_id {
+        None => dbs.local.clone(),
+        Some(team) => dbs
+            .team_db(team)
+            .await
+            .ok_or_else(|| CairnError::NotFound {
+                entity: "team",
+                id: team.clone(),
+            })?,
+    };
+    let project = create(&target_db, clock, input, projects_dir).await?;
+    insert_project_route(&dbs.local, clock, &key, team_id.as_deref()).await?;
+    dbs.set_route(&key, team_id).await;
+    Ok((project, target_db))
+}
+
+/// Resolve the database that owns the project with this `id`. An O(1) prefix
+/// parse, fail-closed.
+///
+/// Collapses onto [`crate::execution::routing::routing_db_for_id`] — the same
+/// router [`crate::execution::routing::owning_db_for_project`] uses — so the
+/// id-keyed lifecycle seams (the Tauri `get_project`/`update_project`/… commands
+/// and their headless equivalents) all share one routing answer. A bare (local)
+/// id routes to the private database exactly as the prior `&db.local` path did;
+/// a `{team}~…` id routes to that team's open replica. Fail-closed — a
+/// team-prefixed id whose replica is not open returns an error rather than
+/// silently falling back to the private database (the CAIRN-2170 split-brain
+/// class).
+pub async fn owning_db(dbs: &crate::db::DbState, id: &str) -> Result<Arc<LocalDb>, CairnError> {
+    crate::execution::routing::routing_db_for_id(dbs, id).await
+}
+
+/// Record a project's routing target in the PRIVATE database's `project_routes`
+/// catalog (CAIRN-2132). `team_id` is `None` for a local project — the row
+/// stores NULL and `DbState::for_project` resolves it to the private database.
+/// The key is normalized upper-case to match every other route lookup.
+pub async fn insert_project_route(
+    db: &LocalDb,
+    clock: &dyn Clock,
+    project_key: &str,
+    team_id: Option<&str>,
+) -> Result<(), CairnError> {
+    let key = project_key.to_uppercase();
+    let team_id = team_id.map(str::to_string);
+    let now = clock.now();
+    db.write(|conn| {
+        let key = key.clone();
+        let team_id = team_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT OR REPLACE INTO project_routes(project_key, team_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                (key.as_str(), team_id.as_deref(), now),
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+/// Build the canonical `DbProject` SELECT for whichever schema this DB carries.
+/// The private database roots projects at `workspace_id`; a team replica
+/// re-roots them at `team_id` (CAIRN-2129). Aliasing `team_id AS workspace_id`
+/// lets the single `db_project_from_row` decoder serve both, so a team project
+/// surfaces with its team id in the `workspace_id` slot.
+fn projects_select(db: &LocalDb, tail: &str) -> String {
+    let root = if db.is_synced() {
+        "team_id AS workspace_id"
+    } else {
+        "workspace_id"
+    };
+    format!(
+        "SELECT id, {root}, name, key, repo_path, context, docs_enabled,
+                default_branch, next_issue_number, created_at, updated_at,
+                ci_commands, setup_commands, terminal_commands, config,
+                hidden, is_workspace
+         FROM projects {tail}"
+    )
+}
+
 pub async fn get_db(db: &LocalDb, id: &str) -> Result<Option<DbProject>, CairnError> {
     let id = id.to_string();
+    let sql = projects_select(db, "WHERE id = ?1");
     db.read(|conn| {
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT id, workspace_id, name, key, repo_path, context, docs_enabled,
-                            default_branch, next_issue_number, created_at, updated_at,
-                            ci_commands, setup_commands, terminal_commands, config,
-                            remote_url, hidden, server_id, is_workspace
-                     FROM projects
-                     WHERE id = ?1",
-                    (id,),
-                )
-                .await?;
+            let mut rows = conn.query(&sql, (id,)).await?;
             rows.next()
                 .await?
                 .map(|row| db_project_from_row(&row))
@@ -343,19 +463,10 @@ pub async fn get_db(db: &LocalDb, id: &str) -> Result<Option<DbProject>, CairnEr
 }
 
 pub async fn list_db(db: &LocalDb) -> Result<Vec<DbProject>, CairnError> {
+    let sql = projects_select(db, "ORDER BY name ASC");
     db.read(|conn| {
         Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT id, workspace_id, name, key, repo_path, context, docs_enabled,
-                            default_branch, next_issue_number, created_at, updated_at,
-                            ci_commands, setup_commands, terminal_commands, config,
-                            remote_url, hidden, server_id, is_workspace
-                     FROM projects
-                     ORDER BY name ASC",
-                    (),
-                )
-                .await?;
+            let mut rows = conn.query(&sql, ()).await?;
             let mut projects = Vec::new();
             while let Some(row) = rows.next().await? {
                 projects.push(db_project_from_row(&row)?);
@@ -381,10 +492,10 @@ pub async fn seed_workspace_project_db(
                 "INSERT OR IGNORE INTO projects(
                     id, workspace_id, name, key, repo_path, context, docs_enabled,
                     default_branch, next_issue_number, created_at, updated_at,
-                    remote_url, hidden, server_id, is_workspace
+                    hidden, is_workspace
                  )
                  VALUES ('workspace', 'default', 'Workspace', 'WS', ?1, '', 1,
-                         'main', 1, ?2, ?3, NULL, 0, NULL, 1)",
+                         'main', 1, ?2, ?3, 0, 1)",
                 (repo_path.as_str(), now, now),
             )
             .await?;
@@ -617,10 +728,8 @@ fn db_project_from_row(row: &turso::Row) -> Result<DbProject, DbError> {
         setup_commands: row.opt_text(12)?,
         terminal_commands: row.opt_text(13)?,
         config: row.opt_text(14)?,
-        remote_url: row.opt_text(15)?,
-        hidden: row.i64(16)? as i32,
-        server_id: row.opt_text(17)?,
-        is_workspace: row.i64(18)? as i32,
+        hidden: row.i64(15)? as i32,
+        is_workspace: row.i64(16)? as i32,
     })
 }
 
@@ -665,8 +774,7 @@ mod tests {
                 name: "Empty Repo".to_string(),
                 key: "ER".to_string(),
                 repo_path: repo.path().to_string_lossy().to_string(),
-                remote_url: None,
-                server_id: None,
+                team_id: None,
             },
             None,
         )
@@ -822,8 +930,7 @@ mod tests {
                 name: "P".to_string(),
                 key: "P".to_string(),
                 repo_path: local_path,
-                remote_url: None,
-                server_id: None,
+                team_id: None,
             },
         )
         .await
@@ -875,8 +982,7 @@ mod tests {
                 name: "P2".to_string(),
                 key: "P2".to_string(),
                 repo_path,
-                remote_url: None,
-                server_id: None,
+                team_id: None,
             },
         )
         .await

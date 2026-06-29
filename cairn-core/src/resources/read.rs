@@ -29,8 +29,8 @@ use super::symbols::{read_node_symbols, read_project_symbols};
 use super::actions::{read_action, read_actions_collection};
 use super::agents::{read_agent, read_agents_collection};
 use super::project::{
-    produce_project_issues, read_project, read_project_issues, read_project_search,
-    read_project_settings, read_projects,
+    produce_project_issues, read_project, read_project_issues, read_project_reference,
+    read_project_references, read_project_search, read_project_settings, read_projects,
 };
 use super::recipes::{read_recipe, read_recipes_collection};
 use super::settings::read_settings;
@@ -860,7 +860,7 @@ pub(crate) async fn produce_cairn_resource(
     };
 
     let identity =
-        match resolve_home_relative_resource_uri(&orch.db.local, request, &split.identity).await {
+        match resolve_home_relative_resource_uri(&orch.db, request, &split.identity).await {
             Ok(identity) => identity,
             Err(error) => return RenderedResource::line(error, None, None, None),
         };
@@ -964,7 +964,9 @@ pub(crate) async fn produce_cairn_resource(
                 });
             }
             let rendered_body = if let CairnResource::ProjectIssues { project } = &resource {
-                match produce_project_issues(&orch.db.local, project, &body_params).await {
+                let issues_db = orch.db.for_project(project).await;
+                let issues_db = &*issues_db;
+                match produce_project_issues(issues_db, project, &body_params).await {
                     Ok(page) => page.body,
                     Err(error) => return RenderedResource::line(error, affordance, None, None),
                 }
@@ -1023,7 +1025,9 @@ pub(crate) async fn produce_cairn_resource(
     // `/issues`: unit = issue. limit/offset push down to SQL; the header reports
     // a truthful total from a COUNT over the same filters.
     if let CairnResource::ProjectIssues { project } = &resource {
-        return match produce_project_issues(&orch.db.local, project, &split.params).await {
+        let issues_db = orch.db.for_project(project).await;
+        let issues_db = &*issues_db;
+        return match produce_project_issues(issues_db, project, &split.params).await {
             Ok(page) => RenderedResource {
                 content: page.body,
                 natural_unit: NaturalUnit::Record,
@@ -1138,6 +1142,15 @@ async fn render_resource_body(
     resource: &CairnResource,
     params: Vec<QueryParam>,
 ) -> String {
+    // Resolve the routing target once so every per-resource reader below reads
+    // from the database that owns this resource's project: the private DB for
+    // global resources and every local project, or the team replica for a
+    // shared project. A cache miss defaults to the private DB (strict no-op).
+    let routed_db = match resource.project_key() {
+        Some(key) => orch.db.for_project(key).await,
+        None => orch.db.local.clone(),
+    };
+    let db = &*routed_db;
     match resource.clone() {
         CairnResource::Db => produce_db_sql_resource(orch, &params, None).await.content,
         CairnResource::Dev => produce_dev_collection_resource(None).await.content,
@@ -1150,24 +1163,24 @@ async fn render_resource_body(
             } else if let Some(error) = reject_query_params("project", &params) {
                 error
             } else {
-                read_project(&orch.db.local, &project).await
+                read_project(orch, &project).await
             }
         }
         CairnResource::ProjectIssues { project } => {
-            read_project_issues(&orch.db.local, &project, &params).await
+            read_project_issues(db, &project, &params).await
         }
         CairnResource::Issue { project, number } => {
             if let Some(error) = reject_query_params("issue", &params) {
                 error
             } else {
-                read_issue(&orch.db.local, &project, number).await
+                read_issue(db, &project, number).await
             }
         }
         CairnResource::IssueExecutions { project, number } => {
             if let Some(error) = reject_query_params("issue executions", &params) {
                 error
             } else {
-                read_issue_executions(&orch.db.local, &project, number).await
+                read_issue_executions(db, &project, number).await
             }
         }
         CairnResource::IssueExecution {
@@ -1178,7 +1191,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("execution snapshot", &params) {
                 error
             } else {
-                read_issue_execution(&orch.db.local, &project, number, exec_seq).await
+                read_issue_execution(db, &project, number, exec_seq).await
             }
         }
         CairnResource::Node {
@@ -1214,15 +1227,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("task", &params) {
                 error
             } else {
-                read_task(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                )
-                .await
+                read_task(db, &project, number, exec_seq, &node_id, &task_name).await
             }
         }
         CairnResource::NodeChat {
@@ -1230,17 +1235,7 @@ async fn render_resource_body(
             number,
             exec_seq,
             node_id,
-        } => {
-            read_node_chat(
-                &orch.db.local,
-                &project,
-                number,
-                exec_seq,
-                &node_id,
-                &params,
-            )
-            .await
-        }
+        } => read_node_chat(db, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::NodeChatRaw {
             project,
             number,
@@ -1250,7 +1245,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node chat", &params) {
                 error
             } else {
-                read_node_chat_raw(&orch.db.local, &project, number, exec_seq, &node_id).await
+                read_node_chat_raw(db, &project, number, exec_seq, &node_id).await
             }
         }
         CairnResource::NodeChatTurn {
@@ -1263,15 +1258,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node chat turn", &params) {
                 error
             } else {
-                read_node_chat_turn(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    turn_seq,
-                )
-                .await
+                read_node_chat_turn(db, &project, number, exec_seq, &node_id, turn_seq).await
             }
         }
         CairnResource::NodeChatEvent {
@@ -1285,16 +1272,8 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node chat event", &params) {
                 error
             } else {
-                read_node_chat_event(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    run_seq,
-                    event_seq,
-                )
-                .await
+                read_node_chat_event(db, &project, number, exec_seq, &node_id, run_seq, event_seq)
+                    .await
             }
         }
         CairnResource::NodeArtifact {
@@ -1338,13 +1317,7 @@ async fn render_resource_body(
             task_name,
         } => {
             read_task_chat(
-                &orch.db.local,
-                &project,
-                number,
-                exec_seq,
-                &node_id,
-                &task_name,
-                &params,
+                db, &project, number, exec_seq, &node_id, &task_name, &params,
             )
             .await
         }
@@ -1358,15 +1331,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("task chat", &params) {
                 error
             } else {
-                read_task_chat_raw(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                )
-                .await
+                read_task_chat_raw(db, &project, number, exec_seq, &node_id, &task_name).await
             }
         }
         CairnResource::TaskChatTurn {
@@ -1381,13 +1346,7 @@ async fn render_resource_body(
                 error
             } else {
                 read_task_chat_turn(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                    turn_seq,
+                    db, &project, number, exec_seq, &node_id, &task_name, turn_seq,
                 )
                 .await
             }
@@ -1405,14 +1364,7 @@ async fn render_resource_body(
                 error
             } else {
                 read_task_chat_event(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                    run_seq,
-                    event_seq,
+                    db, &project, number, exec_seq, &node_id, &task_name, run_seq, event_seq,
                 )
                 .await
             }
@@ -1428,15 +1380,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("task artifact", &params) {
                 error
             } else {
-                read_task_artifact(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                )
-                .await
+                read_task_artifact(db, &project, number, exec_seq, &node_id, &task_name).await
             }
         }
         CairnResource::JobTodos {
@@ -1450,7 +1394,7 @@ async fn render_resource_body(
                 error
             } else {
                 read_job_todos(
-                    &orch.db.local,
+                    db,
                     &project,
                     number,
                     exec_seq,
@@ -1469,7 +1413,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node tasks", &params) {
                 error
             } else {
-                read_node_tasks(&orch.db.local, &project, number, exec_seq, &node_id).await
+                read_node_tasks(db, &project, number, exec_seq, &node_id).await
             }
         }
         CairnResource::NodeWakes {
@@ -1481,7 +1425,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node wakes", &params) {
                 error
             } else {
-                read_node_wakes(&orch.db.local, &project, number, exec_seq, &node_id).await
+                read_node_wakes(db, &project, number, exec_seq, &node_id).await
             }
         }
         CairnResource::NodeQuestions {
@@ -1493,7 +1437,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node questions", &params) {
                 error
             } else {
-                read_node_questions(&orch.db.local, &project, number, exec_seq, &node_id).await
+                read_node_questions(db, &project, number, exec_seq, &node_id).await
             }
         }
         CairnResource::NodeQuestion {
@@ -1506,15 +1450,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node question", &params) {
                 error
             } else {
-                read_node_question(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &segment,
-                )
-                .await
+                read_node_question(db, &project, number, exec_seq, &node_id, &segment).await
             }
         }
         CairnResource::NodePermissions {
@@ -1526,7 +1462,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node permissions", &params) {
                 error
             } else {
-                read_node_permissions(&orch.db.local, &project, number, exec_seq, &node_id).await
+                read_node_permissions(db, &project, number, exec_seq, &node_id).await
             }
         }
         CairnResource::NodePermission {
@@ -1539,15 +1475,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("node permission", &params) {
                 error
             } else {
-                read_node_permission(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &segment,
-                )
-                .await
+                read_node_permission(db, &project, number, exec_seq, &node_id, &segment).await
             }
         }
         CairnResource::TaskPermissions {
@@ -1560,15 +1488,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("task permissions", &params) {
                 error
             } else {
-                read_task_permissions(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                )
-                .await
+                read_task_permissions(db, &project, number, exec_seq, &node_id, &task_name).await
             }
         }
         CairnResource::TaskPermission {
@@ -1583,22 +1503,16 @@ async fn render_resource_body(
                 error
             } else {
                 read_task_permission(
-                    &orch.db.local,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
-                    &task_name,
-                    &segment,
+                    db, &project, number, exec_seq, &node_id, &task_name, &segment,
                 )
                 .await
             }
         }
         CairnResource::Changed { project, number } => {
             if params.is_empty() {
-                read_issue_changed(&orch.db.local, &project, number).await
+                read_issue_changed(db, &project, number).await
             } else {
-                read_issue_changed_projection(&orch.db.local, &project, number, &params).await
+                read_issue_changed_projection(db, &project, number, &params).await
             }
         }
         CairnResource::NodeChanged {
@@ -1615,16 +1529,16 @@ async fn render_resource_body(
             }
         }
         CairnResource::ProjectMessages { project } => {
-            read_project_messages(&orch.db.local, &project, &params).await
+            read_project_messages(db, &project, &params).await
         }
         CairnResource::IssueMessages { project, number } => {
-            read_issue_messages(&orch.db.local, &project, number, &params).await
+            read_issue_messages(db, &project, number, &params).await
         }
         CairnResource::IssueComments { project, number } => {
             if let Some(error) = reject_query_params("issue comments", &params) {
                 error
             } else {
-                read_issue_comments(&orch.db.local, &project, number).await
+                read_issue_comments(db, &project, number).await
             }
         }
         CairnResource::IssueComment {
@@ -1635,7 +1549,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("issue comment", &params) {
                 error
             } else {
-                read_issue_comment(&orch.db.local, &project, number, comment_seq).await
+                read_issue_comment(db, &project, number, comment_seq).await
             }
         }
         // Canonical node/task messaging read target (read/append symmetry).
@@ -1644,18 +1558,7 @@ async fn render_resource_body(
             number,
             exec_seq,
             node_id,
-        } => {
-            read_node_messages(
-                &orch.db.local,
-                &project,
-                number,
-                exec_seq,
-                &node_id,
-                None,
-                &params,
-            )
-            .await
-        }
+        } => read_node_messages(db, &project, number, exec_seq, &node_id, None, &params).await,
         CairnResource::TaskMessages {
             project,
             number,
@@ -1664,7 +1567,7 @@ async fn render_resource_body(
             task_name,
         } => {
             read_node_messages(
-                &orch.db.local,
+                db,
                 &project,
                 number,
                 exec_seq,
@@ -1726,14 +1629,14 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("labels", &params) {
                 error
             } else {
-                read_labels(&orch.db.local).await
+                read_labels(db).await
             }
         }
         CairnResource::Label { label_id } => {
             if let Some(error) = reject_query_params("label", &params) {
                 error
             } else {
-                read_label(&orch.db.local, &label_id).await
+                read_label(db, &label_id).await
             }
         }
         CairnResource::NodeSymbols {
@@ -1877,7 +1780,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("projects", &params) {
                 error
             } else {
-                read_projects(&orch.db.local).await
+                read_projects(db).await
             }
         }
         CairnResource::ProjectSettings { project } => {
@@ -1885,6 +1788,20 @@ async fn render_resource_body(
                 error
             } else {
                 read_project_settings(orch, &project).await
+            }
+        }
+        CairnResource::ProjectReferences { project } => {
+            if let Some(error) = reject_query_params("project references", &params) {
+                error
+            } else {
+                read_project_references(orch, &project).await
+            }
+        }
+        CairnResource::ProjectReference { project, name } => {
+            if let Some(error) = reject_query_params("project reference", &params) {
+                error
+            } else {
+                read_project_reference(orch, &project, &name).await
             }
         }
         // Terminal URIs are routed to read_resource by the MCP binary and should never reach here

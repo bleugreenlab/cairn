@@ -3,6 +3,7 @@
 //! Handles: update_issue
 
 use crate::orchestrator::Orchestrator;
+use cairn_common::ids;
 use turso::params;
 
 use super::{parse_issue_identifier, ProjectContext};
@@ -29,8 +30,10 @@ pub struct CreateExecutionSpec {
 /// Persist a new issue and emit the standard side effects (embed, sync,
 /// db-change), returning the created row so callers can chain follow-on work
 /// (e.g. starting an execution) without re-querying.
+#[allow(clippy::too_many_arguments)]
 async fn insert_issue_with_context(
     orch: &Orchestrator,
+    owning_db: &LocalDb,
     ctx: &ProjectContext,
     title: String,
     description: Option<String>,
@@ -40,8 +43,12 @@ async fn insert_issue_with_context(
 ) -> Result<Issue, String> {
     let services = &orch.services;
     let embed_text = description.clone().unwrap_or_default();
+    // The issue row is written to the database that owns the project (the team
+    // replica for a team project, the private DB for a local one), resolved by
+    // the caller via `for_project` so the row lands in the same DB it is read
+    // back from (CAIRN-2181).
     let issue = create_issue_row(
-        &orch.db.local,
+        owning_db,
         &ctx.project_id,
         title,
         description,
@@ -53,6 +60,8 @@ async fn insert_issue_with_context(
     .map_err(|e| format!("Failed to create issue: {}", e))?;
 
     let issue_uri = cairn_common::uri::build_issue_uri(&ctx.project_key, issue.number);
+    // content→execution boundary (CAIRN-2181): the child-subscription wake seed is
+    // job/run-keyed and stays private until CAIRN-2182.
     if let Err(error) = crate::orchestrator::wakes::seed_default_child_subscription_for_issue(
         &orch.db.local,
         &issue.id,
@@ -68,7 +77,6 @@ async fn insert_issue_with_context(
     }
     orch.enqueue_resource_embed(&issue_uri, embed_text);
 
-    orch.sync(crate::sync::SyncMessage::Issue((&issue).into()));
     if let Err(e) = services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "issues", "action": "update"}),
@@ -96,11 +104,14 @@ fn created_issue_summary(ctx: &ProjectContext, issue: &Issue) -> String {
 
 async fn create_issue_with_context(
     orch: &Orchestrator,
+    owning_db: &LocalDb,
     ctx: ProjectContext,
     title: String,
     description: Option<String>,
 ) -> Result<String, String> {
-    let issue = insert_issue_with_context(orch, &ctx, title, description, None, None, None).await?;
+    let issue =
+        insert_issue_with_context(orch, owning_db, &ctx, title, description, None, None, None)
+            .await?;
     Ok(created_issue_summary(&ctx, &issue))
 }
 
@@ -111,12 +122,28 @@ pub async fn create_issue_from_request(
     title: String,
     description: Option<String>,
 ) -> Result<String, String> {
-    let ctx = if let Some(key) = project_key {
-        lookup_project_by_key(&orch.db.local, key).await?
+    let (owning_db, ctx) = if let Some(key) = project_key {
+        // The project lookup must run against the owning DB: a team project's
+        // `projects` row lives only in its team replica (CAIRN-2181).
+        let db = orch.db.for_project(key).await;
+        let ctx = lookup_project_by_key(&db, key).await?;
+        (db, ctx)
     } else {
-        lookup_project_context(&orch.db.local, request).await?
+        // No explicit key: resolve the run/cwd context from the OWNING DB. A team
+        // run's `runs`/`jobs` rows live in its replica (CAIRN-2182), so a run-id
+        // lookup against the private DB errors `No run found`; route by run id
+        // when present, falling back to the private DB for the cwd path.
+        let lookup_db = match request.run_id.as_deref() {
+            Some(run_id) => crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+                .await
+                .map_err(|e| e.to_string())?,
+            None => orch.db.local.clone(),
+        };
+        let ctx = lookup_project_context(&lookup_db, request).await?;
+        let db = orch.db.for_project(&ctx.project_key).await;
+        (db, ctx)
     };
-    create_issue_with_context(orch, ctx, title, description).await
+    create_issue_with_context(orch, &owning_db, ctx, title, description).await
 }
 
 /// Outcome of creating an issue through the resource-mutation path: the
@@ -142,9 +169,11 @@ pub async fn create_issue_in_project(
     parent_uri: Option<String>,
     caller_run_id: Option<String>,
 ) -> Result<CreatedIssueOutcome, String> {
-    let ctx = lookup_project_by_key(&orch.db.local, project_key).await?;
+    let owning_db = orch.db.for_project(project_key).await;
+    let ctx = lookup_project_by_key(&owning_db, project_key).await?;
     let issue = insert_issue_with_context(
         orch,
+        &owning_db,
         &ctx,
         title,
         description,
@@ -202,8 +231,9 @@ pub async fn create_issue_external_in_project(
     title: String,
     description: Option<String>,
 ) -> Result<String, String> {
-    let ctx = lookup_project_by_key(&orch.db.local, project_key).await?;
-    create_issue_with_context(orch, ctx, title, description).await
+    let owning_db = orch.db.for_project(project_key).await;
+    let ctx = lookup_project_by_key(&owning_db, project_key).await?;
+    create_issue_with_context(orch, &owning_db, ctx, title, description).await
 }
 
 async fn lookup_project_by_key(db: &LocalDb, key: &str) -> Result<ProjectContext, String> {
@@ -396,6 +426,13 @@ async fn create_issue_row(
             // sub-task's own job (which may be a completed job that retains its
             // session). Only set when an agent (a run bound to a job) created
             // the issue under a parent.
+            //
+            // content→execution boundary (CAIRN-2181): this reads runs/jobs from
+            // whatever DB the insert targets. The user-driven create has no
+            // caller_run_id so it never fires; an agent spawning a child into a
+            // team project hits an empty runs table in the replica and degrades
+            // to parent_job_id = NULL (wake routing falls back) — cross-DB job
+            // resolution is execution-slice work for CAIRN-2182.
             let parent_job_id = match (parent_issue_id.as_deref(), caller_run_id.as_deref()) {
                 (Some(_), Some(run_id)) => root_job_for_run(conn, run_id).await?,
                 _ => None,
@@ -413,7 +450,7 @@ async fn create_issue_row(
                 .ok_or_else(|| DbError::Row(format!("project not found: {}", project_id)))?;
             let number = row.opt_i64(0)?.unwrap_or(1) as i32;
             let now = chrono::Utc::now().timestamp() as i32;
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = ids::mint_child(project_id.as_str());
 
             conn.execute(
                 "UPDATE projects SET next_issue_number = ?1, updated_at = ?2 WHERE id = ?3",
@@ -640,10 +677,27 @@ pub async fn update_issue_by_project_number(
         return Err("No fields to update".to_string());
     }
 
-    let ctx = if project_key.is_empty() {
-        lookup_project_context(&orch.db.local, request).await?
+    // Resolve the owning DB by key (CAIRN-2181): a team project's issue row lives
+    // in its team replica, so the field/parent/dependency/label writes must
+    // target the same DB the row is read from. Without a key, the run/cwd context
+    // resolves against the PRIVATE DB (runs/jobs are private), then routes by key.
+    let (owning_db, ctx) = if project_key.is_empty() {
+        // A team run's run/job rows live in its replica (CAIRN-2182): route the
+        // run-id context lookup to the owning DB so it doesn't error `No run
+        // found` against the private DB. The cwd path stays on the private DB.
+        let lookup_db = match request.run_id.as_deref() {
+            Some(run_id) => crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+                .await
+                .map_err(|e| e.to_string())?,
+            None => orch.db.local.clone(),
+        };
+        let ctx = lookup_project_context(&lookup_db, request).await?;
+        let db = orch.db.for_project(&ctx.project_key).await;
+        (db, ctx)
     } else {
-        lookup_project_by_key(&orch.db.local, project_key).await?
+        let db = orch.db.for_project(project_key).await;
+        let ctx = lookup_project_by_key(&db, project_key).await?;
+        (db, ctx)
     };
 
     let embed_description = patch.description.clone();
@@ -651,7 +705,7 @@ pub async fn update_issue_by_project_number(
     let parent_changed = patch.parent.is_some();
     let status = patch.status.clone();
     let issue = update_issue_row(
-        &orch.db.local,
+        &owning_db,
         &ctx.project_id,
         issue_num,
         patch,
@@ -669,6 +723,8 @@ pub async fn update_issue_by_project_number(
     }
 
     if parent_changed {
+        // content→execution boundary (CAIRN-2181): wake reconcile is job-keyed and
+        // stays private until CAIRN-2182.
         if let Err(error) =
             crate::orchestrator::wakes::reconcile_default_child_subscription_for_issue(
                 &orch.db.local,
@@ -685,7 +741,6 @@ pub async fn update_issue_by_project_number(
         }
     }
 
-    orch.sync(crate::sync::SyncMessage::Issue((&issue).into()));
     if let Err(e) = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "issues", "action": "update"}),
@@ -986,5 +1041,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(root_job(&db, "run-orphan").await, None);
+    }
+
+    /// A local project (no team route) still creates its issue in the PRIVATE
+    /// database: with no route registered, `for_project` returns `local`, so the
+    /// owning-DB routing (CAIRN-2181) is a strict no-op for local-only installs.
+    #[tokio::test]
+    async fn create_issue_lands_in_private_db_for_local_project() {
+        let db = migrated_db().await;
+        seed_jobs(&db).await;
+        let orch = test_orchestrator(db);
+
+        let outcome = create_issue_in_project(
+            &orch,
+            "PROJ",
+            "Local issue".to_string(),
+            Some("body".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.number, 1);
+        let found = orch
+            .db
+            .local
+            .query_text(
+                "SELECT title FROM issues WHERE id = ?1",
+                (outcome.issue_id.clone(),),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.as_deref(),
+            Some("Local issue"),
+            "a local project's issue lands in the private database"
+        );
     }
 }

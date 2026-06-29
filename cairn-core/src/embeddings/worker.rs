@@ -215,6 +215,22 @@ async fn process_batch(
                                             e
                                         );
                                     } else {
+                                        let session_id =
+                                            position.as_ref().map(|meta| meta.session_id.as_str());
+                                        let issue_id =
+                                            match queries::issue_id_for_event_async(db, event_id)
+                                                .await
+                                            {
+                                                Ok(issue_id) => issue_id,
+                                                Err(e) => {
+                                                    log::warn!(
+                                                    "Failed to resolve issue id for vibe {}: {}",
+                                                    event_id,
+                                                    e
+                                                );
+                                                    None
+                                                }
+                                            };
                                         let _ = emitter.emit(
                                             "db-change",
                                             serde_json::json!({
@@ -222,6 +238,10 @@ async fn process_batch(
                                                 "action": "upsert",
                                                 "eventId": event_id,
                                                 "event_id": event_id,
+                                                "sessionId": session_id,
+                                                "session_id": session_id,
+                                                "issueId": issue_id,
+                                                "issue_id": issue_id,
                                             }),
                                         );
                                     }

@@ -3,13 +3,13 @@ use super::{CodexBackend, CODEX_BACKEND_NAME};
 use crate::backends::run_state::run_backend_db;
 use crate::backends::AgentBackend;
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbError, RowExt};
+use crate::storage::{DbError, LocalDb, RowExt};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use turso::params;
-use uuid::Uuid;
 
 pub(super) fn codex_mcp_elicitation_accept_payload() -> Value {
     serde_json::json!({
@@ -54,6 +54,7 @@ pub(super) fn extract_codex_mcp_tool_name_from_message(message: &str) -> Option<
 
 pub(super) fn codex_mcp_elicitation_preflight_response(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     params: &Value,
     id_value: &Value,
@@ -62,7 +63,7 @@ pub(super) fn codex_mcp_elicitation_preflight_response(
         return Ok(None);
     };
 
-    if codex_mcp_tool_is_allowed(orch, run_id, &tool_name)? {
+    if codex_mcp_tool_is_allowed(orch, run_db, run_id, &tool_name)? {
         log::info!(
             "Auto-accepting Codex MCP elicitation for already-allowed tool {}",
             tool_name
@@ -71,12 +72,14 @@ pub(super) fn codex_mcp_elicitation_preflight_response(
     }
 
     let tool_use_id = codex_mcp_elicitation_tool_use_id(id_value);
-    let response = request_codex_permission(orch, run_id, &tool_use_id, &tool_name, params, true)?;
+    let response =
+        request_codex_permission(orch, run_db, run_id, &tool_use_id, &tool_name, params, true)?;
     Ok(Some(response))
 }
 
 pub(super) fn codex_mcp_tool_is_allowed(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     tool_name: &str,
 ) -> Result<bool, String> {
@@ -86,16 +89,17 @@ pub(super) fn codex_mcp_tool_is_allowed(
         }
     }
 
-    Ok(load_codex_allowed_tools_for_run(orch, run_id)?.contains(tool_name))
+    Ok(load_codex_allowed_tools_for_run(orch, run_db, run_id)?.contains(tool_name))
 }
 
 pub(super) fn load_codex_allowed_tools_for_run(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
 ) -> Result<HashSet<String>, String> {
     use crate::config::agents as config_agents;
 
-    let db = orch.db.local.clone();
+    let db = run_db.clone();
     let run_id = run_id.to_string();
     let lookup = run_backend_db(CODEX_BACKEND_NAME, async move {
         db.read(|conn| {
@@ -227,8 +231,10 @@ pub(super) fn load_codex_tool_config_from_snapshot(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_codex_approval_request(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     tool_name: &str,
     params: Value,
@@ -242,6 +248,7 @@ pub(super) fn handle_codex_approval_request(
         .unwrap_or("codex-approval");
     let response = request_codex_permission(
         orch,
+        run_db,
         run_id,
         item_id,
         tool_name,
@@ -253,6 +260,7 @@ pub(super) fn handle_codex_approval_request(
 
 pub(super) fn handle_codex_mcp_server_elicitation_request(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     params: Value,
     client: &AppServerClient,
@@ -260,7 +268,7 @@ pub(super) fn handle_codex_mcp_server_elicitation_request(
 ) -> Result<(), String> {
     if is_codex_mcp_tool_approval_elicitation(&params) {
         if let Some(response) =
-            codex_mcp_elicitation_preflight_response(orch, run_id, &params, id_value)?
+            codex_mcp_elicitation_preflight_response(orch, run_db, run_id, &params, id_value)?
         {
             return client.respond(id_value, response);
         }
@@ -349,20 +357,24 @@ pub(super) fn codex_mcp_elicitation_tool_use_id(id_value: &Value) -> String {
     format!("codex-mcp-elicitation:{request_id}")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn request_codex_permission(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     run_id: &str,
     tool_use_id: &str,
     tool_name: &str,
     tool_input: &Value,
     allow_accept_for_session: bool,
 ) -> Result<Value, String> {
-    let request_id = Uuid::new_v4().to_string();
+    // Intrinsic prefixing (CAIRN-2210): inherit the owning run's scope so a team
+    // codex permission_request routes back to the replica via routing_db_for_id.
+    let request_id = cairn_common::ids::mint_child(run_id);
     let now = chrono::Utc::now().timestamp() as i32;
     let tool_input_json = serde_json::to_string(tool_input).unwrap_or_default();
 
     {
-        let db = orch.db.local.clone();
+        let db = run_db.clone();
         let request_id_for_db = request_id.clone();
         let run_id_for_db = run_id.to_string();
         let tool_use_id_for_db = tool_use_id.to_string();

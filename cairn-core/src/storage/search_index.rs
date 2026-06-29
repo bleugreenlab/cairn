@@ -183,6 +183,45 @@ impl SearchIndex {
         Ok(indexed_count)
     }
 
+    /// Rebuilds the index from the source rows of EVERY supplied database.
+    ///
+    /// Like [`rebuild`], but collects documents from all databases BEFORE the
+    /// single `delete_all_documents`, so rebuilding never drops already-applied
+    /// rows that live in another open database (e.g. a team replica). Documents
+    /// are URI-keyed and URIs are project-encoded, so one index serves all
+    /// databases without collision.
+    pub async fn rebuild_many(&self, dbs: &[std::sync::Arc<LocalDb>]) -> DbResult<usize> {
+        let mut all_documents = Vec::new();
+        // (database index, that database's drained outbox ids) — marked applied
+        // only after the rebuild commits.
+        let mut pending: Vec<(usize, Vec<String>)> = Vec::new();
+        for (idx, db) in dbs.iter().enumerate() {
+            let mut snapshot = load_rebuild_snapshot(db).await?;
+            snapshot.documents.extend(load_event_documents(db).await?);
+            pending.push((idx, snapshot.pending_outbox_ids));
+            all_documents.extend(snapshot.documents);
+        }
+        let indexed_count = all_documents.len();
+
+        {
+            let mut writer = self.writer.lock().map_err(|error| {
+                DbError::Search(format!("search writer lock poisoned: {error}"))
+            })?;
+            writer.delete_all_documents()?;
+            for document in all_documents {
+                writer.add_document(self.tantivy_document(document))?;
+            }
+            writer.commit()?;
+        }
+
+        self.reader.reload()?;
+        for (idx, outbox_ids) in pending {
+            mark_applied(&dbs[idx], &outbox_ids).await?;
+        }
+        self.needs_rebuild.store(false, Ordering::SeqCst);
+        Ok(indexed_count)
+    }
+
     pub async fn apply_pending(&self, db: &LocalDb) -> DbResult<usize> {
         let entries = self.pending_entries(db).await?;
         if entries.is_empty() {
@@ -1477,5 +1516,54 @@ mod tests {
         let hits = reopened.search("reopenable", None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "issue-1");
+    }
+
+    #[tokio::test]
+    async fn rebuild_many_keeps_every_database_when_outboxes_are_already_applied() {
+        // Two databases, each with an applied-outbox issue. A single-DB rebuild
+        // clears the whole index and reloads from one DB, dropping the other's
+        // already-applied row. rebuild_many collects from all DBs before the
+        // single clear, so both survive (the cross-DB no-drop guarantee).
+        let db1 = migrated_db().await.unwrap();
+        let db2 = migrated_db().await.unwrap();
+        db1.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('w', 'W', 1, 1)", ()).await?;
+                conn.execute("INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p', 'w', 'P', 'PROJ', '/tmp/p', 1, 1)", ()).await?;
+                conn.execute("INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at) VALUES ('issue-a', 'p', 1, 'Title', 'alpha body', 1, 1)", ()).await?;
+                conn.execute("UPDATE search_outbox SET status = 'applied'", ()).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        db2.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('w', 'W', 1, 1)", ()).await?;
+                conn.execute("INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p', 'w', 'P', 'PROJ', '/tmp/p', 1, 1)", ()).await?;
+                conn.execute("INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at) VALUES ('issue-b', 'p', 1, 'Title', 'bravo body', 1, 1)", ()).await?;
+                conn.execute("UPDATE search_outbox SET status = 'applied'", ()).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert!(index.needs_rebuild());
+
+        let dbs = vec![std::sync::Arc::new(db1), std::sync::Arc::new(db2)];
+        assert_eq!(index.rebuild_many(&dbs).await.unwrap(), 2);
+        assert_eq!(
+            index.search("alpha", None).unwrap().len(),
+            1,
+            "first database's already-applied row must survive the rebuild"
+        );
+        assert_eq!(
+            index.search("bravo", None).unwrap().len(),
+            1,
+            "second database's already-applied row must survive the rebuild"
+        );
     }
 }

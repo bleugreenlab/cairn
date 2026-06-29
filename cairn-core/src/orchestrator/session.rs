@@ -11,12 +11,11 @@ use crate::backends::{self, SessionConfig, SessionStart};
 use crate::models::Model;
 
 use crate::storage::{run_db_blocking, DbError, DbResult, RowExt};
-use crate::sync::{SyncEvent, SyncMessage, SyncTranscriptEvent};
+use cairn_common::ids;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use turso::params;
-use uuid::Uuid;
 
 use super::Orchestrator;
 
@@ -54,7 +53,7 @@ pub fn persist_system_prompt_event(
 
     let hash = sha256_hex(&full_prompt);
     let now = chrono::Utc::now().timestamp() as i32;
-    let event_id = Uuid::new_v4().to_string();
+    let event_id = ids::mint_child(run_id);
     let run_id_owned = run_id.to_string();
     let session_id_owned = session_id.map(|s| s.to_string());
     let full_prompt_owned = full_prompt.clone();
@@ -81,14 +80,17 @@ pub fn persist_system_prompt_event(
     };
 
     let data = serde_json::to_string(&transcript_event).unwrap_or_default();
-    let db = orch.db.local.clone();
     let insert_result = run_db_blocking({
+        let dbs = orch.db.clone();
         let event_id = event_id.clone();
         let run_id = run_id_owned.clone();
         let session_id = session_id_owned.clone();
         let data = data.clone();
         let hash = hash.clone();
         move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
             db.write(|conn| {
                 let event_id = event_id.clone();
                 let run_id = run_id.clone();
@@ -185,23 +187,15 @@ pub fn persist_system_prompt_event(
         return 0;
     };
 
-    if let Some(sequence) = inserted_sequence {
-        orch.sync(SyncMessage::Event(SyncEvent::transcript(
-            SyncTranscriptEvent {
-                id: event_id.clone(),
-                run_id: run_id_owned,
-                session_id: session_id_owned,
-                sequence,
-                event_type: "system:prompt".to_string(),
-                data: data.clone(),
-                created_at: i64::from(now),
-                turn_id: None,
-            },
-        )));
-
+    if inserted_sequence.is_some() {
         let _ = orch.services.emitter.emit(
             "db-change",
-            crate::notify::event_db_change(run_id, session_id, "insert"),
+            crate::notify::event_db_change_for_run(
+                orch.db.local.clone(),
+                run_id,
+                session_id,
+                "insert",
+            ),
         );
     }
 
@@ -229,9 +223,12 @@ struct SessionDbContext {
 }
 
 fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbContext, String> {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let run_id = run_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
@@ -329,10 +326,13 @@ fn resolve_ctx_self_targets(
     execution_id: &str,
     node_id: &str,
 ) -> Vec<crate::models::OutputSchemaInfo> {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let execution_id = execution_id.to_string();
     let node_id = node_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             let execution_id = execution_id.clone();
             let node_id = node_id.clone();
@@ -543,11 +543,14 @@ fn build_messaging_context(
     issue_id: &str,
     current_run_id: &str,
 ) -> String {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let project_key = project_key.to_string();
     let issue_id = issue_id.to_string();
     let current_run_id = current_run_id.to_string();
     let data = run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &current_run_id)
+            .await
+            .map_err(|e| e.to_string())?;
         // Read phase: peers + channel messages newer than this session's
         // injection cursor.
         let (peers, recent, session_id) = db
@@ -840,7 +843,7 @@ pub fn insert_error_event(
     error_message: &str,
 ) {
     let now = chrono::Utc::now().timestamp() as i32;
-    let event_id = Uuid::new_v4().to_string();
+    let event_id = ids::mint_child(run_id);
     let run_id_owned = run_id.to_string();
     let session_id_owned = session_id.map(|s| s.to_string());
     let error_message = error_message.to_string();
@@ -862,13 +865,16 @@ pub fn insert_error_event(
     };
 
     let data = serde_json::to_string(&transcript_event).unwrap_or_default();
-    let db = orch.db.local.clone();
     let insert_result = run_db_blocking({
+        let dbs = orch.db.clone();
         let event_id = event_id.clone();
         let run_id = run_id_owned.clone();
         let session_id = session_id_owned.clone();
         let data = data.clone();
         move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
             db.write(|conn| {
                 let event_id = event_id.clone();
                 let run_id = run_id.clone();
@@ -916,27 +922,13 @@ pub fn insert_error_event(
         }
     });
 
-    let Ok(sequence) = insert_result else {
+    if insert_result.is_err() {
         return;
-    };
-
-    // Sync event to cloud
-    orch.sync(SyncMessage::Event(SyncEvent::transcript(
-        SyncTranscriptEvent {
-            id: event_id.clone(),
-            run_id: run_id_owned,
-            session_id: session_id_owned,
-            sequence,
-            event_type: "system:error".to_string(),
-            data: data.clone(),
-            created_at: i64::from(now),
-            turn_id: None,
-        },
-    )));
+    }
 
     let _ = orch.services.emitter.emit(
         "db-change",
-        crate::notify::event_db_change(run_id, session_id, "insert"),
+        crate::notify::event_db_change_for_run(orch.db.local.clone(), run_id, session_id, "insert"),
     );
 }
 
@@ -2042,7 +2034,7 @@ mod tests {
                         cache_create_tokens, output_tokens, turn_id
                      ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, 1, NULL, NULL, NULL, NULL, NULL)",
                     params![
-                        Uuid::new_v4().to_string(),
+                        ids::mint_child(&run_id),
                         run_id,
                         session_id,
                         sequence,

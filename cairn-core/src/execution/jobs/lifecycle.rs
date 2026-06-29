@@ -17,8 +17,10 @@ pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<V
         gateway.close_session(job_id).await;
     }
 
-    let db = orch.db.local.clone();
     let job_id = job_id.to_string();
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id)
+        .await
+        .map_err(|e| e.to_string())?;
     let (execution_id, recipe_node_id): (Option<String>, Option<String>) = run_db(async move {
         db.read(|conn| {
             Box::pin(async move {
@@ -58,28 +60,41 @@ pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<V
 /// The job status must already be set to `"running"` by the caller before this is
 /// invoked (Tauri does this synchronously so the UI sees the change immediately).
 pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, String> {
+    // Resolve the job's owning database ONCE (fail-closed) and thread it through
+    // every run/session/turn/event write below: a team job's rows live wholly in
+    // its synced replica, so prepare must read and write there, not the private DB.
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+
     // ---- Load job -------------------------------------------------------
     let job = run_db(load_job(
-        orch.db.local.clone(),
+        owning_db.clone(),
         job_id.to_string(),
         "Job not found",
     ))?;
 
     // ---- Load project info ----------------------------------------------
     let (repo_path, project_key) = run_db(load_project_repo_and_key(
-        orch.db.local.clone(),
+        owning_db.clone(),
         job.project_id.clone(),
     ))?;
 
     // ---- Execution seq (for job-activated event) ------------------------
     let exec_seq = match &job.execution_id {
-        Some(exec_id) => run_db(load_execution_seq(orch.db.local.clone(), exec_id.clone()))?,
+        Some(exec_id) => run_db(load_execution_seq(owning_db.clone(), exec_id.clone()))?,
         None => None,
     };
 
     // ---- Display ID (issue number or sequential run counter) ------------
     let display_id = run_db(load_display_id(
-        orch.db.local.clone(),
+        owning_db.clone(),
         job.project_id.clone(),
         job.issue_id.clone(),
     ))?;
@@ -93,7 +108,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
                 .ok_or("Job has recipe node but no execution_id")?;
 
             let all_nodes = run_db(load_nodes_from_execution(
-                orch.db.local.clone(),
+                owning_db.clone(),
                 execution_id.clone(),
             ))?;
             let node_map: HashMap<&str, &DbRecipeNode> =
@@ -122,7 +137,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             // run on the project root without a worktree.
             let needs_wt = if let Some(ref branch) = job.branch {
                 let default_branch = run_db(load_project_default_branch(
-                    orch.db.local.clone(),
+                    owning_db.clone(),
                     job.project_id.clone(),
                 ))?
                 .unwrap_or_else(|| "main".to_string());
@@ -159,7 +174,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
         let (parent_worktree, parent_branch): (String, Option<String>) = {
             let parent = run_db(load_job(
-                orch.db.local.clone(),
+                owning_db.clone(),
                 parent_job_id.to_string(),
                 "Parent job not found",
             ))?;
@@ -176,7 +191,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         let base_commit = worktree_head_commit(orch, Path::new(&parent_worktree));
         let now = chrono::Utc::now().timestamp() as i32;
         run_db(update_job_worktree(
-            orch.db.local.clone(),
+            owning_db.clone(),
             job_id.to_string(),
             Some(parent_worktree.clone()),
             parent_branch.clone(),
@@ -208,7 +223,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     } else if needs_worktree {
         // Count existing branched jobs to compute unique sequence number
         let seq = run_db(count_existing_branched_jobs(
-            orch.db.local.clone(),
+            owning_db.clone(),
             job.issue_id.clone(),
             job.execution_id.clone(),
         ))?;
@@ -334,7 +349,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         let base_commit = worktree_head_commit(orch, &wt_path);
         let now = chrono::Utc::now().timestamp() as i32;
         run_db(update_job_worktree(
-            orch.db.local.clone(),
+            owning_db.clone(),
             job_id.to_string(),
             Some(wt_path_str.clone()),
             Some(branch.clone()),
@@ -378,7 +393,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
     // ---- Reload job (picks up worktree_path/branch updates) -------------
     let job = run_db(load_job(
-        orch.db.local.clone(),
+        owning_db.clone(),
         job_id.to_string(),
         "Job not found after worktree setup",
     ))?;
@@ -389,14 +404,14 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     let agent_config = load_agent_config(orch, &job, project_path.as_deref())?;
 
     // ---- Create session + run record --------------------------------------
-    let run_id = Uuid::new_v4().to_string();
+    let run_id = ids::mint_child(job_id);
     let now = chrono::Utc::now().timestamp() as i32;
     let status_str = RunStatus::Starting.to_string();
 
     // Ensure a Session record exists for this job and derive the first-start mode.
     let had_current_session = job.current_session_id.is_some();
     let (session_id, session_start, run_start_mode) = run_db(prepare_session(
-        orch.db.local.clone(),
+        owning_db.clone(),
         job_id.to_string(),
         job.clone(),
         now,
@@ -421,7 +436,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     }
 
     let existing_active_count = run_db(insert_run(
-        orch.db.local.clone(),
+        owning_db.clone(),
         RunInsert {
             run_id: run_id.clone(),
             issue_id: job.issue_id.clone(),
@@ -445,31 +460,18 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         );
     }
 
-    orch.sync(SyncMessage::Run(crate::sync::SyncRun {
-        id: run_id.clone(),
-        job_id: Some(job_id.to_string()),
-        issue_id: job.issue_id.clone(),
-        status: Some(status_str.clone()),
-        exit_reason: None,
-        error_message: None,
-        started_at: Some(now as i64),
-        exited_at: None,
-        created_at: Some(now as i64),
-    }));
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "runs", "action": "insert", "runId": run_id.as_str(), "jobId": job_id}),
     );
 
     // ---- Create initial turn ------------------------------------------------
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = ids::mint_child(job_id);
     create_initial_turn(orch, &turn_id, &session_id, job_id)?;
 
     // ---- Resolve inputs + build prompt ----------------------------------
-    let (resolved_inputs, artifact_schema_info) = run_db(resolve_inputs_and_schema(
-        orch.db.local.clone(),
-        job.clone(),
-    ))?;
+    let (resolved_inputs, artifact_schema_info) =
+        run_db(resolve_inputs_and_schema(owning_db.clone(), job.clone()))?;
 
     let prompt = format_resolved_inputs(&resolved_inputs);
 
@@ -537,9 +539,21 @@ pub fn continue_job_impl(
     identity_override: Option<crate::identity::UserIdentity>,
     prompt_resume: Option<ResumeContext>,
 ) -> Result<Run, String> {
+    // Resolve the job's owning database ONCE (fail-closed): a team job resumes
+    // against its synced replica, never the private DB.
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+
     // ---- Load job -------------------------------------------------------
     let (job, project_id, issue_id, project_path) =
-        run_db(load_job_context(orch.db.local.clone(), job_id.to_string()))?;
+        run_db(load_job_context(owning_db.clone(), job_id.to_string()))?;
 
     let current_session_id = job.current_session_id.as_ref().ok_or_else(|| {
         if job.status == "blocked" {
@@ -602,7 +616,7 @@ pub fn continue_job_impl(
     // fresh session on the new backend rather than resuming with a wrong handle.
     // This runs before the warm/cold split, so it covers cold continues too.
     let (session_id, session_start, run_start_mode) = match run_db(load_session_optional(
-        orch.db.local.clone(),
+        owning_db.clone(),
         current_session_id.clone(),
     ))? {
         Some(session) => match session.status {
@@ -613,7 +627,7 @@ pub fn continue_job_impl(
                 // orphaned. A backend rotation below also produces a fresh
                 // session, so consuming the flag here is correct either way.
                 let needs_fresh_session = run_db(take_needs_fresh_session(
-                    orch.db.local.clone(),
+                    owning_db.clone(),
                     job_id.to_string(),
                 ))?;
                 match desired_backend
@@ -634,7 +648,7 @@ pub fn continue_job_impl(
                             job_id
                         );
                         let new_session = run_db({
-                            let db = orch.db.local.clone();
+                            let db = owning_db.clone();
                             let session = session.clone();
                             let job_id = job_id.to_string();
                             let want = want.to_string();
@@ -668,7 +682,7 @@ pub fn continue_job_impl(
                             job_id
                         );
                         let new_session = run_db({
-                            let db = orch.db.local.clone();
+                            let db = owning_db.clone();
                             let session = session.clone();
                             let job_id = job_id.to_string();
                             async move {
@@ -757,10 +771,10 @@ pub fn continue_job_impl(
         );
         (existing_id, true)
     } else {
-        let new_run_id = Uuid::new_v4().to_string();
+        let new_run_id = ids::mint_child(job_id);
         let status_str = RunStatus::Starting.to_string();
         run_db(insert_run(
-            orch.db.local.clone(),
+            owning_db.clone(),
             RunInsert {
                 run_id: new_run_id.clone(),
                 issue_id: issue_id.clone(),
@@ -775,17 +789,6 @@ pub fn continue_job_impl(
                 warn_existing_active: false,
             },
         ))?;
-        orch.sync(SyncMessage::Run(crate::sync::SyncRun {
-            id: new_run_id.clone(),
-            job_id: Some(job_id.to_string()),
-            issue_id: issue_id.clone(),
-            status: Some(status_str),
-            exit_reason: None,
-            error_message: None,
-            started_at: None,
-            exited_at: None,
-            created_at: Some(now as i64),
-        }));
         let _ = orch.services.emitter.emit(
             "db-change",
             serde_json::json!({"table": "runs", "action": "insert", "runId": new_run_id.as_str(), "jobId": job_id}),
@@ -804,7 +807,7 @@ pub fn continue_job_impl(
 
     // ---- Artifact schema ------------------------------------------------
     let artifact_schema_info = run_db(find_job_downstream_artifact_schema(
-        orch.db.local.clone(),
+        owning_db.clone(),
         job.clone(),
     ))?;
 
@@ -812,7 +815,7 @@ pub fn continue_job_impl(
     // and any `steer` row that never reached a tool boundary). They are
     // delivered on this resume — covering the turn-end flush and the resume that
     // follows answering a question/permission prompt.
-    let queued_messages = match crate::messages::queued::claim_all_for_job(&orch.db.local, job_id) {
+    let queued_messages = match crate::messages::queued::claim_all_for_job(&owning_db, job_id) {
         Ok(msgs) => msgs,
         Err(error) => {
             log::warn!(
@@ -835,7 +838,7 @@ pub fn continue_job_impl(
     // already resolved is skipped. They are stamped delivered atomically with
     // their carrying event, persisted below once the prompt is assembled.
     let drained_pushes = {
-        let db = orch.db.local.clone();
+        let db = owning_db.clone();
         let recipient = job_id.to_string();
         run_db(async move {
             crate::orchestrator::attention_push::list_pending_live(&db, &recipient)
@@ -883,10 +886,8 @@ pub fn continue_job_impl(
     };
     let base_prompt = resolve_skill_slash_command(orch, &user_message, project_path.as_deref());
     let side_channel_notices =
-        match crate::messages::side_channel::claim_pending_side_channel_for_job(
-            &orch.db.local,
-            job_id,
-        ) {
+        match crate::messages::side_channel::claim_pending_side_channel_for_job(&owning_db, job_id)
+        {
             Ok(notices) => notices,
             Err(error) => {
                 log::warn!(
@@ -922,7 +923,20 @@ pub fn continue_job_impl(
     } else {
         Some(crate::messages::transcript::render_side_channel_prompt_block(&side_channel_notices))
     };
+    // A durable self-suspend resume injects the awaited result as the suspended
+    // tool call's synthetic `tool_result` (this is exactly when
+    // `suppress_user_event` is set). From the agent's side that call looks
+    // interrupted mid-execution and then returns fine, which is disconcerting;
+    // lead the forwarded prompt with a short note that names the pause as
+    // deliberate. The note rides only in the live prompt, never a stored event,
+    // so it frames this turn without cluttering the transcript.
+    let suppress_user_event = prompt_resume
+        .as_ref()
+        .map(|ctx| ctx.suppress_user_event)
+        .unwrap_or(false);
+    let resume_note = suppress_user_event.then_some(RESUME_AFTER_SELF_SUSPEND_NOTE);
     let prompt = assemble_resume_prompt(
+        resume_note,
         queued_block,
         &base_prompt,
         side_channel_block,
@@ -938,10 +952,9 @@ pub fn continue_job_impl(
     // originating Question call's synthetic tool_result, so a separate "You"
     // block would duplicate it. The message is still forwarded to the agent
     // below for the model's context.
-    let suppress_user_event = prompt_resume
-        .as_ref()
-        .map(|ctx| ctx.suppress_user_event)
-        .unwrap_or(false);
+    //
+    // `suppress_user_event` was resolved above (it also gates the resume note);
+    // reuse it here.
     // Skip the default "You" event when the user supplied no explicit message and
     // the content is carried entirely by queued follow-ups (stored individually
     // below) — storing the empty placeholder would render a blank You block.
@@ -1001,6 +1014,22 @@ pub fn continue_job_impl(
 
     // ---- Warm process or new session ------------------------------------
     if is_process_reuse {
+        // Establish the turn FULLY before waking the agent (CAIRN-2123). A warm
+        // agent commonly fires a tool call the instant it resumes; if the wake
+        // (`send_user_message`) preceded turn establishment, that call could
+        // land in the `Busy`-without-turn window and capture a NULL turn for any
+        // worktree-fence crossing it raised — durably parking the run with no
+        // way to resume it. Ordering occupancy (`transition_to_active` then
+        // `ServingTurn` via `begin_turn`) and the persisted DB turn
+        // (`start_turn` writes `jobs.current_turn_id`) ahead of the wake closes
+        // that window: a tool call produced on resume always observes
+        // `ServingTurn(turn)`, never `Busy`.
+        orch.process_state.transition_to_active(&run_id);
+        let _ = start_turn(orch, &turn_id, &run_id);
+        orch.process_state
+            .set_current_turn_id(&run_id, Some(&turn_id));
+
+        // Run stays Live — no durable status change for warm reuse.
         crate::backends::stdin::send_user_message(
             &orch.process_state,
             &run_id,
@@ -1009,10 +1038,6 @@ pub fn continue_job_impl(
             None,
             Some(&worktree_path),
         )?;
-
-        // Run stays Live — no durable status change for warm reuse.
-        // Process occupancy changes to ServingTurn via begin_turn.
-        orch.process_state.transition_to_active(&run_id);
     } else {
         crate::orchestrator::session::start_agent_session(
             orch,
@@ -1028,25 +1053,40 @@ pub fn continue_job_impl(
             job.execution_id.as_deref(),
             identity_override,
         )?;
-    }
 
-    // ---- Start the successor turn and attach to process -------------------
-    let _ = start_turn(orch, &turn_id, &run_id);
-    orch.process_state
-        .set_current_turn_id(&run_id, Some(&turn_id));
+        // The new session's process handle now exists, so establish the turn on
+        // it. `start_agent_session` spawns the CLI and returns before the MCP
+        // handshake completes, so the first tool call cannot arrive until after
+        // this point — the turn is always established before the session emits a
+        // crossing. (`set_current_turn_id` needs the handle to exist, which is
+        // why this follows the spawn rather than preceding it.)
+        let _ = start_turn(orch, &turn_id, &run_id);
+        orch.process_state
+            .set_current_turn_id(&run_id, Some(&turn_id));
+    }
 
     // ---- Return run -----------------------------------------------------
     let run = run_db(load_run(
-        orch.db.local.clone(),
+        owning_db.clone(),
         run_id.clone(),
         "Run not found after creation",
     ))?;
     Ok(run)
 }
 
+/// Short note that leads the forwarded prompt on a durable self-suspend resume.
+///
+/// On the slow (>45s) path the awaited result is delivered as the suspended tool
+/// call's synthetic `tool_result`, so to the resumed agent that call looks
+/// interrupted mid-execution and then returns — a deliberate pause that reads
+/// like a glitch. Naming it as an intentional suspend up front removes that
+/// tension (CAIRN-2173).
+const RESUME_AFTER_SELF_SUSPEND_NOTE: &str = "Resuming after an intentional self-suspend. Your run paused itself to wait on delegated work (a sub-agent task or a user question) and resumed now that the work finished — the earlier tool call was suspended on purpose, not interrupted or errored, and its result follows.";
+
 /// Assemble a resume prompt so notes that accumulated before this wake lead and
 /// the immediate resume message follows them.
 ///
+/// A `resume_note` (the self-suspend frame) leads everything when present.
 /// Queued user follow-ups — including `passive` "quiet" notes that rode along
 /// without waking the agent — were authored before the message that triggers
 /// this resume, so they precede `base_prompt`. A quiet note "A" sent before a
@@ -1056,12 +1096,18 @@ pub fn continue_job_impl(
 /// message. Falls back to the generic continue placeholder when every part is
 /// empty.
 fn assemble_resume_prompt(
+    resume_note: Option<&str>,
     queued_block: Option<String>,
     base_prompt: &str,
     side_channel_block: Option<String>,
     push_prompt: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
+    if let Some(note) = resume_note {
+        if !note.is_empty() {
+            parts.push(note.to_string());
+        }
+    }
     if let Some(q) = queued_block {
         if !q.is_empty() {
             parts.push(q);
@@ -1257,8 +1303,16 @@ pub(super) fn reconcile_stale_active_turn_for_continue(
         return Ok(false);
     }
 
-    let Some(active) = load_active_turn_for_continue(orch.db.local.clone(), job_id.to_string())?
-    else {
+    let owning_db = run_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let Some(active) = load_active_turn_for_continue(owning_db.clone(), job_id.to_string())? else {
         return Ok(false);
     };
 
@@ -1274,7 +1328,7 @@ pub(super) fn reconcile_stale_active_turn_for_continue(
     let turn_id = active.turn_id.clone();
     let run_id = active.run_id.clone();
     let state = active.state.clone();
-    mark_stale_active_turn_for_continue(orch.db.local.clone(), active)?;
+    mark_stale_active_turn_for_continue(owning_db.clone(), active)?;
     log::warn!(
         "Recovered stale {} turn {} for job {} before continue",
         state,
@@ -1313,31 +1367,31 @@ mod tests {
     fn passive_note_precedes_immediate_resume_message() {
         // A quiet note "A" queued before a waking message "B" must deliver as
         // "A then B", matching send order — not reversed.
-        let prompt = assemble_resume_prompt(Some("A".to_string()), "B", None, None);
+        let prompt = assemble_resume_prompt(None, Some("A".to_string()), "B", None, None);
         assert_eq!(prompt, "A\n\nB");
     }
 
     #[test]
     fn multiple_queued_notes_keep_order_before_message() {
-        let prompt = assemble_resume_prompt(Some("A1\n\nA2".to_string()), "B", None, None);
+        let prompt = assemble_resume_prompt(None, Some("A1\n\nA2".to_string()), "B", None, None);
         assert_eq!(prompt, "A1\n\nA2\n\nB");
     }
 
     #[test]
     fn resume_prompt_without_queued_is_just_the_message() {
-        let prompt = assemble_resume_prompt(None, "B", None, None);
+        let prompt = assemble_resume_prompt(None, None, "B", None, None);
         assert_eq!(prompt, "B");
     }
 
     #[test]
     fn queued_only_resume_has_no_placeholder() {
-        let prompt = assemble_resume_prompt(Some("A".to_string()), "", None, None);
+        let prompt = assemble_resume_prompt(None, Some("A".to_string()), "", None, None);
         assert_eq!(prompt, "A");
     }
 
     #[test]
     fn empty_resume_falls_back_to_placeholder() {
-        let prompt = assemble_resume_prompt(None, "", None, None);
+        let prompt = assemble_resume_prompt(None, None, "", None, None);
         assert_eq!(prompt, "Continue where you left off.");
     }
 
@@ -1347,12 +1401,35 @@ mod tests {
         // resolved attention pushes, follow — the established position for those
         // blocks.
         let prompt = assemble_resume_prompt(
+            None,
             Some("A".to_string()),
             "B",
             Some("side".to_string()),
             Some("push"),
         );
         assert_eq!(prompt, "A\n\nB\n\nside\n\npush");
+    }
+
+    #[test]
+    fn self_suspend_note_leads_the_resume_prompt() {
+        // On a durable self-suspend resume the note frames the whole turn, so it
+        // leads even queued notes — the agent reads "this pause was deliberate"
+        // before the awaited result that follows.
+        let prompt = assemble_resume_prompt(
+            Some("NOTE"),
+            Some("A".to_string()),
+            "B",
+            Some("side".to_string()),
+            Some("push"),
+        );
+        assert_eq!(prompt, "NOTE\n\nA\n\nB\n\nside\n\npush");
+    }
+
+    #[test]
+    fn absent_self_suspend_note_is_omitted() {
+        // A normal (non-suspended) resume passes no note and is unchanged.
+        let prompt = assemble_resume_prompt(None, None, "B", None, None);
+        assert_eq!(prompt, "B");
     }
 
     /// Register a warm process with a recorded model and backend. The stdin is an

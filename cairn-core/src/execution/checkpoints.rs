@@ -6,7 +6,7 @@
 //! These are internal helpers called from advancement logic.
 //! The Tauri layer wraps these as `#[tauri::command]` functions.
 
-use uuid::Uuid;
+use cairn_common::ids;
 
 use crate::db_records::{db_job_from_row, DbJob, JOB_COLUMNS};
 use crate::models::{Artifact, Job};
@@ -18,12 +18,12 @@ use turso::params;
 /// Marks the job as complete, then advances the DAG.
 /// Returns the list of newly ready agent jobs after advancement.
 pub async fn approve_job_inner(orch: &Orchestrator, job_id: &str) -> Result<Vec<Job>, String> {
-    validate_confirmable(orch.db.local.as_ref(), job_id).await?;
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id).await?;
+    validate_confirmable(db.as_ref(), job_id).await?;
 
     // Record the resolution fact (artifact.confirmed), then let the projection
     // derive Complete and advance the DAG. Agent jobs from the resulting
     // AdvanceDag are started by the executor directly.
-    let db = orch.db.local.clone();
     let job_id_owned = job_id.to_string();
     let artifact = db
         .write(|conn| {
@@ -40,7 +40,15 @@ pub async fn approve_job_inner(orch: &Orchestrator, job_id: &str) -> Result<Vec<
 /// Confirm a job's resolution (artifact.confirmed) and recompute its status.
 /// Public orchestrator-level entry for hosts that approve/complete a job.
 pub fn confirm_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = crate::execution::advancement::run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let job_id_owned = job_id.to_string();
     let artifact = crate::execution::advancement::run_advancement_db(async move {
         db.write(|conn| {
@@ -165,7 +173,7 @@ pub(crate) async fn confirm_latest_artifact_conn(
             Ok(artifact)
         }
         None => {
-            let artifact_id = Uuid::new_v4().to_string();
+            let artifact_id = ids::mint_child(job_id);
             conn.execute(
                 "INSERT INTO artifacts (id, job_id, artifact_type, schema_version, data, version,
                                         created_at, updated_at, confirmed)
@@ -238,7 +246,7 @@ pub(crate) async fn ensure_checkpoint_artifact_conn(
     };
     if !exists {
         let now = chrono::Utc::now().timestamp() as i32;
-        let artifact_id = Uuid::new_v4().to_string();
+        let artifact_id = ids::mint_child(job_id);
         conn.execute(
             "INSERT INTO artifacts (id, job_id, artifact_type, schema_version, data, version,
                                     created_at, updated_at, confirmed)

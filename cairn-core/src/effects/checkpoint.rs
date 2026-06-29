@@ -11,7 +11,17 @@ use super::types::WorkflowEffect;
 /// Confirm the checkpoint's resolution; the projection derives Complete and
 /// advances the DAG. A passing programmatic check confirms via this path.
 pub fn approve_job_pure(orch: &Orchestrator, job_id: &str) -> Result<Vec<WorkflowEffect>, String> {
-    let db = orch.db.local.clone();
+    // Confirm the checkpoint artifact in the job's OWNING database (CAIRN-2197):
+    // a team job's artifact rows live in the synced replica, not the private DB.
+    let db = crate::execution::advancement::run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let job_id_owned = job_id.to_string();
     crate::execution::advancement::run_advancement_db(async move {
         db.write(|conn| {

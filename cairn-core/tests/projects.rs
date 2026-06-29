@@ -24,8 +24,7 @@ fn create_input(id: &str, name: &str, key: &str, repo_path: &str) -> CreateProje
         name: name.to_string(),
         key: key.to_string(),
         repo_path: repo_path.to_string(),
-        remote_url: None,
-        server_id: None,
+        team_id: None,
     }
 }
 

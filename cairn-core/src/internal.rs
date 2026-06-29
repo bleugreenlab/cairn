@@ -123,10 +123,6 @@ pub mod storage {
     pub use crate::storage::*;
 }
 
-pub mod sync {
-    pub use crate::sync::*;
-}
-
 pub mod workspace {
     pub use crate::workspace::*;
 }

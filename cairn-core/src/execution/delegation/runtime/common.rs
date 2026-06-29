@@ -5,7 +5,7 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
-use uuid::Uuid;
+use cairn_common::ids;
 
 use crate::execution::delegation::{
     create_or_reuse_task_packet, CreateDelegatedPacketInput, DelegatedTaskPayload,
@@ -321,8 +321,9 @@ pub(super) async fn ensure_task_execution_context(
         return Ok(execution_id.clone());
     }
 
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id).await?;
     let existing_execution_id = select_optional_text(
-        &orch.db.local,
+        &db,
         "SELECT execution_id FROM jobs WHERE id = ?1",
         &parent_ctx.job_id,
     )
@@ -359,13 +360,13 @@ pub(super) async fn ensure_task_execution_context(
     let snapshot_json = snapshot.to_json()?;
 
     let seq = match parent_ctx.issue_id.as_deref() {
-        Some(issue_id) => Some(next_execution_seq(&orch.db.local, issue_id).await?),
+        Some(issue_id) => Some(next_execution_seq(&db, issue_id).await?),
         None => None,
     };
 
-    let execution_id = Uuid::new_v4().to_string();
+    let execution_id = ids::mint_child(&parent_ctx.job_id);
     insert_synthetic_execution(
-        &orch.db.local,
+        &db,
         &execution_id,
         &snapshot.recipe.id,
         parent_ctx,
@@ -378,6 +379,7 @@ pub(super) async fn ensure_task_execution_context(
     Ok(execution_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn persist_task_packet(
     orch: &Orchestrator,
     execution_id: &str,
@@ -386,14 +388,16 @@ pub(super) async fn persist_task_packet(
     agent_config: &AgentConfig,
     cwd: &str,
     parent_tool_use_id: Option<&str>,
+    background: bool,
 ) -> Result<crate::models::DelegatedWorkPacket, String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
     // Serialize snapshot read-modify-write per execution to prevent concurrent
     // batch_tasks calls from overwriting each other's packets.
     let lock = orch.execution_lock(execution_id);
     let _guard = lock.lock().await;
 
     let snapshot_json = select_optional_text(
-        &orch.db.local,
+        &db,
         "SELECT snapshot FROM executions WHERE id = ?1",
         execution_id,
     )
@@ -404,7 +408,7 @@ pub(super) async fn persist_task_packet(
         .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
 
     let parent_turn_id = match select_optional_text(
-        &orch.db.local,
+        &db,
         "SELECT current_turn_id FROM jobs WHERE id = ?1",
         &parent_ctx.job_id,
     )
@@ -414,11 +418,11 @@ pub(super) async fn persist_task_packet(
     {
         // Anchor the packet on the parent's real executing turn so concurrent
         // task spawns coalesce onto one delegated wait instead of chaining.
-        Some(current) => resolve_delegated_wait_anchor(&orch.db.local, &current).await,
+        Some(current) => resolve_delegated_wait_anchor(&db, &current).await,
         None => None,
     };
     let parent_backend = select_optional_text(
-        &orch.db.local,
+        &db,
         "SELECT model FROM jobs WHERE id = ?1",
         &parent_ctx.job_id,
     )
@@ -450,12 +454,13 @@ pub(super) async fn persist_task_packet(
             task_index: payload.task_index,
             tier_override: payload.tier.as_deref(),
             backend_preference: payload.backend_preference.as_deref().or(parent_backend),
+            background,
         },
     );
 
     let snapshot_json = serde_json::to_string(&snapshot)
         .map_err(|e| format!("Failed to serialize execution snapshot: {}", e))?;
-    update_execution_snapshot(&orch.db.local, execution_id, snapshot_json)
+    update_execution_snapshot(&db, execution_id, snapshot_json)
         .await
         .map_err(|e| format!("Failed to persist delegated packet: {}", e))?;
 
@@ -635,6 +640,10 @@ pub(super) async fn refresh_packet_state(
         let next_status = match job_status.as_deref() {
             Some("complete") => DelegatedStatus::Completed,
             Some("failed") => DelegatedStatus::Failed,
+            // A cancelled child is terminal; without this it would stay at its
+            // prior non-terminal packet status and never satisfy the resume gate
+            // or the background completion wake.
+            Some("cancelled") => DelegatedStatus::Cancelled,
             Some("running") => DelegatedStatus::Running,
             Some("pending") => DelegatedStatus::Materialized,
             _ if matches!(run_status.as_deref(), Some("live") | Some("starting")) => {
@@ -666,10 +675,11 @@ pub(super) async fn wait_for_packet_run_materialization(
     execution_id: &str,
     packet_id: &str,
 ) -> Result<(crate::models::DelegatedWorkPacket, String, String), String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
     loop {
-        let lookup = lookup_packet_run(&orch.db.local, execution_id, packet_id).await?;
+        let lookup = lookup_packet_run(&db, execution_id, packet_id).await?;
 
         if let Some(result) = lookup {
             return Ok(result);

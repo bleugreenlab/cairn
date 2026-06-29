@@ -28,7 +28,8 @@ pub async fn update_execution_agent(
     agent_id: &str,
     agent_snapshot: AgentSnapshot,
 ) -> Result<(), String> {
-    let db: &LocalDb = &orch.db.local;
+    let owning = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
+    let db: &LocalDb = owning.as_ref();
 
     let snapshot_json = load_execution_snapshot_json(db, execution_id)
         .await?
@@ -117,7 +118,10 @@ async fn propagate_agent_changes_to_processes(
         return;
     }
 
-    let job_sessions = match load_agent_job_sessions(&orch.db.local, execution_id, agent_id).await {
+    let owning = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
+    let job_sessions = match load_agent_job_sessions(&owning, execution_id, agent_id).await {
         Ok(rows) => rows,
         Err(e) => {
             log::warn!("Failed to query jobs for agent propagation: {e}");

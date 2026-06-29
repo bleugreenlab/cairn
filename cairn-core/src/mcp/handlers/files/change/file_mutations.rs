@@ -289,9 +289,18 @@ pub(super) struct FileBatchSuccess {
 /// seal error string so the giveup path can report what went wrong. Only the
 /// write+commit_msg path can recover (the handler can re-derive its intended
 /// content); the run path can't, so it reverts via the stale-resilient discard.
+///
+/// `ConflictedBranch` is the divergent-seal refusal: the branch bookmark tip
+/// carries a recorded CONFLICT and `@` has diverged from it (a deliberate
+/// resolve-at-base flatten). It is NEITHER `Done` nor `StaleRetry` — the edits
+/// must be PRESERVED on disk (discarding destroys the resolved flatten) and the
+/// update-stale → re-apply → re-seal loop can never converge (the workspace is
+/// not stale). `handle_change` surfaces a typed error pointing at the flatten
+/// procedure instead of discarding or retrying.
 pub(super) enum CommitOutcome {
     Done(Option<CommitReport>),
     StaleRetry { seal_error: String },
+    ConflictedBranch { seal_error: String },
 }
 
 pub(super) struct RecordFileChange {
@@ -1341,6 +1350,16 @@ pub(super) async fn finalize_file_commit(
                 pr_number: result.pr_number,
                 message: None,
             })))
+        }
+        Err(e) if crate::jj::is_conflicted_branch_seal_error(&e) => {
+            // The branch bookmark tip carries a recorded conflict and `@` has
+            // diverged from it (a deliberate resolve-at-base flatten). Do NOT
+            // discard — `@` holds the agent's resolved work the discard would
+            // destroy — and do NOT StaleRetry: the update-stale → re-apply →
+            // re-seal loop can never converge because the workspace is not stale.
+            // Hand the typed outcome up so `handle_change` preserves the on-disk
+            // edits and surfaces the flatten guidance.
+            Ok(CommitOutcome::ConflictedBranch { seal_error: e })
         }
         Err(e) if crate::jj::is_stale_error(&e) || crate::jj::is_lost_seal_error(&e) => {
             // A sibling advanced `@` over the shared store between apply and seal,

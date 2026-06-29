@@ -4,28 +4,6 @@ pub(super) fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
 }
 
-pub(super) fn run_from_row(row: &turso::Row) -> DbResult<Run> {
-    Ok(Run {
-        id: row.text(0)?,
-        issue_id: row.opt_text(1)?,
-        project_id: row.opt_text(2)?,
-        job_id: row.opt_text(3)?,
-        status: row
-            .opt_text(4)?
-            .and_then(|status| status.parse().ok())
-            .unwrap_or(RunStatus::Starting),
-        session_id: row.opt_text(5)?,
-        chat_id: row.opt_text(11)?,
-        exit_reason: row.opt_text(12)?,
-        error_message: row.opt_text(6)?,
-        started_at: row.opt_i64(7)?,
-        exited_at: row.opt_i64(8)?,
-        created_at: row.i64(9)?,
-        updated_at: row.i64(10)?,
-        start_mode: row.opt_text(13)?.and_then(|mode| mode.parse().ok()),
-    })
-}
-
 pub(super) fn session_from_row(row: &turso::Row) -> DbResult<Session> {
     Ok(Session {
         id: row.text(0)?,
@@ -588,7 +566,7 @@ pub(super) async fn prepare_session(
                 let session_id = if let Some(sid) = job.current_session_id.as_deref() {
                     sid.to_string()
                 } else {
-                    let session_id = Uuid::new_v4().to_string();
+                    let session_id = ids::mint_session_id().into_string();
                     insert_session_conn(
                         conn,
                         &session_id,
@@ -1077,5 +1055,65 @@ mod pack_anchor_tests {
         let (base_commit, c_anchor) = job_anchors(&db, "job-c").await;
         assert_eq!(base_commit.as_deref(), Some(CHILD_SHA));
         assert_eq!(c_anchor.as_deref(), Some(ROOT_SHA));
+    }
+}
+
+#[cfg(test)]
+mod load_run_tests {
+    use super::*;
+    use crate::models::RunStartMode;
+    use crate::storage::migrated_test_db;
+
+    /// Regression for CAIRN-2230: `load_run` builds `SELECT {RUN_COLUMNS} FROM
+    /// runs` from the canonical run projection. Migration 0081 dropped
+    /// `runs.backend`, but a duplicate column list still named it, so the SELECT
+    /// failed to parse against the real post-0081 schema ("no such column:
+    /// backend") and surfaced on the resume/creation path as "Run not found
+    /// after creation". This drives the real `load_run` against a fully-migrated
+    /// db so the projection MUST parse, and pins the ordinals of the columns the
+    /// drop shifted (`chat_id`, `exit_reason`, `start_mode`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_run_parses_against_post_0081_schema() {
+        let db = Arc::new(migrated_test_db("load-run-post-0081.db").await);
+        db.execute_script(
+            "
+            INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-1', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+            INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('iss-1', 'proj-1', 1, 'Issue', 'active', 1, 1);
+            INSERT INTO jobs (id, project_id, issue_id, status, created_at, updated_at)
+             VALUES ('job-1', 'proj-1', 'iss-1', 'running', 1, 1);
+            INSERT INTO runs (
+                id, issue_id, project_id, job_id, status, session_id,
+                error_message, started_at, exited_at, created_at, updated_at,
+                chat_id, exit_reason, start_mode
+            )
+            VALUES (
+                'run-1', 'iss-1', 'proj-1', 'job-1', 'live', 'sess-1',
+                NULL, 10, NULL, 1, 2,
+                'chat-1', 'completed', 'resume'
+            );
+            ",
+        )
+        .await
+        .unwrap();
+
+        let run = load_run(db, "run-1".to_string(), "load run")
+            .await
+            .expect("load_run must parse the post-0081 runs projection");
+
+        assert_eq!(run.id, "run-1");
+        assert_eq!(run.issue_id.as_deref(), Some("iss-1"));
+        assert_eq!(run.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(run.job_id.as_deref(), Some("job-1"));
+        assert_eq!(run.status, RunStatus::Live);
+        assert_eq!(run.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(run.started_at, Some(10));
+        assert_eq!(run.created_at, 1);
+        assert_eq!(run.updated_at, 2);
+        // Columns whose ordinals the dropped `backend` column would have shifted.
+        assert_eq!(run.chat_id.as_deref(), Some("chat-1"));
+        assert_eq!(run.exit_reason.as_deref(), Some("completed"));
+        assert_eq!(run.start_mode, Some(RunStartMode::Resume));
     }
 }

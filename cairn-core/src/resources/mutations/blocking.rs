@@ -196,8 +196,21 @@ async fn run_tasks_group(
     // decide routing. The CLI rewrites `cairn:~/tasks` to the caller's full node
     // URI before dispatch, so every item arrives as an explicit `NodeTasks` URI —
     // including self-targeted ones, which resolve back to `caller_job_id`.
+    // A team run's job/run rows live in its replica (CAIRN-2182): resolve the
+    // caller's owning DB by run id so `lookup_caller_job_id` and the target-node
+    // lookups read the database the rows actually live in. Without a run id the
+    // cwd path stays on the private DB.
+    let routing_db = match request.run_id.as_deref() {
+        Some(run_id) => {
+            match crate::execution::routing::routing_db_for_id(&orch.db, run_id).await {
+                Ok(db) => db,
+                Err(e) => return format!("Failed to resolve caller node for task spawn: {e}"),
+            }
+        }
+        None => orch.db.local.clone(),
+    };
     let routing = match resolve_task_routing(
-        &orch.db.local,
+        &routing_db,
         request.run_id.as_deref(),
         &request.cwd,
         &coords,

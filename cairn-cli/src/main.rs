@@ -327,7 +327,7 @@ impl schemars::JsonSchema for ChangeInput {
 /// Input for the always-array read tool.
 ///
 /// `paths` is a non-empty list of self-contained target URIs. All per-target
-/// scoping (`offset`, `limit`, `glob`, `grep`, `issue_history`) rides in each
+/// scoping (`offset`, `limit`, `glob`, `grep`, `issue_history`, `branch`) rides in each
 /// URI's query string (e.g. `file:x.rs?offset=10&limit=20`,
 /// `cairn://p/CAIRN/123/changed?grep=foo`). There is no top-level offset/limit:
 /// they are meaningless across N targets, and query-string scoping is the one
@@ -379,13 +379,18 @@ struct RunInput {
     /// Commit message for successful worktree-bound batches that dirty the tree.
     /// Stages all changes and commits once after success. Use "^" to amend the
     /// previous commit. Without a commit_msg, a batch that dirties the worktree
-    /// is restored to HEAD.
+    /// is restored to HEAD. Cannot be combined with branch.
     #[serde(
         rename = "commit_msg",
         default,
         skip_serializing_if = "Option::is_none"
     )]
     commit_msg: Option<String>,
+    /// Branch/ref whose live checkout should be used as the batch cwd. Cannot be
+    /// combined with commit_msg; refuses dirty checkouts and warns if tracked
+    /// changes appear during the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
 }
 
 /// A single run item: exactly one of `command` (shell) or `target` (skill script).
@@ -1060,11 +1065,11 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
 
 Targets (mix freely within one call):
 - File: `file:` (worktree root), `file:src/lib.rs` (worktree-relative), `file:/abs/path` (absolute / global)
-- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` plus collections `/issues`, `/messages`, `/changed`. `cairn:~/...` resolves against the run home.
+- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` plus collections `/issues`, `/messages`, `/changed`, `/references`, and `/references/NAME`. `cairn:~/...` resolves against the run home.
 - Web/PDF: `http(s)://...` URLs and local `.pdf` paths return markdown via the active web-fetch provider (raw capped markdown; no extraction prompt). The default built-in provider is a plain HTTP fetch (HTML→markdown); PDF extraction needs a configured provider such as `bmd`. Providers are configured in Settings → Web Services.
 
 Per-target scoping rides in each URI's query string — append `?key=value&...`:
-- Files: `offset=N` skips N leading lines (0-based — line N is at `offset N−1`); `limit=N` returns N lines; `offset=-N` returns the last N lines (tail). `glob=PATTERN` selects matched files (`output_mode=files_with_matches|content|count`; a directory grep defaults to `files_with_matches`, a single-file grep to `content`). `issue_history=true|verbose` appends issues that touched the file.
+- Files: `offset=N` skips N leading lines (0-based — line N is at `offset N−1`); `limit=N` returns N lines; `offset=-N` returns the last N lines (tail). `branch=REF` reads file content from a jj-resolved bookmark, commit/change id, or node URI without checking out that branch; it is per-target only and applies only to `file:` targets. `glob=PATTERN` selects matched files (`output_mode=files_with_matches|content|count`; a directory grep defaults to `files_with_matches`, a single-file grep to `content`). `issue_history=true|verbose` appends issues that touched the file.
 - Grep is universal: `grep=REGEX` matches over ANY target's rendered text. A file tree greps with ripgrep and labels each line `path:N:text`; a single file or any rendered resource/web body greps in memory and drops the path prefix (`N:text`). Modifiers: `-i` (case-insensitive), `-A=N`/`-B=N`/`-C=N`/`context=N` (context lines), `head_limit=N` to cap matches (`limit=N` aliases it under grep). `offset` is NOT allowed with grep — paginate matches with `head_limit`. The header suffix counts real matches: `[N matches]` for one body, `[N matches in M files]` for a tree.
 - Structural code: `ast=PATTERN` runs an ast-grep pattern over any file/dir target and renders the same `path:N:line` rows as grep (composes with `glob`). A pattern is real code with metavariables — `$VAR` matches one node, `$$$` a run — e.g. `ast=fn $NAME($$$) { $$$ }` (Rust) or `ast=console.log($$$)` (TS); it is NOT a tree-sitter node-kind name like `function_declaration`. `outline` (bare flag) renders a file/dir signature skeleton. Symbol navigation lives on the `symbols` resource: `cairn://p/PROJECT/NUMBER/EXEC/NODE/symbols/{name}?op=definition|references|callers|implementations` (node-scoped) or `cairn://p/PROJECT/symbols/{name}` (project-checkout fallback); absent `op` is an overview (definition site + signature + reference count), `in=GLOB` scopes it.
 - Escaping: `&` and `+` are literal inside a value (so `grep=&mut self` and `grep=\d+` work as written); use `%26` for a literal `&` that immediately precedes a recognized key token
@@ -1140,7 +1145,7 @@ Partial failures never abort: a target that errors shows its message inline as t
     /// synchronously. Parallel by default; `sequential: true` runs in order.
     /// Long-running terminals are managed by `write` on terminal resources.
     #[tool(
-        description = "Execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is a shell `command`, a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`, or a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <command-or-target> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. Not for long-lived/background processes — use a terminal resource via `write` for those. Each item's `timeout` (ms, default 120000, max 600000) is honored by the host: when an item exceeds it, that item is terminated and its result block reports the timeout with whatever output it produced so far — the batch is never aborted with no output. Outer layers (the callback transport and the agent's own tool timeout) are sized strictly above the host budget, so a legal batch always runs to completion: sequential batches get the sum of per-item timeouts, parallel batches the max."
+        description = "Execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is a shell `command`, a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`, or a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <command-or-target> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. `branch` runs the whole batch in the live checkout holding that branch/ref (for example `main` or `agent/CAIRN-123-builder-0`); it rejects `commit_msg`, refuses to run if the target checkout has uncommitted tracked changes, leaves untracked build output as warm cache, warns and leaves tracked changes in place if any appear during the run so concurrent edits are not discarded, and errors if no live checkout exists. Not for long-lived/background processes — use a terminal resource via `write` for those. Each item's `timeout` (ms, default 120000, max 600000) is honored by the host: when an item exceeds it, that item is terminated and its result block reports the timeout with whatever output it produced so far — the batch is never aborted with no output. Outer layers (the callback transport and the agent's own tool timeout) are sized strictly above the host budget, so a legal batch always runs to completion: sequential batches get the sum of per-item timeouts, parallel batches the max."
     )]
     async fn run(&self, params: Parameters<RunInput>) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;

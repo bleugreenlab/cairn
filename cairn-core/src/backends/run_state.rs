@@ -1,7 +1,8 @@
 use crate::models::RunStatus;
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbError, RowExt};
+use crate::storage::{DbError, LocalDb, RowExt};
 use std::future::Future;
+use std::sync::Arc;
 use turso::params;
 
 pub(in crate::backends) fn run_backend_db<T, Fut>(
@@ -34,12 +35,38 @@ fn run_backend_db_future<T>(
         .block_on(future)
 }
 
-pub(in crate::backends) fn transition_run_to_live(
+/// Resolve the run's owning database ONCE at the backend session-launch
+/// boundary (CAIRN-2208). A team run's `runs` row — and the whole streaming
+/// transcript entangled with it — lives wholly in that team's synced replica,
+/// so the backend's stream/event/run-state writes must target THAT database,
+/// not the private one, or the `message_streams → runs` foreign key fails. This
+/// is the expensive async scan ([`crate::execution::routing::owning_db_for_run`]
+/// probes every open DB); callers resolve it once here and thread the returned
+/// handle through the reader/streaming hot path rather than re-resolving per
+/// event. Fail-closed: a team run whose replica is not open errors rather than
+/// silently writing the transcript into the private database. For a local run
+/// the private DB always carries the row, so this is a strict no-op.
+pub(in crate::backends) fn resolve_run_db(
     backend_name: &'static str,
     orch: &Orchestrator,
     run_id: &str,
+) -> Result<Arc<LocalDb>, String> {
+    let dbs = orch.db.clone();
+    let run_id = run_id.to_string();
+    run_backend_db(backend_name, async move {
+        crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+pub(in crate::backends) fn transition_run_to_live(
+    backend_name: &'static str,
+    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
+    run_id: &str,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = db.clone();
     let run_id = run_id.to_string();
     let emit_run_id = run_id.clone();
     let job_id = run_backend_db(backend_name, async move {
@@ -101,11 +128,11 @@ pub(in crate::backends) fn transition_run_to_live(
 
 pub(in crate::backends) fn set_session_backend_id(
     backend_name: &'static str,
-    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     session_id: &str,
     backend_id: &str,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = db.clone();
     let session_id = session_id.to_string();
     let backend_id = backend_id.to_string();
     run_backend_db(backend_name, async move {
@@ -132,10 +159,10 @@ pub(in crate::backends) fn set_session_backend_id(
 
 pub(in crate::backends) fn run_job_id(
     backend_name: &'static str,
-    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     run_id: &str,
 ) -> Option<String> {
-    let db = orch.db.local.clone();
+    let db = db.clone();
     let run_id = run_id.to_string();
     run_backend_db(backend_name, async move {
         db.read(|conn| {
@@ -166,10 +193,10 @@ pub(in crate::backends) fn run_job_id(
 
 pub(in crate::backends) fn run_status(
     backend_name: &'static str,
-    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     run_id: &str,
 ) -> Option<String> {
-    let db = orch.db.local.clone();
+    let db = db.clone();
     let run_id = run_id.to_string();
     run_backend_db(backend_name, async move {
         db.read(|conn| {
@@ -200,13 +227,13 @@ pub(in crate::backends) fn run_status(
 
 pub(in crate::backends) fn is_task_spawned_run(
     backend_name: &'static str,
-    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     run_id: &str,
 ) -> bool {
-    let db = orch.db.local.clone();
-    let Some(job_id) = run_job_id(backend_name, orch, run_id) else {
+    let Some(job_id) = run_job_id(backend_name, db, run_id) else {
         return false;
     };
+    let db = db.clone();
 
     run_backend_db(backend_name, async move {
         db.read(|conn| {

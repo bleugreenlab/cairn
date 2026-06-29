@@ -28,10 +28,10 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use crate::sync::SyncMessage;
 use crate::transcripts::stream_store::{
     get_next_sequence, insert_event, insert_event_stamping_pushes, EventInsert,
 };
+use cairn_common::ids;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -39,7 +39,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use turso::params;
-use uuid::Uuid;
 
 mod child_tasks;
 mod config_loading;
@@ -63,6 +62,9 @@ pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;
 pub use lifecycle::{continue_job_impl, on_job_complete_impl, prepare_job, ResumeContext};
 pub use slash_commands::resolve_skill_slash_command;
 pub use snapshots::store_tool_result_event_with_turn;
+// The canonical, routing-aware turn-start. Host job-start paths call this
+// instead of hand-rolling the turns UPDATE against the private DB (CAIRN-2206).
+pub use turns::start_turn;
 pub(crate) use worktrees::prepare_worktree_for_job;
 
 use config_loading::*;
@@ -71,6 +73,11 @@ use persistence::*;
 use snapshots::*;
 use status::*;
 use turns::*;
+
+// The canonical run projection and row mapper live in `runs::queries`. The job
+// persistence path (`load_run`, `create_run`) reuses them instead of keeping a
+// duplicate column list, so the `runs` projection has one source of truth.
+use crate::runs::queries::{run_from_row, RUN_COLUMNS};
 
 // ============================================================================
 // Public types

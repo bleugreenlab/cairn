@@ -76,12 +76,12 @@ fn schema_config_from_output_contract(contract: &DelegatedOutputContract) -> Sch
 
 pub(super) fn expand_delegated_packets(
     orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     execution_id: &str,
 ) -> Result<HashSet<String>, String> {
-    let mut snapshot = load_execution_snapshot(orch.db.local.clone(), execution_id)?;
-    let project_path =
-        load_project_repo_path(orch.db.local.clone(), &snapshot.trigger_context.project_id)?
-            .map(PathBuf::from);
+    let mut snapshot = load_execution_snapshot(db.clone(), execution_id)?;
+    let project_path = load_project_repo_path(db.clone(), &snapshot.trigger_context.project_id)?
+        .map(PathBuf::from);
     let pending_packet_ids: Vec<String> = snapshot
         .delegated_packets
         .iter()
@@ -227,19 +227,15 @@ pub(super) fn expand_delegated_packets(
         packet.materialized_node_ids = vec![trigger_id, context_id, agent_id];
     }
 
-    update_execution_snapshot(orch.db.local.clone(), execution_id, &snapshot)?;
+    update_execution_snapshot(db.clone(), execution_id, &snapshot)?;
 
     if new_agent_node_ids.is_empty() {
         return Ok(HashSet::new());
     }
 
-    let created_jobs = create_jobs_for_new_nodes(
-        orch.db.local.clone(),
-        execution_id,
-        &new_agent_node_ids,
-        &snapshot,
-    )?;
-    assign_delegated_job_metadata(orch, &created_jobs, &snapshot)?;
+    let created_jobs =
+        create_jobs_for_new_nodes(db.clone(), execution_id, &new_agent_node_ids, &snapshot)?;
+    assign_delegated_job_metadata(db, &created_jobs, &snapshot)?;
 
     let job_by_node: HashMap<String, String> = created_jobs
         .iter()
@@ -263,12 +259,12 @@ pub(super) fn expand_delegated_packets(
             continue;
         };
         packet.result_artifact_job_id = job_by_node.get(&agent_node_id).cloned().or_else(|| {
-            find_job_id_for_node(orch, execution_id, &agent_node_id)
+            find_job_id_for_node(db, execution_id, &agent_node_id)
                 .ok()
                 .flatten()
         });
     }
-    update_execution_snapshot(orch.db.local.clone(), execution_id, &snapshot)?;
+    update_execution_snapshot(db.clone(), execution_id, &snapshot)?;
 
     // One scoped jobs event per created delegated job (frontend dedupes).
     for job in &created_jobs {
@@ -282,11 +278,11 @@ pub(super) fn expand_delegated_packets(
 }
 
 fn find_job_id_for_node(
-    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     execution_id: &str,
     node_id: &str,
 ) -> Result<Option<String>, String> {
-    let db = orch.db.local.clone();
+    let db = db.clone();
     let execution_id = execution_id.to_string();
     let node_id = node_id.to_string();
     run_advancement_db(async move {
@@ -314,11 +310,11 @@ fn find_job_id_for_node(
 }
 
 fn assign_delegated_job_metadata(
-    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     created_jobs: &[Job],
     snapshot: &ExecutionSnapshot,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = db.clone();
     let mut ordered_jobs: Vec<Job> = created_jobs.to_vec();
     let packets = snapshot.delegated_packets.clone();
     ordered_jobs.sort_by_key(|job| {
@@ -515,6 +511,7 @@ mod tests {
             task_index: Some(7),
             tier_override: None,
             backend_preference: None,
+            background: false,
             created_at: 1,
         };
 

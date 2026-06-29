@@ -1,5 +1,6 @@
 //! Documentation operations — filesystem scanning and DB reference queries.
 
+use cairn_common::ids;
 use std::fs;
 use std::path::Path;
 use turso::params;
@@ -207,7 +208,7 @@ pub async fn attach_doc(
     issue_id: &str,
     doc_path: &str,
 ) -> Result<DocReference, String> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = ids::mint_child(issue_id);
     let issue_id = issue_id.to_string();
     let doc_path = doc_path.to_string();
     let created_at = chrono::Utc::now().timestamp_millis();

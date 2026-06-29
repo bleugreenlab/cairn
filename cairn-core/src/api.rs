@@ -43,20 +43,6 @@ impl ApiConfig {
         format!("{}/tokens/issue", self.base_url)
     }
 
-    /// WebSocket URL for remote sync.
-    pub fn ws_url(&self, device_id: &str, jwt: &str) -> String {
-        let ws_base = self
-            .base_url
-            .replace("https://", "wss://")
-            .replace("http://", "ws://");
-        format!("{}/remote/ws/{}?token={}", ws_base, device_id, jwt)
-    }
-
-    /// Remote sync HTTP endpoint.
-    pub fn sync_url(&self, path: &str) -> String {
-        format!("{}/remote/{}", self.base_url, path)
-    }
-
     /// Bug report submission endpoint.
     pub fn bug_report_url(&self) -> String {
         format!("{}/bugs/reports", self.base_url)
@@ -65,6 +51,25 @@ impl ApiConfig {
     /// Embedding gateway endpoint (Bedrock Cohere Embed v4).
     pub fn embed_url(&self) -> String {
         format!("{}/embed", self.base_url)
+    }
+
+    /// Team sync-config endpoint (GET, member-authed). Returns the broker
+    /// `syncUrl` plus bootstrap metadata, or 404/503 when not yet provisioned.
+    pub fn team_sync_config_url(&self, team_id: &str) -> String {
+        format!("{}/teams/{}/sync-config", self.base_url, team_id)
+    }
+
+    /// Team sync-token endpoint (POST, member-authed). Mints a short-lived,
+    /// member- and team-scoped token the desktop presents to the sync broker.
+    pub fn team_sync_token_url(&self, team_id: &str) -> String {
+        format!("{}/teams/{}/sync-token", self.base_url, team_id)
+    }
+
+    /// Per-team content-addressed store endpoint (PUT/GET, sync-token-authed).
+    /// The broker proxies `hash`-keyed archival bytes to/from per-team object
+    /// storage on the same auth boundary as team sync.
+    pub fn team_cas_url(&self, team_id: &str, hash: &str) -> String {
+        format!("{}/teams/{}/cas/{}", self.base_url, team_id, hash)
     }
 }
 
@@ -94,16 +99,16 @@ mod tests {
             "https://api.cairn.computer/tokens/issue"
         );
         assert_eq!(
-            config.ws_url("dev-abc", "jwt-tok"),
-            "wss://api.cairn.computer/remote/ws/dev-abc?token=jwt-tok"
-        );
-        assert_eq!(
-            config.sync_url("events"),
-            "https://api.cairn.computer/remote/events"
-        );
-        assert_eq!(
             config.bug_report_url(),
             "https://api.cairn.computer/bugs/reports"
+        );
+        assert_eq!(
+            config.team_sync_config_url("team-1"),
+            "https://api.cairn.computer/teams/team-1/sync-config"
+        );
+        assert_eq!(
+            config.team_sync_token_url("team-1"),
+            "https://api.cairn.computer/teams/team-1/sync-token"
         );
     }
 
@@ -117,10 +122,5 @@ mod tests {
             "http://localhost:3000/tokens/device/refresh"
         );
         assert_eq!(config.org_token_url(), "http://localhost:3000/tokens/issue");
-        assert_eq!(
-            config.ws_url("dev-1", "tok"),
-            "ws://localhost:3000/remote/ws/dev-1?token=tok"
-        );
-        assert_eq!(config.sync_url("sync"), "http://localhost:3000/remote/sync");
     }
 }

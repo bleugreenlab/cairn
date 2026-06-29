@@ -372,6 +372,15 @@ pub enum CairnResource {
         skill_id: String,
         path: Vec<String>,
     },
+    /// Project references collection.
+    ProjectReferences {
+        project: String,
+    },
+    /// A single project reference addressed by name.
+    ProjectReference {
+        project: String,
+        name: String,
+    },
     /// Workspace labels collection.
     Labels,
     /// A single workspace label addressed by id.
@@ -486,6 +495,74 @@ pub enum CairnResource {
         server: Option<String>,
         resource: Option<String>,
     },
+}
+
+impl CairnResource {
+    /// The project key this resource is scoped to, if any.
+    ///
+    /// Project-scoped resources route to the database that owns their project
+    /// (see `DbState::for_project`); global/workspace resources (skills, labels,
+    /// settings, the projects collection, dev/db/logs, etc.) return `None` and
+    /// stay on the private database.
+    pub fn project_key(&self) -> Option<&str> {
+        use CairnResource::*;
+        match self {
+            Project { project, .. }
+            | ProjectIssues { project, .. }
+            | Issue { project, .. }
+            | Node { project, .. }
+            | NodeChat { project, .. }
+            | NodeChatRaw { project, .. }
+            | NodeChatTurn { project, .. }
+            | NodeChatEvent { project, .. }
+            | NodeArtifact { project, .. }
+            | NodeSymbols { project, .. }
+            | ProjectSymbols { project, .. }
+            | NodeTerminal { project, .. }
+            | TaskTerminal { project, .. }
+            | NodeBrowser { project, .. }
+            | TaskBrowser { project, .. }
+            | Task { project, .. }
+            | TaskChat { project, .. }
+            | TaskChatRaw { project, .. }
+            | TaskChatTurn { project, .. }
+            | TaskChatEvent { project, .. }
+            | TaskArtifact { project, .. }
+            | JobTodos { project, .. }
+            | NodeTasks { project, .. }
+            | NodeWakes { project, .. }
+            | NodeQuestions { project, .. }
+            | NodeQuestion { project, .. }
+            | NodePermissions { project, .. }
+            | NodePermission { project, .. }
+            | TaskPermissions { project, .. }
+            | TaskPermission { project, .. }
+            | NodeMessages { project, .. }
+            | TaskMessages { project, .. }
+            | ProjectMessages { project, .. }
+            | IssueMessages { project, .. }
+            | Changed { project, .. }
+            | IssueExecutions { project, .. }
+            | IssueComments { project, .. }
+            | IssueComment { project, .. }
+            | IssueExecution { project, .. }
+            | NodeChanged { project, .. }
+            | ProjectTerminal { project, .. }
+            | ProjectBrowser { project, .. }
+            | ProjectSkills { project, .. }
+            | ProjectSkill { project, .. }
+            | NodeMemories { project, .. }
+            | NodeMemory { project, .. }
+            | ProjectRecipes { project, .. }
+            | ProjectRecipe { project, .. }
+            | ProjectAgents { project, .. }
+            | ProjectAgent { project, .. }
+            | ProjectActions { project, .. }
+            | ProjectAction { project, .. }
+            | ProjectSettings { project, .. } => Some(project.as_str()),
+            _ => None,
+        }
+    }
 }
 
 fn canonical_project(project: &str) -> String {
@@ -876,6 +953,14 @@ pub fn build_skill_uri(skill_id: &str, path: &[String]) -> String {
 
 pub fn build_project_skills_uri(project: &str) -> String {
     format!("{}/skills", build_project_uri(project))
+}
+
+pub fn build_project_references_uri(project: &str) -> String {
+    format!("{}/references", build_project_uri(project))
+}
+
+pub fn build_project_reference_uri(project: &str, name: &str) -> String {
+    format!("{}/references/{}", build_project_uri(project), name)
 }
 
 pub fn build_project_skill_uri(project: &str, skill_id: &str, path: &[String]) -> String {
@@ -1286,6 +1371,8 @@ impl CairnResource {
                 skill_id,
                 path,
             } => build_project_skill_uri(project, skill_id, path),
+            Self::ProjectReferences { project } => build_project_references_uri(project),
+            Self::ProjectReference { project, name } => build_project_reference_uri(project, name),
             Self::Labels => build_labels_uri(),
             Self::Label { label_id } => build_label_uri(label_id),
             Self::NodeMemories {
@@ -1476,6 +1563,8 @@ impl CairnResource {
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
             | Self::ProjectSkill { .. }
+            | Self::ProjectReferences { .. }
+            | Self::ProjectReference { .. }
             | Self::Labels
             | Self::Label { .. }
             | Self::Recipes
@@ -1550,6 +1639,8 @@ impl CairnResource {
             | Self::ProjectBrowser { project, .. }
             | Self::ProjectSkills { project }
             | Self::ProjectSkill { project, .. }
+            | Self::ProjectReferences { project }
+            | Self::ProjectReference { project, .. }
             | Self::NodeMemories { project, .. }
             | Self::NodeMemory { project, .. }
             | Self::ProjectRecipes { project }
@@ -1632,6 +1723,8 @@ impl CairnResource {
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
             | Self::ProjectSkill { .. }
+            | Self::ProjectReferences { .. }
+            | Self::ProjectReference { .. }
             | Self::Labels
             | Self::Label { .. }
             | Self::Recipes
@@ -1755,6 +1848,8 @@ impl CairnResource {
             Self::Skill { .. } => ResourceKind::Skill,
             Self::ProjectSkills { .. } => ResourceKind::ProjectSkills,
             Self::ProjectSkill { .. } => ResourceKind::ProjectSkill,
+            Self::ProjectReferences { .. } => ResourceKind::ProjectReferences,
+            Self::ProjectReference { .. } => ResourceKind::ProjectReference,
             Self::Labels => ResourceKind::Labels,
             Self::Label { .. } => ResourceKind::Label,
             Self::NodeMemories { .. } => ResourceKind::NodeMemories,
@@ -1852,6 +1947,13 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 path: rest.iter().map(|segment| (*segment).to_string()).collect(),
             })
         }
+        [PROJECT_SCOPE, project, "references"] => Some(CairnResource::ProjectReferences {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "references", name] => Some(CairnResource::ProjectReference {
+            project: canonical_project(project),
+            name: (*name).to_string(),
+        }),
         ["settings"] => Some(CairnResource::Settings),
         ["projects"] => Some(CairnResource::Projects),
         ["labels"] => Some(CairnResource::Labels),
@@ -3431,6 +3533,19 @@ mod tests {
                 path: vec!["scripts".to_string(), "run.sh".to_string()],
             })
         );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/references"),
+            Some(CairnResource::ProjectReferences {
+                project: "CAIRN".to_string(),
+            })
+        );
+        assert_eq!(
+            parse_uri("cairn://p/cairn/references/openpnp"),
+            Some(CairnResource::ProjectReference {
+                project: "CAIRN".to_string(),
+                name: "openpnp".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -3461,10 +3576,30 @@ mod tests {
                 skill_id: "ui".to_string(),
                 path: vec!["scripts".to_string(), "run.sh".to_string()],
             },
+            CairnResource::ProjectReferences {
+                project: "CAIRN".to_string(),
+            },
+            CairnResource::ProjectReference {
+                project: "CAIRN".to_string(),
+                name: "openpnp".to_string(),
+            },
         ];
         for resource in resources {
             assert_eq!(parse_uri(&resource.to_uri()), Some(resource.clone()));
         }
+    }
+
+    #[test]
+    fn project_reference_resources_report_project_and_kind() {
+        let collection = parse_uri("cairn://p/cairn/references").unwrap();
+        assert_eq!(collection.project(), Some("CAIRN"));
+        assert_eq!(collection.issue_number(), None);
+        assert_eq!(collection.kind(), ResourceKind::ProjectReferences);
+
+        let member = parse_uri("cairn://p/cairn/references/openpnp").unwrap();
+        assert_eq!(member.project(), Some("CAIRN"));
+        assert_eq!(member.issue_number(), None);
+        assert_eq!(member.kind(), ResourceKind::ProjectReference);
     }
 
     #[test]

@@ -8,7 +8,7 @@ pub mod runtime;
 pub(crate) use runtime::lookup_caller_job_id;
 pub use runtime::{resume_suspended_parent_after_task_completion, spawn_task_packets};
 
-use uuid::Uuid;
+use cairn_common::ids;
 
 use crate::models::{
     DelegatedOutputContract, DelegatedSessionMode, DelegatedSessionStrategy, DelegatedStatus,
@@ -72,6 +72,10 @@ pub struct CreateDelegatedPacketInput<'a> {
     pub tier_override: Option<&'a str>,
     #[allow(dead_code)]
     pub backend_preference: Option<&'a str>,
+    /// Fire-and-forget request: the spawning parent does not block or suspend on
+    /// this packet. Persisted so the completion-resume handler notifies the
+    /// spawner via a push instead of looking for a (nonexistent) successor turn.
+    pub background: bool,
 }
 
 pub fn create_or_reuse_task_packet(
@@ -98,7 +102,7 @@ pub fn create_or_reuse_task_packet(
     }
 
     let packet = DelegatedWorkPacket {
-        id: Uuid::new_v4().to_string(),
+        id: ids::mint_child(input.parent_job_id),
         parent_job_id: input.parent_job_id.to_string(),
         parent_turn_id: input.parent_turn_id.map(str::to_string),
         parent_tool_use_id: input.parent_tool_use_id.map(str::to_string),
@@ -121,6 +125,7 @@ pub fn create_or_reuse_task_packet(
         task_index: input.task_index,
         tier_override: input.tier_override.map(str::to_string),
         backend_preference: input.backend_preference.map(str::to_string),
+        background: input.background,
         created_at: chrono::Utc::now().timestamp(),
     };
 

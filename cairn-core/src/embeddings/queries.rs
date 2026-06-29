@@ -218,6 +218,19 @@ pub async fn upsert_event_vibe_conn(
     Ok(())
 }
 
+pub async fn issue_id_for_event_async(db: &LocalDb, event_id: &str) -> DbResult<Option<String>> {
+    let event_id = event_id.to_string();
+    db.query_opt_text(
+        "SELECT r.issue_id
+         FROM events e
+         INNER JOIN runs r ON r.id = e.run_id
+         WHERE e.id = ?1
+         LIMIT 1",
+        params![event_id.as_str()],
+    )
+    .await
+}
+
 /// Get persisted vibe records for a session, ordered by event creation order.
 pub fn get_event_vibes_for_session(
     db: Arc<LocalDb>,

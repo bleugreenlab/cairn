@@ -9,6 +9,7 @@ use crate::services::{
     SpawnConfig, TerminalChild,
 };
 use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_common::ids;
 use portable_pty::{CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -66,6 +67,11 @@ pub struct RunPayload {
     /// `run_commit_barrier`).
     #[serde(default)]
     pub commit_msg: Option<String>,
+    /// Run the batch in the live checkout holding this branch/ref. Branch-scoped
+    /// runs never commit, refuse initially dirty checkouts, and warn if tracked
+    /// changes appear during the run.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// A single run invocation: exactly one of `command` (shell) or `target`
@@ -379,6 +385,60 @@ fn normalize_path(path: &str, cwd: &str) -> String {
 ///
 /// Notes are deduplicated: at most one informational and one warning note per
 /// batch, regardless of how many commands repeat the same `cd`.
+fn checkout_tracked_status(
+    orch: &Orchestrator,
+    checkout: &std::path::Path,
+) -> Result<String, String> {
+    if crate::jj::is_jj_dir(checkout) {
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        return crate::jj::working_copy_dirty_paths(&jj, checkout)
+            .map(|paths| paths.join("\n"))
+            .map_err(|error| {
+                format!(
+                    "jj diff --summary failed for {}: {error}",
+                    checkout.display()
+                )
+            });
+    }
+    let output = crate::env::git()
+        .arg("-C")
+        .arg(checkout)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .map_err(|error| format!("git status failed for {}: {error}", checkout.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed for {}: {}",
+            checkout.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn checkout_has_tracked_changes(
+    orch: &Orchestrator,
+    checkout: &std::path::Path,
+) -> Result<bool, String> {
+    Ok(!checkout_tracked_status(orch, checkout)?.is_empty())
+}
+
+fn verify_branch_checkout_clean_after_run(
+    orch: &Orchestrator,
+    checkout: &std::path::Path,
+) -> Result<bool, String> {
+    let status = checkout_tracked_status(orch, checkout)?;
+    if status.is_empty() {
+        return Ok(false);
+    }
+
+    Err(format!(
+        "branch-scoped run left tracked changes in {} and Cairn did not restore them automatically, because another editor or process may have modified the same checkout while the command was running. Review or discard these tracked changes manually before another branch-scoped run:\n{}",
+        checkout.display(),
+        status
+    ))
+}
+
 fn check_cd_commands<'a, I>(headers: I, cwd: &str, repo_root: Option<&str>) -> String
 where
     I: IntoIterator<Item = &'a str>,
@@ -430,12 +490,57 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         );
     }
 
-    let cwd = request.cwd.clone();
+    let mut cwd = request.cwd.clone();
     let tool_use_id = request
         .tool_use_id
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let commit_present = payload.commit_msg.is_some();
+
+    // Look up streaming/run context once for the whole batch. Prefer the
+    // callback's run_id when present: cwd lookups are only a fallback and can
+    // miss or pick the wrong run when multiple runs share a repo/worktree path.
+    // The live bash preview subscribes by this run id, so using the exact
+    // request run is what wires emitted `bash-output` chunks to the visible tool.
+    let run_context = super::run_context::lookup_run(&orch.db.local, request)
+        .await
+        .ok();
+
+    let branch_checkout = if let Some(branch) = payload.branch.as_deref() {
+        if commit_present {
+            return run_envelope(
+                "A branch-scoped run cannot commit; it runs against another checkout and refuses dirty tracked state. Remove commit_msg and retry."
+                    .to_string(),
+                Vec::new(),
+            );
+        }
+        let resolution =
+            match crate::mcp::handlers::branch::resolve_for_run(orch, request, branch).await {
+                Ok(resolution) => resolution,
+                Err(error) => return run_envelope(error, Vec::new()),
+            };
+        let checkout = resolution
+            .checkout
+            .expect("branch run resolution always carries checkout");
+        match checkout_has_tracked_changes(orch, &checkout) {
+            Ok(false) => {}
+            Ok(true) => {
+                return run_envelope(
+                    format!(
+                        "Branch-scoped run refused: target checkout has uncommitted tracked changes: {}",
+                        checkout.display()
+                    ),
+                    Vec::new(),
+                )
+            }
+            Err(error) => return run_envelope(error, Vec::new()),
+        }
+        cwd = checkout.to_string_lossy().into_owned();
+        Some(checkout)
+    } else {
+        None
+    };
+    let branch_scoped_run = branch_checkout.is_some();
 
     // Changes can only happen in a worktree. A non-jj cwd is the project's live
     // checkout behind a long-lived manager / triage / read-only agent (project
@@ -454,14 +559,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         );
     }
 
-    // Look up streaming/run context once for the whole batch. Prefer the
-    // callback's run_id when present: cwd lookups are only a fallback and can
-    // miss or pick the wrong run when multiple runs share a repo/worktree path.
-    // The live bash preview subscribes by this run id, so using the exact
-    // request run is what wires emitted `bash-output` chunks to the visible tool.
-    let run_context = super::run_context::lookup_run(&orch.db.local, request)
-        .await
-        .ok();
     // Look up the project's primary checkout path for cd-command advisory notes.
     let repo_root = if let Some(ctx) = run_context.as_ref() {
         crate::config::get_project_path(&orch.db.local, &ctx.project_id)
@@ -539,6 +636,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 &stream_id,
                 run_context.as_ref(),
                 commit_present,
+                branch_scoped_run,
                 header,
                 spec,
             )
@@ -574,6 +672,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                     &stream_id,
                     run_context.as_ref(),
                     commit_present,
+                    branch_scoped_run,
                     header,
                     spec,
                 )
@@ -593,18 +692,58 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         outcomes
     };
 
+    let branch_restore_message = if let Some(checkout) = branch_checkout.as_ref() {
+        match verify_branch_checkout_clean_after_run(orch, checkout) {
+            Ok(true) => Some(format!(
+                "✓ Verified branch checkout {} has no tracked changes after run",
+                checkout.display()
+            )),
+            Ok(false) => None,
+            Err(error) => Some(format!(
+                "⚠️ Branch checkout {} has tracked changes after run: {}",
+                checkout.display(),
+                error
+            )),
+        }
+    } else {
+        None
+    };
+
     // If any item durably suspended on a worktree-fence approval, return the
     // suspend marker for the whole call; the run re-drives the batch on resume.
     if outcomes.iter().any(|o| o.suspended) {
-        return run_envelope(
-            "Run suspended pending worktree fence approval; resume will \
-             continue once it is answered."
-                .to_string(),
-            Vec::new(),
-        );
+        let mut text = "Run suspended pending worktree fence approval; resume will continue once it is answered."
+            .to_string();
+        if let Some(message) = branch_restore_message {
+            text.push_str("\n\n");
+            text.push_str(&message);
+        }
+        return run_envelope(text, Vec::new());
     }
 
     let mut result = compose_run_output(&outcomes);
+
+    if branch_scoped_run {
+        if let Some(message) = branch_restore_message {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(&message);
+        }
+        if !cd_advisory.is_empty() {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(&cd_advisory);
+        }
+        let text = if result.is_empty() {
+            "(no output)".to_string()
+        } else {
+            result
+        };
+        let images = collect_run_images(outcomes);
+        return run_envelope(text, images);
+    }
 
     // Top-level commit barrier / hygiene gate. The session-archival scheme
     // requires the worktree to exactly equal HEAD after every run; the barrier
@@ -739,6 +878,27 @@ pub(super) fn run_commit_barrier(
                     Err(e) if e.contains("nothing to commit") => {
                         // Tree was (or became) clean; already equals HEAD.
                         log::info!("run commit_msg given but nothing to commit: {}", e);
+                    }
+                    Err(e) if crate::jj::is_conflicted_branch_seal_error(&e) => {
+                        // The seal was refused because the branch bookmark tip
+                        // carries a recorded conflict and `@` has diverged from it
+                        // — a deliberate resolve-at-base flatten away from a
+                        // conflicted intermediate stack. Unlike a stale/lost-seal
+                        // advance, discarding here would DESTROY the agent's
+                        // resolved work: jj will not fold a conflicted history, so
+                        // advancing onto the bookmark lands back on the conflict.
+                        // The only safe automatic action is to PRESERVE the working
+                        // copy exactly as the agent arranged it, so this does NOT
+                        // discard. That deliberately leaves `@` dirty (worktree !=
+                        // bookmark HEAD); the flatten the message points to
+                        // converges the invariant — its final `jj new` leaves `@`
+                        // clean on the moved bookmark.
+                        worktree_changed = false;
+                        committed = false;
+                        message.push_str(&format!(
+                            "\u{26a0}\u{fe0f} Seal refused: this branch has conflicted intermediate commits jj will not fold, so sealing `@` forward can't clear them: {}. The working copy was PRESERVED (not discarded). To land a flattened resolution, run the pure-jj resolve-at-base flatten with NO commit_msg (see the git-workflow skill); do not retry with commit_msg.",
+                            e
+                        ));
                     }
                     Err(e)
                         if crate::jj::is_lost_seal_error(&e) || crate::jj::is_stale_error(&e) =>
@@ -2073,6 +2233,7 @@ async fn run_one(
     tool_use_id: &str,
     run_context: Option<&super::RunContext>,
     _commit_present: bool,
+    branch_scoped_run: bool,
     header: String,
     spec: Result<RunSpec, String>,
 ) -> ItemOutcome {
@@ -2123,6 +2284,7 @@ async fn run_one(
         timeout_ms,
         shell_command.as_deref(),
         true,
+        branch_scoped_run,
     )
     .await
     {
@@ -2140,7 +2302,7 @@ async fn run_one(
         // no run context to adjudicate and nothing the user can grant — changes
         // can only be made in a worktree. This replaces the raw EPERM project
         // chat would otherwise surface.
-        if !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
+        if !branch_scoped_run && !crate::jj::is_jj_dir(std::path::Path::new(cwd)) {
             let _ = denial;
             return ItemOutcome::failed(
                 header,
@@ -2169,6 +2331,7 @@ async fn run_one(
                         timeout_ms,
                         shell_command.as_deref(),
                         false,
+                        branch_scoped_run,
                     )
                     .await
                     {
@@ -2335,6 +2498,7 @@ async fn execute_process(
     timeout_ms: u32,
     shell_command: Option<&str>,
     sandbox_enabled: bool,
+    branch_scoped_run: bool,
 ) -> Result<ExecOutput, String> {
     let services = &orch.services;
     let tool_use_id = tool_use_id.to_string();
@@ -2354,6 +2518,7 @@ async fn execute_process(
             run_context.map(|c| c.run_id.as_str()),
             run_context.map(|c| c.project_id.as_str()),
             shell_command.or(Some(program)),
+            branch_scoped_run,
         )
         .await
     } else {
@@ -2367,9 +2532,10 @@ async fn execute_process(
     // routes such a denial to the hard read-only-checkout message, never a fence
     // prompt — non-worktree is non-grantable, so enabling detection cannot
     // synthesize a grant.
-    let non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
-    let command_scoped_fallback =
-        non_worktree || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
+    let readonly_non_worktree =
+        !branch_scoped_run && !crate::jj::is_jj_dir(std::path::Path::new(cwd));
+    let command_scoped_fallback = readonly_non_worktree
+        || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
     let sandbox_policy = sandbox.map(|(policy, _)| policy);
     let sandboxed = sandbox_policy.is_some();
     let spawn_started = std::time::SystemTime::now();
@@ -2866,7 +3032,7 @@ async fn promote_to_terminal(
         return Err("could not allocate a terminal slug".to_string());
     }
 
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = ids::mint_session_id().into_string();
     insert_terminal_resource(&orch.db.local, &target, &session_id, command, None)
         .await
         .map_err(|e| format!("Database error: {e}"))?;
@@ -3440,6 +3606,7 @@ async fn build_run_sandbox_policy(
     run_id: Option<&str>,
     project_id: Option<&str>,
     command_for_grant: Option<&str>,
+    branch_scoped_run: bool,
 ) -> Option<(sandbox::SandboxPolicy, Fence)> {
     use crate::mcp::handlers::permission::resolve_fence_policy;
 
@@ -3449,7 +3616,8 @@ async fn build_run_sandbox_policy(
     // execution snapshot and would otherwise be fully unconfined. A real worktree
     // keeps the fence gate (ask/deny confine; allow runs free).
     let non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
-    let fence = if non_worktree {
+    let readonly_non_worktree = non_worktree && !branch_scoped_run;
+    let fence = if readonly_non_worktree {
         // Read-only and non-grantable: `Deny` makes run_one never route a denial
         // through the fence (no prompt, no session grant). Detection of the block
         // itself is enabled separately in execute_process so the agent still gets
@@ -3481,7 +3649,7 @@ async fn build_run_sandbox_policy(
     // raised in `run_one`. WORKTREE-ONLY: the project's live checkout is read-only
     // and non-negotiable, so a command grant (earned in some worktree run, since
     // the session set is shared) must never re-open the checkout to writes.
-    if !non_worktree {
+    if !readonly_non_worktree {
         if let Some(cmd) = command_for_grant {
             if granted.contains(&normalize_command(cmd)) {
                 return None;
@@ -3530,7 +3698,7 @@ async fn build_run_sandbox_policy(
     // like a command-scoped session grant does. WORKTREE-ONLY for the same reason
     // — on the live checkout an unconfined carveout still resolves to a read-only
     // checkout policy; nothing re-opens the checkout to writes.
-    if carveouts.unconfined && !non_worktree {
+    if carveouts.unconfined && !readonly_non_worktree {
         log::info!("dev-command carveout: running accepted command unconfined (cwd={cwd})");
         return None;
     }
@@ -3548,12 +3716,12 @@ async fn build_run_sandbox_policy(
     // grants flow into either policy, but `for_readonly_checkout` drops any grant
     // that lies within (or contains) the checkout, so a grant can never re-open it.
     let checkout = std::path::Path::new(cwd);
-    let mut policy = if non_worktree {
+    let mut policy = if readonly_non_worktree {
         sandbox::SandboxPolicy::for_readonly_checkout(checkout, &granted, deny_read)
     } else {
         sandbox::SandboxPolicy::for_run(checkout, &granted, deny_read)
     };
-    if !non_worktree {
+    if !readonly_non_worktree {
         apply_safe_jj_workspace_refresh_status_carveout(&mut policy, checkout, command_for_grant);
     }
     // Writable carveout scopes are globs: realize them as macOS SBPL regex grants
@@ -3563,7 +3731,7 @@ async fn build_run_sandbox_policy(
     // non-worktree cwd, refuse any scope that would write the read-only live
     // checkout — the read-only guarantee outranks a dev-command's declared scope.
     for glob in &carveouts.write_globs {
-        if non_worktree && glob_covers_checkout(glob, checkout) {
+        if readonly_non_worktree && glob_covers_checkout(glob, checkout) {
             log::warn!(
                 "dev-command carveout scope {glob:?} would write the read-only live checkout; \
                  dropping it (cwd={cwd})"
@@ -3652,6 +3820,7 @@ async fn spawn_terminal_session(
         target.run_id.as_deref(),
         Some(target.project_id.as_str()),
         Some(&command),
+        false,
     )
     .await;
     let fence_mode = sandbox.as_ref().map(|(_, fence)| *fence);
@@ -3714,7 +3883,7 @@ async fn spawn_terminal_session(
         .map_err(|e| format!("Failed to spawn shell: {e}"))?;
     let mut reader = components.reader;
     let child_pid = components.child.process_id();
-    let session_id = Uuid::new_v4().to_string();
+    let session_id = ids::mint_session_id().into_string();
     let output_buffer: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
     let last_output_at: Arc<Mutex<SystemTime>> = Arc::new(Mutex::new(SystemTime::now()));
     // Shared phrase-watcher registry: the read loop below scans output against it,
@@ -4528,6 +4697,92 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DbState;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use std::sync::Arc;
+
+    fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    fn test_orchestrator() -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let db_path = root.join("test.db");
+        let local = block_on(async {
+            let local = LocalDb::open(db_path).await.unwrap();
+            MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+                .run(&local)
+                .await
+                .unwrap();
+            local
+        });
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build()
+    }
+
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = crate::env::git()
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn branch_scoped_checkout_policy_is_writable_while_plain_live_checkout_is_readonly() {
+        let checkout = std::path::Path::new("/project/live");
+        let readonly = sandbox::SandboxPolicy::for_readonly_checkout(checkout, &[], vec![]);
+        let branch_scoped = sandbox::SandboxPolicy::for_run(checkout, &[], vec![]);
+
+        assert!(!readonly.worktree_writable);
+        assert!(branch_scoped.worktree_writable);
+    }
+
+    #[test]
+    fn branch_checkout_cleanup_refuses_to_discard_tracked_changes_and_leaves_untracked_cache() {
+        let orch = test_orchestrator();
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "-q"]);
+        git(repo.path(), &["config", "user.name", "Test"]);
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        git(repo.path(), &["add", "tracked.txt"]);
+        git(repo.path(), &["commit", "-q", "-m", "base"]);
+
+        std::fs::write(repo.path().join("tracked.txt"), "changed\n").unwrap();
+        std::fs::create_dir_all(repo.path().join("target")).unwrap();
+        std::fs::write(repo.path().join("target/cache.txt"), "warm\n").unwrap();
+
+        assert!(checkout_has_tracked_changes(&orch, repo.path()).unwrap());
+        let error = verify_branch_checkout_clean_after_run(&orch, repo.path()).unwrap_err();
+        assert!(
+            error.contains("did not restore them automatically"),
+            "unexpected error: {error}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("tracked.txt")).unwrap(),
+            "changed\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("target/cache.txt")).unwrap(),
+            "warm\n"
+        );
+        assert!(checkout_has_tracked_changes(&orch, repo.path()).unwrap());
+    }
 
     #[test]
     fn glob_covers_checkout_drops_checkout_scopes_keeps_external() {
@@ -5502,6 +5757,42 @@ mod commit_barrier_tests {
         assert!(
             out.message.contains("restored to HEAD"),
             "got: {}",
+            out.message
+        );
+    }
+
+    #[test]
+    fn commit_msg_conflicted_branch_seal_preserves_worktree() {
+        // The explicit regression guard for the silent-data-loss bug: a seal
+        // refused because the branch bookmark tip carries a recorded conflict (a
+        // deliberate resolve-at-base flatten) must NOT discard — discarding would
+        // destroy the agent's resolved flatten — and must NOT advise "retry with
+        // commit_msg". The barrier preserves the worktree and points at the
+        // pure-jj flatten procedure instead.
+        let vcs = FakeVcs::new()
+            .dirty(Ok(true))
+            .seal(Err(crate::jj::CONFLICTED_BRANCH_SEAL_MSG.to_string()));
+        let out = run_commit_barrier(&vcs, wt(), Some("flatten"), true, None, None);
+        assert_eq!(vcs.seals(), 1, "the seal is attempted");
+        assert_eq!(
+            vcs.discards(),
+            0,
+            "a conflicted-branch refusal must NOT discard the resolved flatten"
+        );
+        assert!(!out.committed, "a refused seal must not set committed");
+        assert!(
+            !out.worktree_changed,
+            "the worktree is preserved as the agent arranged it"
+        );
+        assert!(
+            out.message.contains("PRESERVED"),
+            "the message names that the working copy was preserved: {}",
+            out.message
+        );
+        assert!(
+            out.message.contains("NO commit_msg")
+                && !out.message.contains("Retry the run with commit_msg"),
+            "the message points at the no-commit_msg flatten, not a futile retry: {}",
             out.message
         );
     }

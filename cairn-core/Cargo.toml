@@ -33,7 +33,6 @@ hostname = "0.4"
 whoami = "1"
 axum = { version = "0.8", features = ["ws"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 async-trait = "0.1"
 cairn-common = { path = "../cairn-common" }
@@ -44,7 +43,14 @@ grep-searcher = "0.1"
 tempfile = "3"
 crossbeam-channel = "0.5"
 zip = "4.2"
-turso = { git = "https://github.com/tursodatabase/turso", rev = "496c24ed85d2a7cf4963f12537e3c539144765a7", default-features = false }
+turso = { git = "https://github.com/tursodatabase/turso", rev = "496c24ed85d2a7cf4963f12537e3c539144765a7", default-features = false, features = ["sync"] }
+# Direct rustls handle solely so `LocalDb::ensure_crypto_provider` can install a
+# process-wide default `CryptoProvider` before turso's sync TLS client is built.
+# The tree already compiles rustls with both `aws-lc-rs` and `ring`, which makes
+# rustls' feature-based auto-detection ambiguous and panics the first sync
+# handshake; we install `aws-lc-rs` (rustls' modern default) explicitly. See the
+# doc comment on `ensure_crypto_provider` in storage/local_db.rs.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tantivy = "0.26.1"
 jsonschema = { version = "0.26", default-features = false }
 tiktoken-rs = "0.6"
@@ -93,6 +99,7 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 landlock = "0.4"
 
 [dev-dependencies]
+async-trait = "0.1"
 filetime = "0.2"
 mockall = "0.13"
 serde_json = "1.0"

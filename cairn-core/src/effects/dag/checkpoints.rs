@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) fn handle_checkpoint_node(
     orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     db_job: &DbJob,
     node: &DbRecipeNode,
     execution_id: &str,
@@ -20,8 +21,8 @@ pub(super) fn handle_checkpoint_node(
         .and_then(|c| c.command.clone())
         .unwrap_or_else(|| "exit 0".to_string());
 
-    let worktree_path = find_checkpoint_worktree(orch, db_job, node)?;
-    let cached_result = check_checkpoint_cache(orch, db_job, &command, &worktree_path);
+    let worktree_path = find_checkpoint_worktree(db, db_job, node)?;
+    let cached_result = check_checkpoint_cache(orch, db, db_job, &command, &worktree_path);
     let cached_pass = matches!(&cached_result, Some((0, _, true)));
 
     effects.push(WorkflowEffect::RunCheckpointCommand {
@@ -42,13 +43,13 @@ pub(super) fn handle_checkpoint_node(
 }
 
 fn find_checkpoint_worktree(
-    orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     job: &DbJob,
     node: &DbRecipeNode,
 ) -> Result<String, String> {
     let execution_id = job.execution_id.clone().ok_or("Job has no execution_id")?;
     let parent_id = node.parent_id.clone();
-    let db = orch.db.local.clone();
+    let db = db.clone();
     run_advancement_db(async move {
         db.read(|conn| {
             let execution_id = execution_id.clone();
@@ -101,13 +102,14 @@ fn find_checkpoint_worktree(
 
 fn check_checkpoint_cache(
     orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     checkpoint_job: &DbJob,
     command: &str,
     worktree_path: &str,
 ) -> Option<(i32, String, bool)> {
     let parent_job_id = checkpoint_job.parent_job_id.clone()?;
     let normalized = normalize_command(command);
-    let db = orch.db.local.clone();
+    let db = db.clone();
     let cached = run_advancement_db(async move {
         db.read(|conn| {
             let parent_job_id = parent_job_id.clone();

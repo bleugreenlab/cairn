@@ -6,7 +6,7 @@ use crate::agent_process::stream::{TokenCounts, TranscriptEvent};
 use crate::db_records::{DbMessageStream, DbMessageStreamChunk};
 use crate::effects::outbox::{self, OutboxEntry};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use crate::storage::{query_opt_text_conn, DbError, DbResult, LocalDb, RowExt};
 use serde::{Deserialize, Serialize};
 use turso::{params, Connection, Row};
 use uuid::Uuid;
@@ -309,23 +309,6 @@ struct EmbedEventPayload {
     data_json: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SyncEventPayload {
-    id: String,
-    run_id: String,
-    session_id: Option<String>,
-    sequence: i32,
-    event_type: String,
-    data: String,
-    created_at: i64,
-    turn_id: Option<String>,
-    input_tokens: Option<i32>,
-    output_tokens: Option<i32>,
-    cache_read_tokens: Option<i32>,
-    cache_create_tokens: Option<i32>,
-    thinking_tokens: Option<i32>,
-}
-
 pub fn get_next_sequence(db: Arc<LocalDb>, run_id: &str) -> Result<i32, String> {
     let run_id = run_id.to_string();
     block_on_stream_db(async move {
@@ -363,6 +346,25 @@ pub fn insert_event(db: Arc<LocalDb>, event: EventInsert) -> Result<bool, String
 /// intermittently freezes the chat transcript (CAIRN-1916). Returns whether a
 /// new row landed (`false` = duplicate id); the emit fires only when a row
 /// actually lands, matching the resolver's append-only delta expectations.
+fn issue_id_for_run(db: Arc<LocalDb>, run_id: &str) -> Result<Option<String>, String> {
+    let run_id = run_id.to_string();
+    block_on_stream_db(async move {
+        db.read(|conn| {
+            let run_id = run_id.clone();
+            Box::pin(async move {
+                query_opt_text_conn(
+                    conn,
+                    "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
+                    params![run_id.as_str()],
+                )
+                .await
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
 pub fn insert_event_emit(
     db: Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
@@ -370,11 +372,17 @@ pub fn insert_event_emit(
 ) -> Result<bool, String> {
     let run_id = event.run_id.clone();
     let session_id = event.session_id.clone();
+    let issue_id = issue_id_for_run(db.clone(), &run_id)?;
     let inserted = insert_event(db, event)?;
     if inserted {
         let _ = emitter.emit(
             "db-change",
-            crate::notify::event_db_change(&run_id, session_id.as_deref(), "insert"),
+            crate::notify::event_db_change_scoped(
+                &run_id,
+                session_id.as_deref(),
+                issue_id.as_deref(),
+                "insert",
+            ),
         );
     }
     Ok(inserted)
@@ -389,18 +397,28 @@ pub fn insert_event_emit(
 /// still drains its outbox entries.
 pub fn finalize_stream_emit(
     db: Arc<LocalDb>,
+    private_db: Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     stream_id: &str,
     expected_version: i32,
     final_event: Option<TranscriptEvent>,
     counts: TokenCounts,
 ) -> Result<FinalizedStream, String> {
-    let finalized = finalize_stream(db, stream_id, expected_version, final_event, counts)?;
+    let finalized = finalize_stream(
+        db.clone(),
+        private_db,
+        stream_id,
+        expected_version,
+        final_event,
+        counts,
+    )?;
+    let issue_id = issue_id_for_run(db, &finalized.run_id)?;
     let _ = emitter.emit(
         "db-change",
-        crate::notify::event_db_change(
+        crate::notify::event_db_change_scoped(
             &finalized.run_id,
             finalized.session_id.as_deref(),
+            issue_id.as_deref(),
             "insert",
         ),
     );
@@ -728,6 +746,7 @@ pub async fn reconstruct_stream_conn(
 
 pub fn finalize_stream(
     db: Arc<LocalDb>,
+    private_db: Arc<LocalDb>,
     stream_id: &str,
     expected_version: i32,
     final_event: Option<TranscriptEvent>,
@@ -735,127 +754,111 @@ pub fn finalize_stream(
 ) -> Result<FinalizedStream, String> {
     let stream_id = stream_id.to_string();
     block_on_stream_db(async move {
-        db.write(|conn| {
-            let stream_id = stream_id.clone();
-            let final_event = final_event.clone();
-            Box::pin(async move {
-                let mut stream = load_stream_conn(conn, &stream_id).await?;
-                if stream.status == "finalized" {
-                    return load_finalized_stream_conn(conn, &stream).await;
-                }
-                if stream.status == "aborted" {
-                    return Err(DbError::internal(format!(
-                        "Stream {} already aborted",
-                        stream_id
-                    )));
-                }
-                if stream.version != expected_version {
-                    return Err(stale_writer_error(
-                        &stream_id,
-                        expected_version,
-                        stream.version,
-                    ));
-                }
+        // The finalized EVENT + `message_streams` UPDATE are ProjectScoped and go
+        // to the run's OWNING database (a team run's synced replica); the embed/sync
+        // `effect_outbox` enqueue is host-local and goes to the PRIVATE database.
+        // `effect_outbox` is deliberately absent from the team schema (CAIRN-2186
+        // private-only allowlist), so threading the owning handle through the whole
+        // finalize trips `no such table: effect_outbox` and aborts the transaction
+        // (CAIRN-2217). Route each write by its own scope: the event commits first,
+        // then the best-effort outbox enqueue lands on the private DB.
+        let (mut finalized, pending_outbox) = db
+            .write(|conn| {
+                let stream_id = stream_id.clone();
+                let final_event = final_event.clone();
+                Box::pin(async move {
+                    let mut stream = load_stream_conn(conn, &stream_id).await?;
+                    if stream.status == "finalized" {
+                        // Already finalized: its outbox was enqueued on the first pass,
+                        // so a re-finalize is a pure read with no further enqueue.
+                        return Ok((load_finalized_stream_conn(conn, &stream).await?, None));
+                    }
+                    if stream.status == "aborted" {
+                        return Err(DbError::internal(format!(
+                            "Stream {} already aborted",
+                            stream_id
+                        )));
+                    }
+                    if stream.version != expected_version {
+                        return Err(stale_writer_error(
+                            &stream_id,
+                            expected_version,
+                            stream.version,
+                        ));
+                    }
 
-                let chunks = load_chunks_for_stream_conn(conn, &stream_id).await?;
-                let active = materialize_stream(stream.clone(), &chunks);
+                    let chunks = load_chunks_for_stream_conn(conn, &stream_id).await?;
+                    let active = materialize_stream(stream.clone(), &chunks);
 
-                let mut final_event = final_event.unwrap_or_else(|| TranscriptEvent {
-                    event_type: "assistant".to_string(),
-                    session_id: stream.session_id.clone(),
-                    parent_tool_use_id: None,
-                    content: None,
-                    thinking: None,
-                    tool_name: None,
-                    tool_input: None,
-                    tool_uses: None,
-                    tool_use_id: None,
-                    tool_result: None,
-                    is_error: false,
-                    thinking_ms: None,
-                    raw: None,
-                });
-                if final_event.content.is_none() && !active.content.is_empty() {
-                    final_event.content = Some(active.content.clone());
-                }
-                if final_event.thinking.is_none() && !active.thinking.is_empty() {
-                    final_event.thinking = Some(active.thinking.clone());
-                }
-                if final_event.session_id.is_none() {
-                    final_event.session_id = stream.session_id.clone();
-                }
+                    let mut final_event = final_event.unwrap_or_else(|| TranscriptEvent {
+                        event_type: "assistant".to_string(),
+                        session_id: stream.session_id.clone(),
+                        parent_tool_use_id: None,
+                        content: None,
+                        thinking: None,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_uses: None,
+                        tool_use_id: None,
+                        tool_result: None,
+                        is_error: false,
+                        thinking_ms: None,
+                        raw: None,
+                    });
+                    if final_event.content.is_none() && !active.content.is_empty() {
+                        final_event.content = Some(active.content.clone());
+                    }
+                    if final_event.thinking.is_none() && !active.thinking.is_empty() {
+                        final_event.thinking = Some(active.thinking.clone());
+                    }
+                    if final_event.session_id.is_none() {
+                        final_event.session_id = stream.session_id.clone();
+                    }
 
-                let data_json = serde_json::to_string(&final_event)
+                    let data_json = serde_json::to_string(&final_event)
+                        .map_err(|e| DbError::internal(e.to_string()))?;
+                    let event_id = stream
+                        .final_event_id
+                        .clone()
+                        .unwrap_or_else(|| stream.id.clone());
+                    if !event_exists_conn(conn, &event_id).await? {
+                        insert_event_conn(
+                            conn,
+                            &EventInsert {
+                                id: event_id.clone(),
+                                run_id: stream.run_id.clone(),
+                                session_id: stream.session_id.clone(),
+                                sequence: stream.sequence,
+                                timestamp: stream.created_at,
+                                event_type: final_event.event_type.clone(),
+                                data: data_json.clone(),
+                                parent_tool_use_id: final_event.parent_tool_use_id.clone(),
+                                created_at: stream.created_at,
+                                input_tokens: counts.input,
+                                cache_read_tokens: counts.cache_read,
+                                cache_create_tokens: counts.cache_create,
+                                output_tokens: counts.output,
+                                thinking_tokens: counts.thinking,
+                                turn_id: stream.turn_id.clone(),
+                                cost_usd: None,
+                            },
+                        )
+                        .await?;
+                    }
+
+                    let embed_payload = serde_json::to_string(&EmbedEventPayload {
+                        event_id: event_id.clone(),
+                        data_json: data_json.clone(),
+                    })
                     .map_err(|e| DbError::internal(e.to_string()))?;
-                let event_id = stream
-                    .final_event_id
-                    .clone()
-                    .unwrap_or_else(|| stream.id.clone());
-                if !event_exists_conn(conn, &event_id).await? {
-                    insert_event_conn(
-                        conn,
-                        &EventInsert {
-                            id: event_id.clone(),
-                            run_id: stream.run_id.clone(),
-                            session_id: stream.session_id.clone(),
-                            sequence: stream.sequence,
-                            timestamp: stream.created_at,
-                            event_type: final_event.event_type.clone(),
-                            data: data_json.clone(),
-                            parent_tool_use_id: final_event.parent_tool_use_id.clone(),
-                            created_at: stream.created_at,
-                            input_tokens: counts.input,
-                            cache_read_tokens: counts.cache_read,
-                            cache_create_tokens: counts.cache_create,
-                            output_tokens: counts.output,
-                            thinking_tokens: counts.thinking,
-                            turn_id: stream.turn_id.clone(),
-                            cost_usd: None,
-                        },
-                    )
-                    .await?;
-                }
 
-                let embed_payload = serde_json::to_string(&EmbedEventPayload {
-                    event_id: event_id.clone(),
-                    data_json: data_json.clone(),
-                })
-                .map_err(|e| DbError::internal(e.to_string()))?;
-                let sync_payload = serde_json::to_string(&SyncEventPayload {
-                    id: event_id.clone(),
-                    run_id: stream.run_id.clone(),
-                    session_id: stream.session_id.clone(),
-                    sequence: stream.sequence,
-                    event_type: final_event.event_type.clone(),
-                    data: data_json.clone(),
-                    created_at: stream.created_at as i64,
-                    turn_id: stream.turn_id.clone(),
-                    input_tokens: counts.input,
-                    output_tokens: counts.output,
-                    cache_read_tokens: counts.cache_read,
-                    cache_create_tokens: counts.cache_create,
-                    thinking_tokens: counts.thinking,
-                })
-                .map_err(|e| DbError::internal(e.to_string()))?;
+                    // The embed outbox entry is NOT enqueued here: it targets
+                    // the PRIVATE DB and is inserted after this owning-DB transaction
+                    // commits (see the end of `finalize_stream`).
 
-                let embed_id = outbox::insert_pending_with_payload_conn(
-                    conn,
-                    "embed_event",
-                    &event_id,
-                    &embed_payload,
-                )
-                .await?;
-                let sync_id = outbox::insert_pending_with_payload_conn(
-                    conn,
-                    "sync_event",
-                    &event_id,
-                    &sync_payload,
-                )
-                .await?;
-
-                let now = chrono::Utc::now().timestamp() as i32;
-                conn.execute(
-                    "UPDATE message_streams
+                    let now = chrono::Utc::now().timestamp() as i32;
+                    conn.execute(
+                        "UPDATE message_streams
                      SET status = 'finalized',
                          version = ?1,
                          final_event_id = ?2,
@@ -863,52 +866,85 @@ pub fn finalize_stream(
                          finalized_at = ?4,
                          abort_reason = NULL
                      WHERE id = ?5",
-                    params![
-                        stream.version + 1,
-                        event_id.as_str(),
-                        now,
-                        now,
-                        stream_id.as_str()
-                    ],
-                )
-                .await?;
-                stream.status = "finalized".to_string();
-                stream.version += 1;
-                stream.final_event_id = Some(event_id.clone());
-                stream.updated_at = now;
-                stream.finalized_at = Some(now);
-                stream.abort_reason = None;
+                        params![
+                            stream.version + 1,
+                            event_id.as_str(),
+                            now,
+                            now,
+                            stream_id.as_str()
+                        ],
+                    )
+                    .await?;
+                    stream.status = "finalized".to_string();
+                    stream.version += 1;
+                    stream.final_event_id = Some(event_id.clone());
+                    stream.updated_at = now;
+                    stream.finalized_at = Some(now);
+                    stream.abort_reason = None;
 
-                Ok(FinalizedStream {
-                    stream_id: stream.id,
-                    event_id: event_id.clone(),
-                    run_id: stream.run_id,
-                    session_id: stream.session_id,
-                    sequence: stream.sequence,
-                    created_at: stream.created_at,
-                    turn_id: stream.turn_id,
-                    event_type: final_event.event_type,
-                    data_json,
-                    outbox_entries: vec![
-                        OutboxEntry {
-                            id: embed_id,
-                            kind: "embed_event".to_string(),
-                            dedupe_key: event_id.clone(),
-                            payload_json: embed_payload,
-                        },
-                        OutboxEntry {
-                            id: sync_id,
-                            kind: "sync_event".to_string(),
-                            dedupe_key: event_id,
-                            payload_json: sync_payload,
-                        },
-                    ],
+                    let finalized = FinalizedStream {
+                        stream_id: stream.id,
+                        event_id,
+                        run_id: stream.run_id,
+                        session_id: stream.session_id,
+                        sequence: stream.sequence,
+                        created_at: stream.created_at,
+                        turn_id: stream.turn_id,
+                        event_type: final_event.event_type,
+                        data_json,
+                        // Filled below from the PRIVATE outbox enqueue; empty until then.
+                        outbox_entries: Vec::new(),
+                    };
+                    Ok((finalized, Some(embed_payload)))
                 })
             })
-        })
-        .await
-        .map_err(|e| e.to_string())
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Some(embed_payload) = pending_outbox {
+            finalized.outbox_entries =
+                enqueue_finalize_outbox(&private_db, &finalized.event_id, embed_payload).await;
+        }
+        Ok(finalized)
     })
+}
+
+/// Enqueue the finalized event's embed follow-on work into the PRIVATE
+/// outbox. `effect_outbox` is a host-local table that the team replica
+/// deliberately does NOT carry (CAIRN-2186 private-only allowlist), so this MUST
+/// target the private DB even when the finalized event itself was just written to
+/// a team replica (CAIRN-2217). Cross-DB atomicity with the event insert is
+/// intentionally given up: the event is already committed and the outbox is
+/// best-effort follow-on work, so an enqueue failure here is logged and
+/// degraded-recoverable (the event simply misses its embed until a future
+/// pass) rather than failing the finalize and stalling the run.
+async fn enqueue_finalize_outbox(
+    private_db: &LocalDb,
+    event_id: &str,
+    embed_payload: String,
+) -> Vec<OutboxEntry> {
+    let mut entries = Vec::new();
+    match outbox::insert_pending_with_payload_async(
+        private_db,
+        "embed_event",
+        event_id,
+        &embed_payload,
+    )
+    .await
+    {
+        Ok(id) => entries.push(OutboxEntry {
+            id,
+            kind: "embed_event".to_string(),
+            dedupe_key: event_id.to_string(),
+            payload_json: embed_payload,
+        }),
+        Err(error) => log::warn!(
+            "Failed to enqueue embed_event outbox for event {}: {}",
+            event_id,
+            error
+        ),
+    }
+    entries
 }
 
 pub fn abort_stream(
@@ -1081,7 +1117,6 @@ pub fn process_post_commit_outbox(orch: &Orchestrator, entries: &[OutboxEntry]) 
     for entry in entries {
         let result = match entry.kind.as_str() {
             "embed_event" => process_embed_event(orch, entry),
-            "sync_event" => process_sync_event(orch, entry),
             _ => continue,
         };
         if let Err(error) = result {
@@ -1096,28 +1131,6 @@ fn process_embed_event(orch: &Orchestrator, entry: &OutboxEntry) -> Result<(), S
     if let Some(text) = crate::embeddings::extract_embeddable_text(&payload.data_json) {
         orch.enqueue_event_embed(&payload.event_id, text);
     }
-    outbox::mark_done(orch.db.local.clone(), &entry.id);
-    Ok(())
-}
-
-fn process_sync_event(orch: &Orchestrator, entry: &OutboxEntry) -> Result<(), String> {
-    let payload: SyncEventPayload =
-        serde_json::from_str(&entry.payload_json).map_err(|e| e.to_string())?;
-    orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
-        id: payload.id,
-        run_id: payload.run_id,
-        session_id: payload.session_id,
-        sequence: Some(payload.sequence),
-        event_type: payload.event_type,
-        data: Some(payload.data),
-        input_tokens: payload.input_tokens,
-        output_tokens: payload.output_tokens,
-        cache_read_tokens: payload.cache_read_tokens,
-        cache_create_tokens: payload.cache_create_tokens,
-        thinking_tokens: payload.thinking_tokens,
-        created_at: Some(payload.created_at),
-        turn_id: payload.turn_id,
-    }));
     outbox::mark_done(orch.db.local.clone(), &entry.id);
     Ok(())
 }
@@ -1361,7 +1374,7 @@ fn run_stream_db_future<T>(future: impl Future<Output = Result<T, String>>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::{MigrationRunner, TEAM_MIGRATIONS, TURSO_MIGRATIONS};
     use tempfile::{tempdir, TempDir};
 
     async fn test_db() -> (TempDir, Arc<LocalDb>) {
@@ -1376,16 +1389,59 @@ mod tests {
         (temp, Arc::new(db))
     }
 
+    /// A team-replica test DB built from the TEAM lineage, which — like the real
+    /// synced replica in prod — does NOT carry the private-only `effect_outbox`
+    /// table (CAIRN-2186). Used to reproduce the CAIRN-2217 finalize crash.
+    async fn team_test_db() -> (TempDir, Arc<LocalDb>) {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("stream-store-team.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        (temp, Arc::new(db))
+    }
+
+    async fn count_one(db: &LocalDb, sql: &'static str, param: &str) -> i64 {
+        let param = param.to_string();
+        db.read(|conn| {
+            let param = param.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(sql, params![param.as_str()]).await?;
+                let row = rows.next().await?.unwrap();
+                row.i64(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
     async fn insert_run(db: &LocalDb, id: &str) {
         let now = chrono::Utc::now().timestamp() as i32;
         db.write(|conn| {
             let id = id.to_string();
             Box::pin(async move {
                 conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('project-1', 'default', 'Project', 'PROJ', '/tmp/project', ?1, ?2)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![now, now],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
+                     VALUES ('issue-1', 'project-1', 1, 'Issue', ?1, ?2)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![now, now],
+                )
+                .await?;
+                conn.execute(
                     "INSERT INTO runs(
-                         id, status, session_id, created_at, updated_at
+                         id, issue_id, status, session_id, created_at, updated_at
                      )
-                     VALUES (?1, 'live', 'session-1', ?2, ?3)",
+                     VALUES (?1, 'issue-1', 'live', 'session-1', ?2, ?3)",
                     params![id.as_str(), now, now],
                 )
                 .await?;
@@ -1494,6 +1550,8 @@ mod tests {
         assert_eq!(captured[0]["action"], "insert");
         assert_eq!(captured[0]["runId"], "run-1");
         assert_eq!(captured[0]["sessionId"], "session-1");
+        assert_eq!(captured[0]["issueId"], "issue-1");
+        assert_eq!(captured[0]["issue_id"], "issue-1");
 
         // Re-inserting the same id conflicts on the UNIQUE id constraint and
         // surfaces as an Err; crucially the helper emits nothing on the failure,
@@ -1528,6 +1586,7 @@ mod tests {
         )
         .unwrap();
         let finalized = finalize_stream_emit(
+            db.clone(),
             db.clone(),
             &emitter,
             opened.stream_id(),
@@ -1571,6 +1630,7 @@ mod tests {
         .unwrap();
         let first = finalize_stream(
             db.clone(),
+            db.clone(),
             opened.stream_id(),
             appended.version,
             None,
@@ -1578,6 +1638,7 @@ mod tests {
         )
         .unwrap();
         let second = finalize_stream(
+            db.clone(),
             db.clone(),
             opened.stream_id(),
             appended.version + 1,
@@ -1651,6 +1712,7 @@ mod tests {
         .unwrap();
         let finalized = finalize_stream(
             db.clone(),
+            db.clone(),
             opened.stream_id(),
             appended.version,
             None,
@@ -1720,5 +1782,81 @@ mod tests {
         assert!(acc.pending_is_empty());
         // Drained → not due even though wall time has passed.
         assert!(!acc.should_flush(Instant::now()));
+    }
+
+    /// CAIRN-2217: a team run's finalize must split its writes by scope. The run +
+    /// transcript live in the team replica, which (like prod) lacks the
+    /// private-only `effect_outbox` table; the finalized event + `message_streams`
+    /// must land in the replica while the embed outbox lands in the PRIVATE
+    /// DB — never tripping `no such table: effect_outbox`.
+    #[tokio::test]
+    async fn finalize_routes_outbox_to_private_when_owning_db_lacks_it() {
+        let (_team_temp, team_db) = team_test_db().await;
+        let (_priv_temp, private_db) = test_db().await;
+        insert_run(&team_db, "run-team").await;
+
+        let opened = open_stream(
+            team_db.clone(),
+            "run-team",
+            Some("session-1"),
+            None,
+            "claude",
+            Some(0),
+        )
+        .unwrap();
+        let appended = append_chunks(
+            team_db.clone(),
+            opened.stream_id(),
+            opened.version(),
+            &[StreamChunkInput::content("hello")],
+        )
+        .unwrap();
+
+        let finalized = finalize_stream(
+            team_db.clone(),
+            private_db.clone(),
+            opened.stream_id(),
+            appended.version,
+            None,
+            TokenCounts::default(),
+        )
+        .expect("finalize must succeed even though the team replica lacks effect_outbox");
+
+        // The embed entry was enqueued.
+        assert_eq!(finalized.outbox_entries.len(), 1);
+
+        // The finalized event landed in the team replica.
+        assert_eq!(
+            count_one(
+                &team_db,
+                "SELECT COUNT(*) FROM events WHERE id = ?1",
+                &finalized.event_id,
+            )
+            .await,
+            1,
+            "the finalized event must land in the team replica",
+        );
+        // The stream was finalized in the team replica.
+        assert_eq!(
+            count_one(
+                &team_db,
+                "SELECT COUNT(*) FROM message_streams WHERE id = ?1 AND status = 'finalized'",
+                opened.stream_id(),
+            )
+            .await,
+            1,
+            "message_streams must be finalized in the team replica",
+        );
+        // The embed outbox pending row landed in the PRIVATE DB.
+        assert_eq!(
+            count_one(
+                &private_db,
+                "SELECT COUNT(*) FROM effect_outbox WHERE dedupe_key = ?1 AND state = 'pending'",
+                &finalized.event_id,
+            )
+            .await,
+            1,
+            "the embed outbox entry must land in the private DB",
+        );
     }
 }

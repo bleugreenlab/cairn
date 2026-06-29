@@ -8,6 +8,7 @@ use crate::execution::jobs::{continue_job_impl, ResumeContext};
 use crate::models::{TurnStartReason, TurnState, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, RowExt};
+use cairn_common::ids;
 use serde::Deserialize;
 use serde_json::Value;
 use turso::params;
@@ -47,6 +48,19 @@ pub async fn ask_questions(
 
     let services = &orch.services;
 
+    // Resolve the run AND its owning database ONCE (CAIRN-2229, mirroring
+    // CAIRN-2227's prompt/permission response routing): a team run's rows — the
+    // prompt we insert, its yielded turn, the issue we recompute — live WHOLLY in
+    // the synced replica. Hardcoding `orch.db.local` here was the live
+    // `No run found with id '…~…'` bug: a team run is absent from the private DB,
+    // so this first lookup failed before a prompt could ever be stored. Routing
+    // is fail-closed (a closed replica errors, never a silent private read); a
+    // bare (local) run resolves to the private DB byte-for-byte unchanged.
+    let (ctx, owning_db) = match super::run_context::lookup_run_routed(&orch.db, request).await {
+        Ok(pair) => pair,
+        Err(e) => return e,
+    };
+
     // Look up the run and store prompt in DB
     let (
         run_id,
@@ -61,17 +75,12 @@ pub async fn ask_questions(
         current_turn_id,
         owns_turn_loop,
     ) = {
-        let ctx = match super::run_context::lookup_run(&orch.db.local, request).await {
-            Ok(ctx) => ctx,
-            Err(e) => return e,
-        };
-
         // Owned-loop backends (OpenRouter) suspend the turn on a foreground
         // question instead of inline-waiting and entering AwaitingHost.
         let owns_turn_loop = !background && orch.process_state.run_owns_turn_loop(&ctx.run_id);
 
         let now = chrono::Utc::now().timestamp() as i32;
-        let prompt_id = uuid::Uuid::new_v4().to_string();
+        let prompt_id = ids::mint_child(&ctx.run_id);
         let questions_json = serde_json::to_string(&payload.questions).unwrap_or_default();
         // Originating `write` tool_use id. Persisted so the slow-path (>45s)
         // resume can attach a synthetic tool_result to the same Question call
@@ -83,9 +92,7 @@ pub async fn ask_questions(
         // Current turn ID for this run (used to yield/resume in the foreground path).
         let current_turn_id = orch.process_state.get_current_turn_id(&ctx.run_id);
 
-        let insert_result = orch
-            .db
-            .local
+        let insert_result = owning_db
             .write(|conn| {
                 let prompt_id = prompt_id.clone();
                 let run_id = ctx.run_id.clone();
@@ -206,8 +213,7 @@ pub async fn ask_questions(
                 &uri_segment,
             );
             if let Ok(issue_ctx) =
-                crate::orchestrator::attention::read_issue_for_attention(&orch.db.local, issue_id)
-                    .await
+                crate::orchestrator::attention::read_issue_for_attention(&owning_db, issue_id).await
             {
                 // Push the question to the issue's watchers (CAIRN-1887): a
                 // `wake` + `event` push keyed `question:{issue}`, ref'd to the
@@ -216,7 +222,7 @@ pub async fn ask_questions(
                 // and the desktop toast.
                 let issue_uri = issue_ctx.issue_uri();
                 match crate::orchestrator::attention_delivery::push_to_issue_watchers(
-                    &orch.db.local,
+                    &owning_db,
                     &issue_uri,
                     Some(ctx.job_id.as_str()),
                     &detail_uri,
@@ -273,7 +279,7 @@ pub async fn ask_questions(
         }
 
         let issue_title = match ctx.issue_id.as_deref() {
-            Some(issue_id) => get_issue_title(&orch.db.local, issue_id).await,
+            Some(issue_id) => get_issue_title(&owning_db, issue_id).await,
             None => None,
         };
         if yielded_turn {
@@ -303,7 +309,7 @@ pub async fn ask_questions(
         "db-change",
         serde_json::json!({"table": "prompts", "action": "insert"}),
     );
-    let run_job_id = crate::messages::side_channel::job_id_for_run(&orch.db.local, &run_id).await;
+    let run_job_id = crate::messages::side_channel::job_id_for_run(&owning_db, &run_id).await;
     let _ = services.emitter.emit(
         "db-change",
         crate::notify::run_db_change_ids("update", &run_id, run_job_id.as_deref()),
@@ -392,7 +398,7 @@ pub async fn ask_questions(
             // Create successor turn for the prompt response and transition run back to Running
             if let Some(ref pred_turn_id) = current_turn_id {
                 match ensure_and_start_successor_turn(
-                    &orch.db.local,
+                    &owning_db,
                     &run_id,
                     pred_turn_id,
                     TurnStartReason::PromptResponse,
@@ -412,11 +418,9 @@ pub async fn ask_questions(
             // Run stays Live — no status change needed on prompt response.
             // The successor turn handles the semantic state change.
 
-            match issue_id_for_run(&orch.db.local, &run_id).await {
+            match issue_id_for_run(&owning_db, &run_id).await {
                 Ok(Some(issue_id)) => {
-                    if let Err(e) =
-                        recompute_issue_status_for_issue(&orch.db.local, &issue_id).await
-                    {
+                    if let Err(e) = recompute_issue_status_for_issue(&owning_db, &issue_id).await {
                         log::warn!("Failed to recompute issue status {}: {}", issue_id, e);
                     }
                     // Answer recorded — attention likely cleared; wake `watch`.
@@ -428,7 +432,7 @@ pub async fn ask_questions(
                 }
             }
             let run_job_id =
-                crate::messages::side_channel::job_id_for_run(&orch.db.local, &run_id).await;
+                crate::messages::side_channel::job_id_for_run(&owning_db, &run_id).await;
             let _ = services.emitter.emit(
                 "db-change",
                 crate::notify::run_db_change_ids("update", &run_id, run_job_id.as_deref()),
@@ -707,9 +711,17 @@ pub async fn answer_prompt_id(
     let now = chrono::Utc::now().timestamp();
     let prompt_id_owned = prompt_id.to_string();
     let response_for_db = response.clone();
-    let resume = orch
-        .db
-        .local
+    // Resolve the owning database ONCE (fail-closed, CAIRN-2227): a team
+    // execution's `prompts` row — with the successor turn and issue-status
+    // recompute `record_prompt_response_conn` performs in the same write — lives
+    // wholly in the synced replica. Writing the private DB instead would no-op
+    // against an absent row and the run would never resume. The resume mechanics
+    // (store_tool_result_event_with_turn / continue_job_impl) self-route by
+    // run/job; wake/emit side effects stay host-local.
+    let owning_db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let resume = owning_db
         .write(|conn| {
             let prompt_id = prompt_id_owned.clone();
             let response = response_for_db.clone();
@@ -807,9 +819,13 @@ async fn lookup_prompt_for_node_question(
     let project_key = project_key.to_string();
     let node_segment = node_segment.to_string();
     let prompt_segment = prompt_segment.to_string();
-    orch.db
-        .local
-        .read(|conn| {
+    // Route the node-URI answer path by project (CAIRN-2229): a team issue's
+    // prompt row lives in the synced replica, so resolving the prompt id from its
+    // node coordinates must read the replica, not the private DB — a private read
+    // raises `question not found` and the answer never reaches the routed,
+    // fail-closed `answer_prompt_id`. A local project resolves to the private DB.
+    let db = orch.db.for_project(&project_key).await;
+    db.read(|conn| {
             let project_key = project_key.clone();
             let node_segment = node_segment.clone();
             let prompt_segment = prompt_segment.clone();
@@ -974,7 +990,7 @@ async fn ensure_prompt_successor_turn_conn(
         .i64(0)?;
 
     let now = chrono::Utc::now().timestamp();
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id = ids::mint_child(job_id);
     let state = TurnState::Pending.to_string();
     let start_reason = TurnStartReason::PromptResponse.to_string();
 

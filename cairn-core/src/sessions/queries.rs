@@ -2,11 +2,11 @@
 
 use crate::models::{Session, SessionStatus};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use cairn_common::ids;
 use turso::params;
-use uuid::Uuid;
 
 pub async fn create_for_job(db: &LocalDb, job_id: &str, backend: &str) -> Result<Session, String> {
-    let id = Uuid::new_v4().to_string();
+    let id = ids::mint_session_id().into_string();
     create_with_id(db, &id, Some(job_id), None, backend).await
 }
 
@@ -228,7 +228,7 @@ async fn rotate_session(
 ) -> Result<Session, String> {
     let source = source.clone();
     let job_id = job_id.to_string();
-    let new_id = Uuid::new_v4().to_string();
+    let new_id = ids::mint_session_id().into_string();
     // The successor inherits the source backend unless a switch was requested.
     let backend = target_backend.unwrap_or_else(|| source.backend.clone());
 

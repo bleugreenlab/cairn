@@ -39,10 +39,10 @@ pub(crate) async fn current_run_project(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
 ) -> Option<(String, Option<PathBuf>)> {
-    let ctx = super::run_context::lookup_run(&orch.db.local, request)
+    let (ctx, db) = super::run_context::lookup_run_routed(&orch.db, request)
         .await
         .ok()?;
-    let path = super::run_context::project_path(&orch.db.local, &ctx.project_id)
+    let path = super::run_context::project_path(&db, &ctx.project_id)
         .await
         .ok()
         .flatten()

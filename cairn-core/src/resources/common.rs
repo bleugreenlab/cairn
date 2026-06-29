@@ -74,7 +74,7 @@ pub(super) fn storage_error(context: &str, error: DbError) -> String {
 }
 
 pub(super) async fn resolve_home_relative_resource_uri(
-    db: &LocalDb,
+    dbs: &crate::db::DbState,
     request: &McpCallbackRequest,
     uri: &str,
 ) -> Result<String, String> {
@@ -85,7 +85,9 @@ pub(super) async fn resolve_home_relative_resource_uri(
         return Ok(uri.to_string());
     };
 
-    let home_uri = crate::mcp::handlers::run_context::lookup_home_uri(db, request).await?;
+    // Route the run lookup across every open database so a `cairn:~/` target
+    // resolves to the home URI in whichever DB the run lives (CAIRN-2132).
+    let home_uri = crate::mcp::handlers::run_context::lookup_home_uri_routed(dbs, request).await?;
     if suffix.is_empty() {
         Ok(home_uri)
     } else {
@@ -98,7 +100,10 @@ pub(super) async fn connect_for_read(db: &LocalDb) -> Result<turso::Connection, 
         .connect()
         .await
         .map_err(|error| storage_error("Database error", error))?;
-    conn.execute("BEGIN CONCURRENT", ())
+    // Backend-aware: a synced (non-MVCC) replica cannot run `BEGIN CONCURRENT`,
+    // so route through the one source of truth for the begin statement on this
+    // handle (plain `BEGIN` on synced, `BEGIN CONCURRENT` on local).
+    conn.execute(db.concurrent_begin(), ())
         .await
         .map_err(|error| storage_error("Database error", error.into()))?;
     Ok(conn)

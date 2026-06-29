@@ -42,9 +42,11 @@ pub const ALWAYS_DISALLOWED_TOOLS: &[&str] = &[
     "ExitWorktree",
     "ListMcpResourcesTool",
     "ReadMcpResourceTool",
+    "ReadMcpResourceDirTool",
     "Monitor",
     "TaskStop",
     "PushNotification",
+    "SendMessage",
     "DesignSync",
     "Workflow",
 ];

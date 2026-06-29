@@ -348,6 +348,19 @@ pub fn validate_read_path(
     resolve_file_target_internal(worktree_path, file_uri, false, true, true)
 }
 
+/// Resolve a file URI for a read operation without requiring the target to exist.
+///
+/// Branch-scoped reads serve bytes from a VCS object rather than the current
+/// working tree, so the current checkout cannot be the existence oracle. This
+/// keeps the same URI normalization and absolute-path rules as `validate_read_path`
+/// while deferring existence/type checks to the requested ref.
+pub fn resolve_read_target_lenient(
+    worktree_path: &Path,
+    file_uri: &str,
+) -> Result<ResolvedFileTarget, String> {
+    resolve_file_target_internal(worktree_path, file_uri, false, false, true)
+}
+
 /// True if `full_path` resolves outside `worktree_path`. For a not-yet-existing
 /// path the nearest existing ancestor is checked, matching how new-file writes
 /// are jailed. Permissive on resolution failure: returns false (no fence) when

@@ -4,7 +4,6 @@
 use crate::issues::{crud, relations};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use crate::sync::SyncMessage;
 use turso::params;
 
 /// Collect the run ids belonging to an issue so their live sessions can be
@@ -39,11 +38,20 @@ async fn run_ids_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<String>, 
 /// Tauri command and the resource `delete` mutation both call it so they perform
 /// identical side effects.
 pub async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), String> {
+    // The issue row lives in its owning database (CAIRN-2181): the private DB for
+    // a local project, the team replica for a team project. The URI lookup and
+    // the row delete must target that DB; the run-kill + worktree teardown below
+    // stay private (runs/jobs are job-keyed execution infra — CAIRN-2182).
+    let owning_db = crud::owning_db_for_issue(&orch.db, issue_id)
+        .await
+        .map_err(|e| e.to_string())?;
+
     // Resolve the canonical URI before the row is gone; used to evict the
     // issue's embedding from the corpus.
-    let issue_uri = relations::issue_uri_for_id_db(&orch.db.local, issue_id)
+    let issue_uri = relations::issue_uri_for_id_db(&owning_db, issue_id)
         .await
         .ok();
+    // content→execution boundary (CAIRN-2181): runs/teardown stay private.
     let run_ids = run_ids_for_issue(&orch.db.local, issue_id).await?;
 
     crate::execution::teardown::teardown_worktrees(
@@ -56,7 +64,7 @@ pub async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), Str
         let _ = crate::orchestrator::lifecycle::kill_session(orch, run_id);
     }
 
-    crud::delete_db(&orch.db.local, issue_id)
+    crud::delete_db(&owning_db, issue_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -64,10 +72,6 @@ pub async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), Str
         orch.enqueue_resource_delete(uri);
     }
 
-    orch.sync(SyncMessage::Delete {
-        table: "issues".to_string(),
-        id: issue_id.to_string(),
-    });
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "issues", "action": "delete"}),

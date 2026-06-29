@@ -19,6 +19,7 @@ use crate::agent_process::stream::{OutputTokensDetails, ToolUseInfo, TranscriptE
 use crate::models::ContextTokenState;
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
+use crate::storage::LocalDb;
 use crate::transcripts::stream_store::append_chunks;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -195,6 +196,7 @@ impl CodexBackend {
         oauth_state: Option<Arc<Mutex<CodexAuthState>>>,
         initial_sequence: i32,
         backend_key: String,
+        run_db: Arc<LocalDb>,
     ) {
         log::debug!("codex_app_server: reader started");
         let mut sequence: i32 = initial_sequence;
@@ -272,6 +274,7 @@ impl CodexBackend {
         };
         store_event(
             orch,
+            &run_db,
             emitter,
             run_id,
             session_id.as_deref(),
@@ -292,6 +295,7 @@ impl CodexBackend {
                         Some("item/commandExecution/requestApproval") => {
                             handle_codex_approval_request(
                                 orch,
+                                &run_db,
                                 run_id,
                                 "codex/command_execution",
                                 msg.get("params").cloned().unwrap_or(Value::Null),
@@ -305,6 +309,7 @@ impl CodexBackend {
                         }
                         Some("item/fileRead/requestApproval") => handle_codex_approval_request(
                             orch,
+                            &run_db,
                             run_id,
                             "codex/file_read",
                             msg.get("params").cloned().unwrap_or(Value::Null),
@@ -314,6 +319,7 @@ impl CodexBackend {
                         ),
                         Some("item/mcpToolCall/requestApproval") => handle_codex_approval_request(
                             orch,
+                            &run_db,
                             run_id,
                             "codex/mcp_tool_call",
                             msg.get("params").cloned().unwrap_or(Value::Null),
@@ -323,6 +329,7 @@ impl CodexBackend {
                         ),
                         Some("item/permissions/requestApproval") => handle_codex_approval_request(
                             orch,
+                            &run_db,
                             run_id,
                             "codex/permissions",
                             msg.get("params").cloned().unwrap_or(Value::Null),
@@ -333,6 +340,7 @@ impl CodexBackend {
                         Some("mcpServer/elicitation/request") => {
                             handle_codex_mcp_server_elicitation_request(
                                 orch,
+                                &run_db,
                                 run_id,
                                 msg.get("params").cloned().unwrap_or(Value::Null),
                                 client.as_ref(),
@@ -461,6 +469,7 @@ impl CodexBackend {
                     if let Some(delta) = extract_app_server_delta(&msg) {
                         handle_agent_message_delta(
                             orch,
+                            &run_db,
                             emitter,
                             run_id,
                             session_id.as_deref(),
@@ -474,6 +483,7 @@ impl CodexBackend {
                     if let Some(text) = extract_app_server_delta(&msg) {
                         handle_reasoning_delta(
                             orch,
+                            &run_db,
                             emitter,
                             run_id,
                             session_id.as_deref(),
@@ -491,6 +501,7 @@ impl CodexBackend {
                             "commandExecution" => {
                                 finalize_streaming(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     &mut streaming_state,
                                     session_id.as_deref(),
@@ -536,6 +547,7 @@ impl CodexBackend {
                                 };
                                 store_event(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
@@ -547,6 +559,7 @@ impl CodexBackend {
                             "fileChange" => {
                                 finalize_streaming(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     &mut streaming_state,
                                     session_id.as_deref(),
@@ -593,6 +606,7 @@ impl CodexBackend {
                                 };
                                 store_event(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
@@ -604,6 +618,7 @@ impl CodexBackend {
                             "mcpToolCall" => {
                                 finalize_streaming(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     &mut streaming_state,
                                     session_id.as_deref(),
@@ -654,6 +669,7 @@ impl CodexBackend {
                                 };
                                 store_event(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
@@ -690,6 +706,7 @@ impl CodexBackend {
                                     }
                                     finalize_agent_message(
                                         orch,
+                                        &run_db,
                                         emitter,
                                         run_id,
                                         session_id.as_deref(),
@@ -716,6 +733,7 @@ impl CodexBackend {
                                 );
                                 store_event(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
@@ -745,6 +763,7 @@ impl CodexBackend {
                                 );
                                 store_event(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
@@ -774,6 +793,7 @@ impl CodexBackend {
                                 );
                                 store_event(
                                     orch,
+                                    &run_db,
                                     emitter,
                                     run_id,
                                     session_id.as_deref(),
@@ -795,6 +815,7 @@ impl CodexBackend {
                                 {
                                     store_event(
                                         orch,
+                                        &run_db,
                                         emitter,
                                         run_id,
                                         session_id.as_deref(),
@@ -823,7 +844,7 @@ impl CodexBackend {
                             if state.acc.content_is_empty() {
                                 state.acc.push_content(&text);
                                 match append_chunks(
-                                    orch.db.local.clone(),
+                                    run_db.clone(),
                                     &state.stream_id,
                                     state.version,
                                     &state.acc.take_pending(),
@@ -860,6 +881,7 @@ impl CodexBackend {
                             };
                             store_event(
                                 orch,
+                                &run_db,
                                 emitter,
                                 run_id,
                                 session_id.as_deref(),
@@ -878,6 +900,7 @@ impl CodexBackend {
                         .unwrap_or("completed");
                     handle_turn_completed(
                         orch,
+                        &run_db,
                         emitter,
                         run_id,
                         session_id.as_deref(),
@@ -896,6 +919,7 @@ impl CodexBackend {
                 Some("turn/aborted") => {
                     finalize_streaming(
                         orch,
+                        &run_db,
                         emitter,
                         &mut streaming_state,
                         session_id.as_deref(),
@@ -910,7 +934,7 @@ impl CodexBackend {
                     match reason {
                         "interrupted" | "replaced" | "review_ended" => {
                             log::info!("codex turn aborted ({}), handling interrupt", reason);
-                            handle_codex_interrupted_turn(orch, emitter, run_id);
+                            handle_codex_interrupted_turn(orch, &run_db, emitter, run_id);
                             client.shutdown();
                         }
                         _ => {
@@ -948,6 +972,7 @@ impl CodexBackend {
                         log::error!("Codex fatal error: {}", message);
                         finalize_streaming(
                             orch,
+                            &run_db,
                             emitter,
                             &mut streaming_state,
                             session_id.as_deref(),
@@ -1023,6 +1048,7 @@ impl CodexBackend {
         watchdog_alive.store(false, Ordering::Release);
         finalize_streaming(
             orch,
+            &run_db,
             emitter,
             &mut streaming_state,
             session_id.as_deref(),

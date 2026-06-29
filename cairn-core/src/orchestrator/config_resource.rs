@@ -8,14 +8,14 @@ use crate::storage::{run_db_blocking, RowExt};
 
 use super::Orchestrator;
 
-async fn all_project_paths_from_db(
+async fn project_paths_from_db(
     db: std::sync::Arc<crate::storage::LocalDb>,
-) -> Result<Vec<(String, PathBuf)>, String> {
+) -> Result<Vec<(String, String, PathBuf)>, String> {
     db.read(|conn| {
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, repo_path
+                    "SELECT id, name, repo_path
                      FROM projects
                      WHERE COALESCE(is_workspace, 0) = 0
                      ORDER BY name ASC",
@@ -24,7 +24,7 @@ async fn all_project_paths_from_db(
                 .await?;
             let mut projects = Vec::new();
             while let Some(row) = rows.next().await? {
-                projects.push((row.text(0)?, PathBuf::from(row.text(1)?)));
+                projects.push((row.text(0)?, row.text(1)?, PathBuf::from(row.text(2)?)));
             }
             Ok(projects)
         })
@@ -34,33 +34,48 @@ async fn all_project_paths_from_db(
 }
 
 impl Orchestrator {
-    /// List all project (id, repo_path) pairs from DB.
+    /// List all project (id, repo_path) pairs across every open database — the
+    /// private DB plus each open team replica — so a team project's recipes,
+    /// agents, and skills are listed. A team project's `projects` row lives in
+    /// its team replica, not the private DB (CAIRN-2126/2129 routing), so a
+    /// private-only read silently dropped team projects (CAIRN-2194). Deduped by
+    /// id and name-sorted to match the project-list ordering.
     pub(crate) fn all_project_paths(&self) -> Result<Vec<(String, PathBuf)>, String> {
-        let db = self.db.local.clone();
-        run_db_blocking(move || all_project_paths_from_db(db))
+        let dbs = self.db.clone();
+        run_db_blocking(move || async move {
+            let mut seen = HashSet::new();
+            let mut rows: Vec<(String, String, PathBuf)> = Vec::new();
+            for db in dbs.all_dbs().await {
+                for (id, name, path) in project_paths_from_db(db).await? {
+                    if seen.insert(id.clone()) {
+                        rows.push((id, name, path));
+                    }
+                }
+            }
+            rows.sort_by(|a, b| a.1.cmp(&b.1));
+            Ok(rows
+                .into_iter()
+                .map(|(id, _name, path)| (id, path))
+                .collect())
+        })
     }
 
-    /// Resolve project_id → repo path from DB.
+    /// Resolve project_id → repo path across every open database. A team
+    /// project's `projects` row lives in its team replica, not the private DB,
+    /// so this routes through `owning_db` to find whichever open database holds
+    /// the row (CAIRN-2194); a private-only read returned `Project not found`
+    /// for a team project, which emptied the recipe/agent/skill pickers.
     pub(crate) fn project_path(&self, project_id: &str) -> Result<PathBuf, String> {
-        let db = self.db.local.clone();
+        let dbs = self.db.clone();
         let project_id = project_id.to_string();
         let missing_id = project_id.clone();
         let path = run_db_blocking(move || async move {
-            db.read(|conn| {
-                Box::pin(async move {
-                    let mut rows = conn
-                        .query(
-                            "SELECT repo_path
-                             FROM projects
-                             WHERE id = ?1",
-                            (project_id.as_str(),),
-                        )
-                        .await?;
-                    crate::storage::next_text(&mut rows, 0).await
-                })
-            })
-            .await
-            .map_err(|e| e.to_string())
+            let db = crate::projects::crud::owning_db(&dbs, &project_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::projects::crud::repo_path(&db, &project_id)
+                .await
+                .map_err(|e| e.to_string())
         })?;
 
         path.map(PathBuf::from)
@@ -728,13 +743,13 @@ fn title_case(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::all_project_paths_from_db;
+    use super::project_paths_from_db;
     use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
     use std::sync::Arc;
     use tempfile::tempdir;
 
     #[tokio::test]
-    async fn all_project_paths_excludes_workspace_project() {
+    async fn project_paths_from_db_excludes_workspace_project() {
         let temp = tempdir().unwrap();
         let db = LocalDb::open(temp.path().join("cairn.db")).await.unwrap();
         MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
@@ -757,13 +772,129 @@ mod tests {
             })
         }).await.unwrap();
 
-        let paths = all_project_paths_from_db(Arc::new(db)).await.unwrap();
+        let paths: Vec<(String, std::path::PathBuf)> = project_paths_from_db(Arc::new(db))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _name, path)| (id, path))
+            .collect();
         assert_eq!(
             paths,
             vec![(
                 "project".to_string(),
                 std::path::PathBuf::from("/tmp/project")
             )]
+        );
+    }
+
+    /// CAIRN-2194: a team project's `projects` row lives only in its team
+    /// replica, never the private DB. `project_path` must route through every
+    /// open database (via `owning_db`) to resolve it, and `all_project_paths`
+    /// must union team projects into its result — otherwise the recipe, agent,
+    /// and skill pickers come up empty on a team-project issue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn project_path_resolves_team_project_in_open_replica() {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let local = Arc::new(crate::storage::migrated_test_db("cfg-local.db").await);
+        let team = Arc::new(crate::storage::migrated_test_db("cfg-team.db").await);
+        // Seed the team project ONLY in the team replica, exactly as routed
+        // creation does — the private DB never carries this row.
+        team.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
+                     VALUES ('team1~00000000-0000-4000-8000-000000000001', 'default', 'Team Project', 'TEAM', '/tmp/team-repo', 1, 1, 0)",
+                    (),
+                ).await?;
+                Ok(())
+            })
+        }).await.unwrap();
+
+        let index =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let dbs = Arc::new(DbState::new(local, index));
+        dbs.insert_team_db_for_test("team1", team.clone()).await;
+
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch = OrchestratorBuilder::new(dbs, services, config_dir).build();
+
+        // Resolves through the open replica rather than erroring "not found".
+        assert_eq!(
+            orch.project_path("team1~00000000-0000-4000-8000-000000000001")
+                .unwrap(),
+            std::path::PathBuf::from("/tmp/team-repo")
+        );
+        // And the union list includes the team project.
+        let all = orch.all_project_paths().unwrap();
+        assert!(
+            all.contains(&(
+                "team1~00000000-0000-4000-8000-000000000001".to_string(),
+                std::path::PathBuf::from("/tmp/team-repo")
+            )),
+            "all_project_paths should union team projects: {all:?}"
+        );
+    }
+
+    /// The picker chain end-to-end: `list_recipes_for_context` for a team
+    /// project must return the inherited workspace recipes instead of bailing
+    /// with the propagated "Project not found" that emptied the picker.
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_recipes_for_context_resolves_team_project() {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        // A workspace recipe that every project context inherits.
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        std::fs::write(
+            config_dir.join("recipes").join("build.yaml"),
+            "cairnVersion: 1\nname: Build\ntrigger: issue\ncontext: issue\n\nnodes:\n  - id: trigger-1\n    type: trigger\n    name: Trigger\n    position: 0@0\n\nedges: []\n",
+        )
+        .unwrap();
+
+        let local = Arc::new(crate::storage::migrated_test_db("recipe-local.db").await);
+        let team = Arc::new(crate::storage::migrated_test_db("recipe-team.db").await);
+        let team_repo = temp.path().join("team-repo");
+        std::fs::create_dir_all(&team_repo).unwrap();
+        let repo_path = team_repo.to_str().unwrap().to_string();
+        team.write(move |conn| {
+            let repo_path = repo_path.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
+                     VALUES ('team1~00000000-0000-4000-8000-000000000001', 'default', 'Team Project', 'TEAM', ?1, 1, 1, 0)",
+                    (repo_path.as_str(),),
+                ).await?;
+                Ok(())
+            })
+        }).await.unwrap();
+
+        let index =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let dbs = Arc::new(DbState::new(local, index));
+        dbs.insert_team_db_for_test("team1", team.clone()).await;
+
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch = OrchestratorBuilder::new(dbs, services, config_dir).build();
+
+        let recipes = orch
+            .list_recipes_for_context("team1~00000000-0000-4000-8000-000000000001")
+            .unwrap();
+        assert!(
+            recipes.iter().any(|r| r.id == "build"),
+            "team-project context should inherit the workspace 'build' recipe: {:?}",
+            recipes.iter().map(|r| r.id.clone()).collect::<Vec<_>>()
         );
     }
 

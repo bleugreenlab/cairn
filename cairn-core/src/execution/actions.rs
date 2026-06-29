@@ -15,6 +15,7 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
+use cairn_common::ids;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -44,8 +45,9 @@ pub async fn load_action_node(
     action_run_id: &str,
     execution_id: &str,
 ) -> Result<RecipeNode, String> {
-    let node_id = action_run_node_id(&orch.db.local, action_run_id).await?;
-    let snapshot = load_execution_snapshot(&orch.db.local, execution_id).await?;
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
+    let node_id = action_run_node_id(&db, action_run_id).await?;
+    let snapshot = load_execution_snapshot(&db, execution_id).await?;
 
     snapshot
         .recipe
@@ -63,8 +65,9 @@ pub async fn find_worktree_for_action_run(
     orch: &Orchestrator,
     action_run_id: &str,
 ) -> Result<String, String> {
-    let execution_id = action_run_execution_id(&orch.db.local, action_run_id).await?;
-    let worktree = first_worktree_for_execution(&orch.db.local, &execution_id).await?;
+    let db = crate::execution::routing::owning_db_for_action_run(&orch.db, action_run_id).await?;
+    let execution_id = action_run_execution_id(&db, action_run_id).await?;
+    let worktree = first_worktree_for_execution(&db, &execution_id).await?;
 
     worktree.ok_or_else(|| "No worktree found for action checkpoint".to_string())
 }
@@ -79,6 +82,7 @@ pub async fn complete_action_run(
     node: &RecipeNode,
     result: Option<serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, String> {
+    let db = crate::execution::routing::owning_db_for_action_run(&orch.db, action_run_id).await?;
     let now = chrono::Utc::now().timestamp() as i32;
     let output_json = result.as_ref().map(|v| v.to_string());
 
@@ -89,7 +93,7 @@ pub async fn complete_action_run(
     // being a job. Resolution flips it to Complete. See CAIRN-1220.
     if node.node_type == crate::models::RecipeNodeType::Pr {
         update_action_run_status(
-            &orch.db.local,
+            &db,
             action_run_id,
             ActionRunStatus::Blocked,
             output_json.as_deref(),
@@ -106,7 +110,7 @@ pub async fn complete_action_run(
         // sweep recomputes attention even with no job-status changes, but only
         // emits/wakes when a job flips — so emit the issue change and wake any
         // in-flight `cairn watch` explicitly here.
-        let pr_action_run = get_action_run(&orch.db.local, action_run_id).await?;
+        let pr_action_run = get_action_run(&db, action_run_id).await?;
         crate::execution::advancement::recompute_execution_jobs(orch, &pr_action_run.execution_id)?;
         for table in ["issues", "executions"] {
             let _ = orch.services.emitter.emit(
@@ -121,7 +125,7 @@ pub async fn complete_action_run(
     }
 
     // Mark action_run as complete
-    update_action_run_complete(&orch.db.local, action_run_id, output_json.as_deref(), now).await?;
+    update_action_run_complete(&db, action_run_id, output_json.as_deref(), now).await?;
 
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -165,8 +169,11 @@ pub async fn execute_action_node(
         .clone()
         .ok_or("Action node has no action config")?;
 
-    // Look up the ActionConfig
-    let action_config = get_action_config_for_node(orch, &node_config).await?;
+    // Look up the ActionConfig (a team project's action_configs live in its replica).
+    let action_db =
+        crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+            .await?;
+    let action_config = get_action_config_for_node(&action_db, &node_config).await?;
 
     // Execute the action
     let result = if action_config.is_builtin {
@@ -189,12 +196,13 @@ async fn get_action_run_for_orchestrator(
     orch: &Orchestrator,
     action_run_id: &str,
 ) -> Result<ActionRun, String> {
-    get_action_run(&orch.db.local, action_run_id).await
+    let db = crate::execution::routing::owning_db_for_action_run(&orch.db, action_run_id).await?;
+    get_action_run(&db, action_run_id).await
 }
 
 /// Get the ActionConfig for a node.
 async fn get_action_config_for_node(
-    orch: &Orchestrator,
+    db: &LocalDb,
     node_config: &ActionNodeConfig,
 ) -> Result<ActionConfig, String> {
     // Try action_config_id first
@@ -217,7 +225,7 @@ async fn get_action_config_for_node(
         ));
     }
 
-    get_action_config(&orch.db.local, &config_id).await
+    get_action_config(db, &config_id).await
 }
 
 /// Execute a built-in action.
@@ -246,10 +254,12 @@ pub async fn handle_pr_node(
     action_run: &ActionRun,
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
     let (worktree_path, branch_name, base_branch) =
         find_implementation_context(orch, action_run).await?;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
-    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+    let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
     let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
@@ -266,7 +276,7 @@ pub async fn handle_pr_node(
     // the post-open call updates this same row with the GitHub url/number/state;
     // the backend refresh fills in live mergeability/checks.
     upsert_merge_request_for_pr(
-        &orch.db.local,
+        &db,
         &action_run.id,
         &action_run.project_id,
         action_run.issue_id.as_deref(),
@@ -306,7 +316,7 @@ pub async fn handle_pr_node(
 
     let now = chrono::Utc::now().timestamp() as i32;
     upsert_merge_request_for_pr(
-        &orch.db.local,
+        &db,
         &action_run.id,
         &action_run.project_id,
         action_run.issue_id.as_deref(),
@@ -320,7 +330,7 @@ pub async fn handle_pr_node(
     )
     .await?;
     crate::pr_data::ports::fire_pr_node_port(
-        &orch.db.local,
+        &db,
         &action_run.execution_id,
         &action_run.recipe_node_id,
         "open",
@@ -400,9 +410,11 @@ async fn resolve_action_inputs(
     action_run: &ActionRun,
 ) -> Result<HashMap<String, serde_json::Value>, String> {
     let mut inputs = HashMap::new();
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
 
     // Load recipe data from execution snapshot
-    let snapshot = load_execution_snapshot(&orch.db.local, &action_run.execution_id).await?;
+    let snapshot = load_execution_snapshot(&db, &action_run.execution_id).await?;
     let nodes = &snapshot.recipe.nodes;
     let edges = &snapshot.recipe.edges;
 
@@ -425,7 +437,7 @@ async fn resolve_action_inputs(
             if source_node.node_type.to_string() == "trigger" {
                 // Build context from issue
                 if let Some(issue_id) = &action_run.issue_id {
-                    let (title, description) = issue_title_description(&orch.db.local, issue_id)
+                    let (title, description) = issue_title_description(&db, issue_id)
                         .await
                         .unwrap_or(("Unknown".to_string(), None));
 
@@ -456,12 +468,9 @@ async fn resolve_action_inputs(
 
             if source_node.node_type.to_string() == "action" {
                 // Get output from action_run
-                if let Some(output) = source_action_output(
-                    &orch.db.local,
-                    &action_run.execution_id,
-                    &edge.source_node_id,
-                )
-                .await?
+                if let Some(output) =
+                    source_action_output(&db, &action_run.execution_id, &edge.source_node_id)
+                        .await?
                 {
                     if let Ok(data) = serde_json::from_str(&output) {
                         inputs.insert(edge.target_handle.clone(), data);
@@ -472,12 +481,8 @@ async fn resolve_action_inputs(
         }
 
         // Find source job for agent nodes
-        let source_job = source_job_for_node(
-            &orch.db.local,
-            &action_run.execution_id,
-            &edge.source_node_id,
-        )
-        .await?;
+        let source_job =
+            source_job_for_node(&db, &action_run.execution_id, &edge.source_node_id).await?;
 
         if let Some(source_job) = source_job {
             // Key the load by the producer's resolved terminal CONTRACT name
@@ -487,8 +492,7 @@ async fn resolve_action_inputs(
             // versioned ctx-self doc (e.g. `plan`) wins the fallback and opens
             // the PR with the wrong title/body (CAIRN-1953).
             let terminal_name =
-                producer_terminal_artifact_name(&orch.db.local, &snapshot, &edge.source_node_id)
-                    .await?;
+                producer_terminal_artifact_name(&db, &snapshot, &edge.source_node_id).await?;
             let ctx_self_names: Vec<String> =
                 crate::execution::jobs::resolve_ctx_self_schemas_with_snapshot(
                     &snapshot,
@@ -502,8 +506,7 @@ async fn resolve_action_inputs(
                 .unwrap_or(edge.source_handle.as_str());
 
             if let Some(artifact) =
-                latest_artifact_for_job(&orch.db.local, &source_job.id, load_name, &ctx_self_names)
-                    .await?
+                latest_artifact_for_job(&db, &source_job.id, load_name, &ctx_self_names).await?
             {
                 if let Some(field_value) = artifact.data.get(&edge.source_handle) {
                     inputs.insert(edge.target_handle.clone(), field_value.clone());
@@ -578,15 +581,17 @@ async fn commit_triage_ledger_if_needed(
     let Some(issue_id) = action_run.issue_id.as_deref() else {
         return Ok(());
     };
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
 
-    let memories = crate::memories::db::triage_batch_memories_for_issue(&orch.db.local, issue_id)
+    let memories = crate::memories::db::triage_batch_memories_for_issue(&db, issue_id)
         .await
         .map_err(|error| format!("Failed to load memory triage batch: {error}"))?;
     if memories.is_empty() {
         return Ok(());
     }
 
-    let issue = crate::issues::crud::get(&orch.db.local, issue_id)
+    let issue = crate::issues::crud::get(&db, issue_id)
         .await
         .map_err(|error| format!("Failed to load memory triage issue: {error}"))?
         .ok_or_else(|| format!("Memory triage issue not found: {issue_id}"))?;
@@ -670,11 +675,13 @@ async fn handle_create_pr(
     action_run: &ActionRun,
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<Option<serde_json::Value>, String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
     let (worktree_path, branch_name, base_branch) =
         find_implementation_context(orch, action_run).await?;
     let (title, body) = extract_pr_details(&inputs, orch, action_run).await?;
 
-    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+    let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
     let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
@@ -706,7 +713,7 @@ async fn handle_create_pr(
         .as_deref()
         .ok_or("Action run has no parent_job_id")?;
     upsert_merge_request_for_pr(
-        &orch.db.local,
+        &db,
         parent_job_id,
         &action_run.project_id,
         action_run.issue_id.as_deref(),
@@ -734,7 +741,7 @@ async fn handle_create_pr(
     // is this same commit — and the shared creator's fingerprint-dedup collapses
     // them to exactly one wake. Fires for local PRs too (no webhook ever comes).
     if let Ok(head_sha) = vcs.head_sha(&worktree_path) {
-        if let Err(e) = set_mr_head_sha(&orch.db.local, parent_job_id, &head_sha).await {
+        if let Err(e) = set_mr_head_sha(&db, parent_job_id, &head_sha).await {
             log::warn!(
                 "Failed to record merge_request head_sha for job {}: {}",
                 parent_job_id,
@@ -947,6 +954,8 @@ async fn handle_merge_pr(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
     // Block a premature merge before touching GitHub: if the issue still has
     // active reviewers/jobs, fail the action rather than resolve it out from
     // under them.
@@ -955,7 +964,7 @@ async fn handle_merge_pr(
     }
 
     let (_worktree_path, branch_name, _) = find_implementation_context(orch, action_run).await?;
-    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+    let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
@@ -991,13 +1000,15 @@ async fn handle_close_pr(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<Option<serde_json::Value>, String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
     let (worktree_path, branch_name, _) = find_implementation_context(orch, action_run).await?;
-    let repo_path = project_repo_path(&orch.db.local, &action_run.project_id)
+    let repo_path = project_repo_path(&db, &action_run.project_id)
         .await?
         .unwrap_or_default();
     let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
     let mr_job_id = find_mr_job_id_for_action(orch, action_run).await?;
-    let pr_number = load_mr_pr_number(&orch.db.local, &mr_job_id).await?;
+    let pr_number = load_mr_pr_number(&db, &mr_job_id).await?;
 
     let output = crate::env::gh()
         .args(close_pr_args(pr_number))
@@ -1013,7 +1024,7 @@ async fn handle_close_pr(
     // Update merge_request status
     let now = chrono::Utc::now().timestamp() as i32;
     {
-        update_merge_request_status(&orch.db.local, &mr_job_id, "closed", now).await?;
+        update_merge_request_status(&db, &mr_job_id, "closed", now).await?;
     }
 
     let _ = orch.services.emitter.emit(
@@ -1036,8 +1047,10 @@ async fn handle_close_issue(
 
     ensure_resolution_not_blocked(orch, issue_id, "closed").await?;
 
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
     crate::issues::crud::resolve(
-        &orch.db.local,
+        &db,
         &*orch.services.clock,
         issue_id,
         crate::transitions::Resolution::Closed,
@@ -1059,7 +1072,9 @@ async fn find_mr_job_id_for_action(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<String, String> {
-    find_mr_job_id_for_execution(&orch.db.local, &action_run.execution_id).await
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
+    find_mr_job_id_for_execution(&db, &action_run.execution_id).await
 }
 
 /// The GitHub PR number recorded for a merge_request owner, if any. `None` for a
@@ -1139,7 +1154,10 @@ async fn extract_pr_details(
 
     // Fall back to issue title/description
     if let Some(issue_id) = &action_run.issue_id {
-        let (title, description) = issue_title_description(&orch.db.local, issue_id).await?;
+        let db =
+            crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+                .await?;
+        let (title, description) = issue_title_description(&db, issue_id).await?;
 
         log::info!("Using issue title/description as PR fallback");
         return Ok((title, description));
@@ -1153,8 +1171,10 @@ async fn find_implementation_context(
     orch: &Orchestrator,
     action_run: &ActionRun,
 ) -> Result<(String, String, Option<String>), String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, &action_run.execution_id)
+        .await?;
     // Load recipe data from execution snapshot
-    let snapshot = load_execution_snapshot(&orch.db.local, &action_run.execution_id).await?;
+    let snapshot = load_execution_snapshot(&db, &action_run.execution_id).await?;
     let edges = snapshot.recipe.edges;
 
     // Find incoming context edges for this action node
@@ -1167,12 +1187,8 @@ async fn find_implementation_context(
 
     // Look for source jobs with branches
     for edge in context_edges {
-        if let Some((wt, branch, base_branch)) = implementation_job_for_node(
-            &orch.db.local,
-            &action_run.execution_id,
-            &edge.source_node_id,
-        )
-        .await?
+        if let Some((wt, branch, base_branch)) =
+            implementation_job_for_node(&db, &action_run.execution_id, &edge.source_node_id).await?
         {
             log::info!("Found implementation context: branch={}", branch);
             return Ok((wt, branch, base_branch));
@@ -1180,8 +1196,7 @@ async fn find_implementation_context(
     }
 
     // Fallback: any complete job with branch in this execution
-    if let Some(context) =
-        latest_complete_implementation_job(&orch.db.local, &action_run.execution_id).await?
+    if let Some(context) = latest_complete_implementation_job(&db, &action_run.execution_id).await?
     {
         return Ok(context);
     }
@@ -1721,7 +1736,7 @@ async fn upsert_merge_request_for_pr(
                 .and_then(|row| row.opt_text(0).ok().flatten())
                 .unwrap_or_else(|| "main".to_string());
             let target_branch = base_branch.as_deref().unwrap_or(&default_branch);
-            let mr_id = uuid::Uuid::new_v4().to_string();
+            let mr_id = ids::mint_child(project_id.as_str());
             let (github_pr_url, github_pr_number, github_state): (
                 Option<String>,
                 Option<i32>,

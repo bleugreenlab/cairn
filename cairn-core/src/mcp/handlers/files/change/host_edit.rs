@@ -206,11 +206,13 @@ fn seal_failure_message(seal_error: &str, restored: Result<(), String>) -> Strin
     if let Err(re) = restored {
         return format!("Save failed and the workspace couldn't be restored: {re}");
     }
-    // "behind its branch tip" is the seal fast-forward refusal: the branch is in a
-    // conflicted/mid-rebase state that `update_stale` can't heal, so retrying does
-    // not help. The other recoverable cases (op-log stale, lost-seal) do clear on
-    // a retry. Keep both terse; the full jj error is in the log.
-    if seal_error.contains("behind its branch tip") {
+    // The conflicted-branch refusal is the seal fast-forward guard rejecting a
+    // seal onto a bookmark whose tip carries a recorded conflict: the branch is in
+    // a conflicted/mid-rebase state that `update_stale` can't heal, so retrying
+    // does not help (a host edit is not a deliberate agent flatten). The other
+    // recoverable cases (op-log stale, lost-seal) do clear on a retry. The shared
+    // classifier is the single source of truth across the run/write/host paths.
+    if crate::jj::is_conflicted_branch_seal_error(seal_error) {
         return "Couldn't save: this worktree's branch is mid-rebase or conflicted, so a \
              direct edit can't be committed here. Nothing was changed."
             .to_string();
@@ -255,8 +257,12 @@ fn finish_commit(
     // treats together (stale OR lost-seal): both recover by advancing onto the
     // current base and re-applying.
     if let Err(seal_error) = &result {
-        let recoverable =
-            crate::jj::is_stale_error(seal_error) || crate::jj::is_lost_seal_error(seal_error);
+        // The conflicted-branch refusal (a divergent `@` over a conflicted
+        // bookmark tip) is NOT stale-recoverable: `update_stale` can't heal it and
+        // a host edit is not a deliberate agent flatten, so it must refuse cleanly
+        // without a retry. The stale / lost-seal family does clear on a retry.
+        let recoverable = !crate::jj::is_conflicted_branch_seal_error(seal_error)
+            && (crate::jj::is_stale_error(seal_error) || crate::jj::is_lost_seal_error(seal_error));
         log::warn!(
             "host file edit: seal of `{repo_rel}` failed (recoverable={recoverable}): {seal_error}"
         );
@@ -757,17 +763,28 @@ mod tests {
 
     #[test]
     fn seal_failure_message_distinguishes_divergence_from_stale() {
-        let diverged = seal_failure_message(
-            "seal refused: workspace `agent/x` is behind its branch tip — the branch advanced",
-            Ok(()),
-        );
+        // A conflicted-branch refusal (divergent `@` over a conflicted bookmark
+        // tip) is named as conflicted/mid-rebase and is NOT a retryable transient.
+        let diverged = seal_failure_message(crate::jj::CONFLICTED_BRANCH_SEAL_MSG, Ok(()));
         assert!(
             diverged.contains("conflicted"),
             "divergence message names the conflicted/mid-rebase state: {diverged}"
         );
         assert!(
             !diverged.contains("try again"),
-            "a divergence is not a retryable transient: {diverged}"
+            "a conflicted-branch divergence is not a retryable transient: {diverged}"
+        );
+
+        // The clean "behind its branch tip" refusal is the genuine stale /
+        // coordinator-advance case, which DOES clear on a retry (update-stale
+        // advances `@` onto the clean tip).
+        let stale_ff = seal_failure_message(
+            "seal refused: workspace `agent/x` is behind its branch tip",
+            Ok(()),
+        );
+        assert!(
+            stale_ff.contains("try again"),
+            "a clean fast-forward refusal is retryable stale: {stale_ff}"
         );
 
         let stale = seal_failure_message("working copy is stale", Ok(()));
@@ -836,6 +853,44 @@ mod tests {
         assert_eq!(sha, "recovered", "a lost-seal also recovers and lands");
         assert_eq!(vcs.update_stales(), 1);
         assert_eq!(vcs.discards(), 0);
+    }
+
+    #[test]
+    fn finish_commit_conflicted_branch_refuses_without_stale_retry() {
+        // A conflicted-branch refusal is NOT stale-recoverable: a host edit is not
+        // a deliberate agent flatten, so finish_commit refuses cleanly — no
+        // update_stale retry (which could never converge), a single discard to
+        // HEAD, and the conflicted/mid-rebase message.
+        let vcs = FakeVcs::new().seal(Err(crate::jj::CONFLICTED_BRANCH_SEAL_MSG.to_string()));
+        let err = finish_commit(
+            &vcs,
+            Path::new("/tmp/ws"),
+            Path::new("/tmp/ws/a.rs"),
+            "a.rs",
+            "x\n",
+            "msg",
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            vcs.update_stales(),
+            0,
+            "a conflicted-branch refusal must not attempt stale recovery"
+        );
+        assert_eq!(
+            vcs.seals(),
+            1,
+            "no re-seal: the refusal is terminal for a host edit"
+        );
+        assert_eq!(
+            vcs.discards(),
+            1,
+            "it discards to HEAD once, refusing the host edit cleanly"
+        );
+        assert!(
+            err.contains("mid-rebase or conflicted"),
+            "reports the conflicted/mid-rebase state: {err}"
+        );
     }
 
     #[test]

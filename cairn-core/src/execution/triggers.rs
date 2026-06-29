@@ -14,6 +14,7 @@ use crate::models::{
     TriggerScope, TriggerType,
 };
 use crate::orchestrator::Orchestrator;
+use cairn_common::ids;
 
 use super::accumulator;
 use super::recipe::{create_jobs_for_execution, start_event_triggered_execution};
@@ -330,7 +331,15 @@ fn record_trigger_sources(
         return Ok(0);
     }
 
-    let db = orch.db.local.clone();
+    let db = block_on_trigger_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let execution_id = execution_id.to_string();
     block_on_trigger_db(async move {
         db.write(|conn| {
@@ -339,7 +348,7 @@ fn record_trigger_sources(
             Box::pin(async move {
                 let now = chrono::Utc::now().timestamp() as i32;
                 for source_job_id in &source_job_ids {
-                    let id = uuid::Uuid::new_v4().to_string();
+                    let id = ids::mint_child(&execution_id);
                     conn.execute(
                         "INSERT INTO execution_trigger_sources(
                             id, source_job_id, triggered_execution_id, created_at

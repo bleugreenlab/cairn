@@ -11,8 +11,17 @@ fn persist_system_direct(
     message: &str,
     urgency: DeliveryUrgency,
 ) -> Result<String, String> {
+    let db = run_db_blocking({
+        let dbs = orch.db.clone();
+        let recipient_run_id = recipient_run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &recipient_run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let msg = msg_db::insert_message_with_urgency(
-        &orch.db.local,
+        &db,
         &ChannelType::Direct,
         None,
         None,
@@ -109,8 +118,18 @@ pub(crate) fn queue_or_resume_parent(
     message: &str,
     urgency: DeliveryUrgency,
 ) {
+    let owning = run_db_blocking({
+        let dbs = orch.db.clone();
+        let parent_job_id = parent_job_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &parent_job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .unwrap_or_else(|_| orch.db.local.clone());
     if let Some(recipient_run_id) =
-        crate::messages::delivery::latest_run_for_job(&orch.db.local, parent_job_id)
+        crate::messages::delivery::latest_run_for_job(&owning, parent_job_id)
     {
         let message_id = match persist_system_direct(orch, &recipient_run_id, message, urgency) {
             Ok(message_id) => {

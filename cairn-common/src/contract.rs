@@ -113,6 +113,8 @@ pub enum ResourceKind {
     Skill,
     ProjectSkills,
     ProjectSkill,
+    ProjectReferences,
+    ProjectReference,
     Labels,
     Label,
     NodeMemories,
@@ -192,6 +194,8 @@ impl ResourceKind {
         ResourceKind::Skill,
         ResourceKind::ProjectSkills,
         ResourceKind::ProjectSkill,
+        ResourceKind::ProjectReferences,
+        ResourceKind::ProjectReference,
         ResourceKind::Labels,
         ResourceKind::Label,
         ResourceKind::NodeMemories,
@@ -506,6 +510,31 @@ const BROWSER_KINDS: KeySpec = KeySpec::new(
     "data buckets for clearData: cookies|cache|storage (default cookies+cache); clears the live webview's persistent website data",
 );
 const DESCRIPTION: KeySpec = KeySpec::new("description", KeyType::Str, "");
+const REFERENCE_NAME: KeySpec = KeySpec::new(
+    "name",
+    KeyType::Str,
+    "reference identifier used in the URI and project config",
+);
+const REFERENCE_GIT: KeySpec = KeySpec::new(
+    "git",
+    KeyType::Str,
+    "git remote URL; use exactly one of git or path",
+);
+const REFERENCE_PATH: KeySpec = KeySpec::new(
+    "path",
+    KeyType::Str,
+    "local directory path; use exactly one of git or path",
+);
+const REFERENCE_BRANCH: KeySpec = KeySpec::new(
+    "branch",
+    KeyType::Str,
+    "optional git branch; send null in patch to clear",
+);
+const REFERENCE_REFRESH: KeySpec = KeySpec::new(
+    "refresh",
+    KeyType::Bool,
+    "when true, refresh the git reference after patching",
+);
 const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 const EXECUTION: KeySpec = KeySpec::new(
     "execution",
@@ -909,6 +938,12 @@ const PROJECT_DEFAULT_BRANCH: KeySpec = KeySpec::with_aliases(
     KeyType::Str,
     "default branch (default main)",
 );
+const PROJECT_TEAM_ID: KeySpec = KeySpec::with_aliases(
+    "teamId",
+    &["team_id"],
+    KeyType::Str,
+    "route this project to a team's shared database (default: local/private)",
+);
 const PROJECT_HIDDEN: KeySpec = KeySpec::new("hidden", KeyType::Bool, "hide/unhide the project");
 const PROJECT_REMOTE_URL: KeySpec = KeySpec::with_aliases(
     "remoteUrl",
@@ -1150,7 +1185,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         mutations: &[MutationSpec {
             mode: ChangeMode::Create,
             required: &[PROJECT_KEY, PROJECT_CREATE_NAME, PROJECT_REPO_PATH],
-            optional: &[PROJECT_DEFAULT_BRANCH],
+            optional: &[PROJECT_DEFAULT_BRANCH, PROJECT_TEAM_ID],
             label: "create project",
             example: "write({changes:[{target:\"cairn://projects\",mode:\"create\",payload:{key:\"DEMO\",name:\"Demo\",repoPath:\"/abs/path/to/repo\"}}]})",
         }],
@@ -2275,6 +2310,47 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
                 optional: &[KeySpec::new("reason", KeyType::Str, "why it was removed")],
                 label: "delete skill",
                 example: "write({changes:[{target:\"cairn://p/PROJECT/skills/ID\",mode:\"delete\"}]})",
+            },
+        ],
+    },
+    ResourceContract {
+        kind: ResourceKind::ProjectReferences,
+        uri_template: "cairn://p/{project}/references",
+        name: "Project references",
+        description: "Project-scoped external git repos and local directories configured in .cairn/config.yaml, with resolved status and member URI links",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[MutationSpec {
+            mode: ChangeMode::Create,
+            required: &[REFERENCE_NAME],
+            optional: &[REFERENCE_GIT, REFERENCE_PATH, DESCRIPTION, REFERENCE_BRANCH],
+            label: "create project reference",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/references\",mode:\"create\",payload:{name:\"openpnp\",git:\"https://github.com/openpnp/openpnp.git\",description:\"OpenPnP source\"}}]})",
+        }],
+    },
+    ResourceContract {
+        kind: ResourceKind::ProjectReference,
+        uri_template: "cairn://p/{project}/references/{name}",
+        name: "Project reference",
+        description: "A single project reference; patch editable source fields or delete it from project config without deleting the global clone. When switching between path and git sources, send null for the old source field so exactly one of git/path remains set.",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[
+            MutationSpec {
+                mode: ChangeMode::Patch,
+                required: &[],
+                optional: &[REFERENCE_GIT, REFERENCE_PATH, DESCRIPTION, REFERENCE_BRANCH, REFERENCE_REFRESH],
+                label: "patch project reference",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/references/openpnp\",mode:\"patch\",payload:{description:\"Updated description\"}}]})",
+            },
+            MutationSpec {
+                mode: ChangeMode::Delete,
+                required: &[],
+                optional: &[],
+                label: "delete project reference",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/references/openpnp\",mode:\"delete\"}]})",
             },
         ],
     },

@@ -184,7 +184,7 @@ async fn insert_job_for_node_conn(
     now: i32,
     snapshot: &ExecutionSnapshot,
 ) -> DbResult<Job> {
-    let job_id = Uuid::new_v4().to_string();
+    let job_id = ids::mint_child(execution_id);
     let model_str = agent_config_id
         .and_then(|id| snapshot.agents.get(id))
         .and_then(|agent| agent.selection.as_ref())
@@ -222,7 +222,7 @@ async fn insert_job_for_node_conn(
             .as_deref()
             .map(|backend| backend == child_backend)
             .unwrap_or(false);
-    let session_id = (!create_forked_session).then(|| Uuid::new_v4().to_string());
+    let session_id = (!create_forked_session).then(|| ids::mint_session_id().into_string());
 
     let uri_segment = if let Some(parent_job_id) = parent_job_id {
         let base = crate::node_segments::task_segment_base(
@@ -306,7 +306,7 @@ async fn insert_job_for_node_conn(
         if let Some(source_session_id) = parent_session_id {
             let (source_backend, source_sequence) =
                 load_session_backend_sequence_conn(conn, &source_session_id).await?;
-            let forked_session_id = Uuid::new_v4().to_string();
+            let forked_session_id = ids::mint_session_id().into_string();
             insert_session_conn(
                 conn,
                 &forked_session_id,
@@ -323,7 +323,7 @@ async fn insert_job_for_node_conn(
             )
             .await?;
         } else {
-            let fallback_session_id = Uuid::new_v4().to_string();
+            let fallback_session_id = ids::mint_session_id().into_string();
             insert_session_conn(
                 conn,
                 &fallback_session_id,

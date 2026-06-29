@@ -7,6 +7,7 @@ use crate::mcp::types::{AddCommentPayload, McpCallbackRequest};
 use crate::models::ConfirmPolicy;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, RowExt};
+use cairn_common::ids;
 use turso::params;
 
 // ============================================================================
@@ -22,20 +23,10 @@ pub async fn append_issue_comment(
 ) -> Result<String, String> {
     let services = &orch.services;
     let project_key_upper = project_key.to_uppercase();
-    let (comment_id, issue_id, now) =
+    let (_comment_id, issue_id, _now) =
         append_issue_comment_db(orch, &project_key_upper, issue_number, content.to_string())
             .await?;
     let source = "agent";
-
-    orch.sync(crate::sync::SyncMessage::Comment(
-        crate::sync::SyncComment {
-            id: comment_id.clone(),
-            issue_id: issue_id.clone(),
-            content: content.to_string(),
-            source: Some(source.to_string()),
-            created_at: Some(now as i64),
-        },
-    ));
 
     let _ = services.emitter.emit(
         "db-change",
@@ -136,23 +127,25 @@ async fn resolve_artifact_schema(
 ) -> Option<crate::models::OutputSchemaInfo> {
     let node_id = node_id.to_string();
     let execution_id = execution_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let node_id = node_id.clone();
-            let execution_id = execution_id.clone();
-            Box::pin(async move {
-                crate::execution::jobs::find_downstream_artifact_schema_conn(
-                    conn,
-                    &node_id,
-                    &execution_id,
-                )
-                .await
-            })
+    let Ok(db) = crate::execution::routing::owning_db_for_execution(&orch.db, &execution_id).await
+    else {
+        return None;
+    };
+    db.read(|conn| {
+        let node_id = node_id.clone();
+        let execution_id = execution_id.clone();
+        Box::pin(async move {
+            crate::execution::jobs::find_downstream_artifact_schema_conn(
+                conn,
+                &node_id,
+                &execution_id,
+            )
+            .await
         })
-        .await
-        .ok()
-        .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Enumerate the node's `context-self` living-doc targets (name + schema) so a
@@ -164,18 +157,20 @@ async fn resolve_ctx_self_schemas(
 ) -> Vec<crate::models::OutputSchemaInfo> {
     let node_id = node_id.to_string();
     let execution_id = execution_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let node_id = node_id.clone();
-            let execution_id = execution_id.clone();
-            Box::pin(async move {
-                crate::execution::jobs::resolve_ctx_self_schemas_conn(conn, &node_id, &execution_id)
-                    .await
-            })
+    let Ok(db) = crate::execution::routing::owning_db_for_execution(&orch.db, &execution_id).await
+    else {
+        return Vec::new();
+    };
+    db.read(|conn| {
+        let node_id = node_id.clone();
+        let execution_id = execution_id.clone();
+        Box::pin(async move {
+            crate::execution::jobs::resolve_ctx_self_schemas_conn(conn, &node_id, &execution_id)
+                .await
         })
-        .await
-        .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// The resolved artifact contract for an addressed name: which schema a write
@@ -284,10 +279,15 @@ pub(crate) async fn write_artifact_change(
     is_patch: bool,
 ) -> Result<String, String> {
     let services = &orch.services;
+    // Resolve the project's owning database (a team project's jobs/artifacts live
+    // wholly in its synced replica). The agent writing the artifact runs on the
+    // member's machine where that replica is open; if it is not, the job lookup
+    // below finds no row and the write errors rather than landing in private.
+    let db = orch.db.for_project(project_key).await;
 
     // 1. Resolve the owning job from the URI coordinates.
     let job_id = crate::resources::resolve_todos_job_id(
-        &orch.db.local,
+        &db,
         project_key,
         number,
         exec_seq,
@@ -453,12 +453,8 @@ pub(crate) async fn write_artifact_change(
     //    cache prevents the recompute's Resolved from drowning out the
     //    artifact write for the same issue within the dedupe window.
     if let Ok((issue_id, issue_ctx)) =
-        crate::orchestrator::attention::lookup_issue_for_attention_by_key(
-            &orch.db.local,
-            project_key,
-            number,
-        )
-        .await
+        crate::orchestrator::attention::lookup_issue_for_attention_by_key(&db, project_key, number)
+            .await
     {
         let title = effective_payload
             .get("title")
@@ -538,8 +534,12 @@ async fn append_issue_comment_db(
     content: String,
 ) -> Result<(String, String, i32), String> {
     let project_key_upper = project_key_upper.to_string();
-    orch.db
-        .local
+    // The comment row lives in the database that owns the project (CAIRN-2181):
+    // a team project's issues/comments live in its team replica. Edit/delete
+    // already route via `for_project`; append must match or an appended comment
+    // lands in the wrong DB and vanishes from the team-replica read view.
+    let owning_db = orch.db.for_project(&project_key_upper).await;
+    owning_db
         .write(|conn| {
             let project_key_upper = project_key_upper.clone();
             let content = content.clone();
@@ -563,7 +563,7 @@ async fn append_issue_comment_db(
                     ))
                 })?;
                 let issue_id = row.text(0)?;
-                let comment_id = uuid::Uuid::new_v4().to_string();
+                let comment_id = ids::mint_child(&issue_id);
                 let now = chrono::Utc::now().timestamp() as i32;
                 let seq = crate::issues::comments::next_issue_comment_seq(conn, &issue_id).await?;
 
@@ -858,9 +858,10 @@ async fn load_latest_artifact(
 ) -> Option<(serde_json::Value, bool)> {
     let job_id = job_id.to_string();
     let output_name = output_name.to_string();
-    let row: Option<(String, i64)> = orch
-        .db
-        .local
+    let Ok(db) = crate::execution::routing::owning_db_for_job(&orch.db, &job_id).await else {
+        return None;
+    };
+    let row: Option<(String, i64)> = db
         .read(|conn| {
             let job_id = job_id.clone();
             let output_name = output_name.clone();
@@ -931,27 +932,26 @@ async fn store_artifact(
     let job_id = job_id.to_string();
     let artifact_type = artifact_type.to_string();
     let output_name = output_name.to_string();
-    orch.db
-        .local
-        .write(|conn| {
-            let job_id = job_id.clone();
-            let data_json = data_json.clone();
-            let artifact_type = artifact_type.clone();
-            let output_name = output_name.clone();
-            Box::pin(async move {
-                insert_next_artifact_version(
-                    conn,
-                    &job_id,
-                    &artifact_type,
-                    &output_name,
-                    &data_json,
-                    confirmed,
-                )
-                .await
-            })
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id).await?;
+    db.write(|conn| {
+        let job_id = job_id.clone();
+        let data_json = data_json.clone();
+        let artifact_type = artifact_type.clone();
+        let output_name = output_name.clone();
+        Box::pin(async move {
+            insert_next_artifact_version(
+                conn,
+                &job_id,
+                &artifact_type,
+                &output_name,
+                &data_json,
+                confirmed,
+            )
+            .await
         })
-        .await
-        .map_err(|e| format!("Failed to store artifact: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Failed to store artifact: {}", e))
 }
 
 /// Insert the next version in an artifact's `(job_id, output_name)` chain.
@@ -992,7 +992,7 @@ async fn insert_next_artifact_version(
         None => (None, 1),
     };
     let now = chrono::Utc::now().timestamp() as i32;
-    let artifact_id = uuid::Uuid::new_v4().to_string();
+    let artifact_id = ids::mint_child(job_id);
 
     conn.execute(
         "
@@ -1032,23 +1032,24 @@ async fn job_node_execution(
     job_id: &str,
 ) -> DbResult<Option<(Option<String>, Option<String>)>> {
     let job_id = job_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT recipe_node_id, execution_id FROM jobs WHERE id = ?1",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| Ok((row.opt_text(0)?, row.opt_text(1)?)))
-                    .transpose()
-            })
-        })
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id)
         .await
+        .map_err(|e| DbError::internal(e.to_string()))?;
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT recipe_node_id, execution_id FROM jobs WHERE id = ?1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| Ok((row.opt_text(0)?, row.opt_text(1)?)))
+                .transpose()
+        })
+    })
+    .await
 }
 
 #[cfg(test)]

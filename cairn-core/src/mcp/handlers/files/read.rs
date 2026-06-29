@@ -56,13 +56,21 @@ type FileProjection = (
     Option<i64>,
     Option<usize>,
     bool,
+    Option<String>,
 );
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchTargetKind {
+    File,
+    Directory,
+}
 
 #[derive(Debug, Serialize)]
 struct TextFileResponse {
     kind: &'static str,
     content: String,
     total_lines: usize,
+    shown_lines: usize,
     offset: usize,
     limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,6 +115,79 @@ fn parse_issue_history_query(value: Option<&str>) -> Result<Option<IssueHistoryM
             )),
         })
         .transpose()
+}
+
+fn branch_repo_path(relative_path: &str) -> Result<&str, String> {
+    if std::path::Path::new(relative_path).is_absolute() || relative_path.contains("..") {
+        return Err("?branch is only supported for worktree-relative file: targets".to_string());
+    }
+    Ok(relative_path)
+}
+
+fn branch_target_kind(
+    jj: &crate::jj::JjEnv,
+    command_dir: &std::path::Path,
+    rev: &str,
+    repo_path: &str,
+) -> Result<BranchTargetKind, String> {
+    if repo_path.is_empty() {
+        return Ok(BranchTargetKind::Directory);
+    }
+    let files = crate::jj::file_list(jj, command_dir, rev, repo_path)?;
+    if files.iter().any(|file| file == repo_path) {
+        return Ok(BranchTargetKind::File);
+    }
+    let prefix = format!("{repo_path}/");
+    if files.iter().any(|file| file.starts_with(&prefix)) {
+        return Ok(BranchTargetKind::Directory);
+    }
+    Err(format!(
+        "Entered path does not exist at branch/rev '{rev}': file:{repo_path}"
+    ))
+}
+
+fn branch_file_bytes(
+    jj: &crate::jj::JjEnv,
+    command_dir: &std::path::Path,
+    rev: &str,
+    repo_path: &str,
+) -> Result<Vec<u8>, String> {
+    crate::jj::file_show(jj, command_dir, rev, repo_path)
+        .map_err(|error| format!("Failed to read file at branch/rev '{rev}': {error}"))
+}
+
+fn materialize_branch_tree(
+    jj: &crate::jj::JjEnv,
+    command_dir: &std::path::Path,
+    rev: &str,
+    repo_path: &str,
+) -> Result<(tempfile::TempDir, std::path::PathBuf), String> {
+    let temp = tempfile::Builder::new()
+        .prefix("cairn-branch-read-")
+        .tempdir()
+        .map_err(|error| format!("Failed to create branch-read scratch tree: {error}"))?;
+    let files = crate::jj::file_list(jj, command_dir, rev, repo_path)?;
+    if files.is_empty() {
+        return Err(format!(
+            "Entered path does not exist at branch/rev '{rev}': file:{repo_path}"
+        ));
+    }
+    for file in files {
+        let bytes = branch_file_bytes(jj, command_dir, rev, &file)?;
+        let out = temp.path().join(&file);
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("Failed to create branch-read scratch dir: {error}"))?;
+        }
+        std::fs::write(&out, bytes)
+            .map_err(|error| format!("Failed to write branch-read scratch file: {error}"))?;
+    }
+    let target = if repo_path.is_empty() {
+        temp.path().to_path_buf()
+    } else {
+        temp.path().join(repo_path)
+    };
+    Ok((temp, target))
 }
 
 fn resolve_offset(offset: Option<i64>, total_lines: usize) -> usize {
@@ -189,6 +270,7 @@ fn render_text_from_bytes(
         kind: "text",
         content,
         total_lines,
+        shown_lines: shown,
         offset,
         limit,
         history: None,
@@ -227,8 +309,11 @@ pub(crate) fn produce_archived_file_segment(
         limit: None,
         issue_history: None,
     };
-    let (projection, issue_history, offset, limit, _annotations) =
+    let (projection, issue_history, offset, limit, _annotations, branch) =
         parse_file_projection(&split.params, &payload)?;
+    if branch.is_some() {
+        return Err("Archived file reconstruction does not support ?branch; branch reads are resolved live from jj".to_string());
+    }
     // History rows come from the DB at read time, not the blob, so a recorded
     // `issue_history` read can never round-trip from a coordinate. The live read
     // appended the history below the body; make the ineligibility explicit instead
@@ -352,6 +437,7 @@ pub(crate) fn produce_archived_file_segment(
                     .map_err(|error| format!("Failed to render archived read: {error}"))?;
                 let mut meta = SegmentMeta::new(uri, SegmentKind::File, NaturalUnit::Line);
                 meta.total_units = Some(response.total_lines);
+                meta.shown_units = response.shown_lines;
                 meta.offset = response.offset;
                 meta.limit = response.limit;
                 meta.char_continuation = char_offset.is_some();
@@ -390,6 +476,15 @@ fn parse_file_projection(
     let ast = find_query_value(params, "ast");
     let outline = find_query_value(params, "outline");
     let annotations_suppressed = find_query_value(params, "annotations") == Some("none");
+    let branch = find_query_value(params, "branch")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if find_query_value(params, "branch") == Some("") {
+        return Err(
+            "Empty 'branch' value; provide a bookmark, commit/change id, or node URI".to_string(),
+        );
+    }
 
     if find_query_value(params, "search").is_some() {
         return Err(
@@ -441,14 +536,15 @@ fn parse_file_projection(
             "head_limit",
             "limit",
             "multiline",
+            "branch",
         ]
         .as_slice()
     } else if ast.is_some() {
-        ["ast", "glob"].as_slice()
+        ["ast", "glob", "branch"].as_slice()
     } else if outline.is_some() {
-        ["outline", "glob"].as_slice()
+        ["outline", "glob", "branch"].as_slice()
     } else if glob.is_some() {
-        ["glob", "offset", "limit", "output_mode"].as_slice()
+        ["glob", "offset", "limit", "output_mode", "branch"].as_slice()
     } else {
         [
             "offset",
@@ -456,6 +552,7 @@ fn parse_file_projection(
             "issue_history",
             "annotations",
             "char_offset",
+            "branch",
         ]
         .as_slice()
     };
@@ -523,6 +620,7 @@ fn parse_file_projection(
         offset,
         limit,
         annotations_suppressed,
+        branch,
     ))
 }
 
@@ -705,7 +803,7 @@ pub(crate) async fn produce_file_segment(
         }
     };
 
-    let (projection, issue_history, offset, limit, _annotations_suppressed) =
+    let (projection, issue_history, offset, limit, _annotations_suppressed, branch) =
         match parse_file_projection(&split.params, payload) {
             Ok(parsed) => parsed,
             Err(error) => return Produced::Segment(error_segment(uri, error)),
@@ -753,11 +851,32 @@ pub(crate) async fn produce_file_segment(
         }
     }
 
-    let resolved_target = match validate_read_path(worktree, &split.identity) {
+    let resolved_target = match if branch.is_some() {
+        crate::mcp::git::resolve_read_target_lenient(worktree, &split.identity)
+    } else {
+        validate_read_path(worktree, &split.identity)
+    } {
         Ok(target) => target,
         Err(error) => {
             return Produced::Segment(error_segment(uri, format!("Invalid file target: {error}")))
         }
+    };
+
+    let branch_context = if let Some(branch) = branch.as_deref() {
+        let repo_path = match branch_repo_path(&resolved_target.relative_path) {
+            Ok(path) => path.to_string(),
+            Err(error) => return Produced::Segment(error_segment(uri, error)),
+        };
+        let resolution =
+            match crate::mcp::handlers::branch::resolve_for_read(orch, request, branch).await {
+                Ok(resolution) => resolution,
+                Err(error) => return Produced::Segment(error_segment(uri, error)),
+            };
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let command_dir = crate::mcp::handlers::branch::jj_command_dir(&resolution, &request.cwd);
+        Some((jj, command_dir, resolution.rev, repo_path))
+    } else {
+        None
     };
 
     match projection {
@@ -767,13 +886,22 @@ pub(crate) async fn produce_file_segment(
             limit,
             output_mode,
         } => {
+            let (_branch_temp, projection_path) =
+                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                    match materialize_branch_tree(jj, command_dir, rev, repo_path) {
+                        Ok((temp, path)) => (Some(temp), path),
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    }
+                } else {
+                    (None, resolved_target.full_path.clone())
+                };
             let glob_request = McpCallbackRequest {
                 cwd: request.cwd.clone(),
                 run_id: request.run_id.clone(),
                 tool: "read".to_string(),
                 payload: serde_json::json!({
                     "pattern": pattern,
-                    "path": resolved_target.full_path,
+                    "path": projection_path,
                 }),
                 tool_use_id: request.tool_use_id.clone(),
             };
@@ -786,8 +914,19 @@ pub(crate) async fn produce_file_segment(
             Produced::Segment(ReadSegment::text(body, meta))
         }
         ReadProjection::Grep(mut grep_payload) => {
+            let branch_kind =
+                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                    match branch_target_kind(jj, command_dir, rev, repo_path) {
+                        Ok(kind) => Some(kind),
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    }
+                } else {
+                    None
+                };
             let full_path = &resolved_target.full_path;
-            let single_file = full_path.is_file()
+            let single_file = branch_kind
+                .map(|kind| kind == BranchTargetKind::File)
+                .unwrap_or_else(|| full_path.is_file())
                 && grep_payload.glob.is_none()
                 && grep_payload.file_type.is_none();
 
@@ -814,13 +953,21 @@ pub(crate) async fn produce_file_segment(
             grep_payload.output_mode = Some(effective_mode.clone());
 
             let body = if single_file {
-                let bytes = match std::fs::read(full_path) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        return Produced::Segment(error_segment(
-                            uri,
-                            format!("Failed to read file: {error}"),
-                        ))
+                let bytes = if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref()
+                {
+                    match branch_file_bytes(jj, command_dir, rev, repo_path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    }
+                } else {
+                    match std::fs::read(full_path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return Produced::Segment(error_segment(
+                                uri,
+                                format!("Failed to read file: {error}"),
+                            ))
+                        }
                     }
                 };
                 let label = full_path
@@ -829,7 +976,16 @@ pub(crate) async fn produce_file_segment(
                     .unwrap_or_default();
                 crate::mcp::handlers::search::render_single_file_grep(&bytes, &label, &grep_payload)
             } else {
-                grep_payload.path = Some(full_path.display().to_string());
+                let (_branch_temp, grep_path) =
+                    if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                        match materialize_branch_tree(jj, command_dir, rev, repo_path) {
+                            Ok((temp, path)) => (Some(temp), path),
+                            Err(error) => return Produced::Segment(error_segment(uri, error)),
+                        }
+                    } else {
+                        (None, full_path.clone())
+                    };
+                grep_payload.path = Some(grep_path.display().to_string());
                 let grep_request = McpCallbackRequest {
                     cwd: request.cwd.clone(),
                     run_id: request.run_id.clone(),
@@ -850,9 +1006,24 @@ pub(crate) async fn produce_file_segment(
             Produced::Segment(ReadSegment::text(body, meta))
         }
         ReadProjection::Ast { pattern, glob } => {
-            let target = &resolved_target.full_path;
+            let (_branch_temp, branch_root, target) =
+                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                    match materialize_branch_tree(jj, command_dir, rev, repo_path) {
+                        Ok((temp, path)) => {
+                            let root = temp.path().to_path_buf();
+                            (Some(temp), root, path)
+                        }
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    }
+                } else {
+                    (
+                        None,
+                        worktree.to_path_buf(),
+                        resolved_target.full_path.clone(),
+                    )
+                };
             let rendered =
-                crate::symbols::search::search(worktree, target, &pattern, glob.as_deref());
+                crate::symbols::search::search(&branch_root, &target, &pattern, glob.as_deref());
             let (matches, files) = grep_counts(&rendered.body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(matches);
@@ -862,8 +1033,23 @@ pub(crate) async fn produce_file_segment(
             Produced::Segment(ReadSegment::text(rendered.body, meta))
         }
         ReadProjection::Outline { glob } => {
-            let target = &resolved_target.full_path;
-            let rendered = crate::symbols::outline::outline(worktree, target, glob.as_deref());
+            let (_branch_temp, branch_root, target) =
+                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                    match materialize_branch_tree(jj, command_dir, rev, repo_path) {
+                        Ok((temp, path)) => {
+                            let root = temp.path().to_path_buf();
+                            (Some(temp), root, path)
+                        }
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    }
+                } else {
+                    (
+                        None,
+                        worktree.to_path_buf(),
+                        resolved_target.full_path.clone(),
+                    )
+                };
+            let rendered = crate::symbols::outline::outline(&branch_root, &target, glob.as_deref());
             let (matches, _files) = grep_counts(&rendered.body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(matches);
@@ -876,9 +1062,30 @@ pub(crate) async fn produce_file_segment(
         }
         ReadProjection::None => {
             let full_path = &resolved_target.full_path;
+            let branch_kind =
+                if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                    match branch_target_kind(jj, command_dir, rev, repo_path) {
+                        Ok(kind) => Some(kind),
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    }
+                } else {
+                    None
+                };
 
-            if full_path.is_dir() {
-                let body = format_directory_listing(full_path);
+            if branch_kind
+                .map(|kind| kind == BranchTargetKind::Directory)
+                .unwrap_or_else(|| full_path.is_dir())
+            {
+                let (_branch_temp, listing_path) =
+                    if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                        match materialize_branch_tree(jj, command_dir, rev, repo_path) {
+                            Ok((temp, path)) => (Some(temp), path),
+                            Err(error) => return Produced::Segment(error_segment(uri, error)),
+                        }
+                    } else {
+                        (None, full_path.clone())
+                    };
+                let body = format_directory_listing(&listing_path);
                 return Produced::Segment(ReadSegment::text(
                     body,
                     SegmentMeta::new(uri, SegmentKind::Directory, NaturalUnit::Line),
@@ -886,13 +1093,21 @@ pub(crate) async fn produce_file_segment(
             }
 
             if let Some(mime_type) = get_image_mime_type(full_path) {
-                let bytes = match std::fs::read(full_path) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        return Produced::Segment(error_segment(
-                            uri,
-                            format!("Failed to read file: {error}"),
-                        ))
+                let bytes = if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref()
+                {
+                    match branch_file_bytes(jj, command_dir, rev, repo_path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => return Produced::Segment(error_segment(uri, error)),
+                    }
+                } else {
+                    match std::fs::read(full_path) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            return Produced::Segment(error_segment(
+                                uri,
+                                format!("Failed to read file: {error}"),
+                            ))
+                        }
                     }
                 };
                 let data =
@@ -908,13 +1123,20 @@ pub(crate) async fn produce_file_segment(
                 return Produced::Segment(segment);
             }
 
-            let bytes = match std::fs::read(full_path) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return Produced::Segment(error_segment(
-                        uri,
-                        format!("Failed to read file: {error}"),
-                    ))
+            let bytes = if let Some((jj, command_dir, rev, repo_path)) = branch_context.as_ref() {
+                match branch_file_bytes(jj, command_dir, rev, repo_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => return Produced::Segment(error_segment(uri, error)),
+                }
+            } else {
+                match std::fs::read(full_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return Produced::Segment(error_segment(
+                            uri,
+                            format!("Failed to read file: {error}"),
+                        ))
+                    }
                 }
             };
             let response = match render_text_from_bytes(&bytes, offset, limit, char_offset) {
@@ -941,6 +1163,7 @@ pub(crate) async fn produce_file_segment(
 
             let mut meta = SegmentMeta::new(uri, SegmentKind::File, NaturalUnit::Line);
             meta.total_units = Some(response.total_lines);
+            meta.shown_units = response.shown_lines;
             meta.offset = response.offset;
             meta.limit = response.limit;
             meta.char_continuation = char_offset.is_some();
@@ -1141,7 +1364,7 @@ mod tests {
 
     #[test]
     fn grep_with_limit_aliases_to_head_limit() {
-        let (projection, _, _, _, _) = project("grep=foo&limit=2").unwrap();
+        let (projection, _, _, _, _, _) = project("grep=foo&limit=2").unwrap();
         match projection {
             ReadProjection::Grep(grep) => assert_eq!(grep.head_limit, Some(2)),
             other => panic!("expected grep projection, got {other:?}"),
@@ -1164,7 +1387,7 @@ mod tests {
 
     #[test]
     fn grep_with_head_limit_is_accepted() {
-        let (projection, _, _, _, _) = project("grep=foo&head_limit=5").unwrap();
+        let (projection, _, _, _, _, _) = project("grep=foo&head_limit=5").unwrap();
         match projection {
             ReadProjection::Grep(grep) => {
                 assert_eq!(grep.pattern, "foo");
@@ -1177,7 +1400,7 @@ mod tests {
 
     #[test]
     fn grep_with_context_is_accepted() {
-        let (projection, _, _, _, _) = project("grep=foo&-C=3").unwrap();
+        let (projection, _, _, _, _, _) = project("grep=foo&-C=3").unwrap();
         match projection {
             ReadProjection::Grep(grep) => assert_eq!(grep.context_alias, Some(3)),
             other => panic!("expected grep projection, got {other:?}"),
@@ -1186,7 +1409,7 @@ mod tests {
 
     #[test]
     fn grep_with_bare_case_insensitive_flag_is_accepted() {
-        let (projection, _, _, _, _) = project("grep=foo&-i&-C=3").unwrap();
+        let (projection, _, _, _, _, _) = project("grep=foo&-i&-C=3").unwrap();
         match projection {
             ReadProjection::Grep(grep) => {
                 assert_eq!(grep.case_insensitive, Some(true));
@@ -1198,7 +1421,7 @@ mod tests {
 
     #[test]
     fn glob_with_offset_and_limit_still_slices() {
-        let (projection, _, _, _, _) = project("glob=*.rs&offset=1&limit=3").unwrap();
+        let (projection, _, _, _, _, _) = project("glob=*.rs&offset=1&limit=3").unwrap();
         match projection {
             ReadProjection::Glob {
                 pattern,
@@ -1217,7 +1440,7 @@ mod tests {
 
     #[test]
     fn glob_with_output_mode_content_is_accepted() {
-        let (projection, _, _, _, _) = project("glob=*.rs&output_mode=content").unwrap();
+        let (projection, _, _, _, _, _) = project("glob=*.rs&output_mode=content").unwrap();
         match projection {
             ReadProjection::Glob {
                 pattern,
@@ -1233,7 +1456,7 @@ mod tests {
 
     #[test]
     fn glob_with_count_output_mode_is_accepted() {
-        let (projection, _, _, _, _) = project("glob=*.rs&output_mode=count").unwrap();
+        let (projection, _, _, _, _, _) = project("glob=*.rs&output_mode=count").unwrap();
         assert!(matches!(
             projection,
             ReadProjection::Glob {
@@ -1251,10 +1474,33 @@ mod tests {
 
     #[test]
     fn plain_read_offset_limit_unchanged() {
-        let (projection, _, offset, limit, _) = project("offset=10&limit=20").unwrap();
+        let (projection, _, offset, limit, _, _) = project("offset=10&limit=20").unwrap();
         assert!(matches!(projection, ReadProjection::None));
         assert_eq!(offset, Some(10));
         assert_eq!(limit, Some(20));
+    }
+
+    #[test]
+    fn branch_query_is_accepted_on_file_projections() {
+        let (projection, _, _, _, _, branch) = project("branch=main").unwrap();
+        assert!(matches!(projection, ReadProjection::None));
+        assert_eq!(branch.as_deref(), Some("main"));
+
+        let (projection, _, _, _, _, branch) =
+            project("grep=needle&branch=agent/CAIRN-1-builder-0").unwrap();
+        assert!(matches!(projection, ReadProjection::Grep(_)));
+        assert_eq!(branch.as_deref(), Some("agent/CAIRN-1-builder-0"));
+
+        let (projection, _, _, _, _, branch) =
+            project("glob=**/*.rs&branch=cairn://p/CAIRN/1/1/builder").unwrap();
+        assert!(matches!(projection, ReadProjection::Glob { .. }));
+        assert_eq!(branch.as_deref(), Some("cairn://p/CAIRN/1/1/builder"));
+    }
+
+    #[test]
+    fn empty_branch_query_is_rejected() {
+        let err = project("branch=").unwrap_err();
+        assert!(err.to_lowercase().contains("empty"), "{err}");
     }
 
     #[test]

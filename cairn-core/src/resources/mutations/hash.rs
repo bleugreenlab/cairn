@@ -74,12 +74,9 @@ pub(crate) async fn hash_resource_target(
     request: &McpCallbackRequest,
     item: &ChangeItem,
 ) -> Result<ResourceTargetHash, String> {
-    let target = super::super::common::resolve_home_relative_resource_uri(
-        &orch.db.local,
-        request,
-        &item.target,
-    )
-    .await?;
+    let target =
+        super::super::common::resolve_home_relative_resource_uri(&orch.db, request, &item.target)
+            .await?;
     let resource =
         parse_uri(&target).ok_or_else(|| format!("Unrecognized URI format: {}", item.target))?;
     if let Some(hash) = hash_skill_target(orch, request, item, &resource).await? {

@@ -6,10 +6,10 @@
 //! Execution creation functions.
 //! Functions taking `&Orchestrator` also need config/settings access.
 
+use cairn_common::ids;
 use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::config::get_recipe_from_files;
 use crate::config::presets::{
@@ -39,7 +39,16 @@ pub fn create_jobs_for_execution(
     orch: &Orchestrator,
     execution_id: &str,
 ) -> Result<Vec<Job>, String> {
-    crate::execution::advancement::create_jobs_for_execution(orch.db.local.clone(), execution_id)
+    let db = run_recipe_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    crate::execution::advancement::create_jobs_for_execution(db, execution_id)
 }
 
 /// Start a recipe execution, create its jobs, and kick off DAG advancement.
@@ -102,8 +111,14 @@ pub fn start_recipe_execution_impl(
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
 
+    // Resolve the owning database ONCE (fail-closed): a team project's rows live
+    // wholly in its synced replica, so the execution and its jobs must be created
+    // there, not in the private DB. The id-keyed resolvers cannot be used yet —
+    // the execution row does not exist — so resolve by project id.
+    let db = resolve_owning_db_for_project(orch, project_id)?;
+
     // Get project path for file-based recipe loading
-    let project_path = project_path_for_recipe(orch.db.local.clone(), project_id.to_string())?;
+    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
 
     // Get the recipe (use provided or find default)
     let recipe = match recipe_id {
@@ -201,12 +216,12 @@ pub fn start_recipe_execution_impl(
     let snapshot_json = snapshot.to_json()?;
 
     // Calculate next seq for this issue
-    let next_seq = next_execution_seq_for_issue(orch.db.local.clone(), issue_id.to_string())?;
+    let next_seq = next_execution_seq_for_issue(db.clone(), issue_id.to_string())?;
 
     // Create execution
-    let exec_id = Uuid::new_v4().to_string();
+    let exec_id = ids::mint_child(issue_id);
     insert_execution(
-        orch.db.local.clone(),
+        db.clone(),
         NewExecution {
             id: exec_id.clone(),
             recipe_id: recipe.id.clone(),
@@ -248,8 +263,10 @@ pub fn start_manual_execution_impl(
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
 
+    let db = resolve_owning_db_for_project(orch, project_id)?;
+
     // Get project path for file-based recipe loading
-    let project_path = project_path_for_recipe(orch.db.local.clone(), project_id.to_string())?;
+    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
 
     // Verify recipe exists (load from files)
     let recipe = get_recipe_from_files(&orch.config_dir, Some(&project_path), recipe_id)?;
@@ -268,9 +285,9 @@ pub fn start_manual_execution_impl(
     let snapshot_json = snapshot.to_json()?;
 
     // Create execution
-    let exec_id = Uuid::new_v4().to_string();
+    let exec_id = ids::mint_child(project_id);
     insert_execution(
-        orch.db.local.clone(),
+        db.clone(),
         NewExecution {
             id: exec_id.clone(),
             recipe_id: recipe.id.clone(),
@@ -311,7 +328,10 @@ pub fn start_scheduled_execution_impl(
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
     let project_path = project_id
-        .map(|id| project_path_for_recipe(orch.db.local.clone(), id.to_string()))
+        .map(|id| {
+            let db = resolve_owning_db_for_project(orch, id)?;
+            project_path_for_recipe(db, id.to_string())
+        })
         .transpose()?;
 
     let recipe = get_recipe_from_files(&orch.config_dir, project_path.as_deref(), recipe_id)?;
@@ -339,9 +359,10 @@ pub fn start_scheduled_execution_impl(
     )?;
     let snapshot_json = snapshot.to_json()?;
 
-    let exec_id = Uuid::new_v4().to_string();
+    let db = resolve_owning_db_for_project(orch, &final_project_id)?;
+    let exec_id = ids::mint_child(&final_project_id);
     insert_execution(
-        orch.db.local.clone(),
+        db,
         NewExecution {
             id: exec_id.clone(),
             recipe_id: recipe.id.clone(),
@@ -391,8 +412,10 @@ pub fn start_event_triggered_execution(
 
     let trigger_type_str = trigger_type.to_string();
 
+    let db = resolve_owning_db_for_project(orch, project_id)?;
+
     // Build execution snapshot with event payload
-    let project_path = project_path_for_recipe(orch.db.local.clone(), project_id.to_string())?;
+    let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
     let snapshot = build_execution_snapshot_from_files(
         &orch.config_dir,
         Some(&project_path),
@@ -407,13 +430,13 @@ pub fn start_event_triggered_execution(
 
     // Calculate next seq if issue-scoped
     let next_seq: Option<i32> = issue_id
-        .map(|iid| next_execution_seq_for_issue(orch.db.local.clone(), iid.to_string()))
+        .map(|iid| next_execution_seq_for_issue(db.clone(), iid.to_string()))
         .transpose()?;
 
     // Create execution
-    let exec_id = uuid::Uuid::new_v4().to_string();
+    let exec_id = ids::mint_child(project_id);
     insert_execution(
-        orch.db.local.clone(),
+        db.clone(),
         NewExecution {
             id: exec_id.clone(),
             recipe_id: recipe.id.clone(),
@@ -536,7 +559,8 @@ pub fn resolve_recipe_launch(
     project_id: &str,
     overrides: Option<LaunchOverrides>,
 ) -> Result<LaunchPlan, String> {
-    let project_path = project_path_for_recipe(orch.db.local.clone(), project_id.to_string())?;
+    let db = resolve_owning_db_for_project(orch, project_id)?;
+    let project_path = project_path_for_recipe(db, project_id.to_string())?;
     let recipe = get_recipe_from_files(&orch.config_dir, Some(&project_path), recipe_id)?;
     let presets = load_effective_presets(&orch.config_dir, Some(&project_path));
     let overrides = overrides.unwrap_or_default();
@@ -797,6 +821,22 @@ async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<Stri
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Fail-closed sync resolve of a project's owning database, bridged onto the
+/// recipe DB runtime. Used at execution-start sites where no execution/job/run
+/// row exists yet, so the id-keyed resolvers cannot be used.
+fn resolve_owning_db_for_project(
+    orch: &Orchestrator,
+    project_id: &str,
+) -> Result<Arc<LocalDb>, String> {
+    let dbs = orch.db.clone();
+    let project_id = project_id.to_string();
+    run_recipe_db(async move {
+        crate::execution::routing::owning_db_for_project(&dbs, &project_id)
+            .await
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn run_recipe_db<T, Fut>(future: Fut) -> Result<T, String>

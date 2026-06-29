@@ -1,8 +1,6 @@
 use crate::issues::crud;
-use crate::models::Issue;
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
-use crate::sync::SyncMessage;
 use crate::transitions::Resolution;
 use turso::params;
 
@@ -15,28 +13,28 @@ pub async fn update_status(orch: &Orchestrator, id: &str, status: &str) -> Resul
         // active work so the resolve + worktree teardown below can clean up
         // without stranding a live agent on a soon-to-be-deleted worktree,
         // rather than refusing the action while agents are running.
+        // content→execution boundary (CAIRN-2181): stop_active_runs queries
+        // runs/jobs, which stay private until CAIRN-2182.
         stop_active_runs_for_terminal_issue(orch, id).await;
     }
 
+    // The issue row lives in its owning database — the private DB for a local
+    // project, the team replica for a team project (CAIRN-2181). resolve/unresolve
+    // mutate that row (and close sessions that, for a team project, are empty in
+    // the replica), so they must target the same DB the row is read from.
+    let owning_db = crud::owning_db_for_issue(&orch.db, id)
+        .await
+        .map_err(|e| e.to_string())?;
+
     let closed_sessions = match status {
-        "merged" => crud::resolve(
-            &orch.db.local,
-            &*orch.services.clock,
-            id,
-            Resolution::Merged,
-        )
-        .await
-        .map_err(|e| e.to_string())?,
-        "closed" => crud::resolve(
-            &orch.db.local,
-            &*orch.services.clock,
-            id,
-            Resolution::Closed,
-        )
-        .await
-        .map_err(|e| e.to_string())?,
+        "merged" => crud::resolve(&owning_db, &*orch.services.clock, id, Resolution::Merged)
+            .await
+            .map_err(|e| e.to_string())?,
+        "closed" => crud::resolve(&owning_db, &*orch.services.clock, id, Resolution::Closed)
+            .await
+            .map_err(|e| e.to_string())?,
         "backlog" => {
-            crud::unresolve(&orch.db.local, &*orch.services.clock, id)
+            crud::unresolve(&owning_db, &*orch.services.clock, id)
                 .await
                 .map_err(|e| e.to_string())?;
             Vec::new()
@@ -61,10 +59,6 @@ pub async fn update_status(orch: &Orchestrator, id: &str, status: &str) -> Resul
                 &session_id[..session_id.len().min(8)]
             );
         }
-    }
-
-    if let Ok(Some(issue)) = crud::get(&orch.db.local, id).await {
-        sync_issue(orch, &issue);
     }
 
     let _ = orch.services.emitter.emit(
@@ -242,8 +236,4 @@ pub async fn terminal_resolution_blockers(
         ));
     }
     Ok(blockers)
-}
-
-fn sync_issue(orch: &Orchestrator, issue: &Issue) {
-    orch.sync(SyncMessage::Issue(issue.into()));
 }

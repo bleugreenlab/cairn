@@ -60,6 +60,13 @@ pub struct DelegatedWorkPacket {
     #[serde(rename = "backend", alias = "backendPreference")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_preference: Option<String>,
+    /// Whether the spawning agent requested this packet run in the background
+    /// (fire-and-forget). Persisted so the finalize-time resume handler can tell
+    /// an intentional background batch (expected: no successor turn) from a
+    /// genuinely broken blocking parent. `#[serde(default)]` keeps pre-field
+    /// snapshots deserializable as non-background.
+    #[serde(default)]
+    pub background: bool,
     pub created_at: i64,
 }
 
@@ -423,6 +430,7 @@ mod tests {
                 task_index: Some(0),
                 tier_override: None,
                 backend_preference: None,
+                background: false,
                 created_at: 1234567890,
             }],
             created_at: 1234567890,
@@ -585,6 +593,28 @@ mod tests {
 
         let packet: DelegatedWorkPacket = serde_json::from_str(json).unwrap();
         assert_eq!(packet.session.mode, DelegatedSessionMode::New);
+    }
+
+    /// A snapshot serialized before the `background` field deserializes as
+    /// non-background, so old executions resume on the blocking path unchanged.
+    #[test]
+    fn delegated_packet_defaults_background_to_false() {
+        let json = r#"{
+            "id": "pkt-1",
+            "parentJobId": "job-1",
+            "origin": "task_tool",
+            "title": "Explore",
+            "problemStatement": "Investigate",
+            "agentConfigId": "Explore",
+            "ownership": {"cwd": "/tmp/test"},
+            "acceptance": [],
+            "outputContract": {"schemaType": "return"},
+            "status": "pending",
+            "createdAt": 123
+        }"#;
+
+        let packet: DelegatedWorkPacket = serde_json::from_str(json).unwrap();
+        assert!(!packet.background);
     }
 
     /// Pre-resolve-early snapshot (flat model/resolvedBackend + frozen presets,

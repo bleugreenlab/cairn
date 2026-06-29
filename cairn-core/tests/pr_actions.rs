@@ -244,8 +244,12 @@ async fn orchestrator_with_http(db: LocalDb, http: MockHttpClient) -> (TempDir, 
 async fn orchestrator_with_http_and_git(
     db: LocalDb,
     http: MockHttpClient,
-    git: MockGitClient,
+    mut git: MockGitClient,
 ) -> (TempDir, Orchestrator) {
+    git.expect_status()
+        .times(0..)
+        .returning(|_| Ok(String::new()));
+
     let cfg = tempfile::tempdir().unwrap();
     let db = Arc::new(db);
     let search = Arc::new(SearchIndex::open_or_create(cfg.path().join("search")).unwrap());
@@ -271,7 +275,16 @@ async fn orchestrator_with_effect_channel(
     let db = Arc::new(db);
     let search = Arc::new(SearchIndex::open_or_create(cfg.path().join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db, search));
-    let services = Arc::new(TestServicesBuilder::new().with_http(http).build());
+    let mut git = MockGitClient::new();
+    git.expect_status()
+        .times(0..)
+        .returning(|_| Ok(String::new()));
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_http(http)
+            .with_git(git)
+            .build(),
+    );
     let orch = Orchestrator::builder(db_state, services, cfg.path().join("config"))
         .effect_tx(Some(tx))
         .build();

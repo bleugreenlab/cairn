@@ -6,6 +6,7 @@
 
 use crate::models::TodoItem;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use cairn_common::ids;
 use turso::params;
 
 /// Compact one-line-per-todo rendering (`[id] content - status`) returned in
@@ -41,7 +42,7 @@ pub async fn replace_todos(
 
             let mut result = Vec::with_capacity(items.len());
             for (position, item) in items.iter().enumerate() {
-                let id = uuid::Uuid::new_v4().to_string();
+                let id = ids::mint_child(&job_id);
                 // Default to the 1-based position so the id matches how the
                 // list reads and is trivially guessable (item 1, 2, 3…). The
                 // `todos` table is already scoped by `job_id`, so there's
@@ -115,7 +116,7 @@ pub async fn append_todos(
             };
 
             for item in items.iter() {
-                let id = uuid::Uuid::new_v4().to_string();
+                let id = ids::mint_child(&job_id);
                 // 1-based position id; see `replace_todos` for rationale.
                 let default_id = (next_position + 1).to_string();
                 let todo_id = item.id.as_deref().unwrap_or(&default_id);

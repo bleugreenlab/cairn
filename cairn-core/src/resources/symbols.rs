@@ -43,12 +43,12 @@ pub(crate) async fn read_node_symbols(
     symbol: Option<&str>,
     params: &[QueryParam],
 ) -> String {
-    let (_, job) =
-        match connect_and_find_node_job(&orch.db.local, project, number, exec_seq, node_id).await {
-            Ok(pair) => pair,
-            Err(error) => return error,
-        };
-    let job = match crate::jobs::queries::get_job(&orch.db.local, &job.id).await {
+    let db = orch.db.for_project(project).await;
+    let (_, job) = match connect_and_find_node_job(&db, project, number, exec_seq, node_id).await {
+        Ok(pair) => pair,
+        Err(error) => return error,
+    };
+    let job = match crate::jobs::queries::get_job(&db, &job.id).await {
         Ok(job) => job,
         Err(error) => return format!("Error loading node job: {error}"),
     };
@@ -69,7 +69,8 @@ pub(crate) async fn read_project_symbols(
     params: &[QueryParam],
 ) -> String {
     let repo_path = {
-        let conn = match connect_for_read(&orch.db.local).await {
+        let routed_db = orch.db.for_project(project).await;
+        let conn = match connect_for_read(&routed_db).await {
             Ok(conn) => conn,
             Err(error) => return error,
         };

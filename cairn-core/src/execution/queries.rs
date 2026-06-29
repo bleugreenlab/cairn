@@ -396,22 +396,46 @@ pub fn compute_tabs_for_jobs(
 }
 
 pub fn list_jobs_for_issue_impl(orch: &Orchestrator, issue_id: &str) -> Result<Vec<Job>, String> {
-    run_query_db(list_jobs_for_issue(
-        orch.db.local.clone(),
-        issue_id.to_string(),
-    ))
+    let db = run_query_db({
+        let dbs = orch.db.clone();
+        let issue_id = issue_id.to_string();
+        async move {
+            crate::issues::crud::owning_db_for_issue(&dbs, &issue_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    run_query_db(list_jobs_for_issue(db, issue_id.to_string()))
 }
 
 pub fn get_job_impl(orch: &Orchestrator, job_id: &str) -> Result<Job, String> {
-    run_query_db(get_job(orch.db.local.clone(), job_id.to_string()))
+    let db = run_query_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    run_query_db(get_job(db, job_id.to_string()))
 }
 
 pub fn list_child_jobs_impl(
     orch: &Orchestrator,
     parent_tool_use_id: &str,
 ) -> Result<Vec<Job>, String> {
+    let db = run_query_db({
+        let dbs = orch.db.clone();
+        let parent_tool_use_id = parent_tool_use_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_parent_tool_use(&dbs, &parent_tool_use_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_query_db(list_jobs_by_column(
-        orch.db.local.clone(),
+        db,
         "parent_tool_use_id",
         parent_tool_use_id.to_string(),
     ))
@@ -421,8 +445,17 @@ pub fn list_child_jobs_by_parent_impl(
     orch: &Orchestrator,
     parent_job_id: &str,
 ) -> Result<Vec<Job>, String> {
+    let db = run_query_db({
+        let dbs = orch.db.clone();
+        let parent_job_id = parent_job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &parent_job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     run_query_db(list_jobs_by_column(
-        orch.db.local.clone(),
+        db,
         "parent_job_id",
         parent_job_id.to_string(),
     ))

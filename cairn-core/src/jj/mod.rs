@@ -157,8 +157,8 @@ impl JjEnv {
         }
     }
 
-    /// Run a jj command, returning trimmed stdout or a contextual error.
-    fn run(&self, cwd: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
+    /// Run a jj command, returning raw stdout bytes or a contextual error.
+    fn run_bytes(&self, cwd: &Path, args: &[&str], ctx: &str) -> Result<Vec<u8>, String> {
         #[cfg(test)]
         let _guard = jj_subprocess_lock()
             .lock()
@@ -175,7 +175,13 @@ impl JjEnv {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        Ok(out.stdout)
+    }
+
+    /// Run a jj command, returning trimmed stdout or a contextual error.
+    fn run(&self, cwd: &Path, args: &[&str], ctx: &str) -> Result<String, String> {
+        let out = self.run_bytes(cwd, args, ctx)?;
+        Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 }
 
@@ -183,6 +189,31 @@ impl JjEnv {
 /// signal the commit barrier dispatches on.
 pub fn is_jj_dir(dir: &Path) -> bool {
     dir.join(".jj").is_dir()
+}
+
+/// Read a file's bytes from `rev` without consulting or snapshotting the working
+/// copy. `path` is a repo-relative path (or fileset expression understood by jj).
+pub fn file_show(jj: &JjEnv, cwd: &Path, rev: &str, path: &str) -> Result<Vec<u8>, String> {
+    jj.run_bytes(
+        cwd,
+        &["file", "show", "-r", rev, "--ignore-working-copy", path],
+        "jj file show",
+    )
+}
+
+/// List repo-relative files visible at `rev`, optionally scoped to `path`.
+pub fn file_list(jj: &JjEnv, cwd: &Path, rev: &str, path: &str) -> Result<Vec<String>, String> {
+    let mut args = vec!["file", "list", "-r", rev, "--ignore-working-copy"];
+    if !path.is_empty() {
+        args.push(path);
+    }
+    Ok(jj
+        .run(cwd, &args, "jj file list")?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// The shared jj store directory for a project, under the Cairn home. One store
@@ -639,6 +670,26 @@ pub fn seal_paths(
     let branch = read_branch_marker(ws);
     if let Some(branch) = branch.as_deref() {
         if !seal_is_fast_forward(jj, ws, branch)? {
+            // The fast-forward guard refused: `@` does not descend from the branch
+            // bookmark. Two structurally different causes need OPPOSITE handling,
+            // and ancestry alone cannot separate them (in both, `@-` is an ancestor
+            // of the bookmark). The distinguisher is whether the bookmark tip
+            // carries a recorded CONFLICT:
+            //
+            // - Conflicted tip → a deliberate resolve-at-base FLATTEN. `@` is a
+            //   fresh resolved tree on the current base while the bookmark still
+            //   points at the conflicted intermediate stack tip the agent is
+            //   escaping. Discarding `@` would destroy the resolved work and
+            //   advancing would land back on the conflict, so this returns a
+            //   DISTINCT error routed to a non-destructive preserve-and-instruct
+            //   path (see [`is_conflicted_branch_seal_error`]).
+            // - Clean tip → a genuine STALE / coordinator-advance: the bookmark
+            //   advanced onto a clean tip and `@` is a stale shell. The existing
+            //   "behind its branch tip" message and its stale-family recovery
+            //   (discard, self-healing via update-stale) stay unchanged.
+            if branch_has_conflict(jj, ws, branch).unwrap_or(false) {
+                return Err(CONFLICTED_BRANCH_SEAL_MSG.to_string());
+            }
             return Err(format!(
                 "seal refused: workspace `{branch}` is behind its branch tip — the branch \
                  advanced past this workspace's head, so sealing would create a commit off \
@@ -903,8 +954,8 @@ pub fn node_changed_files(
     if !is_jj_dir(ws) {
         return None;
     }
-    let base_rev = resolve_changed_base(jj, ws, base_branch, base_commit)?;
-    let revset = format!("{base_rev}..@");
+    let fork = resolve_node_fork_point(jj, ws, base_branch, base_commit)?;
+    let revset = format!("{fork}..@");
     let out = jj
         .run(
             ws,
@@ -915,31 +966,69 @@ pub fn node_changed_files(
     Some(parse_git_diff(&out))
 }
 
-/// Resolve the base anchor for [`node_changed_files`] to a revset that resolves
-/// in the store, preferring the named base bookmark (resilient to a base
-/// advance: `bookmarks(exact:..)` tracks the current tip) over the recorded
-/// fork-point commit. Returns `None` when neither resolves, so the caller falls
-/// back to the cache rather than diffing against an empty set — which, as
-/// `<empty>..@`, would dump the workspace's entire history. Lock-free via
+/// Resolve the node's current effective fork point from the live jj graph.
+///
+/// The recorded `base_commit`/`pack_anchor` is the original fork point. That is
+/// not necessarily where the workspace is currently based: default-branch
+/// reconciliation can rebase the node onto `<base>@origin`, while local/manual
+/// advancement can move the local bookmark first. Rather than trusting one stale
+/// reference, resolve every base form that exists and choose the newest commit
+/// common to `@` and any of those bases. That keeps `/changed` and live PR diffs
+/// measuring only the node's own commits whether the node was rebased or the base
+/// advanced without the node.
+///
+/// Returns `None` when no base candidate resolves, so callers keep their existing
+/// cache or anchor fallback rather than diffing against an empty revset, which
+/// would dump the workspace's entire history. Lock-free via
 /// `--ignore-working-copy`.
-fn resolve_changed_base(
+pub fn resolve_node_fork_point(
     jj: &JjEnv,
     ws: &Path,
     base_branch: Option<&str>,
     base_commit: Option<&str>,
 ) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
     if let Some(branch) = base_branch.filter(|s| !s.is_empty()) {
-        let rev = format!("bookmarks(exact:{branch:?})");
-        if changed_base_resolves(jj, ws, &rev) {
-            return Some(rev);
-        }
+        candidates.push(format!("{branch}@origin"));
+        candidates.push(format!("bookmarks(exact:{branch:?})"));
     }
     if let Some(commit) = base_commit.filter(|s| !s.is_empty()) {
-        if changed_base_resolves(jj, ws, commit) {
-            return Some(commit.to_string());
-        }
+        candidates.push(commit.to_string());
     }
-    None
+
+    let resolved: Vec<String> = candidates
+        .into_iter()
+        .filter(|rev| changed_base_resolves(jj, ws, rev))
+        .collect();
+    if resolved.is_empty() {
+        return None;
+    }
+
+    let union = resolved.join(" | ");
+    let revset = format!("heads(::@ & ::({union}))");
+    // A criss-cross graph can produce multiple heads here. Taking the first is
+    // intentionally git-like: callers need a stable base, and any merge-base is
+    // a valid common ancestor for this defensive diff.
+    jj.run(
+        ws,
+        &[
+            "log",
+            "--ignore-working-copy",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\n\"",
+        ],
+        "jj resolve node fork point",
+    )
+    .ok()
+    .and_then(|s| {
+        s.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Whether `rev` resolves to a commit in the store, read lock-free. An exact
@@ -1612,7 +1701,10 @@ pub fn rebase_branch_onto(
 /// classify and self-heal it rather than dead-end. Also classify the `seal_paths`
 /// pre-commit "behind its branch tip" refusal: it is the same family (the
 /// bookmark advanced past a rewritten `@`), and the write path recovers from it
-/// the same way.
+/// the same way. The DISTINCT conflicted-branch refusal (a divergent `@` over a
+/// bookmark whose tip carries a recorded conflict) is split off into
+/// [`is_conflicted_branch_seal_error`] and deliberately NOT matched here: it must
+/// preserve the working copy, not discard it.
 ///
 /// Detection is by error-string because jj 0.42 exposes no non-snapshotting
 /// staleness probe (`jj debug workingcopy` is gone; `--ignore-working-copy`
@@ -1637,6 +1729,32 @@ const LOST_SEAL_MSG: &str =
 /// against the current base and re-seal.
 pub fn is_lost_seal_error(msg: &str) -> bool {
     msg.contains(LOST_SEAL_MSG)
+}
+
+/// Stable marker phrase for a seal refused because the workspace head diverged
+/// from a branch bookmark whose tip carries a recorded CONFLICT — the deliberate
+/// resolve-at-base FLATTEN case. The agent moved `@` onto a fresh resolved line
+/// off the current base while the bookmark still points at the conflicted
+/// intermediate stack tip it is escaping; jj will not fold that conflicted
+/// history, so sealing forward is refused. Unlike the clean "behind its branch
+/// tip" refusal (genuine stale / coordinator-advance, recovered by discard +
+/// update-stale), this MUST NOT discard: `@` holds real resolved work the discard
+/// would destroy. Deliberately omits the "behind its branch tip" phrase so
+/// [`is_stale_error`] does not match it. `pub(crate)` so the cross-module barrier
+/// tests can reference the exact string without drift.
+pub(crate) const CONFLICTED_BRANCH_SEAL_MSG: &str =
+    "seal refused: branch tip carries a recorded conflict; sealing forward would advance onto the conflict";
+
+/// Classify a jj error as the CONFLICTED-BRANCH seal refusal: the fast-forward
+/// guard refused a seal because the branch bookmark tip carries a recorded
+/// conflict and `@` has diverged from it (a deliberate resolve-at-base flatten).
+/// Kept DISTINCT from [`is_stale_error`] and [`is_lost_seal_error`] — those
+/// recover by discarding / re-sealing, but this one must PRESERVE the working
+/// copy, because discarding destroys the resolved flatten and advancing lands
+/// back on the conflict. The routing sites give it its own non-destructive arm
+/// that preserves `@` and points at the git-workflow resolve-at-base flatten.
+pub fn is_conflicted_branch_seal_error(msg: &str) -> bool {
+    msg.contains(CONFLICTED_BRANCH_SEAL_MSG)
 }
 
 /// Refresh a workspace whose `@` was rebased out from under it. A rebased live
@@ -2688,6 +2806,67 @@ index 1111111111..2222222222 100644
         assert!(node_changed_files(&jj, dir.path(), Some("main"), None).is_none());
     }
 
+    fn setup_base_advance_with_node_change(
+        bin: &str,
+        rebase_workspace: bool,
+    ) -> (
+        TempDir,
+        TempDir,
+        TempDir,
+        TempDir,
+        JjEnv,
+        std::path::PathBuf,
+        String,
+    ) {
+        let home = TempDir::new().unwrap();
+        let origin = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        init_project(proj.path());
+        std::fs::write(proj.path().join("base-only.rs"), "base-only\n").unwrap();
+        git(proj.path(), &["add", "-A"]);
+        git(proj.path(), &["commit", "-q", "-m", "add base-only"]);
+        let base = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+        git(
+            proj.path(),
+            &["remote", "add", "origin", &origin.path().to_string_lossy()],
+        );
+        git(proj.path(), &["push", "-q", "origin", "main"]);
+
+        let jj = JjEnv::resolve(bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let ws = wts.path().join("job");
+        let branch = "agent/CAIRN-1-builder-0";
+        add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+
+        std::fs::write(ws.join("node.rs"), "node\n").unwrap();
+        seal(&jj, &ws, "node work", None).unwrap();
+
+        std::fs::remove_file(proj.path().join("base-only.rs")).unwrap();
+        git(proj.path(), &["add", "-A"]);
+        git(
+            proj.path(),
+            &["commit", "-q", "-m", "external base deletion"],
+        );
+        git(proj.path(), &["push", "-q", "origin", "main"]);
+        fetch_remote(&jj, &store, "origin").unwrap();
+
+        if rebase_workspace {
+            reconcile_siblings(
+                &jj,
+                &store,
+                "main@origin",
+                &[(branch.to_string(), ws.clone())],
+            )
+            .unwrap();
+        }
+
+        (home, origin, proj, wts, jj, ws, base)
+    }
+
     /// The graph-derived change set lists a SEALED file (the omission this fixes)
     /// AND a loose, un-sealed `@` edit, while leaving the unchanged base file
     /// out. Drives the real shared-store seal path, mirroring the seal/discard
@@ -2747,6 +2926,53 @@ index 1111111111..2222222222 100644
         assert!(
             !by_path.contains_key("shared.rs"),
             "the unchanged base file must not appear: {changes:?}"
+        );
+    }
+
+    /// When origin/main advances externally and deletes a base file, but the node
+    /// has not yet been rebased, the effective fork point remains the original
+    /// base. `/changed` must report only the node's own file, not the unrelated
+    /// base deletion.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn node_changed_files_excludes_unrebased_external_base_deletion() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping node_changed_files_excludes_unrebased_external_base_deletion: jj not resolvable");
+            return;
+        };
+        let (_home, _origin, _proj, _wts, jj, ws, base) =
+            setup_base_advance_with_node_change(&bin, false);
+
+        let changes = node_changed_files(&jj, &ws, Some("main"), Some(&base))
+            .expect("jj workspace resolves an effective fork point");
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["node.rs"],
+            "base deletion must be absent: {changes:?}"
+        );
+    }
+
+    /// After the same external advance, reconcile rebases the node onto
+    /// `main@origin`. The effective fork point must move to that remote-tracking
+    /// tip, so the base branch's deletion still does not appear as node work.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn node_changed_files_excludes_rebased_external_base_deletion() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping node_changed_files_excludes_rebased_external_base_deletion: jj not resolvable");
+            return;
+        };
+        let (_home, _origin, _proj, _wts, jj, ws, base) =
+            setup_base_advance_with_node_change(&bin, true);
+
+        let changes = node_changed_files(&jj, &ws, Some("main"), Some(&base))
+            .expect("jj workspace resolves an effective fork point");
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["node.rs"],
+            "base deletion must be absent: {changes:?}"
         );
     }
 
@@ -5023,6 +5249,100 @@ index 1111111111..2222222222 100644
         // The lost-seal marker is its OWN family, not folded into the stale one:
         // the cause and remediation differ, so the predicates stay distinct.
         assert!(!is_stale_error(LOST_SEAL_MSG));
+        // The conflicted-branch refusal is ALSO its own family — it must PRESERVE
+        // the working copy, not discard it — so the stale classifier must not claim
+        // it (it deliberately omits the "behind its branch tip" phrase).
+        assert!(!is_stale_error(CONFLICTED_BRANCH_SEAL_MSG));
+    }
+
+    /// `is_conflicted_branch_seal_error` recognizes the conflicted-branch marker
+    /// and rejects every other seal-failure family, so the routing sites can give
+    /// it its own non-destructive arm without stealing the stale / lost-seal
+    /// cases that recover by discard / re-seal.
+    #[test]
+    fn is_conflicted_branch_seal_error_classifies_the_conflicted_branch_message() {
+        assert!(is_conflicted_branch_seal_error(CONFLICTED_BRANCH_SEAL_MSG));
+        // Wrapped in the write-path's surrounding text it still classifies.
+        assert!(is_conflicted_branch_seal_error(&format!(
+            "Applied file changes but the seal was refused: {CONFLICTED_BRANCH_SEAL_MSG}. ..."
+        )));
+        // Distinct from the stale and lost-seal families it is routed alongside.
+        assert!(!is_conflicted_branch_seal_error(
+            "Error: The working copy is stale (not updated since operation abc123)."
+        ));
+        assert!(!is_conflicted_branch_seal_error(
+            "seal refused: workspace `agent/x` is behind its branch tip"
+        ));
+        assert!(!is_conflicted_branch_seal_error(LOST_SEAL_MSG));
+        // And neither sibling classifier claims the conflicted-branch message.
+        assert!(!is_stale_error(CONFLICTED_BRANCH_SEAL_MSG));
+        assert!(!is_lost_seal_error(CONFLICTED_BRANCH_SEAL_MSG));
+    }
+
+    /// Real-store regression guard: when the branch bookmark tip carries a
+    /// recorded conflict and `@` has been moved to a fresh line off the current
+    /// base (the deliberate resolve-at-base flatten), `seal_paths` refuses with
+    /// the DISTINCT conflicted-branch error — NOT the stale "behind its branch
+    /// tip" message that would route the seal into a destructive discard. This is
+    /// the empirical confirmation that the conflicted-tip distinguisher fires and
+    /// the new classifier never lets the silent-data-loss path reach the flatten.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn seal_refuses_conflicted_branch_with_distinct_error() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping seal_refuses_conflicted_branch_with_distinct_error: jj not resolvable"
+            );
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path()); // main: shared.rs = "base\n"
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let branch = "agent/CAIRN-2081-builder-0";
+        let ws = wts.path().join("job");
+        add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+
+        // Feature edit on shared.rs, sealed on the agent branch.
+        std::fs::write(ws.join("shared.rs"), "feature change\n").unwrap();
+        seal(&jj, &ws, "feature edit", None).unwrap();
+
+        // main advances with a CONFLICTING change to the same file, re-imported.
+        std::fs::write(proj.path().join("shared.rs"), "main change\n").unwrap();
+        git(proj.path(), &["commit", "-aqm", "main change"]);
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        // Reconcile: rebase the feature branch onto main — the bookmark tip now
+        // carries a recorded conflict.
+        rebase_branch_onto(&jj, &store, branch, "main").unwrap();
+        assert!(
+            branch_has_conflict(&jj, &store, branch).unwrap(),
+            "precondition: the rebased bookmark tip carries a recorded conflict"
+        );
+
+        // Refresh the now-stale workspace, then move `@` to a fresh line off the
+        // current base tip — the resolve-at-base flatten shape, where `@` no longer
+        // descends from the conflicted bookmark.
+        let _ = update_stale(&jj, &ws);
+        let base_tip = revset_commit(&jj, &store, "main").unwrap();
+        jj.run(&ws, &["new", &base_tip], "jj new off base").unwrap();
+        std::fs::write(ws.join("flat.rs"), "resolved flat\n").unwrap();
+
+        // Sealing through the commit_msg path is refused with the DISTINCT
+        // conflicted-branch error, not the stale "behind its branch tip" message.
+        let err = seal(&jj, &ws, "flatten", None).unwrap_err();
+        assert!(
+            is_conflicted_branch_seal_error(&err),
+            "a divergent seal over a conflicted bookmark tip returns the conflicted-branch error: {err}"
+        );
+        assert!(
+            !is_stale_error(&err),
+            "and it is NOT misclassified as the stale family: {err}"
+        );
     }
 
     /// `is_lost_seal_error` recognizes the lost-seal marker (even wrapped in the

@@ -10,7 +10,9 @@ use super::thread_params::{
 use super::version::check_codex_version;
 use super::{CodexAppServerProfile, CodexBackend, CODEX_BACKEND_NAME};
 use crate::agent_process::process::{ActiveProcess, BackendStdin};
-use crate::backends::run_state::{run_job_id, set_session_backend_id, transition_run_to_live};
+use crate::backends::run_state::{
+    resolve_run_db, run_job_id, set_session_backend_id, transition_run_to_live,
+};
 use crate::identity::CodexAuth;
 use crate::orchestrator::session::{
     assemble_prompt_segments, base_instructions_from_segments,
@@ -95,6 +97,12 @@ impl AgentBackend for CodexBackend {
     fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
         let start_time = std::time::Instant::now();
         let session_id = Some(config.session_start.session_id().to_string());
+
+        // Resolve the run's owning DB ONCE (CAIRN-2208) and thread it through the
+        // run-state, resume-fallback, and streaming-transcript writes below. A team
+        // run lives wholly in its synced replica; routing those writes to the
+        // private DB would fail the message_streams→runs foreign key. Fail-closed.
+        let run_db = resolve_run_db(CODEX_BACKEND_NAME, orch, &config.run_id)?;
 
         let codex_path = crate::env::find_binary("codex").map_err(|e| {
             insert_error_event(
@@ -299,7 +307,7 @@ impl AgentBackend for CodexBackend {
                         );
                         let cairn_sid = session_id.as_str();
                         if let Some(preloaded_prompt) =
-                            build_resume_fallback_prompt(orch, cairn_sid, &config.prompt)
+                            build_resume_fallback_prompt(&run_db, cairn_sid, &config.prompt)
                         {
                             prompt_text = preloaded_prompt;
                         }
@@ -396,7 +404,7 @@ impl AgentBackend for CodexBackend {
 
         // Store the Codex thread_id as the session's backend resume handle
         if let Some(ref sid) = session_id {
-            let _ = set_session_backend_id(CODEX_BACKEND_NAME, orch, sid, &thread_id);
+            let _ = set_session_backend_id(CODEX_BACKEND_NAME, &run_db, sid, &thread_id);
         }
 
         let initial_sequence = persist_system_prompt_event(
@@ -426,7 +434,7 @@ impl AgentBackend for CodexBackend {
         ));
 
         // Transition run to Running AFTER successful spawn (sets started_at accurately)
-        if let Err(e) = transition_run_to_live(CODEX_BACKEND_NAME, orch, &config.run_id) {
+        if let Err(e) = transition_run_to_live(CODEX_BACKEND_NAME, orch, &run_db, &config.run_id) {
             log::warn!("Failed to transition codex run to running: {}", e);
             // Job is already Running from start_job's transition_job call — no write needed
         }
@@ -443,7 +451,8 @@ impl AgentBackend for CodexBackend {
                 current_turn_id.clone(),
             )) as Box<dyn BackendStdin>)));
 
-        let process_job_id: Option<String> = run_job_id(CODEX_BACKEND_NAME, orch, &config.run_id);
+        let process_job_id: Option<String> =
+            run_job_id(CODEX_BACKEND_NAME, &run_db, &config.run_id);
 
         {
             let mut processes = orch
@@ -480,6 +489,7 @@ impl AgentBackend for CodexBackend {
                 oauth_state,
                 initial_sequence,
                 "codex".to_string(),
+                run_db,
             );
         });
 
@@ -541,6 +551,9 @@ pub(crate) fn start_app_server_session(
 ) -> Result<(), String> {
     let start_time = std::time::Instant::now();
     let session_id = Some(config.session_start.session_id().to_string());
+
+    // Resolve the run's owning DB ONCE (CAIRN-2208); see the sibling start path.
+    let run_db = resolve_run_db(profile.backend_name, orch, &config.run_id)?;
 
     let codex_path = crate::env::find_binary("codex").map_err(|e| {
         insert_error_event(
@@ -751,7 +764,7 @@ pub(crate) fn start_app_server_session(
                         );
                     let cairn_sid = session_id.as_str();
                     if let Some(preloaded_prompt) =
-                        build_resume_fallback_prompt(orch, cairn_sid, &config.prompt)
+                        build_resume_fallback_prompt(&run_db, cairn_sid, &config.prompt)
                     {
                         prompt_text = preloaded_prompt;
                     }
@@ -848,7 +861,7 @@ pub(crate) fn start_app_server_session(
 
     // Store the Codex thread_id as the session's backend resume handle
     if let Some(ref sid) = session_id {
-        let _ = set_session_backend_id(profile.backend_name, orch, sid, &thread_id);
+        let _ = set_session_backend_id(profile.backend_name, &run_db, sid, &thread_id);
     }
 
     let initial_sequence = persist_system_prompt_event(
@@ -878,7 +891,7 @@ pub(crate) fn start_app_server_session(
     ));
 
     // Transition run to Running AFTER successful spawn (sets started_at accurately)
-    if let Err(e) = transition_run_to_live(profile.backend_name, orch, &config.run_id) {
+    if let Err(e) = transition_run_to_live(profile.backend_name, orch, &run_db, &config.run_id) {
         log::warn!("Failed to transition codex run to running: {}", e);
         // Job is already Running from start_job's transition_job call — no write needed
     }
@@ -895,7 +908,7 @@ pub(crate) fn start_app_server_session(
             current_turn_id.clone(),
         )) as Box<dyn BackendStdin>)));
 
-    let process_job_id: Option<String> = run_job_id(profile.backend_name, orch, &config.run_id);
+    let process_job_id: Option<String> = run_job_id(profile.backend_name, &run_db, &config.run_id);
 
     {
         let mut processes = orch
@@ -932,6 +945,7 @@ pub(crate) fn start_app_server_session(
             oauth_state,
             initial_sequence,
             profile.backend_key.to_string(),
+            run_db,
         );
     });
 

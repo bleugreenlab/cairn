@@ -72,10 +72,7 @@ pub async fn find_project_by_remote_full_name(
     let target = normalize_full_name(full_name)?;
 
     for project in crud::list_db(db).await? {
-        if project.remote_url.is_some()
-            || project.server_id.is_some()
-            || project.repo_path.is_empty()
-        {
+        if project.repo_path.is_empty() {
             continue;
         }
 
@@ -202,13 +199,7 @@ mod tests {
         db
     }
 
-    async fn insert_project(
-        db: &LocalDb,
-        id: &str,
-        repo_path: &str,
-        remote_url: Option<String>,
-        server_id: Option<String>,
-    ) {
+    async fn insert_project(db: &LocalDb, id: &str, repo_path: &str) {
         crud::create_db(
             db,
             &FixedClock,
@@ -217,8 +208,7 @@ mod tests {
                 name: id.to_string(),
                 key: id.chars().take(8).collect::<String>().to_uppercase(),
                 repo_path: repo_path.to_string(),
-                remote_url,
-                server_id,
+                team_id: None,
             },
         )
         .await
@@ -280,22 +270,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_project_by_remote_full_name_matches_local_origin_and_skips_bookmarks() {
+    async fn find_project_by_remote_full_name_matches_origin_and_skips_non_matching() {
         let db = migrated_db().await;
-        insert_project(&db, "local", "/repos/local", None, None).await;
-        insert_project(
-            &db,
-            "bookmark",
-            "/repos/bookmark",
-            Some("https://server.example".to_string()),
-            None,
-        )
-        .await;
+        insert_project(&db, "local", "/repos/local").await;
+        insert_project(&db, "other", "/repos/other").await;
 
         let mut git = MockGitClient::new();
         git.expect_remote_get_url()
             .with(function(|path: &Path| path == Path::new("/repos/local")))
             .returning(|_| Ok("git@github.com:Acme/workspace.git".to_string()));
+        git.expect_remote_get_url()
+            .with(function(|path: &Path| path == Path::new("/repos/other")))
+            .returning(|_| Ok("git@github.com:other/repo.git".to_string()));
 
         let project = find_project_by_remote_full_name(&db, &git, "acme/workspace")
             .await
@@ -307,8 +293,8 @@ mod tests {
     #[tokio::test]
     async fn find_project_by_remote_full_name_handles_https_and_owner_repo_forms() {
         let db = migrated_db().await;
-        insert_project(&db, "https", "/repos/https", None, None).await;
-        insert_project(&db, "path", "/repos/path", None, None).await;
+        insert_project(&db, "https", "/repos/https").await;
+        insert_project(&db, "path", "/repos/path").await;
 
         let mut git = MockGitClient::new();
         git.expect_remote_get_url()
@@ -346,7 +332,7 @@ mod tests {
     #[tokio::test]
     async fn push_sync_pulls_matching_default_branch_project() {
         let db = migrated_db().await;
-        insert_project(&db, "local", "/repos/local", None, None).await;
+        insert_project(&db, "local", "/repos/local").await;
 
         let mut git = MockGitClient::new();
         git.expect_remote_get_url()
@@ -392,7 +378,7 @@ mod tests {
         // reconcile fetches it into the shared store itself. The outcome must
         // still be `Pulled` so the caller reconciles in-flight workspaces.
         let db = migrated_db().await;
-        insert_project(&db, "local", "/repos/local", None, None).await;
+        insert_project(&db, "local", "/repos/local").await;
 
         let mut git = MockGitClient::new();
         git.expect_remote_get_url()
@@ -435,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn push_sync_skips_main_checkout_reconcile_when_dirty_but_still_signals_pulled() {
         let db = migrated_db().await;
-        insert_project(&db, "local", "/repos/local", None, None).await;
+        insert_project(&db, "local", "/repos/local").await;
 
         let mut git = MockGitClient::new();
         git.expect_remote_get_url()
@@ -470,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn push_sync_uses_resolved_default_branch_for_checkout_reconcile() {
         let db = migrated_db().await;
-        insert_project(&db, "local", "/repos/local", None, None).await;
+        insert_project(&db, "local", "/repos/local").await;
         crud::set_default_branch_db(&db, "local", "develop")
             .await
             .unwrap();
@@ -515,7 +501,7 @@ mod tests {
     #[tokio::test]
     async fn push_sync_ignores_unmatched_repo() {
         let db = migrated_db().await;
-        insert_project(&db, "local", "/repos/local", None, None).await;
+        insert_project(&db, "local", "/repos/local").await;
 
         let mut git = MockGitClient::new();
         git.expect_remote_get_url()

@@ -51,7 +51,6 @@ pub mod identity;
 pub mod models;
 pub mod output_schemas;
 pub mod references;
-pub mod remote_servers;
 pub mod skills;
 pub mod system_prompt;
 pub mod transcripts;
@@ -75,7 +74,6 @@ mod orchestrator;
 mod resources;
 mod services;
 mod storage;
-mod sync;
 mod workspace;
 
 /// Unstable app-facing API used by Cairn host crates.

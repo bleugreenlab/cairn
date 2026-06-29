@@ -145,8 +145,7 @@ pub(super) async fn target_resource_for_request(
     item: &ChangeItem,
 ) -> Result<CairnResource, String> {
     let target =
-        super::common::resolve_home_relative_resource_uri(&orch.db.local, request, &item.target)
-            .await?;
+        super::common::resolve_home_relative_resource_uri(&orch.db, request, &item.target).await?;
     parse_uri(&target).ok_or_else(|| {
         crate::mcp::handlers::resources::task_terminal_hint(&target)
             .unwrap_or_else(|| format!("Unrecognized URI format: {}", item.target))

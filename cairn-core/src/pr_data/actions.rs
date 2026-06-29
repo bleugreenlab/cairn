@@ -1161,8 +1161,20 @@ async fn refresh_local_pr_for_job(
     } else {
         Vec::new()
     };
-    let additions = additions.or_else(|| Some(local_files.iter().map(|file| file.additions).sum()));
-    let deletions = deletions.or_else(|| Some(local_files.iter().map(|file| file.deletions).sum()));
+    // An open local PR's diff stat must track its live source branch: recompute
+    // it from the fresh `git diff --numstat` on every refresh so a rebased or
+    // flattened source branch self-corrects. Freezing the first value (via
+    // `.or_else`/`COALESCE`) would pin a stale — possibly pre-conflict-resolution
+    // — diff forever. For merged/closed PRs `local_files` is empty, so keep the
+    // stored stat rather than zeroing it.
+    let (additions, deletions) = if status == "open" {
+        (
+            Some(local_files.iter().map(|file| file.additions).sum()),
+            Some(local_files.iter().map(|file| file.deletions).sum()),
+        )
+    } else {
+        (additions, deletions)
+    };
     let mergeable = if status == "open" {
         compute_local_mergeable(git, Path::new(&repo_path), &target_branch, &source_branch)
     } else {
@@ -1179,7 +1191,7 @@ async fn refresh_local_pr_for_job(
                 conn.execute(
                     "UPDATE merge_requests
                      SET github_mergeable = ?1, github_fetched_at = ?2, updated_at = ?2,
-                         additions = COALESCE(additions, ?3), deletions = COALESCE(deletions, ?4)
+                         additions = ?3, deletions = ?4
                      WHERE id = ?5",
                     params![
                         mergeable_str.as_str(),

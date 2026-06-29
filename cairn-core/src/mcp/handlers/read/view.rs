@@ -35,12 +35,18 @@ pub struct LineWindow {
     pub body: String,
     pub total: usize,
     pub offset: usize,
+    pub shown: usize,
 }
 
 /// Window `raw` by lines (offset/limit, negative offset = tail), without
 /// numbering. Shared by web and resource segments.
 pub fn window_text_lines(raw: &str, offset: Option<i64>, limit: Option<usize>) -> LineWindow {
-    let lines: Vec<&str> = raw.lines().collect();
+    // Generated resource and web markdown often ends with one or more formatting
+    // newlines. They should not create a phantom final page after the whole
+    // meaningful body has already been shown; internal blank lines remain real
+    // lines because only the tail is normalized.
+    let normalized = raw.trim_end_matches(['\r', '\n']);
+    let lines: Vec<&str> = normalized.lines().collect();
     let total = lines.len();
     let start = resolve_offset(offset, total);
     if start >= total {
@@ -48,6 +54,7 @@ pub fn window_text_lines(raw: &str, offset: Option<i64>, limit: Option<usize>) -
             body: String::new(),
             total,
             offset: start,
+            shown: 0,
         };
     }
     let end = match limit {
@@ -59,6 +66,7 @@ pub fn window_text_lines(raw: &str, offset: Option<i64>, limit: Option<usize>) -
         body: slice.join("\n"),
         total,
         offset: start,
+        shown: slice.len(),
     }
 }
 
@@ -314,11 +322,11 @@ struct BodyCut {
 /// Cut `body` to `budget` chars on a line boundary. When even the first line
 /// alone exceeds the budget, fall back to a character-truncated prefix of that
 /// line and report a text-relative `char_offset` so the continue URI advances.
-fn cut_body(body: &str, budget: usize, numbered: bool) -> BodyCut {
+fn cut_body(body: &str, budget: usize, numbered: bool, logical_lines: Option<usize>) -> BodyCut {
     if body.len() <= budget {
         return BodyCut {
             body: body.to_string(),
-            shown_lines: body.lines().count(),
+            shown_lines: logical_lines.unwrap_or_else(|| body.lines().count()),
             budget_truncated: false,
             char_offset: None,
         };
@@ -387,7 +395,8 @@ pub fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
         .map(|h| format!("\n\n{h}"))
         .unwrap_or_default();
 
-    let full_lines = body.lines().count();
+    let logical_full_lines = (meta.shown_units > 0).then_some(meta.shown_units);
+    let full_lines = logical_full_lines.unwrap_or_else(|| body.lines().count());
     // A line/file window that ends before EOF needs a footer even when the
     // budget was not the limiting factor.
     let window_short = line_unit(&meta)
@@ -399,7 +408,7 @@ pub fn render_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
     loop {
         let header_estimate = header(&meta, full_lines, true).len();
         let body_budget = content_budget.saturating_sub(header_estimate + 1 + history_suffix.len());
-        let cut = cut_body(&body, body_budget, numbered);
+        let cut = cut_body(&body, body_budget, numbered, logical_full_lines);
         let truncated = cut.budget_truncated || window_short || cut.char_offset.is_some();
 
         let head = header(&meta, cut.shown_lines, truncated);
@@ -498,7 +507,7 @@ fn render_record_segment(seg: ReadSegment, budget: usize) -> RenderedSegment {
 
     let header_estimate = header(&meta, shown, true).len();
     let body_budget = budget.saturating_sub(header_estimate + 1 + history_suffix.len());
-    let cut = cut_body(&body, body_budget, false);
+    let cut = cut_body(&body, body_budget, false, None);
     let truncated = cut.budget_truncated || more;
 
     let head = header(&meta, shown, truncated);
@@ -813,5 +822,43 @@ mod tests {
         assert_eq!(w.body, "c\nd");
         assert_eq!(w.total, 4);
         assert_eq!(w.offset, 2);
+        assert_eq!(w.shown, 2);
+    }
+
+    #[test]
+    fn window_text_lines_does_not_count_trailing_format_newlines() {
+        let w = window_text_lines("# Question\n\n## Response\n\nanswer\n\n", None, None);
+        assert_eq!(w.body, "# Question\n\n## Response\n\nanswer");
+        assert_eq!(w.total, 5);
+        assert_eq!(w.offset, 0);
+        assert_eq!(w.shown, 5);
+    }
+
+    #[test]
+    fn internal_blank_line_window_counts_as_one_line_and_terminates() {
+        let w = window_text_lines("first\n\nthird", Some(1), Some(1));
+        assert_eq!(w.body, "");
+        assert_eq!(w.total, 3);
+        assert_eq!(w.offset, 1);
+        assert_eq!(w.shown, 1);
+
+        let mut meta = SegmentMeta::new(
+            "cairn://p/CAIRN/1/1/planner/questions/q-1?offset=1&limit=1",
+            SegmentKind::Resource,
+            NaturalUnit::Line,
+        );
+        meta.total_units = Some(w.total);
+        meta.shown_units = w.shown;
+        meta.offset = w.offset;
+        meta.limit = Some(1);
+
+        let out = render_segment(ReadSegment::text(w.body, meta), 10_000);
+
+        assert_eq!(
+            out.text,
+            "=== cairn://p/CAIRN/1/1/planner/questions/q-1?offset=1&limit=1 [lines 2\u{2013}2 of 3] ===\n[lines 2\u{2013}2 of 3 — continue: cairn://p/CAIRN/1/1/planner/questions/q-1?offset=2&limit=1]"
+        );
+        assert_eq!(out.meta.shown_units, 1);
+        assert!(out.meta.truncated);
     }
 }

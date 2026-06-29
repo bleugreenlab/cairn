@@ -267,6 +267,7 @@ fn cairn_kind(path: &str) -> String {
         "bug",
         "help",
         "mcp",
+        "branch",
     ];
     for keyword in KEYWORDS {
         if segments.iter().any(|s| s == keyword) {

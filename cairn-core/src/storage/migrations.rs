@@ -1,6 +1,40 @@
 use super::Migration;
 
-pub const TURSO_MIGRATIONS: &[Migration] = &[
+/// Composes a migration lineage from its head migrations plus the shared tail.
+///
+/// The private (`TURSO_MIGRATIONS`) and team (`TEAM_MIGRATIONS`) lineages diverge
+/// only at their heads — the private head is the frozen 0001.. history rooted at
+/// `workspaces`; the team head is a one-time snapshot of the same shared tables
+/// re-rooted at `teams`. Shipped private history can never be rewritten, so that
+/// one-time divergence is unavoidable. From here forward, every FUTURE
+/// shared-table change is written ONCE in the `SHARED_TAIL` block below and both
+/// lineages compose it via this macro — the single source of truth that the
+/// schema-equivalence test enforces.
+macro_rules! shared_lineage {
+    ($($head:expr),* $(,)?) => {
+        &[
+            $($head,)*
+            // ── SHARED_TAIL ─────────────────────────────────────────────────
+            // Future shared-table migrations go HERE (not in a head). Each entry
+            // added below lands in BOTH lineages.
+            //
+            // CAIRN-2188 is the FIRST user: `execution_history.pack_hash` is a
+            // pointer to the per-execution range pack in the shared per-team
+            // content store. It is a shared-table change (both the private and
+            // team `execution_history` gain the column identically), so it is
+            // written once here. The SQL file lives in `turso_migrations/`; it is
+            // numbered 0084 to follow the private head (0082 + the 0083 cas_cache
+            // private head), and the team lineage records it after its 0002 head.
+            Migration::new(
+                "0084",
+                "archival_pack_hash",
+                include_str!("../../../../turso_migrations/0084_archival_pack_hash.sql"),
+            ),
+        ]
+    };
+}
+
+pub const TURSO_MIGRATIONS: &[Migration] = shared_lineage![
     Migration::new(
         "0001",
         "initial_schema",
@@ -416,6 +450,290 @@ pub const TURSO_MIGRATIONS: &[Migration] = &[
         "drop_runs_backend",
         include_str!("../../../../turso_migrations/0081_drop_runs_backend.sql"),
     ),
+    Migration::new(
+        "0082",
+        "team_routing",
+        include_str!("../../../../turso_migrations/0082_team_routing.sql"),
+    ),
+    // PRIVATE-ONLY (CAIRN-2188): the local read-through cache for content-store
+    // objects (team-run packs/blobs fetched by hash). Fetched bytes must never
+    // land on the synced team replica, so this is a private head entry, not a
+    // SHARED_TAIL change. Classified `Private(PrivateReason::RebuildableCache)` in
+    // `TABLE_SCOPES`; the `team_schema_matches_private` projection test proves it
+    // stays out of the team lineage.
+    Migration::new(
+        "0083",
+        "cas_cache",
+        include_str!("../../../../turso_migrations/0083_cas_cache.sql"),
+    ),
+];
+
+/// Team-DB migration lineage (the team-rooted counterpart of `TURSO_MIGRATIONS`).
+///
+/// `TEAM_HEAD` is a single snapshot migration (`turso_migrations_team/0001`) of
+/// the FINAL schema of every project-scoped table, re-anchored from `workspaces`
+/// to a `teams` root. It composes the same (currently empty) `SHARED_TAIL` as the
+/// private lineage, so a future shared-table change written once in
+/// `shared_lineage!` reaches both. The `team_schema_matches_private` test proves
+/// the two lineages stay byte-equivalent (after whitespace normalization) for
+/// every shared table except the four intentional re-rootings.
+pub const TEAM_MIGRATIONS: &[Migration] = shared_lineage![
+    Migration::new(
+        "0001",
+        "team_initial_schema",
+        include_str!("../../../../turso_migrations_team/0001_team_initial_schema.sql"),
+    ),
+    // Catch-up: the team head (0001) omitted `labels` (team-scoped label
+    // management is deferred), but the routed issue-content paths JOIN it for
+    // read-resolution. This adds the EMPTY table so that JOIN resolves uniformly
+    // across both lineages instead of failing `no such table: labels`
+    // (CAIRN-2186). Team-only by design: the private lineage already has `labels`
+    // from 0023, so this is not a SHARED_TAIL change.
+    Migration::new(
+        "0002",
+        "labels_read_completeness",
+        include_str!("../../../../turso_migrations_team/0002_labels_read_completeness.sql"),
+    ),
+];
+
+// ── Table scope: the single source of truth (CAIRN-2210) ────────────────────
+//
+// Scope is a property of the data, declared ONCE per table here. This one
+// declaration drives schema derivation (the team schema is the projection of the
+// ProjectScoped tables), the sync filter, and the write router. There is no
+// second place that encodes the same fact: the deleted CAIRN-2186 allowlist used
+// to, and that is exactly the drift this replaces. The `team_schema_matches_private`
+// test below proves the team lineage IS this projection.
+
+/// Which physical lineage a table currently lives in. Distinct from a table's
+/// eventual scope: a `SharedContent` table names where it lives TODAY so the
+/// schema projection stays exact until CAIRN-2188 moves it to the shared store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lineage {
+    /// The private/per-install database only.
+    Private,
+    /// The team replica (and, for a local project, the private DB — the team
+    /// lineage is the projection).
+    Team,
+}
+
+/// The eventual target scope of a `DeferredShared` table — what it WILL become
+/// once its tracked owner does the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeTarget {
+    ProjectScoped,
+    SharedContent,
+}
+
+/// Why a table is Private. Every Private classification carries a re-justified
+/// reason rather than an undifferentiated "doesn't sync" bucket, so a genuinely
+/// private credential is never confused with a rebuildable cache or a table whose
+/// lean is shared but whose move is deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateReason {
+    /// Identity and credentials (account, device, GitHub app/installations,
+    /// webhook staging, server registry).
+    IdentityCredential,
+    /// A structural root or the router itself (the private `workspaces` lineage
+    /// root, the `project_routes` catalog).
+    StructuralRoot,
+    /// A host-local runner-transient work queue (effect outbox, injection queue,
+    /// trigger accumulation, archival-backfill progress).
+    RunnerTransient,
+    /// A rebuildable / refetchable cache (CI logs).
+    RebuildableCache,
+    /// Private today, but its lean is to be shared; the move is DEFERRED to a
+    /// named owner. Recorded as an owned, documented exception, never an
+    /// anonymous allowlist line.
+    DeferredShared {
+        issue: &'static str,
+        target: ScopeTarget,
+    },
+}
+
+/// A table's scope: the single classification that drives schema, sync, and
+/// routing. Independent of `RouteScope` (where an *id* routes) — a local issue
+/// lives in a `ProjectScoped` table but has a bare, Local-routing id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableScope {
+    /// Lives only in the local/per-install database; never synced.
+    Private(PrivateReason),
+    /// Durable shared collaboration data owned by a project/team. Lives in BOTH
+    /// lineages: the private DB for a local project, the team replica for a team
+    /// project. The team schema is exactly the projection of these tables.
+    ProjectScoped,
+    /// Heavy content-addressed objects fetched on demand from a per-team shared
+    /// store (CAIRN-2188). The scope model NAMES the category; 2188 builds the
+    /// store and moves these. Until then each stays in its current lineage.
+    SharedContent { current: Lineage },
+}
+
+impl TableScope {
+    /// Whether a table with this scope physically appears in the team lineage
+    /// today (and therefore must be present in the team schema).
+    pub fn lives_in_team(&self) -> bool {
+        matches!(
+            self,
+            TableScope::ProjectScoped
+                | TableScope::SharedContent {
+                    current: Lineage::Team
+                }
+        )
+    }
+}
+
+/// Every table the private lineage creates, classified exactly once. The
+/// `team_schema_matches_private` test proves this is exhaustive (no private table
+/// unclassified), free of duplicate/stale entries, and that the team lineage is
+/// its projection. `teams` is the team-only root and has no private counterpart,
+/// so it is intentionally absent here and special-cased in the test.
+pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
+    // ── ProjectScoped: the durable shared collaboration surface ──────────────
+    ("action_configs", TableScope::ProjectScoped),
+    ("action_runs", TableScope::ProjectScoped),
+    ("artifact_content", TableScope::ProjectScoped),
+    ("artifacts", TableScope::ProjectScoped),
+    ("attention_pushes", TableScope::ProjectScoped),
+    ("attention_read_cursors", TableScope::ProjectScoped),
+    ("checkpoint_command_cache", TableScope::ProjectScoped),
+    ("checkpoint_runs", TableScope::ProjectScoped),
+    ("comments", TableScope::ProjectScoped),
+    ("condition_evaluations", TableScope::ProjectScoped),
+    ("doc_references", TableScope::ProjectScoped),
+    ("event_read_tokens", TableScope::ProjectScoped),
+    ("event_vibes", TableScope::ProjectScoped),
+    ("events", TableScope::ProjectScoped),
+    ("execution_trigger_sources", TableScope::ProjectScoped),
+    ("executions", TableScope::ProjectScoped),
+    ("file_changes", TableScope::ProjectScoped),
+    ("issue_dependencies", TableScope::ProjectScoped),
+    ("issue_labels", TableScope::ProjectScoped),
+    ("issue_workspaces", TableScope::ProjectScoped),
+    ("issues", TableScope::ProjectScoped),
+    ("job_browsers", TableScope::ProjectScoped),
+    ("job_terminals", TableScope::ProjectScoped),
+    ("jobs", TableScope::ProjectScoped),
+    ("labels", TableScope::ProjectScoped),
+    ("memories", TableScope::ProjectScoped),
+    ("memory_triage_issue_memories", TableScope::ProjectScoped),
+    ("merge_requests", TableScope::ProjectScoped),
+    ("message_stream_chunks", TableScope::ProjectScoped),
+    ("message_streams", TableScope::ProjectScoped),
+    ("messages", TableScope::ProjectScoped),
+    ("permission_requests", TableScope::ProjectScoped),
+    ("pr_node_port_fires", TableScope::ProjectScoped),
+    ("projects", TableScope::ProjectScoped),
+    ("prompts", TableScope::ProjectScoped),
+    ("queued_messages", TableScope::ProjectScoped),
+    ("resource_surfacings", TableScope::ProjectScoped),
+    ("runs", TableScope::ProjectScoped),
+    ("search_outbox", TableScope::ProjectScoped),
+    ("session_skyline_cache", TableScope::ProjectScoped),
+    ("sessions", TableScope::ProjectScoped),
+    ("skill_configs", TableScope::ProjectScoped),
+    ("suppressed_wakes", TableScope::ProjectScoped),
+    ("todos", TableScope::ProjectScoped),
+    ("token_rollup", TableScope::ProjectScoped),
+    ("token_rollup_runs", TableScope::ProjectScoped),
+    ("tool_invocation_runs", TableScope::ProjectScoped),
+    ("tool_invocations", TableScope::ProjectScoped),
+    ("turns", TableScope::ProjectScoped),
+    ("wake_subscriptions", TableScope::ProjectScoped),
+    // ── SharedContent: content-addressed, owned by CAIRN-2188 ────────────────
+    // Named here so the category exists; 2188 builds the store and moves them.
+    // Each stays in its CURRENT lineage until then so the projection is exact.
+    (
+        "archival_blobs",
+        TableScope::SharedContent {
+            current: Lineage::Private,
+        },
+    ),
+    (
+        "execution_history",
+        TableScope::SharedContent {
+            current: Lineage::Team,
+        },
+    ),
+    // ── Private: identity & credentials ──────────────────────────────────────
+    (
+        "account",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "anon_device",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "github_app",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "github_installations",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "servers",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "webhook_events",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    // ── Private: structural roots & the router ───────────────────────────────
+    (
+        "project_routes",
+        TableScope::Private(PrivateReason::StructuralRoot),
+    ),
+    (
+        "workspaces",
+        TableScope::Private(PrivateReason::StructuralRoot),
+    ),
+    // ── Private: runner-transient work queues ────────────────────────────────
+    (
+        "archival_backfill_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "effect_outbox",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "pending_injections",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "trigger_accumulator_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // ── Private: rebuildable / refetchable caches ────────────────────────────
+    (
+        "cas_cache",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
+        "ci_logs_cache",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    // ── Private: deferred-shared (lean is shared, move tracked by an owner) ───
+    // resource_embeddings: remotely computed (expensive to regenerate); lean is
+    // compute-once-per-team. Sharing needs routing the embed worker + a mechanism
+    // choice (sync rows vs the 2188 store), so it is deferred, not anonymous.
+    (
+        "resource_embeddings",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-2210",
+            target: ScopeTarget::ProjectScoped,
+        }),
+    ),
+    // config_disables: a host-side resolution override; team-config propagation is
+    // a separate cross-scope feature, deferred with a named owner.
+    (
+        "config_disables",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-2210",
+            target: ScopeTarget::ProjectScoped,
+        }),
+    ),
 ];
 
 #[cfg(test)]
@@ -515,7 +833,10 @@ mod tests {
                 "0078_browser_last_active_at".to_string(),
                 "0079_index_runs_session_id_created_at".to_string(),
                 "0080_token_rollup".to_string(),
-                "0081_drop_runs_backend".to_string()
+                "0081_drop_runs_backend".to_string(),
+                "0082_team_routing".to_string(),
+                "0083_cas_cache".to_string(),
+                "0084_archival_pack_hash".to_string()
             ]
         );
         Ok(db)
@@ -1608,5 +1929,297 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, before + 1, "issues search trigger must still fire");
+    }
+
+    // ── Team lineage (TEAM_MIGRATIONS) ──────────────────────────────────────
+
+    /// Reads `sqlite_master` rows of one object kind into a name→DDL map.
+    async fn schema_objects(
+        db: &LocalDb,
+        kind: &'static str,
+    ) -> std::collections::BTreeMap<String, String> {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut map = std::collections::BTreeMap::new();
+                let mut rows = conn
+                    .query(
+                        "SELECT name, sql FROM sqlite_master WHERE type = ?1 AND sql IS NOT NULL",
+                        (kind,),
+                    )
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    map.insert(row.text(0)?, row.text(1)?);
+                }
+                Ok(map)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Canonicalizes DDL for cross-lineage comparison. Turso's `sqlite_master`
+    /// re-rendering is not idempotent for the trailing `FOREIGN KEY (...)
+    /// REFERENCES x(id)` form (it inserts a space before `(id)`) and collapses
+    /// trigger-body newlines, so byte-equality requires normalizing whitespace
+    /// and the space-before-paren. Both differences are purely cosmetic.
+    fn norm(sql: &str) -> String {
+        sql.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace(" (", "(")
+    }
+
+    async fn migrated_team_db() -> (tempfile::TempDir, LocalDb) {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("team.turso.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        (temp, db)
+    }
+
+    #[tokio::test]
+    async fn team_migrations_apply_in_order() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("team.turso.db"))
+            .await
+            .unwrap();
+        let applied = MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied,
+            vec![
+                "0001_team_initial_schema".to_string(),
+                "0002_labels_read_completeness".to_string(),
+                // The first SHARED_TAIL migration: it lands in the team lineage
+                // after the team head (CAIRN-2188, execution_history.pack_hash).
+                "0084_archival_pack_hash".to_string(),
+            ]
+        );
+        // The team lineage is rooted at `teams`, not the private `workspaces`.
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='teams'"
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='workspaces'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        // Re-running is idempotent (tracked in cairn_schema_migrations).
+        let again = MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        assert!(again.is_empty(), "team migrations must be idempotent");
+    }
+
+    /// The anti-drift guarantee: every shared table, index, and trigger in the
+    /// team lineage is byte-identical (after `norm`) to the private lineage,
+    /// except the four intentional re-rootings, whose expected team DDL is
+    /// DERIVED from the private DDL by exactly the documented transforms. If a
+    /// future shared-table change lands in one lineage but not the other, this
+    /// fails. (`teams` is the team-only root and has no private counterpart.)
+    #[tokio::test]
+    async fn team_schema_matches_private() {
+        let priv_temp = tempdir().unwrap();
+        let priv_db = LocalDb::open(priv_temp.path().join("private.turso.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&priv_db)
+            .await
+            .unwrap();
+        let (_team_temp, team_db) = migrated_team_db().await;
+
+        let priv_tables = schema_objects(&priv_db, "table").await;
+        let team_tables = schema_objects(&team_db, "table").await;
+
+        let rerooted = [
+            "projects",
+            "action_configs",
+            "skill_configs",
+            "issue_labels",
+        ];
+        for table in rerooted {
+            let p = norm(&priv_tables[table]);
+            let expected = match table {
+                "projects" => p
+                    .replace("workspace_id", "team_id")
+                    .replace("REFERENCES workspaces(id)", "REFERENCES teams(id)")
+                    .replace(", FOREIGN KEY(server_id) REFERENCES servers(id)", ""),
+                "action_configs" | "skill_configs" => p
+                    .replace(
+                        "workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE, ",
+                        "",
+                    )
+                    .replace(
+                        "project_id TEXT REFERENCES projects(id)",
+                        "project_id TEXT NOT NULL REFERENCES projects(id)",
+                    )
+                    .replace(", CHECK((workspace_id IS NULL) !=(project_id IS NULL))", ""),
+                "issue_labels" => p.replace(
+                    "label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE",
+                    "label_id TEXT NOT NULL",
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                norm(&team_tables[table]),
+                expected,
+                "re-rooted table `{table}` drifted from its private counterpart"
+            );
+        }
+
+        for (name, sql) in &team_tables {
+            if name == "teams" || rerooted.contains(&name.as_str()) {
+                continue;
+            }
+            let p = priv_tables.get(name).unwrap_or_else(|| {
+                panic!("team table `{name}` is missing from the private lineage")
+            });
+            assert_eq!(
+                norm(sql),
+                norm(p),
+                "shared table `{name}` drifted between the team and private lineages"
+            );
+        }
+
+        for kind in ["index", "trigger", "view"] {
+            let priv_objs = schema_objects(&priv_db, kind).await;
+            let team_objs = schema_objects(&team_db, kind).await;
+            for (name, sql) in &team_objs {
+                let p = priv_objs.get(name).unwrap_or_else(|| {
+                    panic!("team {kind} `{name}` is missing from the private lineage")
+                });
+                assert_eq!(
+                    norm(sql),
+                    norm(p),
+                    "{kind} `{name}` drifted between lineages"
+                );
+            }
+        }
+
+        // ── The team schema is the PROJECTION of TABLE_SCOPES (CAIRN-2210) ─────
+        //
+        // The hand-curated CAIRN-2186 allowlist is gone. Scope is declared once,
+        // in `TABLE_SCOPES`; the team lineage is exactly the projection of the
+        // tables that classify into it. These assertions prove that projection,
+        // which subsumes the old reverse-completeness guard (a private table the
+        // team lineage lacks now surfaces as a projection mismatch).
+
+        // 1. Exhaustiveness + no duplicate / stale entries. Every table the
+        //    private lineage creates is classified exactly once, and every
+        //    classified name is a real private table.
+        // Infrastructure tables exist in EVERY database regardless of scope: the
+        // Turso MVCC bookkeeping table and the migration ledger itself. `teams`
+        // is special too — it exists in BOTH lineages with divergent schema (the
+        // private routing registry from 0082 vs the team-only FK root), so it is
+        // excluded from classification and handled explicitly, exactly as the
+        // DDL loops above skip it.
+        const SCHEMA_INFRA: &[&str] = &["__turso_internal_mvcc_meta", "cairn_schema_migrations"];
+        let is_classifiable = |name: &str| !SCHEMA_INFRA.contains(&name) && name != "teams";
+
+        let mut scope_map: std::collections::BTreeMap<&'static str, TableScope> =
+            std::collections::BTreeMap::new();
+        for (name, scope) in TABLE_SCOPES {
+            assert!(
+                scope_map.insert(name, *scope).is_none(),
+                "TABLE_SCOPES has a duplicate entry for `{name}`"
+            );
+        }
+        let mut unclassified: Vec<&str> = priv_tables
+            .keys()
+            .map(String::as_str)
+            .filter(|name| is_classifiable(name) && !scope_map.contains_key(name))
+            .collect();
+        unclassified.sort_unstable();
+        assert!(
+            unclassified.is_empty(),
+            "private table(s) missing a TABLE_SCOPES classification (scope must be \
+             declared once per table): {unclassified:?}"
+        );
+        let mut stale: Vec<&str> = scope_map
+            .keys()
+            .copied()
+            .filter(|name| !priv_tables.contains_key(*name))
+            .collect();
+        stale.sort_unstable();
+        assert!(
+            stale.is_empty(),
+            "TABLE_SCOPES classifies table(s) the private lineage does not create \
+             (stale entries): {stale:?}"
+        );
+
+        // 2. Projection. The team lineage's table set is EXACTLY the tables that
+        //    classify into it — every ProjectScoped table, every SharedContent
+        //    table located in the team lineage — plus the team-only `teams` root.
+        let mut expected_team: std::collections::BTreeSet<&str> = scope_map
+            .iter()
+            .filter(|(_, scope)| scope.lives_in_team())
+            .map(|(name, _)| *name)
+            .collect();
+        expected_team.insert("teams"); // present in both; classified specially
+        let actual_team: std::collections::BTreeSet<&str> = team_tables
+            .keys()
+            .map(String::as_str)
+            .filter(|name| !SCHEMA_INFRA.contains(name))
+            .collect();
+        assert_eq!(
+            expected_team, actual_team,
+            "the team schema is not the projection of TABLE_SCOPES (left = expected \
+             from the declarations, right = the actual team lineage). A table the \
+             team lineage lacks but TABLE_SCOPES places in-team is the schema-\
+             completeness gap the old allowlist guarded; an extra table is an \
+             unclassified team-only table."
+        );
+
+        // 3. The complement falls out of the projection: every private table NOT
+        //    in the team lineage is exactly a Private table or a SharedContent
+        //    table located in private — no hand-curated list to keep in sync.
+        let mut private_only_actual: Vec<&str> = priv_tables
+            .keys()
+            .map(String::as_str)
+            .filter(|name| is_classifiable(name) && !team_tables.contains_key(*name))
+            .collect();
+        private_only_actual.sort_unstable();
+        let mut private_only_expected: Vec<&str> = scope_map
+            .iter()
+            .filter(|(_, scope)| !scope.lives_in_team())
+            .map(|(name, _)| *name)
+            .collect();
+        private_only_expected.sort_unstable();
+        assert_eq!(
+            private_only_actual, private_only_expected,
+            "private-only tables diverge from their TABLE_SCOPES classification"
+        );
+
+        // 4. DeferredShared validity: every deferred-sharing exception names a
+        //    real tracking issue and a concrete target scope, so it stays an
+        //    owned, documented decision rather than an anonymous allowlist line.
+        for (name, scope) in TABLE_SCOPES {
+            if let TableScope::Private(PrivateReason::DeferredShared { issue, target }) = scope {
+                assert!(
+                    issue.starts_with("CAIRN-"),
+                    "DeferredShared table `{name}` must name a CAIRN issue, got {issue:?}"
+                );
+                // `target` is a closed enum; its presence is the contract.
+                let _ = target;
+            }
+        }
     }
 }

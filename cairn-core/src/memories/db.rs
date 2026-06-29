@@ -619,11 +619,10 @@ pub async fn revert_orphaned_claimed_memories(db: &LocalDb) -> DbResult<Vec<Stri
 /// claimed batch was already linked. A failed triage issue is terminal but never
 /// merged or closed, so neither `resolve_triage_batch_on_merge` nor
 /// `revert_triage_batch_on_close` ever runs for it: the batch would otherwise
-/// stay `claimed` forever and — because the issue is neither merged nor closed —
-/// keep `open_triage_issue_for_scope` reporting a live cover, wedging the scope
-/// against every future spawn. Revert those still-`claimed` memories to
-/// `pending`, clearing any decision recorded before the failure, so the batch
-/// re-enters its pool. Returns the reverted ids.
+/// stay `claimed` forever, stranding those memories outside their pending pool.
+/// Revert those still-`claimed` memories to `pending`, clearing any decision
+/// recorded before the failure, so the batch re-enters its pool. Returns the
+/// reverted ids.
 pub async fn revert_claimed_for_failed_triage_issues(db: &LocalDb) -> DbResult<Vec<String>> {
     let now = chrono::Utc::now().timestamp();
     db.write(|conn| {
@@ -685,47 +684,6 @@ pub async fn merged_triage_issues_with_claimed_memories(db: &LocalDb) -> DbResul
             Ok(ids)
         })
     })
-    .await
-}
-
-/// Escape SQL `LIKE` metacharacters so a built prefix matches literally under
-/// `ESCAPE '\'`.
-fn escape_like_pattern(input: &str) -> String {
-    input
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
-/// Issue id of a *live* memory-triage issue seeded for the exact
-/// `(scope, scope_value)`, matched on the deterministic triage title prefix.
-/// "Live" means non-terminal: `merged_at` and `closed_at` both NULL **and** the
-/// issue is not `failed`. Used to avoid spawning a duplicate triage issue when
-/// one is already in flight — including an orphan issue whose execution start
-/// failed and whose claimed batch was reverted (no link row survives, so a title
-/// match is the only signal). A *failed* triage execution is terminal: it is
-/// excluded here (otherwise it would wedge its scope against every future spawn)
-/// and its stranded batch is recovered by `revert_claimed_for_failed_triage_issues`.
-pub async fn open_triage_issue_for_scope(
-    db: &LocalDb,
-    scope: &str,
-    scope_value: &str,
-) -> DbResult<Option<String>> {
-    let prefix = format!(
-        "Memory triage: {}={} (",
-        escape_like_pattern(scope),
-        escape_like_pattern(scope_value)
-    );
-    let pattern = format!("{prefix}%");
-    db.query_opt(
-        "SELECT id FROM issues \
-         WHERE title LIKE ?1 ESCAPE '\\' \
-           AND merged_at IS NULL AND closed_at IS NULL \
-           AND status != 'failed' \
-         ORDER BY created_at DESC LIMIT 1",
-        params![pattern],
-        |row| row.text(0),
-    )
     .await
 }
 
@@ -1122,40 +1080,6 @@ mod tests {
         )
         .await
         .unwrap()
-    }
-
-    #[tokio::test]
-    async fn open_triage_issue_for_scope_ignores_failed_terminal_issue() {
-        let db = test_db().await;
-        // A failed triage execution is terminal even though merged_at/closed_at
-        // are NULL; it must not count as a live cover for its scope.
-        db.execute(
-            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-             VALUES ('issue-failed', 'project-1', 9, 'Memory triage: project=project-1 (5 pending)', 'failed', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-        assert!(open_triage_issue_for_scope(&db, "project", "project-1")
-            .await
-            .unwrap()
-            .is_none());
-
-        // A non-terminal issue for the same scope still counts as a live cover.
-        db.execute(
-            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
-             VALUES ('issue-active', 'project-1', 10, 'Memory triage: project=project-1 (5 pending)', 'active', 2, 2)",
-            (),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            open_triage_issue_for_scope(&db, "project", "project-1")
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("issue-active")
-        );
     }
 
     #[tokio::test]

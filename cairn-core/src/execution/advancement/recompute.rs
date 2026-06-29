@@ -278,7 +278,7 @@ pub(crate) async fn force_fail_job_turn_conn(
                     (session, None, 1)
                 }
             };
-            let turn_id = uuid::Uuid::new_v4().to_string();
+            let turn_id = ids::mint_child(job_id);
             conn.execute(
                 "INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state,
                                     start_reason, created_at, ended_at, updated_at)
@@ -796,7 +796,16 @@ pub async fn recompute_execution_jobs_conn(
 /// (manager jobs have no execution). This is the entry point for deciders that
 /// hold a `job_id` rather than an `execution_id`.
 pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let owning_db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let db = owning_db.clone();
     let job_id_owned = job_id.to_string();
     let execution_id = run_advancement_db(async move {
         db.query_opt_text(
@@ -813,7 +822,7 @@ pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
 
     // Standalone / manager job: derive and write in isolation. No DAG advance,
     // no JobEnded — a manager is never terminalized by the projection.
-    let db = orch.db.local.clone();
+    let db = owning_db.clone();
     let job_id_owned = job_id.to_string();
     let changed = run_advancement_db(async move {
         db.write(|conn| {
@@ -847,7 +856,7 @@ pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
 
     if changed {
         let job = run_advancement_db({
-            let db = orch.db.local.clone();
+            let db = owning_db.clone();
             let job_id = job_id.to_string();
             async move {
                 crate::jobs::queries::get_job(&db, &job_id)
@@ -866,8 +875,16 @@ pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
 /// The single entry point every former decider calls: run the execution sweep in
 /// a write transaction, then emit the follow-on effects keyed by each derived edge.
 pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Result<(), String> {
-    let db = orch.db.local.clone();
     let execution_id_owned = execution_id.to_string();
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let execution_id_owned = execution_id_owned.clone();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id_owned)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let changes = run_advancement_db(async move {
         db.write(|conn| {
             let execution_id = execution_id_owned.clone();
@@ -919,9 +936,12 @@ pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Resu
         .into_iter()
         .collect();
     for issue_id in touched_issue_ids {
-        let db = orch.db.local.clone();
+        let dbs = orch.db.clone();
         let issue_id_owned = issue_id.clone();
         let lookup = run_advancement_db(async move {
+            let db = crate::issues::crud::owning_db_for_issue(&dbs, &issue_id_owned)
+                .await
+                .map_err(|e| e.to_string())?;
             crate::orchestrator::attention::read_issue_for_attention(&db, &issue_id_owned).await
         });
         if let Ok(ctx) = lookup {

@@ -16,6 +16,7 @@
 //! pending. A `steer` that never reaches a tool boundary is therefore never
 //! stranded — the resume claim sweeps it up.
 
+use cairn_common::ids;
 use serde::{Deserialize, Serialize};
 use turso::params;
 
@@ -115,7 +116,7 @@ pub async fn enqueue_async(
     content: &str,
     delivery: Delivery,
 ) -> Result<QueuedMessage, String> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = ids::mint_child(job_id);
     let job_id = job_id.to_string();
     let content = content.to_string();
     let now = chrono::Utc::now().timestamp();

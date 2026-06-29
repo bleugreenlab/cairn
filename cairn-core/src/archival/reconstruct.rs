@@ -40,6 +40,7 @@ use sha2::{Digest, Sha256};
 use super::encoding::{
     decode, init_placeholder, ArchivedShape, EventColumns, ARCHIVED_SYSTEM_INIT, INIT_TOOLS_TAG,
 };
+use super::store::{content_hash, unframe_pack, ContentStore};
 use super::{decompress, diff, ObjectStore, CODEC_NONE, CODEC_ZSTD_V1};
 use crate::models::Event;
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -61,9 +62,17 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
     // reconstruct synchronously.
     let run_ids = gitcoord_run_ids(&events);
     let hashes = blobbed_hashes(&events);
+    // A team replica carries a content store; the private DB returns `None`. When
+    // present, an offloaded pack/blob whose bytes are absent locally is fetched
+    // from the shared per-team store (the store read-through caches into the
+    // private `cas_cache`, so repeat reconstructs are offline). The fetch happens
+    // in this async phase, before the non-Send `ObjectStore` is built.
+    let store = db.content_store().cloned();
     let coords = db
         .read(move |conn| {
-            Box::pin(async move { DbResult::Ok(Coords::load(conn, &run_ids, &hashes).await) })
+            Box::pin(async move {
+                DbResult::Ok(Coords::load(conn, &run_ids, &hashes, store.as_deref()).await)
+            })
         })
         .await
         .unwrap_or_default();
@@ -75,13 +84,14 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
 pub async fn reconstruct_events_with_conn(
     conn: &turso::Connection,
     events: Vec<Event>,
+    store: Option<&dyn ContentStore>,
 ) -> Vec<Event> {
     if !events.iter().any(is_archived) {
         return events;
     }
     let run_ids = gitcoord_run_ids(&events);
     let hashes = blobbed_hashes(&events);
-    let coords = Coords::load(conn, &run_ids, &hashes).await;
+    let coords = Coords::load(conn, &run_ids, &hashes, store).await;
     finish(coords, events)
 }
 
@@ -189,7 +199,12 @@ struct ReconstructCtx {
 }
 
 impl Coords {
-    async fn load(conn: &turso::Connection, run_ids: &[String], hashes: &[String]) -> Coords {
+    async fn load(
+        conn: &turso::Connection,
+        run_ids: &[String],
+        hashes: &[String],
+        store: Option<&dyn ContentStore>,
+    ) -> Coords {
         let mut run_meta: HashMap<String, RunMeta> = HashMap::new();
 
         for run_id in run_ids {
@@ -211,13 +226,13 @@ impl Coords {
             else {
                 continue;
             };
-            let pack = load_pack_bytes(conn, &exec_id).await;
+            let pack = load_pack_bytes(conn, &exec_id, store).await;
             packs.insert(exec_id, ExecPack { repo_path, pack });
         }
 
         let mut blobs: HashMap<String, String> = HashMap::new();
         for hash in hashes {
-            if let Some(text) = load_blob(conn, hash).await {
+            if let Some(text) = load_blob(conn, hash, store).await {
                 blobs.insert(hash.clone(), text);
             }
         }
@@ -275,28 +290,86 @@ async fn load_run_meta(conn: &turso::Connection, run_id: &str) -> Option<RunMeta
 }
 
 /// Load an execution's range pack bytes, returning `None` for an empty range
-/// (NULL pack columns) or a missing `execution_history` row.
+/// (NULL pack columns and no `pack_hash`) or a missing `execution_history` row.
+///
+/// Local run: `pack`/`pack_idx` are inline. Team run: those columns are NULL and
+/// `pack_hash` points at the framed pack object in the content store, fetched
+/// here by hash and split back into `(pack, idx)`. A missing pointer, absent
+/// store, fetch error, or malformed object yields `None` (degrade to stub).
 async fn load_pack_bytes(
     conn: &turso::Connection,
     execution_id: &str,
+    store: Option<&dyn ContentStore>,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut rows = conn
         .query(
-            "SELECT pack, pack_idx FROM execution_history WHERE execution_id = ?1 LIMIT 1",
+            "SELECT pack, pack_idx, pack_hash FROM execution_history WHERE execution_id = ?1 LIMIT 1",
             (execution_id,),
         )
         .await
         .ok()?;
     let row = rows.next().await.ok()??;
-    match (row.opt_blob(0).ok()?, row.opt_blob(1).ok()?) {
-        (Some(pack), Some(idx)) => Some((pack, idx)),
-        _ => None,
+    if let (Some(pack), Some(idx)) = (row.opt_blob(0).ok()?, row.opt_blob(1).ok()?) {
+        return Some((pack, idx));
+    }
+    let pack_hash = row.opt_text(2).ok()??;
+    let bytes = store?.get(&pack_hash).await.ok()??;
+    // Content-addressed integrity: the fetched object MUST hash to the pointer
+    // that named it. A mismatch (corrupt/stale object, broker or backend bug,
+    // tampering) is treated as absent so reconstruction degrades to a stub rather
+    // than restoring from bytes that are not the object `pack_hash` names.
+    if content_hash(&bytes) != pack_hash {
+        log::warn!(
+            "content-store pack object for {pack_hash} failed integrity check; treating as absent"
+        );
+        return None;
+    }
+    unframe_pack(&bytes)
+}
+
+/// Restore one content-addressed segment blob's text. `None` (missing
+/// row/object, integrity/utf-8 failure) leaves the segment to degrade to a
+/// labeled stub.
+///
+/// The two scopes store the blob DIFFERENTLY under the same hash. Team conn
+/// (`store` present): the `archival_blobs` table is private-only and absent here,
+/// so the bytes are fetched from the content store — where they are stored
+/// UNCOMPRESSED (their sha256 IS the key, so a fetch can verify integrity), hence
+/// used directly after the hash check, no decompress. Private conn (`store` is
+/// `None`): the bytes come from `archival_blobs`, which holds the
+/// zstd-COMPRESSED form, so the local path decompresses.
+async fn load_blob(
+    conn: &turso::Connection,
+    hash: &str,
+    store: Option<&dyn ContentStore>,
+) -> Option<String> {
+    match store {
+        // Team conn: the store object is the UNCOMPRESSED segment bytes, keyed by
+        // their sha256. Verify the fetched bytes hash to the requested key before
+        // trusting them (content-addressed integrity over an untrusted network); a
+        // mismatch is treated as absent and degrades to a stub.
+        Some(store) => {
+            let bytes = store.get(hash).await.ok()??;
+            if content_hash(&bytes) != hash {
+                log::warn!(
+                    "content-store blob object for {hash} failed integrity check; treating as absent"
+                );
+                return None;
+            }
+            String::from_utf8(bytes).ok()
+        }
+        // Private conn: `archival_blobs` holds the zstd-compressed bytes.
+        None => {
+            let content = load_blob_local(conn, hash).await?;
+            let bytes = decompress(CODEC_ZSTD_V1, &content).ok()?;
+            String::from_utf8(bytes).ok()
+        }
     }
 }
 
-/// Load and decompress one content-addressed segment blob. `None` (missing row,
-/// decompress/utf-8 failure) leaves the segment to degrade to a labeled stub.
-async fn load_blob(conn: &turso::Connection, hash: &str) -> Option<String> {
+/// Read one content-addressed blob's compressed bytes from the private
+/// `archival_blobs` table.
+async fn load_blob_local(conn: &turso::Connection, hash: &str) -> Option<Vec<u8>> {
     let mut rows = conn
         .query(
             "SELECT content FROM archival_blobs WHERE hash = ?1 LIMIT 1",
@@ -305,9 +378,7 @@ async fn load_blob(conn: &turso::Connection, hash: &str) -> Option<String> {
         .await
         .ok()?;
     let row = rows.next().await.ok()??;
-    let content = row.opt_blob(0).ok()??;
-    let bytes = decompress(CODEC_ZSTD_V1, &content).ok()?;
-    String::from_utf8(bytes).ok()
+    row.opt_blob(0).ok()?
 }
 
 fn reconstruct_one(event: &mut Event, ctx: &ReconstructCtx) {

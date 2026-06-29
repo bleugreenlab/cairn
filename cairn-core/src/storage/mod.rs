@@ -5,17 +5,24 @@ mod migration;
 mod migrations;
 mod row;
 mod search_index;
+mod team_sync;
 
 pub(crate) use blocking::run_db_blocking;
 pub use error::{DbError, DbResult};
-pub use local_db::{db_set_paths, db_set_size, move_db_set, LocalDb, RetryConfig};
+pub use local_db::{
+    db_set_paths, db_set_size, install_crypto_provider, move_db_set, LocalDb, RetryConfig,
+};
 pub use migration::{Migration, MigrationRunner};
-pub use migrations::TURSO_MIGRATIONS;
+pub use migrations::{
+    Lineage, PrivateReason, ScopeTarget, TableScope, TABLE_SCOPES, TEAM_MIGRATIONS,
+    TURSO_MIGRATIONS,
+};
 pub use row::{
     next_i64, next_opt_text, next_text, query_opt_i64_conn, query_opt_text_conn, query_text_conn,
     FromDbRow, RowExt,
 };
 pub use search_index::{SearchIndex, SearchIndexHit};
+pub use team_sync::{run_pull_task, run_push_task, RouteReconcile, SyncCadence};
 
 #[cfg(test)]
 pub(crate) async fn migrated_test_db(name: &str) -> LocalDb {

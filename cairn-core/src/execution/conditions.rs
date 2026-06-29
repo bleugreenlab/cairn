@@ -3,7 +3,7 @@
 //! Handles conditional branching logic in recipes by evaluating conditions
 //! against upstream artifact context.
 
-use uuid::Uuid;
+use cairn_common::ids;
 
 use crate::db_records::{DbRecipeEdge, DbRecipeNode};
 use crate::services::EventEmitter;
@@ -184,7 +184,7 @@ pub(crate) async fn store_condition_evaluation(
     emitter: &dyn EventEmitter,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().timestamp() as i32;
-    let eval_id = Uuid::new_v4().to_string();
+    let eval_id = ids::mint_child(execution_id);
     let execution_id = execution_id.to_string();
     let node_id = node_id.to_string();
     let result_port = result_port.to_string();

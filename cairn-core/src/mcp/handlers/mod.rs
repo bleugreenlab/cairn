@@ -3,6 +3,7 @@
 //! Framework-agnostic handler logic. Both Tauri and cairn-server dispatch to these.
 
 pub mod bash;
+pub(crate) mod branch;
 pub mod bug_report; // retained: used by files.rs change dispatch
 pub mod executions;
 pub mod fence;

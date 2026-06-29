@@ -34,9 +34,13 @@ pub fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) {
     if !matches!(event.fact, AttentionFact::Resolved { .. }) {
         return;
     }
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
+    let issue_id = event.issue_id.clone();
     let issue_uri = event.issue_uri.clone();
     let result = run_db_blocking(move || async move {
+        let db = crate::issues::crud::owning_db_for_issue(&dbs, &issue_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let key = format!("resolved:{issue_uri}");
         // Resolved is issue-wide; there is no single producing node to exclude.
         push_to_issue_watchers(

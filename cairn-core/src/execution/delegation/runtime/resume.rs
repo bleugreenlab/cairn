@@ -1,13 +1,19 @@
 use crate::models::{DelegatedStatus, ExecutionSnapshot};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
-use uuid::Uuid;
+use cairn_common::ids;
 
 use super::common::{
     block_on, block_on_value, latest_run_for_job_arc, refresh_packet_state, select_optional_text,
     ParentRunContext,
 };
-use super::results::{latest_nonempty_artifact_content_arc, latest_nonempty_assistant_content_arc};
+use super::results::{
+    compute_artifact_uri_for_child_job, latest_nonempty_artifact_content_arc,
+    latest_nonempty_assistant_content_arc,
+};
+use crate::orchestrator::attention_push::{
+    latest_push_fingerprint, push_with_fingerprint, Boundary, Wake,
+};
 
 const DEFERRED_TASK_PARENT_SUSPEND_GRACE: std::time::Duration =
     std::time::Duration::from_millis(75);
@@ -18,8 +24,17 @@ pub(super) fn prepare_parent_for_delegated_wait(
     packet: &crate::models::DelegatedWorkPacket,
 ) -> Result<(), String> {
     if let Some(pred_turn_id) = packet.parent_turn_id.as_deref() {
+        let db = {
+            let dbs = orch.db.clone();
+            let job_id = parent_ctx.job_id.clone();
+            block_on(async move {
+                crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            })?
+        };
         block_on(prepare_parent_for_delegated_wait_db(
-            orch.db.local.clone(),
+            db,
             pred_turn_id.to_string(),
             parent_ctx.job_id.clone(),
         ))?;
@@ -88,7 +103,7 @@ async fn prepare_parent_for_delegated_wait_db(
 
             let sequence = next_turn_sequence(conn, &session_id).await?;
             let now = chrono::Utc::now().timestamp() as i32;
-            let turn_id = Uuid::new_v4().to_string();
+            let turn_id = ids::mint_child(&parent_job_id);
             conn.execute(
                 "
                 INSERT INTO turns (
@@ -308,6 +323,108 @@ struct TaskResumeDelivery {
     tool_results: Vec<TaskToolResultDelivery>,
 }
 
+/// What a settled delegated task should trigger on its spawning parent.
+#[derive(Debug)]
+enum TaskCompletionOutcome {
+    /// Blocking spawn: deliver combined results into the suspended parent's
+    /// pending successor turn via `continue_job_impl`.
+    Resume(TaskResumeDelivery),
+    /// Background spawn: a `tasks:` attention push was already written for the
+    /// spawning node inside the closure. `wake_idle` says whether the effective
+    /// wake level should nudge an idle spawner now (a passive in-flight push
+    /// never nudges; the completion wake does).
+    BackgroundNotify { recipient: String, wake_idle: bool },
+}
+
+/// Background-spawn completion handler: notify the spawning node that one of its
+/// fire-and-forget tasks settled, passively while the batch is still in flight
+/// and with a single `wake` when the last sibling settles. This is the
+/// background sibling of the blocking successor-resume path; it never touches a
+/// successor turn or `continue_job_impl`.
+async fn notify_spawner_after_background_task_completion(
+    db: &LocalDb,
+    execution_id: &str,
+    trigger: &crate::models::DelegatedWorkPacket,
+    sibling_ids: &[String],
+) -> Result<Option<TaskCompletionOutcome>, String> {
+    let total = sibling_ids.len();
+    let mut terminal_count = 0usize;
+    for packet_id in sibling_ids {
+        let packet = refresh_packet_state(db, execution_id, packet_id)
+            .await?
+            .ok_or_else(|| format!("Delegated packet disappeared: {}", packet_id))?;
+        if matches!(
+            packet.status,
+            DelegatedStatus::Completed | DelegatedStatus::Failed | DelegatedStatus::Cancelled
+        ) {
+            terminal_count += 1;
+        }
+    }
+
+    let recipient = trigger.parent_job_id.clone();
+    // The anchor turn groups the batch (the same anchor `delegated_sibling_ids`
+    // keys on); fall back to the packet id for an unanchored single task so the
+    // supersession key is still stable.
+    let anchor = trigger
+        .parent_turn_id
+        .as_deref()
+        .unwrap_or(trigger.id.as_str());
+    let key = format!("tasks:{anchor}");
+    let settled = terminal_count >= total;
+
+    // content_ref: a single-task batch links straight to the task artifact; a
+    // multi-task batch links to the spawning node's tasks collection, which
+    // lists each child's status and artifact URI. Fall back to the recipient job
+    // id when neither resolves.
+    let content_ref = if total <= 1 {
+        match trigger.result_artifact_job_id.as_deref() {
+            Some(job_id) => compute_artifact_uri_for_child_job(db, job_id).await,
+            None => None,
+        }
+    } else {
+        crate::messages::delivery::node_uri_for_job(db, &recipient)
+            .await
+            .map(|uri| format!("{uri}/tasks"))
+    };
+    let content_ref = content_ref.unwrap_or_else(|| recipient.clone());
+
+    // Passive while the batch is in flight (the monotonic progress fingerprint
+    // supersedes the prior undelivered row each completion); one Wake when the
+    // last sibling settles. The fingerprint guard below makes a re-finalize
+    // after delivery a no-op, so recovery never double-wakes.
+    let (wake, fingerprint) = if settled {
+        (Wake::Wake, format!("complete:{total}"))
+    } else {
+        (Wake::Passive, format!("progress:{terminal_count}/{total}"))
+    };
+
+    if let Some(Some(prev)) = latest_push_fingerprint(db, &recipient, &key)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        if prev == fingerprint {
+            return Ok(None);
+        }
+    }
+
+    let (_, effective) = push_with_fingerprint(
+        db,
+        &recipient,
+        &content_ref,
+        wake,
+        Boundary::Event,
+        &key,
+        Some(&fingerprint),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(Some(TaskCompletionOutcome::BackgroundNotify {
+        recipient,
+        wake_idle: effective.wakes_idle(),
+    }))
+}
+
 fn task_tool_result_deliveries(
     run_id: &str,
     session_id: &str,
@@ -346,12 +463,21 @@ fn task_tool_result_deliveries(
 }
 
 /// The delegated packets that resume together with `trigger`: the same parent
-/// job anchored on the same `parent_turn_id`. Concurrent task spawns coalesce
-/// onto one wait (see `resolve_delegated_wait_anchor`), so every packet sharing
-/// that anchor resumes as a unit — whether they came from one `write` call or
-/// several back-to-back ones. The parent resume gate fires only once every
-/// packet in this group is terminal, and they deliver their results together.
-/// Falls back to `trigger` alone when it carries no anchor turn.
+/// job, the same `parent_turn_id`, AND the same `background` disposition.
+/// Concurrent task spawns coalesce onto one wait (see
+/// `resolve_delegated_wait_anchor`), so every packet sharing that anchor resumes
+/// as a unit — whether they came from one `write` call or several back-to-back
+/// ones. The parent resume gate fires only once every packet in this group is
+/// terminal, and they deliver their results together. Falls back to `trigger`
+/// alone when it carries no anchor turn.
+///
+/// `background` is part of the group identity, not just the anchor: a parent can
+/// spawn a background batch and a blocking batch in the *same* turn, so both
+/// share the anchor turn but have opposite resume semantics. Without this split
+/// a blocking resume would wait for and inline a fire-and-forget sibling, and a
+/// background completion wake would be delayed behind unrelated foreground work.
+/// Keying the group on `background` too keeps the two paths from ever observing
+/// each other's packets.
 fn delegated_sibling_ids(
     packets: &[crate::models::DelegatedWorkPacket],
     trigger: &crate::models::DelegatedWorkPacket,
@@ -360,6 +486,7 @@ fn delegated_sibling_ids(
         .iter()
         .filter(|candidate| {
             candidate.parent_job_id == trigger.parent_job_id
+                && candidate.background == trigger.background
                 && match trigger.parent_turn_id.as_deref() {
                     Some(anchor) => candidate.parent_turn_id.as_deref() == Some(anchor),
                     None => candidate.id == trigger.id,
@@ -407,7 +534,15 @@ pub fn resume_suspended_parent_after_task_completion(
     orch: &Orchestrator,
     child_job_id: &str,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = {
+        let dbs = orch.db.clone();
+        let cjid = child_job_id.to_string();
+        block_on(async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &cjid)
+                .await
+                .map_err(|e| e.to_string())
+        })?
+    };
     let child_job_id = child_job_id.to_string();
     let resume = block_on({
         let db = db.clone();
@@ -457,6 +592,19 @@ pub fn resume_suspended_parent_after_task_completion(
             }
 
             let sibling_ids = delegated_sibling_ids(&snapshot.delegated_packets, &refreshed_packet);
+
+            // Background spawns never prepared a successor turn, so the blocking
+            // successor/resume path below does not apply: notify the spawner via
+            // a push instead.
+            if refreshed_packet.background {
+                return notify_spawner_after_background_task_completion(
+                    &db,
+                    &execution_id,
+                    &refreshed_packet,
+                    &sibling_ids,
+                )
+                .await;
+            }
 
             let mut grouped_packets = Vec::with_capacity(sibling_ids.len());
             for packet_id in sibling_ids {
@@ -551,16 +699,39 @@ pub fn resume_suspended_parent_after_task_completion(
                 _ => Vec::new(),
             };
 
-            Ok(Some(TaskResumeDelivery {
+            Ok(Some(TaskCompletionOutcome::Resume(TaskResumeDelivery {
                 parent_job_id: refreshed_packet.parent_job_id,
                 parent_turn_id: parent_turn_id.to_string(),
                 message: full_combined,
                 tool_results,
-            }))
+            })))
         }
     })?;
-    let Some(resume) = resume else {
-        return Ok(());
+    let resume = match resume {
+        Some(TaskCompletionOutcome::Resume(resume)) => resume,
+        Some(TaskCompletionOutcome::BackgroundNotify {
+            recipient,
+            wake_idle,
+        }) => {
+            // A settled background batch upgrades to a `wake`; nudge an idle
+            // spawner so it drains the push now. A passive in-flight push
+            // reports `wake_idle == false` and rides along on the next run.
+            if wake_idle {
+                if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
+                    orch,
+                    &recipient,
+                    crate::messages::queued::DeliveryUrgency::Steer,
+                ) {
+                    log::warn!(
+                        "background task completion wake for {} failed: {}",
+                        recipient,
+                        e
+                    );
+                }
+            }
+            return Ok(());
+        }
+        None => return Ok(()),
     };
     let mut suppress_user_event = !resume.tool_results.is_empty();
     if suppress_user_event {
@@ -605,6 +776,17 @@ mod tests {
         anchor: Option<&str>,
     ) -> crate::models::DelegatedWorkPacket {
         packet_with_tool(id, parent_job, anchor, None)
+    }
+
+    fn packet_bg(
+        id: &str,
+        parent_job: &str,
+        anchor: Option<&str>,
+        background: bool,
+    ) -> crate::models::DelegatedWorkPacket {
+        let mut packet = packet(id, parent_job, anchor);
+        packet.background = background;
+        packet
     }
 
     fn packet_with_tool(
@@ -694,6 +876,27 @@ mod tests {
         let mut ids = delegated_sibling_ids(&packets, &trigger);
         ids.sort();
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn siblings_split_background_from_blocking_in_same_turn() {
+        // A background batch and a blocking batch spawned in the same parent turn
+        // share the anchor T1, but their resume semantics differ, so each path
+        // must see only its own packets — never the other disposition's.
+        let bg_trigger = packet_bg("a", "builder", Some("T1"), true);
+        let fg_trigger = packet_bg("c", "builder", Some("T1"), false);
+        let packets = vec![
+            packet_bg("a", "builder", Some("T1"), true),
+            packet_bg("b", "builder", Some("T1"), true),
+            packet_bg("c", "builder", Some("T1"), false),
+            packet_bg("d", "builder", Some("T1"), false),
+        ];
+        let mut bg = delegated_sibling_ids(&packets, &bg_trigger);
+        bg.sort();
+        assert_eq!(bg, vec!["a".to_string(), "b".to_string()]);
+        let mut fg = delegated_sibling_ids(&packets, &fg_trigger);
+        fg.sort();
+        assert_eq!(fg, vec!["c".to_string(), "d".to_string()]);
     }
 
     #[test]
@@ -795,5 +998,299 @@ mod tests {
         .unwrap();
         assert!(!claim_pending_successor(&db, "job", "other").await.unwrap());
         assert_eq!(turn_state(&db, "other").await, "pending");
+    }
+}
+
+#[cfg(test)]
+mod background_completion_tests {
+    use super::resume_suspended_parent_after_task_completion;
+    use crate::db::DbState;
+    use crate::orchestrator::attention_push::{list_pending, stamp_delivered, Push, Wake};
+    use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::Arc;
+
+    const ANCHOR: &str = "T1";
+    const TASKS_KEY: &str = "tasks:T1";
+
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// Execution snapshot JSON with one delegated packet per child, all anchored
+    /// on `T1`. Each tuple is `(packet_id, child_job_id, background)`.
+    fn snapshot_json(children: &[(&str, &str, bool)]) -> String {
+        let packets: Vec<serde_json::Value> = children
+            .iter()
+            .map(|(pid, cjob, bg)| {
+                serde_json::json!({
+                    "id": pid,
+                    "parentJobId": "j-parent",
+                    "parentTurnId": ANCHOR,
+                    "origin": "task_tool",
+                    "title": "Explore",
+                    "problemStatement": "x",
+                    "agentConfigId": "Explore",
+                    "ownership": { "cwd": "/tmp" },
+                    "outputContract": { "schemaType": "return" },
+                    "status": "running",
+                    "resultArtifactJobId": cjob,
+                    "background": bg,
+                    "createdAt": 0
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "recipe": {"id":"r","name":"R","description":null,"trigger":"manual","nodes":[],"edges":[]},
+            "agents": {},
+            "skills": {},
+            "triggerContext": {"issueId":"i","projectId":"p","triggerType":"manual"},
+            "delegatedPackets": packets,
+            "createdAt": 0
+        })
+        .to_string()
+    }
+
+    /// Seed a project/issue/execution, the spawning parent node `j-parent`, and a
+    /// child job per packet. Each tuple is `(packet_id, child_job_id, background,
+    /// child_status)`.
+    async fn seed(db: &LocalDb, children: &[(&str, &str, bool, &str)]) {
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','PRJ','/tmp/repo',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('i','p',7,'I','active','active','none',1,1);",
+        )
+        .await
+        .unwrap();
+
+        let snap = snapshot_json(
+            &children
+                .iter()
+                .map(|(pid, cjob, bg, _)| (*pid, *cjob, *bg))
+                .collect::<Vec<_>>(),
+        );
+        db.write(move |conn| {
+            let snap = snap.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,snapshot)
+                     VALUES('e','r','i','p','running',1,1,?1)",
+                    (snap.as_str(),),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id,execution_id,project_id,issue_id,status,uri_segment,node_name,created_at,updated_at)
+                     VALUES('j-parent','e','p','i','running','builder','builder',1,1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        for (_, cjob, _, status) in children {
+            let cjob = cjob.to_string();
+            let status = status.to_string();
+            db.write(move |conn| {
+                let cjob = cjob.clone();
+                let status = status.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO jobs(id,execution_id,project_id,issue_id,status,uri_segment,node_name,parent_job_id,created_at,updated_at)
+                         VALUES(?1,'e','p','i',?2,?1,'Explore','j-parent',1,1)",
+                        (cjob.as_str(), status.as_str()),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn set_job_status(db: &LocalDb, job_id: &str, status: &str) {
+        let job_id = job_id.to_string();
+        let status = status.to_string();
+        db.write(move |conn| {
+            let job_id = job_id.clone();
+            let status = status.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE jobs SET status = ?1 WHERE id = ?2",
+                    (status.as_str(), job_id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn parent_pushes(orch: &Orchestrator) -> Vec<Push> {
+        list_pending(&orch.db.local, "j-parent").await.unwrap()
+    }
+
+    /// One background task settling pushes a single `tasks:` wake to the spawner,
+    /// linked to the task artifact.
+    #[tokio::test]
+    async fn single_background_task_wakes_spawner() {
+        let db = crate::storage::migrated_test_db("bg-single.db").await;
+        seed(&db, &[("pkt-1", "j-c1", true, "complete")]).await;
+        let orch = test_orchestrator(db);
+
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].key, TASKS_KEY);
+        assert_eq!(pushes[0].wake, Wake::Wake);
+        assert!(
+            pushes[0].content_ref.contains("/task/"),
+            "content_ref = {}",
+            pushes[0].content_ref
+        );
+    }
+
+    /// A multi-task batch rides passively while siblings are still in flight and
+    /// upgrades to exactly one wake when the last sibling settles.
+    #[tokio::test]
+    async fn batch_is_passive_until_last_sibling_settles() {
+        let db = crate::storage::migrated_test_db("bg-batch.db").await;
+        seed(
+            &db,
+            &[
+                ("pkt-1", "j-c1", true, "running"),
+                ("pkt-2", "j-c2", true, "running"),
+                ("pkt-3", "j-c3", true, "running"),
+            ],
+        )
+        .await;
+        let orch = test_orchestrator(db);
+
+        set_job_status(&orch.db.local, "j-c1", "complete").await;
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].key, TASKS_KEY);
+        assert_eq!(pushes[0].wake, Wake::Passive);
+        assert!(
+            pushes[0].content_ref.ends_with("/tasks"),
+            "content_ref = {}",
+            pushes[0].content_ref
+        );
+
+        set_job_status(&orch.db.local, "j-c2", "complete").await;
+        resume_suspended_parent_after_task_completion(&orch, "j-c2").unwrap();
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].wake, Wake::Passive);
+
+        set_job_status(&orch.db.local, "j-c3", "complete").await;
+        resume_suspended_parent_after_task_completion(&orch, "j-c3").unwrap();
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].key, TASKS_KEY);
+        assert_eq!(pushes[0].wake, Wake::Wake);
+    }
+
+    /// Re-finalizing an already-settled, already-delivered batch creates no fresh
+    /// push: the unchanged fingerprint guards against a double wake on recovery.
+    #[tokio::test]
+    async fn redelivery_after_settled_does_not_double_wake() {
+        let db = crate::storage::migrated_test_db("bg-dedup.db").await;
+        seed(&db, &[("pkt-1", "j-c1", true, "complete")]).await;
+        let orch = test_orchestrator(db);
+
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        stamp_delivered(&orch.db.local, &[pushes[0].id.clone()], "ev-1")
+            .await
+            .unwrap();
+
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+        assert!(parent_pushes(&orch).await.is_empty());
+    }
+
+    /// A child that settles `failed` still counts terminal and fires the wake.
+    #[tokio::test]
+    async fn failed_child_still_fires_completion_wake() {
+        let db = crate::storage::migrated_test_db("bg-failed.db").await;
+        seed(&db, &[("pkt-1", "j-c1", true, "failed")]).await;
+        let orch = test_orchestrator(db);
+
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].wake, Wake::Wake);
+    }
+
+    /// A child that settles `cancelled` likewise counts terminal and fires the
+    /// wake — `refresh_packet_state` must map the cancelled job row to
+    /// `DelegatedStatus::Cancelled`, or the batch never reaches terminal.
+    #[tokio::test]
+    async fn cancelled_child_still_fires_completion_wake() {
+        let db = crate::storage::migrated_test_db("bg-cancelled.db").await;
+        seed(&db, &[("pkt-1", "j-c1", true, "cancelled")]).await;
+        let orch = test_orchestrator(db);
+
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].wake, Wake::Wake);
+    }
+
+    /// A non-background batch takes the blocking successor path and never creates
+    /// a `tasks:` push.
+    #[tokio::test]
+    async fn blocking_batch_creates_no_tasks_push() {
+        let db = crate::storage::migrated_test_db("bg-blocking.db").await;
+        seed(&db, &[("pkt-1", "j-c1", false, "complete")]).await;
+        let orch = test_orchestrator(db);
+
+        resume_suspended_parent_after_task_completion(&orch, "j-c1").unwrap();
+        assert!(parent_pushes(&orch).await.is_empty());
+    }
+
+    /// A background task and a blocking task spawned in the same parent turn
+    /// share the anchor but form separate batches: finalizing the background one
+    /// wakes immediately as a batch of one, not held behind the still-running
+    /// foreground sibling.
+    #[tokio::test]
+    async fn mixed_same_turn_group_isolates_background_from_blocking() {
+        let db = crate::storage::migrated_test_db("bg-mixed.db").await;
+        seed(
+            &db,
+            &[
+                ("pkt-bg", "j-bg", true, "complete"),
+                ("pkt-fg", "j-fg", false, "running"),
+            ],
+        )
+        .await;
+        let orch = test_orchestrator(db);
+
+        resume_suspended_parent_after_task_completion(&orch, "j-bg").unwrap();
+
+        // The background batch is one task: it settles and wakes immediately,
+        // ignoring the unrelated foreground sibling sharing the anchor.
+        let pushes = parent_pushes(&orch).await;
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].key, TASKS_KEY);
+        assert_eq!(pushes[0].wake, Wake::Wake);
     }
 }

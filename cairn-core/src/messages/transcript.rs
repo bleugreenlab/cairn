@@ -14,22 +14,25 @@ use crate::messages::side_channel::SideChannelNotice;
 use crate::models::Message;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
-use crate::sync::{SyncEvent, SyncMessage, SyncTranscriptEvent};
+use cairn_common::ids;
 use turso::params;
 
-/// Insert a `system:message` event per delivered message and forward each to
-/// cloud sync. Best-effort: individual insert failures are logged but don't
-/// stop the loop, matching the previous Tauri-side behavior.
+/// Insert a `system:message` event per delivered message. Best-effort:
+/// individual insert failures are logged but don't stop the loop, matching the
+/// previous Tauri-side behavior.
 pub async fn insert_message_events(
     orch: &Orchestrator,
     run_id: &str,
     session_id: Option<&str>,
     messages: &[Message],
 ) {
+    let db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
     let now = chrono::Utc::now().timestamp() as i32;
 
     for msg in messages {
-        let event_id = uuid::Uuid::new_v4().to_string();
+        let event_id = ids::mint_child(run_id);
         let summary = format!("{}: {}", msg.sender_name, msg.content);
 
         let transcript_event = TranscriptEvent {
@@ -55,8 +58,8 @@ pub async fn insert_message_events(
 
         let data = serde_json::to_string(&transcript_event).unwrap_or_default();
 
-        let sequence = match insert_system_event(
-            &orch.db.local,
+        if let Err(error) = insert_system_event(
+            &db,
             &event_id,
             run_id,
             session_id,
@@ -67,25 +70,9 @@ pub async fn insert_message_events(
         )
         .await
         {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                log::warn!("Failed to insert message event: {}", error);
-                continue;
-            }
-        };
-
-        orch.sync(SyncMessage::Event(SyncEvent::transcript(
-            SyncTranscriptEvent {
-                id: event_id.clone(),
-                run_id: run_id.to_string(),
-                session_id: session_id.map(str::to_string),
-                sequence,
-                event_type: "system:message".to_string(),
-                data: data.clone(),
-                created_at: i64::from(now),
-                turn_id: orch.process_state.get_current_turn_id(run_id),
-            },
-        )));
+            log::warn!("Failed to insert message event: {}", error);
+            continue;
+        }
     }
 }
 
@@ -105,8 +92,11 @@ pub async fn insert_attention_push_events(
     if pushes.is_empty() {
         return;
     }
+    let db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
     let now = chrono::Utc::now().timestamp() as i32;
-    let event_id = uuid::Uuid::new_v4().to_string();
+    let event_id = ids::mint_child(run_id);
     // CAIRN-1891: render delivered wakes through the one wake-card formatter —
     // store the carrying event as an `attention:briefing` whose content is the
     // structured `{active, catchup}` card payload plus the `resolved` markdown the
@@ -130,8 +120,8 @@ pub async fn insert_attention_push_events(
     };
     let data = serde_json::to_string(&transcript_event).unwrap_or_default();
 
-    let sequence = match insert_system_event(
-        &orch.db.local,
+    if let Err(error) = insert_system_event(
+        &db,
         &event_id,
         run_id,
         session_id,
@@ -142,25 +132,8 @@ pub async fn insert_attention_push_events(
     )
     .await
     {
-        Ok(sequence) => sequence,
-        Err(error) => {
-            log::warn!("Failed to insert attention push event: {}", error);
-            return;
-        }
-    };
-
-    orch.sync(SyncMessage::Event(SyncEvent::transcript(
-        SyncTranscriptEvent {
-            id: event_id.clone(),
-            run_id: run_id.to_string(),
-            session_id: session_id.map(str::to_string),
-            sequence,
-            event_type: "system:message".to_string(),
-            data: data.clone(),
-            created_at: i64::from(now),
-            turn_id: orch.process_state.get_current_turn_id(run_id),
-        },
-    )));
+        log::warn!("Failed to insert attention push event: {}", error);
+    }
 }
 
 /// Insert a `user` transcript event per delivered queued user message, so the
@@ -172,10 +145,13 @@ pub async fn insert_queued_user_events(
     session_id: Option<&str>,
     messages: &[QueuedMessage],
 ) {
+    let db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
     let now = chrono::Utc::now().timestamp() as i32;
 
     for msg in messages {
-        let event_id = uuid::Uuid::new_v4().to_string();
+        let event_id = ids::mint_child(run_id);
         let content = msg.content.clone();
         let transcript_event = TranscriptEvent {
             event_type: "user".to_string(),
@@ -194,35 +170,11 @@ pub async fn insert_queued_user_events(
         };
         let data = serde_json::to_string(&transcript_event).unwrap_or_default();
 
-        let sequence = match insert_user_event(
-            &orch.db.local,
-            &event_id,
-            run_id,
-            session_id,
-            &data,
-            now,
-        )
-        .await
+        if let Err(error) = insert_user_event(&db, &event_id, run_id, session_id, &data, now).await
         {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                log::warn!("Failed to insert queued user event: {}", error);
-                continue;
-            }
-        };
-
-        orch.sync(SyncMessage::Event(SyncEvent::transcript(
-            SyncTranscriptEvent {
-                id: event_id.clone(),
-                run_id: run_id.to_string(),
-                session_id: session_id.map(str::to_string),
-                sequence,
-                event_type: "user".to_string(),
-                data: data.clone(),
-                created_at: i64::from(now),
-                turn_id: orch.process_state.get_current_turn_id(run_id),
-            },
-        )));
+            log::warn!("Failed to insert queued user event: {}", error);
+            continue;
+        }
     }
 }
 
@@ -242,10 +194,13 @@ pub async fn insert_side_channel_events(
     session_id: Option<&str>,
     notices: &[SideChannelNotice],
 ) {
+    let db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+        .await
+        .unwrap_or_else(|_| orch.db.local.clone());
     let now = chrono::Utc::now().timestamp() as i32;
 
     for notice in notices {
-        let event_id = uuid::Uuid::new_v4().to_string();
+        let event_id = ids::mint_child(run_id);
         let summary = notice.render();
         let transcript_event = TranscriptEvent {
             event_type: "system:message".to_string(),
@@ -269,8 +224,8 @@ pub async fn insert_side_channel_events(
         };
         let data = serde_json::to_string(&transcript_event).unwrap_or_default();
 
-        let sequence = match insert_system_event(
-            &orch.db.local,
+        if let Err(error) = insert_system_event(
+            &db,
             &event_id,
             run_id,
             session_id,
@@ -281,25 +236,9 @@ pub async fn insert_side_channel_events(
         )
         .await
         {
-            Ok(sequence) => sequence,
-            Err(error) => {
-                log::warn!("Failed to insert side-channel event: {}", error);
-                continue;
-            }
-        };
-
-        orch.sync(SyncMessage::Event(SyncEvent::transcript(
-            SyncTranscriptEvent {
-                id: event_id.clone(),
-                run_id: run_id.to_string(),
-                session_id: session_id.map(str::to_string),
-                sequence,
-                event_type: "system:message".to_string(),
-                data: data.clone(),
-                created_at: i64::from(now),
-                turn_id: orch.process_state.get_current_turn_id(run_id),
-            },
-        )));
+            log::warn!("Failed to insert side-channel event: {}", error);
+            continue;
+        }
     }
 }
 
@@ -312,10 +251,19 @@ pub fn insert_side_channel_events_sync(
     turn_id: Option<&str>,
     notices: &[SideChannelNotice],
 ) -> Result<(), String> {
+    let db = crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
     let now = chrono::Utc::now().timestamp() as i32;
 
     for notice in notices {
-        let event_id = uuid::Uuid::new_v4().to_string();
+        let event_id = ids::mint_child(run_id);
         let summary = notice.render();
         let transcript_event = TranscriptEvent {
             event_type: "system:message".to_string(),
@@ -338,8 +286,8 @@ pub fn insert_side_channel_events_sync(
             })),
         };
         let data = serde_json::to_string(&transcript_event).unwrap_or_default();
-        let sequence = insert_system_event_sync(
-            &orch.db.local,
+        insert_system_event_sync(
+            &db,
             &event_id,
             run_id,
             session_id,
@@ -348,19 +296,6 @@ pub fn insert_side_channel_events_sync(
             now,
             turn_id,
         )?;
-
-        orch.sync(SyncMessage::Event(SyncEvent::transcript(
-            SyncTranscriptEvent {
-                id: event_id.clone(),
-                run_id: run_id.to_string(),
-                session_id: session_id.map(str::to_string),
-                sequence,
-                event_type: "system:message".to_string(),
-                data: data.clone(),
-                created_at: i64::from(now),
-                turn_id: turn_id.map(str::to_string),
-            },
-        )));
     }
     Ok(())
 }

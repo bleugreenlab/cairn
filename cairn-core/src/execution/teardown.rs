@@ -154,7 +154,15 @@ pub async fn plan_teardown(
 /// close/merge, issue delete). Issue-wide and unconditional — the work is done
 /// by the time any of these fire.
 pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Result<(), String> {
-    let targets = plan_teardown(&orch.db.local, &scope).await?;
+    // Route to the issue's owning database: a team issue's jobs (and their
+    // worktree_path rows, terminals, and browsers) live wholly in its synced
+    // replica, so planning and cleanup must read/write there or the team's
+    // worktrees leak and its terminal/browser rows are never cleared.
+    let TeardownScope::Issue(issue_id) = &scope;
+    let db = crate::issues::crud::owning_db_for_issue(&orch.db, issue_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let targets = plan_teardown(&db, &scope).await?;
     if targets.is_empty() {
         return Ok(());
     }
@@ -164,7 +172,7 @@ pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Re
         .iter()
         .flat_map(|target| target.job_ids.iter().cloned())
         .collect();
-    kill_terminals_for_jobs(orch, &job_ids).await;
+    kill_terminals_for_jobs(orch, &db, &job_ids).await;
 
     // Remove worktrees + delete local branches; collect branches per repo.
     let mut branches_by_repo: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -179,7 +187,7 @@ pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Re
         // its commits forward-mapped past any auto-rebase.
         let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
         match crate::archival::archive_target(
-            &orch.db.local,
+            &db,
             &target.worktree_path,
             &target.repo_path,
             &target.job_ids,
@@ -298,7 +306,12 @@ pub async fn teardown_removed_node_worktrees(
     targets: &[TeardownTarget],
 ) {
     if !cancelled_job_ids.is_empty() {
-        kill_terminals_for_jobs(orch, cancelled_job_ids).await;
+        // Best-effort cleanup: resolve the cancelled jobs' owning replica, falling
+        // back to private only if the rows are already gone.
+        let db = crate::execution::routing::owning_db_for_job(&orch.db, &cancelled_job_ids[0])
+            .await
+            .unwrap_or_else(|_| orch.db.local.clone());
+        kill_terminals_for_jobs(orch, &db, cancelled_job_ids).await;
     }
     if targets.is_empty() {
         return;
@@ -331,13 +344,13 @@ pub async fn teardown_removed_node_worktrees(
 ///
 /// Uses `orch.pty_state`, which both hosts share. On cairn-server (no live PTY
 /// sessions) this naturally no-ops the kill while still clearing terminal rows.
-async fn kill_terminals_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
+async fn kill_terminals_for_jobs(orch: &Orchestrator, db: &LocalDb, job_ids: &[String]) {
     if job_ids.is_empty() {
         return;
     }
 
     // Kill live PTY sessions for running terminals first.
-    match load_running_terminals_for_jobs(&orch.db.local, job_ids).await {
+    match load_running_terminals_for_jobs(db, job_ids).await {
         Ok(running) => {
             for (terminal_id, session_id) in &running {
                 let removed = match orch.pty_state.sessions.lock() {
@@ -367,7 +380,7 @@ async fn kill_terminals_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
 
     // Delete every terminal row for these jobs — the running ones we just killed
     // and any lingering exited rows retained for post-exit reads / exit wakes.
-    if let Err(e) = delete_all_terminal_rows_for_jobs(&orch.db.local, job_ids).await {
+    if let Err(e) = delete_all_terminal_rows_for_jobs(db, job_ids).await {
         log::warn!("Teardown: failed to delete terminal rows: {}", e);
     }
 
@@ -380,7 +393,7 @@ async fn kill_terminals_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
     // persist). Core cannot touch the live webview handle, so it sends a Close
     // over the channel for the app-side drain task to destroy it, then deletes
     // the rows.
-    close_browsers_for_jobs(orch, job_ids).await;
+    close_browsers_for_jobs(orch, db, job_ids).await;
 }
 
 /// Close live native webviews for the given jobs and delete their browser rows.
@@ -389,11 +402,11 @@ async fn kill_terminals_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
 /// [`BrowserCommand::Close`](crate::browsers::BrowserCommand) over the channel.
 /// On hosts without a webview layer the channel is `None` and only the rows are
 /// cleared.
-async fn close_browsers_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
+async fn close_browsers_for_jobs(orch: &Orchestrator, db: &LocalDb, job_ids: &[String]) {
     if job_ids.is_empty() {
         return;
     }
-    match crate::browsers::list_running_browsers_for_jobs(&orch.db.local, job_ids).await {
+    match crate::browsers::list_running_browsers_for_jobs(db, job_ids).await {
         Ok(running) => {
             for browser in &running {
                 if let Some(tx) = &orch.browser_command_tx {
@@ -406,8 +419,7 @@ async fn close_browsers_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
         }
         Err(e) => log::warn!("Teardown: failed to load running browsers: {e}"),
     }
-    if let Err(e) = crate::browsers::delete_all_browser_rows_for_jobs(&orch.db.local, job_ids).await
-    {
+    if let Err(e) = crate::browsers::delete_all_browser_rows_for_jobs(db, job_ids).await {
         log::warn!("Teardown: failed to delete browser rows: {e}");
     }
     let _ = orch.services.emitter.emit(

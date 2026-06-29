@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::docs;
 use crate::models::{DocContent, DocFile, DocReference};
 use crate::storage::{run_db_blocking, DbResult, RowExt};
+use cairn_common::ids;
 
 use super::Orchestrator;
 
@@ -146,7 +147,7 @@ impl Orchestrator {
     /// Attach a doc reference to an issue.
     pub fn attach_doc(&self, issue_id: &str, doc_path: &str) -> Result<DocReference, String> {
         let db = self.db.local.clone();
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = ids::mint_child(issue_id);
         let issue_id = issue_id.to_string();
         let doc_path = doc_path.to_string();
         let created_at = chrono::Utc::now().timestamp_millis();

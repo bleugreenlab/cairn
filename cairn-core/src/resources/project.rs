@@ -11,7 +11,8 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
 use cairn_common::uri::{
-    build_issue_uri, build_project_issues_uri, build_project_terminal_uri, build_project_uri,
+    build_issue_uri, build_project_issues_uri, build_project_reference_uri,
+    build_project_references_uri, build_project_terminal_uri, build_project_uri,
 };
 
 #[derive(Debug, Default)]
@@ -549,7 +550,13 @@ pub(super) async fn read_project_issues(
 // ============================================================================
 
 /// Read project overview with stats, recent activity, and terminals
-pub(super) async fn read_project(db: &LocalDb, project_key: &str) -> String {
+pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> String {
+    // Route to the project's owning database: the private DB for a local project,
+    // the team replica for a shared one. PR #1953 refactored read_project to take
+    // `orch` and read `orch.db.local`; resolving the owning DB by key here keeps
+    // CAIRN-2129 read-routing so a team project's overview reads from its replica.
+    let routed_db = orch.db.for_project(project_key).await;
+    let db = &*routed_db;
     let conn = match connect_for_read(db).await {
         Ok(conn) => conn,
         Err(error) => return error,
@@ -558,7 +565,7 @@ pub(super) async fn read_project(db: &LocalDb, project_key: &str) -> String {
     let mut project_rows = match conn
         .query(
             "
-            SELECT id, name, context, key
+            SELECT id, name, context, key, repo_path
             FROM projects
             WHERE key = ?1
             LIMIT 1
@@ -571,14 +578,23 @@ pub(super) async fn read_project(db: &LocalDb, project_key: &str) -> String {
         Err(error) => return storage_error("Failed to load project", error.into()),
     };
 
-    let (project_id, project_name, project_context, canonical_key): (
+    let (project_id, project_name, project_context, canonical_key, repo_path): (
         String,
         String,
         Option<String>,
         String,
+        String,
     ) = match project_rows.next().await {
-        Ok(Some(row)) => match (row.text(0), row.text(1), row.opt_text(2), row.text(3)) {
-            (Ok(id), Ok(name), Ok(context), Ok(key)) => (id, name, context, key),
+        Ok(Some(row)) => match (
+            row.text(0),
+            row.text(1),
+            row.opt_text(2),
+            row.text(3),
+            row.text(4),
+        ) {
+            (Ok(id), Ok(name), Ok(context), Ok(key), Ok(repo_path)) => {
+                (id, name, context, key, repo_path)
+            }
             _ => return "Failed to decode project".to_string(),
         },
         _ => return format!("Project '{}' not found", project_key),
@@ -653,6 +669,34 @@ pub(super) async fn read_project(db: &LocalDb, project_key: &str) -> String {
         ));
     }
 
+    output.push_str("## References\n\n");
+    let config =
+        crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
+    let references = config.references.clone().unwrap_or_default();
+    let statuses = crate::references::list_reference_status(&orch.config_dir, &references);
+    if statuses.is_empty() {
+        output.push_str("None.\n");
+    } else {
+        for status in &statuses {
+            let description = if status.description.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", status.description)
+            };
+            output.push_str(&format!(
+                "- `{}` [{:?}] exists={}{} (`{}`)\n",
+                status.name,
+                status.reference_type,
+                status.exists,
+                description,
+                build_project_reference_uri(&canonical_key, &status.name)
+            ));
+        }
+    }
+    output.push_str(&format!(
+        "\nManage references: `{}`\n\n",
+        build_project_references_uri(&canonical_key)
+    ));
     // Project terminals section (if any)
     if !terminals.is_empty() {
         output.push_str("## Terminals\n\n");
@@ -703,7 +747,7 @@ pub(super) async fn read_projects(db: &LocalDb) -> String {
     };
     let mut rows = match conn
         .query(
-            "SELECT key, name, hidden, remote_url FROM projects ORDER BY name ASC",
+            "SELECT key, name, hidden FROM projects ORDER BY name ASC",
             (),
         )
         .await
@@ -715,24 +759,17 @@ pub(super) async fn read_projects(db: &LocalDb) -> String {
     let mut out = String::from("# Projects\n\n");
     let mut any = false;
     while let Ok(Some(row)) = rows.next().await {
-        let (Ok(key), Ok(name), Ok(hidden), Ok(remote)) =
-            (row.text(0), row.text(1), row.i64(2), row.opt_text(3))
-        else {
+        let (Ok(key), Ok(name), Ok(hidden)) = (row.text(0), row.text(1), row.i64(2)) else {
             continue;
         };
         any = true;
         let hidden_mark = if hidden != 0 { " (hidden)" } else { "" };
-        let remote_mark = remote
-            .filter(|r| !r.is_empty())
-            .map(|r| format!(" — {r}"))
-            .unwrap_or_default();
         out.push_str(&format!(
-            "- [{}]({}) {}{}{}\n",
+            "- [{}]({}) {}{}\n",
             key,
             build_project_uri(&key),
             name,
-            hidden_mark,
-            remote_mark
+            hidden_mark
         ));
     }
     if !any {
@@ -742,8 +779,162 @@ pub(super) async fn read_projects(db: &LocalDb) -> String {
     out
 }
 
-pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str) -> String {
+fn render_configured_reference(
+    project_key: &str,
+    reference: &crate::references::ProjectReference,
+    status: &crate::references::ReferenceStatus,
+    detailed: bool,
+) -> String {
+    let mut out = String::new();
+    if detailed {
+        out.push_str(&format!("# Project reference — {}\n\n", reference.name));
+        out.push_str(&format!("- project: `{}`\n", project_key));
+        out.push_str(&format!(
+            "- uri: `{}`\n",
+            build_project_reference_uri(project_key, &reference.name)
+        ));
+        out.push_str(&format!("- type: {:?}\n", status.reference_type));
+        out.push_str(&format!("- exists: {}\n", status.exists));
+        if let Some(git) = &reference.git {
+            out.push_str(&format!("- git: `{}`\n", git));
+        }
+        if let Some(path) = &reference.path {
+            out.push_str(&format!("- path: `{}`\n", path));
+        }
+        if let Some(branch) = &reference.branch {
+            out.push_str(&format!("- branch: `{}`\n", branch));
+        }
+        if let Some(path) = &status.resolved_path {
+            out.push_str(&format!("- resolvedPath: `{}`\n", path));
+        } else {
+            out.push_str("- resolvedPath: null\n");
+        }
+        if status.description.is_empty() {
+            out.push_str("- description: \n");
+        } else {
+            out.push_str(&format!("- description: {}\n", status.description));
+        }
+        return out;
+    }
+
+    out.push_str(&format!(
+        "- `{}` [{:?}] exists={}\n",
+        reference.name, status.reference_type, status.exists
+    ));
+    out.push_str(&format!(
+        "  - uri: `{}`\n",
+        build_project_reference_uri(project_key, &reference.name)
+    ));
+    if let Some(git) = &reference.git {
+        out.push_str(&format!("  - git: `{}`\n", git));
+    }
+    if let Some(path) = &reference.path {
+        out.push_str(&format!("  - path: `{}`\n", path));
+    }
+    if let Some(branch) = &reference.branch {
+        out.push_str(&format!("  - branch: `{}`\n", branch));
+    }
+    if let Some(path) = &status.resolved_path {
+        out.push_str(&format!("  - resolvedPath: `{}`\n", path));
+    } else {
+        out.push_str("  - resolvedPath: null\n");
+    }
+    if !status.description.is_empty() {
+        out.push_str(&format!("  - description: {}\n", status.description));
+    }
+    out
+}
+
+pub(super) async fn read_project_references(orch: &Orchestrator, project_key: &str) -> String {
     let conn = match connect_for_read(&orch.db.local).await {
+        Ok(conn) => conn,
+        Err(error) => return error,
+    };
+    let lookup = project_key.to_uppercase();
+    let mut rows = match conn
+        .query(
+            "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
+            (lookup.as_str(),),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return storage_error("Failed to load project", error.into()),
+    };
+    let repo_path = match rows.next().await {
+        Ok(Some(row)) => match row.text(0) {
+            Ok(repo) => repo,
+            _ => return "Failed to decode project".to_string(),
+        },
+        _ => return format!("Project '{}' not found", project_key),
+    };
+    let config =
+        crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
+    let references = config.references.clone().unwrap_or_default();
+    let statuses = crate::references::list_reference_status(&orch.config_dir, &references);
+
+    let mut out = format!("# Project references — {}\n\n", lookup);
+    if references.is_empty() {
+        out.push_str("None.\n\n");
+        out.push_str(&format!(
+            "Add references at `{}`.\n",
+            build_project_references_uri(&lookup)
+        ));
+        return out;
+    }
+    for reference in &references {
+        if let Some(status) = statuses.iter().find(|status| status.name == reference.name) {
+            out.push_str(&render_configured_reference(
+                &lookup, reference, status, false,
+            ));
+        }
+    }
+    out
+}
+
+pub(super) async fn read_project_reference(
+    orch: &Orchestrator,
+    project_key: &str,
+    name: &str,
+) -> String {
+    let conn = match connect_for_read(&orch.db.local).await {
+        Ok(conn) => conn,
+        Err(error) => return error,
+    };
+    let lookup = project_key.to_uppercase();
+    let mut rows = match conn
+        .query(
+            "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
+            (lookup.as_str(),),
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => return storage_error("Failed to load project", error.into()),
+    };
+    let repo_path = match rows.next().await {
+        Ok(Some(row)) => match row.text(0) {
+            Ok(repo) => repo,
+            _ => return "Failed to decode project".to_string(),
+        },
+        _ => return format!("Project '{}' not found", project_key),
+    };
+    let config =
+        crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
+    let references = config.references.clone().unwrap_or_default();
+    let Some(reference) = references.iter().find(|reference| reference.name == name) else {
+        return format!("Project reference '{}' not found in {}", name, lookup);
+    };
+    let statuses = crate::references::list_reference_status(&orch.config_dir, &references);
+    let Some(status) = statuses.iter().find(|status| status.name == name) else {
+        return format!("Project reference '{}' not found in {}", name, lookup);
+    };
+    render_configured_reference(&lookup, reference, status, true)
+}
+
+pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str) -> String {
+    let routed_db = orch.db.for_project(project_key).await;
+    let conn = match connect_for_read(&routed_db).await {
         Ok(conn) => conn,
         Err(error) => return error,
     };
@@ -880,7 +1071,8 @@ pub(super) async fn read_project_search(
         );
     }
 
-    let conn = match connect_for_read(&orch.db.local).await {
+    let routed_db = orch.db.for_project(project_key).await;
+    let conn = match connect_for_read(&routed_db).await {
         Ok(conn) => conn,
         Err(error) => return error,
     };
@@ -913,7 +1105,12 @@ pub(super) async fn read_project_search(
         limit,
     };
 
-    match crate::search::search_content(&orch.db.local, &orch.db.search_index, query, Some(filters))
+    // Drain every open database's outbox so a shared project's locally-originated
+    // writes are indexed before this query (the index is URI-keyed and shared).
+    if let Err(error) = orch.db.apply_pending_search().await {
+        return format!("Search index update failed: {error}");
+    }
+    match crate::search::search_content(&routed_db, &orch.db.search_index, query, Some(filters))
         .await
     {
         Ok(results) => crate::mcp::handlers::search::format_search_results(

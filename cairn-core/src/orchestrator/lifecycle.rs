@@ -14,11 +14,11 @@
 
 use crate::agent_process::stream::TranscriptEvent;
 use crate::mcp::handlers::{emit_attention, AttentionEvent};
-use crate::models::{Run, RunStatus, TurnState};
+use crate::models::{RunStatus, TurnState};
 use crate::storage::{run_db_blocking, DbError, DbResult, RowExt};
 use crate::transcripts::stream_store::{self, EventInsert};
+use cairn_common::ids;
 use std::collections::HashSet;
-use uuid::Uuid;
 
 use super::attention_push::{Boundary, Wake};
 use super::Orchestrator;
@@ -69,267 +69,282 @@ fn apply_turn_outcome(
         ));
     }
 
-    let db = orch.db.local.clone();
     let turn_id = turn_id.to_string();
     let outcome_str = outcome.to_string();
-    run_db_blocking(move || async move {
-        db.write(|conn| {
-            let turn_id = turn_id.clone();
-            let outcome_str = outcome_str.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT state
+    run_db_blocking({
+        let dbs = orch.db.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_turn(&dbs, &turn_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            db.write(|conn| {
+                let turn_id = turn_id.clone();
+                let outcome_str = outcome_str.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT state
                          FROM turns
                          WHERE id = ?1",
-                        (turn_id.as_str(),),
-                    )
-                    .await?;
-                let current_str = crate::storage::next_text(&mut rows, 0).await?;
-                let Some(current_str) = current_str else {
-                    return Err(db_internal(transition_error(
-                        "turn",
-                        &turn_id,
-                        "unknown",
-                        outcome_str,
-                        "turn not found",
-                    )));
-                };
+                            (turn_id.as_str(),),
+                        )
+                        .await?;
+                    let current_str = crate::storage::next_text(&mut rows, 0).await?;
+                    let Some(current_str) = current_str else {
+                        return Err(db_internal(transition_error(
+                            "turn",
+                            &turn_id,
+                            "unknown",
+                            outcome_str,
+                            "turn not found",
+                        )));
+                    };
 
-                let from: TurnState = current_str.parse().map_err(|_| {
-                    db_internal(transition_error(
-                        "turn",
-                        &turn_id,
-                        current_str.clone(),
-                        outcome_str.clone(),
-                        format!("unparseable current state: {}", current_str),
-                    ))
-                })?;
+                    let from: TurnState = current_str.parse().map_err(|_| {
+                        db_internal(transition_error(
+                            "turn",
+                            &turn_id,
+                            current_str.clone(),
+                            outcome_str.clone(),
+                            format!("unparseable current state: {}", current_str),
+                        ))
+                    })?;
 
-                let outcome: TurnState = outcome_str.parse().map_err(db_internal)?;
-                if from == outcome {
-                    return Ok(());
-                }
-                if from.is_terminal() {
-                    return Err(db_internal(transition_error(
-                        "turn",
-                        &turn_id,
-                        from.to_string(),
-                        outcome.to_string(),
-                        "turn already terminal",
-                    )));
-                }
-
-                match (&from, &outcome) {
-                    (TurnState::Running, _) => {}
-                    (TurnState::Pending, TurnState::Failed | TurnState::Cancelled) => {}
-                    _ => {
+                    let outcome: TurnState = outcome_str.parse().map_err(db_internal)?;
+                    if from == outcome {
+                        return Ok(());
+                    }
+                    if from.is_terminal() {
                         return Err(db_internal(transition_error(
                             "turn",
                             &turn_id,
                             from.to_string(),
                             outcome.to_string(),
-                            format!("invalid transition: {:?} -> {:?}", from, outcome),
+                            "turn already terminal",
                         )));
                     }
-                }
 
-                let now = chrono::Utc::now().timestamp();
-                conn.execute(
-                    "UPDATE turns
+                    match (&from, &outcome) {
+                        (TurnState::Running, _) => {}
+                        (TurnState::Pending, TurnState::Failed | TurnState::Cancelled) => {}
+                        _ => {
+                            return Err(db_internal(transition_error(
+                                "turn",
+                                &turn_id,
+                                from.to_string(),
+                                outcome.to_string(),
+                                format!("invalid transition: {:?} -> {:?}", from, outcome),
+                            )));
+                        }
+                    }
+
+                    let now = chrono::Utc::now().timestamp();
+                    conn.execute(
+                        "UPDATE turns
                      SET state = ?1,
                          ended_at = ?2,
                          updated_at = ?2
                      WHERE id = ?3",
-                    (outcome.to_string().as_str(), now, turn_id.as_str()),
-                )
-                .await?;
-                Ok(())
+                        (outcome.to_string().as_str(), now, turn_id.as_str()),
+                    )
+                    .await?;
+                    Ok(())
+                })
             })
-        })
-        .await
-        .map_err(|e| e.to_string())
+            .await
+            .map_err(|e| e.to_string())
+        }
     })?;
     emit_db_change(orch, "turns", "update");
     Ok(())
 }
 
 fn interrupt_turn(orch: &Orchestrator, turn_id: &str) -> Result<(), String> {
-    let db = orch.db.local.clone();
     let turn_id = turn_id.to_string();
-    run_db_blocking(move || async move {
-        db.write(|conn| {
-            let turn_id = turn_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT state
+    run_db_blocking({
+        let dbs = orch.db.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_turn(&dbs, &turn_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            db.write(|conn| {
+                let turn_id = turn_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT state
                          FROM turns
                          WHERE id = ?1",
-                        (turn_id.as_str(),),
-                    )
-                    .await?;
-                let current_str = crate::storage::next_text(&mut rows, 0).await?;
-                let Some(current_str) = current_str else {
-                    return Err(db_internal(transition_error(
-                        "turn",
-                        &turn_id,
-                        "unknown",
-                        "interrupted",
-                        "turn not found",
-                    )));
-                };
+                            (turn_id.as_str(),),
+                        )
+                        .await?;
+                    let current_str = crate::storage::next_text(&mut rows, 0).await?;
+                    let Some(current_str) = current_str else {
+                        return Err(db_internal(transition_error(
+                            "turn",
+                            &turn_id,
+                            "unknown",
+                            "interrupted",
+                            "turn not found",
+                        )));
+                    };
 
-                let from: TurnState = current_str.parse().map_err(|_| {
-                    db_internal(transition_error(
-                        "turn",
-                        &turn_id,
-                        current_str.clone(),
-                        "interrupted",
-                        format!("unparseable current state: {}", current_str),
-                    ))
-                })?;
+                    let from: TurnState = current_str.parse().map_err(|_| {
+                        db_internal(transition_error(
+                            "turn",
+                            &turn_id,
+                            current_str.clone(),
+                            "interrupted",
+                            format!("unparseable current state: {}", current_str),
+                        ))
+                    })?;
 
-                if from == TurnState::Interrupted {
-                    return Ok(());
-                }
-                if from.is_terminal() {
-                    return Err(db_internal(transition_error(
-                        "turn",
-                        &turn_id,
-                        from.to_string(),
-                        "interrupted",
-                        "turn already terminal",
-                    )));
-                }
-                if from != TurnState::Running {
-                    return Err(db_internal(transition_error(
-                        "turn",
-                        &turn_id,
-                        from.to_string(),
-                        "interrupted",
-                        "can only interrupt a running turn",
-                    )));
-                }
+                    if from == TurnState::Interrupted {
+                        return Ok(());
+                    }
+                    if from.is_terminal() {
+                        return Err(db_internal(transition_error(
+                            "turn",
+                            &turn_id,
+                            from.to_string(),
+                            "interrupted",
+                            "turn already terminal",
+                        )));
+                    }
+                    if from != TurnState::Running {
+                        return Err(db_internal(transition_error(
+                            "turn",
+                            &turn_id,
+                            from.to_string(),
+                            "interrupted",
+                            "can only interrupt a running turn",
+                        )));
+                    }
 
-                let now = chrono::Utc::now().timestamp();
-                conn.execute(
-                    "UPDATE turns
+                    let now = chrono::Utc::now().timestamp();
+                    conn.execute(
+                        "UPDATE turns
                      SET state = 'interrupted',
                          ended_at = ?1,
                          updated_at = ?1
                      WHERE id = ?2",
-                    (now, turn_id.as_str()),
-                )
-                .await?;
-                Ok(())
+                        (now, turn_id.as_str()),
+                    )
+                    .await?;
+                    Ok(())
+                })
             })
-        })
-        .await
-        .map_err(|e| e.to_string())
+            .await
+            .map_err(|e| e.to_string())
+        }
     })?;
     emit_db_change(orch, "turns", "update");
     Ok(())
 }
 
 fn transition_run(orch: &Orchestrator, run_id: &str, to: RunStatus) -> Result<RunStatus, String> {
-    let db = orch.db.local.clone();
     let run_id = run_id.to_string();
     let emit_run_id = run_id.clone();
     let to_str = to.to_string();
-    let from = run_db_blocking(move || async move {
-        db.write(|conn| {
-            let run_id = run_id.clone();
-            let to_str = to_str.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT status
+    let from = run_db_blocking({
+        let dbs = orch.db.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            db.write(|conn| {
+                let run_id = run_id.clone();
+                let to_str = to_str.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT status
                          FROM runs
                          WHERE id = ?1",
-                        (run_id.as_str(),),
-                    )
-                    .await?;
-                let current_str = crate::storage::next_opt_text(&mut rows, 0)
-                    .await?
-                    .ok_or_else(|| {
+                            (run_id.as_str(),),
+                        )
+                        .await?;
+                    let current_str = crate::storage::next_opt_text(&mut rows, 0)
+                        .await?
+                        .ok_or_else(|| {
+                            db_internal(transition_error(
+                                "run",
+                                &run_id,
+                                "unknown",
+                                to_str.clone(),
+                                "run not found",
+                            ))
+                        })?;
+
+                    let from: RunStatus = current_str.parse().map_err(|_| {
                         db_internal(transition_error(
                             "run",
                             &run_id,
-                            "unknown",
+                            current_str.clone(),
                             to_str.clone(),
-                            "run not found",
+                            format!("unparseable current status: {}", current_str),
                         ))
                     })?;
+                    let to: RunStatus = to_str.parse().map_err(db_internal)?;
+                    let valid = matches!(
+                        (&from, &to),
+                        (RunStatus::Starting, RunStatus::Live)
+                            | (RunStatus::Starting, RunStatus::Exited)
+                            | (RunStatus::Starting, RunStatus::Crashed)
+                            | (RunStatus::Live, RunStatus::Exited)
+                            | (RunStatus::Live, RunStatus::Crashed)
+                    );
+                    if !valid {
+                        return Err(db_internal(transition_error(
+                            "run",
+                            &run_id,
+                            from.to_string(),
+                            to.to_string(),
+                            "transition not allowed",
+                        )));
+                    }
 
-                let from: RunStatus = current_str.parse().map_err(|_| {
-                    db_internal(transition_error(
-                        "run",
-                        &run_id,
-                        current_str.clone(),
-                        to_str.clone(),
-                        format!("unparseable current status: {}", current_str),
-                    ))
-                })?;
-                let to: RunStatus = to_str.parse().map_err(db_internal)?;
-                let valid = matches!(
-                    (&from, &to),
-                    (RunStatus::Starting, RunStatus::Live)
-                        | (RunStatus::Starting, RunStatus::Exited)
-                        | (RunStatus::Starting, RunStatus::Crashed)
-                        | (RunStatus::Live, RunStatus::Exited)
-                        | (RunStatus::Live, RunStatus::Crashed)
-                );
-                if !valid {
-                    return Err(db_internal(transition_error(
-                        "run",
-                        &run_id,
-                        from.to_string(),
-                        to.to_string(),
-                        "transition not allowed",
-                    )));
-                }
-
-                let now = chrono::Utc::now().timestamp();
-                match to {
-                    RunStatus::Live => {
-                        conn.execute(
-                            "UPDATE runs
+                    let now = chrono::Utc::now().timestamp();
+                    match to {
+                        RunStatus::Live => {
+                            conn.execute(
+                                "UPDATE runs
                              SET status = ?1,
                                  started_at = ?2,
                                  updated_at = ?2
                              WHERE id = ?3",
-                            (to.to_string().as_str(), now, run_id.as_str()),
-                        )
-                        .await?;
-                    }
-                    RunStatus::Exited | RunStatus::Crashed => {
-                        conn.execute(
-                            "UPDATE runs
+                                (to.to_string().as_str(), now, run_id.as_str()),
+                            )
+                            .await?;
+                        }
+                        RunStatus::Exited | RunStatus::Crashed => {
+                            conn.execute(
+                                "UPDATE runs
                              SET status = ?1,
                                  exited_at = ?2,
                                  updated_at = ?2
                              WHERE id = ?3",
-                            (to.to_string().as_str(), now, run_id.as_str()),
-                        )
-                        .await?;
-                    }
-                    RunStatus::Starting => {
-                        conn.execute(
-                            "UPDATE runs
+                                (to.to_string().as_str(), now, run_id.as_str()),
+                            )
+                            .await?;
+                        }
+                        RunStatus::Starting => {
+                            conn.execute(
+                                "UPDATE runs
                              SET status = ?1,
                                  updated_at = ?2
                              WHERE id = ?3",
-                            (to.to_string().as_str(), now, run_id.as_str()),
-                        )
-                        .await?;
+                                (to.to_string().as_str(), now, run_id.as_str()),
+                            )
+                            .await?;
+                        }
                     }
-                }
-                Ok(from)
+                    Ok(from)
+                })
             })
-        })
-        .await
-        .map_err(|e| e.to_string())
+            .await
+            .map_err(|e| e.to_string())
+        }
     })?;
     let job_id = job_id_for_run(orch, &emit_run_id);
     let _ = orch.services.emitter.emit(
@@ -344,35 +359,47 @@ pub(crate) fn set_exit_reason(
     run_id: &str,
     reason: &str,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
     let run_id = run_id.to_string();
     let reason = reason.to_string();
-    run_db_blocking(move || async move {
-        db.write(|conn| {
-            let run_id = run_id.clone();
-            let reason = reason.clone();
-            Box::pin(async move {
-                let now = chrono::Utc::now().timestamp();
-                conn.execute(
-                    "UPDATE runs
+    run_db_blocking({
+        let dbs = orch.db.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            db.write(|conn| {
+                let run_id = run_id.clone();
+                let reason = reason.clone();
+                Box::pin(async move {
+                    let now = chrono::Utc::now().timestamp();
+                    conn.execute(
+                        "UPDATE runs
                      SET exit_reason = ?1,
                          updated_at = ?2
                      WHERE id = ?3",
-                    (reason.as_str(), now, run_id.as_str()),
-                )
-                .await?;
-                Ok(())
+                        (reason.as_str(), now, run_id.as_str()),
+                    )
+                    .await?;
+                    Ok(())
+                })
             })
-        })
-        .await
-        .map_err(|e| e.to_string())
+            .await
+            .map_err(|e| e.to_string())
+        }
     })
 }
 
 fn finalize_todos(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
-    let db = orch.db.local.clone();
     let job_id = job_id.to_string();
-    run_db_blocking(move || async move { crate::todos::finalize_todos(&db, &job_id).await })
+    run_db_blocking({
+        let dbs = orch.db.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::todos::finalize_todos(&db, &job_id).await
+        }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -387,10 +414,18 @@ fn blocking_text_lookup(
     query: &'static str,
     column: TextColumn,
 ) -> Option<String> {
-    let db = orch.db.local.clone();
+    // Shared id-keyed read helper: the key is a self-routing run/turn/job id, so
+    // parse its team prefix to the owning database in O(1) (CAIRN-2210) instead
+    // of scanning every open database. A team id whose replica is not open routes
+    // to an Err, which collapses to None below — exactly as the old scan returned
+    // None when no open database carried the row.
+    let dbs = orch.db.clone();
     let key = key.to_string();
     run_db_blocking(move || async move {
-        db.read(|conn| {
+        let db = crate::execution::routing::routing_db_for_id(&dbs, &key)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.read(move |conn| {
             Box::pin(async move {
                 let mut rows = conn.query(query, (key.as_str(),)).await?;
                 match column {
@@ -461,61 +496,79 @@ fn pending_run_tool_results(
     run_id: &str,
     turn_id: &str,
 ) -> Result<Vec<PendingRunToolResult>, String> {
-    let db = orch.db.local.clone();
     let run_id = run_id.to_string();
     let turn_id = turn_id.to_string();
-    run_db_blocking(move || async move {
-        db.read(|conn| {
-            let run_id = run_id.clone();
-            let turn_id = turn_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT data
+    run_db_blocking({
+        let dbs = orch.db.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            db.read(|conn| {
+                let run_id = run_id.clone();
+                let turn_id = turn_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT data
                          FROM events
                          WHERE run_id = ?1
                            AND turn_id = ?2
                            AND event_type IN ('assistant', 'tool_result')
                          ORDER BY sequence ASC, rowid ASC",
-                        (run_id.as_str(), turn_id.as_str()),
-                    )
-                    .await?;
-                let mut candidates = Vec::new();
-                let mut completed = HashSet::new();
-                while let Some(row) = rows.next().await? {
-                    let data = row.text(0)?;
-                    let Ok(event) = serde_json::from_str::<TranscriptEvent>(&data) else {
-                        continue;
-                    };
-                    match event.event_type.as_str() {
-                        "assistant" => {
-                            for tool in event.tool_uses.unwrap_or_default() {
-                                if is_run_tool_call(&tool.name, &tool.input) {
-                                    candidates.push(PendingRunToolResult {
-                                        tool_use_id: tool.id,
-                                        tool_name: tool.name,
-                                        session_id: event.session_id.clone(),
-                                        parent_tool_use_id: event.parent_tool_use_id.clone(),
-                                    });
+                            (run_id.as_str(), turn_id.as_str()),
+                        )
+                        .await?;
+                    let mut candidates = Vec::new();
+                    let mut completed = HashSet::new();
+                    while let Some(row) = rows.next().await? {
+                        let data = row.text(0)?;
+                        let Ok(event) = serde_json::from_str::<TranscriptEvent>(&data) else {
+                            continue;
+                        };
+                        match event.event_type.as_str() {
+                            "assistant" => {
+                                for tool in event.tool_uses.unwrap_or_default() {
+                                    if is_run_tool_call(&tool.name, &tool.input) {
+                                        candidates.push(PendingRunToolResult {
+                                            tool_use_id: tool.id,
+                                            tool_name: tool.name,
+                                            session_id: event.session_id.clone(),
+                                            parent_tool_use_id: event.parent_tool_use_id.clone(),
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        "tool_result" => {
-                            if let Some(tool_use_id) = event.tool_use_id {
-                                completed.insert(tool_use_id);
+                            "tool_result" => {
+                                if let Some(tool_use_id) = event.tool_use_id {
+                                    completed.insert(tool_use_id);
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                Ok(candidates
-                    .into_iter()
-                    .filter(|candidate| !completed.contains(&candidate.tool_use_id))
-                    .collect())
+                    Ok(candidates
+                        .into_iter()
+                        .filter(|candidate| !completed.contains(&candidate.tool_use_id))
+                        .collect())
+                })
             })
-        })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    })
+}
+
+fn run_issue_id(orch: &Orchestrator, run_id: &str) -> Result<Option<String>, String> {
+    let run_id = run_id.to_string();
+    let db = orch.db.local.clone();
+    run_db_blocking(move || async move {
+        db.query_opt_text(
+            "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
+            turso::params![run_id.as_str()],
+        )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("Failed to load issue id for run db-change: {e}"))
     })
 }
 
@@ -529,11 +582,20 @@ fn fail_pending_run_tool_results(
         return Ok(0);
     }
 
-    let mut sequence = stream_store::get_next_sequence(orch.db.local.clone(), run_id)?;
+    let owning = run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let mut sequence = stream_store::get_next_sequence(owning.clone(), run_id)?;
     let now = chrono::Utc::now().timestamp() as i32;
     let mut inserted = 0;
     for pending_result in pending {
-        let event_id = Uuid::new_v4().to_string();
+        let event_id = ids::mint_child(run_id);
         let event = TranscriptEvent {
             event_type: "tool_result".to_string(),
             session_id: pending_result.session_id.clone(),
@@ -568,33 +630,17 @@ fn fail_pending_run_tool_results(
             turn_id: Some(turn_id.to_string()),
             cost_usd: None,
         };
-        if stream_store::insert_event(orch.db.local.clone(), event_insert)? {
+        if stream_store::insert_event(owning.clone(), event_insert)? {
             inserted += 1;
-            orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
-                id: event_id,
-                run_id: run_id.to_string(),
-                session_id: pending_result.session_id.clone(),
-                sequence: Some(sequence),
-                event_type: "tool_result".to_string(),
-                data: Some(data),
-                input_tokens: None,
-                output_tokens: None,
-                cache_read_tokens: None,
-                cache_create_tokens: None,
-                thinking_tokens: None,
-                created_at: Some(now as i64),
-                turn_id: Some(turn_id.to_string()),
-            }));
+            let issue_id = run_issue_id(orch, run_id)?;
             let _ = orch.services.emitter.emit(
                 "db-change",
-                serde_json::json!({
-                    "table": "events",
-                    "action": "insert",
-                    "runId": run_id,
-                    "run_id": run_id,
-                    "sessionId": pending_result.session_id,
-                    "session_id": pending_result.session_id,
-                }),
+                crate::notify::event_db_change_scoped(
+                    run_id,
+                    pending_result.session_id.as_deref(),
+                    issue_id.as_deref(),
+                    "insert",
+                ),
             );
         }
         sequence += 1;
@@ -640,54 +686,6 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str) {
     }
 }
 
-fn run_from_row(row: &turso::Row) -> DbResult<Run> {
-    Ok(Run {
-        id: row.text(0)?,
-        issue_id: row.opt_text(1)?,
-        project_id: row.opt_text(2)?,
-        job_id: row.opt_text(3)?,
-        status: row
-            .opt_text(4)?
-            .and_then(|status| status.parse().ok())
-            .unwrap_or(RunStatus::Starting),
-        session_id: row.opt_text(5)?,
-        error_message: row.opt_text(6)?,
-        started_at: row.opt_i64(7)?,
-        exited_at: row.opt_i64(8)?,
-        created_at: row.i64(9)?,
-        updated_at: row.i64(10)?,
-        chat_id: row.opt_text(11)?,
-        exit_reason: row.opt_text(12)?,
-        start_mode: row.opt_text(13)?.and_then(|mode| mode.parse().ok()),
-    })
-}
-
-fn run_for_sync(orch: &Orchestrator, run_id: &str) -> Option<Run> {
-    let db = orch.db.local.clone();
-    let run_id = run_id.to_string();
-    run_db_blocking(move || async move {
-        db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id, issue_id, project_id, job_id, status, session_id,
-                                error_message, started_at, exited_at, created_at, updated_at,
-                                chat_id, exit_reason, start_mode
-                         FROM runs
-                         WHERE id = ?1",
-                        (run_id.as_str(),),
-                    )
-                    .await?;
-                rows.next().await?.map(|row| run_from_row(&row)).transpose()
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
-    })
-    .ok()
-    .flatten()
-}
-
 fn run_status(orch: &Orchestrator, run_id: &str) -> Option<String> {
     blocking_text_lookup(
         orch,
@@ -708,14 +706,18 @@ fn issue_for_attention_by_job(
     String,
     crate::orchestrator::attention::IssueAttentionContext,
 )> {
-    let db = orch.db.local.clone();
     let issue_id = blocking_text_lookup(
         orch,
         job_id,
         "SELECT issue_id FROM jobs WHERE id = ?1",
         TextColumn::Optional,
     )?;
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let ctx = crate::orchestrator::attention::read_issue_for_attention(&db, &issue_id).await?;
         Ok(Some((issue_id, ctx)))
     })
@@ -751,11 +753,14 @@ fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
     // wake moved to the push queue.
     create_review_push_on_turn_end(orch, job_id, &issue_id, &ctx);
     // Resolve the fact (and any detail URI) synchronously via the shared helper.
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let issue_id_for_fact = issue_id.clone();
     let ctx_for_fact = ctx.clone();
     let job_id_owned = job_id.to_string();
     let idle = run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id_owned)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok::<_, String>(
             crate::orchestrator::attention::idle_fact_for_issue(
                 &db,
@@ -809,11 +814,14 @@ fn create_review_push_on_turn_end(
     if latest_turn_is_memory_review(orch, job_id) {
         return;
     }
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let issue_id_owned = issue_id.to_string();
     let job_id_owned = job_id.to_string();
     let ctx_owned = ctx.clone();
     let result = run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id_owned)
+            .await
+            .map_err(|e| e.to_string())?;
         create_review_push_rows(&db, &job_id_owned, &issue_id_owned, &ctx_owned).await
     });
     match result {
@@ -858,7 +866,14 @@ pub async fn create_review_push_for_pr_open(
     issue_id: &str,
     source_branch: &str,
 ) {
-    let db = &orch.db.local;
+    let owning = match crate::issues::crud::owning_db_for_issue(&orch.db, issue_id).await {
+        Ok(db) => db,
+        Err(e) => {
+            log::warn!("PR-open review push: issue db resolve failed: {e}");
+            return;
+        }
+    };
+    let db = &owning;
     // Resolve the producing BUILDER by the shared branch — not the pr-action node
     // that owns the merge_request. Without a builder there is nothing to gate on,
     // so skip rather than fire blind.
@@ -1375,9 +1390,12 @@ fn job_id_for_run(orch: &Orchestrator, run_id: &str) -> Option<String> {
 }
 
 fn running_terminals_for_job(orch: &Orchestrator, job_id: &str) -> Vec<(String, String)> {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
@@ -1505,7 +1523,11 @@ pub fn suspend_run_for_durable_wait(
     exit_reason: &str,
 ) -> Result<(), String> {
     let _ = exit_reason;
-    stop_session_internal(orch, run_id)?;
+    // Self-suspend: do NOT reap the run's inline commands. A fence crossing in
+    // one item of a parallel `run()` suspends the run; its sibling commands are
+    // still executing and must survive so the batch can collect their outcomes
+    // and re-run cleanly on resume (CAIRN-2123).
+    stop_session_internal(orch, run_id, false)?;
     Ok(())
 }
 
@@ -1623,9 +1645,12 @@ pub(crate) fn memory_review_turn_ended(orch: &Orchestrator, job_id: &str) -> boo
 }
 
 fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str) {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     let _ = run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.write(|conn| {
             let job_id = job_id.clone();
             Box::pin(async move {
@@ -1812,10 +1837,6 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
         log::error!("Failed to transition run {}: {}", run_id, e);
     }
 
-    if let Some(run) = run_for_sync(orch, run_id) {
-        orch.sync(crate::sync::SyncMessage::Run((&run).into()));
-    }
-
     let job_id = job_id_for_run(orch, run_id);
 
     if had_active_turn {
@@ -1889,10 +1910,13 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
 /// Log session context when a run crashes. If this was a resume attempt, the session
 /// may be invalid — log a warning so operators can investigate.
 fn log_session_crash_context(orch: &Orchestrator, run_id: &str) {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let log_run_id = run_id.to_string();
     let run_id = run_id.to_string();
     let run_info = run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
@@ -1946,9 +1970,12 @@ fn emit_agent_terminal_attention_once(
         return;
     }
 
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let run_id = run_id.to_string();
     let row = run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(async move {
                 let mut rows = conn
@@ -2007,8 +2034,12 @@ fn child_run_ids_for_run(orch: &Orchestrator, run_id: &str) -> Vec<String> {
     let Some(job_id) = job_id_for_run(orch, run_id) else {
         return Vec::new();
     };
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
+    let run_id = run_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(async move {
                 let descendant_job_ids = find_descendant_job_ids(conn, &job_id).await?;
@@ -2084,9 +2115,12 @@ async fn get_running_runs_for_jobs(
 /// failed, or never started), letting the caller report a clear no-op rather
 /// than guessing a run id.
 pub fn live_run_id_for_job(orch: &Orchestrator, job_id: &str) -> Option<String> {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(
                 async move { get_running_runs_for_jobs(conn, std::slice::from_ref(&job_id)).await },
@@ -2111,11 +2145,11 @@ pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
             child_run_id,
             run_id
         );
-        let _ = stop_session_internal(orch, child_run_id);
+        let _ = stop_session_internal(orch, child_run_id, true);
     }
 
     // Stop the requested run
-    stop_session_internal(orch, run_id)
+    stop_session_internal(orch, run_id, true)
 }
 
 /// Marker recorded as the response of an `ask_user` prompt cancelled by a
@@ -2154,7 +2188,7 @@ pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
             child_run_id,
             job_id
         );
-        let _ = stop_session_internal(orch, &child_run_id);
+        let _ = stop_session_internal(orch, &child_run_id, true);
     }
 
     // Cancel open input and terminalize the job's live turns (drops a pending
@@ -2180,9 +2214,12 @@ pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
 /// job-level analogue of [`child_run_ids_for_run`], resolved from a job id rather
 /// than a run id (a suspended job may have no run of its own).
 fn descendant_running_run_ids_for_job(orch: &Orchestrator, job_id: &str) -> Vec<String> {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.read(|conn| {
             Box::pin(async move {
                 let descendant_job_ids = find_descendant_job_ids(conn, &job_id).await?;
@@ -2207,9 +2244,12 @@ fn cancel_open_input_and_live_turns_for_job(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
         db.write(|conn| {
             let job_id = job_id.clone();
             Box::pin(async move {
@@ -2242,7 +2282,19 @@ fn cancel_open_input_and_live_turns_for_job(
 /// Sends an interrupt control request via stdin and transitions the process
 /// to warm state. The process is NOT killed - it stays available for follow-up
 /// messages.
-fn stop_session_internal(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
+///
+/// `reap_inline` decides the fate of the run's foreground (inline) shell
+/// commands. An external stop (user Stop, cascade) passes `true` to kill them.
+/// A *self*-suspend for a durable wait passes `false`: the run paused itself on
+/// a dependency it raised mid-batch, and in a parallel `run()` the suspending
+/// item's still-executing siblings must keep running so `handle_run` can collect
+/// their outcomes before returning the suspend marker (the whole batch re-runs
+/// on resume). Reaping them here would kill siblings mid-flight (CAIRN-2123).
+fn stop_session_internal(
+    orch: &Orchestrator,
+    run_id: &str,
+    reap_inline: bool,
+) -> Result<(), String> {
     // Interrupt/cancel the current turn. Fall back to the DB current_turn_id so
     // stop repairs stale UI-visible state even when the process map lost the run.
     stop_active_turn_for_run(orch, run_id);
@@ -2252,8 +2304,11 @@ fn stop_session_internal(orch: &Orchestrator, run_id: &str) -> Result<(), String
         log::warn!("Failed to send interrupt to run {}: {}", run_id, e);
     }
 
-    // Only kill foreground bash processes — background terminals survive the interrupt
-    cleanup_inline_commands(orch, run_id);
+    // Only kill foreground bash processes — background terminals survive the
+    // interrupt regardless. A self-suspend leaves the inline siblings alone.
+    if reap_inline {
+        cleanup_inline_commands(orch, run_id);
+    }
 
     // Transition to warm state instead of killing
     if orch.process_state.transition_to_warm(run_id) {
@@ -2404,9 +2459,8 @@ mod memory_review_tests {
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("memory-review.db"))
-            .await
-            .unwrap();
+        let root = temp.keep();
+        let db = LocalDb::open(root.join("memory-review.db")).await.unwrap();
         MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
             .run(&db)
             .await

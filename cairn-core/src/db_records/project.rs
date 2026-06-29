@@ -17,9 +17,7 @@ pub struct DbProject {
     pub setup_commands: Option<String>,
     pub terminal_commands: Option<String>,
     pub config: Option<String>,
-    pub remote_url: Option<String>,
     pub hidden: i32,
-    pub server_id: Option<String>,
     pub is_workspace: i32,
 }
 
@@ -36,8 +34,6 @@ pub struct NewProject<'a> {
     pub next_issue_number: Option<i32>,
     pub created_at: i32,
     pub updated_at: i32,
-    pub remote_url: Option<&'a str>,
-    pub server_id: Option<&'a str>,
 }
 
 #[derive(Debug, Default)]

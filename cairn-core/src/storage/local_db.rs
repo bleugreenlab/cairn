@@ -1,11 +1,55 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
+use tokio::sync::Notify;
 use tokio::time::sleep;
 use turso::{params::IntoParams, Builder, Connection, Row};
 
 use super::{DbError, DbResult, RowExt};
+use crate::archival::store::{ContentStore, TeamReplicaContext};
+use crate::db::TeamId;
+
+/// Install a process-wide rustls [`CryptoProvider`](rustls::crypto::CryptoProvider)
+/// exactly once, before any Turso Sync TLS client is built.
+///
+/// The dependency tree compiles rustls 0.23 with BOTH crypto providers:
+/// `aws-lc-rs` (rustls' own default) and `ring` (pulled in by `jsonwebtoken` and
+/// by rustls' `ring` feature). With two providers present, rustls cannot pick
+/// one from crate features — the first TLS handshake panics in
+/// `CryptoProvider::get_default_or_install_from_crate_features()`. In practice
+/// that handshake is turso's sync IO building a hyper-rustls client via
+/// `with_native_roots()`, which it does the INSTANT the `turso-sync-io` thread
+/// spawns — at the top of the IO run loop, before it processes any queued IO,
+/// not lazily on the first push/pull. Spawning that thread is a side effect of
+/// `turso::sync::Builder::build()`, so the provider must already be installed by
+/// the time any synced replica opens, or the sync thread races the install and
+/// crashes the whole process (CAIRN-2176 / CAIRN-2196).
+///
+/// Installing a process default selects the provider deterministically
+/// regardless of how many are compiled in, so it stays correct even if a future
+/// dependency re-adds a second provider — the robust remedy rustls itself
+/// recommends, rather than the fragile "keep exactly one provider in the tree".
+/// We pick `aws-lc-rs` because it is rustls' modern default and turso's sync
+/// client pins no provider (it resolves the process default via
+/// `with_native_roots()`), so nothing requires `ring`.
+///
+/// Guarded by [`Once`] and idempotent: `install_default()` returns `Err` once a
+/// default is already set, which we deliberately ignore. The PRIMARY install
+/// site is the orchestrator constructor (`Orchestrator::build`): every host
+/// binary (desktop app, dev instance, headless `cairn-server`) builds the
+/// orchestrator synchronously at startup, before it starts team sync or opens
+/// any replica, so the provider is in place before a `turso-sync-io` thread can
+/// ever spawn. The synced-open paths below also call this as a
+/// belt-and-suspenders guard for any caller that opens a [`LocalDb`] replica
+/// directly without an orchestrator (e.g. tests).
+pub fn install_crypto_provider() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -26,11 +70,43 @@ impl Default for RetryConfig {
     }
 }
 
+/// Backing database engine for a [`LocalDb`]. A local file database and a Turso
+/// Sync replica expose an identical `turso::Connection` surface, so every query
+/// helper on `LocalDb` routes through one `connect()` regardless of which engine
+/// backs it. Only `push()`/`pull()` and the journaling pragma differ between
+/// the two arms.
+enum DbHandle {
+    /// A plain on-disk (or `:memory:`) database opened via `Builder::new_local`.
+    Local(turso::Database),
+    /// A Turso Sync replica opened via `turso::sync::Builder::new_remote`. Reads
+    /// and writes are local; `push()`/`pull()` reconcile with the sync server.
+    Synced(turso::sync::Database),
+}
+
+impl std::fmt::Debug for DbHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DbHandle::Local(_) => f.write_str("DbHandle::Local"),
+            DbHandle::Synced(_) => f.write_str("DbHandle::Synced"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LocalDb {
     path: PathBuf,
-    database: turso::Database,
+    database: DbHandle,
     retry: RetryConfig,
+    /// Fired after every successful transaction on a SYNCED replica (never on a
+    /// local database). The per-team push task waits on it to push promptly once
+    /// writes settle; permit-backed, so a burst of commits collapses to a single
+    /// pending wakeup and none is lost.
+    commit_signal: Arc<Notify>,
+    /// Set ONLY for a team replica: its intrinsic team id plus the per-team
+    /// content store archival offloads to and reconstruction fetches from. The
+    /// private DB carries `None`, so archival/reconstruct branch on
+    /// `content_store()` and the local-run inline path is byte-for-byte unchanged.
+    team: Option<Arc<TeamReplicaContext>>,
 }
 
 impl LocalDb {
@@ -44,11 +120,173 @@ impl LocalDb {
         let database = Builder::new_local(&path_string).build().await?;
         let db = Self {
             path,
-            database,
+            database: DbHandle::Local(database),
             retry,
+            commit_signal: Arc::new(Notify::new()),
+            team: None,
         };
         db.configure().await?;
         Ok(db)
+    }
+
+    /// Open a Turso Sync replica at `path`, reconciling against the sync server
+    /// at `remote_url`. `auth_token` is `None` for an unauthenticated local sync
+    /// server (`tursodb --sync-server`) and `Some(token)` for a hosted endpoint.
+    ///
+    /// An empty replica bootstraps its schema and data from the server on open
+    /// (`bootstrap_if_empty` defaults to `true`); a replica that already holds a
+    /// schema opens as-is and converges on the next `pull()`.
+    pub async fn open_synced(
+        path: impl AsRef<Path>,
+        remote_url: impl Into<String>,
+        auth_token: Option<String>,
+    ) -> DbResult<Self> {
+        Self::open_synced_with_retry(path, remote_url, auth_token, RetryConfig::default()).await
+    }
+
+    pub async fn open_synced_with_retry(
+        path: impl AsRef<Path>,
+        remote_url: impl Into<String>,
+        auth_token: Option<String>,
+        retry: RetryConfig,
+    ) -> DbResult<Self> {
+        // Belt-and-suspenders: the orchestrator installs the rustls crypto
+        // provider at startup, but guard direct-`LocalDb` callers (tests) here
+        // too, before `build()` spawns the `turso-sync-io` thread and it builds
+        // its TLS stack (see `install_crypto_provider`).
+        install_crypto_provider();
+        let path = path.as_ref().to_path_buf();
+        let path_string = path.to_string_lossy().to_string();
+        let mut builder =
+            turso::sync::Builder::new_remote(&path_string).with_remote_url(remote_url.into());
+        if let Some(token) = auth_token {
+            builder = builder.with_auth_token(token);
+        }
+        let database = builder.build().await?;
+        let db = Self {
+            path,
+            database: DbHandle::Synced(database),
+            retry,
+            commit_signal: Arc::new(Notify::new()),
+            team: None,
+        };
+        db.configure().await?;
+        Ok(db)
+    }
+
+    /// Open a Turso Sync replica whose auth token is produced on demand by
+    /// `token_fn`, which the sync client invokes before every HTTP request. This
+    /// is the ROTATING-token path: the closure can return a freshly minted token
+    /// each call (e.g. via a [`crate::account::team_token_minter::TeamTokenMinter`]),
+    /// so a short-lived token is refreshed transparently without reopening the
+    /// replica. A closure error fails the in-flight sync op (the caller's backoff
+    /// retries it). The static-token / unauthenticated path is [`Self::open_synced`].
+    pub async fn open_synced_with_token_fn<F, Fut>(
+        path: impl AsRef<Path>,
+        remote_url: impl Into<String>,
+        token_fn: F,
+    ) -> DbResult<Self>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = turso::Result<String>> + Send + 'static,
+    {
+        // Belt-and-suspenders: the orchestrator installs the rustls crypto
+        // provider at startup, but guard direct-`LocalDb` callers (tests) here
+        // too, before `build()` spawns the `turso-sync-io` thread and it builds
+        // its TLS stack (see `install_crypto_provider`).
+        install_crypto_provider();
+        let path = path.as_ref().to_path_buf();
+        let path_string = path.to_string_lossy().to_string();
+        let database = turso::sync::Builder::new_remote(&path_string)
+            .with_remote_url(remote_url.into())
+            .with_auth_token_fn(token_fn)
+            .build()
+            .await?;
+        let db = Self {
+            path,
+            database: DbHandle::Synced(database),
+            retry: RetryConfig::default(),
+            commit_signal: Arc::new(Notify::new()),
+            team: None,
+        };
+        db.configure().await?;
+        Ok(db)
+    }
+
+    /// Whether this handle is backed by a Turso Sync replica (vs a local file).
+    pub fn is_synced(&self) -> bool {
+        matches!(self.database, DbHandle::Synced(_))
+    }
+
+    /// The team id this handle belongs to, or `None` for the private DB. A team
+    /// replica carries its own scope (set at open), so callers detect a team run
+    /// from the resolved handle itself — independent of HOW it was resolved.
+    pub fn team_id(&self) -> Option<&TeamId> {
+        self.team.as_ref().map(|ctx| &ctx.team_id)
+    }
+
+    /// The per-team content store for a team replica, or `None` for the private
+    /// DB. `Some` is the signal to offload archival bytes (and fetch them back)
+    /// by hash; `None` keeps the local-run inline path.
+    pub fn content_store(&self) -> Option<&Arc<dyn ContentStore>> {
+        self.team.as_ref().map(|ctx| &ctx.store)
+    }
+
+    /// Attach a team replica's identity + content store. Called by `open_team`
+    /// after construction (and by tests that inject a fake store) before the
+    /// handle is shared behind an `Arc`.
+    pub fn set_team_context(&mut self, ctx: TeamReplicaContext) {
+        self.team = Some(Arc::new(ctx));
+    }
+
+    /// The commit signal fired after each successful synced-replica transaction.
+    /// The per-team push task in `storage::team_sync` waits on this to coalesce a
+    /// write burst into one prompt push.
+    pub fn commit_signal(&self) -> Arc<Notify> {
+        self.commit_signal.clone()
+    }
+
+    /// The BEGIN statement for concurrent read/write transactions. A local
+    /// (MVCC) database uses `BEGIN CONCURRENT` for optimistic concurrency; the
+    /// synced engine captures changes via CDC, which is incompatible with MVCC,
+    /// so it uses a plain `BEGIN` (writers serialize and retry on Busy instead).
+    pub(crate) fn concurrent_begin(&self) -> &'static str {
+        match self.database {
+            DbHandle::Local(_) => "BEGIN CONCURRENT",
+            DbHandle::Synced(_) => "BEGIN",
+        }
+    }
+
+    /// Push local changes to the sync server. Errors on a local (non-synced)
+    /// database rather than silently no-opping, so a routing bug surfaces loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Internal` when called on a local database, or a Turso
+    /// error when the push fails.
+    pub async fn push(&self) -> DbResult<()> {
+        match &self.database {
+            DbHandle::Synced(db) => Ok(db.push().await?),
+            DbHandle::Local(_) => Err(DbError::internal(
+                "push() called on a local (non-synced) database",
+            )),
+        }
+    }
+
+    /// Pull remote changes from the sync server, returning `true` when any were
+    /// applied. Errors on a local (non-synced) database rather than no-opping.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::Internal` when called on a local database, or a Turso
+    /// error when the pull fails.
+    pub async fn pull(&self) -> DbResult<bool> {
+        match &self.database {
+            DbHandle::Synced(db) => Ok(db.pull().await?),
+            DbHandle::Local(_) => Err(DbError::internal(
+                "pull() called on a local (non-synced) database",
+            )),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -56,7 +294,10 @@ impl LocalDb {
     }
 
     pub async fn connect(&self) -> DbResult<Connection> {
-        let conn = self.database.connect()?;
+        let conn = match &self.database {
+            DbHandle::Local(db) => db.connect()?,
+            DbHandle::Synced(db) => db.connect().await?,
+        };
         conn.busy_timeout(self.retry.busy_timeout)?;
         conn.execute("PRAGMA foreign_keys = ON", ()).await?;
         Ok(conn)
@@ -67,14 +308,14 @@ impl LocalDb {
         f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
         let conn = self.connect().await?;
-        run_read_tx(&conn, f).await
+        run_read_tx(&conn, self.concurrent_begin(), f).await
     }
 
     pub async fn write<T>(
         &self,
         mut f: impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
-        self.transaction_with_begin("BEGIN CONCURRENT", &mut f)
+        self.transaction_with_begin(self.concurrent_begin(), &mut f)
             .await
     }
 
@@ -265,7 +506,19 @@ impl LocalDb {
         for attempt in 1..=self.retry.max_attempts {
             let conn = self.connect().await?;
             match run_tx(&conn, begin_sql, f).await {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    // Signal the push task that a synced replica committed. Gated
+                    // on `is_synced()` so a local database stays zero-cost (the
+                    // Notify is allocated but never fired). This is the ONLY fire
+                    // site for `commit_signal`: `pull()` applies remote pages via
+                    // physical WAL replay OUTSIDE `transaction_with_begin`, so an
+                    // applied pull fires no commit signal — there is no
+                    // push<->pull feedback loop.
+                    if self.is_synced() {
+                        self.commit_signal.notify_one();
+                    }
+                    return Ok(value);
+                }
                 Err(error) if error.is_retryable() && attempt < self.retry.max_attempts => {
                     last_retryable = Some(error);
                     let jitter = Duration::from_millis(rand::random::<u64>() % 5);
@@ -335,7 +588,15 @@ impl LocalDb {
     }
 
     async fn configure(&self) -> DbResult<()> {
-        self.consume_query("PRAGMA journal_mode = 'mvcc'").await?;
+        // `journal_mode = mvcc` enables BEGIN CONCURRENT (optimistic concurrency)
+        // on a local database. The synced engine cannot use MVCC: it captures
+        // changes via CDC for push, and "CDC is not supported in MVCC mode". A
+        // synced handle therefore keeps the sync engine's own journaling and
+        // uses a plain BEGIN for transactions (see `concurrent_begin`). Foreign
+        // keys are enforced on every connection regardless of backend.
+        if matches!(self.database, DbHandle::Local(_)) {
+            self.consume_query("PRAGMA journal_mode = 'mvcc'").await?;
+        }
         self.consume_query("PRAGMA foreign_keys = ON").await?;
         Ok(())
     }
@@ -418,9 +679,10 @@ async fn run_tx<T>(
 
 async fn run_read_tx<T>(
     conn: &Connection,
+    begin_sql: &str,
     f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
 ) -> DbResult<T> {
-    conn.execute("BEGIN CONCURRENT", ()).await?;
+    conn.execute(begin_sql, ()).await?;
 
     let result = f(conn).await;
     match result {
@@ -724,6 +986,97 @@ mod tests {
             "mvcc"
         );
         assert_eq!(query_i64(&db, "PRAGMA foreign_keys").await.unwrap(), 1);
+    }
+
+    async fn synced_memory_db() -> DbResult<LocalDb> {
+        // A synced replica with bootstrapping disabled and no remote is purely
+        // local-engine-backed, so it proves the `DbHandle::Synced` arm is
+        // transparent to every query helper without needing a sync server. The
+        // synced engine runs CDC (incompatible with MVCC), so it uses a plain
+        // BEGIN rather than BEGIN CONCURRENT -- the test below pins that fact.
+        let database = turso::sync::Builder::new_remote(":memory:")
+            .bootstrap_if_empty(false)
+            .build()
+            .await?;
+        let db = LocalDb {
+            path: PathBuf::from(":memory:"),
+            database: DbHandle::Synced(database),
+            retry: RetryConfig::default(),
+            commit_signal: Arc::new(Notify::new()),
+            team: None,
+        };
+        db.configure().await?;
+        MigrationRunner::new(TEST_SCHEMA.to_vec()).run(&db).await?;
+        Ok(db)
+    }
+
+    #[tokio::test]
+    async fn synced_handle_is_transparent_to_query_helpers() {
+        let db = synced_memory_db().await.unwrap();
+        assert!(db.is_synced());
+
+        // The synced engine cannot run MVCC (CDC is incompatible), so its
+        // journal mode is NOT mvcc; writes use a plain BEGIN instead.
+        let journal = db
+            .query_one("PRAGMA journal_mode", (), |row| row.text(0))
+            .await
+            .unwrap();
+        assert_ne!(journal, "mvcc");
+
+        // Writes route through the same write() helper as a local handle, but
+        // under a plain BEGIN here (not BEGIN CONCURRENT, which needs MVCC).
+        db.execute(
+            "INSERT INTO counters(id, value) VALUES (?1, ?2), (?3, ?4)",
+            ("a", 1_i64, "b", 2_i64),
+        )
+        .await
+        .unwrap();
+
+        let total = db
+            .query_one("SELECT SUM(value) FROM counters", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+
+        let one = db
+            .query_one("SELECT value FROM counters WHERE id = ?1", ("b",), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(one, 2);
+    }
+
+    #[test]
+    fn crypto_provider_installs_and_client_config_builds() {
+        // Regression guard for the `turso-sync-io` panic: with both `aws-lc-rs`
+        // and `ring` compiled into the rustls tree, rustls' feature-based
+        // provider auto-detection is ambiguous and panics when a TLS client is
+        // built without a process default installed. `ensure_crypto_provider`
+        // installs one; after it, building a `ClientConfig` — the same provider
+        // resolution path turso's sync client takes via hyper-rustls
+        // `with_native_roots()` — must succeed without panicking.
+        install_crypto_provider();
+
+        // A default provider is now installed process-wide.
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+
+        // Building a ClientConfig exercises provider resolution; it would panic
+        // in the ambiguous dual-provider tree if no default were installed.
+        let _config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+
+        // Idempotent: a second call is a no-op guarded by `Once` and never panics.
+        install_crypto_provider();
+    }
+
+    #[tokio::test]
+    async fn push_pull_error_on_local_database() {
+        let db = test_db().await.unwrap();
+        assert!(!db.is_synced());
+        assert!(matches!(db.push().await.unwrap_err(), DbError::Internal(_)));
+        assert!(matches!(db.pull().await.unwrap_err(), DbError::Internal(_)));
     }
 
     #[tokio::test]

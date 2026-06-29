@@ -7,8 +7,9 @@ use crate::models::{CreateIssue, Issue, IssueAttention, IssueProgress, IssueStat
 use crate::services::Clock;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::transitions::Resolution;
+use cairn_common::ids;
+use std::sync::Arc;
 use turso::params;
-use uuid::Uuid;
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, progress,
     attention, priority, completed_at, dismissed_at, created_at, updated_at, model,
@@ -16,6 +17,44 @@ const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status,
 
 fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
+}
+
+/// Resolve the database that owns the issue with this `id`. An O(1) prefix parse,
+/// fail-closed.
+///
+/// Delegates to [`crate::execution::routing::routing_db_for_id`]: a bare (local)
+/// issue id routes to the private database exactly as the prior `&db.local` path
+/// did, while a `{team}~…` id routes to that team's open replica. Fail-closed — a
+/// team-prefixed id whose replica is not open returns an error rather than
+/// silently falling back to the private database (the CAIRN-2170 split-brain
+/// class).
+pub async fn owning_db_for_issue(
+    dbs: &crate::db::DbState,
+    issue_id: &str,
+) -> Result<Arc<LocalDb>, CairnError> {
+    crate::execution::routing::routing_db_for_id(dbs, issue_id).await
+}
+
+/// Resolve the database that owns `input.project_id` and create the issue there.
+///
+/// The desktop `create_issue` Tauri command historically wrote straight to the
+/// private database, so creating an issue in a team project — whose `projects`
+/// row lives only in the team replica — failed `project not found` (CAIRN-2184).
+/// This mirrors the agent path's `for_project` routing (CAIRN-2181) and
+/// [`crate::projects::crud::create_routed`]: scan for the project's owning
+/// database (the private DB for a local project, the team replica for a team
+/// one) and insert there. Returns the created issue alongside the database it
+/// landed in so the caller embeds and reads it back from the same place. For a
+/// local project this is a strict no-op — `owning_db` short-circuits on the
+/// private database.
+pub async fn create_routed(
+    dbs: &crate::db::DbState,
+    clock: &dyn Clock,
+    input: CreateIssue,
+) -> Result<(Issue, Arc<LocalDb>), CairnError> {
+    let owning_db = crate::projects::crud::owning_db(dbs, &input.project_id).await?;
+    let issue = create(&owning_db, clock, input).await?;
+    Ok((issue, owning_db))
 }
 
 pub async fn list_children(db: &LocalDb, parent_issue_id: &str) -> Result<Vec<Issue>, CairnError> {
@@ -109,7 +148,7 @@ pub async fn create(
         backend_override,
         label_ids,
     } = input;
-    let id = Uuid::new_v4().to_string();
+    let id = ids::mint_child(&project_id);
     let now = clock.now();
 
     db.write(|conn| {

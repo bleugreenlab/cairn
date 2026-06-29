@@ -176,6 +176,41 @@ fn give_up_error_message(
     }
 }
 
+/// Build the typed failure for a write whose seal was refused because the branch
+/// bookmark tip carries a recorded conflict and `@` diverged from it (a
+/// deliberate resolve-at-base flatten). Unlike every other seal failure this does
+/// NOT discard — the on-disk edits are PRESERVED, because `@` holds the agent's
+/// resolved work a discard would destroy — so the message names that and points at
+/// the pure-jj flatten procedure rather than the futile "retry" advice the stale
+/// family gets. Pure, so the contract is unit-testable without a jj binary.
+fn conflicted_branch_failure(
+    first_file_change: &IndexedChange<'_>,
+    seal_error: &str,
+) -> Box<IndexedFailure> {
+    let error = format!(
+        "Applied file changes but the seal was refused: {seal_error}. This branch has conflicted \
+         intermediate commits jj will not fold, so sealing `@` forward can't clear them. The \
+         on-disk edits were PRESERVED (not discarded). To land a flattened resolution, run the \
+         pure-jj resolve-at-base flatten with NO commit_msg (see the git-workflow skill); do not \
+         retry the write with commit_msg."
+    );
+    Box::new(IndexedFailure {
+        failure: ChangeFailure {
+            index: first_file_change.index,
+            target: first_file_change.item.target.clone(),
+            mode: mode_name(first_file_change.item.mode).to_string(),
+            kind: "file".to_string(),
+            error: error.clone(),
+        },
+        commit: Some(CommitReport {
+            status: "failed".to_string(),
+            sha: None,
+            pr_number: None,
+            message: Some(error),
+        }),
+    })
+}
+
 /// Recover a write+commit_msg batch whose seal hit a STALE working copy
 /// ([`CommitOutcome::StaleRetry`]). A sibling advanced `@` over the shared store
 /// between apply and seal; the loose edits are still on disk. Clear the staleness
@@ -310,6 +345,14 @@ async fn recover_stale_file_commit(
             );
             emit_worktree_changed(orch, &request.cwd);
             Err(failure)
+        }
+        Ok(CommitOutcome::ConflictedBranch { seal_error: e2 }) => {
+            // The just-advanced base itself presents a conflicted bookmark tip:
+            // preserve the edits (no discard) and surface the flatten guidance,
+            // same as the primary path. Reaching here from stale-recovery is rare
+            // but must NOT fall through to the discarding give-up.
+            emit_worktree_changed(orch, &request.cwd);
+            Err(conflicted_branch_failure(first_file_change, &e2))
         }
         // A non-stale re-seal error already discarded inside finalize.
         Err(failure) => Err(failure),
@@ -896,6 +939,28 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         .await
         {
             Ok(CommitOutcome::Done(commit_report)) => commit = commit_report,
+            Ok(CommitOutcome::ConflictedBranch { seal_error }) => {
+                // The seal was refused because the branch bookmark tip carries a
+                // recorded conflict and `@` diverged from it — a deliberate
+                // resolve-at-base flatten. Preserve the on-disk edits (no discard,
+                // no update-stale retry which can never converge) and surface a
+                // typed error pointing at the flatten procedure. The worktree==HEAD
+                // invariant is deliberately left broken here because the only safe
+                // automatic action is to keep the agent's resolved state; the
+                // flatten the message references converges it.
+                let IndexedFailure {
+                    failure,
+                    commit: failure_commit,
+                } = *conflicted_branch_failure(&first_file_change, &seal_error);
+                if atomic {
+                    rollback_promoted_memory_decisions(orch, &promoted_memories).await;
+                    return change_report_json(applied, vec![failure], failure_commit, atomic);
+                }
+                if let Some(failure_commit) = failure_commit {
+                    commit = Some(failure_commit);
+                }
+                failures.push(failure);
+            }
             Ok(CommitOutcome::StaleRetry { seal_error }) => {
                 // A sibling advanced `@` between apply and seal. Try to land the
                 // batch on the advanced base rather than lose it; any failure
@@ -1042,6 +1107,46 @@ mod change_preview_tests {
                 "new_string": new,
             })),
         }
+    }
+
+    #[test]
+    fn conflicted_branch_failure_preserves_edits_and_points_at_flatten() {
+        // The write-path contract for a seal refused because the branch bookmark
+        // tip carries a recorded conflict (a deliberate resolve-at-base flatten):
+        // the typed failure says the on-disk edits were PRESERVED (no discard),
+        // points at the no-commit_msg flatten, and does NOT advise retrying the
+        // write with commit_msg. The CommitReport is a non-sha "failed" record.
+        let item = patch_item("file:src/lib.rs", "old", "new");
+        let change = IndexedChange {
+            index: 3,
+            item: &item,
+        };
+        let IndexedFailure { failure, commit } =
+            *conflicted_branch_failure(&change, crate::jj::CONFLICTED_BRANCH_SEAL_MSG);
+
+        assert_eq!(failure.index, 3);
+        assert_eq!(failure.target, "file:src/lib.rs");
+        assert_eq!(failure.kind, "file");
+        assert!(
+            failure.error.contains("PRESERVED"),
+            "names that the edits were preserved: {}",
+            failure.error
+        );
+        assert!(
+            failure.error.contains("NO commit_msg") && failure.error.contains("git-workflow"),
+            "points at the no-commit_msg flatten procedure: {}",
+            failure.error
+        );
+        assert!(
+            failure
+                .error
+                .contains("do not retry the write with commit_msg"),
+            "explicitly warns against retrying with commit_msg: {}",
+            failure.error
+        );
+        let commit = commit.expect("carries a failed CommitReport");
+        assert_eq!(commit.status, "failed");
+        assert!(commit.sha.is_none(), "a refused seal has no sha");
     }
 
     #[test]

@@ -14,8 +14,8 @@ use crate::agent_process::turn_boundary::{
 use crate::backends::context_window::{claude_context_window, ClaudeContextOptIn};
 
 use super::run_state::{
-    is_task_spawned_run, run_backend_db, run_job_id, run_status, set_session_backend_id,
-    transition_run_to_live,
+    is_task_spawned_run, resolve_run_db, run_backend_db, run_job_id, run_status,
+    set_session_backend_id, transition_run_to_live,
 };
 use crate::backends::{OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey};
 use crate::models::{
@@ -27,11 +27,12 @@ use crate::orchestrator::session::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::services::SpawnConfig;
-use crate::storage::{DbError, RowExt};
+use crate::storage::{DbError, LocalDb, RowExt};
 use crate::transcripts::stream_store::{
     abort_stream, append_chunks, finalize_stream_emit, open_stream, process_post_commit_outbox,
     ActiveMessageStream, EmitDelta, EventInsert, StreamAccumulator, StreamingToolWrite,
 };
+use cairn_common::ids;
 use std::io::{BufRead, Write};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -70,10 +71,10 @@ struct StreamingState {
 mod tests {
     use super::{
         build_claude_context_snapshot, claude_context_used_tokens, parse_thinking_tokens_estimate,
-        should_confirm_backend_id_after_init,
+        should_confirm_backend_id_after_init, ClaudeBackend,
     };
     use crate::agent_process::stream::Usage;
-    use crate::backends::SessionStart;
+    use crate::backends::{AgentBackend, SessionStart};
 
     fn test_streaming_state() -> super::StreamingState {
         super::StreamingState {
@@ -192,6 +193,22 @@ mod tests {
             session_id: "session-fork".to_string(),
             source_backend_id: "backend-source".to_string(),
         }));
+    }
+
+    #[test]
+    fn claude_disallows_host_harness_send_message_tool() {
+        let resolved = ClaudeBackend.resolve_tools(&["SendMessage".to_string()], &[]);
+
+        assert!(
+            resolved.disallowed.contains(&"SendMessage".to_string()),
+            "SendMessage must be passed through --disallowedTools: {:?}",
+            resolved.disallowed
+        );
+        assert!(
+            !resolved.allowed.contains(&"SendMessage".to_string()),
+            "SendMessage must not remain on the Claude allow-list: {:?}",
+            resolved.allowed
+        );
     }
 }
 
@@ -482,8 +499,8 @@ fn classify_eof(
 }
 
 /// Look up `(job_id, execution_id)` for a run, for the crash diagnostic.
-fn run_job_execution(orch: &Orchestrator, run_id: &str) -> (Option<String>, Option<String>) {
-    let db = orch.db.local.clone();
+fn run_job_execution(db: &Arc<LocalDb>, run_id: &str) -> (Option<String>, Option<String>) {
+    let db = db.clone();
     let run_id = run_id.to_string();
     run_backend_db(CLAUDE_BACKEND_NAME, async move {
         db.read(|conn| {
@@ -513,6 +530,7 @@ fn run_job_execution(orch: &Orchestrator, run_id: &str) -> (Option<String>, Opti
 
 fn finalize_streaming_message(
     orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     run_id: &str,
     // The finalize emit is owned by `finalize_stream_emit` (it scopes from the
     // finalized stream's own run/session), so this path no longer reads the
@@ -529,7 +547,7 @@ fn finalize_streaming_message(
     // final content from the chunk rows, so unflushed tokens would be lost.
     if !state.acc.pending_is_empty() {
         match append_chunks(
-            orch.db.local.clone(),
+            db.clone(),
             &state.stream_id,
             state.version,
             &state.acc.take_pending(),
@@ -573,6 +591,7 @@ fn finalize_streaming_message(
         }
     }
     match finalize_stream_emit(
+        db.clone(),
         orch.db.local.clone(),
         &orch.services.emitter,
         &state.stream_id,
@@ -611,8 +630,10 @@ fn finalize_streaming_message(
 /// is finalized in place. If that pairing was already broken (the stream row is
 /// gone but a pending event remains), the message is inserted directly so it is
 /// never silently dropped.
+#[allow(clippy::too_many_arguments)]
 fn flush_pending_assistant_before_suppress(
     orch: &Orchestrator,
+    db: &Arc<LocalDb>,
     run_id: &str,
     session_id: Option<&str>,
     sequence: i32,
@@ -627,6 +648,7 @@ fn flush_pending_assistant_before_suppress(
     if streaming_state.is_some() {
         return finalize_streaming_message(
             orch,
+            db,
             run_id,
             session_id,
             streaming_state,
@@ -641,7 +663,7 @@ fn flush_pending_assistant_before_suppress(
     let data = serde_json::to_string(&pending).unwrap_or_default();
     let current_turn = orch.process_state.get_current_turn_id(run_id);
     match crate::transcripts::stream_store::insert_event_emit(
-        orch.db.local.clone(),
+        db.clone(),
         &orch.services.emitter,
         EventInsert {
             id: Uuid::new_v4().to_string(),
@@ -802,6 +824,13 @@ impl AgentBackend for ClaudeBackend {
             &prompt_segments,
         );
 
+        // Resolve the run's owning DB ONCE (CAIRN-2208) and thread it through the
+        // transcript/stream/run-state writes below. A team run lives wholly in its
+        // synced replica; targeting the private DB would fail the
+        // message_streams→runs foreign key. Resolved before the process spawns so a
+        // closed replica fails fast rather than orphaning a live agent.
+        let run_db = resolve_run_db(CLAUDE_BACKEND_NAME, orch, &config.run_id)?;
+
         // Write hook settings file for memory surfacing (passed via --settings)
         let hook_settings_path =
             crate::memories::hooks::write_hook_settings_file(orch.mcp_callback_port).ok();
@@ -927,7 +956,7 @@ impl AgentBackend for ClaudeBackend {
 
         // Transition run to Running AFTER successful spawn (sets started_at accurately)
         log::debug!("ClaudeBackend: transitioning run to running");
-        if let Err(e) = transition_run_to_live(CLAUDE_BACKEND_NAME, orch, &config.run_id) {
+        if let Err(e) = transition_run_to_live(CLAUDE_BACKEND_NAME, orch, &run_db, &config.run_id) {
             log::warn!("Failed to transition run to running: {}", e);
             // Job is already Running from start_job's transition_job call — no write needed
         }
@@ -958,7 +987,8 @@ impl AgentBackend for ClaudeBackend {
         let stdin_arc = Arc::new(Mutex::new(stdin));
 
         // Get job_id for warm process tracking
-        let process_job_id: Option<String> = run_job_id(CLAUDE_BACKEND_NAME, orch, &config.run_id);
+        let process_job_id: Option<String> =
+            run_job_id(CLAUDE_BACKEND_NAME, &run_db, &config.run_id);
 
         {
             let mut processes = orch
@@ -1022,6 +1052,7 @@ impl AgentBackend for ClaudeBackend {
                 confirm_backend_id_after_init,
                 initial_sequence,
                 stdout,
+                run_db,
             );
         });
 
@@ -1190,6 +1221,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
 
 impl ClaudeBackend {
     /// Reader thread: reads Claude's stream-json stdout and stores events in the database.
+    #[allow(clippy::too_many_arguments)]
     fn reader_thread(
         orch: &Orchestrator,
         emitter: &Arc<dyn crate::services::EventEmitter>,
@@ -1198,6 +1230,7 @@ impl ClaudeBackend {
         confirm_backend_id_after_init: bool,
         initial_sequence: i32,
         stdout: Box<dyn std::io::BufRead + Send>,
+        run_db: Arc<LocalDb>,
     ) {
         log::debug!("reader_thread: started");
         let thread_start = std::time::Instant::now();
@@ -1282,7 +1315,7 @@ impl ClaudeBackend {
                                 if let Some(ref sid) = session_id {
                                     if let Err(error) = set_session_backend_id(
                                         CLAUDE_BACKEND_NAME,
-                                        orch,
+                                        &run_db,
                                         sid,
                                         backend_session_id,
                                     ) {
@@ -1401,6 +1434,7 @@ impl ClaudeBackend {
                             // skips, so flush here or the tool-call event is lost.
                             if flush_pending_assistant_before_suppress(
                                 orch,
+                                &run_db,
                                 run_id,
                                 session_id.as_deref(),
                                 sequence,
@@ -1418,6 +1452,7 @@ impl ClaudeBackend {
                                     log::warn!("New MessageStart while a stream is still active");
                                     if finalize_streaming_message(
                                         orch,
+                                        &run_db,
                                         run_id,
                                         session_id.as_deref(),
                                         &mut streaming_state,
@@ -1433,7 +1468,7 @@ impl ClaudeBackend {
                                 last_thinking_tokens = pending_thinking_tokens.take();
                                 let current_turn = orch.process_state.get_current_turn_id(run_id);
                                 match open_stream(
-                                    orch.db.local.clone(),
+                                    run_db.clone(),
                                     run_id,
                                     session_id.as_deref(),
                                     current_turn.as_deref(),
@@ -1459,7 +1494,8 @@ impl ClaudeBackend {
                                         streaming_state = Some(new_state);
                                         let _ = emitter.emit(
                                             "db-change",
-                                            crate::notify::event_db_change(
+                                            crate::notify::event_db_change_for_run(
+                                                orch.db.local.clone(),
                                                 run_id,
                                                 session_id.as_deref(),
                                                 "insert",
@@ -1499,15 +1535,6 @@ impl ClaudeBackend {
                                 if let Some(ref mut state) = streaming_state {
                                     match delta {
                                         DeltaContent::TextDelta { text } => {
-                                            // Remote (cloud WS) streaming stays per-token: a
-                                            // separate channel where token latency is desirable.
-                                            orch.sync(crate::sync::SyncMessage::StreamDelta(
-                                                crate::sync::StreamDelta {
-                                                    run_id: run_id.to_string(),
-                                                    event_id: state.stream_id.clone(),
-                                                    tokens: text.to_string(),
-                                                },
-                                            ));
                                             state.acc.push_content(text);
                                             state.capture_thinking_done();
                                         }
@@ -1533,7 +1560,7 @@ impl ClaudeBackend {
                                     let now = std::time::Instant::now();
                                     if state.acc.should_flush(now) {
                                         match append_chunks(
-                                            orch.db.local.clone(),
+                                            run_db.clone(),
                                             &state.stream_id,
                                             state.version,
                                             &state.acc.take_pending(),
@@ -1590,6 +1617,7 @@ impl ClaudeBackend {
                                     && streaming_state.is_some()
                                     && finalize_streaming_message(
                                         orch,
+                                        &run_db,
                                         run_id,
                                         session_id.as_deref(),
                                         &mut streaming_state,
@@ -1622,6 +1650,7 @@ impl ClaudeBackend {
                         // orphaned post-boundary placeholder with no real message.
                         if flush_pending_assistant_before_suppress(
                             orch,
+                            &run_db,
                             run_id,
                             session_id.as_deref(),
                             sequence,
@@ -1634,14 +1663,15 @@ impl ClaudeBackend {
                         // Delete any streaming placeholder that started after the flag.
                         if let Some(state) = streaming_state.take() {
                             let _ = abort_stream(
-                                orch.db.local.clone(),
+                                run_db.clone(),
                                 &state.stream_id,
                                 state.version,
                                 "terminal_tool",
                             );
                             let _ = emitter.emit(
                                 "db-change",
-                                crate::notify::event_db_change(
+                                crate::notify::event_db_change_for_run(
+                                    orch.db.local.clone(),
                                     run_id,
                                     session_id.as_deref(),
                                     "update",
@@ -1669,7 +1699,7 @@ impl ClaudeBackend {
                             }
 
                             let is_task_spawned =
-                                is_task_spawned_run(CLAUDE_BACKEND_NAME, orch, run_id);
+                                is_task_spawned_run(CLAUDE_BACKEND_NAME, &run_db, run_id);
 
                             if is_task_spawned {
                                 crate::orchestrator::lifecycle::finalize_run(
@@ -1699,6 +1729,7 @@ impl ClaudeBackend {
                     if matches!(&event, ClaudeEvent::Result { .. })
                         && finalize_streaming_message(
                             orch,
+                            &run_db,
                             run_id,
                             session_id.as_deref(),
                             &mut streaming_state,
@@ -1749,6 +1780,7 @@ impl ClaudeBackend {
                         if pending_delta_usage.is_some() {
                             if finalize_streaming_message(
                                 orch,
+                                &run_db,
                                 run_id,
                                 session_id.as_deref(),
                                 &mut streaming_state,
@@ -1792,6 +1824,7 @@ impl ClaudeBackend {
                         // interrupt-notice stream (CAIRN-1611).
                         if flush_pending_assistant_before_suppress(
                             orch,
+                            &run_db,
                             run_id,
                             session_id.as_deref(),
                             sequence,
@@ -1803,14 +1836,15 @@ impl ClaudeBackend {
                         }
                         if let Some(state) = streaming_state.take() {
                             let _ = abort_stream(
-                                orch.db.local.clone(),
+                                run_db.clone(),
                                 &state.stream_id,
                                 state.version,
                                 "host_interrupt",
                             );
                             let _ = emitter.emit(
                                 "db-change",
-                                crate::notify::event_db_change(
+                                crate::notify::event_db_change_for_run(
+                                    orch.db.local.clone(),
                                     run_id,
                                     session_id.as_deref(),
                                     "update",
@@ -1824,7 +1858,7 @@ impl ClaudeBackend {
                     // Store event in database
                     {
                         let now = chrono::Utc::now().timestamp() as i32;
-                        let event_id = Uuid::new_v4().to_string();
+                        let event_id = ids::mint_child(run_id);
                         let event_type = transcript_event.event_type.clone();
                         let data = serde_json::to_string(&transcript_event).unwrap_or_default();
 
@@ -1845,7 +1879,7 @@ impl ClaudeBackend {
 
                         let current_turn = orch.process_state.get_current_turn_id(run_id);
                         let inserted = crate::transcripts::stream_store::insert_event_emit(
-                            orch.db.local.clone(),
+                            run_db.clone(),
                             emitter,
                             EventInsert {
                                 id: event_id.clone(),
@@ -1869,23 +1903,6 @@ impl ClaudeBackend {
                         .unwrap_or(false);
 
                         if inserted {
-                            // Sync event to cloud
-                            orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
-                                id: event_id.clone(),
-                                run_id: run_id.to_string(),
-                                session_id: session_id.clone(),
-                                sequence: Some(sequence),
-                                event_type: event_type.clone(),
-                                data: Some(data.clone()),
-                                input_tokens: event_counts.input,
-                                output_tokens: event_counts.output,
-                                cache_read_tokens: event_counts.cache_read,
-                                cache_create_tokens: event_counts.cache_create,
-                                thinking_tokens: event_counts.thinking,
-                                created_at: Some(now as i64),
-                                turn_id: current_turn.clone(),
-                            }));
-
                             // Embed events for vibe coloring (agent content) and
                             // session position (user / agent / change feeds).
                             // Position needs a session id to key on; without one
@@ -1997,7 +2014,7 @@ impl ClaudeBackend {
                         } else {
                             // Check if this is a task-spawned run (has parent_job_id)
                             let is_task_spawned =
-                                is_task_spawned_run(CLAUDE_BACKEND_NAME, orch, run_id);
+                                is_task_spawned_run(CLAUDE_BACKEND_NAME, &run_db, run_id);
 
                             if is_task_spawned {
                                 crate::orchestrator::lifecycle::finalize_run(
@@ -2076,6 +2093,7 @@ impl ClaudeBackend {
         // Finalize any remaining durable stream on EOF
         let _ = finalize_streaming_message(
             orch,
+            &run_db,
             run_id,
             session_id.as_deref(),
             &mut streaming_state,
@@ -2097,9 +2115,9 @@ impl ClaudeBackend {
         // marked failed and cascading failure to downstream nodes.
         let was_warm = was_host_interrupted(orch, run_id)
             || orch.process_state.get_occupancy(run_id).is_none();
-        let run_status_val = run_status(CLAUDE_BACKEND_NAME, orch, run_id);
+        let run_status_val = run_status(CLAUDE_BACKEND_NAME, &run_db, run_id);
         let terminal_tool_called = terminal_tool_flag.load(std::sync::atomic::Ordering::Acquire);
-        let task_spawned = is_task_spawned_run(CLAUDE_BACKEND_NAME, orch, run_id);
+        let task_spawned = is_task_spawned_run(CLAUDE_BACKEND_NAME, &run_db, run_id);
 
         match classify_eof(
             was_warm,
@@ -2124,7 +2142,7 @@ impl ClaudeBackend {
                 // interrupts the still-running turn rather than failing it, so the
                 // job stays resumable: a blocking rate-limit exit recovers on
                 // reset, and a genuine crash recovers via a follow-up message.
-                let (job_id, execution_id) = run_job_execution(orch, run_id);
+                let (job_id, execution_id) = run_job_execution(&run_db, run_id);
                 let turn_id = orch.process_state.get_current_turn_id(run_id);
                 log::warn!(
                     "Claude process EOF without terminal result — finalizing Crashed (running turn interrupted, resumable). \
@@ -2352,6 +2370,7 @@ mod flush_pending_tests {
 
         let committed = flush_pending_assistant_before_suppress(
             &orch,
+            &orch.db.local,
             "run-paired",
             Some("session-1"),
             0,
@@ -2382,6 +2401,7 @@ mod flush_pending_tests {
 
         let committed = flush_pending_assistant_before_suppress(
             &orch,
+            &orch.db.local,
             "run-orphan",
             Some("session-1"),
             7,
@@ -2411,6 +2431,7 @@ mod flush_pending_tests {
 
         let committed = flush_pending_assistant_before_suppress(
             &orch,
+            &orch.db.local,
             "run-empty",
             Some("session-1"),
             0,

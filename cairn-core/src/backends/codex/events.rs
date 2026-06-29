@@ -8,14 +8,15 @@ use crate::models::{
 };
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
+use crate::storage::LocalDb;
 use crate::transcripts::stream_store::{
     append_chunks, finalize_stream_emit, open_stream, process_post_commit_outbox, EmitDelta,
     EventInsert,
 };
+use cairn_common::ids;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use uuid::Uuid;
 
 pub(super) fn extract_app_server_delta(msg: &Value) -> Option<&str> {
     msg.pointer("/params/delta")
@@ -70,17 +71,20 @@ pub(super) fn extract_raw_response_message_text(item: &Value) -> Option<String> 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn store_event(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
     sequence: i32,
     event: &TranscriptEvent,
 ) {
-    let event_id = Uuid::new_v4().to_string();
+    let event_id = ids::mint_child(run_id);
     store_event_with_id(
         orch,
+        run_db,
         emitter,
         run_id,
         session_id,
@@ -115,22 +119,19 @@ pub(super) fn emit_streaming_delta(
 /// Flush the accumulator's buffered chunks to the DB and advance the stream
 /// version. Caller ensures there is something to flush.
 pub(super) fn flush_codex_pending(
-    orch: &Orchestrator,
     state: &mut StreamingState,
+    run_db: &Arc<LocalDb>,
 ) -> Result<(), String> {
     let pending = state.acc.take_pending();
-    let result = append_chunks(
-        orch.db.local.clone(),
-        &state.stream_id,
-        state.version,
-        &pending,
-    )?;
+    let result = append_chunks(run_db.clone(), &state.stream_id, state.version, &pending)?;
     state.version = result.version;
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn ensure_stream_open(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
@@ -142,7 +143,7 @@ pub(super) fn ensure_stream_open(
     }
     let current_turn = orch.process_state.get_current_turn_id(run_id);
     let stream = open_stream(
-        orch.db.local.clone(),
+        run_db.clone(),
         run_id,
         session_id,
         current_turn.as_deref(),
@@ -152,13 +153,15 @@ pub(super) fn ensure_stream_open(
     *streaming_state = Some(StreamingState::new(&stream, run_id));
     let _ = emitter.emit(
         "db-change",
-        crate::notify::event_db_change(run_id, session_id, "insert"),
+        crate::notify::event_db_change_for_run(orch.db.local.clone(), run_id, session_id, "insert"),
     );
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_agent_message_delta(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
@@ -168,6 +171,7 @@ pub(super) fn handle_agent_message_delta(
 ) {
     if ensure_stream_open(
         orch,
+        run_db,
         emitter,
         run_id,
         session_id,
@@ -183,7 +187,7 @@ pub(super) fn handle_agent_message_delta(
         state.acc.push_content(delta);
         let now = std::time::Instant::now();
         if state.acc.should_flush(now) {
-            if let Err(error) = flush_codex_pending(orch, state) {
+            if let Err(error) = flush_codex_pending(state, run_db) {
                 log::warn!(
                     "Failed to flush Codex content chunks for {}: {}",
                     run_id,
@@ -198,8 +202,10 @@ pub(super) fn handle_agent_message_delta(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_reasoning_delta(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
@@ -207,7 +213,17 @@ pub(super) fn handle_reasoning_delta(
     sequence: i32,
     delta: &str,
 ) {
-    if ensure_stream_open(orch, emitter, run_id, session_id, streaming_state, sequence).is_err() {
+    if ensure_stream_open(
+        orch,
+        run_db,
+        emitter,
+        run_id,
+        session_id,
+        streaming_state,
+        sequence,
+    )
+    .is_err()
+    {
         return;
     }
 
@@ -215,7 +231,7 @@ pub(super) fn handle_reasoning_delta(
         state.acc.push_thinking(delta);
         let now = std::time::Instant::now();
         if state.acc.should_flush(now) {
-            if let Err(error) = flush_codex_pending(orch, state) {
+            if let Err(error) = flush_codex_pending(state, run_db) {
                 log::warn!(
                     "Failed to flush Codex reasoning chunks for {}: {}",
                     run_id,
@@ -230,8 +246,10 @@ pub(super) fn handle_reasoning_delta(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_agent_message(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
@@ -242,6 +260,7 @@ pub(super) fn finalize_agent_message(
     if streaming_state.is_some() {
         finalize_streaming_with_event(
             orch,
+            run_db,
             emitter,
             streaming_state,
             Some(TranscriptEvent {
@@ -277,7 +296,7 @@ pub(super) fn finalize_agent_message(
             thinking_ms: None,
             raw: None,
         };
-        store_event(orch, emitter, run_id, session_id, *sequence, &event);
+        store_event(orch, run_db, emitter, run_id, session_id, *sequence, &event);
         *sequence += 1;
     }
 }
@@ -285,6 +304,7 @@ pub(super) fn finalize_agent_message(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_turn_completed(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
@@ -293,7 +313,7 @@ pub(super) fn handle_turn_completed(
     status: &str,
     usage: Option<Usage>,
 ) {
-    finalize_streaming(orch, emitter, streaming_state, session_id, sequence);
+    finalize_streaming(orch, run_db, emitter, streaming_state, session_id, sequence);
     let counts = TokenCounts::from_optional_usage(usage.as_ref());
 
     match status {
@@ -313,9 +333,10 @@ pub(super) fn handle_turn_completed(
                 thinking_ms: None,
                 raw: None,
             };
-            let event_id = Uuid::new_v4().to_string();
+            let event_id = ids::mint_child(run_id);
             store_event_with_id(
                 orch,
+                run_db,
                 emitter,
                 run_id,
                 session_id,
@@ -326,7 +347,7 @@ pub(super) fn handle_turn_completed(
             );
             *sequence += 1;
 
-            let is_task = is_task_spawned_run(CODEX_BACKEND_NAME, orch, run_id);
+            let is_task = is_task_spawned_run(CODEX_BACKEND_NAME, run_db, run_id);
             if is_task {
                 crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Exited);
                 orch.process_state.transition_to_warm(run_id);
@@ -344,7 +365,7 @@ pub(super) fn handle_turn_completed(
             }
         }
         "interrupted" => {
-            handle_codex_interrupted_turn(orch, emitter, run_id);
+            handle_codex_interrupted_turn(orch, run_db, emitter, run_id);
         }
         _ => {
             insert_error_event(
@@ -397,12 +418,13 @@ pub(super) fn should_finalize_task_run_on_interrupted_turn(
 
 pub(super) fn handle_codex_interrupted_turn(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
 ) {
     if should_finalize_task_run_on_interrupted_turn(
         terminal_tool_called_for_run(orch, run_id),
-        is_task_spawned_run(CODEX_BACKEND_NAME, orch, run_id),
+        is_task_spawned_run(CODEX_BACKEND_NAME, run_db, run_id),
     ) {
         log::info!(
             "codex interrupted after terminal tool for task-spawned run {}; finalizing as completed",
@@ -516,6 +538,7 @@ pub(super) fn codex_rate_limit_window_label(id: &str, window_duration_mins: Opti
 #[allow(clippy::too_many_arguments)]
 pub(super) fn store_event_with_id(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,
     session_id: Option<&str>,
@@ -529,7 +552,7 @@ pub(super) fn store_event_with_id(
 
     let current_turn = orch.process_state.get_current_turn_id(run_id);
     if crate::transcripts::stream_store::insert_event_emit(
-        orch.db.local.clone(),
+        run_db.clone(),
         emitter,
         EventInsert {
             id: event_id.to_string(),
@@ -552,23 +575,6 @@ pub(super) fn store_event_with_id(
     )
     .unwrap_or(false)
     {
-        // Sync event to cloud
-        orch.sync(crate::sync::SyncMessage::Event(crate::sync::SyncEvent {
-            id: event_id.to_string(),
-            run_id: run_id.to_string(),
-            session_id: session_id.map(|s| s.to_string()),
-            sequence: Some(sequence),
-            event_type: event.event_type.clone(),
-            data: Some(data.clone()),
-            input_tokens: counts.input,
-            output_tokens: counts.output,
-            cache_read_tokens: counts.cache_read,
-            cache_create_tokens: counts.cache_create,
-            thinking_tokens: counts.thinking,
-            created_at: Some(now as i64),
-            turn_id: current_turn.clone(),
-        }));
-
         // Embed events for vibe coloring (agent content) and session position
         // (user / agent / change feeds). Position needs a session id to key on;
         // without one we still color agent events.
@@ -617,6 +623,7 @@ pub(super) fn store_event_with_id(
 
 pub(super) fn finalize_streaming_with_event(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     streaming_state: &mut Option<StreamingState>,
     final_event: Option<TranscriptEvent>,
@@ -628,7 +635,7 @@ pub(super) fn finalize_streaming_with_event(
     // Flush buffered chunks before finalize: finalize_stream reconstructs the
     // final content from chunk rows, so unflushed tokens would be lost.
     if !state.acc.pending_is_empty() {
-        if let Err(error) = flush_codex_pending(orch, &mut state) {
+        if let Err(error) = flush_codex_pending(&mut state, run_db) {
             log::warn!(
                 "Failed to flush Codex stream {} before finalize: {}",
                 state.stream_id,
@@ -642,6 +649,7 @@ pub(super) fn finalize_streaming_with_event(
         emit_streaming_delta(emitter, &state.run_id, &state.stream_id, &d);
     }
     match finalize_stream_emit(
+        run_db.clone(),
         orch.db.local.clone(),
         emitter,
         &state.stream_id,
@@ -665,12 +673,13 @@ pub(super) fn finalize_streaming_with_event(
 
 pub(super) fn finalize_streaming(
     orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     streaming_state: &mut Option<StreamingState>,
     _session_id: Option<&str>,
     sequence: &mut i32,
 ) {
-    finalize_streaming_with_event(orch, emitter, streaming_state, None, sequence);
+    finalize_streaming_with_event(orch, run_db, emitter, streaming_state, None, sequence);
 }
 
 /// Extract display text from a Codex MCP CallToolResult.

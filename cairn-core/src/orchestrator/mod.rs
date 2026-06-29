@@ -48,7 +48,6 @@ use crate::models::{
 };
 use crate::notify::Notifier;
 use crate::services::{ChildProcess, PtyState, Services};
-use crate::sync::SyncMessage;
 
 pub use crate::account::AnonDeviceManager;
 pub use account_manager::AccountManager;
@@ -78,7 +77,6 @@ pub struct OrchestratorBuilder {
     mcp_callback_port: u16,
     vibe_state: Option<Arc<VibeState>>,
     account_manager: Arc<AccountManager>,
-    sync_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SyncMessage>>>>,
     notifier: Notifier,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
@@ -104,8 +102,7 @@ impl OrchestratorBuilder {
         let session_allowed_crossings = Arc::new(Mutex::new(HashSet::new()));
         let identity_store = Arc::new(Mutex::new(None));
         let account_manager = Arc::new(AccountManager::new(db.clone(), services.emitter.clone()));
-        let sync_tx = Arc::new(std::sync::Mutex::new(None));
-        let notifier = Notifier::new(sync_tx.clone(), services.emitter.clone());
+        let notifier = Notifier::new(services.emitter.clone());
 
         Self {
             db,
@@ -131,7 +128,6 @@ impl OrchestratorBuilder {
             mcp_callback_port: 0,
             vibe_state: None,
             account_manager,
-            sync_tx,
             notifier,
             api_config: ApiConfig::default(),
             effect_tx: None,
@@ -234,14 +230,6 @@ impl OrchestratorBuilder {
         self
     }
 
-    pub fn sync_tx(
-        mut self,
-        sync_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SyncMessage>>>>,
-    ) -> Self {
-        self.sync_tx = sync_tx;
-        self
-    }
-
     pub fn notifier(mut self, notifier: Notifier) -> Self {
         self.notifier = notifier;
         self
@@ -269,6 +257,16 @@ impl OrchestratorBuilder {
     }
 
     pub fn build(self) -> Orchestrator {
+        // Install the process-wide rustls CryptoProvider at the single startup
+        // chokepoint every sync-capable host passes through before it can open a
+        // team replica. Turso's sync IO builds its hyper-rustls client the
+        // instant the `turso-sync-io` thread spawns (inside
+        // `turso::sync::Builder::build()`), so the provider must already be
+        // installed by then — doing it lazily per-open races that thread spawn
+        // (CAIRN-2196). Idempotent and `Once`-guarded; see
+        // `storage::install_crypto_provider`.
+        crate::storage::install_crypto_provider();
+
         let anon_device_manager = Arc::new(AnonDeviceManager::new(
             self.db.clone(),
             self.api_config.clone(),
@@ -299,7 +297,6 @@ impl OrchestratorBuilder {
             embed_tx: Arc::new(Mutex::new(None)),
             anon_device_manager,
             account_manager: self.account_manager,
-            sync_tx: self.sync_tx,
             notifier: self.notifier,
             api_config: self.api_config,
             effect_tx: self.effect_tx,
@@ -431,13 +428,8 @@ pub struct Orchestrator {
     /// embedding works logged-out. Account JWT takes precedence when connected.
     pub anon_device_manager: Arc<AnonDeviceManager>,
 
-    // === Remote sync channel ===
-    /// Sync sender for dual-writing to cloud. None when not connected or no plan.
-    /// Wrapped in Arc<Mutex> so it can be set after account connection.
-    pub sync_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SyncMessage>>>>,
-
     // === Unified notification ===
-    /// Combined sync + emit for write operations. Shares `sync_tx` and `emitter`.
+    /// Emits frontend `db-change` events for write operations. Shares `emitter`.
     pub notifier: Notifier,
 
     // === Cloud API ===
@@ -521,7 +513,10 @@ pub struct Orchestrator {
 }
 
 /// Resolve the `/embed` gateway token: account JWT preferred, anonymous device
-/// JWT as fallback. Single source of truth for `embed_token_provider`'s
+/// JWT as fallback. An *expired* account JWT is treated as absent (see
+/// `AccountManager::get_jwt`), so it falls through to the anonymous token rather
+/// than shadowing it — keeping vibe coloring and the recommender alive when the
+/// account token lapses. Single source of truth for `embed_token_provider`'s
 /// precedence so it can be unit-tested without a full Orchestrator.
 fn resolve_embed_token(account: &AccountManager, anon: &AnonDeviceManager) -> Option<String> {
     account
@@ -657,7 +652,14 @@ impl Orchestrator {
     /// watch handler can render the specific content. Fact construction is
     /// shared with the turn-end emit via [`attention::idle_fact_for_issue`].
     pub async fn wake_for_issue(&self, issue_id: &str) {
-        let ctx = match attention::read_issue_for_attention(&self.db.local, issue_id).await {
+        let db = match crate::issues::crud::owning_db_for_issue(&self.db, issue_id).await {
+            Ok(db) => db,
+            Err(e) => {
+                log::debug!("wake_for_issue skip ({}): {}", issue_id, e);
+                return;
+            }
+        };
+        let ctx = match attention::read_issue_for_attention(&db, issue_id).await {
             Ok(ctx) => ctx,
             Err(e) => {
                 log::debug!("wake_for_issue skip ({}): {}", issue_id, e);
@@ -665,8 +667,7 @@ impl Orchestrator {
             }
         };
         let issue_uri = ctx.issue_uri();
-        let Some(idle) = attention::idle_fact_for_issue(&self.db.local, issue_id, &ctx, None).await
-        else {
+        let Some(idle) = attention::idle_fact_for_issue(&db, issue_id, &ctx, None).await else {
             // No actionable state, not terminal, no open PR — nothing for `watch`.
             return;
         };
@@ -678,48 +679,6 @@ impl Orchestrator {
             status: ctx.status,
             updated_at: idle.updated_at,
         });
-    }
-
-    /// Send a sync message to the cloud (no-op if sync not active).
-    pub fn sync(&self, msg: SyncMessage) {
-        if let Ok(guard) = self.sync_tx.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.send(msg);
-            }
-        }
-    }
-
-    /// Prepare the sync task for a connected paid account.
-    /// Returns a future to spawn and the sender, or None if not eligible.
-    /// Caller must spawn the future on a runtime (e.g. `tauri::async_runtime::spawn`).
-    pub fn prepare_sync(
-        &self,
-    ) -> Option<(
-        impl std::future::Future<Output = ()>,
-        tokio::sync::mpsc::UnboundedSender<SyncMessage>,
-        String, // email for logging
-    )> {
-        let conn = match self.account_manager.get_connection() {
-            Ok(Some(c)) if c.plan != "free" => c,
-            _ => return None,
-        };
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let am = self.account_manager.clone();
-        let jwt_provider = Arc::new(move || am.get_jwt().ok().flatten());
-        let device_id = conn.device_id.clone();
-        let email = conn.email.clone();
-
-        let task =
-            crate::sync::SyncTask::new(rx, jwt_provider, device_id, self.api_config.clone()).run();
-        Some((task, tx, email))
-    }
-
-    /// Activate sync by storing the sender. Call after spawning the task future.
-    pub fn activate_sync(&self, tx: tokio::sync::mpsc::UnboundedSender<SyncMessage>) {
-        if let Ok(mut guard) = self.sync_tx.lock() {
-            *guard = Some(tx);
-        }
     }
 
     /// Start the async embed worker. Call once at startup, on a tokio runtime.
@@ -862,6 +821,157 @@ impl Orchestrator {
             crate::orchestrator::base_advance::reconcile_startup_remote_default_advances(&orch)
                 .await;
         });
+    }
+
+    /// Enable the per-team background sync loop: build a [`SyncRuntime`] from the
+    /// services emitter and default cadence and hand it to `DbState`. Mirrors the
+    /// other detached background-spawn methods (`spawn_memory_*`,
+    /// `spawn_default_advance_reconcile`) — same fire-and-forget pattern, owned by
+    /// runtime teardown. The actual per-team push/pull tasks then spawn lazily as
+    /// teams open. Inert with no team configured. Must run within a tokio runtime.
+    pub fn start_team_sync(&self) {
+        let db = self.db.clone();
+        let runtime = crate::db::SyncRuntime {
+            emitter: self.services.emitter.clone(),
+            cadence: crate::storage::SyncCadence::default(),
+        };
+        tokio::spawn(async move {
+            db.enable_team_sync(runtime).await;
+        });
+    }
+
+    /// Resolve the replica path for a team's synced database: `<dir>/teams/<id>.db`
+    /// beside the private database, so a dev instance (`CAIRN_DB_PATH`) keeps its
+    /// team replicas under its own home rather than a shared location.
+    fn team_replica_path(&self, team_id: &str) -> PathBuf {
+        self.db
+            .local
+            .path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("teams")
+            .join(format!("{team_id}.db"))
+    }
+
+    /// Runtime entry point for using a team's synced data: fetch the team's sync
+    /// config (member-authed, reusing the stored device JWT), and on an active
+    /// team register it in the private `teams` catalog and open its replica
+    /// (which reconciles the team's project routes). 404/503 are treated as
+    /// not-yet-available: nothing is opened or written and the caller can poll.
+    ///
+    /// The durable local `teams` registry is the source of truth for which teams
+    /// to reopen at startup; this method is what populates it in production. The
+    /// api remains the membership authority (the broker rechecks every request).
+    pub async fn connect_team(
+        &self,
+        team_id: &str,
+    ) -> Result<crate::account::team_sync::TeamConnectStatus, String> {
+        use crate::account::team_sync::{
+            fetch_team_sync_config, read_device_jwt, SyncConfigStatus, TeamConnectStatus,
+        };
+
+        // Read the device JWT directly (async, no AccountManager refresh loop).
+        let device_jwt = match read_device_jwt(&self.db.local).await? {
+            Some(jwt) => jwt,
+            None => return Ok(TeamConnectStatus::NotAuthenticated),
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        match fetch_team_sync_config(&client, &device_jwt, team_id, &self.api_config).await? {
+            SyncConfigStatus::NotConfigured => Ok(TeamConnectStatus::NotConfigured),
+            SyncConfigStatus::Provisioning => Ok(TeamConnectStatus::Provisioning),
+            SyncConfigStatus::Active(cfg) => {
+                let replica_path = self.team_replica_path(team_id);
+                if let Some(parent) = replica_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("create team replica dir: {e}"))?;
+                }
+                // Resolve the team's human-readable name from the account's org
+                // memberships — a team id IS its org id. This is the name seeded
+                // into the synced `teams` root row and stored in the private
+                // registry, so members converge on the same id+name. Falls back to
+                // the api's db_name only if the membership is unexpectedly absent.
+                let team_name = crate::account::queries::get(&self.db.local)
+                    .await?
+                    .and_then(|conn| {
+                        conn.org_memberships
+                            .into_iter()
+                            .find(|m| m.org_id == team_id)
+                            .map(|m| m.org_name)
+                    })
+                    .unwrap_or_else(|| cfg.db_name.clone());
+                // Register the team durably BEFORE opening, so a project_routes
+                // row written during reconcile satisfies its FK to `teams(id)`.
+                self.db
+                    .upsert_team_registry(
+                        team_id,
+                        &team_name,
+                        &cfg.sync_url,
+                        &replica_path.to_string_lossy(),
+                    )
+                    .await
+                    .map_err(|e| format!("register team in catalog: {e}"))?;
+                self.db
+                    .open_team(crate::db::TeamConfig {
+                        team_id: team_id.to_string(),
+                        team_name,
+                        sync_url: cfg.sync_url,
+                        auth_token: None,
+                        replica_path,
+                    })
+                    .await
+                    .map_err(|e| format!("open team replica: {e}"))?;
+                Ok(TeamConnectStatus::Connected)
+            }
+        }
+    }
+
+    /// Read-only companion to [`Self::connect_team`]: probe the sync readiness of
+    /// every team the account belongs to WITHOUT opening any replica. This backs
+    /// the desktop create-into-team selector, which must show which teams can
+    /// receive a project before the user picks one (the actual replica open still
+    /// happens via `connect_team` at submit). Teams are enumerated from the
+    /// account's org memberships; with no account connected the list is empty, and
+    /// with no device JWT every team is reported `NotAuthenticated` without a probe.
+    pub async fn list_team_sync_status(
+        &self,
+    ) -> Result<Vec<crate::account::team_sync::TeamSyncStatus>, String> {
+        use crate::account::team_sync::{
+            probe_team_sync_status, read_device_jwt, TeamSyncReadiness, TeamSyncStatus,
+        };
+
+        let team_ids: Vec<String> = match crate::account::queries::get(&self.db.local).await? {
+            Some(conn) => conn.org_memberships.into_iter().map(|m| m.org_id).collect(),
+            None => return Ok(Vec::new()),
+        };
+        if team_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let device_jwt = match read_device_jwt(&self.db.local).await? {
+            Some(jwt) => jwt,
+            None => {
+                return Ok(team_ids
+                    .into_iter()
+                    .map(|team_id| TeamSyncStatus {
+                        team_id,
+                        status: TeamSyncReadiness::NotAuthenticated,
+                    })
+                    .collect());
+            }
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        Ok(probe_team_sync_status(&client, &device_jwt, &team_ids, &self.api_config).await)
     }
 
     /// Send a job to the embed worker. Non-blocking; a no-op if the worker
@@ -1047,8 +1157,21 @@ impl Orchestrator {
             return Some(state);
         }
 
-        let snapshot = match get_latest_context_token_event(self.db.local.clone(), session_id).await
+        // A team session's events live in its synced replica, so resolve the
+        // owning database by the run that carries this session (CAIRN-2225)
+        // rather than reading the private DB. Fail-closed: a team session whose
+        // replica is not open yields no snapshot (the token meter stays empty)
+        // rather than reading the private DB's empty result. A local session
+        // short-circuits on the always-open private DB — behavior unchanged.
+        let db = match crate::execution::routing::owning_db_for_session(&self.db, session_id).await
         {
+            Ok(db) => db,
+            Err(error) => {
+                log::warn!("Failed to resolve owning database for context token state: {error}");
+                return None;
+            }
+        };
+        let snapshot = match get_latest_context_token_event(db, session_id).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 log::warn!("Failed to derive context token state from events: {error}");
@@ -1182,6 +1305,26 @@ mod tests {
                              created_at, updated_at)
                          VALUES ('anon-dev', ?1, ?2, 0, 0)",
                         (enc.as_str(), chrono::Utc::now().timestamp() + 3600),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn insert_expired_account_jwt(db: &DbState, jwt: &str) {
+        let enc = encrypt_jwt_for_storage(jwt).unwrap();
+        db.local
+            .write(|conn| {
+                let enc = enc.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO account (user_id, email, name, device_id, plan,
+                             jwt_encrypted, jwt_expires_at, org_memberships, connected_at, updated_at)
+                         VALUES ('u1','a@b.com','A','dev','free', ?1, ?2, NULL, 0, 0)",
+                        (enc.as_str(), chrono::Utc::now().timestamp() - 10),
                     )
                     .await?;
                     Ok(())
@@ -1471,6 +1614,28 @@ mod tests {
     #[tokio::test]
     async fn embed_token_none_when_neither_present() {
         let db = test_db().await;
+        let (account, anon) = managers(db);
+        assert_eq!(resolve_embed_token(&account, &anon), None);
+    }
+
+    #[tokio::test]
+    async fn embed_token_skips_expired_account_jwt_for_anon() {
+        let db = test_db().await;
+        insert_expired_account_jwt(&db, "stale-account-jwt").await;
+        insert_anon_jwt(&db, "anon-jwt").await;
+        let (account, anon) = managers(db);
+        // An expired account JWT must not shadow the valid anon token — otherwise
+        // embedding 401s and vibe colors silently stop.
+        assert_eq!(
+            resolve_embed_token(&account, &anon),
+            Some("anon-jwt".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn embed_token_none_when_account_expired_and_no_anon() {
+        let db = test_db().await;
+        insert_expired_account_jwt(&db, "stale-account-jwt").await;
         let (account, anon) = managers(db);
         assert_eq!(resolve_embed_token(&account, &anon), None);
     }

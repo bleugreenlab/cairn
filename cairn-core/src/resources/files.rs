@@ -495,10 +495,9 @@ pub(super) async fn read_node_changed(
     exec_seq: i32,
     node_name: &str,
 ) -> String {
+    let db = orch.db.for_project(project_key).await;
     let (conn, job) =
-        match connect_and_find_node_job(&orch.db.local, project_key, number, exec_seq, node_name)
-            .await
-        {
+        match connect_and_find_node_job(&db, project_key, number, exec_seq, node_name).await {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
@@ -529,10 +528,9 @@ pub(super) async fn read_node_changed_projection(
     node_name: &str,
     params: &[QueryParam],
 ) -> String {
+    let db = orch.db.for_project(project_key).await;
     let (conn, job) =
-        match connect_and_find_node_job(&orch.db.local, project_key, number, exec_seq, node_name)
-            .await
-        {
+        match connect_and_find_node_job(&db, project_key, number, exec_seq, node_name).await {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
