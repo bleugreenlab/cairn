@@ -693,7 +693,7 @@ impl Orchestrator {
         spawn_embed_worker(
             rx,
             client,
-            self.db.local.clone(),
+            self.db.clone(),
             self.vibe_state.clone(),
             self.services.emitter.clone(),
         );
@@ -1037,13 +1037,13 @@ impl Orchestrator {
     pub fn collect_warm_if_needed(&self) -> Option<String> {
         let gc = self.warm_gc.as_ref()?.clone();
         let process_state = self.process_state.clone();
-        let db = self.db.local.clone();
+        let dbs = self.db.clone();
 
         let eviction_candidate = {
             fn run_lookup(
                 gc: Arc<crate::agent_process::gc::WarmProcessGC>,
                 process_state: Arc<AgentProcessState>,
-                db: Arc<crate::storage::LocalDb>,
+                dbs: Arc<crate::db::DbState>,
             ) -> Option<String> {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1053,17 +1053,17 @@ impl Orchestrator {
                         error
                     })
                     .ok()?
-                    .block_on(async move { gc.find_eviction_candidate(&process_state, &db).await })
+                    .block_on(async move { gc.find_eviction_candidate(&process_state, &dbs).await })
             }
 
             if tokio::runtime::Handle::try_current().is_ok() {
-                std::thread::spawn(move || run_lookup(gc, process_state, db))
+                std::thread::spawn(move || run_lookup(gc, process_state, dbs))
                     .join()
                     .map_err(|_| log::error!("GC: database lookup thread panicked"))
                     .ok()
                     .flatten()
             } else {
-                run_lookup(gc, process_state, db)
+                run_lookup(gc, process_state, dbs)
             }
         };
 

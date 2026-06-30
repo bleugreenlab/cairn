@@ -283,6 +283,36 @@ impl ExecutionSnapshot {
         Ok(snapshot)
     }
 
+    /// Re-key every routable id embedded in the snapshot for a private-to-team
+    /// project move. Provider ids and backend session ids are intentionally not
+    /// present in this pass.
+    pub fn rekey_to_team(&mut self, team_id: &str) -> Result<(), String> {
+        self.trigger_context.project_id =
+            cairn_common::ids::rekey_to_team(&self.trigger_context.project_id, team_id)
+                .map_err(|e| format!("re-keying snapshot project_id: {e}"))?;
+        if let Some(issue_id) = &mut self.trigger_context.issue_id {
+            *issue_id = cairn_common::ids::rekey_to_team(issue_id, team_id)
+                .map_err(|e| format!("re-keying snapshot issue_id: {e}"))?;
+        }
+        for packet in &mut self.delegated_packets {
+            packet.id = cairn_common::ids::rekey_to_team(&packet.id, team_id)
+                .map_err(|e| format!("re-keying delegated packet id: {e}"))?;
+            packet.parent_job_id = cairn_common::ids::rekey_to_team(&packet.parent_job_id, team_id)
+                .map_err(|e| format!("re-keying delegated packet parent_job_id: {e}"))?;
+            if let Some(parent_turn_id) = &mut packet.parent_turn_id {
+                *parent_turn_id = cairn_common::ids::rekey_to_team(parent_turn_id, team_id)
+                    .map_err(|e| format!("re-keying delegated packet parent_turn_id: {e}"))?;
+            }
+            if let Some(result_artifact_job_id) = &mut packet.result_artifact_job_id {
+                *result_artifact_job_id =
+                    cairn_common::ids::rekey_to_team(result_artifact_job_id, team_id).map_err(
+                        |e| format!("re-keying delegated packet result_artifact_job_id: {e}"),
+                    )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Fold legacy per-agent flat `model`/`resolved_backend` (and frozen
     /// `presets`) into the atomic `selection` + `extras` representation, once.
     ///

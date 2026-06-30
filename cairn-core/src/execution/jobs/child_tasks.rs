@@ -41,7 +41,7 @@ pub fn create_child_task(
         .ok_or("Parent job has no worktree")?
         .clone();
 
-    let project_path = run_db(load_project_path(db.clone(), project_id.clone()))?;
+    let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
 
     // ---- Load agent config from files -----------------------------------
     let config_dir = config::get_config_dir()?;

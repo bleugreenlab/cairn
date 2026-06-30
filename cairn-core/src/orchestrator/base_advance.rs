@@ -15,12 +15,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::execution::routing::{owning_db_for_job, owning_db_for_project};
 use crate::messages::delivery::{latest_run_for_job, queue_system_direct};
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::ExecutionSnapshot;
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbError, DbResult, RowExt};
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use turso::params;
 
 #[derive(Debug)]
@@ -50,6 +52,11 @@ struct IssueInfo {
     number: i64,
 }
 
+struct BaseAdvanceNotes {
+    conflict: String,
+    clean: String,
+}
+
 #[derive(Debug)]
 struct DefaultReconcileProject {
     id: String,
@@ -63,7 +70,15 @@ pub async fn notify_downstream_of_base_advance(
     orch: &Orchestrator,
     merged_job_id: &str,
 ) -> Result<(), String> {
-    let Some(merged_job) = load_merged_job_for_owner(orch, merged_job_id).await? else {
+    let db = owning_db_for_job(&orch.db, merged_job_id)
+        .await
+        .map_err(|error| {
+            log::warn!(
+                "Skipping base advance notify for owner {merged_job_id}: failed to route owning database: {error}"
+            );
+            error.to_string()
+        })?;
+    let Some(merged_job) = load_merged_job_for_owner(&db, merged_job_id).await? else {
         log::debug!(
             "Skipping base advance notify: no implementation job found for owner {}",
             merged_job_id
@@ -82,14 +97,22 @@ pub async fn notify_downstream_of_base_advance(
     // auto-rebase of in-flight siblings over the shared store. The advance
     // propagates through the commit graph itself; conflicts are recorded (not
     // blocking) and no sibling rebase/force-push is required.
-    let Some(repo_path) = load_project_repo_path(orch, &merged_job.project_id).await? else {
+    let Some(repo_path) = load_project_repo_path(&db, &merged_job.project_id).await? else {
         log::debug!(
             "Skipping base advance reconcile for job {}: no project repo_path",
             merged_job.id
         );
         return Ok(());
     };
-    reconcile_jj_downstream(orch, merged_job_id, &merged_job, base_branch, &repo_path).await
+    reconcile_jj_downstream(
+        orch,
+        &db,
+        merged_job_id,
+        &merged_job,
+        base_branch,
+        &repo_path,
+    )
+    .await
 }
 
 /// Sentinel for `load_sibling_jobs` when there is no merged job to exclude — an
@@ -107,6 +130,7 @@ const EXCLUDE_NONE: &str = "";
 /// moved.
 async fn reconcile_jj_downstream(
     orch: &Orchestrator,
+    db: &LocalDb,
     merged_job_id: &str,
     merged_job: &MergedJob,
     base_branch: &str,
@@ -131,10 +155,10 @@ async fn reconcile_jj_downstream(
     // and a later edit+seal would orphan off the advanced branch. Runs
     // independently of (and before) the sibling reconcile — a coordinator must be
     // advanced even when it has no other in-flight siblings.
-    advance_on_branch_workspaces(orch, &merged_job.project_id, base_branch, repo_path).await;
+    advance_on_branch_workspaces(orch, db, &merged_job.project_id, base_branch, repo_path).await;
 
     let siblings =
-        load_sibling_jobs(orch, &merged_job.project_id, base_branch, &merged_job.id).await?;
+        load_sibling_jobs(db, &merged_job.project_id, base_branch, &merged_job.id).await?;
     if siblings.is_empty() {
         log::debug!(
             "jj base advance for merged job {}: no in-flight siblings to reconcile",
@@ -147,22 +171,24 @@ async fn reconcile_jj_downstream(
     // integration bookmark), so the rebase dest is the bare local integration
     // bookmark — no fetch needed.
     let issue_info = match merged_job.issue_id.as_deref() {
-        Some(issue_id) => load_issue_info(orch, issue_id).await?,
+        Some(issue_id) => load_issue_info(db, issue_id).await?,
         None => None,
     };
-    let pr_number = load_merge_request_info(orch, merged_job_id, &merged_job.id)
+    let pr_number = load_merge_request_info(db, merged_job_id, &merged_job.id)
         .await?
         .and_then(|info| info.pr_number);
-    let conflict_note = build_jj_conflict_note(base_branch, pr_number, issue_info.as_ref());
-    let clean_note = build_jj_clean_note(base_branch, pr_number, issue_info.as_ref());
+    let notes = BaseAdvanceNotes {
+        conflict: build_jj_conflict_note(base_branch, pr_number, issue_info.as_ref()),
+        clean: build_jj_clean_note(base_branch, pr_number, issue_info.as_ref()),
+    };
     reconcile_base_advance(
         orch,
+        db,
         &format!("merged job {}", merged_job.id),
         repo_path,
         base_branch,
         siblings,
-        conflict_note,
-        clean_note,
+        notes,
     )
     .await
 }
@@ -199,11 +225,19 @@ async fn reconcile_default_advance(
     project_id: &str,
     default_branch: &str,
 ) -> Result<(), String> {
-    let Some(repo_path) = load_project_repo_path(orch, project_id).await? else {
+    let db = owning_db_for_project(&orch.db, project_id)
+        .await
+        .map_err(|error| {
+            log::warn!(
+                "Skipping external advance reconcile for project {project_id}: failed to route owning database: {error}"
+            );
+            error.to_string()
+        })?;
+    let Some(repo_path) = load_project_repo_path(&db, project_id).await? else {
         log::debug!("Skipping external advance reconcile: no repo_path for project {project_id}");
         return Ok(());
     };
-    let siblings = load_sibling_jobs(orch, project_id, default_branch, EXCLUDE_NONE).await?;
+    let siblings = load_sibling_jobs(&db, project_id, default_branch, EXCLUDE_NONE).await?;
     if siblings.is_empty() {
         log::debug!("external advance on {default_branch}: no in-flight siblings to reconcile");
         return Ok(());
@@ -233,16 +267,18 @@ async fn reconcile_default_advance(
         return Ok(());
     }
 
-    let conflict_note = build_external_advance_conflict_note(default_branch);
-    let clean_note = build_external_advance_clean_note(default_branch);
+    let notes = BaseAdvanceNotes {
+        conflict: build_external_advance_conflict_note(default_branch),
+        clean: build_external_advance_clean_note(default_branch),
+    };
     reconcile_base_advance(
         orch,
+        &db,
         &format!("external advance on {default_branch}"),
         &repo_path,
         &remote_default_revset(default_branch),
         siblings,
-        conflict_note,
-        clean_note,
+        notes,
     )
     .await
 }
@@ -260,7 +296,7 @@ pub async fn reconcile_startup_remote_default_advances(orch: &Orchestrator) {
             return;
         }
     };
-    for project in projects {
+    for (db, project) in projects {
         if !project_has_origin(orch, Path::new(&project.repo_path)) {
             log::debug!(
                 "startup default-advance catch-up: skipping project {} with no origin remote",
@@ -268,7 +304,7 @@ pub async fn reconcile_startup_remote_default_advances(orch: &Orchestrator) {
             );
             continue;
         }
-        if let Err(error) = reconcile_startup_remote_default_advance(orch, &project).await {
+        if let Err(error) = reconcile_startup_remote_default_advance(orch, &db, &project).await {
             log::warn!(
                 "startup default-advance catch-up for project {} failed: {error}",
                 project.id
@@ -279,10 +315,11 @@ pub async fn reconcile_startup_remote_default_advances(orch: &Orchestrator) {
 
 async fn reconcile_startup_remote_default_advance(
     orch: &Orchestrator,
+    db: &LocalDb,
     project: &DefaultReconcileProject,
 ) -> Result<(), String> {
     let siblings =
-        load_sibling_jobs(orch, &project.id, &project.default_branch, EXCLUDE_NONE).await?;
+        load_sibling_jobs(db, &project.id, &project.default_branch, EXCLUDE_NONE).await?;
     if siblings.is_empty() {
         log::debug!(
             "startup remote advance on {}: no in-flight siblings to reconcile",
@@ -329,16 +366,18 @@ async fn reconcile_startup_remote_default_advance(
         return Ok(());
     }
 
-    let conflict_note = build_external_advance_conflict_note(&project.default_branch);
-    let clean_note = build_external_advance_clean_note(&project.default_branch);
+    let notes = BaseAdvanceNotes {
+        conflict: build_external_advance_conflict_note(&project.default_branch),
+        clean: build_external_advance_clean_note(&project.default_branch),
+    };
     reconcile_base_advance(
         orch,
+        db,
         &format!("startup external advance on {}", project.default_branch),
         &project.repo_path,
         &remote_default,
         siblings,
-        conflict_note,
-        clean_note,
+        notes,
     )
     .await
 }
@@ -367,12 +406,12 @@ fn project_has_origin(orch: &Orchestrator, repo_path: &Path) -> bool {
 /// or clean.
 async fn reconcile_base_advance(
     orch: &Orchestrator,
+    db: &LocalDb,
     label: &str,
     repo_path: &str,
     rebase_dest: &str,
     siblings: Vec<SiblingJob>,
-    conflict_note: String,
-    clean_note: String,
+    notes: BaseAdvanceNotes,
 ) -> Result<(), String> {
     let specs: Vec<(String, std::path::PathBuf)> = siblings
         .iter()
@@ -426,7 +465,7 @@ async fn reconcile_base_advance(
         }
     }
     if !ambiguous.is_empty() {
-        notify_ambiguous_divergence(orch, &siblings, &ambiguous)?;
+        notify_ambiguous_divergence(orch, db, &siblings, &ambiguous)?;
     }
 
     // Snapshot each sibling's commit id BEFORE the rebase, so we notify only
@@ -485,9 +524,10 @@ async fn reconcile_base_advance(
             .collect();
         notify_conflicted_siblings(
             orch,
+            db,
             &siblings,
             &conflicted_rewritten,
-            &conflict_note,
+            &notes.conflict,
             &files_by_branch,
         )?;
     }
@@ -498,7 +538,7 @@ async fn reconcile_base_advance(
     if clean_rewritten.is_empty() {
         log::debug!("jj reconcile ({label}): clean rebases unchanged since a prior reconcile; no redundant note");
     } else {
-        notify_clean_siblings(orch, &siblings, &clean_rewritten, &clean_note)?;
+        notify_clean_siblings(orch, db, &siblings, &clean_rewritten, &notes.clean)?;
     }
 
     Ok(())
@@ -597,11 +637,12 @@ fn build_jj_clean_note(
 /// branch as `agent/...`), so the on-branch query returns nothing for it.
 async fn advance_on_branch_workspaces(
     orch: &Orchestrator,
+    db: &LocalDb,
     project_id: &str,
     branch: &str,
     repo_path: &str,
 ) {
-    let on_branch = match load_on_branch_workspaces(orch, project_id, branch).await {
+    let on_branch = match load_on_branch_workspaces(db, project_id, branch).await {
         Ok(workspaces) => workspaces,
         Err(error) => {
             log::warn!("on-branch advance: failed to load workspaces on {branch}: {error}");
@@ -638,7 +679,7 @@ async fn advance_on_branch_workspaces(
                 twins.join(", ")
             );
             for workspace in &on_branch {
-                let Some(run_id) = latest_run_for_job(&orch.db.local, &workspace.id) else {
+                let Some(run_id) = latest_run_for_job(db, &workspace.id) else {
                     continue;
                 };
                 let message = build_ambiguous_divergence_note(branch, &change_id, &twins);
@@ -697,7 +738,7 @@ async fn advance_on_branch_workspaces(
                         workspace.worktree_path,
                         branch
                     );
-                    if let Some(run_id) = latest_run_for_job(&orch.db.local, &workspace.id) {
+                    if let Some(run_id) = latest_run_for_job(db, &workspace.id) {
                         let note = build_on_branch_advance_clean_note(branch);
                         if let Err(error) =
                             queue_system_direct(orch, &run_id, &note, DeliveryUrgency::Passive)
@@ -721,7 +762,7 @@ async fn advance_on_branch_workspaces(
                     "on-branch advance of {} recorded a conflict; interrupting it",
                     workspace.worktree_path
                 );
-                if let Some(run_id) = latest_run_for_job(&orch.db.local, &workspace.id) {
+                if let Some(run_id) = latest_run_for_job(db, &workspace.id) {
                     let note = build_on_branch_advance_conflict_note(branch);
                     let files =
                         crate::jj::conflicted_files(&jj, Path::new(&workspace.worktree_path));
@@ -808,6 +849,7 @@ fn append_conflicting_files(note: &str, files: Option<&Vec<String>>) -> String {
 /// are not in `conflicted`; they receive a passive note via `notify_clean_siblings`.
 fn notify_conflicted_siblings(
     orch: &Orchestrator,
+    db: &LocalDb,
     siblings: &[SiblingJob],
     conflicted: &[String],
     note: &str,
@@ -820,7 +862,7 @@ fn notify_conflicted_siblings(
         if !conflicted.contains(&branch) {
             continue;
         }
-        let Some(run_id) = latest_run_for_job(&orch.db.local, &sibling.id) else {
+        let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
             log::debug!(
                 "jj reconcile: no run for conflicted sibling {} to interrupt",
                 sibling.id
@@ -866,6 +908,7 @@ fn build_ambiguous_divergence_note(branch: &str, change_id: &str, twins: &[Strin
 /// twins and asks for manual resolution + escalation (never a force-push).
 fn notify_ambiguous_divergence(
     orch: &Orchestrator,
+    db: &LocalDb,
     siblings: &[SiblingJob],
     ambiguous: &[AmbiguousDivergence],
 ) -> Result<(), String> {
@@ -876,7 +919,7 @@ fn notify_ambiguous_divergence(
         else {
             continue;
         };
-        let Some(run_id) = latest_run_for_job(&orch.db.local, &sibling.id) else {
+        let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
             log::debug!(
                 "jj collapse: no run for ambiguous sibling {} to interrupt",
                 sibling.id
@@ -906,6 +949,7 @@ fn notify_ambiguous_divergence(
 /// record without mechanically resuming an idle agent.
 fn notify_clean_siblings(
     orch: &Orchestrator,
+    db: &LocalDb,
     siblings: &[SiblingJob],
     clean: &[String],
     note: &str,
@@ -917,7 +961,7 @@ fn notify_clean_siblings(
         if !clean.contains(&branch) {
             continue;
         }
-        let Some(run_id) = latest_run_for_job(&orch.db.local, &sibling.id) else {
+        let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
             log::debug!(
                 "jj reconcile: no run for cleanly-rebased sibling {} to notify",
                 sibling.id
@@ -934,19 +978,19 @@ fn notify_clean_siblings(
 }
 
 async fn load_merged_job_for_owner(
-    orch: &Orchestrator,
+    db: &LocalDb,
     owner_id: &str,
 ) -> Result<Option<MergedJob>, String> {
-    if let Some(job) = load_job_by_id(orch, owner_id).await? {
+    if let Some(job) = load_job_by_id(db, owner_id).await? {
         return Ok(Some(job));
     }
 
-    let Some(action_run) = load_action_run_pr_owner(orch, owner_id).await? else {
+    let Some(action_run) = load_action_run_pr_owner(db, owner_id).await? else {
         return Ok(None);
     };
 
     if let Some(parent_job_id) = action_run.parent_job_id.as_deref() {
-        if let Some(job) = load_job_by_id(orch, parent_job_id).await? {
+        if let Some(job) = load_job_by_id(db, parent_job_id).await? {
             if job.worktree_path.is_some() && job.base_branch.is_some() {
                 return Ok(Some(job));
             }
@@ -954,12 +998,12 @@ async fn load_merged_job_for_owner(
     }
 
     if let Some(job) =
-        find_context_source_job(orch, &action_run.execution_id, &action_run.recipe_node_id).await?
+        find_context_source_job(db, &action_run.execution_id, &action_run.recipe_node_id).await?
     {
         return Ok(Some(job));
     }
 
-    latest_complete_implementation_job(orch, &action_run.execution_id).await
+    latest_complete_implementation_job(db, &action_run.execution_id).await
 }
 
 #[derive(Debug)]
@@ -969,16 +1013,14 @@ struct ActionRunOwner {
     parent_job_id: Option<String>,
 }
 
-async fn load_job_by_id(orch: &Orchestrator, job_id: &str) -> Result<Option<MergedJob>, String> {
+async fn load_job_by_id(db: &LocalDb, job_id: &str) -> Result<Option<MergedJob>, String> {
     let job_id = job_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let job_id = job_id.clone();
-            Box::pin(async move { load_job_by_id_conn(conn, &job_id).await })
-        })
-        .await
-        .map_err(|error| error.to_string())
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move { load_job_by_id_conn(conn, &job_id).await })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn load_job_by_id_conn(
@@ -1008,59 +1050,55 @@ async fn load_job_by_id_conn(
 }
 
 async fn load_action_run_pr_owner(
-    orch: &Orchestrator,
+    db: &LocalDb,
     owner_id: &str,
 ) -> Result<Option<ActionRunOwner>, String> {
     let owner_id = owner_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let owner_id = owner_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT execution_id, recipe_node_id, parent_job_id
+    db.read(|conn| {
+        let owner_id = owner_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT execution_id, recipe_node_id, parent_job_id
                          FROM action_runs
                          WHERE id = ?1",
-                        params![owner_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        Ok(ActionRunOwner {
-                            execution_id: row.text(0)?,
-                            recipe_node_id: row.text(1)?,
-                            parent_job_id: row.opt_text(2)?,
-                        })
+                    params![owner_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| {
+                    Ok(ActionRunOwner {
+                        execution_id: row.text(0)?,
+                        recipe_node_id: row.text(1)?,
+                        parent_job_id: row.opt_text(2)?,
                     })
-                    .transpose()
-            })
+                })
+                .transpose()
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn find_context_source_job(
-    orch: &Orchestrator,
+    db: &LocalDb,
     execution_id: &str,
     pr_node_id: &str,
 ) -> Result<Option<MergedJob>, String> {
     let execution_id = execution_id.to_string();
     let pr_node_id = pr_node_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let execution_id = execution_id.clone();
-            let pr_node_id = pr_node_id.clone();
-            Box::pin(async move {
-                let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
-                for edge in snapshot.recipe.edges.iter().filter(|edge| {
-                    edge.edge_type.to_string() == "context" && edge.target_node_id == pr_node_id
-                }) {
-                    let mut rows = conn
-                        .query(
-                            "SELECT id, project_id, issue_id, base_branch, worktree_path
+    db.read(|conn| {
+        let execution_id = execution_id.clone();
+        let pr_node_id = pr_node_id.clone();
+        Box::pin(async move {
+            let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
+            for edge in snapshot.recipe.edges.iter().filter(|edge| {
+                edge.edge_type.to_string() == "context" && edge.target_node_id == pr_node_id
+            }) {
+                let mut rows = conn
+                    .query(
+                        "SELECT id, project_id, issue_id, base_branch, worktree_path
                              FROM jobs
                              WHERE execution_id = ?1
                                AND recipe_node_id = ?2
@@ -1069,39 +1107,37 @@ async fn find_context_source_job(
                                AND status <> 'cancelled'
                              ORDER BY created_at DESC
                              LIMIT 1",
-                            params![execution_id.as_str(), edge.source_node_id.as_str()],
-                        )
-                        .await?;
-                    if let Some(row) = rows.next().await? {
-                        return Ok(Some(MergedJob {
-                            id: row.text(0)?,
-                            project_id: row.text(1)?,
-                            issue_id: row.opt_text(2)?,
-                            base_branch: row.opt_text(3)?,
-                            worktree_path: row.opt_text(4)?,
-                        }));
-                    }
+                        params![execution_id.as_str(), edge.source_node_id.as_str()],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    return Ok(Some(MergedJob {
+                        id: row.text(0)?,
+                        project_id: row.text(1)?,
+                        issue_id: row.opt_text(2)?,
+                        base_branch: row.opt_text(3)?,
+                        worktree_path: row.opt_text(4)?,
+                    }));
                 }
-                Ok(None)
-            })
+            }
+            Ok(None)
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn latest_complete_implementation_job(
-    orch: &Orchestrator,
+    db: &LocalDb,
     execution_id: &str,
 ) -> Result<Option<MergedJob>, String> {
     let execution_id = execution_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let execution_id = execution_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id, project_id, issue_id, base_branch, worktree_path
+    db.read(|conn| {
+        let execution_id = execution_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, project_id, issue_id, base_branch, worktree_path
                          FROM jobs
                          WHERE execution_id = ?1
                            AND worktree_path IS NOT NULL
@@ -1109,25 +1145,25 @@ async fn latest_complete_implementation_job(
                            AND status = 'complete'
                          ORDER BY completed_at DESC, updated_at DESC
                          LIMIT 1",
-                        params![execution_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        Ok(MergedJob {
-                            id: row.text(0)?,
-                            project_id: row.text(1)?,
-                            issue_id: row.opt_text(2)?,
-                            base_branch: row.opt_text(3)?,
-                            worktree_path: row.opt_text(4)?,
-                        })
+                    params![execution_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| {
+                    Ok(MergedJob {
+                        id: row.text(0)?,
+                        project_id: row.text(1)?,
+                        issue_id: row.opt_text(2)?,
+                        base_branch: row.opt_text(3)?,
+                        worktree_path: row.opt_text(4)?,
                     })
-                    .transpose()
-            })
+                })
+                .transpose()
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn load_execution_snapshot_conn(
@@ -1155,7 +1191,7 @@ async fn load_execution_snapshot_conn(
 /// not merged/closed): a child whose build job finished but whose PR is awaiting
 /// merge is exactly the sibling that must auto-rebase onto the advanced base.
 async fn load_sibling_jobs(
-    orch: &Orchestrator,
+    db: &LocalDb,
     project_id: &str,
     base_branch: &str,
     merged_job_id: &str,
@@ -1163,16 +1199,14 @@ async fn load_sibling_jobs(
     let project_id = project_id.to_string();
     let base_branch = base_branch.to_string();
     let merged_job_id = merged_job_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let project_id = project_id.clone();
-            let base_branch = base_branch.clone();
-            let merged_job_id = merged_job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT j.id, j.worktree_path, j.branch
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        let base_branch = base_branch.clone();
+        let merged_job_id = merged_job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT j.id, j.worktree_path, j.branch
                          FROM jobs j
                          WHERE j.project_id = ?1
                            AND j.base_branch = ?2
@@ -1185,26 +1219,26 @@ async fn load_sibling_jobs(
                                      AND mr.project_id = j.project_id
                                      AND mr.status NOT IN ('merged', 'closed')
                                  ) )",
-                        params![
-                            project_id.as_str(),
-                            base_branch.as_str(),
-                            merged_job_id.as_str()
-                        ],
-                    )
-                    .await?;
-                let mut siblings = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    siblings.push(SiblingJob {
-                        id: row.text(0)?,
-                        worktree_path: row.text(1)?,
-                        branch: row.opt_text(2)?,
-                    });
-                }
-                Ok(siblings)
-            })
+                    params![
+                        project_id.as_str(),
+                        base_branch.as_str(),
+                        merged_job_id.as_str()
+                    ],
+                )
+                .await?;
+            let mut siblings = Vec::new();
+            while let Some(row) = rows.next().await? {
+                siblings.push(SiblingJob {
+                    id: row.text(0)?,
+                    worktree_path: row.text(1)?,
+                    branch: row.opt_text(2)?,
+                });
+            }
+            Ok(siblings)
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// The active workspace(s) whose `branch` *is* `branch` itself — the Coordinator
@@ -1216,21 +1250,19 @@ async fn load_sibling_jobs(
 /// (still running, or completed with an open PR). Callers dedup by
 /// `worktree_path` for the inheritance fan-out.
 async fn load_on_branch_workspaces(
-    orch: &Orchestrator,
+    db: &LocalDb,
     project_id: &str,
     branch: &str,
 ) -> Result<Vec<SiblingJob>, String> {
     let project_id = project_id.to_string();
     let branch = branch.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let project_id = project_id.clone();
-            let branch = branch.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT j.id, j.worktree_path, j.branch
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        let branch = branch.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT j.id, j.worktree_path, j.branch
                          FROM jobs j
                          WHERE j.project_id = ?1
                            AND j.branch = ?2
@@ -1242,84 +1274,77 @@ async fn load_on_branch_workspaces(
                                      AND mr.project_id = j.project_id
                                      AND mr.status NOT IN ('merged', 'closed')
                                  ) )",
-                        params![project_id.as_str(), branch.as_str()],
-                    )
-                    .await?;
-                let mut workspaces = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    workspaces.push(SiblingJob {
-                        id: row.text(0)?,
-                        worktree_path: row.text(1)?,
-                        branch: row.opt_text(2)?,
-                    });
-                }
-                Ok(workspaces)
-            })
+                    params![project_id.as_str(), branch.as_str()],
+                )
+                .await?;
+            let mut workspaces = Vec::new();
+            while let Some(row) = rows.next().await? {
+                workspaces.push(SiblingJob {
+                    id: row.text(0)?,
+                    worktree_path: row.text(1)?,
+                    branch: row.opt_text(2)?,
+                });
+            }
+            Ok(workspaces)
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn load_merge_request_info(
-    orch: &Orchestrator,
+    db: &LocalDb,
     owner_id: &str,
     implementation_job_id: &str,
 ) -> Result<Option<MergeRequestInfo>, String> {
     let owner_id = owner_id.to_string();
     let implementation_job_id = implementation_job_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let owner_id = owner_id.clone();
-            let implementation_job_id = implementation_job_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT github_pr_number
+    db.read(|conn| {
+        let owner_id = owner_id.clone();
+        let implementation_job_id = implementation_job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT github_pr_number
                          FROM merge_requests
                          WHERE job_id = ?1 OR job_id = ?2
                          ORDER BY CASE WHEN job_id = ?1 THEN 0 ELSE 1 END
                          LIMIT 1",
-                        params![owner_id.as_str(), implementation_job_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        Ok(MergeRequestInfo {
-                            pr_number: row.opt_i64(0)?,
-                        })
+                    params![owner_id.as_str(), implementation_job_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| {
+                    Ok(MergeRequestInfo {
+                        pr_number: row.opt_i64(0)?,
                     })
-                    .transpose()
-            })
+                })
+                .transpose()
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// The git-backed checkout path for a project (the source of the jj-managed
 /// signal and the anchor for the shared jj store).
-async fn load_project_repo_path(
-    orch: &Orchestrator,
-    project_id: &str,
-) -> Result<Option<String>, String> {
+async fn load_project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<String>, String> {
     let project_id = project_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let project_id = project_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT repo_path FROM projects WHERE id = ?1",
-                        params![project_id.as_str()],
-                    )
-                    .await?;
-                rows.next().await?.map(|row| row.text(0)).transpose()
-            })
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT repo_path FROM projects WHERE id = ?1",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            rows.next().await?.map(|row| row.text(0)).transpose()
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Projects eligible for startup default-advance catch-up: those with a local git
@@ -1328,63 +1353,65 @@ async fn load_project_repo_path(
 /// skip and cloud-only projects never enter the path.
 async fn load_projects_for_default_reconcile(
     orch: &Orchestrator,
-) -> Result<Vec<DefaultReconcileProject>, String> {
-    orch.db
-        .local
-        .read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id, repo_path, default_branch FROM projects
+) -> Result<Vec<(Arc<LocalDb>, DefaultReconcileProject)>, String> {
+    let mut all_projects = Vec::new();
+    for db in orch.db.all_dbs().await {
+        let mut projects = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT id, repo_path, default_branch FROM projects
                          WHERE repo_path IS NOT NULL AND repo_path != ''
                            AND default_branch IS NOT NULL AND default_branch != ''",
-                        (),
-                    )
-                    .await?;
-                let mut projects = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    projects.push(DefaultReconcileProject {
-                        id: row.text(0)?,
-                        repo_path: row.text(1)?,
-                        default_branch: row.text(2)?,
-                    });
-                }
-                Ok(projects)
+                            (),
+                        )
+                        .await?;
+                    let mut projects = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        projects.push(DefaultReconcileProject {
+                            id: row.text(0)?,
+                            repo_path: row.text(1)?,
+                            default_branch: row.text(2)?,
+                        });
+                    }
+                    Ok(projects)
+                })
             })
-        })
-        .await
-        .map_err(|error| error.to_string())
+            .await
+            .map_err(|error| error.to_string())?;
+        all_projects.extend(projects.drain(..).map(|project| (db.clone(), project)));
+    }
+    Ok(all_projects)
 }
 
-async fn load_issue_info(orch: &Orchestrator, issue_id: &str) -> Result<Option<IssueInfo>, String> {
+async fn load_issue_info(db: &LocalDb, issue_id: &str) -> Result<Option<IssueInfo>, String> {
     let issue_id = issue_id.to_string();
-    orch.db
-        .local
-        .read(|conn| {
-            let issue_id = issue_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT p.key, i.number
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT p.key, i.number
                          FROM issues i
                          JOIN projects p ON p.id = i.project_id
                          WHERE i.id = ?1",
-                        params![issue_id.as_str()],
-                    )
-                    .await?;
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        Ok(IssueInfo {
-                            project_key: row.text(0)?,
-                            number: row.i64(1)?,
-                        })
+                    params![issue_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .map(|row| {
+                    Ok(IssueInfo {
+                        project_key: row.text(0)?,
+                        number: row.i64(1)?,
                     })
-                    .transpose()
-            })
+                })
+                .transpose()
         })
-        .await
-        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1471,6 +1498,71 @@ mod tests {
         .unwrap();
     }
 
+    async fn migrated_team_db(path: &Path) -> Arc<LocalDb> {
+        let db = Arc::new(LocalDb::open(path).await.unwrap());
+        crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn seed_team_base_advance_notification_fixture(
+        db: &LocalDb,
+        team_id: &str,
+        job_id: &str,
+        run_id: &str,
+    ) {
+        let project_id = format!("{team_id}~00000000-0000-4000-8000-200000000001");
+        let issue_id = format!("{team_id}~00000000-0000-4000-8000-200000000002");
+        let execution_id = format!("{team_id}~00000000-0000-4000-8000-200000000003");
+        db.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES (?1, 'default', 'Team Project', 'TEAM', '/repo/team', 'main', 1, 1)",
+            params![project_id.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES (?1, ?2, 9, 'Team Issue', 'active', 1, 1)",
+            params![issue_id.as_str(), project_id.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES (?1, 'recipe-default', ?2, ?3, 'running', 1, 1)",
+            params![
+                execution_id.as_str(),
+                issue_id.as_str(),
+                project_id.as_str()
+            ],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, base_branch, uri_segment, created_at, updated_at)
+             VALUES (?1, ?2, 'node', ?3, ?4, 'running', '/wt/team-overlap', 'agent/TEAM-9-builder-0', 'integration', 'builder', 1, 1)",
+            params![job_id, execution_id.as_str(), issue_id.as_str(), project_id.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'live', 1, 1)",
+            params![run_id, issue_id.as_str(), project_id.as_str(), job_id],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn message_count(db: &LocalDb) -> i64 {
+        db.query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
+            .await
+            .unwrap()
+    }
+
     #[test]
     fn jj_conflict_note_carries_no_rebase_commands() {
         let issue = IssueInfo {
@@ -1525,7 +1617,7 @@ mod tests {
         .unwrap();
         let orch = test_orchestrator(db, MockGitClient::new());
 
-        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", "job-merged")
+        let siblings = load_sibling_jobs(&orch.db.local, "proj-1", "integration", "job-merged")
             .await
             .unwrap();
         let ids: std::collections::HashSet<&str> = siblings.iter().map(|s| s.id.as_str()).collect();
@@ -1568,7 +1660,7 @@ mod tests {
         .unwrap();
         let orch = test_orchestrator(db, MockGitClient::new());
 
-        let on_branch = load_on_branch_workspaces(&orch, "proj-1", "integration")
+        let on_branch = load_on_branch_workspaces(&orch.db.local, "proj-1", "integration")
             .await
             .unwrap();
         let on_ids: std::collections::HashSet<&str> =
@@ -1584,7 +1676,7 @@ mod tests {
         );
 
         // The sibling query (branches based ON integration) must NOT include it.
-        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", "job-merged")
+        let siblings = load_sibling_jobs(&orch.db.local, "proj-1", "integration", "job-merged")
             .await
             .unwrap();
         let sib_ids: std::collections::HashSet<&str> =
@@ -1632,7 +1724,7 @@ mod tests {
         seed_base_advance_fixture(&db).await;
         let orch = test_orchestrator(db, MockGitClient::new());
 
-        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", "job-merged")
+        let siblings = load_sibling_jobs(&orch.db.local, "proj-1", "integration", "job-merged")
             .await
             .unwrap();
         let ids: std::collections::HashSet<&str> = siblings.iter().map(|s| s.id.as_str()).collect();
@@ -1651,7 +1743,7 @@ mod tests {
         // An external default-branch advance has no merged job to exclude, so the
         // sentinel excludes nothing. Every in-flight sibling on the branch is a
         // reconcile candidate; a completed job without an open PR is still out.
-        let siblings = load_sibling_jobs(&orch, "proj-1", "integration", EXCLUDE_NONE)
+        let siblings = load_sibling_jobs(&orch.db.local, "proj-1", "integration", EXCLUDE_NONE)
             .await
             .unwrap();
         let ids: std::collections::HashSet<&str> = siblings.iter().map(|s| s.id.as_str()).collect();
@@ -1770,7 +1862,15 @@ mod tests {
             vec!["shared.rs".to_string(), "lib.rs".to_string()],
         );
 
-        notify_conflicted_siblings(&orch, &siblings, &conflicted, &note, &files_by_branch).unwrap();
+        notify_conflicted_siblings(
+            &orch,
+            &orch.db.local,
+            &siblings,
+            &conflicted,
+            &note,
+            &files_by_branch,
+        )
+        .unwrap();
 
         // Only the conflicted sibling receives a message, and that message names
         // the conflicting files threaded through from `files_by_branch`.
@@ -1839,6 +1939,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn team_conflicted_sibling_notification_lands_in_team_replica() {
+        let private = migrated_db().await;
+        let orch = test_orchestrator(private, MockGitClient::new());
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teambase";
+        let team_db = migrated_team_db(&team_temp.path().join("team-base-test.db")).await;
+        let job_id = "teambase~00000000-0000-4000-8000-200000000010";
+        let run_id = "teambase~00000000-0000-4000-8000-200000000011";
+        seed_team_base_advance_notification_fixture(&team_db, team_id, job_id, run_id).await;
+        orch.db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+
+        let siblings = vec![SiblingJob {
+            id: job_id.to_string(),
+            worktree_path: "/wt/team-overlap".to_string(),
+            branch: Some("agent/TEAM-9-builder-0".to_string()),
+        }];
+        let conflicted = vec!["agent/TEAM-9-builder-0".to_string()];
+        let note = build_jj_conflict_note("integration", Some(42), None);
+        let mut files_by_branch: HashMap<String, Vec<String>> = HashMap::new();
+        files_by_branch.insert(
+            "agent/TEAM-9-builder-0".to_string(),
+            vec!["team.rs".to_string()],
+        );
+
+        notify_conflicted_siblings(
+            &orch,
+            &team_db,
+            &siblings,
+            &conflicted,
+            &note,
+            &files_by_branch,
+        )
+        .unwrap();
+
+        assert_eq!(
+            message_count(&team_db).await,
+            1,
+            "the base-advance direct message must be written to the team replica"
+        );
+        assert_eq!(
+            message_count(&orch.db.local).await,
+            0,
+            "a team base-advance notification must not fall back to the private database"
+        );
+        let wake: String = team_db
+            .query_one(
+                "SELECT wake FROM attention_pushes WHERE recipient = ?1",
+                params![job_id],
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wake, "interrupt");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn ambiguous_divergence_interrupts_only_the_affected_sibling() {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
@@ -1862,7 +2020,7 @@ mod tests {
             twins: vec!["aaaa1111".to_string(), "bbbb2222".to_string()],
         }];
 
-        notify_ambiguous_divergence(&orch, &siblings, &ambiguous).unwrap();
+        notify_ambiguous_divergence(&orch, &orch.db.local, &siblings, &ambiguous).unwrap();
 
         // Only the ambiguous sibling is messaged, and the note names the
         // change-id, both twin commit ids, and the no-force-push instruction.
@@ -1943,7 +2101,7 @@ mod tests {
         let clean = vec!["agent/PROJ-3-builder-0".to_string()];
         let note = build_jj_clean_note("integration", Some(42), None);
 
-        notify_clean_siblings(&orch, &siblings, &clean, &note).unwrap();
+        notify_clean_siblings(&orch, &orch.db.local, &siblings, &clean, &note).unwrap();
 
         // (a) the cleanly-rebased sibling receives a direct note.
         let recipients: Vec<String> = orch
@@ -2058,8 +2216,10 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
 
         let projects = load_projects_for_default_reconcile(&orch).await.unwrap();
-        let ids: std::collections::HashSet<&str> =
-            projects.iter().map(|project| project.id.as_str()).collect();
+        let ids: std::collections::HashSet<&str> = projects
+            .iter()
+            .map(|(_, project)| project.id.as_str())
+            .collect();
 
         assert!(
             ids.contains("p-ok"),
@@ -2075,14 +2235,14 @@ mod tests {
         );
         let ok = projects
             .iter()
-            .find(|project| project.id == "p-ok")
+            .find(|(_, project)| project.id == "p-ok")
             .unwrap();
         assert_eq!(
-            ok.repo_path, "/repo/ok",
+            ok.1.repo_path, "/repo/ok",
             "the repository path is returned for live remote detection"
         );
         assert_eq!(
-            ok.default_branch, "main",
+            ok.1.default_branch, "main",
             "the default branch is returned alongside the id"
         );
     }

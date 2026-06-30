@@ -376,6 +376,9 @@ pub async fn create_routed(
     };
     let project = create(&target_db, clock, input, projects_dir).await?;
     insert_project_route(&dbs.local, clock, &key, team_id.as_deref()).await?;
+    if team_id.is_some() && !project.repo_path.is_empty() {
+        set_local_repo_path(&dbs.local, &key, Path::new(&project.repo_path)).await?;
+    }
     dbs.set_route(&key, team_id).await;
     Ok((project, target_db))
 }
@@ -394,6 +397,90 @@ pub async fn create_routed(
 /// class).
 pub async fn owning_db(dbs: &crate::db::DbState, id: &str) -> Result<Arc<LocalDb>, CairnError> {
     crate::execution::routing::routing_db_for_id(dbs, id).await
+}
+
+/// Effective local repository path for a project on this machine.
+///
+/// Local projects keep using `projects.repo_path`. Team projects resolve through
+/// the private `project_routes.local_repo_path`, because the synced
+/// `projects.repo_path` belongs to the creator's machine and must not be
+/// overwritten by teammates.
+pub async fn resolve_local_repo_path(
+    dbs: &crate::db::DbState,
+    project_id: &str,
+    project_key: &str,
+    synced_repo_path: &str,
+) -> Result<Option<String>, CairnError> {
+    match ids::parse_route_scope(project_id) {
+        Ok(ids::RouteScope::Local) => Ok(Some(synced_repo_path.to_string())),
+        Ok(ids::RouteScope::Team(_)) => local_repo_path(&dbs.local, project_key).await,
+        Err(error) => Err(CairnError::Internal(format!("invalid project id: {error}"))),
+    }
+}
+
+/// Resolve a project's effective local repository path and key by id.
+pub async fn resolve_local_repo_path_and_key(
+    dbs: &crate::db::DbState,
+    project_id: &str,
+) -> Result<(Option<String>, String), CairnError> {
+    let db = owning_db(dbs, project_id).await?;
+    let project = get_db(&db, project_id)
+        .await?
+        .ok_or_else(|| CairnError::NotFound {
+            entity: "project",
+            id: project_id.to_string(),
+        })?;
+    let local_path =
+        resolve_local_repo_path(dbs, &project.id, &project.key, &project.repo_path).await?;
+    Ok((local_path, project.key))
+}
+
+pub async fn local_repo_path(
+    private_db: &LocalDb,
+    project_key: &str,
+) -> Result<Option<String>, CairnError> {
+    let key = project_key.to_uppercase();
+    private_db
+        .query_opt_text(
+            "SELECT local_repo_path FROM project_routes WHERE project_key = ?1",
+            (key,),
+        )
+        .await
+        .map_err(CairnError::from)
+}
+
+pub async fn set_local_repo_path(
+    private_db: &LocalDb,
+    project_key: &str,
+    path: &Path,
+) -> Result<(), CairnError> {
+    let key = project_key.to_uppercase();
+    let path = path.to_string_lossy().to_string();
+    private_db
+        .execute(
+            "UPDATE project_routes SET local_repo_path = ?1 WHERE project_key = ?2",
+            (path, key),
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn remote_url(db: &LocalDb, id: &str) -> Result<Option<String>, CairnError> {
+    let id = id.to_string();
+    db.query_opt_text("SELECT remote_url FROM projects WHERE id = ?1", (id,))
+        .await
+        .map_err(CairnError::from)
+}
+
+pub async fn set_remote_url_db(db: &LocalDb, id: &str, remote_url: &str) -> Result<(), CairnError> {
+    let id = id.to_string();
+    let remote_url = remote_url.to_string();
+    db.execute(
+        "UPDATE projects SET remote_url = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
+        (remote_url, id),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Record a project's routing target in the PRIVATE database's `project_routes`
@@ -794,6 +881,64 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&status.stdout).trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_local_repo_path_uses_synced_path_for_local_projects() {
+        let local = Arc::new(migrated_db().await);
+        let index = Arc::new(
+            crate::storage::SearchIndex::open_or_create(tempdir().unwrap().keep()).unwrap(),
+        );
+        let dbs = crate::db::DbState::new(local, index);
+
+        let path = resolve_local_repo_path(&dbs, "local-project", "PRJ", "/repo/local")
+            .await
+            .unwrap();
+
+        assert_eq!(path.as_deref(), Some("/repo/local"));
+    }
+
+    #[tokio::test]
+    async fn resolve_local_repo_path_uses_private_route_for_team_projects() {
+        let local = Arc::new(migrated_db().await);
+        let index = Arc::new(
+            crate::storage::SearchIndex::open_or_create(tempdir().unwrap().keep()).unwrap(),
+        );
+        let dbs = crate::db::DbState::new(local.clone(), index);
+        local
+            .execute(
+                "INSERT INTO teams(id, name, sync_url, replica_path, created_at) VALUES ('teamABC123', 'Team', 'http://sync', '/tmp/team.db', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        insert_project_route(&local, &FixedClock, "PRJ", Some("teamABC123"))
+            .await
+            .unwrap();
+
+        let missing = resolve_local_repo_path(
+            &dbs,
+            "teamABC123~00000000-0000-4000-8000-000000000001",
+            "prj",
+            "/creator/repo",
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing, None);
+
+        set_local_repo_path(&local, "prj", Path::new("/member/repo"))
+            .await
+            .unwrap();
+        let resolved = resolve_local_repo_path(
+            &dbs,
+            "teamABC123~00000000-0000-4000-8000-000000000001",
+            "PRJ",
+            "/creator/repo",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("/member/repo"));
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
@@ -211,6 +211,11 @@ impl DbState {
         self.teams.read().await.get(team_id).cloned()
     }
 
+    #[cfg(test)]
+    pub async fn register_team_db_for_test(&self, team_id: TeamId, db: Arc<LocalDb>) {
+        self.teams.write().await.insert(team_id, db);
+    }
+
     /// Opens (or returns the already-open) synced replica for a team, running
     /// `TEAM_MIGRATIONS` once when the replica is newly created.
     ///
@@ -291,6 +296,7 @@ impl DbState {
             db.set_team_context(TeamReplicaContext {
                 team_id: cfg.team_id.clone(),
                 store: factory.store_for(&cfg.team_id),
+                private_db: Some(self.local.clone()),
             });
         }
         let db = Arc::new(db);
@@ -563,13 +569,24 @@ async fn reconcile_team_routes(
     routes: &RwLock<RouteMap>,
     team_id: &TeamId,
 ) -> DbResult<usize> {
-    let projects = crate::projects::crud::list_db(team_db)
-        .await
-        .map_err(|e| DbError::internal(format!("reconcile list_db: {e}")))?;
+    let projects = team_db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT key, repo_path FROM projects", ())
+                    .await?;
+                let mut projects = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    projects.push((row.text(0)?, row.text(1)?));
+                }
+                Ok(projects)
+            })
+        })
+        .await?;
     let now = chrono::Utc::now().timestamp();
     let mut added = 0;
-    for project in projects {
-        let key = project.key.to_uppercase();
+    for (project_key, repo_path) in projects {
+        let key = project_key.to_uppercase();
         local
             .execute(
                 "INSERT OR IGNORE INTO project_routes(project_key, team_id, created_at)
@@ -577,10 +594,24 @@ async fn reconcile_team_routes(
                 (key.clone(), team_id.clone(), now),
             )
             .await?;
+        if !repo_path.is_empty() && path_is_git_repo(Path::new(&repo_path)) {
+            local
+                .execute(
+                    "UPDATE project_routes
+                     SET local_repo_path = ?1
+                     WHERE project_key = ?2 AND local_repo_path IS NULL",
+                    (repo_path.clone(), key.clone()),
+                )
+                .await?;
+        }
         routes.write().await.insert(key, Some(team_id.clone()));
         added += 1;
     }
     Ok(added)
+}
+
+fn path_is_git_repo(path: &Path) -> bool {
+    path.join(".git").exists() || path.join("objects").is_dir()
 }
 
 /// The [`RouteReconcile`] the per-team pull task invokes after applying remote
@@ -675,6 +706,16 @@ mod tests {
         DbState::new(local, index)
     }
 
+    async fn migrated_team_db(name: &str) -> LocalDb {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.keep().join(name)).await.unwrap();
+        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
     /// An unrouted (local) project mints bare ids, so local installs are
     /// byte-for-byte unchanged by the self-routing id format.
     #[tokio::test(flavor = "current_thread")]
@@ -706,6 +747,57 @@ mod tests {
         assert_eq!(
             id.route_scope(),
             Ok(RouteScope::Team("teamABC123".to_string()))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_team_routes_backfills_local_repo_path_when_creator_repo_exists() {
+        let dbs = db_state("db-bridge-route-backfill.db").await;
+        let team_db = migrated_team_db("db-bridge-route-backfill-team.db").await;
+        let repo = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        let repo_path = repo.path().to_string_lossy().to_string();
+
+        team_db
+            .execute_script(&format!(
+                "
+                INSERT INTO teams(id, name, created_at, updated_at) VALUES ('teamABC123', 'Team', 1, 1);
+                INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('teamABC123~00000000-0000-4000-8000-000000000001', 'teamABC123', 'Project', 'Legacy', '{}', 1, 1);
+                ",
+                repo_path.replace('\'', "''")
+            ))
+            .await
+            .unwrap();
+
+        dbs.local
+            .execute(
+                "INSERT INTO teams(id, name, sync_url, replica_path, created_at) VALUES ('teamABC123', 'Team', 'http://sync', '/tmp/team.db', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        reconcile_team_routes(&dbs.local, &team_db, &dbs.routes, &"teamABC123".to_string())
+            .await
+            .unwrap();
+
+        let stored = dbs
+            .local
+            .query_opt_text(
+                "SELECT local_repo_path FROM project_routes WHERE project_key = 'LEGACY'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some(repo_path.as_str()));
+        assert_eq!(
+            dbs.route_scope_for_project("legacy").await,
+            RouteScope::Team("teamABC123".to_string())
         );
     }
 

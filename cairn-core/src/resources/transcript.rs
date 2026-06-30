@@ -43,6 +43,7 @@ pub(super) async fn load_job_events_ordered(
     conn: &turso::Connection,
     job_id: &str,
     store: Option<&dyn crate::archival::store::ContentStore>,
+    private_route_db: Option<&crate::storage::LocalDb>,
 ) -> Vec<EventRow> {
     // 1. Load run_ids ordered by creation time
     let mut ordered_run_ids: Vec<String> = Vec::new();
@@ -87,24 +88,30 @@ pub(super) async fn load_job_events_ordered(
         }
     }
 
-    crate::archival::reconstruct::reconstruct_events_with_conn(conn, events, store)
-        .await
-        .into_iter()
-        .map(|event| EventRow {
-            run_id: event.run_id,
-            sequence: event.sequence,
-            event_type: event.event_type,
-            data: event.data,
-            turn_id: event.turn_id,
-            created_at: event.created_at,
-        })
-        .collect()
+    crate::archival::reconstruct::reconstruct_events_with_conn_and_routes(
+        conn,
+        events,
+        store,
+        private_route_db,
+    )
+    .await
+    .into_iter()
+    .map(|event| EventRow {
+        run_id: event.run_id,
+        sequence: event.sequence,
+        event_type: event.event_type,
+        data: event.data,
+        turn_id: event.turn_id,
+        created_at: event.created_at,
+    })
+    .collect()
 }
 
 pub(super) async fn load_turn_events(
     conn: &turso::Connection,
     turn_id: &str,
     store: Option<&dyn crate::archival::store::ContentStore>,
+    private_route_db: Option<&crate::storage::LocalDb>,
 ) -> Vec<(String, i32, String, String)> {
     let columns = crate::runs::queries::EVENT_COLUMNS;
     let sql = format!("SELECT {columns} FROM events WHERE turn_id = ?1 ORDER BY sequence ASC");
@@ -116,11 +123,16 @@ pub(super) async fn load_turn_events(
             }
         }
     }
-    crate::archival::reconstruct::reconstruct_events_with_conn(conn, events, store)
-        .await
-        .into_iter()
-        .map(|event| (event.run_id, event.sequence, event.event_type, event.data))
-        .collect()
+    crate::archival::reconstruct::reconstruct_events_with_conn_and_routes(
+        conn,
+        events,
+        store,
+        private_route_db,
+    )
+    .await
+    .into_iter()
+    .map(|event| (event.run_id, event.sequence, event.event_type, event.data))
+    .collect()
 }
 
 /// Get the Nth run for a job (1-indexed)
@@ -156,6 +168,7 @@ pub(super) async fn get_single_event(
     run_id: &str,
     event_seq: i32,
     store: Option<&dyn crate::archival::store::ContentStore>,
+    private_route_db: Option<&crate::storage::LocalDb>,
 ) -> String {
     let columns = crate::runs::queries::EVENT_COLUMNS;
     let sql = format!(
@@ -184,8 +197,13 @@ pub(super) async fn get_single_event(
         return format!("Event with sequence {} not found", event_seq);
     };
 
-    let mut events =
-        crate::archival::reconstruct::reconstruct_events_with_conn(conn, vec![event], store).await;
+    let mut events = crate::archival::reconstruct::reconstruct_events_with_conn_and_routes(
+        conn,
+        vec![event],
+        store,
+        private_route_db,
+    )
+    .await;
     let event = events.remove(0);
     let resolved_tool_name =
         resolve_single_event_tool_name(conn, run_id, &event.event_type, &event.data).await;
@@ -1507,7 +1525,7 @@ mod tests {
             .read(|conn| {
                 Box::pin(async move {
                     Ok::<Vec<(String, i32, String, String)>, crate::storage::DbError>(
-                        load_turn_events(conn, "turn-1", None).await,
+                        load_turn_events(conn, "turn-1", None, None).await,
                     )
                 })
             })
@@ -1623,7 +1641,7 @@ mod tests {
         .await
         .unwrap();
 
-        let rendered = get_single_event(&conn, "run-1", 2, None).await;
+        let rendered = get_single_event(&conn, "run-1", 2, None, None).await;
 
         assert!(rendered.contains("**Tool Result (read):**"));
         assert!(rendered.contains("body"));

@@ -31,6 +31,8 @@ use super::position::{EvictionFlush, PositionConfig, PositionEngine, PositionKin
 use super::queries;
 use super::vector;
 use super::vibes::VibeState;
+use crate::db::DbState;
+use crate::execution::routing;
 use crate::services::EventEmitter;
 use crate::storage::LocalDb;
 
@@ -84,7 +86,7 @@ const IDLE_TTL_SECS: u64 = 300;
 pub fn spawn_embed_worker(
     mut rx: UnboundedReceiver<EmbedJob>,
     client: EmbeddingClient,
-    db: Arc<LocalDb>,
+    dbs: Arc<DbState>,
     vibe_state: Option<Arc<VibeState>>,
     emitter: Arc<dyn EventEmitter>,
 ) {
@@ -98,7 +100,7 @@ pub fn spawn_embed_worker(
                 maybe_first = rx.recv() => {
                     let Some(first) = maybe_first else {
                         // Channel closed: final flush of all in-memory state.
-                        apply_flush(&db, engine.drain_all()).await;
+                        apply_flush(&dbs.local, engine.drain_all()).await;
                         break;
                     };
                     let mut batch = vec![first];
@@ -114,17 +116,17 @@ pub fn spawn_embed_worker(
                             }
                         }
                     }
-                    process_batch(&client, &db, vibe_state.as_deref(), &emitter, &mut engine, batch).await;
+                    process_batch(&client, &dbs, vibe_state.as_deref(), &emitter, &mut engine, batch).await;
                     if closed {
-                        apply_flush(&db, engine.drain_all()).await;
+                        apply_flush(&dbs.local, engine.drain_all()).await;
                         break;
                     }
                 }
                 _ = idle.tick() => {
                     // Finalize idle sessions/owners, then upsert summary
                     // centroids for still-active owners on this coarse cadence.
-                    apply_flush(&db, engine.evict_idle(Instant::now(), Duration::from_secs(IDLE_TTL_SECS))).await;
-                    upsert_owner_summaries(&db, engine.take_dirty_owners()).await;
+                    apply_flush(&dbs.local, engine.evict_idle(Instant::now(), Duration::from_secs(IDLE_TTL_SECS))).await;
+                    upsert_owner_summaries(&dbs.local, engine.take_dirty_owners()).await;
                 }
             }
         }
@@ -144,12 +146,13 @@ enum EmbedTarget {
 
 async fn process_batch(
     client: &EmbeddingClient,
-    db: &LocalDb,
+    dbs: &DbState,
     vibe_state: Option<&VibeState>,
     emitter: &Arc<dyn EventEmitter>,
     engine: &mut PositionEngine,
     batch: Vec<EmbedJob>,
 ) {
+    let db = dbs.local.as_ref();
     // Deletes need no embedding — apply them directly.
     let mut targets: Vec<EmbedTarget> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
@@ -198,52 +201,56 @@ async fn process_batch(
                         if should_color(position) {
                             if let Some(vibe_state) = vibe_state {
                                 if let Some(assignment) = vibe_state.assign_one(event_id, vector) {
-                                    if let Err(e) = queries::upsert_event_vibe_async(
-                                        db,
+                                    match persist_event_vibe_for_event(
+                                        dbs,
                                         event_id,
                                         position.as_ref().map(|meta| meta.session_id.as_str()),
                                         &assignment.css_color,
                                         assignment.phase,
                                         assignment.friction,
-                                        COHERE_MODEL,
                                     )
                                     .await
                                     {
-                                        log::warn!(
-                                            "Failed to persist vibe for {}: {}",
-                                            event_id,
-                                            e
-                                        );
-                                    } else {
-                                        let session_id =
-                                            position.as_ref().map(|meta| meta.session_id.as_str());
-                                        let issue_id =
-                                            match queries::issue_id_for_event_async(db, event_id)
-                                                .await
+                                        Err(e) => {
+                                            log::warn!(
+                                                "Failed to persist vibe for {}: {}",
+                                                event_id,
+                                                e
+                                            );
+                                        }
+                                        Ok(event_db) => {
+                                            let session_id = position
+                                                .as_ref()
+                                                .map(|meta| meta.session_id.as_str());
+                                            let issue_id = match queries::issue_id_for_event_async(
+                                                &event_db, event_id,
+                                            )
+                                            .await
                                             {
                                                 Ok(issue_id) => issue_id,
                                                 Err(e) => {
                                                     log::warn!(
-                                                    "Failed to resolve issue id for vibe {}: {}",
-                                                    event_id,
-                                                    e
-                                                );
+                                                        "Failed to resolve issue id for vibe {}: {}",
+                                                        event_id,
+                                                        e
+                                                    );
                                                     None
                                                 }
                                             };
-                                        let _ = emitter.emit(
-                                            "db-change",
-                                            serde_json::json!({
-                                                "table": "event_vibes",
-                                                "action": "upsert",
-                                                "eventId": event_id,
-                                                "event_id": event_id,
-                                                "sessionId": session_id,
-                                                "session_id": session_id,
-                                                "issueId": issue_id,
-                                                "issue_id": issue_id,
-                                            }),
-                                        );
+                                            let _ = emitter.emit(
+                                                "db-change",
+                                                serde_json::json!({
+                                                    "table": "event_vibes",
+                                                    "action": "upsert",
+                                                    "eventId": event_id,
+                                                    "event_id": event_id,
+                                                    "sessionId": session_id,
+                                                    "session_id": session_id,
+                                                    "issueId": issue_id,
+                                                    "issue_id": issue_id,
+                                                }),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -292,6 +299,31 @@ fn should_color(position: &Option<PositionMeta>) -> bool {
         .as_ref()
         .map(|meta| matches!(meta.kind, PositionKind::Agent | PositionKind::User))
         .unwrap_or(true)
+}
+
+async fn persist_event_vibe_for_event(
+    dbs: &DbState,
+    event_id: &str,
+    session_id: Option<&str>,
+    css_color: &str,
+    phase: f32,
+    friction: f32,
+) -> Result<Arc<LocalDb>, String> {
+    let event_db = routing::owning_db_for_event(dbs, event_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    queries::upsert_event_vibe_async(
+        &event_db,
+        event_id,
+        session_id,
+        css_color,
+        phase,
+        friction,
+        COHERE_MODEL,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(event_db)
 }
 
 /// Fold one event vector into the engine, lazily registering the session on
@@ -451,5 +483,56 @@ mod tests {
             PositionKind::Change,
             1.0
         ))));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_vibe_persists_to_team_replica_owner() {
+        use crate::storage::RowExt;
+        use crate::storage::SearchIndex;
+
+        let local = Arc::new(crate::storage::migrated_test_db("worker-vibe-local.db").await);
+        let team = Arc::new(crate::storage::migrated_test_db("worker-vibe-team.db").await);
+        let index =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let dbs = DbState::new(local.clone(), index);
+        dbs.insert_team_db_for_test("team1", team.clone()).await;
+
+        let run_id = "team1~00000000-0000-4000-8000-000000000001";
+        let event_id = "team1~00000000-0000-4000-8000-000000000002";
+        team.execute(
+            "INSERT INTO runs(id, status, session_id, created_at, updated_at)
+             VALUES (?1, 'live', ?2, 1, 1)",
+            (run_id.to_string(), "sess-team".to_string()),
+        )
+        .await
+        .unwrap();
+        team.execute(
+            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+             VALUES (?1, ?2, ?3, 1, 1, 'assistant', '{}', 1)",
+            (
+                event_id.to_string(),
+                run_id.to_string(),
+                "sess-team".to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+
+        persist_event_vibe_for_event(&dbs, event_id, Some("sess-team"), "#123456", 0.25, 0.75)
+            .await
+            .unwrap();
+
+        let count = |db: Arc<LocalDb>| async move {
+            db.query_one(
+                "SELECT COUNT(*) FROM event_vibes WHERE event_id = ?1",
+                (event_id.to_string(),),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(count(team.clone()).await, 1);
+        assert_eq!(count(local.clone()).await, 0);
     }
 }

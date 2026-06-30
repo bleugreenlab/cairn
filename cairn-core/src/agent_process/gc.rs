@@ -14,6 +14,8 @@
 //! the warm process with the lowest relevance score is evicted.
 
 use crate::agent_process::process::AgentProcessState;
+use crate::db::DbState;
+use crate::execution::routing::routing_db_for_id;
 use crate::storage::{LocalDb, RowExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -180,7 +182,7 @@ impl WarmProcessGC {
     pub async fn find_eviction_candidate(
         &self,
         process_state: &AgentProcessState,
-        db: &LocalDb,
+        dbs: &DbState,
     ) -> Option<String> {
         let warm_count = process_state.warm_process_count();
         if warm_count < self.max_warm {
@@ -204,7 +206,7 @@ impl WarmProcessGC {
             return None;
         }
 
-        let metadata = self.load_relevance_metadata(db, &warm_processes).await;
+        let metadata = self.load_relevance_metadata(dbs, &warm_processes).await;
 
         // Score each warm process
         let mut scored: Vec<(String, i32)> = Vec::new();
@@ -217,6 +219,19 @@ impl WarmProcessGC {
             // session), but it forces a costly full reload and, until the resume
             // fires, the parent has no live process. Never evict a parent with
             // active children: it is not an eviction target at all.
+            if metadata.unresolved_run_ids.contains(run_id)
+                || job_id
+                    .as_ref()
+                    .map(|jid| metadata.unresolved_job_ids.contains(jid))
+                    .unwrap_or(false)
+            {
+                log::debug!(
+                    "GC: run {} protected (owning database unresolved), not an eviction target",
+                    &run_id[..run_id.len().min(8)]
+                );
+                continue;
+            }
+
             let has_active_children = job_id
                 .as_ref()
                 .map(|jid| metadata.parents_with_active_children.contains(jid))
@@ -284,7 +299,7 @@ impl WarmProcessGC {
 
     async fn load_relevance_metadata(
         &self,
-        db: &LocalDb,
+        dbs: &DbState,
         warm_processes: &[(String, u64, Option<String>)],
     ) -> RelevanceMetadata {
         let run_ids: Vec<String> = warm_processes
@@ -298,75 +313,76 @@ impl WarmProcessGC {
             .into_iter()
             .collect();
 
-        db.read(move |conn| {
-            Box::pin(async move {
-                let mut session_ids = HashMap::new();
-                for run_id in run_ids {
-                    let mut rows = conn
-                        .query(
-                            "SELECT session_id
-                             FROM runs
-                             WHERE id = ?1",
-                            (run_id.as_str(),),
-                        )
-                        .await?;
-                    let session_id = match rows.next().await? {
-                        Some(row) => row.opt_text(0)?,
-                        None => None,
-                    };
-                    session_ids.insert(run_id, session_id);
-                }
+        let mut metadata = RelevanceMetadata::default();
 
-                let mut job_statuses = HashMap::new();
-                let mut parents_with_active_children = HashSet::new();
-                let mut jobs_with_pending_memory_review = HashSet::new();
-                for job_id in job_ids {
-                    let mut rows = conn
-                        .query(
-                            "SELECT status, memory_review_state
-                             FROM jobs
-                             WHERE id = ?1",
-                            (job_id.as_str(),),
-                        )
-                        .await?;
-                    if let Some(row) = rows.next().await? {
-                        job_statuses.insert(job_id.clone(), row.text(0)?);
-                        if row.opt_text(1)?.as_deref() == Some("sent") {
-                            jobs_with_pending_memory_review.insert(job_id.clone());
+        for run_id in run_ids {
+            let db = match routing_db_for_id(dbs, &run_id).await {
+                Ok(db) => db,
+                Err(error) => {
+                    log::warn!(
+                        "GC: failed to route run {run_id} for relevance metadata: {error}; protecting it from eviction"
+                    );
+                    metadata.unresolved_run_ids.insert(run_id);
+                    continue;
+                }
+            };
+            match load_session_id_for_run(&db, &run_id).await {
+                Ok(session_id) => {
+                    metadata.session_ids.insert(run_id, session_id);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "GC: failed to load session metadata for run {run_id}: {error}; protecting it from eviction"
+                    );
+                    metadata.unresolved_run_ids.insert(run_id);
+                }
+            }
+        }
+
+        for job_id in job_ids {
+            let db = match routing_db_for_id(dbs, &job_id).await {
+                Ok(db) => db,
+                Err(error) => {
+                    log::warn!(
+                        "GC: failed to route job {job_id} for relevance metadata: {error}; protecting it from eviction"
+                    );
+                    metadata.unresolved_job_ids.insert(job_id);
+                    continue;
+                }
+            };
+            match load_job_relevance(&db, &job_id).await {
+                Ok(job) => {
+                    if let Some((status, memory_review_state)) = job {
+                        metadata.job_statuses.insert(job_id.clone(), status);
+                        if memory_review_state.as_deref() == Some("sent") {
+                            metadata
+                                .jobs_with_pending_memory_review
+                                .insert(job_id.clone());
                         }
                     }
-
-                    // A parent is protected from eviction while any of its
-                    // delegated children is non-terminal (not complete/failed).
-                    let mut child_rows = conn
-                        .query(
-                            "SELECT 1
-                             FROM jobs
-                             WHERE parent_job_id = ?1
-                               AND status NOT IN ('complete', 'failed')
-                             LIMIT 1",
-                            (job_id.as_str(),),
-                        )
-                        .await?;
-                    if child_rows.next().await?.is_some() {
-                        parents_with_active_children.insert(job_id);
+                    match parent_has_active_children(&db, &job_id).await {
+                        Ok(true) => {
+                            metadata.parents_with_active_children.insert(job_id);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            log::warn!(
+                                "GC: failed to load child metadata for job {job_id}: {error}; protecting it from eviction"
+                            );
+                            metadata.unresolved_job_ids.insert(job_id);
+                        }
                     }
                 }
+                Err(error) => {
+                    log::warn!(
+                        "GC: failed to load job metadata for job {job_id}: {error}; protecting it from eviction"
+                    );
+                    metadata.unresolved_job_ids.insert(job_id);
+                }
+            }
+        }
 
-                Ok(RelevanceMetadata {
-                    session_ids,
-                    job_statuses,
-                    parents_with_active_children,
-                    jobs_with_pending_memory_review,
-                })
-            })
-        })
-        .await
-        .map_err(|error| {
-            log::warn!("GC: failed to load relevance metadata: {}", error);
-            error
-        })
-        .unwrap_or_default()
+        metadata
     }
 
     /// Get current statistics
@@ -397,6 +413,77 @@ impl WarmProcessGC {
     }
 }
 
+async fn load_session_id_for_run(
+    db: &LocalDb,
+    run_id: &str,
+) -> Result<Option<String>, crate::storage::DbError> {
+    let run_id = run_id.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT session_id
+                     FROM runs
+                     WHERE id = ?1",
+                    (run_id.as_str(),),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => row.opt_text(0),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+}
+
+async fn load_job_relevance(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<(String, Option<String>)>, crate::storage::DbError> {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT status, memory_review_state
+                     FROM jobs
+                     WHERE id = ?1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some((row.text(0)?, row.opt_text(1)?))),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+}
+
+async fn parent_has_active_children(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<bool, crate::storage::DbError> {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut child_rows = conn
+                .query(
+                    "SELECT 1
+                     FROM jobs
+                     WHERE parent_job_id = ?1
+                       AND status NOT IN ('complete', 'failed')
+                     LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            Ok(child_rows.next().await?.is_some())
+        })
+    })
+    .await
+}
+
 #[derive(Debug, Default)]
 struct RelevanceMetadata {
     session_ids: HashMap<String, Option<String>>,
@@ -409,6 +496,12 @@ struct RelevanceMetadata {
     /// completed. These runs must stay warm so flush-on-idle can deliver the
     /// review prompt.
     jobs_with_pending_memory_review: HashSet<String>,
+    /// Run IDs whose owning database could not be resolved or queried. GC treats
+    /// them as protected because their relevance/protection state is unknown.
+    unresolved_run_ids: HashSet<String>,
+    /// Job IDs whose owning database could not be resolved or queried. GC treats
+    /// them as protected because their active-child or memory-review state is unknown.
+    unresolved_job_ids: HashSet<String>,
 }
 
 /// Statistics about the GC state
@@ -424,11 +517,13 @@ pub struct GCStats {
 mod tests {
     use super::*;
     use crate::agent_process::process::{AgentProcessState, RunHandle};
+    use crate::storage::SearchIndex;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
-    async fn test_db() -> (TempDir, LocalDb) {
+    async fn test_db() -> (TempDir, Arc<LocalDb>) {
         let temp = tempfile::tempdir().unwrap();
-        let db = LocalDb::open(temp.path().join("gc-test.db")).await.unwrap();
+        let db = Arc::new(LocalDb::open(temp.path().join("gc-test.db")).await.unwrap());
         db.execute_batch(
             "
             CREATE TABLE jobs (
@@ -448,6 +543,13 @@ mod tests {
         .unwrap();
 
         (temp, db)
+    }
+
+    fn test_db_state(temp: &TempDir, db: Arc<LocalDb>) -> DbState {
+        DbState::new(
+            db,
+            Arc::new(SearchIndex::open_or_create(temp.path().join("search-index.db")).unwrap()),
+        )
     }
 
     async fn insert_job(db: &LocalDb, id: &str, status: &str) {
@@ -562,8 +664,9 @@ mod tests {
             );
         }
 
+        let dbs = test_db_state(&_temp, db.clone());
         assert_eq!(
-            gc.find_eviction_candidate(&state, &db).await.as_deref(),
+            gc.find_eviction_candidate(&state, &dbs).await.as_deref(),
             Some("run-evict")
         );
     }
@@ -595,9 +698,71 @@ mod tests {
 
         // The protected parent is skipped, so the (higher-scoring) sibling is
         // evicted instead.
+        let dbs = test_db_state(&_temp, db.clone());
         assert_eq!(
-            gc.find_eviction_candidate(&state, &db).await.as_deref(),
+            gc.find_eviction_candidate(&state, &dbs).await.as_deref(),
             Some("run-other")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_team_parent_with_active_children_is_not_evicted() {
+        let (_temp, private) = test_db().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_db = Arc::new(
+            LocalDb::open(team_temp.path().join("team-gc-test.db"))
+                .await
+                .unwrap(),
+        );
+        team_db
+            .execute_batch(
+                "
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    status TEXT NOT NULL,
+                    parent_job_id TEXT,
+                    memory_review_state TEXT
+                );
+
+                CREATE TABLE runs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT
+                );
+                ",
+            )
+            .await
+            .unwrap();
+        let team = "teamgc";
+        let parent = "teamgc~00000000-0000-4000-8000-000000000001";
+        let child = "teamgc~00000000-0000-4000-8000-000000000002";
+        let other_job = "job-other";
+        let parent_run = "teamgc~00000000-0000-4000-8000-000000000003";
+        insert_job(&team_db, parent, "running").await;
+        insert_child_job(&team_db, child, "running", parent).await;
+        insert_run(&team_db, parent_run, Some("session-parent")).await;
+        insert_job(&private, other_job, "running").await;
+        insert_run(&private, "run-other", Some("session-other")).await;
+
+        let dbs = test_db_state(&_temp, private.clone());
+        dbs.insert_team_db_for_test(team, team_db.clone()).await;
+        let gc = WarmProcessGC::new(2);
+        let state = AgentProcessState::default();
+        {
+            let mut processes = state.processes.lock().unwrap();
+            processes.register(
+                parent_run.to_string(),
+                warm_handle(Some("session-parent"), Some(parent), 600),
+            );
+            processes.register(
+                "run-other".to_string(),
+                warm_handle(Some("session-other"), Some(other_job), 60),
+            );
+        }
+
+        assert_eq!(
+            gc.find_eviction_candidate(&state, &dbs).await.as_deref(),
+            Some("run-other"),
+            "the team parent is protected by active child metadata loaded from the team replica"
         );
     }
 
@@ -619,8 +784,9 @@ mod tests {
             );
         }
 
+        let dbs = test_db_state(&_temp, db.clone());
         assert_eq!(
-            gc.find_eviction_candidate(&state, &db).await.as_deref(),
+            gc.find_eviction_candidate(&state, &dbs).await.as_deref(),
             Some("run-parent")
         );
     }
@@ -644,7 +810,8 @@ mod tests {
 
         // At capacity but the only candidate is protected: evict nothing.
         // The new process spawns anyway (the cap is soft).
-        assert_eq!(gc.find_eviction_candidate(&state, &db).await, None);
+        let dbs = test_db_state(&_temp, db.clone());
+        assert_eq!(gc.find_eviction_candidate(&state, &dbs).await, None);
     }
 
     #[tokio::test]
@@ -675,8 +842,9 @@ mod tests {
             );
         }
 
+        let dbs = test_db_state(&_temp, db.clone());
         assert_eq!(
-            gc.find_eviction_candidate(&state, &db).await.as_deref(),
+            gc.find_eviction_candidate(&state, &dbs).await.as_deref(),
             Some("run-other")
         );
     }
@@ -693,6 +861,7 @@ mod tests {
             processes.register("run-1".to_string(), handle);
         }
 
-        assert_eq!(gc.find_eviction_candidate(&state, &db).await, None);
+        let dbs = test_db_state(&_temp, db.clone());
+        assert_eq!(gc.find_eviction_candidate(&state, &dbs).await, None);
     }
 }

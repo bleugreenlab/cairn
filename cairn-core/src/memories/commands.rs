@@ -1,5 +1,8 @@
 //! Memory command helpers.
 
+use std::sync::Arc;
+
+use crate::execution::routing::owning_db_for_job;
 use crate::models::{CreateMemory, Memory, UpdateMemory};
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_common::ids;
@@ -64,25 +67,51 @@ pub fn confirm_drafts_for_completed_job(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
 ) -> Result<Vec<Memory>, String> {
-    let db = orch.db.local.clone();
+    let db = resolve_owning_db_for_job_sync(orch, job_id)?;
+    confirm_drafts_for_completed_job_in_db(orch, db, job_id)
+}
+
+fn confirm_drafts_for_completed_job_in_db(
+    orch: &crate::orchestrator::Orchestrator,
+    db: Arc<LocalDb>,
+    job_id: &str,
+) -> Result<Vec<Memory>, String> {
     let job_id_owned = job_id.to_string();
-    let memories = crate::execution::advancement::run_advancement_db(async move {
-        crate::memories::db::confirm_draft_memories_for_job(&db, &job_id_owned)
-            .await
-            .map_err(|e| e.to_string())
-    })?;
-    for memory in &memories {
-        let db = orch.db.local.clone();
-        let memory_for_uri = memory.clone();
-        let content = memory.content.clone();
-        let uri = crate::execution::advancement::run_advancement_db(async move {
-            crate::memories::db::build_node_memory_uri_for_memory(&db, &memory_for_uri)
+    let memories = crate::execution::advancement::run_advancement_db({
+        let db = db.clone();
+        async move {
+            crate::memories::db::confirm_draft_memories_for_job(&db, &job_id_owned)
                 .await
                 .map_err(|e| e.to_string())
+        }
+    })?;
+    for memory in &memories {
+        let memory_for_uri = memory.clone();
+        let content = memory.content.clone();
+        let uri = crate::execution::advancement::run_advancement_db({
+            let db = db.clone();
+            async move {
+                crate::memories::db::build_node_memory_uri_for_memory(&db, &memory_for_uri)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
         })?;
         orch.enqueue_resource_embed(&uri, content);
     }
     Ok(memories)
+}
+
+fn resolve_owning_db_for_job_sync(
+    orch: &crate::orchestrator::Orchestrator,
+    job_id: &str,
+) -> Result<Arc<LocalDb>, String> {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    crate::execution::advancement::run_advancement_db(async move {
+        owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -514,7 +543,7 @@ fn set_memory_review_done(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = resolve_owning_db_for_job_sync(orch, job_id)?;
     let job_id = job_id.to_string();
     crate::execution::advancement::run_advancement_db(async move {
         db.execute(
@@ -531,13 +560,25 @@ pub fn confirm_drafts_for_completed_job_without_artifact_review(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
 ) -> Result<MemoryReviewCompletion, String> {
-    if job_has_artifacts_or_review_state(orch, job_id)? {
+    let db = match resolve_owning_db_for_job_sync(orch, job_id) {
+        Ok(db) => db,
+        Err(error) => {
+            log::warn!(
+                "draft-memory safety net: failed to route completed job {job_id}: {error}; skipping"
+            );
+            return Ok(MemoryReviewCompletion {
+                confirmed_count: 0,
+                confirmed_scopes: Vec::new(),
+            });
+        }
+    };
+    if job_has_artifacts_or_review_state(db.clone(), job_id)? {
         return Ok(MemoryReviewCompletion {
             confirmed_count: 0,
             confirmed_scopes: Vec::new(),
         });
     }
-    let confirmed_memories = confirm_drafts_for_completed_job(orch, job_id)?;
+    let confirmed_memories = confirm_drafts_for_completed_job_in_db(orch, db, job_id)?;
     Ok(MemoryReviewCompletion {
         confirmed_count: confirmed_memories.len(),
         confirmed_scopes: crate::memories::triage::distinct_scopes_from_memories(
@@ -578,11 +619,7 @@ pub fn confirm_orphaned_drafts(orch: &crate::orchestrator::Orchestrator) -> Resu
     Ok(confirmed)
 }
 
-fn job_has_artifacts_or_review_state(
-    orch: &crate::orchestrator::Orchestrator,
-    job_id: &str,
-) -> Result<bool, String> {
-    let db = orch.db.local.clone();
+fn job_has_artifacts_or_review_state(db: Arc<LocalDb>, job_id: &str) -> Result<bool, String> {
     let job_id = job_id.to_string();
     crate::execution::advancement::run_advancement_db(async move {
         db.query_one(
@@ -801,6 +838,90 @@ mod tests {
             .unwrap();
     }
 
+    async fn migrated_team_db(temp: &TempDir) -> Arc<LocalDb> {
+        let db = Arc::new(
+            LocalDb::open(temp.path().join("team-memory-test.db"))
+                .await
+                .unwrap(),
+        );
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    async fn seed_team_memory_job(
+        db: &LocalDb,
+        team_id: &str,
+        job_id: &str,
+        memory_id: &str,
+        review_state: Option<&str>,
+    ) {
+        let project_id = format!("{team_id}~00000000-0000-4000-8000-100000000001");
+        let issue_id = format!("{team_id}~00000000-0000-4000-8000-100000000002");
+        let execution_id = format!("{team_id}~00000000-0000-4000-8000-100000000003");
+        db.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'TP', '/tmp/team-project', 1, 1)",
+            params![project_id.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES (?1, ?2, 7, 'Team Issue', 'active', 1, 1)",
+            params![issue_id.as_str(), project_id.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES (?1, 'recipe', ?2, ?3, 'running', 1, 1)",
+            params![execution_id.as_str(), issue_id.as_str(), project_id.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, node_name, uri_segment, memory_review_state, created_at, updated_at)
+             VALUES (?1, ?2, 'agent', ?3, ?4, 'complete', 'builder', 'builder', ?5, 1, 1)",
+            params![job_id, execution_id.as_str(), issue_id.as_str(), project_id.as_str(), review_state],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
+             VALUES (?1, ?1, ?2, 'a durable team fact', 'draft', 'project', ?2, ?3, 1, 'cairn://p/TP/7/1/builder/chat/turn/2', 1, 1)",
+            params![memory_id, project_id.as_str(), job_id],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn memory_status(db: &LocalDb, memory_id: &str) -> Option<String> {
+        db.query_opt(
+            "SELECT status FROM memories WHERE id = ?1",
+            params![memory_id],
+            |row| row.text(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn job_review_state(db: &LocalDb, job_id: &str) -> Option<String> {
+        db.query_one(
+            "SELECT memory_review_state FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.opt_text(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn table_count_by_id(db: &LocalDb, table: &str, id: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE id = ?1");
+        db.query_one(&sql, params![id], |row| row.i64(0))
+            .await
+            .unwrap()
+    }
+
     async fn review_state(test: &TestOrch, job_id: &str) -> Option<String> {
         test.orch
             .db
@@ -825,6 +946,68 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn team_no_artifact_safety_net_confirms_drafts_in_team_replica() {
+        let test = test_orch().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teammem";
+        let job_id = "teammem~00000000-0000-4000-8000-100000000010";
+        let memory_id = "teammem~00000000-0000-4000-8000-100000000011";
+        let team_db = migrated_team_db(&team_temp).await;
+        seed_team_memory_job(&team_db, team_id, job_id, memory_id, None).await;
+        test.orch
+            .db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+
+        let completion =
+            super::confirm_drafts_for_completed_job_without_artifact_review(&test.orch, job_id)
+                .unwrap();
+
+        assert_eq!(completion.confirmed_count, 1);
+        assert_eq!(
+            memory_status(&team_db, memory_id).await.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            table_count_by_id(&test.orch.db.local, "memories", memory_id).await,
+            0,
+            "the team draft must not be read from or written into the private database"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_sent_memory_review_completion_marks_team_job_done() {
+        let test = test_orch().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teamdone";
+        let job_id = "teamdone~00000000-0000-4000-8000-100000000010";
+        let memory_id = "teamdone~00000000-0000-4000-8000-100000000011";
+        let team_db = migrated_team_db(&team_temp).await;
+        seed_team_memory_job(&team_db, team_id, job_id, memory_id, Some("sent")).await;
+        test.orch
+            .db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+
+        let completion = super::complete_sent_memory_review(&test.orch, job_id).unwrap();
+
+        assert_eq!(completion.confirmed_count, 1);
+        assert_eq!(
+            memory_status(&team_db, memory_id).await.as_deref(),
+            Some("pending")
+        );
+        assert_eq!(
+            job_review_state(&team_db, job_id).await.as_deref(),
+            Some("done")
+        );
+        assert_eq!(
+            table_count_by_id(&test.orch.db.local, "jobs", job_id).await,
+            0,
+            "the review-state update must route to the team replica, not private"
+        );
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@
 //! the queued-direct injection paths (Claude `additionalContext` hook +
 //! tool-result augmentation) — see CAIRN-1196.
 
+use crate::execution::routing::{owning_db_for_job, owning_db_for_run};
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::{ChannelType, Message};
 use crate::orchestrator::Orchestrator;
@@ -278,15 +279,29 @@ pub(crate) fn enqueue_direct_push(
 ) -> Result<crate::orchestrator::attention_push::Wake, String> {
     use crate::orchestrator::attention_push::Boundary;
     let requested = direct_wake_for_urgency(urgency);
-    let db = orch.db.local.clone();
+    let owning = run_db_blocking({
+        let dbs = orch.db.clone();
+        let recipient_job_id = recipient_job_id.to_string();
+        move || async move {
+            owning_db_for_job(&dbs, &recipient_job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .map_err(|error| {
+        log::warn!(
+            "enqueue_direct_push: failed to route recipient job {recipient_job_id}: {error}"
+        );
+        error
+    })?;
     let recipient_job_id = recipient_job_id.to_string();
     let message_id = message_id.to_string();
     run_db_blocking(move || async move {
-        let content_ref = node_uri_for_job(&db, &recipient_job_id)
+        let content_ref = node_uri_for_job(&owning, &recipient_job_id)
             .await
             .unwrap_or_else(|| recipient_job_id.clone());
         let (_, effective) = crate::orchestrator::attention_push::push(
-            &db,
+            &owning,
             &recipient_job_id,
             &content_ref,
             requested,
@@ -315,7 +330,23 @@ pub fn queue_system_direct(
     content: &str,
     urgency: DeliveryUrgency,
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
+    let db = match run_db_blocking({
+        let dbs = orch.db.clone();
+        let run = recipient_run_id.to_string();
+        move || async move {
+            owning_db_for_run(&dbs, &run)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }) {
+        Ok(db) => db,
+        Err(error) => {
+            log::warn!(
+                "queue_system_direct: failed to route recipient run {recipient_run_id}: {error}; direct message undeliverable"
+            );
+            return Ok(());
+        }
+    };
     let run = recipient_run_id.to_string();
     let job_id = run_db_blocking({
         let db = db.clone();
@@ -333,7 +364,7 @@ pub fn queue_system_direct(
     };
 
     let (message_id, effective) = run_db_blocking({
-        let db = orch.db.local.clone();
+        let db = db.clone();
         let job_id = job_id.clone();
         let run_id = recipient_run_id.to_string();
         let content = content.to_string();
@@ -545,7 +576,22 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
 /// stamps every pending item (notices, queued messages, pushes); this function
 /// only decides whether to resume and carries no prompt of its own.
 pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
-    let Some(pending) = collect_pending_for_flush(&orch.db.local, run_id) else {
+    let db = match run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }) {
+        Ok(db) => db,
+        Err(error) => {
+            log::warn!("flush-on-idle: failed to route run {run_id}: {error}");
+            return;
+        }
+    };
+    let Some(pending) = collect_pending_for_flush(&db, run_id) else {
         return;
     };
 
@@ -576,12 +622,27 @@ pub fn nudge_job_for_urgency(
         return Ok(());
     }
 
-    let Some(run_id) = latest_run_for_job(&orch.db.local, job_id) else {
+    let db = match run_db_blocking({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        move || async move {
+            owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    }) {
+        Ok(db) => db,
+        Err(error) => {
+            log::warn!("nudge_job_for_urgency: failed to route job {job_id}: {error}");
+            return Ok(());
+        }
+    };
+
+    let Some(run_id) = latest_run_for_job(&db, job_id) else {
         return Ok(());
     };
 
-    let active =
-        orch.process_state.is_active(&run_id) || head_turn_active_sync(&orch.db.local, job_id);
+    let active = orch.process_state.is_active(&run_id) || head_turn_active_sync(&db, job_id);
     if active && urgency != DeliveryUrgency::Interrupt {
         return Ok(());
     }

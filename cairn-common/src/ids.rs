@@ -266,6 +266,33 @@ pub fn mint_child(parent_id: &str) -> String {
     mint_inheriting(&RoutableId::from_trusted(parent_id)).into_string()
 }
 
+/// Re-key a routable entity id from local/private ownership into `team`.
+///
+/// This is a pure prefix transform for project moves: bare UUID-bearing ids become
+/// `{team}~{uuid}`, ids already carrying the same prefix are returned unchanged
+/// so retries are idempotent, and malformed/foreign-prefixed ids fail closed.
+/// Bare legacy strings are left untouched because not every ProjectScoped column
+/// that participates in routing is uuid-shaped (`projects.id = workspace` in
+/// legacy roots, label ids in old data, and URI-visible segments are examples).
+pub fn rekey_to_team(id: &str, team: &str) -> Result<String, IdError> {
+    match parse_route_scope(id)? {
+        RouteScope::Team(existing) => {
+            if existing == team {
+                Ok(id.to_string())
+            } else {
+                Err(IdError::BadTeamPrefix)
+            }
+        }
+        RouteScope::Local => {
+            if is_canonical_v4_uuid(id) {
+                Ok(format!("{team}~{id}"))
+            } else {
+                Ok(id.to_string())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +425,37 @@ mod tests {
         // A session id, were it ever (wrongly) parsed, routes Local — but the type
         // prevents it reaching the routable parser at all.
         assert_eq!(parse_route_scope(sid.as_str()), Ok(RouteScope::Local));
+    }
+    #[test]
+    fn rekey_to_team_prefixes_bare_uuid_and_preserves_suffix() {
+        let team = "Team123";
+        let id = sample_uuid();
+        let moved = rekey_to_team(&id, team).unwrap();
+        assert_eq!(moved, format!("{team}~{id}"));
+    }
+
+    #[test]
+    fn rekey_to_team_is_idempotent_for_same_team() {
+        let team = "Team123";
+        let id = format!("{team}~{}", sample_uuid());
+        assert_eq!(rekey_to_team(&id, team).unwrap(), id);
+    }
+
+    #[test]
+    fn rekey_to_team_refuses_foreign_team_prefix() {
+        let id = format!("OtherTeam~{}", sample_uuid());
+        assert_eq!(rekey_to_team(&id, "Team123"), Err(IdError::BadTeamPrefix));
+    }
+
+    #[test]
+    fn bare_session_ids_are_protected_by_type_and_manifest_boundaries() {
+        let session = mint_session_id();
+        assert_eq!(
+            rekey_to_team(session.as_str(), "Team123").unwrap(),
+            format!("Team123~{}", session.as_str())
+        );
+        // The transform is intentionally for routable strings. The protection is
+        // the type boundary plus the project-move manifest: callers receive
+        // `BareSessionId`, and session-id columns are never declared routable.
     }
 }

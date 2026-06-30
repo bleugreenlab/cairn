@@ -82,7 +82,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
     // ---- Load project info ----------------------------------------------
     let (repo_path, project_key) = run_db(load_project_repo_and_key(
-        owning_db.clone(),
+        orch.db.clone(),
         job.project_id.clone(),
     ))?;
 
@@ -552,8 +552,11 @@ pub fn continue_job_impl(
     })?;
 
     // ---- Load job -------------------------------------------------------
-    let (job, project_id, issue_id, project_path) =
-        run_db(load_job_context(owning_db.clone(), job_id.to_string()))?;
+    let (job, project_id, issue_id, project_path) = run_db(load_job_context(
+        owning_db.clone(),
+        orch.db.clone(),
+        job_id.to_string(),
+    ))?;
 
     let current_session_id = job.current_session_id.as_ref().ok_or_else(|| {
         if job.status == "blocked" {

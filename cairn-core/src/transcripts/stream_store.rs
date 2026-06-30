@@ -583,6 +583,8 @@ pub fn open_stream(
                     None => get_next_sequence_conn(conn, &run_id).await?,
                 };
                 let now = chrono::Utc::now().timestamp() as i32;
+                abort_active_streams_for_run_conn(conn, &run_id, now, "superseded").await?;
+
                 let stream_id = Uuid::new_v4().to_string();
                 conn.execute(
                     "INSERT INTO message_streams(
@@ -983,28 +985,7 @@ pub fn abort_stream(
                     ));
                 }
                 let now = chrono::Utc::now().timestamp() as i32;
-                conn.execute(
-                    "UPDATE message_streams
-                     SET status = 'aborted',
-                         version = ?1,
-                         abort_reason = ?2,
-                         updated_at = ?3,
-                         finalized_at = ?4
-                     WHERE id = ?5",
-                    params![
-                        stream.version + 1,
-                        reason.as_str(),
-                        now,
-                        now,
-                        stream_id.as_str()
-                    ],
-                )
-                .await?;
-                stream.status = "aborted".to_string();
-                stream.version += 1;
-                stream.abort_reason = Some(reason);
-                stream.updated_at = now;
-                stream.finalized_at = Some(now);
+                abort_stream_conn(conn, &mut stream, now, &reason).await?;
                 let chunks = load_chunks_for_stream_conn(conn, &stream_id).await?;
                 Ok(Some(materialize_stream(stream, &chunks)))
             })
@@ -1014,28 +995,23 @@ pub fn abort_stream(
     })
 }
 
-pub fn list_recoverable_streams(db: Arc<LocalDb>) -> Result<Vec<ActiveMessageStream>, String> {
+pub fn reconcile_orphaned_streams(db: Arc<LocalDb>, reason: &str) -> Result<usize, String> {
+    let reason = reason.to_string();
     block_on_stream_db(async move {
-        db.read(|conn| {
+        db.write(|conn| {
+            let reason = reason.clone();
             Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT id, run_id, session_id, turn_id, backend, sequence, status,
-                                version, content_chars, thinking_chars, chunk_count,
-                                final_event_id, abort_reason, created_at, updated_at, finalized_at
-                         FROM message_streams
-                         WHERE status IN ('open', 'finalizing')
-                         ORDER BY created_at ASC",
-                        (),
-                    )
-                    .await?;
-                let mut streams = Vec::new();
-                while let Some(row) = rows.next().await? {
-                    let stream = stream_from_row(&row)?;
-                    let chunks = load_chunks_for_stream_conn(conn, &stream.id).await?;
-                    streams.push(materialize_stream(stream, &chunks));
+                let streams = list_recoverable_streams_conn(conn).await?;
+                if streams.is_empty() {
+                    return Ok(0);
                 }
-                Ok(streams)
+
+                let now = chrono::Utc::now().timestamp() as i32;
+                for stream in &streams {
+                    let mut stream = stream.stream.clone();
+                    abort_stream_conn(conn, &mut stream, now, &reason).await?;
+                }
+                Ok(streams.len())
             })
         })
         .await
@@ -1060,7 +1036,7 @@ pub fn find_active_stream_for_run(
                          FROM message_streams
                          WHERE run_id = ?1
                            AND status IN ('open', 'finalizing')
-                         ORDER BY created_at ASC
+                         ORDER BY created_at DESC, rowid DESC
                          LIMIT 1",
                         params![run_id.as_str()],
                     )
@@ -1095,7 +1071,7 @@ pub fn find_active_stream_for_session(
                          FROM message_streams
                          WHERE session_id = ?1
                            AND status IN ('open', 'finalizing')
-                         ORDER BY created_at ASC
+                         ORDER BY created_at DESC, rowid DESC
                          LIMIT 1",
                         params![session_id.as_str()],
                     )
@@ -1132,6 +1108,85 @@ fn process_embed_event(orch: &Orchestrator, entry: &OutboxEntry) -> Result<(), S
         orch.enqueue_event_embed(&payload.event_id, text);
     }
     outbox::mark_done(orch.db.local.clone(), &entry.id);
+    Ok(())
+}
+
+async fn list_recoverable_streams_conn(conn: &Connection) -> DbResult<Vec<ActiveMessageStream>> {
+    let mut rows = conn
+        .query(
+            "SELECT id, run_id, session_id, turn_id, backend, sequence, status,
+                    version, content_chars, thinking_chars, chunk_count,
+                    final_event_id, abort_reason, created_at, updated_at, finalized_at
+             FROM message_streams
+             WHERE status IN ('open', 'finalizing')
+             ORDER BY created_at ASC",
+            (),
+        )
+        .await?;
+    let mut streams = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let stream = stream_from_row(&row)?;
+        let chunks = load_chunks_for_stream_conn(conn, &stream.id).await?;
+        streams.push(materialize_stream(stream, &chunks));
+    }
+    Ok(streams)
+}
+
+async fn abort_active_streams_for_run_conn(
+    conn: &Connection,
+    run_id: &str,
+    now: i32,
+    reason: &str,
+) -> DbResult<usize> {
+    // Backends own the message-boundary invariant: a legitimate within-turn
+    // re-open finalizes the prior stream before calling `open_stream` again.
+    // Anything still open/finalizing for this run is therefore an orphan that
+    // must not keep stealing the live placeholder id from the new stream.
+    let mut rows = conn
+        .query(
+            "SELECT id, run_id, session_id, turn_id, backend, sequence, status,
+                    version, content_chars, thinking_chars, chunk_count,
+                    final_event_id, abort_reason, created_at, updated_at, finalized_at
+             FROM message_streams
+             WHERE run_id = ?1
+               AND status IN ('open', 'finalizing')
+             ORDER BY created_at ASC",
+            params![run_id],
+        )
+        .await?;
+    let mut streams = Vec::new();
+    while let Some(row) = rows.next().await? {
+        streams.push(stream_from_row(&row)?);
+    }
+
+    for mut stream in streams.iter().cloned() {
+        abort_stream_conn(conn, &mut stream, now, reason).await?;
+    }
+    Ok(streams.len())
+}
+
+async fn abort_stream_conn(
+    conn: &Connection,
+    stream: &mut DbMessageStream,
+    now: i32,
+    reason: &str,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE message_streams
+         SET status = 'aborted',
+             version = ?1,
+             abort_reason = ?2,
+             updated_at = ?3,
+             finalized_at = ?4
+         WHERE id = ?5",
+        params![stream.version + 1, reason, now, now, stream.id.as_str()],
+    )
+    .await?;
+    stream.status = "aborted".to_string();
+    stream.version += 1;
+    stream.abort_reason = Some(reason.to_string());
+    stream.updated_at = now;
+    stream.finalized_at = Some(now);
     Ok(())
 }
 
@@ -1418,15 +1473,51 @@ mod tests {
         .unwrap()
     }
 
+    async fn table_has_column(conn: &Connection, table: &str, column: &str) -> DbResult<bool> {
+        let mut rows = conn
+            .query(format!("PRAGMA table_info({table})"), ())
+            .await?;
+        while let Some(row) = rows.next().await? {
+            if row.text(1)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn insert_run(db: &LocalDb, id: &str) {
+        insert_run_with_session(db, id, "session-1").await;
+    }
+
+    async fn insert_run_with_session(db: &LocalDb, id: &str, session_id: &str) {
         let now = chrono::Utc::now().timestamp() as i32;
         db.write(|conn| {
             let id = id.to_string();
+            let session_id = session_id.to_string();
             Box::pin(async move {
+                let project_scope_column = if table_has_column(conn, "projects", "workspace_id").await? {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO workspaces(id, name, created_at, updated_at)
+                         VALUES ('default', 'Default', ?1, ?2)",
+                        params![now, now],
+                    )
+                    .await?;
+                    "workspace_id"
+                } else {
+                    conn.execute(
+                        "INSERT OR IGNORE INTO teams(id, name, created_at, updated_at)
+                         VALUES ('default', 'Default', ?1, ?2)",
+                        params![now, now],
+                    )
+                    .await?;
+                    "team_id"
+                };
                 conn.execute(
-                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('project-1', 'default', 'Project', 'PROJ', '/tmp/project', ?1, ?2)
-                     ON CONFLICT(id) DO NOTHING",
+                    format!(
+                        "INSERT INTO projects(id, {project_scope_column}, name, key, repo_path, created_at, updated_at)
+                         VALUES ('project-1', 'default', 'Project', 'PROJ', '/tmp/project', ?1, ?2)
+                         ON CONFLICT(id) DO NOTHING"
+                    ),
                     params![now, now],
                 )
                 .await?;
@@ -1441,8 +1532,8 @@ mod tests {
                     "INSERT INTO runs(
                          id, issue_id, status, session_id, created_at, updated_at
                      )
-                     VALUES (?1, 'issue-1', 'live', 'session-1', ?2, ?3)",
-                    params![id.as_str(), now, now],
+                     VALUES (?1, 'issue-1', 'live', ?2, ?3, ?4)",
+                    params![id.as_str(), session_id.as_str(), now, now],
                 )
                 .await?;
                 Ok(())
@@ -1450,6 +1541,25 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    async fn stream_status(db: &LocalDb, stream_id: &str) -> String {
+        let stream_id = stream_id.to_string();
+        db.read(|conn| {
+            let stream_id = stream_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT status FROM message_streams WHERE id = ?1",
+                        params![stream_id.as_str()],
+                    )
+                    .await?;
+                let row = rows.next().await?.unwrap();
+                row.text(0)
+            })
+        })
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1720,6 +1830,94 @@ mod tests {
         )
         .unwrap();
         assert!(finalized.data_json.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn active_lookup_prefers_newest_stream_for_session() {
+        let (_temp, db) = test_db().await;
+        insert_run_with_session(&db, "run-zombie", "session-1").await;
+        insert_run_with_session(&db, "run-live", "session-1").await;
+
+        let zombie = open_stream(
+            db.clone(),
+            "run-zombie",
+            Some("session-1"),
+            None,
+            "claude",
+            Some(0),
+        )
+        .unwrap();
+        let live = open_stream(
+            db.clone(),
+            "run-live",
+            Some("session-1"),
+            None,
+            "claude",
+            Some(0),
+        )
+        .unwrap();
+
+        let active = find_active_stream_for_session(db.clone(), "session-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.stream_id(), live.stream_id());
+        assert_eq!(stream_status(&db, zombie.stream_id()).await, "open");
+    }
+
+    #[tokio::test]
+    async fn opening_stream_supersedes_prior_active_stream_for_run() {
+        let (_temp, db) = test_db().await;
+        insert_run(&db, "run-1").await;
+
+        let zombie = open_stream(
+            db.clone(),
+            "run-1",
+            Some("session-1"),
+            None,
+            "claude",
+            Some(0),
+        )
+        .unwrap();
+        let live = open_stream(
+            db.clone(),
+            "run-1",
+            Some("session-1"),
+            None,
+            "claude",
+            Some(1),
+        )
+        .unwrap();
+
+        assert_eq!(stream_status(&db, zombie.stream_id()).await, "aborted");
+        let active = find_active_stream_for_run(db.clone(), "run-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.stream_id(), live.stream_id());
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_aborts_orphaned_streams() {
+        let (_temp, db) = test_db().await;
+        insert_run(&db, "run-1").await;
+        let orphan = open_stream(
+            db.clone(),
+            "run-1",
+            Some("session-1"),
+            None,
+            "claude",
+            Some(0),
+        )
+        .unwrap();
+
+        let count = reconcile_orphaned_streams(db.clone(), "startup_reconcile").unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(stream_status(&db, orphan.stream_id()).await, "aborted");
+        assert!(find_active_stream_for_run(db.clone(), "run-1")
+            .unwrap()
+            .is_none());
+        assert!(find_active_stream_for_session(db.clone(), "session-1")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

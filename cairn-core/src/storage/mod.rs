@@ -14,8 +14,8 @@ pub use local_db::{
 };
 pub use migration::{Migration, MigrationRunner};
 pub use migrations::{
-    Lineage, PrivateReason, ScopeTarget, TableScope, TABLE_SCOPES, TEAM_MIGRATIONS,
-    TURSO_MIGRATIONS,
+    Lineage, PrivateReason, RekeyTableManifest, ScopeTarget, TableScope, PROJECT_REKEY_MANIFEST,
+    TABLE_SCOPES, TEAM_MIGRATIONS, TURSO_MIGRATIONS,
 };
 pub use row::{
     next_i64, next_opt_text, next_text, query_opt_i64_conn, query_opt_text_conn, query_text_conn,

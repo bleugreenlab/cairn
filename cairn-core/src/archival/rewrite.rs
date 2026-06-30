@@ -3377,6 +3377,7 @@ mod tests {
         db.set_team_context(crate::archival::store::TeamReplicaContext {
             team_id: "team-x".to_string(),
             store: std::sync::Arc::new(store.clone()),
+            private_db: None,
         });
 
         let backend_base = "CLAUDE-BASE ".repeat(800);
@@ -3453,6 +3454,7 @@ mod tests {
         db.set_team_context(crate::archival::store::TeamReplicaContext {
             team_id: "team-x".to_string(),
             store: std::sync::Arc::new(store.clone()),
+            private_db: None,
         });
 
         let v2: &[u8] = b"ALPHA\nbeta\ngamma\ndelta\nepsilon\n";
@@ -3541,6 +3543,7 @@ mod tests {
         db.set_team_context(crate::archival::store::TeamReplicaContext {
             team_id: "team-x".to_string(),
             store: std::sync::Arc::new(empty),
+            private_db: None,
         });
         let events = load_events(&db).await;
         let recon = reconstruct_events(&db, events).await;
@@ -3562,6 +3565,7 @@ mod tests {
         db.set_team_context(crate::archival::store::TeamReplicaContext {
             team_id: "team-x".to_string(),
             store: std::sync::Arc::new(corrupt),
+            private_db: None,
         });
         let events = load_events(&db).await;
         let recon = reconstruct_events(&db, events).await;
@@ -3606,6 +3610,7 @@ mod tests {
         db.set_team_context(crate::archival::store::TeamReplicaContext {
             team_id: "team-x".to_string(),
             store: std::sync::Arc::new(FailingStore),
+            private_db: None,
         });
 
         let backend_base = "CLAUDE-BASE ".repeat(800);

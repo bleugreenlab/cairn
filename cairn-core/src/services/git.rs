@@ -65,6 +65,9 @@ pub trait GitClient: Send + Sync {
     /// Get the remote URL for origin.
     fn remote_get_url(&self, repo: &Path) -> Result<String, String>;
 
+    /// Clone a remote repository into the target directory.
+    fn clone(&self, remote_url: &str, target_dir: &Path) -> Result<(), String>;
+
     /// Add or update a named git remote.
     fn set_remote(&self, repo: &Path, name: &str, url: &str) -> Result<(), String>;
 
@@ -152,6 +155,17 @@ impl RealGitClient {
 }
 
 impl GitClient for RealGitClient {
+    fn clone(&self, remote_url: &str, target_dir: &Path) -> Result<(), String> {
+        let parent = target_dir.parent().unwrap_or_else(|| Path::new("."));
+        let target = target_dir.to_string_lossy().to_string();
+        let output = self.run_git_strs(parent, &["clone", remote_url, &target])?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(format!("git clone failed: {}", output.stderr))
+        }
+    }
+
     fn is_repo(&self, path: &Path) -> Result<bool, String> {
         let output = self.run_git_strs(path, &["rev-parse", "--is-inside-work-tree"])?;
         Ok(output.success && output.stdout.trim() == "true")

@@ -1194,8 +1194,13 @@ pub(super) async fn read_node_chat(
             Err(error) => return error,
         };
 
-    let event_rows =
-        load_job_events_ordered(&conn, &job.id, db.content_store().map(|s| s.as_ref())).await;
+    let event_rows = load_job_events_ordered(
+        &conn,
+        &job.id,
+        db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
     if event_rows.is_empty() {
         return "No runs found for this node.".to_string();
     }
@@ -1238,8 +1243,13 @@ pub(super) async fn read_node_chat_raw(
             Err(error) => return error,
         };
 
-    let event_rows =
-        load_job_events_ordered(&conn, &job.id, db.content_store().map(|s| s.as_ref())).await;
+    let event_rows = load_job_events_ordered(
+        &conn,
+        &job.id,
+        db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
     if event_rows.is_empty() {
         return "No runs found for this node.".to_string();
     }
@@ -1336,8 +1346,13 @@ pub(super) async fn read_node_chat_turn(
     };
 
     // Load events for this turn
-    let event_rows =
-        load_turn_events(&conn, &turn_id, db.content_store().map(|s| s.as_ref())).await;
+    let event_rows = load_turn_events(
+        &conn,
+        &turn_id,
+        db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
 
     if event_rows.is_empty() {
         return format!(
@@ -1592,8 +1607,13 @@ pub(super) async fn read_task_chat(
             Err(error) => return error,
         };
 
-    let event_rows =
-        load_job_events_ordered(&conn, &task_job.id, db.content_store().map(|s| s.as_ref())).await;
+    let event_rows = load_job_events_ordered(
+        &conn,
+        &task_job.id,
+        db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
     if event_rows.is_empty() {
         return "No runs found for this task.".to_string();
     }
@@ -1640,8 +1660,13 @@ pub(super) async fn read_task_chat_raw(
             Err(error) => return error,
         };
 
-    let event_rows =
-        load_job_events_ordered(&conn, &task_job.id, db.content_store().map(|s| s.as_ref())).await;
+    let event_rows = load_job_events_ordered(
+        &conn,
+        &task_job.id,
+        db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
     if event_rows.is_empty() {
         return "No runs found for this task.".to_string();
     }
@@ -1739,8 +1764,13 @@ pub(super) async fn read_task_chat_turn(
     };
 
     // Load events for this turn
-    let event_rows =
-        load_turn_events(&conn, &turn_id, db.content_store().map(|s| s.as_ref())).await;
+    let event_rows = load_turn_events(
+        &conn,
+        &turn_id,
+        db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
 
     if event_rows.is_empty() {
         return format!(
@@ -1805,6 +1835,7 @@ pub(super) async fn read_node_chat_event(
         &run_id,
         event_seq,
         db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
     )
     .await
 }
@@ -1979,6 +2010,7 @@ pub(super) async fn read_task_chat_event(
         &run_id,
         event_seq,
         db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
     )
     .await
 }

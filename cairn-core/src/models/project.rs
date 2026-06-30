@@ -22,6 +22,10 @@ pub struct Project {
     pub updated_at: i64,
     /// Whether this project is hidden from the sidebar.
     pub hidden: bool,
+    /// Whether this project lives in a team replica.
+    pub is_team: bool,
+    /// Whether this machine has a usable local git repository for the project.
+    pub repo_cloned: bool,
     /// Whether this project represents the Cairn workspace config root.
     pub is_workspace: bool,
 }
@@ -82,4 +86,11 @@ pub struct UpdateProject {
     pub terminal_commands: Option<Vec<TerminalCommand>>,
     pub worktree_populate: Option<crate::config::project_settings::PopulateConfig>,
     pub default_branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveProject {
+    pub project_id: String,
+    pub team_id: String,
 }

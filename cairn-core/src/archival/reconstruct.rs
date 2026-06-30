@@ -68,10 +68,21 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
     // private `cas_cache`, so repeat reconstructs are offline). The fetch happens
     // in this async phase, before the non-Send `ObjectStore` is built.
     let store = db.content_store().cloned();
+    let private_route_db = db.private_route_db().cloned();
     let coords = db
         .read(move |conn| {
+            let private_route_db = private_route_db.clone();
             Box::pin(async move {
-                DbResult::Ok(Coords::load(conn, &run_ids, &hashes, store.as_deref()).await)
+                DbResult::Ok(
+                    Coords::load(
+                        conn,
+                        &run_ids,
+                        &hashes,
+                        store.as_deref(),
+                        private_route_db.as_deref(),
+                    )
+                    .await,
+                )
             })
         })
         .await
@@ -86,12 +97,21 @@ pub async fn reconstruct_events_with_conn(
     events: Vec<Event>,
     store: Option<&dyn ContentStore>,
 ) -> Vec<Event> {
+    reconstruct_events_with_conn_and_routes(conn, events, store, None).await
+}
+
+pub async fn reconstruct_events_with_conn_and_routes(
+    conn: &turso::Connection,
+    events: Vec<Event>,
+    store: Option<&dyn ContentStore>,
+    private_route_db: Option<&LocalDb>,
+) -> Vec<Event> {
     if !events.iter().any(is_archived) {
         return events;
     }
     let run_ids = gitcoord_run_ids(&events);
     let hashes = blobbed_hashes(&events);
-    let coords = Coords::load(conn, &run_ids, &hashes, store).await;
+    let coords = Coords::load(conn, &run_ids, &hashes, store, private_route_db).await;
     finish(coords, events)
 }
 
@@ -204,11 +224,12 @@ impl Coords {
         run_ids: &[String],
         hashes: &[String],
         store: Option<&dyn ContentStore>,
+        private_route_db: Option<&LocalDb>,
     ) -> Coords {
         let mut run_meta: HashMap<String, RunMeta> = HashMap::new();
 
         for run_id in run_ids {
-            if let Some(meta) = load_run_meta(conn, run_id).await {
+            if let Some(meta) = load_run_meta(conn, run_id, private_route_db).await {
                 run_meta.insert(run_id.clone(), meta);
             }
         }
@@ -267,10 +288,14 @@ impl ReconstructCtx {
     }
 }
 
-async fn load_run_meta(conn: &turso::Connection, run_id: &str) -> Option<RunMeta> {
+async fn load_run_meta(
+    conn: &turso::Connection,
+    run_id: &str,
+    private_route_db: Option<&LocalDb>,
+) -> Option<RunMeta> {
     let mut rows = conn
         .query(
-            "SELECT j.execution_id, p.repo_path
+            "SELECT j.execution_id, p.id, p.key, p.repo_path
              FROM runs r
              JOIN jobs j ON r.job_id = j.id
              JOIN projects p ON j.project_id = p.id
@@ -282,11 +307,33 @@ async fn load_run_meta(conn: &turso::Connection, run_id: &str) -> Option<RunMeta
         .ok()?;
     let row = rows.next().await.ok()??;
     let execution_id: Option<String> = row.opt_text(0).ok()?;
-    let repo_path: String = row.text(1).ok()?;
+    let project_id: String = row.text(1).ok()?;
+    let project_key: String = row.text(2).ok()?;
+    let synced_repo_path: String = row.text(3).ok()?;
+    let repo_path = match cairn_common::ids::parse_route_scope(&project_id) {
+        Ok(cairn_common::ids::RouteScope::Team(_)) => {
+            load_private_local_repo_path(private_route_db?, &project_key)
+                .await
+                .unwrap_or_default()
+        }
+        _ => synced_repo_path,
+    };
     Some(RunMeta {
         execution_id: execution_id?,
         repo_path: PathBuf::from(repo_path),
     })
+}
+
+async fn load_private_local_repo_path(private_db: &LocalDb, project_key: &str) -> Option<String> {
+    let key = project_key.to_uppercase();
+    private_db
+        .query_opt_text(
+            "SELECT local_repo_path FROM project_routes WHERE project_key = ?1",
+            (key,),
+        )
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Load an execution's range pack bytes, returning `None` for an empty range
@@ -1017,6 +1064,7 @@ mod tests {
     use crate::archival::{build_execution_pack, compress, CODEC_ZSTD_V1};
     use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use turso::params;
 
     async fn migrated_db() -> LocalDb {
@@ -1084,6 +1132,59 @@ mod tests {
                         )
                         .await?;
                     }
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn seed_team_chain(
+        db: &LocalDb,
+        synced_repo_path: &str,
+        pack: Option<(Vec<u8>, Vec<u8>)>,
+    ) {
+        let synced_repo_path = synced_repo_path.to_string();
+        db.write(move |conn| {
+            let synced_repo_path = synced_repo_path.clone();
+            let pack = pack.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('teamABC123~00000000-0000-4000-8000-000000000001','ws','p','P',?1,1,1)",
+                    (synced_repo_path.as_str(),),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO executions(id, recipe_id, status, started_at) VALUES ('exec','r','running',1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id, execution_id, project_id, status, created_at, updated_at)
+                     VALUES ('job','exec','teamABC123~00000000-0000-4000-8000-000000000001','complete',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs(id, job_id, status, created_at, updated_at)
+                     VALUES ('run','job','exited',1,1)",
+                    (),
+                )
+                .await?;
+                if let Some((pack, idx)) = pack {
+                    conn.execute(
+                        "INSERT INTO execution_history(execution_id, base_sha, tip_sha, pack, pack_idx)
+                         VALUES ('exec','base','tip',?1,?2)",
+                        params![pack, idx],
+                    )
+                    .await?;
                 }
                 Ok(())
             })
@@ -1285,6 +1386,93 @@ mod tests {
         let anchor_event = read_event(&fx.anchor, &["file:a.txt"]);
         let anchor_out = reconstruct_events(&db, vec![anchor_event]).await;
         assert_eq!(tool_result(&anchor_out[0]), expected_read(&anchor_targets));
+    }
+
+    #[tokio::test]
+    async fn team_gitcoord_read_stubs_until_private_local_repo_path_is_set() {
+        let fx = build_fixture();
+        let team_db = migrated_db().await;
+        seed_team_chain(
+            &team_db,
+            "/creator/path/not/on/this/machine",
+            Some((fx.pack.clone(), fx.idx.clone())),
+        )
+        .await;
+        let private_db = Arc::new(migrated_db().await);
+        private_db
+            .execute(
+                "INSERT INTO teams(id, name, sync_url, replica_path, created_at) VALUES ('teamABC123', 'Team', 'http://sync', '/tmp/team.db', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        private_db
+            .execute(
+                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('P', 'teamABC123', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let event = read_event(&fx.tip, &["file:a.txt"]);
+        let without_clone = team_db
+            .read(|conn| {
+                let event = event.clone();
+                let private_db = private_db.clone();
+                Box::pin(async move {
+                    DbResult::Ok(
+                        reconstruct_events_with_conn_and_routes(
+                            conn,
+                            vec![event],
+                            None,
+                            Some(private_db.as_ref()),
+                        )
+                        .await,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        assert!(tool_result(&without_clone[0]).contains(STUB_PREFIX));
+
+        private_db
+            .execute(
+                "UPDATE project_routes SET local_repo_path = ?1 WHERE project_key = 'P'",
+                (fx.origin.to_str().unwrap(),),
+            )
+            .await
+            .unwrap();
+        let event = read_event(&fx.tip, &["file:a.txt"]);
+        let with_clone = team_db
+            .read(|conn| {
+                let event = event.clone();
+                let private_db = private_db.clone();
+                Box::pin(async move {
+                    DbResult::Ok(
+                        reconstruct_events_with_conn_and_routes(
+                            conn,
+                            vec![event],
+                            None,
+                            Some(private_db.as_ref()),
+                        )
+                        .await,
+                    )
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tool_result(&with_clone[0]),
+            expected_read(&[(
+                "file:a.txt",
+                b"ALPHA
+beta
+gamma
+delta
+epsilon
+" as &[u8],
+            )])
+        );
     }
 
     #[tokio::test]

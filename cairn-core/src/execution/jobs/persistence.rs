@@ -53,78 +53,52 @@ pub(super) async fn load_job(
 
 pub(super) async fn load_job_context(
     db: Arc<LocalDb>,
+    dbs: std::sync::Arc<crate::db::DbState>,
     job_id: String,
 ) -> Result<(DbJob, String, Option<String>, Option<PathBuf>), String> {
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let job = load_job_conn(conn, &job_id)
-                .await?
-                .ok_or_else(|| DbError::Row(format!("job not found: {job_id}")))?;
-            let project_path = load_project_path_conn(conn, &job.project_id).await?;
-            Ok((
-                job.clone(),
-                job.project_id.clone(),
-                job.issue_id.clone(),
-                project_path.map(PathBuf::from),
-            ))
+    let (job, project_id, issue_id) = db
+        .read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let job = load_job_conn(conn, &job_id)
+                    .await?
+                    .ok_or_else(|| DbError::Row(format!("job not found: {job_id}")))?;
+                Ok((job.clone(), job.project_id.clone(), job.issue_id.clone()))
+            })
         })
-    })
-    .await
-    .map_err(|e| db_error("Job not found", e))
+        .await
+        .map_err(|e| db_error("Job not found", e))?;
+    let project_path = load_project_path(dbs, project_id.clone()).await?;
+    Ok((job, project_id, issue_id, project_path))
 }
 
 pub(super) async fn load_project_repo_and_key(
-    db: Arc<LocalDb>,
+    dbs: std::sync::Arc<crate::db::DbState>,
     project_id: String,
 ) -> Result<(String, String), String> {
-    db.read(|conn| {
-        let project_id = project_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT repo_path, key FROM projects WHERE id = ?1",
-                    (project_id.as_str(),),
-                )
-                .await?;
-            rows.next()
-                .await?
-                .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?)))
-                .transpose()?
-                .ok_or_else(|| DbError::Row(format!("project not found: {project_id}")))
-        })
-    })
-    .await
-    .map_err(|e| db_error("Project not found", e))
-}
-
-pub(super) async fn load_project_path_conn(
-    conn: &turso::Connection,
-    project_id: &str,
-) -> DbResult<Option<String>> {
-    let mut rows = conn
-        .query(
-            "SELECT repo_path FROM projects WHERE id = ?1",
-            (project_id,),
-        )
-        .await?;
-    crate::storage::next_text(&mut rows, 0).await
+    let (repo_path, key) =
+        crate::projects::crud::resolve_local_repo_path_and_key(&dbs, &project_id)
+            .await
+            .map_err(|e| db_error("Project not found", DbError::internal(e.to_string())))?;
+    let repo_path = repo_path.ok_or_else(|| {
+        "Clone this team project's repository before running executions".to_string()
+    })?;
+    Ok((repo_path, key))
 }
 
 pub(super) async fn load_project_path(
-    db: Arc<LocalDb>,
+    dbs: std::sync::Arc<crate::db::DbState>,
     project_id: String,
 ) -> Result<Option<PathBuf>, String> {
-    db.read(|conn| {
-        let project_id = project_id.clone();
-        Box::pin(async move {
-            Ok(load_project_path_conn(conn, &project_id)
-                .await?
-                .map(PathBuf::from))
+    crate::projects::crud::resolve_local_repo_path_and_key(&dbs, &project_id)
+        .await
+        .map(|(path, _)| path.map(PathBuf::from))
+        .map_err(|e| {
+            db_error(
+                "Failed to load project path",
+                DbError::internal(e.to_string()),
+            )
         })
-    })
-    .await
-    .map_err(|e| db_error("Failed to load project path", e))
 }
 
 pub(super) async fn load_project_default_branch(
@@ -829,6 +803,83 @@ pub(super) async fn insert_child_job_session_run(
     .map_err(|e| e.to_string())?;
     crate::orchestrator::wakes::seed_default_job_subscriptions(&seed_db, &seed_job_id).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod project_path_tests {
+    use super::*;
+    use crate::storage::{migrated_test_db, SearchIndex};
+
+    const TEAM_ID: &str = "teamABC123";
+    const PROJECT_ID: &str = "teamABC123~00000000-0000-4000-8000-000000000001";
+
+    async fn routed_team_project_state() -> Arc<crate::db::DbState> {
+        let private = Arc::new(migrated_test_db("execution-team-path-private.db").await);
+        private
+            .execute(
+                "INSERT INTO teams(id, name, sync_url, replica_path, created_at) VALUES (?1, 'Team', 'http://sync', '/tmp/team.db', 1)",
+                (TEAM_ID,),
+            )
+            .await
+            .unwrap();
+        private
+            .execute(
+                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('PRJ', ?1, 1)",
+                (TEAM_ID,),
+            )
+            .await
+            .unwrap();
+
+        let team_db = Arc::new(migrated_test_db("execution-team-path-team.db").await);
+        team_db
+            .execute_script(&format!(
+                "
+                INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1);
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('{}','ws','Project','PRJ','/creator/repo',1,1);
+                ",
+                PROJECT_ID
+            ))
+            .await
+            .unwrap();
+
+        let index =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let dbs = Arc::new(crate::db::DbState::new(private, index));
+        dbs.register_team_db_for_test(TEAM_ID.to_string(), team_db)
+            .await;
+        dbs.set_route("PRJ", Some(TEAM_ID.to_string())).await;
+        dbs
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_project_repo_and_key_blocks_uncloned_team_projects() {
+        let dbs = routed_team_project_state().await;
+
+        let error = load_project_repo_and_key(dbs, PROJECT_ID.to_string())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Clone this team project's repository before running executions"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_project_repo_and_key_uses_team_local_repo_path_when_cloned() {
+        let dbs = routed_team_project_state().await;
+        crate::projects::crud::set_local_repo_path(&dbs.local, "PRJ", Path::new("/member/repo"))
+            .await
+            .unwrap();
+
+        let (repo_path, key) = load_project_repo_and_key(dbs, PROJECT_ID.to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(repo_path, "/member/repo");
+        assert_eq!(key, "PRJ");
+    }
 }
 
 #[cfg(test)]

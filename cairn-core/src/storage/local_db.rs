@@ -232,6 +232,12 @@ impl LocalDb {
         self.team.as_ref().map(|ctx| &ctx.store)
     }
 
+    /// The private database that owns machine-local route metadata for this team
+    /// replica, when available.
+    pub fn private_route_db(&self) -> Option<&Arc<LocalDb>> {
+        self.team.as_ref().and_then(|ctx| ctx.private_db.as_ref())
+    }
+
     /// Attach a team replica's identity + content store. Called by `open_team`
     /// after construction (and by tests that inject a fake store) before the
     /// handle is shared behind an `Arc`.

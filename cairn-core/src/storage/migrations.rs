@@ -10,31 +10,59 @@ use super::Migration;
 /// shared-table change is written ONCE in the `SHARED_TAIL` block below and both
 /// lineages compose it via this macro — the single source of truth that the
 /// schema-equivalence test enforces.
+macro_rules! shared_tail {
+    () => {
+        // ── SHARED_TAIL ─────────────────────────────────────────────────
+        // Future shared-table migrations go HERE (not in a head). Each entry
+        // added below lands in BOTH lineages.
+        //
+        // CAIRN-2188 is the FIRST user: `execution_history.pack_hash` is a
+        // pointer to the per-execution range pack in the shared per-team content
+        // store. It is a shared-table change (both the private and team
+        // `execution_history` gain the column identically), so it is written once
+        // here. The SQL file lives in `turso_migrations/`; it is numbered 0084 to
+        // follow the private head (0082 + the 0083 cas_cache private head), and
+        // the team lineage records it after its 0002 head.
+        Migration::new(
+            "0084",
+            "archival_pack_hash",
+            include_str!("../../../../turso_migrations/0084_archival_pack_hash.sql"),
+        )
+    };
+}
+
 macro_rules! shared_lineage {
     ($($head:expr),* $(,)?) => {
         &[
             $($head,)*
-            // ── SHARED_TAIL ─────────────────────────────────────────────────
-            // Future shared-table migrations go HERE (not in a head). Each entry
-            // added below lands in BOTH lineages.
+            shared_tail!(),
+        ]
+    };
+}
+
+macro_rules! private_lineage {
+    ($($head:expr),* $(,)?) => {
+        &[
+            $($head,)*
+            shared_tail!(),
+            // ── PRIVATE_TAIL ────────────────────────────────────────────────
+            // Private-only migrations that must apply after the shared tail go
+            // here. They are intentionally absent from `TEAM_MIGRATIONS`.
             //
-            // CAIRN-2188 is the FIRST user: `execution_history.pack_hash` is a
-            // pointer to the per-execution range pack in the shared per-team
-            // content store. It is a shared-table change (both the private and
-            // team `execution_history` gain the column identically), so it is
-            // written once here. The SQL file lives in `turso_migrations/`; it is
-            // numbered 0084 to follow the private head (0082 + the 0083 cas_cache
-            // private head), and the team lineage records it after its 0002 head.
+            // CAIRN-2223: per-machine repository clone path for team projects.
+            // The synced `projects.repo_path` is the creator's path and cannot be
+            // overwritten by teammates; this private router column is the
+            // effective local path on this machine.
             Migration::new(
-                "0084",
-                "archival_pack_hash",
-                include_str!("../../../../turso_migrations/0084_archival_pack_hash.sql"),
+                "0085",
+                "project_routes_local_path",
+                include_str!("../../../../turso_migrations/0085_project_routes_local_path.sql"),
             ),
         ]
     };
 }
 
-pub const TURSO_MIGRATIONS: &[Migration] = shared_lineage![
+pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
     Migration::new(
         "0001",
         "initial_schema",
@@ -736,12 +764,271 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
 ];
 
+/// Declarative re-key manifest for moving a local project into a team replica.
+///
+/// Each `ProjectScoped` table must appear exactly once. `id_columns` are the
+/// structural columns whose values are Cairn routable ids and must be transformed
+/// from a bare local id to `{team}~{uuid}` during a private-to-team move. Columns
+/// intentionally absent from this list, such as `runs.session_id` or provider
+/// `tool_use_id` values, stay bare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RekeyTableManifest {
+    pub table: &'static str,
+    pub id_columns: &'static [&'static str],
+}
+
+pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
+    RekeyTableManifest {
+        table: "action_configs",
+        id_columns: &["id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "action_runs",
+        id_columns: &[
+            "id",
+            "execution_id",
+            "action_config_id",
+            "issue_id",
+            "project_id",
+            "parent_job_id",
+        ],
+    },
+    RekeyTableManifest {
+        table: "artifact_content",
+        id_columns: &["id", "execution_id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "artifacts",
+        id_columns: &["id", "job_id", "parent_version_id"],
+    },
+    RekeyTableManifest {
+        table: "attention_pushes",
+        id_columns: &["id", "recipient", "delivered_event_id"],
+    },
+    RekeyTableManifest {
+        table: "attention_read_cursors",
+        id_columns: &["recipient", "source"],
+    },
+    RekeyTableManifest {
+        table: "checkpoint_command_cache",
+        id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "checkpoint_runs",
+        id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "comments",
+        id_columns: &["id", "issue_id"],
+    },
+    RekeyTableManifest {
+        table: "condition_evaluations",
+        id_columns: &["id", "execution_id"],
+    },
+    RekeyTableManifest {
+        table: "doc_references",
+        id_columns: &["id", "issue_id"],
+    },
+    RekeyTableManifest {
+        table: "event_read_tokens",
+        id_columns: &["event_id"],
+    },
+    RekeyTableManifest {
+        table: "event_vibes",
+        id_columns: &["event_id"],
+    },
+    RekeyTableManifest {
+        table: "events",
+        id_columns: &["id", "run_id", "turn_id"],
+    },
+    RekeyTableManifest {
+        table: "execution_history",
+        id_columns: &["execution_id"],
+    },
+    RekeyTableManifest {
+        table: "execution_trigger_sources",
+        id_columns: &["id", "source_job_id", "triggered_execution_id"],
+    },
+    RekeyTableManifest {
+        table: "executions",
+        id_columns: &["id", "issue_id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "file_changes",
+        id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "issue_dependencies",
+        id_columns: &["issue_id"],
+    },
+    RekeyTableManifest {
+        table: "issue_labels",
+        id_columns: &["issue_id", "label_id"],
+    },
+    RekeyTableManifest {
+        table: "issue_workspaces",
+        id_columns: &["issue_id", "execution_id"],
+    },
+    RekeyTableManifest {
+        table: "issues",
+        id_columns: &["id", "project_id", "parent_issue_id", "parent_job_id"],
+    },
+    RekeyTableManifest {
+        table: "job_browsers",
+        id_columns: &["id", "job_id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "job_terminals",
+        id_columns: &["id", "job_id", "project_id", "run_id"],
+    },
+    RekeyTableManifest {
+        table: "jobs",
+        id_columns: &[
+            "id",
+            "execution_id",
+            "parent_job_id",
+            "issue_id",
+            "project_id",
+            "current_turn_id",
+            "resume_session_id",
+        ],
+    },
+    RekeyTableManifest {
+        table: "labels",
+        id_columns: &["id"],
+    },
+    RekeyTableManifest {
+        table: "memories",
+        id_columns: &["id", "project_id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "memory_triage_issue_memories",
+        id_columns: &["issue_id", "memory_id"],
+    },
+    RekeyTableManifest {
+        table: "merge_requests",
+        id_columns: &["id", "job_id", "project_id", "issue_id"],
+    },
+    RekeyTableManifest {
+        table: "message_stream_chunks",
+        id_columns: &["id", "stream_id"],
+    },
+    RekeyTableManifest {
+        table: "message_streams",
+        id_columns: &["id", "run_id", "turn_id", "final_event_id"],
+    },
+    RekeyTableManifest {
+        table: "messages",
+        id_columns: &["id", "channel_id", "sender_run_id", "recipient_run_id"],
+    },
+    RekeyTableManifest {
+        table: "permission_requests",
+        id_columns: &["id", "run_id", "turn_id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "pr_node_port_fires",
+        id_columns: &["id", "execution_id"],
+    },
+    RekeyTableManifest {
+        table: "projects",
+        id_columns: &["id"],
+    },
+    RekeyTableManifest {
+        table: "prompts",
+        id_columns: &["id", "run_id", "turn_id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "queued_messages",
+        id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "resource_surfacings",
+        id_columns: &["id"],
+    },
+    RekeyTableManifest {
+        table: "runs",
+        id_columns: &["id", "issue_id", "project_id", "job_id", "chat_id"],
+    },
+    RekeyTableManifest {
+        table: "search_outbox",
+        id_columns: &["id", "source_id"],
+    },
+    RekeyTableManifest {
+        table: "session_skyline_cache",
+        id_columns: &["session_id"],
+    },
+    RekeyTableManifest {
+        table: "sessions",
+        id_columns: &[
+            "id",
+            "job_id",
+            "chat_id",
+            "replaced_by_id",
+            "parent_session_id",
+        ],
+    },
+    RekeyTableManifest {
+        table: "skill_configs",
+        id_columns: &["id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "suppressed_wakes",
+        id_columns: &["id", "subscription_id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "todos",
+        id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "token_rollup",
+        id_columns: &["id", "project_id", "run_id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "token_rollup_runs",
+        id_columns: &["run_id"],
+    },
+    RekeyTableManifest {
+        table: "tool_invocation_runs",
+        id_columns: &["run_id"],
+    },
+    RekeyTableManifest {
+        table: "tool_invocations",
+        id_columns: &["id", "event_id", "run_id"],
+    },
+    RekeyTableManifest {
+        table: "turns",
+        id_columns: &["id", "run_id", "job_id", "predecessor_id"],
+    },
+    RekeyTableManifest {
+        table: "wake_subscriptions",
+        id_columns: &["id", "job_id"],
+    },
+];
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
     use super::*;
     use crate::storage::{DbError, DbResult, LocalDb, MigrationRunner, RowExt};
+
+    #[test]
+    fn project_rekey_manifest_covers_project_scoped_tables() {
+        let scoped = TABLE_SCOPES
+            .iter()
+            .filter_map(|(table, scope)| {
+                matches!(scope, TableScope::ProjectScoped).then_some(*table)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let manifest = PROJECT_REKEY_MANIFEST
+            .iter()
+            .map(|entry| entry.table)
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let mut expected = scoped.clone();
+        expected.insert("execution_history");
+        assert_eq!(manifest, expected);
+    }
 
     async fn migrated_db() -> DbResult<LocalDb> {
         let temp = tempdir()?;
@@ -836,7 +1123,8 @@ mod tests {
                 "0081_drop_runs_backend".to_string(),
                 "0082_team_routing".to_string(),
                 "0083_cas_cache".to_string(),
-                "0084_archival_pack_hash".to_string()
+                "0084_archival_pack_hash".to_string(),
+                "0085_project_routes_local_path".to_string()
             ]
         );
         Ok(db)

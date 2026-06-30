@@ -47,7 +47,9 @@ pub use workspace::{
 };
 
 // Project types
-pub use project::{CreateProject, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject};
+pub use project::{
+    CreateProject, MoveProject, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject,
+};
 
 // Context token snapshot types
 pub(crate) use context_tokens::get_latest_context_token_event;

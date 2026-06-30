@@ -89,6 +89,9 @@ pub trait ContentStore: Send + Sync {
 pub struct TeamReplicaContext {
     pub team_id: TeamId,
     pub store: Arc<dyn ContentStore>,
+    /// Private database for machine-local project route metadata. Team replicas
+    /// use this to resolve `project_routes.local_repo_path` during reconstruction.
+    pub private_db: Option<Arc<LocalDb>>,
 }
 
 impl std::fmt::Debug for TeamReplicaContext {
@@ -96,6 +99,7 @@ impl std::fmt::Debug for TeamReplicaContext {
         f.debug_struct("TeamReplicaContext")
             .field("team_id", &self.team_id)
             .field("store", &"<dyn ContentStore>")
+            .field("private_db", &self.private_db.as_ref().map(|_| "<LocalDb>"))
             .finish()
     }
 }
