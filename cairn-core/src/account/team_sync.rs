@@ -83,6 +83,29 @@ pub struct TeamSyncStatus {
     pub status: TeamSyncReadiness,
 }
 
+/// Outcome of [`crate::orchestrator::Orchestrator::connect_account_teams`]: a
+/// fail-soft fan-out over [`crate::orchestrator::Orchestrator::connect_team`]
+/// for every team the account belongs to. The counts let the caller log a
+/// one-line summary; individual per-team failures are logged and swallowed so
+/// one unreachable/unprovisioned team never blocks the rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectAccountTeamsSummary {
+    /// Teams whose replica opened (or was already open).
+    pub connected: usize,
+    /// Teams the api reports as still provisioning (503).
+    pub provisioning: usize,
+    /// Teams with no sync config (404) — team sync not enabled.
+    pub not_configured: usize,
+    /// Teams skipped because no device JWT is stored (not authenticated).
+    pub not_authenticated: usize,
+    /// Teams whose connect attempt errored (logged and swallowed).
+    pub failed: usize,
+    /// Teams the account no longer belongs to that were forgotten (replica
+    /// closed, registry + routes deleted) so they stop being visible locally.
+    pub forgotten: usize,
+}
+
 /// The readiness states the create-into-team selector distinguishes, mapped
 /// fail-soft from the `/sync-config` probe (a transport/other error collapses to
 /// [`TeamSyncReadiness::NotConfigured`] so one unreachable team never sinks the

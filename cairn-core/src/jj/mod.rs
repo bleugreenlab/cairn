@@ -2028,6 +2028,50 @@ pub fn conflicted_commits(jj: &JjEnv, store: &Path, range_revset: &str) -> Vec<C
         .collect()
 }
 
+/// Classification of a branch (already rebased onto its dest) for flatten
+/// recovery. A base advance that re-applies a whole feature lineage onto a new
+/// base can record conflicts in INTERMEDIATE commits while a later commit
+/// resolves them, leaving the NET tip clean. jj still refuses to push or fold a
+/// branch whose history contains ANY conflicted commit, so a mechanically-clean
+/// tip is blocked by its own conflicted ancestors. This three-way split drives
+/// the guarded flatten that clears them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FlattenState {
+    /// No recorded conflict anywhere in `dest..branch` — nothing to recover.
+    Clean,
+    /// The branch TIP itself carries a recorded conflict. A flatten preserves the
+    /// tip tree, so it would NOT clear this — the agent must resolve the markers
+    /// and re-seal. Kept distinct so callers escalate rather than flatten.
+    TipConflicted,
+    /// The tip is clean but an INTERMEDIATE commit in `dest..branch` carries a
+    /// recorded conflict — flatten-recoverable: collapsing to one commit whose
+    /// tree equals the clean tip discards the conflicted history without changing
+    /// the net tree.
+    IntermediateOnly,
+}
+
+/// Classify a branch for flatten recovery against `dest_revset` (any revset that
+/// resolves to the dest tip — a bookmark name, `<default>@origin`, or a concrete
+/// commit id). The tip is checked FIRST so a conflicted tip is never misread as a
+/// recoverable intermediate: `conflicted_commits(dest..branch)` would include the
+/// tip too, but a conflicted tip needs manual resolution, not a flatten.
+pub fn flatten_state(
+    jj: &JjEnv,
+    store: &Path,
+    dest_revset: &str,
+    branch: &str,
+) -> Result<FlattenState, String> {
+    if branch_has_conflict(jj, store, branch)? {
+        return Ok(FlattenState::TipConflicted);
+    }
+    let range = format!("({dest_revset})..bookmarks(exact:{branch:?})");
+    if conflicted_commits(jj, store, &range).is_empty() {
+        Ok(FlattenState::Clean)
+    } else {
+        Ok(FlattenState::IntermediateOnly)
+    }
+}
+
 /// True when `tip_revset` resolves to a commit that already descends from (or
 /// equals) `dest_commit`. `tip_revset` is any single-revision revset — a
 /// `bookmarks(...)` expression, a `<name>@` workspace ref, etc. Implemented with
@@ -2237,6 +2281,357 @@ pub fn collapse_divergent_bookmark(
     Ok(CollapseOutcome::Collapsed { kept, abandoned })
 }
 
+/// The set of paths a branch changes relative to a dest, plus which of those are
+/// deletions. Captured before a flatten and re-checked after: [`squash_branch_onto`]
+/// restores the exact clean-tip tree, so the post-flatten footprint MUST match
+/// the pre-flatten one. A footprint mismatch — above all a NEW deletion of a dest
+/// file — means the flatten re-parented a stale tree (wrong base/tip) and would
+/// silently revert base files, so the guard rejects it.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BranchFootprint {
+    changed: std::collections::BTreeSet<String>,
+    deletions: std::collections::BTreeSet<String>,
+}
+
+/// Compute the tree diff footprint of `dest_commit..tip_commit` over the store.
+/// Uses the same `jj diff --git` → [`parse_git_diff`] path as `node_changed_files`,
+/// so a rename is decomposed into an added new path plus a deleted old path.
+fn branch_footprint(
+    jj: &JjEnv,
+    store: &Path,
+    dest_commit: &str,
+    tip_commit: &str,
+) -> Result<BranchFootprint, String> {
+    let out = jj.run(
+        store,
+        &[
+            "diff",
+            "--ignore-working-copy",
+            "--git",
+            "--from",
+            dest_commit,
+            "--to",
+            tip_commit,
+        ],
+        "jj diff (flatten footprint)",
+    )?;
+    let mut footprint = BranchFootprint::default();
+    for change in parse_git_diff(&out) {
+        footprint.changed.insert(change.path.clone());
+        if change.status == "deleted" {
+            footprint.deletions.insert(change.path.clone());
+        }
+        if let Some(prev) = change.previous_path {
+            // A rename removes the old path from the tree.
+            footprint.changed.insert(prev.clone());
+            footprint.deletions.insert(prev);
+        }
+    }
+    Ok(footprint)
+}
+
+/// The full description of a bookmark's tip over the store, trimmed, or empty when
+/// the bookmark does not resolve. A reconcile-time flatten preserves the branch's
+/// own seal message (not a PR title) by passing this as the squash description.
+pub fn branch_description(jj: &JjEnv, store: &Path, branch: &str) -> String {
+    jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            &format!("bookmarks(exact:{branch:?})"),
+            "--no-graph",
+            "-T",
+            "description",
+            "--ignore-working-copy",
+        ],
+        "branch description",
+    )
+    .map(|s| s.trim().to_string())
+    .unwrap_or_default()
+}
+
+/// Reset `branch` back to `tip` (a deliberate sideways/backwards move) and
+/// re-export the ref to git. Used to UNDO a [`squash_branch_onto`] when a
+/// post-squash guard in [`flatten_branch_recovery`] refuses the result: the squash
+/// has already moved the bookmark, so without this a rejected flatten would leave
+/// the visible branch rewritten. The git export is best-effort (a stale ref
+/// self-heals on the next seal); the bookmark move is load-bearing and propagated.
+fn restore_bookmark(jj: &JjEnv, store: &Path, branch: &str, tip: &str) -> Result<(), String> {
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            tip,
+            "--allow-backwards",
+            "--ignore-working-copy",
+        ],
+        "flatten: restore bookmark after guard failure",
+    )?;
+    let _ = jj.run(
+        store,
+        &["git", "export", "--ignore-working-copy"],
+        "flatten: git export after restore",
+    );
+    Ok(())
+}
+
+/// The outcome of a guarded flatten recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlattenReport {
+    /// The single commit the branch now points at: its tree equals the clean
+    /// rebased tip and its parent is `dest_commit`.
+    pub flattened_commit: String,
+    /// How many conflicted intermediate commits the flatten collapsed away
+    /// (advisory count).
+    pub collapsed_conflicted_commits: usize,
+    /// Orphaned twins of the PRE-flatten change-id that were abandoned in the
+    /// twin-cleanup pass.
+    pub abandoned_twins: Vec<String>,
+}
+
+/// Guarded flatten recovery for a clean-tip / conflicted-intermediate branch.
+///
+/// A base advance that re-applies a whole lineage onto a new base can bake
+/// conflicts into intermediate commits while a later commit resolves them, so the
+/// NET tip is clean but jj still refuses to push/fold the branch (its history
+/// contains conflicted commits). This collapses the branch to ONE commit on
+/// `dest_commit` whose tree equals the clean rebased tip — clearing the conflicted
+/// history while preserving the exact net tree — behind two guards:
+///
+/// - **Pre-guard:** the branch tip must genuinely descend from `dest_commit`.
+///   Otherwise the squash would re-parent a stale tree onto dest and revert dest's
+///   own files (the wrong-base reversion). Fails with a typed guard error.
+/// - **Post-guard (footprint):** after the squash, the flattened tree must equal
+///   the pre-flatten tip tree AND the flatten must delete no dest path that was
+///   not already a deletion in the pre-flatten footprint. A violation is a
+///   wrong-base/wrong-tip bug; the caller escalates rather than landing a
+///   footprint-unsafe flatten.
+///
+/// Then a **twin-cleanup** pass: the squash mints a fresh change-id, so any commit
+/// still sharing the PRE-flatten change-id is an orphaned twin (including the
+/// "every twin conflicted" divergence that [`collapse_divergent_bookmark`] cannot
+/// resolve). Now that a clean flattened commit exists they are safe to abandon.
+///
+/// The caller MUST hold the per-store lock (like [`collapse_divergent_bookmark`])
+/// so the flatten cannot itself fork the op log. `message` becomes the flattened
+/// commit's description (a PR title at a default landing, the branch's own seal
+/// message at a reconcile).
+pub fn flatten_branch_recovery(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest_commit: &str,
+    message: &str,
+) -> Result<FlattenReport, String> {
+    let branch_revset = format!("bookmarks(exact:{branch:?})");
+
+    // Pre-guard: the branch must genuinely descend from the dest it is about to be
+    // flattened onto, or the squash re-parents a stale tree and reverts base files.
+    if !revset_descends_from(jj, store, &branch_revset, dest_commit) {
+        return Err(format!(
+            "flatten guard: branch `{branch}` does not descend from dest `{dest_commit}`; refusing to flatten (would re-parent a stale tree and revert base files)"
+        ));
+    }
+
+    let pre_tip = bookmark_commit(jj, store, branch)
+        .ok_or_else(|| format!("flatten: branch `{branch}` did not resolve"))?;
+    let pre_change_id = change_id_of(jj, store, branch);
+    let pre_footprint = branch_footprint(jj, store, dest_commit, &pre_tip)?;
+    let pre_tree = sealed_tree_hash_via_git(jj, store, &pre_tip).ok();
+    let collapsed_conflicted_commits =
+        conflicted_commits(jj, store, &format!("{dest_commit}..{branch_revset}")).len();
+
+    // Collapse the branch to one commit on dest whose tree = the clean rebased tip.
+    squash_branch_onto(jj, store, branch, dest_commit, message)?;
+
+    // From here on the bookmark has ALREADY been rewritten by the squash, so every
+    // post-squash failure path — a footprint mismatch, a transient tree-hash read,
+    // or an unresolved post tip — must first restore the bookmark to `pre_tip`, or a
+    // refused flatten would leave the visible branch mutated despite reporting a
+    // refusal (the load-bearing safety guarantee). `fail` performs that restore and
+    // returns the reason to hand back as the `Err`.
+    let fail = |reason: String| -> String {
+        if let Err(e) = restore_bookmark(jj, store, branch, &pre_tip) {
+            log::warn!(
+                "flatten: failed to restore bookmark {branch} to {pre_tip} after a post-squash guard failure: {e}"
+            );
+        }
+        reason
+    };
+
+    let post_tip = match bookmark_commit(jj, store, branch) {
+        Some(commit) => commit,
+        None => {
+            return Err(fail(format!(
+                "flatten: branch `{branch}` did not resolve after squash"
+            )))
+        }
+    };
+
+    // Post-guard (footprint): a wrong-base/wrong-tip squash would delete dest files
+    // the branch never touched. Reject any NEW deletion, naming the offending paths.
+    let post_footprint = match branch_footprint(jj, store, dest_commit, &post_tip) {
+        Ok(footprint) => footprint,
+        Err(e) => return Err(fail(e)),
+    };
+    let new_deletions: Vec<String> = post_footprint
+        .deletions
+        .difference(&pre_footprint.deletions)
+        .cloned()
+        .collect();
+    if !new_deletions.is_empty() {
+        return Err(fail(format!(
+            "flatten footprint guard: flattening `{branch}` onto `{dest_commit}` would delete base file(s) the branch did not delete: {}. Refusing (wrong-base/wrong-tip flatten).",
+            new_deletions.join(", ")
+        )));
+    }
+    // The restore should have copied the tip tree exactly; verify byte-for-byte via
+    // the git tree object when it resolves (advisory fallback: skip on git hiccup).
+    if let Some(pre_tree) = pre_tree {
+        let post_tree = match sealed_tree_hash_via_git(jj, store, &post_tip) {
+            Ok(tree) => tree,
+            Err(e) => return Err(fail(e)),
+        };
+        if post_tree != pre_tree {
+            return Err(fail(format!(
+                "flatten footprint guard: flattened `{branch}` tree {post_tree} does not match the pre-flatten tip tree {pre_tree}. Refusing (wrong-base/wrong-tip flatten)."
+            )));
+        }
+    }
+
+    // Twin cleanup: the squash minted a fresh change-id, so any commit still
+    // sharing the PRE-flatten change-id is an orphaned twin (the old lineage tip,
+    // or every twin of an ambiguous conflicted divergence). Drop them now that a
+    // clean flattened commit exists.
+    let flattened_change_id = change_id_of(jj, store, branch);
+    let mut abandoned_twins = Vec::new();
+    if !pre_change_id.is_empty() && pre_change_id != flattened_change_id {
+        for commit in visible_commit_ids_for_change(jj, store, &pre_change_id) {
+            if commit == post_tip {
+                continue;
+            }
+            match jj.run(
+                store,
+                &["abandon", &commit, "--ignore-working-copy"],
+                "flatten: abandon orphaned twin",
+            ) {
+                Ok(_) => abandoned_twins.push(commit),
+                Err(e) => log::warn!("flatten: abandoning orphaned twin {commit} failed: {e}"),
+            }
+        }
+    }
+
+    Ok(FlattenReport {
+        flattened_commit: post_tip,
+        collapsed_conflicted_commits,
+        abandoned_twins,
+    })
+}
+
+/// Classify one sibling that is already positioned on `dest_commit` (either it was
+/// just rebased there, or it already descended from it) into the reconcile report,
+/// applying proactive flatten recovery for the clean-tip / conflicted-intermediate
+/// case. `dest_commit` is `None` only when the reconcile dest was unresolvable, in
+/// which case this falls back to the bare tip-conflict check (liveness over
+/// strictness). `push_clean` advances a cleanly-rebased sibling's PR head on
+/// origin; a FLATTENED sibling is always pushed regardless, because the flatten
+/// rewrote its commit id and origin's PR head must follow. The caller holds the
+/// per-store lock, so the flatten cannot fork.
+fn classify_reconciled_sibling(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    ws_path: &Path,
+    dest_commit: Option<&str>,
+    push_clean: bool,
+    report: &mut ReconcileReport,
+) {
+    let state = dest_commit.and_then(|dest| flatten_state(jj, store, dest, branch).ok());
+    match state {
+        // No concrete dest to classify against: fall back to the tip-conflict check.
+        None => match branch_has_conflict(jj, store, branch) {
+            Ok(true) => report.conflicted.push(branch.to_string()),
+            Ok(false) => {
+                if push_clean {
+                    if let Err(e) = push_store_bookmark(jj, store, branch) {
+                        log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
+                    }
+                }
+                report.rebased_clean.push(branch.to_string());
+            }
+            Err(e) => {
+                log::warn!("jj reconcile: conflict check for {branch} failed: {e}");
+                report.rebased_clean.push(branch.to_string());
+            }
+        },
+        Some(FlattenState::Clean) => {
+            if push_clean {
+                if let Err(e) = push_store_bookmark(jj, store, branch) {
+                    log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
+                }
+            }
+            report.rebased_clean.push(branch.to_string());
+        }
+        // A genuinely-conflicted tip needs the agent to resolve markers; a
+        // conflicted commit can never push, so it is stop-the-line.
+        Some(FlattenState::TipConflicted) => report.conflicted.push(branch.to_string()),
+        // Clean tip, conflicted intermediates: heal it in place so the branch stays
+        // pushable/mergeable at all times (no silent seal-push failure, no
+        // misleading "clean" note while the merge is actually blocked).
+        Some(FlattenState::IntermediateOnly) => {
+            let dest = dest_commit.expect("IntermediateOnly implies a concrete dest");
+            let desc = branch_description(jj, store, branch);
+            let message = if desc.is_empty() {
+                format!("Flatten {branch} onto base (auto-recovery)")
+            } else {
+                desc
+            };
+            match flatten_branch_recovery(jj, store, branch, dest, &message) {
+                Ok(recovered) => {
+                    // Re-parent the sibling's live workspace onto the flattened
+                    // commit so its `@` no longer sits on the abandoned conflicted
+                    // line; this refreshes the on-disk files via update-stale.
+                    if let Err(e) = advance_workspace_onto(
+                        jj,
+                        store,
+                        ws_path,
+                        branch,
+                        &recovered.flattened_commit,
+                    ) {
+                        log::warn!(
+                            "jj reconcile: re-parent workspace {branch} onto flattened tip failed: {e}"
+                        );
+                    }
+                    // The flatten rewrote the commit id, so the PR head must move
+                    // even when a plain clean rebase would have been skipped.
+                    if let Err(e) = push_store_bookmark(jj, store, branch) {
+                        log::warn!("jj reconcile: push flattened sibling {branch} failed: {e}");
+                    }
+                    log::info!(
+                        "jj reconcile: flattened {branch} ({} conflicted intermediate(s) collapsed, {} twin(s) abandoned)",
+                        recovered.collapsed_conflicted_commits,
+                        recovered.abandoned_twins.len()
+                    );
+                    report.rebased_clean.push(branch.to_string());
+                }
+                Err(e) => {
+                    // Guard failure: a footprint-unsafe flatten. Fall back to a
+                    // conflicted classification so the agent is interrupted rather
+                    // than the branch silently wedged.
+                    log::warn!(
+                        "jj reconcile: flatten of {branch} refused by guard ({e}); classifying conflicted"
+                    );
+                    report.conflicted.push(branch.to_string());
+                }
+            }
+        }
+    }
+}
+
 /// Reconcile in-flight siblings onto the locally-advanced integration tip: the
 /// store already owns the merge (the child's commit was folded into the
 /// integration bookmark by `merge_into_bookmark`), so there is no fetch or origin
@@ -2312,16 +2707,22 @@ pub fn reconcile_siblings(
             .map(|dest| branch_descends_from(jj, store, branch, dest))
             .unwrap_or(false);
         if already_on_dest {
-            match branch_has_conflict(jj, store, branch) {
-                Ok(true) => report.conflicted.push(branch.clone()),
-                Ok(false) => report.rebased_clean.push(branch.clone()),
-                Err(e) => {
-                    log::warn!(
-                        "jj reconcile: conflict check for already-rebased {branch} failed: {e}"
-                    );
-                    report.rebased_clean.push(branch.clone());
-                }
-            }
+            // No rebase/stale-refresh needed and (per the comment above) a plain
+            // clean sibling was already pushed by the reconcile that first put it
+            // here — but flatten recovery still runs, because a sibling that
+            // arrived here with conflicted intermediates (a prior reconcile that
+            // rebased but predates this healing) is otherwise wedged: clean tip,
+            // unpushable history. `classify_reconciled_sibling` no-ops on a truly
+            // clean branch and flattens+pushes only the intermediate-only case.
+            classify_reconciled_sibling(
+                jj,
+                store,
+                branch,
+                ws_path,
+                dest_commit.as_deref(),
+                false,
+                &mut report,
+            );
             continue;
         }
         if let Err(e) = rebase_branch_onto(jj, store, branch, integration_branch) {
@@ -2334,21 +2735,15 @@ pub fn reconcile_siblings(
                 ws_path.display()
             );
         }
-        match branch_has_conflict(jj, store, branch) {
-            Ok(true) => report.conflicted.push(branch.clone()),
-            Ok(false) => {
-                // Advance the cleanly-rebased sibling's PR head on origin.
-                // Best-effort: a no-remote project has nothing to push to.
-                if let Err(e) = push_store_bookmark(jj, store, branch) {
-                    log::warn!("jj reconcile: push rebased sibling {branch} failed: {e}");
-                }
-                report.rebased_clean.push(branch.clone());
-            }
-            Err(e) => {
-                log::warn!("jj reconcile: conflict check for {branch} failed: {e}");
-                report.rebased_clean.push(branch.clone());
-            }
-        }
+        classify_reconciled_sibling(
+            jj,
+            store,
+            branch,
+            ws_path,
+            dest_commit.as_deref(),
+            true,
+            &mut report,
+        );
     }
     Ok(report)
 }
@@ -4013,13 +4408,17 @@ index 1111111111..2222222222 100644
         }
     }
 
-    /// Acceptance requirement 3: a clean (resolved) bookmark target, once set, is
-    /// NOT dragged back onto a conflicted copy by the next reconcile. After the
-    /// base advance conflicts the overlapping child, the agent resolves the
-    /// markers and re-seals — the bookmark now points at a CLEAN commit that
-    /// descends from the integration tip. The next reconcile sees it already on
-    /// the dest and skips it, so the resolution is preserved (no regenerated
-    /// conflict) rather than re-rebased into a fresh conflicted twin.
+    /// A manually-resolved bookmark (clean tip over a conflicted intermediate) is
+    /// FLATTENED by the next reconcile, never dragged back onto a conflicted copy.
+    /// After the base advance conflicts the overlapping child, the agent resolves
+    /// the markers and re-seals — but that leaves the conflicted rebase commit as a
+    /// conflicted INTERMEDIATE in the history, so the branch is still unmergeable
+    /// (jj refuses a conflicted history). The reconcile-time flatten collapses it
+    /// to ONE clean commit on the dest, preserving the agent's resolved TREE and
+    /// clearing the conflicted intermediate, so the branch becomes genuinely
+    /// mergeable. The resolution is preserved (never regenerated as a conflict) and
+    /// the pre-flatten change-id is cleaned up (no divergent twin). This is the
+    /// automation of the old hand-run resolve-at-base flatten.
     #[test]
     #[serial_test::serial(jj)]
     fn reconcile_siblings_preserves_resolved_bookmark() {
@@ -4074,9 +4473,12 @@ index 1111111111..2222222222 100644
         let resolved_commit = bookmark_commit(&jj, &store, overlap).unwrap();
         let resolved_cid = change_id_of(&jj, &store, overlap);
 
-        // The next reconcile must NOT drag the clean bookmark back onto a
-        // conflicted copy: the child already descends from the dest, so it is
-        // skipped and classified clean, its commit id unchanged.
+        // The next reconcile FLATTENS the resolved-but-conflicted-intermediate
+        // branch: it already descends from the dest, but its history still carries
+        // the conflicted rebase commit (unmergeable), so the reconcile collapses it
+        // to one clean commit — preserving the resolved tree, never regenerating a
+        // conflict.
+        let _ = resolved_commit; // the flatten deliberately rewrites this commit id
         let report2 = reconcile_siblings(&jj, &store, int, &specs).unwrap();
         assert_eq!(
             report2.rebased_clean,
@@ -4088,15 +4490,38 @@ index 1111111111..2222222222 100644
             !branch_has_conflict(&jj, &store, overlap).unwrap(),
             "the resolution is preserved — no regenerated conflict"
         );
-        assert_eq!(
-            bookmark_commit(&jj, &store, overlap).unwrap(),
-            resolved_commit,
-            "the clean bookmark target is not silently dragged back"
+        // The branch is now genuinely mergeable: the flatten cleared the conflicted
+        // intermediate from its history.
+        let dest = bookmark_commit(&jj, &store, int).unwrap();
+        assert!(
+            conflicted_commits(
+                &jj,
+                &store,
+                &format!("{dest}..bookmarks(exact:{overlap:?})")
+            )
+            .is_empty(),
+            "the flatten cleared the conflicted intermediate — the branch is mergeable"
         );
         assert_eq!(
-            visible_commits_for_change(&jj, &store, &resolved_cid),
+            count_commits(
+                &jj,
+                &store,
+                &format!("{dest}..bookmarks(exact:{overlap:?})")
+            ),
             1,
-            "no divergent twin of the resolved change"
+            "the branch is collapsed to a single clean commit on the dest"
+        );
+        // The agent's resolved TREE is preserved though the commit was rewritten.
+        assert_eq!(
+            String::from_utf8_lossy(&file_show(&jj, &store, overlap, "shared.rs").unwrap()),
+            "resolved-by-agent\n",
+            "the flatten preserves the agent's resolved content"
+        );
+        // The pre-flatten change-id is cleaned up: no lingering (divergent) twin.
+        assert_eq!(
+            visible_commits_for_change(&jj, &store, &resolved_cid),
+            0,
+            "the pre-flatten change-id is abandoned by twin cleanup — no divergent twin"
         );
     }
 
@@ -5181,6 +5606,351 @@ index 1111111111..2222222222 100644
         assert!(
             err.contains("not a descendant"),
             "the sanitized error names the real cause: {err}"
+        );
+    }
+
+    /// Drive `DIV_SIBLING` into the clean-tip / conflicted-intermediate shape: the
+    /// integration tip advances with a conflicting `shared.rs` edit, the sibling's
+    /// original sealed commit is rebased onto it (recording a conflict on that
+    /// INTERMEDIATE commit), then a resolving seal on top leaves the TIP clean.
+    /// Returns the advanced integration tip commit id (the flatten dest).
+    fn make_intermediate_only(fx: &DivergenceFixture) -> String {
+        let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
+        rebase_branch_onto(&fx.jj, &fx.store, DIV_SIBLING, DIV_INT).unwrap();
+        assert!(
+            branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            "the rebase records a conflict on the sibling's sealed commit"
+        );
+        update_stale(&fx.jj, &fx.ws_sibling).unwrap();
+        std::fs::write(fx.ws_sibling.join("shared.rs"), "resolved\n").unwrap();
+        seal(&fx.jj, &fx.ws_sibling, "resolve conflict", None).unwrap();
+        assert!(
+            !branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap(),
+            "the resolving seal leaves the tip clean"
+        );
+        dest
+    }
+
+    /// Count the commits a range revset resolves to over the store.
+    fn count_commits(jj: &JjEnv, store: &Path, range: &str) -> usize {
+        jj.run(
+            store,
+            &[
+                "log",
+                "-r",
+                range,
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+                "--ignore-working-copy",
+            ],
+            "count commits",
+        )
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+    }
+
+    /// The core recovery: a branch with a conflicted INTERMEDIATE commit and a
+    /// clean tip is classified `IntermediateOnly`, and `flatten_branch_recovery`
+    /// collapses it to ONE clean commit on the dest whose tree equals the clean
+    /// tip — no conflict anywhere, exact tree preserved, parented on the dest.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn flatten_recovers_clean_tip_conflicted_intermediate() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping flatten_recovers_clean_tip_conflicted_intermediate: jj not resolvable"
+            );
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        let dest = make_intermediate_only(&fx);
+
+        assert_eq!(
+            flatten_state(&fx.jj, &fx.store, &dest, DIV_SIBLING).unwrap(),
+            FlattenState::IntermediateOnly,
+            "clean tip over a conflicted intermediate is flatten-recoverable"
+        );
+        let pre_tree = file_show(&fx.jj, &fx.store, DIV_SIBLING, "shared.rs").unwrap();
+
+        let report =
+            flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &dest, "flattened recovery")
+                .unwrap();
+        assert!(
+            report.collapsed_conflicted_commits >= 1,
+            "the flatten collapsed at least the conflicted intermediate"
+        );
+
+        // Exactly one commit remains in dest..branch, and it carries no conflict.
+        let range = format!("{dest}..bookmarks(exact:{DIV_SIBLING:?})");
+        assert_eq!(
+            count_commits(&fx.jj, &fx.store, &range),
+            1,
+            "the branch is collapsed to a single commit on the dest"
+        );
+        assert!(
+            conflicted_commits(&fx.jj, &fx.store, &range).is_empty(),
+            "no conflicted commit survives the flatten"
+        );
+        assert!(!branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap());
+
+        // The net tree is preserved exactly.
+        let post_tree = file_show(&fx.jj, &fx.store, DIV_SIBLING, "shared.rs").unwrap();
+        assert_eq!(
+            post_tree, pre_tree,
+            "the flattened tree equals the clean tip tree"
+        );
+        assert_eq!(String::from_utf8_lossy(&post_tree), "resolved\n");
+
+        // The single commit's only parent is the dest.
+        let parents = fx
+            .jj
+            .run(
+                &fx.store,
+                &[
+                    "log",
+                    "-r",
+                    &format!("bookmarks(exact:{DIV_SIBLING:?})"),
+                    "--no-graph",
+                    "--ignore-working-copy",
+                    "-T",
+                    "parents.map(|c| c.commit_id()).join(\",\")",
+                ],
+                "flattened parents",
+            )
+            .unwrap();
+        assert_eq!(
+            parents, dest,
+            "the flattened commit is parented on the dest"
+        );
+    }
+
+    /// The footprint pre-guard: flattening onto a base the branch does NOT descend
+    /// from returns the typed guard error and leaves the bookmark UNMUTATED (the
+    /// squash never runs), so a wrong-base flatten can never revert base files.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn flatten_footprint_guard_rejects_wrong_base() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping flatten_footprint_guard_rejects_wrong_base: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        // A second sibling off the integration branch on a divergent line: the
+        // first sibling does not descend from it, so it is a wrong flatten base.
+        let wts2 = TempDir::new().unwrap();
+        let other = "agent/CAIRN-9-builder-0";
+        let ws_other = wts2.path().join("other");
+        add_workspace(&fx.jj, &fx.store, &ws_other, other, DIV_INT, None).unwrap();
+        std::fs::write(ws_other.join("other2.rs"), "x\n").unwrap();
+        seal(&fx.jj, &ws_other, "other edits other2", None).unwrap();
+        let wrong_dest = bookmark_commit(&fx.jj, &fx.store, other).unwrap();
+
+        let before = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        let err = flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &wrong_dest, "wrong")
+            .unwrap_err();
+        assert!(
+            err.contains("does not descend"),
+            "the pre-guard names the wrong-base cause: {err}"
+        );
+        let after = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected flatten does not mutate the bookmark"
+        );
+    }
+
+    /// Twin/orphan cleanup: the squash mints a fresh change-id, so every commit
+    /// sharing the PRE-flatten change-id (the orphaned old lineage tip, and any
+    /// conflicted divergent twin) is abandoned — no commit retains the old id.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn flatten_abandons_orphaned_change_id_commits() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping flatten_abandons_orphaned_change_id_commits: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        let dest = make_intermediate_only(&fx);
+        let pre_change = change_id_of(&fx.jj, &fx.store, DIV_SIBLING);
+        assert!(
+            visible_commits_for_change(&fx.jj, &fx.store, &pre_change) >= 1,
+            "precondition: the pre-flatten change-id is visible"
+        );
+
+        let report =
+            flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &dest, "flattened").unwrap();
+        assert!(
+            !report.abandoned_twins.is_empty(),
+            "the orphaned old lineage tip is abandoned"
+        );
+        assert_eq!(
+            visible_commits_for_change(&fx.jj, &fx.store, &pre_change),
+            0,
+            "no commit retains the pre-flatten change-id after cleanup"
+        );
+        assert_ne!(
+            pre_change,
+            change_id_of(&fx.jj, &fx.store, DIV_SIBLING),
+            "the flattened commit carries a fresh change-id"
+        );
+    }
+
+    /// End-to-end reconcile: a sibling in the clean-tip / conflicted-intermediate
+    /// shape is FLATTENED by `reconcile_siblings` (not left wedged), classified
+    /// `rebased_clean`, and pushed so its PR head advances on origin — the branch is
+    /// pushable/mergeable with no hand-run jj.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn reconcile_siblings_flattens_intermediate_only_sibling() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping reconcile_siblings_flattens_intermediate_only_sibling: jj not resolvable"
+            );
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let origin = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        init_project(proj.path());
+        git(
+            proj.path(),
+            &["remote", "add", "origin", &origin.path().to_string_lossy()],
+        );
+        git(proj.path(), &["push", "-q", "origin", "main"]);
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let int = "agent/CAIRN-1940-coordinator-0";
+        add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+        ensure_bookmark_on_origin(&jj, &store, int).unwrap();
+
+        let sibling = "agent/CAIRN-1-builder-0";
+        let ws = wts.path().join("sib");
+        add_workspace(&jj, &store, &ws, sibling, int, None).unwrap();
+        std::fs::write(ws.join("shared.rs"), "sibling-edit\n").unwrap();
+        seal(&jj, &ws, "sibling edits shared", None).unwrap();
+        push_to_origin(&jj, &ws, sibling);
+        let origin_before = git_stdout(origin.path(), &["rev-parse", sibling]);
+
+        // Advance the integration tip conflictingly and publish it.
+        jj.run(&store, &["new", int], "new on int").unwrap();
+        std::fs::write(store.join("shared.rs"), "integration-advanced\n").unwrap();
+        jj.run(
+            &store,
+            &["describe", "-m", "int advances shared"],
+            "describe",
+        )
+        .unwrap();
+        jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
+            .unwrap();
+        jj.run(
+            &store,
+            &["git", "push", "--remote", "origin", "--bookmark", int],
+            "push int",
+        )
+        .unwrap();
+
+        // Drive the sibling into the clean-tip / conflicted-intermediate shape:
+        // rebase onto the conflicting tip, then resolve on top.
+        rebase_branch_onto(&jj, &store, sibling, int).unwrap();
+        assert!(branch_has_conflict(&jj, &store, sibling).unwrap());
+        update_stale(&jj, &ws).unwrap();
+        std::fs::write(ws.join("shared.rs"), "resolved\n").unwrap();
+        seal(&jj, &ws, "resolve conflict", None).unwrap();
+        assert!(!branch_has_conflict(&jj, &store, sibling).unwrap());
+        let dest = bookmark_commit(&jj, &store, int).unwrap();
+        assert_eq!(
+            flatten_state(&jj, &store, &dest, sibling).unwrap(),
+            FlattenState::IntermediateOnly
+        );
+
+        // The reconcile flattens the sibling (already-on-dest path), classifies it
+        // clean, and pushes the flattened tip to origin.
+        let report =
+            reconcile_siblings(&jj, &store, int, &[(sibling.to_string(), ws.clone())]).unwrap();
+        assert_eq!(report.rebased_clean, vec![sibling.to_string()]);
+        assert!(report.conflicted.is_empty());
+
+        let range = format!("{dest}..bookmarks(exact:{sibling:?})");
+        assert_eq!(
+            count_commits(&jj, &store, &range),
+            1,
+            "sibling collapsed to one commit"
+        );
+        assert!(conflicted_commits(&jj, &store, &range).is_empty());
+        assert!(!branch_has_conflict(&jj, &store, sibling).unwrap());
+
+        let origin_after = git_stdout(origin.path(), &["rev-parse", sibling]);
+        assert_ne!(
+            origin_before, origin_after,
+            "the flattened sibling's PR head advanced on origin"
+        );
+        // A flattened (clean) bookmark pushes; the wedge is gone.
+        assert!(
+            jj.run(
+                &store,
+                &["git", "push", "--remote", "origin", "--bookmark", sibling],
+                "re-push flattened",
+            )
+            .is_ok(),
+            "the flattened sibling is pushable"
+        );
+    }
+
+    /// `restore_bookmark` undoes a `squash_branch_onto`: after the squash moves the
+    /// bookmark to a new flattened commit, restoring it returns the bookmark to the
+    /// exact pre-squash tip and its full multi-commit lineage. This is the recovery
+    /// the post-squash flatten guards run so a refused flatten never leaves the
+    /// branch rewritten. (The footprint guard itself cannot be triggered through the
+    /// real jj harness — `squash_branch_onto` restores the exact tip tree, so the
+    /// post/pre footprints are equal by construction — so the restore mechanism is
+    /// covered directly here rather than via a forced guard failure.)
+    #[test]
+    #[serial_test::serial(jj)]
+    fn restore_bookmark_resets_a_squashed_branch() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping restore_bookmark_resets_a_squashed_branch: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+        let branch = "agent/CAIRN-3001-builder-0";
+        let ws = wts.path().join("src");
+        add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+        for i in 1..=2 {
+            std::fs::write(ws.join(format!("c{i}.rs")), format!("c{i}\n")).unwrap();
+            seal(&jj, &ws, &format!("c{i}"), None).unwrap();
+        }
+        let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
+
+        squash_branch_onto(&jj, &store, branch, "main", "squashed").unwrap();
+        assert_ne!(
+            bookmark_commit(&jj, &store, branch).unwrap(),
+            pre_tip,
+            "the squash moved the bookmark off the pre-squash tip"
+        );
+
+        restore_bookmark(&jj, &store, branch, &pre_tip).unwrap();
+        assert_eq!(
+            bookmark_commit(&jj, &store, branch).unwrap(),
+            pre_tip,
+            "restore returns the bookmark to the exact pre-squash tip"
+        );
+        assert_eq!(
+            count_commits(&jj, &store, &format!("main..bookmarks(exact:{branch:?})")),
+            2,
+            "the original multi-commit lineage is restored (the squash is fully undone)"
         );
     }
 

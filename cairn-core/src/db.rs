@@ -426,6 +426,47 @@ impl DbState {
         Ok(())
     }
 
+    /// Team ids currently in the private `teams` registry — the durable
+    /// "which teams to reopen at startup" set. The account-teams reconcile
+    /// diffs this against the account's current org memberships to find teams
+    /// the user no longer belongs to and forget them.
+    pub async fn registered_team_ids(&self) -> DbResult<Vec<String>> {
+        self.local
+            .query_all("SELECT id FROM teams", (), |row| row.text(0))
+            .await
+    }
+
+    /// Fully forget a team the account no longer belongs to. Stops its sync loop
+    /// and drops its open replica (`close_team`), removes its in-memory route
+    /// cache entries, and deletes its durable `project_routes` and `teams`
+    /// registry rows — so it neither serves reads now (project listing iterates
+    /// only open replicas) nor reopens at the next `load_routing_catalog`. The
+    /// on-disk replica file is left in place (inert once closed and
+    /// deregistered); a rejoin re-bootstraps it. Idempotent: a team never
+    /// registered or opened is a no-op. Returns whether a registry row existed.
+    pub async fn forget_team(&self, team_id: &str) -> DbResult<bool> {
+        // In-memory teardown: abort the sync tasks and drop the replica handle.
+        self.close_team(team_id).await;
+        // Drop route-cache entries that pointed at this team so a stale read
+        // can't resolve to the now-closed replica before the durable delete.
+        self.routes
+            .write()
+            .await
+            .retain(|_key, target| target.as_deref() != Some(team_id));
+        // Durable removal: routes first, then the registry row.
+        self.local
+            .execute(
+                "DELETE FROM project_routes WHERE team_id = ?1",
+                (team_id.to_string(),),
+            )
+            .await?;
+        let affected = self
+            .local
+            .execute("DELETE FROM teams WHERE id = ?1", (team_id.to_string(),))
+            .await?;
+        Ok(affected > 0)
+    }
+
     /// Test accessor: number of currently-open team replicas.
     #[cfg(feature = "test-utils")]
     pub async fn open_team_count(&self) -> usize {
@@ -799,6 +840,49 @@ mod tests {
             dbs.route_scope_for_project("legacy").await,
             RouteScope::Team("teamABC123".to_string())
         );
+    }
+
+    /// Forgetting a team removes its registry row, its project routes, and its
+    /// in-memory route-cache entries, so it neither serves reads nor reopens.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forget_team_removes_registry_routes_and_cache() {
+        let dbs = db_state("db-bridge-forget.db").await;
+        dbs.upsert_team_registry("teamABC123", "Team", "http://sync", "/tmp/t.db")
+            .await
+            .unwrap();
+        dbs.set_route("PROJ", Some("teamABC123".to_string())).await;
+        dbs.local
+            .execute(
+                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('PROJ', 'teamABC123', 0)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        assert!(dbs.forget_team("teamABC123").await.unwrap());
+
+        // Registry row gone — won't reopen at startup.
+        assert!(dbs.registered_team_ids().await.unwrap().is_empty());
+        // Durable route row gone.
+        let routes = dbs
+            .local
+            .query_all(
+                "SELECT project_key FROM project_routes WHERE team_id = 'teamABC123'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert!(routes.is_empty());
+        // Route cache no longer resolves the project to the team.
+        assert_eq!(dbs.route_scope_for_project("PROJ").await, RouteScope::Local);
+    }
+
+    /// Forgetting a team that was never registered is a no-op returning `false`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn forget_team_unregistered_is_noop() {
+        let dbs = db_state("db-bridge-forget-noop.db").await;
+        assert!(!dbs.forget_team("teamABC123").await.unwrap());
     }
 
     /// The team-id guard rejects a malformed routing prefix at the registration

@@ -19,6 +19,7 @@ pub use manager::AccountManager;
 pub use org_tokens::OrgTokenCache;
 pub use team_sync::{
     fetch_team_sync_config, mint_team_sync_token, probe_team_sync_status, read_device_jwt,
-    SyncConfig, SyncConfigStatus, TeamConnectStatus, TeamSyncReadiness, TeamSyncStatus,
+    ConnectAccountTeamsSummary, SyncConfig, SyncConfigStatus, TeamConnectStatus, TeamSyncReadiness,
+    TeamSyncStatus,
 };
 pub use team_token_minter::{DefaultTeamTokenMinter, TeamTokenMinter};

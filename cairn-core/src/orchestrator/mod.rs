@@ -1025,6 +1025,93 @@ impl Orchestrator {
         Ok(probe_team_sync_status(&client, &device_jwt, &team_ids, &self.api_config).await)
     }
 
+    /// Auto-connect every team the account belongs to: a fail-soft fan-out over
+    /// [`Self::connect_team`] for each org membership. This is the single
+    /// reconcile primitive behind the startup, sign-in, and membership-refresh
+    /// triggers that make a joined team's projects and issues visible without a
+    /// create-into-team flow.
+    ///
+    /// A per-team failure is logged and swallowed so one unreachable or
+    /// unprovisioned team never blocks the rest — mirroring
+    /// [`crate::account::probe_team_sync_status`]'s fail-soft contract.
+    /// `Provisioning`/`NotConfigured`/`NotAuthenticated` open nothing and are
+    /// simply retried on the next reconcile. Because `connect_team` is
+    /// idempotent (its `open_team` is single-flight and `upsert_team_registry`
+    /// is an upsert), this is safe to call repeatedly. Strict no-op for
+    /// local-only installs: no account means no memberships means nothing to do.
+    pub async fn connect_account_teams(&self) -> crate::account::ConnectAccountTeamsSummary {
+        use crate::account::{ConnectAccountTeamsSummary, TeamConnectStatus};
+
+        let team_ids: Vec<String> = match crate::account::queries::get(&self.db.local).await {
+            Ok(Some(conn)) => conn.org_memberships.into_iter().map(|m| m.org_id).collect(),
+            // No account row: strict no-op. We only forget a team when we
+            // positively know the current membership set excludes it; a missing
+            // account (transient read gap, or a logout handled elsewhere) must
+            // not tear down team data.
+            Ok(None) => return ConnectAccountTeamsSummary::default(),
+            Err(error) => {
+                log::warn!("connect_account_teams: failed to read account memberships: {error}");
+                return ConnectAccountTeamsSummary::default();
+            }
+        };
+
+        let mut summary = ConnectAccountTeamsSummary::default();
+
+        // Subtractive reconcile FIRST: forget every registered team the account
+        // no longer belongs to, so a member removed from a team loses local
+        // visibility (its replica closes and it won't reopen at startup). The
+        // membership set is authoritative here — an empty set (account in zero
+        // teams) correctly forgets all previously-registered teams. The api
+        // remains the ultimate authority; this enforces it on the client too.
+        let membership_set: std::collections::HashSet<&str> =
+            team_ids.iter().map(String::as_str).collect();
+        match self.db.registered_team_ids().await {
+            Ok(registered) => {
+                for team_id in registered {
+                    if membership_set.contains(team_id.as_str()) {
+                        continue;
+                    }
+                    match self.db.forget_team(&team_id).await {
+                        Ok(_) => summary.forgotten += 1,
+                        Err(error) => log::warn!(
+                            "connect_account_teams: failed to forget team `{team_id}`: {error}"
+                        ),
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("connect_account_teams: failed to list registered teams: {error}");
+            }
+        }
+
+        for team_id in team_ids {
+            match self.connect_team(&team_id).await {
+                Ok(TeamConnectStatus::Connected) => summary.connected += 1,
+                Ok(TeamConnectStatus::Provisioning) => summary.provisioning += 1,
+                Ok(TeamConnectStatus::NotConfigured) => summary.not_configured += 1,
+                Ok(TeamConnectStatus::NotAuthenticated) => summary.not_authenticated += 1,
+                Err(error) => {
+                    log::warn!(
+                        "connect_account_teams: team `{team_id}` failed to connect: {error}"
+                    );
+                    summary.failed += 1;
+                }
+            }
+        }
+        if summary.connected > 0 || summary.failed > 0 || summary.forgotten > 0 {
+            log::info!(
+                "connect_account_teams: {} connected, {} provisioning, {} not-configured, {} not-authenticated, {} failed, {} forgotten",
+                summary.connected,
+                summary.provisioning,
+                summary.not_configured,
+                summary.not_authenticated,
+                summary.failed,
+                summary.forgotten,
+            );
+        }
+        summary
+    }
+
     /// Send a job to the embed worker. Non-blocking; a no-op if the worker
     /// hasn't been started.
     fn send_embed_job(&self, job: EmbedJob) {
@@ -1689,5 +1776,208 @@ mod tests {
         insert_expired_account_jwt(&db, "stale-account-jwt").await;
         let (account, anon) = managers(db);
         assert_eq!(resolve_embed_token(&account, &anon), None);
+    }
+
+    // ── connect_account_teams: fail-soft fan-out ────────────────────────────
+
+    /// Insert an account with the given org memberships (`org_id`, `org_name`)
+    /// and, when `jwt` is `Some`, a valid device JWT. Populates the
+    /// `org_memberships` JSON so `connect_account_teams` has teams to enumerate.
+    async fn insert_account_teams(db: &DbState, jwt: Option<&str>, teams: &[(&str, &str)]) {
+        let enc = jwt.map(|j| encrypt_jwt_for_storage(j).unwrap());
+        let memberships: Vec<serde_json::Value> = teams
+            .iter()
+            .map(|(id, name)| serde_json::json!({"orgId": id, "orgName": name, "role": "member"}))
+            .collect();
+        let memberships_json = serde_json::to_string(&memberships).unwrap();
+        db.local
+            .write(|conn| {
+                let enc = enc.clone();
+                let memberships_json = memberships_json.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO account (user_id, email, name, device_id, plan,
+                             jwt_encrypted, jwt_expires_at, org_memberships, connected_at, updated_at)
+                         VALUES ('u1','a@b.com','A','dev','free', ?1, ?2, ?3, 0, 0)",
+                        (
+                            enc.as_deref(),
+                            chrono::Utc::now().timestamp() + 3600,
+                            memberships_json.as_str(),
+                        ),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Build an orchestrator whose cloud API points at `base_url` (a mock).
+    fn orch_with_api(db: Arc<DbState>, base_url: String) -> Orchestrator {
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db, services, tempfile::tempdir().unwrap().keep())
+            .api_config(ApiConfig { base_url })
+            .build()
+    }
+
+    /// Multi-connection mock: reply to each `/teams/<id>/sync-config` request
+    /// with a status mapped by team id. Loops until the listener drops. Loopback
+    /// only (fence-safe); std sockets on a background thread keep it independent
+    /// of tokio's IO feature set.
+    fn routing_sync_config_mock(
+        routes: std::collections::HashMap<String, (&'static str, &'static str)>,
+    ) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status_line, body) = routes
+                    .iter()
+                    .find(|(team_id, _)| req.contains(&format!("/teams/{team_id}/")))
+                    .map(|(_, resp)| *resp)
+                    .unwrap_or(("HTTP/1.1 404 Not Found", r#"{"error":"x"}"#));
+                let response = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes());
+                let _ = sock.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn connect_account_teams_no_account_is_noop() {
+        // Local-only install: no account row => no memberships => strict no-op.
+        let db = test_db().await;
+        let orch = orch_with_api(db.clone(), "http://127.0.0.1:1".to_string());
+        let summary = orch.connect_account_teams().await;
+        assert_eq!(
+            summary,
+            crate::account::ConnectAccountTeamsSummary::default()
+        );
+        assert_eq!(db.open_team_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn connect_account_teams_without_jwt_reports_not_authenticated() {
+        // Memberships present but no device JWT: every team maps to
+        // NotAuthenticated with no network call, and nothing opens.
+        let db = test_db().await;
+        insert_account_teams(&db, None, &[("t1", "T1"), ("t2", "T2")]).await;
+        let orch = orch_with_api(db.clone(), "http://127.0.0.1:1".to_string());
+        let summary = orch.connect_account_teams().await;
+        assert_eq!(summary.not_authenticated, 2);
+        assert_eq!(summary.connected, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(db.open_team_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn connect_account_teams_is_fail_soft_over_mixed_teams() {
+        // A mix of provisioning (503) and not-configured (404) teams: the batch
+        // never errors, maps each team to its status, and opens nothing.
+        let db = test_db().await;
+        insert_account_teams(&db, Some("jwt"), &[("t1", "T1"), ("t2", "T2")]).await;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "t1".to_string(),
+            ("HTTP/1.1 503 Service Unavailable", r#"{"error":"x"}"#),
+        );
+        routes.insert(
+            "t2".to_string(),
+            ("HTTP/1.1 404 Not Found", r#"{"error":"x"}"#),
+        );
+        let base = routing_sync_config_mock(routes);
+        let orch = orch_with_api(db.clone(), base);
+        let summary = orch.connect_account_teams().await;
+        assert_eq!(summary.provisioning, 1);
+        assert_eq!(summary.not_configured, 1);
+        assert_eq!(summary.connected, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(db.open_team_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn connect_account_teams_forgets_teams_the_account_left() {
+        // A previously-connected team (registered + open replica + a route) that
+        // is no longer in the account's memberships must be forgotten: its
+        // replica closed and its registry row deleted so it neither serves reads
+        // nor reopens at startup. This ties memberships_match's leave detection
+        // to actually hiding the removed team.
+        let db = test_db().await;
+        // The account belongs to t1 only (t2 was left).
+        insert_account_teams(&db, Some("jwt"), &[("t1", "T1")]).await;
+        // t2 is registered and open from a prior membership.
+        db.upsert_team_registry("t2", "T2", "http://broker/t2", "/tmp/t2.db")
+            .await
+            .unwrap();
+        db.insert_team_db_for_test("t2", db.local.clone()).await;
+        db.local
+            .execute(
+                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('PROJ2', 't2', 0)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.set_route("PROJ2", Some("t2".to_string())).await;
+
+        // t1's connect will fail (no reachable broker), which is irrelevant to
+        // the subtractive leave path being validated here.
+        let orch = orch_with_api(db.clone(), "http://127.0.0.1:1".to_string());
+        let summary = orch.connect_account_teams().await;
+
+        assert_eq!(summary.forgotten, 1, "the left team t2 must be forgotten");
+        assert_eq!(db.open_team_count().await, 0, "t2's replica must be closed");
+        assert!(
+            db.registered_team_ids().await.unwrap().is_empty(),
+            "t2 must be deregistered so it won't reopen at startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_account_teams_keeps_current_teams_registered() {
+        // A registered team that IS still in the membership set is not forgotten
+        // by the subtractive pass (guard against over-eager teardown).
+        let db = test_db().await;
+        insert_account_teams(&db, Some("jwt"), &[("t1", "T1")]).await;
+        db.upsert_team_registry("t1", "T1", "http://broker/t1", "/tmp/t1.db")
+            .await
+            .unwrap();
+
+        let orch = orch_with_api(db.clone(), "http://127.0.0.1:1".to_string());
+        let summary = orch.connect_account_teams().await;
+
+        assert_eq!(summary.forgotten, 0, "a current team must not be forgotten");
+        assert_eq!(
+            db.registered_team_ids().await.unwrap(),
+            vec!["t1".to_string()],
+            "t1 stays registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_account_teams_swallows_unreachable_team() {
+        // An unreachable api (connection refused) makes connect_team error; the
+        // batch counts it failed and still returns without erroring the whole run.
+        let db = test_db().await;
+        insert_account_teams(&db, Some("jwt"), &[("t1", "T1")]).await;
+        // Reserve a port, then drop the listener so the connection is refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let orch = orch_with_api(db.clone(), format!("http://{addr}"));
+        let summary = orch.connect_account_teams().await;
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.connected, 0);
+        assert_eq!(db.open_team_count().await, 0);
     }
 }

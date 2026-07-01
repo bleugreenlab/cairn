@@ -32,6 +32,13 @@ impl ApiConfig {
         format!("{}/tokens/device/{}", self.base_url, device_id)
     }
 
+    /// Read-only device org-memberships endpoint (GET, device-JWT-authed). Mints
+    /// no token, so the account-refresh loop can poll membership each tick to
+    /// discover newly-joined teams without minting a JWT every time.
+    pub fn device_orgs_url(&self) -> String {
+        format!("{}/tokens/device/orgs", self.base_url)
+    }
+
     /// Anonymous (account-less) device registration endpoint.
     /// Returns a long-lived, user-less device JWT usable only on `/embed`.
     pub fn anon_device_url(&self) -> String {
@@ -89,6 +96,10 @@ mod tests {
         assert_eq!(
             config.device_url("dev-123"),
             "https://api.cairn.computer/tokens/device/dev-123"
+        );
+        assert_eq!(
+            config.device_orgs_url(),
+            "https://api.cairn.computer/tokens/device/orgs"
         );
         assert_eq!(
             config.anon_device_url(),

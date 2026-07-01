@@ -312,6 +312,13 @@ async fn refresh_loop(
             }
         };
 
+        // Reconcile org memberships each connected tick, independent of the
+        // token-expiry gate below. The token refresh only fires near expiry, so
+        // it alone can't bound how quickly a team joined mid-session becomes
+        // visible; polling the read-only orgs endpoint here caps that latency at
+        // one interval. Best-effort: any error leaves the stored set untouched.
+        reconcile_org_memberships(&db, &emitter, &client, &api_config, &jwt).await;
+
         let expires_at = match expires_at_opt {
             Some(exp) => exp,
             None => continue,
@@ -398,6 +405,127 @@ async fn refresh_loop(
             consecutive_failures = 0;
         }
     }
+}
+
+/// Fetch the account's current org memberships and, when they differ from the
+/// stored set, persist the new set and emit `account-updated` so the frontend
+/// can auto-connect newly-joined teams (and drop ones the user left). Compares
+/// full `(org_id, org_name, role)` tuples so a rename also refreshes the cached
+/// account view. Best-effort and side-effect-free on error or when unchanged.
+async fn reconcile_org_memberships(
+    db: &DbState,
+    emitter: &Arc<dyn EventEmitter>,
+    client: &reqwest::Client,
+    api_config: &crate::api::ApiConfig,
+    device_jwt: &str,
+) {
+    let fetched = match fetch_org_memberships(client, api_config, device_jwt).await {
+        Ok(memberships) => memberships,
+        Err(error) => {
+            log::debug!("Account refresh: org membership fetch skipped: {error}");
+            return;
+        }
+    };
+
+    let stored = match get_account_connection(db).await {
+        Ok(Some(conn)) => conn.org_memberships,
+        // No account (raced with a disconnect) or a read error: nothing to do.
+        _ => return,
+    };
+
+    if memberships_match(&stored, &fetched) {
+        return;
+    }
+
+    let json = match serde_json::to_string(&fetched) {
+        Ok(json) => json,
+        Err(error) => {
+            log::warn!("Account refresh: failed to serialize memberships: {error}");
+            return;
+        }
+    };
+
+    if let Err(error) = update_org_memberships(db, &json).await {
+        log::warn!("Account refresh: failed to persist memberships: {error}");
+        return;
+    }
+
+    log::info!(
+        "Account org memberships changed ({} team(s)); emitting account-updated",
+        fetched.len()
+    );
+    let _ = emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "account", "action": "upsert"}),
+    );
+    let _ = emitter.emit("account-updated", serde_json::json!({}));
+}
+
+/// Fetch the account's org memberships from the read-only `/tokens/device/orgs`
+/// endpoint. Returns an error (not an empty list) on any non-success status or
+/// transport failure, so the caller leaves the stored set untouched rather than
+/// wiping memberships on a transient blip.
+async fn fetch_org_memberships(
+    client: &reqwest::Client,
+    api_config: &crate::api::ApiConfig,
+    device_jwt: &str,
+) -> Result<Vec<OrgMembership>, String> {
+    let resp = client
+        .get(api_config.device_orgs_url())
+        .bearer_auth(device_jwt)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("orgs endpoint returned {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse failed: {e}"))?;
+    let orgs = body
+        .get("orgs")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+    serde_json::from_value(orgs).map_err(|e| format!("deserialize orgs failed: {e}"))
+}
+
+/// Order-insensitive equality of two membership sets on `(org_id, org_name,
+/// role)`, so a reorder from the api doesn't spuriously churn the stored set.
+fn memberships_match(a: &[OrgMembership], b: &[OrgMembership]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<(&str, &str, &str)> = a
+        .iter()
+        .map(|m| (m.org_id.as_str(), m.org_name.as_str(), m.role.as_str()))
+        .collect();
+    let mut b: Vec<(&str, &str, &str)> = b
+        .iter()
+        .map(|m| (m.org_id.as_str(), m.org_name.as_str(), m.role.as_str()))
+        .collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
+}
+
+/// Persist a new `org_memberships` JSON blob on the account row.
+async fn update_org_memberships(db: &DbState, memberships_json: &str) -> Result<(), String> {
+    let json = memberships_json.to_string();
+    db.local
+        .write(|conn| {
+            let json = json.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE account SET org_memberships = ?1, updated_at = ?2",
+                    (json.as_str(), chrono::Utc::now().timestamp()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| account_db_error("Failed to update org memberships", error))
 }
 
 async fn upsert_account(db: &DbState, account: DbAccount) -> Result<(), String> {
@@ -672,6 +800,52 @@ mod tests {
     fn decode_device_jwt_invalid_base64_fails() {
         let result = decode_device_jwt_claims("header.!!!invalid!!!.sig");
         assert!(result.is_err());
+    }
+
+    fn membership(id: &str, name: &str, role: &str) -> OrgMembership {
+        OrgMembership {
+            org_id: id.to_string(),
+            org_name: name.to_string(),
+            role: role.to_string(),
+        }
+    }
+
+    #[test]
+    fn memberships_match_is_order_insensitive() {
+        let a = vec![
+            membership("o1", "One", "member"),
+            membership("o2", "Two", "owner"),
+        ];
+        let b = vec![
+            membership("o2", "Two", "owner"),
+            membership("o1", "One", "member"),
+        ];
+        assert!(memberships_match(&a, &b));
+    }
+
+    #[test]
+    fn memberships_match_detects_join_leave_and_rename() {
+        let base = vec![membership("o1", "One", "member")];
+        // A newly-joined team.
+        assert!(!memberships_match(
+            &base,
+            &[
+                membership("o1", "One", "member"),
+                membership("o2", "Two", "member")
+            ]
+        ));
+        // A left team.
+        assert!(!memberships_match(&base, &[]));
+        // A rename (same id, different name) still counts as a change.
+        assert!(!memberships_match(
+            &base,
+            &[membership("o1", "Renamed", "member")]
+        ));
+        // A role change counts as a change.
+        assert!(!memberships_match(
+            &base,
+            &[membership("o1", "One", "owner")]
+        ));
     }
 
     #[test]

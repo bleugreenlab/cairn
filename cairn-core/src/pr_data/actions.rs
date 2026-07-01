@@ -313,6 +313,14 @@ async fn load_mr_branches(db: &LocalDb, mr_id: &str) -> Result<Option<(String, S
 /// source, so `commits` is never empty.
 pub(crate) struct SourceConflictReport {
     pub commits: Vec<crate::jj::ConflictedCommit>,
+    /// Whether the source bookmark's TIP carries a recorded conflict. A conflicted
+    /// tip is a HARD block — a flatten preserves the tip tree, so only the agent
+    /// resolving markers and re-sealing clears it. A clean tip with conflicted
+    /// INTERMEDIATE commits (this is `false`) is AUTO-RECOVERABLE: the guarded
+    /// flatten at merge time collapses the branch to its clean tip. The merge gate
+    /// and the mergeable override key off this, not off the mere presence of a
+    /// conflict somewhere in the range.
+    pub tip_conflicted: bool,
 }
 
 /// `None` when the source branch is clean; `Some(report)` when its history
@@ -341,7 +349,15 @@ pub(crate) fn source_conflict_report(
         None => source_revset,
     };
     let commits = crate::jj::conflicted_commits(&jj, &store, &range);
-    (!commits.is_empty()).then_some(SourceConflictReport { commits })
+    if commits.is_empty() {
+        return None;
+    }
+    let tip_conflicted =
+        crate::jj::branch_has_conflict(&jj, &store, source_branch).unwrap_or(false);
+    Some(SourceConflictReport {
+        commits,
+        tip_conflicted,
+    })
 }
 
 /// Render a conflicted-commit list as compact markdown bullets, one per commit,
@@ -399,8 +415,11 @@ fn conflicted_history_detail(
     )
 }
 
-/// Mergeability override for a jj PR read path: `Conflicting` when the source
-/// bookmark has a recorded conflict, else `None` (keep the GitHub value).
+/// Mergeability override for a jj PR read path: `Conflicting` only when the source
+/// bookmark's TIP carries a recorded conflict (a hard block), else `None` (keep
+/// the GitHub value). A clean-tip / conflicted-intermediate branch is
+/// auto-recoverable via the merge-time flatten, so it is NOT surfaced as a hard
+/// `Conflicting` that disables the merge button.
 async fn jj_conflict_mergeable_override(
     orch: &Orchestrator,
     repo_path: &str,
@@ -414,6 +433,7 @@ async fn jj_conflict_mergeable_override(
         &source_branch,
         Some(&target_branch),
     )
+    .filter(|report| report.tip_conflicted)
     .map(|_| MergeableState::Conflicting)
 }
 
@@ -1388,7 +1408,7 @@ pub async fn render_live_pr_section(
             Some(tgt),
         )
     });
-    if source_conflict.is_some() {
+    if source_conflict.as_ref().is_some_and(|r| r.tip_conflicted) {
         pr_details.mergeable = MergeableState::Conflicting;
     }
     let checks = fetch_checks_via_api(http, &creds, &owner, &repo, &pr_details.head_sha)
@@ -1432,11 +1452,11 @@ pub async fn render_live_pr_section(
     if let Some(status) = &checks_status {
         out.push_str(&format!("Checks: {}\n", status));
     }
-    if source_conflict.is_some() {
-        // A conflicted history inflates the diff GitHub reports; flag it so the
+    if source_conflict.as_ref().is_some_and(|r| r.tip_conflicted) {
+        // A conflicted TIP inflates the diff GitHub reports; flag it so the
         // number can't read as a clean, mergeable change.
         out.push_str(&format!(
-            "Changes: +{} -{} (stale — branch carries conflicts; resolve before trusting)\n",
+            "Changes: +{} -{} (stale — branch tip carries conflicts; resolve before trusting)\n",
             pr_details.additions.unwrap_or(0),
             pr_details.deletions.unwrap_or(0)
         ));
@@ -1448,11 +1468,21 @@ pub async fn render_live_pr_section(
         ));
     }
     if let (Some(report), Some((src, tgt))) = (&source_conflict, &source_branches) {
-        out.push_str("\n⛔ Conflicted history — cannot merge:\n");
-        out.push_str(&format_conflicted_commits(&report.commits));
-        out.push('\n');
-        out.push_str(&conflict_recovery_hint(src.as_str(), Some(tgt.as_str())));
-        out.push('\n');
+        if report.tip_conflicted {
+            out.push_str("\n⛔ Conflicted history — cannot merge:\n");
+            out.push_str(&format_conflicted_commits(&report.commits));
+            out.push('\n');
+            out.push_str(&conflict_recovery_hint(src.as_str(), Some(tgt.as_str())));
+            out.push('\n');
+        } else {
+            // Clean tip, conflicted intermediates: the merge is not blocked — the
+            // guarded flatten collapses these away automatically at merge time.
+            out.push_str(
+                "\n♻️ Auto-recoverable history — the branch tip is clean; these conflicted intermediate commits are flattened automatically at merge:\n",
+            );
+            out.push_str(&format_conflicted_commits(&report.commits));
+            out.push('\n');
+        }
     }
 
     if let Some(body) = pr_details.body.as_deref().filter(|b| !b.is_empty()) {
@@ -1795,28 +1825,62 @@ async fn store_merge_child(
             if !already_landed {
                 // Collapse to one commit whose parent is the live default tip and
                 // whose tree equals the rebased source, then FF the default to it.
-                crate::jj::squash_branch_onto(&jj, &store, source_branch, &dest, squash_title)?;
+                // Routed through the footprint-guarded flatten so a clean-tip /
+                // conflicted-intermediate source is recovered (the squash discards
+                // the conflicted intermediates), while the footprint guard refuses
+                // a wrong-base/wrong-tip collapse rather than landing it. The
+                // fully-clean case is unchanged (a plain squash plus orphan cleanup).
+                crate::jj::flatten_branch_recovery(&jj, &store, source_branch, &dest, squash_title)
+                    .map_err(|e| {
+                        format!(
+                            "Refusing to merge: could not safely flatten `{source_branch}` onto the default branch `{target_branch}` ({e})."
+                        )
+                    })?;
                 crate::jj::merge_into_bookmark(&jj, &store, target_branch, source_branch)?;
             }
         } else {
             // Non-squash (workspace / memory-triage): keep the real fold so the
-            // default branch carries every sealed commit. Rebase the source onto
-            // the live default tip, then FF the default to it.
-            if let Err(conflict_err) =
-                crate::jj::rebase_then_fold_into(&jj, &store, target_branch, source_branch, &dest)
-            {
-                // The rebase recorded a conflict on the source bookmark and
-                // aborted the fold — the default bookmark was NOT moved. The
-                // source's live workspace `@` was rebased out from under it and is
-                // now stale: its on-disk files do not yet carry the conflict
-                // markers. Materialize them (as `reconcile_siblings` does after a
-                // store-driven rebase) so the resolve-and-retry guidance is
-                // actionable, and the merge gate keeps blocking until the agent
-                // resolves them.
+            // default branch carries every sealed commit. This method exists to
+            // PRESERVE every commit, so flattening would contradict its intent —
+            // instead it refuses on ANY recorded conflict (tip or intermediate) so
+            // the relaxed merge gate cannot let a conflicted-ancestor branch poison
+            // the default branch via a preserved fold. Rebase onto the live default
+            // tip, gate, then FF the default to it.
+            crate::jj::rebase_branch_onto(&jj, &store, source_branch, &dest)?;
+            let clean = match crate::jj::flatten_state(&jj, &store, &dest, source_branch) {
+                Ok(crate::jj::FlattenState::Clean) => true,
+                Ok(_) => false,
+                // Liveness: fall back to the bare tip-conflict check on a probe error.
+                Err(e) => {
+                    log::warn!(
+                        "non-squash preserve: flatten_state check for {source_branch} failed: {e}; falling back to tip check"
+                    );
+                    !crate::jj::branch_has_conflict(&jj, &store, source_branch).unwrap_or(false)
+                }
+            };
+            if !clean {
+                // A conflict (tip or intermediate) survives the rebase and the
+                // default bookmark was NOT moved. The source's live workspace `@`
+                // is now stale: materialize the markers so resolve-and-retry is
+                // actionable, and keep the merge blocked until they are resolved.
                 materialize_source_conflict_in_workspaces(orch, project_id, &jj, source_branch)
                     .await;
-                return Err(conflict_err);
+                return Err(format!(
+                    "Refusing to merge: rebasing `{source_branch}` onto the advanced default branch `{target_branch}` recorded a conflict, and this PR preserves every commit (its history cannot be flattened).{detail}",
+                    detail = conflicted_history_detail(
+                        &jj,
+                        &store,
+                        &format!(
+                            "bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})"
+                        ),
+                        source_branch,
+                        Some(target_branch),
+                    )
+                ));
             }
+            // Clean: the source now descends from the advanced default tip, so this
+            // FF can never go backwards.
+            crate::jj::merge_into_bookmark(&jj, &store, target_branch, source_branch)?;
         }
 
         if has_remote {
@@ -1878,6 +1942,57 @@ async fn store_merge_child(
                     Some(target_branch),
                 )
             ));
+        }
+
+        // Clean tip: if a base advance baked conflicts into INTERMEDIATE commits
+        // (clean net tip, conflicted ancestors), flatten the child to ONE clean
+        // commit on the integration tip before folding — otherwise `merge_into_bookmark`
+        // preserves the child's lineage and poisons the integration branch with
+        // conflicted ancestors (exactly the CAIRN-2269 failure). The per-child
+        // lineage is ephemeral (collapsed again at default-landing), so flattening
+        // it changes nothing on main. On guard failure, keep the existing refuse +
+        // materialize path.
+        match crate::jj::flatten_state(&jj, &store, target_branch, source_branch) {
+            Ok(crate::jj::FlattenState::IntermediateOnly) => {
+                let dest_commit = crate::jj::bookmark_commit(&jj, &store, target_branch)
+                    .ok_or_else(|| {
+                        format!(
+                            "integration bookmark `{target_branch}` did not resolve for flatten"
+                        )
+                    })?;
+                let desc = crate::jj::branch_description(&jj, &store, source_branch);
+                let message = if desc.is_empty() {
+                    squash_title.to_string()
+                } else {
+                    desc
+                };
+                if let Err(e) = crate::jj::flatten_branch_recovery(
+                    &jj,
+                    &store,
+                    source_branch,
+                    &dest_commit,
+                    &message,
+                ) {
+                    materialize_source_conflict_in_workspaces(orch, project_id, &jj, source_branch)
+                        .await;
+                    return Err(format!(
+                        "Refusing to merge: could not safely flatten `{source_branch}` onto the integration branch `{target_branch}` ({e}).{detail}",
+                        detail = conflicted_history_detail(
+                            &jj,
+                            &store,
+                            &format!(
+                                "bookmarks(exact:{target_branch:?})..bookmarks(exact:{source_branch:?})"
+                            ),
+                            source_branch,
+                            Some(target_branch),
+                        )
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!(
+                "child->integration: flatten_state check for {source_branch} failed: {e}; proceeding with a plain fold"
+            ),
         }
 
         // Fold the source's (now-descendant) real commit into the integration
@@ -2022,6 +2137,26 @@ fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<S
         "merge".to_string()
     } else {
         merge_method.unwrap_or_else(|| "squash".to_string())
+    }
+}
+
+/// The merge method a DEFAULT-BRANCH landing will actually use, resolved per
+/// route: the GitHub route (`merge_remote_pr_via_github`) passes the caller's
+/// method straight through (defaulting to squash), while the local fold applies
+/// the workspace / memory-triage forcing (`effective_merge_method`). Only
+/// meaningful when the target IS the default branch. The merge gate uses this to
+/// refuse a clean-tip / conflicted-intermediate source under a non-`squash`
+/// (preserve-every-commit) landing on BOTH routes uniformly — a squash landing
+/// flattens the intermediate away, a preserve landing cannot.
+fn default_landing_method(
+    ctx: &MergeMrContext,
+    resolved_default: &str,
+    merge_method: Option<String>,
+) -> String {
+    if should_route_to_github(ctx, resolved_default) {
+        merge_method.unwrap_or_else(|| "squash".to_string())
+    } else {
+        effective_merge_method(ctx, merge_method)
     }
 }
 
@@ -2207,6 +2342,14 @@ pub async fn merge_pr_for_job(
     // cleanly-rebased sibling is pushed immediately, so origin's PR head tracks
     // the local rebased tip rather than lagging a stale pre-rebase commit.
     let gate_started = std::time::Instant::now();
+    let resolved_default =
+        resolve_project_default_branch(&repo_path, &merge_context.default_branch);
+    // Gate on the TIP, not the whole range. A genuinely conflicted tip needs
+    // manual marker resolution and can never fold, so it is refused here. A clean
+    // tip with conflicted INTERMEDIATE commits is auto-recoverable: it is allowed
+    // through to `store_merge_child`, which decides per-path whether to flatten
+    // (squash-to-default, child→integration) or refuse (non-squash preserve). The
+    // range is still enumerated, solely to build the refusal message.
     if let Some(report) = source_conflict_report(
         &orch.jj_binary_path,
         &orch.config_dir,
@@ -2214,19 +2357,45 @@ pub async fn merge_pr_for_job(
         &merge_context.source_branch,
         Some(&merge_context.target_branch),
     ) {
-        return Err(format!(
-            "Refusing to merge: the jj source bookmark `{source}` carries a recorded conflict — a conflicted history cannot fold into `{target}`.\n{commits}\n{recovery}",
+        if report.tip_conflicted {
+            return Err(format!(
+                "Refusing to merge: the jj source bookmark `{source}` carries a recorded conflict on its tip — a conflicted history cannot fold into `{target}`.\n{commits}\n{recovery}",
+                source = merge_context.source_branch,
+                target = merge_context.target_branch,
+                commits = format_conflicted_commits(&report.commits),
+                recovery = conflict_recovery_hint(
+                    &merge_context.source_branch,
+                    Some(&merge_context.target_branch)
+                ),
+            ));
+        }
+        // Clean tip, conflicted intermediate(s): auto-recoverable only for a SQUASH
+        // landing (which flattens). A preserve-every-commit landing on the default
+        // branch cannot flatten, so it must refuse — and the refusal must cover BOTH
+        // routes: the local non-squash fold (`store_merge_child`) AND the remote
+        // GitHub `merge` route (`merge_remote_pr_via_github`), which passes the
+        // method straight to GitHub and would otherwise carry the conflicted
+        // intermediate onto the default branch as a merge commit, bypassing the
+        // local refusal. The two routes resolve the method differently, so mirror
+        // each here. (Child→integration landings always flatten, so they are exempt.)
+        if merge_context.target_branch == resolved_default {
+            let route_method =
+                default_landing_method(&merge_context, &resolved_default, merge_method.clone());
+            if route_method != "squash" {
+                return Err(format!(
+                    "Refusing to merge: `{source}` has a clean tip but conflicted intermediate commit(s), and the `{route_method}` method preserves every commit — a conflicted intermediate cannot land on the default branch `{target}`. Resolve the conflict markers and re-seal, or merge with the squash method (which flattens the intermediate history).\n{commits}",
+                    source = merge_context.source_branch,
+                    target = merge_context.target_branch,
+                    commits = format_conflicted_commits(&report.commits),
+                ));
+            }
+        }
+        log::info!(
+            "merge_pr_for_job[{job_id}]: source `{source}` has a clean tip with {n} conflicted intermediate(s); allowing through to the guarded flatten",
             source = merge_context.source_branch,
-            target = merge_context.target_branch,
-            commits = format_conflicted_commits(&report.commits),
-            recovery = conflict_recovery_hint(
-                &merge_context.source_branch,
-                Some(&merge_context.target_branch)
-            ),
-        ));
+            n = report.commits.len(),
+        );
     }
-    let resolved_default =
-        resolve_project_default_branch(&repo_path, &merge_context.default_branch);
     if merge_context.target_branch == resolved_default {
         assert_main_checkout_clean_for_default_merge(&*orch.services.git, &repo_path)?;
     }
@@ -2366,6 +2535,39 @@ mod tests {
         assert_eq!(
             effective_merge_method(&merge_context(false, false), Some("merge".to_string())),
             "merge"
+        );
+    }
+
+    /// `default_landing_method` mirrors each route's method resolution so the merge
+    /// gate refuses a conflicted-intermediate source under a preserve landing on
+    /// BOTH routes. The load-bearing case is the GitHub route: a remote default PR
+    /// that requests `merge` resolves to `merge` (passed straight to GitHub), so
+    /// the gate catches it before it carries a conflicted intermediate onto the
+    /// default branch — the bypass the local `store_merge_child` refusal missed.
+    #[test]
+    fn default_landing_method_resolves_per_route_for_the_preserve_gate() {
+        // Remote default PR (routes to GitHub): default is squash (safe — flattens).
+        let mut remote = merge_context(false, false);
+        remote.mr.github_pr_number = Some(7);
+        assert_eq!(default_landing_method(&remote, "main", None), "squash");
+        // Remote default PR requesting `merge`: resolves to merge (the bypass case).
+        assert_eq!(
+            default_landing_method(&remote, "main", Some("merge".to_string())),
+            "merge",
+            "a GitHub `merge` request must be seen by the gate as a preserve landing"
+        );
+
+        // Local-only default PR (stays on the local fold): a normal PR defaults to
+        // squash, a workspace PR is forced to merge (preserve) — both surfaced here.
+        let mut local = merge_context(false, false);
+        local.mr.is_local = true;
+        assert_eq!(default_landing_method(&local, "main", None), "squash");
+        let mut local_ws = merge_context(true, false);
+        local_ws.mr.is_local = true;
+        assert_eq!(
+            default_landing_method(&local_ws, "main", Some("squash".to_string())),
+            "merge",
+            "a workspace PR forces a preserve landing even when squash is requested"
         );
     }
 
@@ -2592,6 +2794,10 @@ mod tests {
         let proj_path = proj.path().to_string_lossy().to_string();
         let report = source_conflict_report(&bin, home.path(), &proj_path, overlap, Some(int))
             .expect("a recorded-conflict sibling must gate the merge");
+        assert!(
+            report.tip_conflicted,
+            "the overlapping sibling's rebase records the conflict on its tip (a hard block)"
+        );
         // The report names the offending commit(s) and conflicted file(s).
         assert!(
             !report.commits.is_empty(),
@@ -2620,6 +2826,26 @@ mod tests {
         assert!(
             source_conflict_report(&bin, home.path(), &proj_path, clean, Some(int)).is_none(),
             "a cleanly-rebased sibling must not gate"
+        );
+
+        // Resolve the overlapping sibling's conflict on top: the rebased
+        // (intermediate) commit stays conflicted, but the TIP is now clean. The
+        // report still fires (a conflict remains in the range) yet marks the tip
+        // clean — so the relaxed merge gate treats it as auto-recoverable (the
+        // guarded flatten) rather than a hard block.
+        crate::jj::update_stale(&jj, &ws_o).unwrap();
+        std::fs::write(ws_o.join("shared.rs"), "resolved\n").unwrap();
+        crate::jj::seal(&jj, &ws_o, "resolve conflict", None).unwrap();
+        let intermediate =
+            source_conflict_report(&bin, home.path(), &proj_path, overlap, Some(int))
+                .expect("a conflicted intermediate still enumerates in the report");
+        assert!(
+            !intermediate.commits.is_empty(),
+            "the conflicted intermediate is still enumerated"
+        );
+        assert!(
+            !intermediate.tip_conflicted,
+            "a clean tip over a conflicted intermediate is not a tip conflict (auto-recoverable)"
         );
 
         // A non-jj project (no config marker) never gates.
