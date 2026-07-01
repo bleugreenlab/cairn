@@ -88,6 +88,15 @@ fn change_report_json(
     .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
 }
 
+/// Append the synchronous when:write check-runner summary (when present) to a
+/// tool result, separated by a blank line. A no-op when no checks applied.
+fn append_check_summary(text: String, summary: &Option<String>) -> String {
+    match summary {
+        Some(s) => format!("{text}\n\n{s}"),
+        None => text,
+    }
+}
+
 async fn rollback_promoted_memory_decisions(
     orch: &Orchestrator,
     promoted_memories: &[(usize, String, String, PromotedMemoryRef)],
@@ -912,6 +921,7 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         .map(|(_, _, _, promoted)| promoted.memory_uri.clone())
         .collect();
 
+    let had_file_change = first_file_change.is_some();
     if let Some(first_file_change) = first_file_change {
         // Serialize the seal/discard (and its stale-recovery: update-stale →
         // re-apply → re-seal → fallback discard) on the per-store jj lock that
@@ -1015,6 +1025,36 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         }
     }
 
+    // Synchronous when:write check runner: a write that sealed a source-touching
+    // commit fires the affected when:write checks against that sealed commit,
+    // streams their output live into this tool's transcript, runs them to
+    // completion, and returns a compact inline pass/fail line appended to the
+    // change report. Gated on an actual file change that produced a real commit
+    // sha — a cairn://-resource-only write has no file change and never triggers.
+    let check_summary: Option<String> = if had_file_change
+        && commit
+            .as_ref()
+            .and_then(|report| report.sha.clone())
+            .is_some()
+    {
+        let run_context = crate::mcp::handlers::run_context::lookup_run(&orch.db.local, request)
+            .await
+            .ok();
+        let tool_use_id = request
+            .tool_use_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        crate::execution::checks::run_write_checks_after_seal(
+            orch,
+            run_context.as_ref(),
+            &request.cwd,
+            &tool_use_id,
+        )
+        .await
+    } else {
+        None
+    };
+
     if !promoted_memories.is_empty() {
         let commit_sha = commit.as_ref().and_then(|report| report.sha.clone());
         if let Some(sha) = commit_sha {
@@ -1067,25 +1107,31 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
         // structured change report first so callers still see the failed indices.
         if !failures.is_empty() {
             let report = change_report_json(applied, failures, commit, atomic);
-            return format!("{report}\n\n{blocking_result}");
+            return append_check_summary(format!("{report}\n\n{blocking_result}"), &check_summary);
         }
         if applied.is_empty() {
-            return blocking_result;
+            return append_check_summary(blocking_result, &check_summary);
         }
         let summary = applied
             .iter()
             .map(|change| change.summary.clone())
             .collect::<Vec<_>>()
             .join("; ");
-        return format!(
-            "Applied {} change(s): {}\n\n{}",
-            applied.len(),
-            summary,
-            blocking_result
+        return append_check_summary(
+            format!(
+                "Applied {} change(s): {}\n\n{}",
+                applied.len(),
+                summary,
+                blocking_result
+            ),
+            &check_summary,
         );
     }
 
-    change_report_json(applied, failures, commit, atomic)
+    append_check_summary(
+        change_report_json(applied, failures, commit, atomic),
+        &check_summary,
+    )
 }
 
 #[cfg(test)]

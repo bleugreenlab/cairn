@@ -556,6 +556,33 @@ pub async fn insert_event_conn(conn: &Connection, event: &EventInsert) -> DbResu
             ],
         )
         .await?;
+    if count > 0 {
+        // Per-event analytics rollup maintenance (Tier A token/cost + Tier B
+        // tool invocations) rides this same insert transaction, gated on a NEW
+        // row landing so a duplicate-id re-insert never double-counts. This is
+        // the single seam every durable-event insert funnels through (live,
+        // finalize, and resume paths all call it), so the analytics page never
+        // has to fold/backfill on open. Infallible by design: a rollup hiccup is
+        // logged and swallowed so it can never roll back (lose) the event that
+        // just landed; the one-time historical backfill and the fold/backfill
+        // safety nets reconcile any miss.
+        if let Err(e) = crate::analytics::queries::maintain_rollups_on_insert(
+            conn,
+            &event.id,
+            &event.run_id,
+            event.created_at as i64,
+            &event.event_type,
+            &event.data,
+            event.cost_usd,
+        )
+        .await
+        {
+            log::warn!(
+                "analytics rollup maintenance failed for event {}: {e}",
+                event.id
+            );
+        }
+    }
     Ok(count)
 }
 

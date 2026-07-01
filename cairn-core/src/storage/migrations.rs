@@ -7,26 +7,56 @@ use super::Migration;
 /// `workspaces`; the team head is a one-time snapshot of the same shared tables
 /// re-rooted at `teams`. Shipped private history can never be rewritten, so that
 /// one-time divergence is unavoidable. From here forward, every FUTURE
-/// shared-table change is written ONCE in the `SHARED_TAIL` block below and both
-/// lineages compose it via this macro — the single source of truth that the
-/// schema-equivalence test enforces.
+/// shared-table change is written ONCE as its own `shared_tail*!` macro below and
+/// both lineages compose them IN ORDER — the single source of truth that the
+/// schema-equivalence test enforces. Each shared migration is a separate
+/// single-expression macro because a `macro_rules!` invocation in array-element
+/// position must expand to exactly one expression, not a multi-item list.
 macro_rules! shared_tail {
     () => {
         // ── SHARED_TAIL ─────────────────────────────────────────────────
-        // Future shared-table migrations go HERE (not in a head). Each entry
-        // added below lands in BOTH lineages.
-        //
-        // CAIRN-2188 is the FIRST user: `execution_history.pack_hash` is a
-        // pointer to the per-execution range pack in the shared per-team content
-        // store. It is a shared-table change (both the private and team
-        // `execution_history` gain the column identically), so it is written once
-        // here. The SQL file lives in `turso_migrations/`; it is numbered 0084 to
-        // follow the private head (0082 + the 0083 cas_cache private head), and
-        // the team lineage records it after its 0002 head.
+        // CAIRN-2188 is the FIRST shared-tail migration: `execution_history.
+        // pack_hash` is a pointer to the per-execution range pack in the shared
+        // per-team content store. It is a shared-table change (both the private
+        // and team `execution_history` gain the column identically), so it is
+        // written once here. The SQL file lives in `turso_migrations/`; it is
+        // numbered 0084 to follow the private head (0082 + the 0083 cas_cache
+        // private head), and the team lineage records it after its 0002 head.
         Migration::new(
             "0084",
             "archival_pack_hash",
             include_str!("../../../../turso_migrations/0084_archival_pack_hash.sql"),
+        )
+    };
+}
+
+/// CAIRN-2270: re-grain token_rollup from the UTC-day floor to the UTC-hour floor
+/// (the `day` column becomes `bucket_start`). token_rollup is a project-scoped
+/// SHARED table — present in both lineages, with `team_schema_matches_private`
+/// enforcing identical schema — so the drop-and-recreate is written once here and
+/// reaches both. The private-only backfill-marker reset that forces the
+/// historical fold to re-derive every run lives in the sibling private migration
+/// 0088_reopen_analytics_backfill.
+macro_rules! shared_tail_token_rollup_hourly {
+    () => {
+        Migration::new(
+            "0087",
+            "token_rollup_hourly",
+            include_str!("../../../../turso_migrations/0087_token_rollup_hourly.sql"),
+        )
+    };
+}
+
+/// CAIRN-2251: sync-on-write check result cache, keyed by (project, sealed tree,
+/// check name). A project-scoped SHARED table (present in both lineages), so it is
+/// written once here and appended last in each lineage. Numbered 0089 to follow
+/// main's analytics migrations (0086-0088) after this branch rebased onto #2037.
+macro_rules! shared_tail_check_result_cache {
+    () => {
+        Migration::new(
+            "0089",
+            "check_result_cache",
+            include_str!("../../../../turso_migrations/0089_check_result_cache.sql"),
         )
     };
 }
@@ -36,6 +66,8 @@ macro_rules! shared_lineage {
         &[
             $($head,)*
             shared_tail!(),
+            shared_tail_token_rollup_hourly!(),
+            shared_tail_check_result_cache!(),
         ]
     };
 }
@@ -45,6 +77,7 @@ macro_rules! private_lineage {
         &[
             $($head,)*
             shared_tail!(),
+            shared_tail_token_rollup_hourly!(),
             // ── PRIVATE_TAIL ────────────────────────────────────────────────
             // Private-only migrations that must apply after the shared tail go
             // here. They are intentionally absent from `TEAM_MIGRATIONS`.
@@ -58,6 +91,27 @@ macro_rules! private_lineage {
                 "project_routes_local_path",
                 include_str!("../../../../turso_migrations/0085_project_routes_local_path.sql"),
             ),
+            // CAIRN-2252: one-time marker for the historical analytics-rollup
+            // backfill. Per-install runner-transient state (mirrors
+            // archival_backfill_state); never synced to a team replica.
+            Migration::new(
+                "0086",
+                "analytics_rollup_backfill_state",
+                include_str!(
+                    "../../../../turso_migrations/0086_analytics_rollup_backfill_state.sql"
+                ),
+            ),
+            // CAIRN-2270: reopen the one-time historical analytics-rollup backfill
+            // so it re-folds every run into the hour-grain token_rollup the shared
+            // 0087 migration recreated empty. Private-only: it resets
+            // analytics_rollup_backfill_state (migration 0086), which exists only
+            // in this lineage.
+            Migration::new(
+                "0088",
+                "reopen_analytics_backfill",
+                include_str!("../../../../turso_migrations/0088_reopen_analytics_backfill.sql"),
+            ),
+            shared_tail_check_result_cache!(),
         ]
     };
 }
@@ -623,6 +677,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("artifacts", TableScope::ProjectScoped),
     ("attention_pushes", TableScope::ProjectScoped),
     ("attention_read_cursors", TableScope::ProjectScoped),
+    ("check_result_cache", TableScope::ProjectScoped),
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
     ("comments", TableScope::ProjectScoped),
@@ -718,6 +773,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     // ── Private: runner-transient work queues ────────────────────────────────
     (
+        "analytics_rollup_backfill_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
         "archival_backfill_state",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
@@ -808,6 +867,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "attention_read_cursors",
         id_columns: &["recipient", "source"],
+    },
+    RekeyTableManifest {
+        table: "check_result_cache",
+        id_columns: &["project_id"],
     },
     RekeyTableManifest {
         table: "checkpoint_command_cache",
@@ -1124,7 +1187,14 @@ mod tests {
                 "0082_team_routing".to_string(),
                 "0083_cas_cache".to_string(),
                 "0084_archival_pack_hash".to_string(),
-                "0085_project_routes_local_path".to_string()
+                // CAIRN-2270: the shared 0087 re-grain lives in the SHARED_TAIL,
+                // which the macro emits BEFORE the private tail (0085/0086), so it
+                // applies here between 0084 and 0085 despite its higher number.
+                "0087_token_rollup_hourly".to_string(),
+                "0085_project_routes_local_path".to_string(),
+                "0086_analytics_rollup_backfill_state".to_string(),
+                "0088_reopen_analytics_backfill".to_string(),
+                "0089_check_result_cache".to_string()
             ]
         );
         Ok(db)
@@ -2284,9 +2354,13 @@ mod tests {
             vec![
                 "0001_team_initial_schema".to_string(),
                 "0002_labels_read_completeness".to_string(),
-                // The first SHARED_TAIL migration: it lands in the team lineage
-                // after the team head (CAIRN-2188, execution_history.pack_hash).
+                // Shared-tail migrations land in the team lineage after the team
+                // head, preserving one shared SQL source for project-scoped tables.
                 "0084_archival_pack_hash".to_string(),
+                // CAIRN-2270: the token_rollup hour re-grain is a shared-table
+                // change, so it lands in the team lineage too.
+                "0087_token_rollup_hourly".to_string(),
+                "0089_check_result_cache".to_string()
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

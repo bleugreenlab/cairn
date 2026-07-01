@@ -155,6 +155,19 @@ pub fn render_push(push: &Push) -> String {
 /// card's resource link opens for the full resolved content. The agent's prompt
 /// still receives the resolved markdown separately ([`render_pushes_resolved`] in
 /// `attention_delivery`); this is the UI record.
+pub fn push_kind_headline(prefix: &str) -> (&str, &str) {
+    match prefix {
+        "review" => ("review", "Work product ready for review"),
+        "question" => ("question", "Question awaiting an answer"),
+        "permission" => ("permission", "Permission awaiting a decision"),
+        "catchup" => ("catch-up", "New chat to catch up on"),
+        "direct" => ("message", "Direct message"),
+        "resolved" => ("resolved", "Issue resolved"),
+        "tasks" => ("tasks", "Tasks need attention"),
+        other => (other, "Attention update"),
+    }
+}
+
 pub fn pushes_to_briefing_json(pushes: &[Push]) -> String {
     let mut active = Vec::new();
     let mut catchup = Vec::new();
@@ -164,15 +177,7 @@ pub fn pushes_to_briefing_json(pushes: &[Push]) -> String {
             .split_once(':')
             .map(|(p, _)| p)
             .unwrap_or(&push.key);
-        let (kind, headline) = match prefix {
-            "review" => ("review", "Work product ready for review"),
-            "question" => ("question", "Question awaiting an answer"),
-            "permission" => ("permission", "Permission awaiting a decision"),
-            "catchup" => ("catch-up", "New chat to catch up on"),
-            "direct" => ("message", "Direct message"),
-            "resolved" => ("resolved", "Issue resolved"),
-            other => (other, "Attention update"),
-        };
+        let (kind, headline) = push_kind_headline(prefix);
         let item = serde_json::json!({
             "kind": kind,
             "headline": headline,
@@ -518,6 +523,25 @@ pub async fn has_pending_waking_live(db: &LocalDb, recipient: &str) -> DbResult<
     Ok(false)
 }
 
+/// Delete an undelivered push by id. Dismissal only applies while the push is
+/// still pending; a concurrent delivery that stamps `delivered_event_id` first
+/// makes this a no-op.
+pub async fn delete_pending_by_id(db: &LocalDb, id: &str) -> DbResult<()> {
+    let id = id.to_string();
+    db.write(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "DELETE FROM attention_pushes WHERE id = ?1 AND delivered_event_id IS NULL",
+                params![id.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
 /// Stamp each push as delivered by `event_id`, first-writer-wins: the
 /// `delivered_event_id IS NULL` guard makes a duplicate stamp a no-op. Returns
 /// the number of rows newly stamped. This is the standalone form; delivery sites
@@ -764,6 +788,28 @@ pub async fn lazy_resolve_live(db: &LocalDb, push: &Push) -> DbResult<bool> {
                 _ => true,
             };
             Ok::<bool, DbError>(live)
+        })
+    })
+    .await
+}
+
+/// Whether the issue currently has an open (not merged/closed) merge request.
+/// Extracted from the `review` lazy-resolve predicate above so the turn-end
+/// check runner can gate `when:review` checks on an actually-open PR (it uses
+/// only the PR arm, not the unconfirmed-artifact arm the review push also treats
+/// as reviewable).
+pub async fn has_open_pr_for_issue(db: &LocalDb, issue_id: &str) -> DbResult<bool> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            exists(
+                conn,
+                "SELECT 1 FROM merge_requests
+                 WHERE issue_id=?1 AND status NOT IN ('merged','closed') LIMIT 1",
+                &issue_id,
+            )
+            .await
         })
     })
     .await

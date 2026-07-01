@@ -4,15 +4,15 @@
 //! - `cairn://p/PROJECT` patch renames, hides/unhides, or attaches a remote.
 //! - `cairn://p/PROJECT/settings` patch routes each field to its store:
 //!   `project-settings.yaml` (setup/terminal commands, worktree populate,
-//!   default branch, references), the projects DB row (default branch, name,
-//!   hidden), and the per-project identity overrides store.
+//!   default branch, references, background-testing checks), the projects DB row
+//!   (default branch, name, hidden), and the per-project identity overrides store.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::project_settings::{
-    load_project_settings, save_project_settings, PopulateConfig, ProjectSettingsFile,
+    load_project_settings, save_project_settings, CheckCommand, PopulateConfig, ProjectSettingsFile,
 };
 use crate::identity::AccountOverrides;
 use crate::mcp::types::{ChangeItem, ChangeMode};
@@ -23,6 +23,7 @@ use crate::references::ProjectReference;
 use crate::services::RealClock;
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::uri::{parse_uri, CairnResource};
+use std::collections::HashMap;
 
 fn emit_db_change(orch: &Orchestrator, action: &str) {
     if let Err(error) = orch
@@ -638,6 +639,19 @@ pub(super) async fn apply_project_settings_patch(
         file_changed = true;
         ops.push("terminalCommands".to_string());
     }
+    if let Some(checks) = payload.get("checks") {
+        let checks: HashMap<String, CheckCommand> = serde_json::from_value(checks.clone())
+            .map_err(|error| format!("invalid checks: {error}"))?;
+        // An empty map clears checks so the key drops out of the YAML entirely,
+        // matching the `update_project` Tauri command's behavior.
+        config.checks = if checks.is_empty() {
+            None
+        } else {
+            Some(checks)
+        };
+        file_changed = true;
+        ops.push("checks".to_string());
+    }
     if let Some(populate) = first_value(payload, &["worktreePopulate", "worktree_populate"]) {
         let populate: PopulateConfig = serde_json::from_value(populate.clone())
             .map_err(|error| format!("invalid worktreePopulate: {error}"))?;
@@ -683,7 +697,7 @@ pub(super) async fn apply_project_settings_patch(
 
     if ops.is_empty() {
         return Err(
-            "payload must set at least one of: setupCommands, terminalCommands, worktreePopulate, defaultBranch, accountOverrides, references"
+            "payload must set at least one of: setupCommands, terminalCommands, checks, worktreePopulate, defaultBranch, accountOverrides, references"
                 .to_string(),
         );
     }

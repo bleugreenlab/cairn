@@ -13,12 +13,13 @@ pub mod types;
 
 use std::collections::HashMap;
 
-use crate::storage::{DbResult, LocalDb};
+use crate::storage::{DbResult, LocalDb, RowExt};
 
 pub use types::{
-    Bucket, CostPoint, EconomicsRow, EffectiveCostPoint, ModelRoleEconomics, Scope,
-    TargetBreakdown, TargetShapeRow, TimeRange, TokensPerLocPoint, TokensPerSessionPoint,
-    ToolBackfillSummary, ToolCallsPerSessionPoint, ToolMixPoint, TopTargetRow,
+    BackendCostPoint, Bucket, CostPoint, EconomicsRow, EffectiveCostPoint, HeatmapCell,
+    ModelRoleEconomics, ProjectCost, Scope, TargetBreakdown, TargetShapeRow, TimeRange,
+    TokenCompositionPoint, TokensPerLocPoint, TokensPerSessionPoint, ToolBackfillSummary,
+    ToolCallsPerSessionPoint, ToolErrorRatePoint, ToolMixPoint, TopTargetRow,
 };
 
 /// Average billable tokens per session, bucketed by the session's first event.
@@ -54,12 +55,23 @@ pub async fn tokens_per_loc(
             } else {
                 0.0
             };
+            let cost_usd = exact_or_priced(
+                &r.backend,
+                r.model.as_deref(),
+                r.input,
+                r.cache_read,
+                r.cache_create,
+                r.output,
+                r.exact_cost,
+                r.exact_cost_count,
+            );
             TokensPerLocPoint {
                 job_id: r.job_id,
                 ts: r.ts,
                 billable_tokens: r.billable,
                 lines_changed: r.lines,
                 tokens_per_line,
+                cost_usd,
                 model: r.model,
                 role: normalize_role(r.node_name.as_deref()),
             }
@@ -93,23 +105,190 @@ pub async fn cost_timeseries(
     Ok(points)
 }
 
-/// The cost of one (bucket, model, backend) group: the real metered cost when
-/// any event in the group reported one, else the price-table estimate. The
+/// The canonical token-group cost rule: the real metered cost (`events.cost_usd`)
+/// when any event in the group reported one, else the price-table estimate. The
 /// price table returns ~$0 for many metered (OpenRouter) models, so a real cost
-/// is always preferred when present.
-fn group_cost(row: &queries::CostComponentRow) -> f64 {
-    if row.exact_cost_count > 0 {
-        row.exact_cost
+/// is always preferred when present. Every $-valued analytic routes through this.
+#[allow(clippy::too_many_arguments)]
+fn exact_or_priced(
+    backend: &str,
+    model: Option<&str>,
+    input: i64,
+    cache_read: i64,
+    cache_create: i64,
+    output: i64,
+    exact_cost: f64,
+    exact_cost_count: i64,
+) -> f64 {
+    if exact_cost_count > 0 {
+        exact_cost
     } else {
-        pricing::cost_usd(
+        pricing::cost_usd(backend, model, input, cache_read, cache_create, output)
+    }
+}
+
+/// The cost of one (bucket, model, backend) group via [`exact_or_priced`].
+fn group_cost(row: &queries::CostComponentRow) -> f64 {
+    exact_or_priced(
+        &row.backend,
+        row.model.as_deref(),
+        row.input,
+        row.cache_read,
+        row.cache_create,
+        row.output,
+        row.exact_cost,
+        row.exact_cost_count,
+    )
+}
+
+/// Priced cost over time split per backend, summed per (bucket, backend) group.
+/// Reuses [`queries::cost_components`] (no new SQL); the per-bucket backend stack
+/// heights sum to the blended [`cost_timeseries`] total. Powers the stacked
+/// provider-split cost chart.
+pub async fn cost_by_backend_timeseries(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<BackendCostPoint>> {
+    let rows = queries::cost_components(db, scope, range, bucket).await?;
+    let mut buckets: HashMap<(i64, String), (f64, i64)> = HashMap::new();
+    for row in &rows {
+        let entry = buckets
+            .entry((row.bucket_start, row.backend.clone()))
+            .or_insert((0.0, 0));
+        entry.0 += group_cost(row);
+        entry.1 += row.billable;
+    }
+    let mut points: Vec<BackendCostPoint> = buckets
+        .into_iter()
+        .map(
+            |((bucket_start, backend), (cost_usd, billable_tokens))| BackendCostPoint {
+                bucket_start,
+                backend,
+                cost_usd,
+                billable_tokens,
+            },
+        )
+        .collect();
+    points.sort_by(|a, b| {
+        a.bucket_start
+            .cmp(&b.bucket_start)
+            .then_with(|| a.backend.cmp(&b.backend))
+    });
+    Ok(points)
+}
+
+/// Token components (input / cache-read / cache-create / output / thinking) over
+/// time, for the stacked token-composition chart.
+pub async fn token_composition_timeseries(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<TokenCompositionPoint>> {
+    let rows = queries::token_components(db, scope, range, bucket).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TokenCompositionPoint {
+            bucket_start: r.bucket_start,
+            input: r.input,
+            cache_read: r.cache_read,
+            cache_create: r.cache_create,
+            output: r.output,
+            thinking: r.thinking,
+        })
+        .collect())
+}
+
+/// Total real cost per project across the range, preferring metered cost over
+/// the price table per (model, backend) group, sorted by cost descending. The
+/// workspace-only cost-by-project chart.
+pub async fn cost_by_project(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<Vec<ProjectCost>> {
+    let rows = queries::cost_by_project(db, scope, range).await?;
+    let mut by_project: HashMap<String, (String, f64, i64)> = HashMap::new();
+    for row in &rows {
+        let cost = exact_or_priced(
             &row.backend,
             row.model.as_deref(),
             row.input,
             row.cache_read,
             row.cache_create,
             row.output,
-        )
+            row.exact_cost,
+            row.exact_cost_count,
+        );
+        let entry = by_project
+            .entry(row.project_id.clone())
+            .or_insert_with(|| (row.project_name.clone(), 0.0, 0));
+        entry.1 += cost;
+        entry.2 += row.billable;
     }
+    let mut out: Vec<ProjectCost> = by_project
+        .into_iter()
+        .map(
+            |(project_id, (project_name, cost_usd, billable_tokens))| ProjectCost {
+                project_id,
+                project_name,
+                cost_usd,
+                billable_tokens,
+            },
+        )
+        .collect();
+    out.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
+/// Tool-call error rate over time (errors / total per bucket).
+pub async fn tool_error_rate(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<ToolErrorRatePoint>> {
+    let rows = queries::tool_error_rate(db, scope, range, bucket).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ToolErrorRatePoint {
+            bucket_start: r.bucket_start,
+            total: r.total,
+            errors: r.errors,
+            error_rate: if r.total > 0 {
+                r.errors as f64 / r.total as f64
+            } else {
+                0.0
+            },
+        })
+        .collect())
+}
+
+/// Billable-token usage heatmap by local-time day-of-week and hour, summed from
+/// the hour-grain `token_rollup`. `tz_offset_minutes` is the user's offset from
+/// UTC (`-getTimezoneOffset()`), converted to seconds and applied inside
+/// `strftime` so "when work happens" reads in local time.
+pub async fn usage_heatmap(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    tz_offset_minutes: i64,
+) -> DbResult<Vec<HeatmapCell>> {
+    let rows = queries::usage_heatmap(db, scope, range, tz_offset_minutes * 60).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| HeatmapCell {
+            day_of_week: r.day_of_week,
+            hour: r.hour,
+            tokens: r.tokens,
+        })
+        .collect())
 }
 
 /// Real per-model cost for one backend: the metered dollar amount Cairn recorded
@@ -172,19 +351,52 @@ pub async fn provider_model_costs(
     Ok(costs)
 }
 
-/// First-of-month (UTC) epoch seconds for the current wall-clock time. Mirrors
-/// the SQLite `start of month` bucketing so the in-progress month is flagged
-/// provisional.
-fn current_month_start() -> i64 {
+/// First-of-month (UTC) epoch seconds for the given epoch. Mirrors the SQLite
+/// `start of month` bucketing, so a fine (day/week/hour) bucket maps to the
+/// calendar month whose flat fee it draws against.
+fn month_floor(epoch: i64) -> i64 {
     use chrono::{Datelike, TimeZone, Utc};
-    let now = Utc::now();
-    Utc.with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+    let Some(dt) = Utc.timestamp_opt(epoch, 0).single() else {
+        return 0;
+    };
+    Utc.with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
         .single()
-        .map(|dt| dt.timestamp())
+        .map(|d| d.timestamp())
         .unwrap_or(0)
 }
 
-/// Effective (subscription-normalized) cost per (month, backend).
+/// First-of-month (UTC) epoch seconds for the current wall-clock time, so the
+/// in-progress month is flagged provisional.
+fn current_month_start() -> i64 {
+    month_floor(chrono::Utc::now().timestamp())
+}
+
+/// Split an effective cost into input- and output-side components by the
+/// list-price fraction, falling back to token share when the price table is
+/// empty (e.g. an unknown metered model), else attributing nothing. The two
+/// components always sum to `effective`.
+fn split_effective(
+    effective: f64,
+    input_list: f64,
+    output_list: f64,
+    input_tokens: i64,
+    output_tokens: i64,
+) -> (f64, f64) {
+    let list_denom = input_list + output_list;
+    let frac_in = if list_denom > 0.0 {
+        input_list / list_denom
+    } else {
+        let tok_denom = input_tokens + output_tokens;
+        if tok_denom > 0 {
+            input_tokens as f64 / tok_denom as f64
+        } else {
+            0.0
+        }
+    };
+    (effective * frac_in, effective * (1.0 - frac_in))
+}
+
+/// Effective (subscription-normalized) cost per (fine-bucket, backend).
 ///
 /// For each provider-month the workspace-wide list-price cost defines a ratio
 /// against the configured flat subscription fee (`ratio = fee / list_cost`); the
@@ -193,17 +405,29 @@ fn current_month_start() -> i64 {
 /// provider-month sum to the fee when scoped to the whole workspace. Backends
 /// with no configured fee (e.g. OpenRouter) are metered and pass through at real
 /// cost with `ratio = 1`.
+///
+/// The flat fee is allocated per calendar **month** (the ratio denominator), but
+/// usage is emitted at the page's `bucket` granularity so the trend follows the
+/// range selector: each fine bucket inherits the ratio of the month that
+/// contains it (mapped via [`month_floor`]). Because the scoped fine-bucket
+/// costs within a month sum to that month's scoped cost, the per-bucket
+/// effective costs still sum to the fee share — exactly for day/hour/month, and
+/// approximately for a week that straddles a month boundary (it is attributed to
+/// the month of its `bucket_start`).
 pub async fn effective_cost(
     db: &LocalDb,
     scope: &Scope,
     range: &TimeRange,
     fees: &HashMap<String, f64>,
+    bucket: Bucket,
 ) -> DbResult<Vec<EffectiveCostPoint>> {
-    // The ratio denominator is always workspace-wide, even when display usage is
-    // scoped to a project: a project shows its effective share of the shared fee.
+    // The ratio denominator is always workspace-wide and per calendar month,
+    // even when display usage is scoped to a project or shown at a finer bucket:
+    // a project shows its effective share of the shared monthly fee.
     let workspace = Scope::new(None);
     let workspace_rows = queries::cost_components(db, &workspace, range, Bucket::Month).await?;
-    let scoped_rows = queries::cost_components(db, scope, range, Bucket::Month).await?;
+    // Scoped usage at the page granularity so the trend follows the range.
+    let scoped_rows = queries::cost_components(db, scope, range, bucket).await?;
 
     let mut workspace_cost: HashMap<(i64, String), f64> = HashMap::new();
     for row in &workspace_rows {
@@ -213,108 +437,124 @@ pub async fn effective_cost(
     }
 
     #[derive(Default)]
-    struct ScopedAgg {
+    struct FineAgg {
         cost: f64,
         billable: i64,
+        input_tokens: i64,
+        output_tokens: i64,
+        /// Input/output split of the list price, summed from per-component
+        /// pricing calls (linear, so they add back to the full list cost).
+        input_list: f64,
+        output_list: f64,
         /// Whether any event in this group reported a real per-generation cost.
         /// This — not the absence of a configured fee — is what makes a backend
         /// genuinely metered (pay-as-you-go, e.g. OpenRouter). Claude/Codex never
         /// report exact cost, so they are always subscription backends.
         has_exact: bool,
     }
-    let mut scoped: HashMap<(i64, String), ScopedAgg> = HashMap::new();
+    let mut fine: HashMap<(i64, String), FineAgg> = HashMap::new();
+    // A (month, backend) is metered iff any of its fine buckets carry a real
+    // per-generation cost; the per-month verdict drives every fine point in it.
+    let mut month_metered: HashMap<(i64, String), bool> = HashMap::new();
     for row in &scoped_rows {
-        let entry = scoped
+        // Split list price into input/output sides by calling the linear pricing
+        // function once per side: input_list + output_list == the full cost.
+        let input_list = pricing::cost_usd(
+            &row.backend,
+            row.model.as_deref(),
+            row.input,
+            row.cache_read,
+            row.cache_create,
+            0,
+        );
+        let output_list =
+            pricing::cost_usd(&row.backend, row.model.as_deref(), 0, 0, 0, row.output);
+        let entry = fine
             .entry((row.bucket_start, row.backend.clone()))
             .or_default();
         entry.cost += group_cost(row);
         entry.billable += row.billable;
+        entry.input_tokens += row.input + row.cache_read + row.cache_create;
+        entry.output_tokens += row.output;
+        entry.input_list += input_list;
+        entry.output_list += output_list;
         entry.has_exact |= row.exact_cost_count > 0;
+        let month = month_floor(row.bucket_start);
+        *month_metered
+            .entry((month, row.backend.clone()))
+            .or_default() |= row.exact_cost_count > 0;
     }
 
     let current_month = current_month_start();
-    let mut points: Vec<EffectiveCostPoint> = scoped
+    let mut points: Vec<EffectiveCostPoint> = fine
         .into_iter()
-        .map(|((month_start, backend), agg)| {
+        .map(|((bucket_start, backend), agg)| {
+            let month_start = month_floor(bucket_start);
             let workspace_list = workspace_cost
                 .get(&(month_start, backend.clone()))
                 .copied()
                 .unwrap_or(0.0);
+            let metered = month_metered
+                .get(&(month_start, backend.clone()))
+                .copied()
+                .unwrap_or(false);
             let fee = fees
                 .get(&backend)
                 .copied()
                 .filter(|f| f.is_finite() && *f > 0.0);
             let provisional = month_start == current_month;
-            if agg.has_exact {
+
+            // Resolve the month's allocation rule into (fee, ratio, effective).
+            let (subscription_fee, ratio, effective_cost) = if metered {
                 // Genuinely metered backend (OpenRouter): pass through real cost.
                 // A real per-generation cost is authoritative even if a fee was
                 // configured, so metering wins over normalization here.
-                EffectiveCostPoint {
-                    month_start,
-                    backend,
-                    metered: true,
-                    provisional,
-                    subscription_fee: 0.0,
-                    list_cost: workspace_list,
-                    scoped_cost: agg.cost,
-                    ratio: Some(1.0),
-                    effective_cost: agg.cost,
-                    billable_tokens: agg.billable,
-                }
+                (0.0, Some(1.0), agg.cost)
             } else {
                 // Subscription backend (Claude/Codex). With a fee, normalize;
-                // without one, there is no effective cost yet — the card shows the
+                // without one, there is no effective cost yet — the row shows the
                 // list-price estimate and prompts the user to set a fee. The
                 // `subscription_fee == 0 && !metered` shape signals "no fee set".
                 match fee {
                     Some(fee) if workspace_list > 0.0 => {
                         let ratio = fee / workspace_list;
-                        EffectiveCostPoint {
-                            month_start,
-                            backend,
-                            metered: false,
-                            provisional,
-                            subscription_fee: fee,
-                            list_cost: workspace_list,
-                            scoped_cost: agg.cost,
-                            ratio: Some(ratio),
-                            effective_cost: agg.cost * ratio,
-                            billable_tokens: agg.billable,
-                        }
+                        (fee, Some(ratio), agg.cost * ratio)
                     }
                     // Fee paid but no priced usage: ratio undefined (unrecovered).
-                    Some(fee) => EffectiveCostPoint {
-                        month_start,
-                        backend,
-                        metered: false,
-                        provisional,
-                        subscription_fee: fee,
-                        list_cost: 0.0,
-                        scoped_cost: agg.cost,
-                        ratio: None,
-                        effective_cost: 0.0,
-                        billable_tokens: agg.billable,
-                    },
-                    // No fee configured: show list-price estimate, no allocation.
-                    None => EffectiveCostPoint {
-                        month_start,
-                        backend,
-                        metered: false,
-                        provisional,
-                        subscription_fee: 0.0,
-                        list_cost: workspace_list,
-                        scoped_cost: agg.cost,
-                        ratio: None,
-                        effective_cost: 0.0,
-                        billable_tokens: agg.billable,
-                    },
+                    Some(fee) => (fee, None, 0.0),
+                    // No fee configured: list-price estimate, no allocation.
+                    None => (0.0, None, 0.0),
                 }
+            };
+            let (effective_input_cost, effective_output_cost) = split_effective(
+                effective_cost,
+                agg.input_list,
+                agg.output_list,
+                agg.input_tokens,
+                agg.output_tokens,
+            );
+            EffectiveCostPoint {
+                month_start,
+                bucket_start,
+                backend,
+                metered,
+                provisional,
+                subscription_fee,
+                list_cost: workspace_list,
+                scoped_cost: agg.cost,
+                ratio,
+                effective_cost,
+                billable_tokens: agg.billable,
+                input_tokens: agg.input_tokens,
+                output_tokens: agg.output_tokens,
+                effective_input_cost,
+                effective_output_cost,
             }
         })
         .collect();
     points.sort_by(|a, b| {
-        a.month_start
-            .cmp(&b.month_start)
+        a.bucket_start
+            .cmp(&b.bucket_start)
             .then_with(|| a.backend.cmp(&b.backend))
     });
     Ok(points)
@@ -330,14 +570,22 @@ pub async fn model_role_economics(
     let mut by_model: HashMap<String, Acc> = HashMap::new();
     let mut by_role: HashMap<String, Acc> = HashMap::new();
     for row in &rows {
-        let cost = pricing::cost_usd(
-            &row.backend,
-            row.model.as_deref(),
-            row.input,
-            row.cache_read,
-            row.cache_create,
-            row.output,
-        );
+        // Prefer the real metered cost when any event in the group reported one
+        // (matching `group_cost`), else fall back to the price-table estimate.
+        // Without this the table reads ~$0 for metered providers (OpenRouter,
+        // z-ai, deepseek) whose price table is empty.
+        let cost = if row.exact_cost_count > 0 {
+            row.exact_cost
+        } else {
+            pricing::cost_usd(
+                &row.backend,
+                row.model.as_deref(),
+                row.input,
+                row.cache_read,
+                row.cache_create,
+                row.output,
+            )
+        };
         let model_key = row
             .model
             .clone()
@@ -364,6 +612,47 @@ pub async fn model_role_economics(
 /// safe to invoke on demand from the dashboard.
 pub async fn backfill_tool_invocations(db: &LocalDb) -> DbResult<ToolBackfillSummary> {
     queries::backfill_tool_invocations(db).await
+}
+
+/// Run the one-time historical rollup backfill, gated so it runs once per
+/// install. Spawn it on a background task at startup.
+///
+/// Live event inserts now maintain both rollups incrementally
+/// (`queries::maintain_rollups_on_insert`, hooked into the insert transaction),
+/// but events that predate that seam were never folded. This populates both
+/// tiers for those historical events — the Tier A token/cost fold and the
+/// Tier B reconstruct-based tool-invocation backfill — then records completion
+/// so it never re-scans the whole events table on later startups. Both passes
+/// are themselves idempotent safety nets (the fold re-derives a run wholesale,
+/// the tool backfill upserts by id), so a concurrent per-event increment can
+/// never double-count: the marker only avoids the redundant full scan.
+pub async fn run_historical_backfill(db: &LocalDb) -> DbResult<()> {
+    if historical_backfill_complete(db).await? {
+        return Ok(());
+    }
+    queries::fold_token_rollup(db).await?;
+    queries::backfill_tool_invocations(db).await?;
+    mark_historical_backfill_complete(db).await?;
+    Ok(())
+}
+
+async fn historical_backfill_complete(db: &LocalDb) -> DbResult<bool> {
+    db.query_one(
+        "SELECT backfilled_at FROM analytics_rollup_backfill_state WHERE id = 1",
+        (),
+        |row| Ok(row.opt_i64(0)?.is_some()),
+    )
+    .await
+}
+
+async fn mark_historical_backfill_complete(db: &LocalDb) -> DbResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "UPDATE analytics_rollup_backfill_state SET backfilled_at = ?1 WHERE id = 1",
+        (now,),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Target-shape activity, per-shape error rate, and the most-targeted resources.
@@ -611,6 +900,11 @@ mod tests {
         )
         .await
         .unwrap();
+        // These tests seed events via raw SQL, bypassing the per-event insert
+        // seam that keeps the rollup current in production. The read paths no
+        // longer fold on open, so run the one-time backfill once here — exactly
+        // as startup does for pre-seam historical events.
+        queries::fold_token_rollup(&db).await.unwrap();
         db
     }
 
@@ -663,6 +957,8 @@ mod tests {
         )
         .await
         .unwrap();
+        // Fold again so the after-fixture event (run-task) is in the rollup.
+        queries::fold_token_rollup(&db).await.unwrap();
 
         let out = model_role_economics(&db, &Scope::default(), &TimeRange::default())
             .await
@@ -875,6 +1171,9 @@ mod tests {
         ))
         .await
         .unwrap();
+        // Raw-SQL seed bypasses the per-event insert seam; fold so the rollup
+        // stays current the way the live insert path keeps it.
+        queries::fold_token_rollup(db).await.unwrap();
     }
 
     fn fees(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
@@ -915,6 +1214,7 @@ mod tests {
             &Scope::default(),
             &TimeRange::default(),
             &fees(&[("claude", 200.0)]),
+            Bucket::Month,
         )
         .await
         .unwrap();
@@ -936,6 +1236,26 @@ mod tests {
             p.effective_cost
         );
         assert_eq!(p.billable_tokens, 2_000_000);
+        // Month bucket is the identity case: the fine bucket IS the month.
+        assert_eq!(p.bucket_start, p.month_start);
+        assert_eq!(p.month_start, JAN_2025);
+        // Input/output split sums back to the effective cost.
+        assert!(
+            (p.effective_input_cost + p.effective_output_cost - p.effective_cost).abs() < 1e-6,
+            "split {} + {} vs {}",
+            p.effective_input_cost,
+            p.effective_output_cost,
+            p.effective_cost
+        );
+        // 1M input @ $3/Mtok = $3 list, 1M output @ $15/Mtok = $15 list, so the
+        // input side is 3/18 of the allocated fee.
+        assert!(
+            (p.effective_input_cost - 200.0 * (3.0 / 18.0)).abs() < 1e-6,
+            "input side {}",
+            p.effective_input_cost
+        );
+        assert_eq!(p.input_tokens, 1_000_000);
+        assert_eq!(p.output_tokens, 1_000_000);
     }
 
     #[tokio::test]
@@ -973,6 +1293,7 @@ mod tests {
             &Scope::default(),
             &TimeRange::default(),
             &fees(&[("claude", 200.0)]),
+            Bucket::Month,
         )
         .await
         .unwrap();
@@ -994,6 +1315,7 @@ mod tests {
             &Scope::default(),
             &TimeRange::default(),
             &fees(&[("claude", 200.0)]),
+            Bucket::Month,
         )
         .await
         .unwrap();
@@ -1023,9 +1345,15 @@ mod tests {
         )
         .await;
 
-        let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), &fees(&[]))
-            .await
-            .unwrap();
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[]),
+            Bucket::Month,
+        )
+        .await
+        .unwrap();
         let p = point(&points, JAN_2025, "claude");
         assert!(!p.metered, "claude is a subscription backend, not metered");
         assert_eq!(p.subscription_fee, 0.0);
@@ -1072,6 +1400,7 @@ mod tests {
             &Scope::default(),
             &TimeRange::default(),
             &fees(&[("claude", 200.0)]),
+            Bucket::Month,
         )
         .await
         .unwrap();
@@ -1084,6 +1413,160 @@ mod tests {
             p.effective_cost
         );
         assert!((p.scoped_cost - 0.42).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn effective_cost_fine_buckets_inherit_month_ratio_and_sum_to_fee() {
+        let db = cost_db().await;
+        // Two claude turns in January on different days. At Day granularity each
+        // day is its own point, both attributed to January, each inheriting
+        // January's workspace ratio, and the day points sum to the flat fee.
+        seed_run(&db, "d1", "claude", "sonnet").await;
+        seed_run(&db, "d2", "claude", "sonnet").await;
+        add_event(
+            &db,
+            "e1",
+            "d1",
+            "assistant",
+            JAN_2025 + 100,
+            1_000_000,
+            1_000_000,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "e2",
+            "d2",
+            "assistant",
+            JAN_2025 + 8 * 86_400,
+            1_000_000,
+            1_000_000,
+            None,
+        )
+        .await;
+
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[("claude", 200.0)]),
+            Bucket::Day,
+        )
+        .await
+        .unwrap();
+
+        let claude: Vec<_> = points.iter().filter(|p| p.backend == "claude").collect();
+        assert_eq!(claude.len(), 2, "two distinct day points");
+        let mut days: Vec<i64> = claude.iter().map(|p| p.bucket_start).collect();
+        days.sort();
+        assert_eq!(days, vec![JAN_2025, JAN_2025 + 8 * 86_400]);
+        for p in &claude {
+            assert_eq!(p.month_start, JAN_2025, "both days are January");
+            // Workspace January list = 2 days * $18 = $36, so ratio = 200/36.
+            let ratio = p.ratio.expect("ratio");
+            assert!((ratio - 200.0 / 36.0).abs() < 1e-9, "ratio {ratio}");
+        }
+        let total: f64 = claude.iter().map(|p| p.effective_cost).sum();
+        assert!(
+            (total - 200.0).abs() < 1e-6,
+            "day points sum to fee: {total}"
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_cost_metered_split_apportions_by_list_fraction() {
+        let db = cost_db().await;
+        // OpenRouter sonnet: 1M input + 1M output (list $3 + $15 = $18), settled at
+        // a real $9. The real cost is apportioned by the list-price fraction:
+        // input 3/18, output 15/18.
+        seed_run(&db, "or", "openrouter", "sonnet").await;
+        add_event(
+            &db,
+            "or1",
+            "or",
+            "assistant",
+            JAN_2025 + 30,
+            1_000_000,
+            1_000_000,
+            None,
+        )
+        .await;
+        add_event(
+            &db,
+            "or2",
+            "or",
+            "result:success",
+            JAN_2025 + 31,
+            0,
+            0,
+            Some(9.0),
+        )
+        .await;
+
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[]),
+            Bucket::Month,
+        )
+        .await
+        .unwrap();
+        let p = point(&points, JAN_2025, "openrouter");
+        assert!(p.metered);
+        assert!(
+            (p.effective_cost - 9.0).abs() < 1e-9,
+            "effective {}",
+            p.effective_cost
+        );
+        assert!(
+            (p.effective_input_cost - 9.0 * (3.0 / 18.0)).abs() < 1e-6,
+            "input {}",
+            p.effective_input_cost
+        );
+        assert!(
+            (p.effective_output_cost - 9.0 * (15.0 / 18.0)).abs() < 1e-6,
+            "output {}",
+            p.effective_output_cost
+        );
+        assert!((p.effective_input_cost + p.effective_output_cost - 9.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn model_role_economics_uses_real_metered_cost() {
+        let db = cost_db().await;
+        // A metered model absent from the price table (price-table cost == $0).
+        // The economics table must still report the real recorded dollar cost.
+        seed_run(&db, "z", "openrouter", "z-ai/glm").await;
+        add_event(&db, "z1", "z", "assistant", JAN_2025 + 10, 1000, 1000, None).await;
+        add_event(
+            &db,
+            "z2",
+            "z",
+            "result:success",
+            JAN_2025 + 11,
+            0,
+            0,
+            Some(0.33),
+        )
+        .await;
+
+        // The price table genuinely returns $0 for this model.
+        assert_eq!(
+            pricing::cost_usd("openrouter", Some("z-ai/glm"), 1000, 0, 0, 1000),
+            0.0
+        );
+
+        let out = model_role_economics(&db, &Scope::default(), &TimeRange::default())
+            .await
+            .unwrap();
+        let row = econ(&out.by_model, "z-ai/glm");
+        assert!(
+            (row.cost_usd - 0.33).abs() < 1e-9,
+            "real metered cost surfaced: {}",
+            row.cost_usd
+        );
     }
 
     #[tokio::test]
@@ -1113,9 +1596,15 @@ mod tests {
         )
         .await;
 
-        let points = effective_cost(&db, &Scope::default(), &TimeRange::default(), &fees(&[]))
-            .await
-            .unwrap();
+        let points = effective_cost(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            &fees(&[]),
+            Bucket::Month,
+        )
+        .await
+        .unwrap();
 
         assert!(!point(&points, JAN_2025, "claude").provisional);
         assert!(!point(&points, FEB_2025, "claude").provisional);
@@ -1565,6 +2054,30 @@ mod tests {
         }
     }
 
+    fn assert_token_components_eq(
+        rollup: Vec<queries::TokenComponentRow>,
+        live: Vec<queries::TokenComponentRow>,
+        ctx: &str,
+    ) {
+        let mut r = rollup;
+        let mut l = live;
+        r.sort_by_key(|x| x.bucket_start);
+        l.sort_by_key(|x| x.bucket_start);
+        assert_eq!(
+            r.len(),
+            l.len(),
+            "token_components len ({ctx}):\n{r:#?}\nvs\n{l:#?}"
+        );
+        for (a, b) in r.iter().zip(l.iter()) {
+            assert_eq!(a.bucket_start, b.bucket_start, "{ctx}");
+            assert_eq!(a.input, b.input, "{ctx}");
+            assert_eq!(a.cache_read, b.cache_read, "{ctx}");
+            assert_eq!(a.cache_create, b.cache_create, "{ctx}");
+            assert_eq!(a.output, b.output, "{ctx}");
+            assert_eq!(a.thinking, b.thinking, "{ctx}");
+        }
+    }
+
     fn assert_provider_eq(
         rollup: Vec<queries::ProviderModelComponentRow>,
         live: Vec<queries::ProviderModelComponentRow>,
@@ -1628,6 +2141,8 @@ mod tests {
             assert_eq!(a.thinking, b.thinking, "{ctx}");
             assert_eq!(a.billable, b.billable, "{ctx}");
             assert_eq!(a.runs, b.runs, "{ctx}");
+            assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
+            assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
         }
     }
 
@@ -1661,6 +2176,13 @@ mod tests {
             assert_eq!(a.lines, b.lines, "{ctx}");
             assert_eq!(a.model, b.model, "{ctx}");
             assert_eq!(a.node_name, b.node_name, "{ctx}");
+            assert_eq!(a.backend, b.backend, "{ctx}");
+            assert_eq!(a.input, b.input, "{ctx}");
+            assert_eq!(a.cache_read, b.cache_read, "{ctx}");
+            assert_eq!(a.cache_create, b.cache_create, "{ctx}");
+            assert_eq!(a.output, b.output, "{ctx}");
+            assert!((a.exact_cost - b.exact_cost).abs() < 1e-9, "{ctx} cost");
+            assert_eq!(a.exact_cost_count, b.exact_cost_count, "{ctx}");
         }
     }
 
@@ -1687,15 +2209,21 @@ mod tests {
     #[tokio::test]
     async fn rollup_matches_live_oracle() {
         let db = oracle_db().await;
+        // oracle_db seeds via raw SQL (ins_ev), leaving the rollup cold so the
+        // idempotency/concurrency tests below can fold it from scratch. Fold here
+        // before asserting rollup == live, as the one-time backfill would.
+        queries::fold_token_rollup(&db).await.unwrap();
         let scopes = [Scope::new(None), Scope::new(Some("p1".to_string()))];
-        // Every range start is UTC-day-aligned so the day-grain rollup matches the
-        // per-event live scan exactly: unbounded, day-1 only, and day-2 onward.
+        // Every range start is UTC-hour-aligned (here day-aligned), so the
+        // hour-grain rollup matches the per-event live scan exactly at every
+        // bucket -- including Hour, where bucket_expr on the hour-floored
+        // bucket_start is the identity floor: unbounded, day-1 only, day-2 onward.
         let ranges = [
             TimeRange::new(None, None),
             TimeRange::new(Some(86_400), Some(172_800)),
             TimeRange::new(Some(172_800), None),
         ];
-        let buckets = [Bucket::Day, Bucket::Week, Bucket::Month];
+        let buckets = [Bucket::Hour, Bucket::Day, Bucket::Week, Bucket::Month];
 
         for scope in &scopes {
             for range in &ranges {
@@ -1720,6 +2248,15 @@ mod tests {
                             .await
                             .unwrap(),
                         queries::avg_tokens_per_session_live(&db, scope, range, bucket)
+                            .await
+                            .unwrap(),
+                        &ctx,
+                    );
+                    assert_token_components_eq(
+                        queries::token_components(&db, scope, range, bucket)
+                            .await
+                            .unwrap(),
+                        queries::token_components_live(&db, scope, range, bucket)
                             .await
                             .unwrap(),
                         &ctx,
@@ -1819,5 +2356,457 @@ mod tests {
         c.unwrap();
         d.unwrap();
         assert_eq!(dump_rollup(&concurrent).await, baseline);
+    }
+
+    // --- Per-event maintenance equality + sub-day (hourly) read path ---
+
+    /// Insert one event through the real durable-event seam
+    /// (`insert_event_conn`), so the per-event rollup maintenance runs exactly as
+    /// it does in production.
+    async fn seam_insert(db: &LocalDb, ev: crate::transcripts::stream_store::EventInsert) {
+        db.write(|conn| {
+            let ev = ev.clone();
+            Box::pin(async move {
+                crate::transcripts::stream_store::insert_event_conn(conn, &ev).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ev_insert(
+        id: &str,
+        run: &str,
+        sess: &str,
+        seq: i32,
+        etype: &str,
+        ts: i32,
+        input: i32,
+        cread: i32,
+        ccreate: i32,
+        output: i32,
+        thinking: i32,
+        cost: Option<f64>,
+    ) -> crate::transcripts::stream_store::EventInsert {
+        crate::transcripts::stream_store::EventInsert {
+            id: id.to_string(),
+            run_id: run.to_string(),
+            session_id: Some(sess.to_string()),
+            sequence: seq,
+            timestamp: ts,
+            event_type: etype.to_string(),
+            data: "{}".to_string(),
+            parent_tool_use_id: None,
+            created_at: ts,
+            input_tokens: Some(input),
+            cache_read_tokens: Some(cread),
+            cache_create_tokens: Some(ccreate),
+            output_tokens: Some(output),
+            thinking_tokens: Some(thinking),
+            turn_id: None,
+            cost_usd: cost,
+        }
+    }
+
+    #[tokio::test]
+    async fn per_event_rollup_matches_refold() {
+        // Seed only dimension rows, then insert events through the real insert
+        // seam so the per-event maintenance (not the fold) populates the rollup.
+        let db = cost_db().await;
+        seed_run(&db, "a", "claude", "sonnet").await;
+        seed_run(&db, "b", "codex", "gpt-5").await;
+        seed_run(&db, "c", "openrouter", "sonnet").await;
+
+        let events = [
+            ev_insert(
+                "a1",
+                "run-a",
+                "sess-a",
+                1,
+                "assistant",
+                100,
+                10,
+                20,
+                30,
+                40,
+                5,
+                None,
+            ),
+            // claude skips a cumulative result event.
+            ev_insert(
+                "a2",
+                "run-a",
+                "sess-a",
+                2,
+                "result:success",
+                110,
+                9,
+                9,
+                9,
+                9,
+                0,
+                None,
+            ),
+            // codex bills its result event.
+            ev_insert(
+                "b1",
+                "run-b",
+                "sess-b",
+                1,
+                "result:success",
+                100,
+                100,
+                50,
+                0,
+                10,
+                0,
+                None,
+            ),
+            // codex skips assistant.
+            ev_insert(
+                "b2",
+                "run-b",
+                "sess-b",
+                2,
+                "assistant",
+                110,
+                8,
+                0,
+                0,
+                8,
+                0,
+                None,
+            ),
+            ev_insert(
+                "c1",
+                "run-c",
+                "sess-c",
+                1,
+                "assistant",
+                100,
+                1000,
+                0,
+                0,
+                1000,
+                0,
+                None,
+            ),
+            // a metered settlement event: real cost but not a billable token event.
+            ev_insert(
+                "c2",
+                "run-c",
+                "sess-c",
+                2,
+                "result:success",
+                150,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(0.42),
+            ),
+        ];
+        for ev in events {
+            seam_insert(&db, ev).await;
+        }
+
+        let incremental = dump_rollup(&db).await;
+        assert!(
+            !incremental.is_empty(),
+            "per-event maintenance populated the rollup"
+        );
+
+        // A full re-fold (delete + reinsert per run) must reproduce identical
+        // rows: summing the per-event increments equals the batch fold.
+        queries::fold_token_rollup(&db).await.unwrap();
+        assert_eq!(
+            incremental,
+            dump_rollup(&db).await,
+            "per-event rollup must equal a full re-fold"
+        );
+    }
+
+    #[tokio::test]
+    async fn hourly_bucket_serves_subday_window_from_rollup() {
+        let db = cost_db().await;
+        seed_run(&db, "h", "claude", "sonnet").await;
+        // Three assistant turns one hour apart inside a 24h window. add_event
+        // folds after each insert, so the hour rows are in the rollup. base is
+        // hour-aligned so the rollup's bucket_start range filter includes the
+        // first hour exactly, as the frontend's hour-floored window start does.
+        let base: i64 = 1_700_000_000 / 3600 * 3600;
+        add_event(&db, "h1", "h", "assistant", base, 1000, 100, None).await;
+        add_event(&db, "h2", "h", "assistant", base + 3600, 1000, 100, None).await;
+        add_event(&db, "h3", "h", "assistant", base + 7200, 1000, 100, None).await;
+
+        // A 24h window at hour granularity yields one point per populated hour,
+        // served DIRECTLY from the hour-grain rollup (bucket_expr(Hour) on the
+        // hour-floored bucket_start is the identity floor).
+        let rows = queries::cost_components(
+            &db,
+            &Scope::new(None),
+            &TimeRange::new(Some(base), Some(base + 86_400)),
+            Bucket::Hour,
+        )
+        .await
+        .unwrap();
+        let floor = |t: i64| (t / 3600) * 3600;
+        let buckets: std::collections::BTreeSet<i64> =
+            rows.iter().map(|r| r.bucket_start).collect();
+        assert_eq!(buckets.len(), 3, "three distinct hourly buckets: {rows:#?}");
+        assert!(buckets.contains(&floor(base)));
+        assert!(buckets.contains(&floor(base + 3600)));
+        assert!(buckets.contains(&floor(base + 7200)));
+    }
+
+    /// §D acceptance guard: a metered settlement event that lands in a DIFFERENT
+    /// UTC hour than its turn's billable tokens must still have its cost counted
+    /// by the aggregate economics views. This FAILS on a naive hour-grain of the
+    /// old co-location gate (the cost-only hour row is dropped) and PASSES under
+    /// the independent-cost attribution -- the guard `rollup_matches_live_oracle`
+    /// structurally cannot be, since it re-grains both sides together.
+    #[tokio::test]
+    async fn economics_metered_cost_survives_cross_hour_settlement() {
+        let db = cost_db().await;
+        seed_run(&db, "or", "openrouter", "glm").await;
+        // A billable turn at hour H, then a SEPARATE metered settlement event two
+        // hours later (same UTC day, same run/session/model/agent). At the hour
+        // grain these land in two distinct rollup rows: one with tokens/no cost,
+        // one with cost/no tokens.
+        let h: i64 = JAN_2025 + 100;
+        add_event(&db, "or1", "or", "assistant", h, 1000, 500, None).await;
+        add_event(
+            &db,
+            "or2",
+            "or",
+            "result:success",
+            h + 7200,
+            0,
+            0,
+            Some(0.50),
+        )
+        .await;
+
+        let out = model_role_economics(&db, &Scope::default(), &TimeRange::default())
+            .await
+            .unwrap();
+        // The metered $0.50 must appear in BOTH the by-model and by-role views.
+        assert!(
+            (econ(&out.by_model, "glm").cost_usd - 0.50).abs() < 1e-9,
+            "by_model cost {}",
+            econ(&out.by_model, "glm").cost_usd
+        );
+        assert!(
+            (econ(&out.by_role, "Builder").cost_usd - 0.50).abs() < 1e-9,
+            "by_role cost {}",
+            econ(&out.by_role, "Builder").cost_usd
+        );
+        // cost_by_project (already independent-cost) must include it too.
+        let projects = cost_by_project(&db, &Scope::default(), &TimeRange::default())
+            .await
+            .unwrap();
+        let proj = projects
+            .iter()
+            .find(|p| p.project_id == "proj")
+            .expect("proj");
+        assert!(
+            proj.cost_usd >= 0.50 - 1e-9,
+            "project cost {}",
+            proj.cost_usd
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_by_backend_sums_to_blended_total() {
+        let db = oracle_db().await;
+        queries::fold_token_rollup(&db).await.unwrap();
+        let split =
+            cost_by_backend_timeseries(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+                .await
+                .unwrap();
+        let blended = cost_timeseries(&db, &Scope::new(None), &TimeRange::default(), Bucket::Day)
+            .await
+            .unwrap();
+        let split_total: f64 = split.iter().map(|p| p.cost_usd).sum();
+        let blended_total: f64 = blended.iter().map(|p| p.cost_usd).sum();
+        assert!(
+            (split_total - blended_total).abs() < 1e-9,
+            "provider split {split_total} must sum to blended {blended_total}"
+        );
+        // OpenRouter settled $0.42 on a day-1 billable group; the $0.10 day-2
+        // settlement has no billable token that day, so the token-side guard drops
+        // it from this (and the blended) view. The metered $0.42 must still beat
+        // the ~$0 price-table estimate.
+        let or: f64 = split
+            .iter()
+            .filter(|p| p.backend == "openrouter")
+            .map(|p| p.cost_usd)
+            .sum();
+        assert!((or - 0.42).abs() < 1e-9, "openrouter metered cost {or}");
+    }
+
+    #[tokio::test]
+    async fn cost_by_project_folds_prefers_exact_and_joins_names() {
+        let db = oracle_db().await;
+        queries::fold_token_rollup(&db).await.unwrap();
+        let rows = cost_by_project(&db, &Scope::new(None), &TimeRange::default())
+            .await
+            .unwrap();
+        let p1 = rows.iter().find(|r| r.project_id == "p1").expect("p1");
+        let p2 = rows.iter().find(|r| r.project_id == "p2").expect("p2");
+        assert_eq!(p1.project_name, "P1");
+        assert_eq!(p2.project_name, "P2");
+        // p1's openrouter usage settled $0.52 of real cost, which must be folded in.
+        assert!(p1.cost_usd >= 0.52 - 1e-9, "p1 cost {}", p1.cost_usd);
+        // Sorted by cost descending.
+        assert!(rows.windows(2).all(|w| w[0].cost_usd >= w[1].cost_usd));
+    }
+
+    #[tokio::test]
+    async fn tokens_per_loc_cost_prefers_exact_metered() {
+        let db = oracle_db().await;
+        queries::fold_token_rollup(&db).await.unwrap();
+        let rows = tokens_per_loc(&db, &Scope::new(None), &TimeRange::default())
+            .await
+            .unwrap();
+        // job jo (openrouter) settled $0.42 + $0.10 = $0.52; exact wins.
+        let jo = rows.iter().find(|r| r.job_id == "jo").expect("jo");
+        assert!((jo.cost_usd - 0.52).abs() < 1e-9, "jo cost {}", jo.cost_usd);
+        // job jc (claude) has no metered cost: price-table estimate, still > 0.
+        let jc = rows.iter().find(|r| r.job_id == "jc").expect("jc");
+        assert!(jc.cost_usd > 0.0, "jc cost {}", jc.cost_usd);
+    }
+
+    #[tokio::test]
+    async fn tool_error_rate_is_errors_over_total_per_bucket() {
+        let db = fixture_db().await;
+        // One assistant event with two tool uses, plus a tool_result marking one
+        // as an error: total 2, errors 1 in the day-1 bucket.
+        db.execute_script(
+            "
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-tools', 'proj', 'job-claude', 'exited', 'sess-claude', 1, 1);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+             VALUES ('ev-a', 'run-tools', 'sess-claude', 1, 1, 'assistant',
+                '{\"eventType\":\"assistant\",\"isError\":false,\"toolUses\":[{\"id\":\"tu1\",\"name\":\"mcp__cairn__read\",\"input\":{\"paths\":[\"file:src/lib.rs\"]}},{\"id\":\"tu2\",\"name\":\"run\",\"input\":{\"commands\":[{\"command\":\"cargo test\"}]}}]}',
+                NULL, 90000);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+             VALUES ('ev-r', 'run-tools', 'sess-claude', 2, 2, 'tool_result',
+                '{\"eventType\":\"tool_result\",\"toolUseId\":\"tu1\",\"toolName\":\"read\",\"toolResult\":\"boom\",\"isError\":true}',
+                NULL, 90001);
+            ",
+        )
+        .await
+        .unwrap();
+        backfill_tool_invocations(&db).await.unwrap();
+        let rows = tool_error_rate(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bucket_start, 86400);
+        assert_eq!(rows[0].total, 2);
+        assert_eq!(rows[0].errors, 1);
+        assert!((rows[0].error_rate - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn usage_heatmap_applies_tz_offset_to_local_day() {
+        let db = cost_db().await;
+        seed_run(&db, "h", "claude", "sonnet").await;
+        // 1970-01-04 (Sunday) 01:00:00 UTC = epoch 262800 (a whole-hour floor).
+        // A claude assistant turn there: billable = input + output = 10 + 5 = 15.
+        add_event(&db, "h1", "h", "assistant", 262800, 10, 5, None).await;
+        // UTC: Sunday (dow 0) at 01:00 (hour 1), summing billable tokens.
+        let utc = usage_heatmap(&db, &Scope::default(), &TimeRange::default(), 0)
+            .await
+            .unwrap();
+        assert_eq!(utc.len(), 1);
+        assert_eq!(utc[0].day_of_week, 0);
+        assert_eq!(utc[0].hour, 1);
+        assert_eq!(utc[0].tokens, 15);
+        // UTC-2 shifts it back across the day boundary to Saturday (dow 6) at 23:00.
+        let local = usage_heatmap(&db, &Scope::default(), &TimeRange::default(), -120)
+            .await
+            .unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].day_of_week, 6);
+        assert_eq!(local[0].hour, 23);
+        assert_eq!(local[0].tokens, 15);
+    }
+
+    #[tokio::test]
+    async fn usage_heatmap_sums_billable_tokens_per_cell() {
+        let db = cost_db().await;
+        seed_run(&db, "h", "claude", "sonnet").await;
+        // Two assistant turns in the same UTC hour (Sunday 01:00): 15 + 25 = 40.
+        add_event(&db, "h1", "h", "assistant", 262800, 10, 5, None).await;
+        add_event(&db, "h2", "h", "assistant", 262800 + 120, 20, 5, None).await;
+        // A turn one hour later (Sunday 02:00): a separate cell of 30.
+        add_event(&db, "h3", "h", "assistant", 262800 + 3600, 25, 5, None).await;
+        // A cost-only settlement in the first hour contributes no billable tokens.
+        add_event(
+            &db,
+            "h4",
+            "h",
+            "result:success",
+            262800 + 200,
+            0,
+            0,
+            Some(0.1),
+        )
+        .await;
+
+        let cells = usage_heatmap(&db, &Scope::default(), &TimeRange::default(), 0)
+            .await
+            .unwrap();
+        let sun_1 = cells
+            .iter()
+            .find(|c| c.day_of_week == 0 && c.hour == 1)
+            .expect("sunday 01:00");
+        let sun_2 = cells
+            .iter()
+            .find(|c| c.day_of_week == 0 && c.hour == 2)
+            .expect("sunday 02:00");
+        assert_eq!(sun_1.tokens, 40); // 15 + 25
+        assert_eq!(sun_2.tokens, 30);
+        // The cost-only settlement produces no zero-token cell.
+        assert!(!cells.iter().any(|c| c.tokens == 0));
+    }
+
+    #[tokio::test]
+    async fn token_composition_sums_components_per_bucket() {
+        let db = fixture_db().await;
+        let rows = token_composition_timeseries(
+            &db,
+            &Scope::default(),
+            &TimeRange::default(),
+            Bucket::Day,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "single day bucket");
+        let r = &rows[0];
+        assert_eq!(r.bucket_start, 86400);
+        // Claude c1 (10/100/20/5/3) + c2 (12/0/0/8/1); codex x1 (100/50/0/10/0)
+        // + x2 (200/80/0/20/0). Columns are input/cache_read/cache_create/output/
+        // thinking. (codex cache subsumed in billing but components still stored.)
+        assert_eq!(r.input, 322); // 10 + 12 + 100 + 200
+        assert_eq!(r.cache_read, 230); // 100 + 50 + 80
+        assert_eq!(r.cache_create, 20); // 20 only
+        assert_eq!(r.output, 43); // 5 + 8 + 10 + 20
+        assert_eq!(r.thinking, 4); // 3 + 1
+    }
+
+    #[test]
+    fn bucket_parses_hour() {
+        assert_eq!(Bucket::parse(Some("hour")), Bucket::Hour);
+        assert_eq!(Bucket::parse(Some("HOUR")), Bucket::Hour);
+        assert_eq!(Bucket::parse(Some("week")), Bucket::Week);
+        assert_eq!(Bucket::parse(None), Bucket::Day);
     }
 }

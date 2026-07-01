@@ -11,7 +11,7 @@
 //! normalization happen in the parent module so the price table stays in one
 //! place.
 
-use turso::{params, Value};
+use turso::{params, Connection, Value};
 
 use super::tool_extract::{self, ToolInvocation};
 use super::types::{Bucket, Scope, TimeRange, ToolBackfillSummary, TopTargetRow};
@@ -21,12 +21,16 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 // --- Tier A: token/cost rollup (incremental fold + read queries) ---
 //
 // The read paths aggregate the app-maintained `token_rollup` table -- one row
-// per (UTC-day x run x resolved dimensions) -- instead of rescanning the
-// ~780k-row `events` table on every analytics page load. `fold_token_rollup`
-// keeps it fresh incrementally, watermark-gated per run, mirroring the
-// tool-invocation rollup (migration 0067). The retained `*_live` event-scan
-// queries further below are the `#[cfg(test)]` oracle the rollup is proven
-// equal to.
+// per (UTC-hour x run x resolved dimensions) -- instead of rescanning the
+// ~780k-row `events` table on every analytics page load. ONE hour-grain cache
+// answers every time query: day/week/month floor an already-hour-floored epoch
+// (exact, since an hour nests wholly inside its day/week/month), and the 24h
+// window reads the rollup directly (`bucket_expr(Hour)` on an hour-floored
+// column is the identity floor). `fold_token_rollup` keeps it fresh
+// incrementally, watermark-gated per run, mirroring the tool-invocation rollup
+// (migration 0067). The retained `*_live` event-scan queries further below are
+// the `#[cfg(test)]` oracle the rollup is proven equal to -- no longer a
+// production read path.
 
 /// Backend resolved per event, mirroring `models::context_tokens`: backend
 /// identity lives on `sessions.backend` (the vestigial `runs.backend` column was
@@ -64,17 +68,18 @@ const NEEDING_FOLD_SQL: &str = "SELECT e.run_id
 
 /// Scope/range predicate over the `token_rollup` alias `tr`. Bound params are
 /// `?1` = project id, `?2` = start, `?3` = end; each NULL disables that filter.
-/// The range filters the stored UTC-day floor, so it matches the live per-event
-/// scan exactly when the window start is day-aligned (see `AnalyticsSection`).
+/// The range filters the stored UTC-hour floor, so it matches the live per-event
+/// scan exactly when the window start is hour-aligned -- which the analytics
+/// range selector always is (see `AnalyticsSection`).
 const ROLLUP_SCOPE_RANGE: &str = "(?1 IS NULL OR tr.project_id = ?1)
-        AND (?2 IS NULL OR tr.day >= ?2)
-        AND (?3 IS NULL OR tr.day < ?3)";
+        AND (?2 IS NULL OR tr.bucket_start >= ?2)
+        AND (?3 IS NULL OR tr.bucket_start < ?3)";
 
 /// Sibling of [`ROLLUP_SCOPE_RANGE`] bound to params `?4`/`?5`/`?6` so the token
 /// and cost scans can carry independent (identical) filters in one statement.
 const ROLLUP_COST_SCOPE_RANGE: &str = "(?4 IS NULL OR tr.project_id = ?4)
-        AND (?5 IS NULL OR tr.day >= ?5)
-        AND (?6 IS NULL OR tr.day < ?6)";
+        AND (?5 IS NULL OR tr.bucket_start >= ?5)
+        AND (?6 IS NULL OR tr.bucket_start < ?6)";
 
 /// Positional params for [`ROLLUP_SCOPE_RANGE`] (and the retained
 /// `#[cfg(test)]` [`SCOPE_RANGE`] oracle, which has the same `?1..?3` shape).
@@ -100,21 +105,21 @@ fn scope_range_params_doubled(scope: &Scope, range: &TimeRange) -> Vec<Value> {
 /// event carrying a real `cost_usd` -- a broader population, since the metered
 /// settlement event is not itself a billable token event. The synthetic `id`
 /// is unique per grouped row because all of its components are functionally
-/// determined by the run (fixed at `?1`) plus the grouped day/session/model/
+/// determined by the run (fixed at `?1`) plus the grouped hour/session/model/
 /// backend/agent dimensions.
 fn rollup_insert_sql() -> String {
     format!(
         "INSERT INTO token_rollup (
-            id, day, project_id, run_id, session_id, job_id, node_name, model,
+            id, bucket_start, project_id, run_id, session_id, job_id, node_name, model,
             agent_config_id, backend, input_tokens, cache_read_tokens,
             cache_create_tokens, output_tokens, thinking_tokens, billable_tokens,
             token_event_count, exact_cost, exact_cost_count
         )
         SELECT
-            CAST((e.created_at / 86400) * 86400 AS TEXT) || ':' || e.run_id || ':' ||
+            CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
                 COALESCE(e.session_id, '') || ':' || COALESCE(j.model, '') || ':' ||
                 {backend} || ':' || COALESCE(j.agent_config_id, '') AS id,
-            (e.created_at / 86400) * 86400 AS day,
+            (e.created_at / 3600) * 3600 AS bucket_start,
             COALESCE(r.project_id, j.project_id) AS project_id,
             e.run_id AS run_id,
             e.session_id AS session_id,
@@ -138,7 +143,7 @@ fn rollup_insert_sql() -> String {
         LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
         WHERE e.run_id = ?1
           AND (({billable}) OR e.cost_usd IS NOT NULL)
-        GROUP BY (e.created_at / 86400) * 86400,
+        GROUP BY (e.created_at / 3600) * 3600,
                  COALESCE(r.project_id, j.project_id),
                  e.run_id,
                  e.session_id,
@@ -218,9 +223,157 @@ pub(crate) async fn fold_token_rollup(db: &LocalDb) -> DbResult<()> {
     .await
 }
 
-/// Retained event-scan CTE: the `#[cfg(test)]` oracle the rollup read queries
-/// are proven equal to. One row per billable top-level turn event, referenced as
-/// `te` by every `*_live` query.
+// --- Tier A: per-event incremental maintenance (hot insert path) ---
+
+/// The single-event upsert that maintains `token_rollup` as each event lands.
+///
+/// The batch [`fold_token_rollup`] re-derives a whole run with a GROUP BY SUM;
+/// this applies only THIS event's contribution to its one matching rollup row
+/// (`ON CONFLICT(id) DO UPDATE` increments every measure), so the streaming path
+/// stays O(1) in the event instead of O(run). It reuses the exact same backend
+/// resolution, billable predicate, and billable total as the fold, so summing
+/// the per-event increments is provably equal to the batch fold (the retained
+/// `*_live` event-scan queries are the oracle that equality is tested against).
+/// Bound param `?1` is the event id; the event is already inserted in the same
+/// transaction, so this SELECT sees it.
+fn token_rollup_event_upsert_sql() -> String {
+    format!(
+        "INSERT INTO token_rollup (
+            id, bucket_start, project_id, run_id, session_id, job_id, node_name, model,
+            agent_config_id, backend, input_tokens, cache_read_tokens,
+            cache_create_tokens, output_tokens, thinking_tokens, billable_tokens,
+            token_event_count, exact_cost, exact_cost_count
+        )
+        SELECT
+            CAST((e.created_at / 3600) * 3600 AS TEXT) || ':' || e.run_id || ':' ||
+                COALESCE(e.session_id, '') || ':' || COALESCE(j.model, '') || ':' ||
+                {backend} || ':' || COALESCE(j.agent_config_id, '') AS id,
+            (e.created_at / 3600) * 3600 AS bucket_start,
+            COALESCE(r.project_id, j.project_id) AS project_id,
+            e.run_id,
+            e.session_id,
+            COALESCE(r.job_id, s.job_id) AS job_id,
+            j.node_name,
+            j.model,
+            j.agent_config_id,
+            {backend} AS backend,
+            CASE WHEN {billable} THEN COALESCE(e.input_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} THEN COALESCE(e.cache_read_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} THEN COALESCE(e.cache_create_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} THEN COALESCE(e.output_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} THEN COALESCE(e.thinking_tokens, 0) ELSE 0 END,
+            CASE WHEN {billable} THEN {billable_total} ELSE 0 END,
+            CASE WHEN {billable} THEN 1 ELSE 0 END,
+            COALESCE(e.cost_usd, 0.0),
+            CASE WHEN e.cost_usd IS NOT NULL THEN 1 ELSE 0 END
+        FROM events e
+        LEFT JOIN runs r ON r.id = e.run_id
+        LEFT JOIN sessions s ON s.id = e.session_id
+        LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+        WHERE e.id = ?1
+          AND (({billable}) OR e.cost_usd IS NOT NULL)
+        ON CONFLICT(id) DO UPDATE SET
+            input_tokens = input_tokens + excluded.input_tokens,
+            cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+            cache_create_tokens = cache_create_tokens + excluded.cache_create_tokens,
+            output_tokens = output_tokens + excluded.output_tokens,
+            thinking_tokens = thinking_tokens + excluded.thinking_tokens,
+            billable_tokens = billable_tokens + excluded.billable_tokens,
+            token_event_count = token_event_count + excluded.token_event_count,
+            exact_cost = exact_cost + excluded.exact_cost,
+            exact_cost_count = exact_cost_count + excluded.exact_cost_count",
+        backend = BACKEND_EXPR,
+        billable = BILLABLE_PREDICATE,
+        billable_total = BILLABLE_TOTAL,
+    )
+}
+
+/// Maintain both analytics rollups for one freshly-inserted event, inside the
+/// event-insert transaction (see
+/// `transcripts::stream_store::insert_event_conn`).
+///
+/// Idempotency comes from the caller gating this on a NEW row actually landing
+/// (`count > 0`): a duplicate-id re-insert never re-applies the increment.
+/// Tier A applies this event's token/cost contribution; Tier B indexes an
+/// assistant event's tool uses or links a `tool_result`'s error. Both are O(1)
+/// in the event. The conn already has the event row written, so Tier A's SELECT
+/// by id sees it.
+pub(crate) async fn maintain_rollups_on_insert(
+    conn: &Connection,
+    event_id: &str,
+    run_id: &str,
+    created_at: i64,
+    event_type: &str,
+    data: &str,
+    cost_usd: Option<f64>,
+) -> DbResult<()> {
+    // Tier A: only billable token events (assistant / result%) or events
+    // carrying a real cost contribute. The SELECT self-filters, but skipping the
+    // join for the common non-contributing event keeps the hot path cheap.
+    if event_type == "assistant" || event_type.starts_with("result") || cost_usd.is_some() {
+        conn.execute(&token_rollup_event_upsert_sql(), params![event_id])
+            .await?;
+    }
+    // Tier B: an assistant event's tool uses, or a tool_result's error link.
+    if event_type == "assistant" || event_type == "tool_result" {
+        maintain_tool_rollup_event(conn, event_id, run_id, created_at, event_type, data).await?;
+    }
+    Ok(())
+}
+
+/// Tier B per-event maintenance: index a single assistant event's tool uses
+/// (`is_error = 0`), or update the matching row's `is_error` from a single
+/// `tool_result` event. Shares `tool_extract`'s extraction/classification with
+/// the run-level backfill, so the live rows match what a full re-backfill would
+/// produce; the backfill remains the idempotent safety net that reconciles any
+/// out-of-order results.
+async fn maintain_tool_rollup_event(
+    conn: &Connection,
+    event_id: &str,
+    run_id: &str,
+    created_at: i64,
+    event_type: &str,
+    data: &str,
+) -> DbResult<()> {
+    if event_type == "assistant" {
+        for row in tool_extract::extract_event_invocations(event_id, run_id, created_at, data) {
+            conn.execute(
+                "INSERT OR REPLACE INTO tool_invocations
+                    (id, event_id, tool_use_id, run_id, ts, verb, tool_name,
+                     target_scheme, target_kind, target_path, is_error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    row.id(),
+                    row.event_id.as_str(),
+                    row.tool_use_id.as_str(),
+                    row.run_id.as_str(),
+                    row.ts,
+                    row.verb.as_str(),
+                    row.tool_name.as_str(),
+                    row.target_scheme.as_str(),
+                    row.target_kind.as_str(),
+                    row.target_path.as_deref(),
+                    row.is_error as i64
+                ],
+            )
+            .await?;
+        }
+    } else if event_type == "tool_result" {
+        if let Some((tool_use_id, is_error)) = tool_extract::tool_result_error(data) {
+            conn.execute(
+                "UPDATE tool_invocations SET is_error = ?3
+                 WHERE run_id = ?1 AND tool_use_id = ?2",
+                params![run_id, tool_use_id.as_str(), is_error as i64],
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Retained event-scan CTE: the `#[cfg(test)]` oracle the rollup read queries are
+/// proven equal to (no longer a production read path). One row per billable
+/// top-level turn event, referenced as `te` by every `*_live` query.
 #[cfg(test)]
 const TOKEN_EVENTS_CTE: &str = "\
 token_events AS (
@@ -258,14 +411,15 @@ token_events AS (
       )
 )";
 
-/// Scope/range predicate over the `token_events` alias `te` (oracle only).
+/// Scope/range predicate over the `token_events` alias `te` (the `#[cfg(test)]`
+/// oracle).
 #[cfg(test)]
 const SCOPE_RANGE: &str = "(?1 IS NULL OR te.project_id = ?1)
         AND (?2 IS NULL OR te.ts >= ?2)
         AND (?3 IS NULL OR te.ts < ?3)";
 
 /// Scope/range predicate over the `cost_events` alias `ce` using `?4`/`?5`/`?6`
-/// (oracle only).
+/// (the `#[cfg(test)]` oracle).
 #[cfg(test)]
 const COST_SCOPE_RANGE: &str = "(?4 IS NULL OR ce.project_id = ?4)
         AND (?5 IS NULL OR ce.ts >= ?5)
@@ -279,22 +433,21 @@ pub(crate) struct SessionBucketRow {
     pub session_count: i64,
 }
 
-/// Bucketing on `MIN(day)` equals bucketing on `MIN(ts)` because a UTC day nests
-/// wholly inside its week and month, so the day floor of the earliest event
-/// shares the earliest event's week/month bucket.
+/// Bucketing on `MIN(bucket_start)` equals bucketing on `MIN(ts)` because a UTC
+/// hour nests wholly inside its day, week, and month, so the hour floor of the
+/// earliest event shares the earliest event's day/week/month bucket.
 pub(crate) async fn avg_tokens_per_session(
     db: &LocalDb,
     scope: &Scope,
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<SessionBucketRow>> {
-    fold_token_rollup(db).await?;
     let bucket_expr = bucket.bucket_expr("session_day");
     let sql = format!(
         "WITH sessions_agg AS (
             SELECT tr.session_id AS session_id,
                    SUM(tr.billable_tokens) AS total,
-                   MIN(tr.day) AS session_day
+                   MIN(tr.bucket_start) AS session_day
             FROM token_rollup tr
             WHERE tr.session_id IS NOT NULL AND tr.token_event_count > 0 AND {filter}
             GROUP BY tr.session_id
@@ -317,7 +470,8 @@ pub(crate) async fn avg_tokens_per_session(
     .await
 }
 
-/// Event-scan oracle for [`avg_tokens_per_session`].
+/// Event-scan variant of [`avg_tokens_per_session`]: the `#[cfg(test)]` oracle
+/// the rollup read is proven equal to (no longer a production path).
 #[cfg(test)]
 pub(crate) async fn avg_tokens_per_session_live(
     db: &LocalDb,
@@ -355,7 +509,8 @@ pub(crate) async fn avg_tokens_per_session_live(
     .await
 }
 
-/// One PR-producing job: billable tokens and lines changed.
+/// One PR-producing job: billable tokens, lines changed, and the token/cost
+/// components needed to derive its real metered cost (for cost-per-line).
 #[derive(Debug, Clone)]
 pub(crate) struct LocRow {
     pub job_id: String,
@@ -364,6 +519,15 @@ pub(crate) struct LocRow {
     pub lines: i64,
     pub model: Option<String>,
     pub node_name: Option<String>,
+    pub backend: String,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub output: i64,
+    /// Sum of real `events.cost_usd` for this job (0 when none reported).
+    pub exact_cost: f64,
+    /// Count of this job's events that carried a real `cost_usd`.
+    pub exact_cost_count: i64,
 }
 
 pub(crate) async fn tokens_per_loc(
@@ -379,15 +543,27 @@ pub(crate) async fn tokens_per_loc(
     //
     // No day range on `token_rollup` here: the range applies to `mr.opened_at`,
     // and a job's whole billable total is attributed to its merge request.
-    fold_token_rollup(db).await?;
     let sql = "WITH job_tokens AS (
             SELECT tr.job_id AS job_id,
                    SUM(tr.billable_tokens) AS billable,
+                   SUM(tr.input_tokens) AS input,
+                   SUM(tr.cache_read_tokens) AS cache_read,
+                   SUM(tr.cache_create_tokens) AS cache_create,
+                   SUM(tr.output_tokens) AS output,
                    MAX(tr.model) AS model,
-                   MAX(tr.node_name) AS node_name
+                   MAX(tr.node_name) AS node_name,
+                   MAX(tr.backend) AS backend
             FROM token_rollup tr
             WHERE tr.job_id IS NOT NULL AND tr.token_event_count > 0
               AND (?1 IS NULL OR tr.project_id = ?1)
+            GROUP BY tr.job_id
+        ),
+        job_cost AS (
+            SELECT tr.job_id AS job_id,
+                   SUM(tr.exact_cost) AS exact_cost,
+                   SUM(tr.exact_cost_count) AS exact_cost_count
+            FROM token_rollup tr
+            WHERE tr.job_id IS NOT NULL AND tr.exact_cost_count > 0
             GROUP BY tr.job_id
         ),
         job_lines AS (
@@ -405,10 +581,18 @@ pub(crate) async fn tokens_per_loc(
                    ELSE COALESCE(jl.lines, 0)
                END AS lines_changed,
                jt.model,
-               jt.node_name
+               jt.node_name,
+               jt.backend,
+               jt.input,
+               jt.cache_read,
+               jt.cache_create,
+               jt.output,
+               COALESCE(jc.exact_cost, 0.0),
+               COALESCE(jc.exact_cost_count, 0)
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
         LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
+        LEFT JOIN job_cost jc ON jc.job_id = jt.job_id
         WHERE (CASE
                    WHEN (COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)) > 0
                        THEN COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)
@@ -425,6 +609,13 @@ pub(crate) async fn tokens_per_loc(
             lines: row.i64(3)?,
             model: row.opt_text(4)?,
             node_name: row.opt_text(5)?,
+            backend: row.text(6)?,
+            input: row.i64(7)?,
+            cache_read: row.i64(8)?,
+            cache_create: row.i64(9)?,
+            output: row.i64(10)?,
+            exact_cost: row.opt_f64(11)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(12)?,
         })
     })
     .await
@@ -439,11 +630,26 @@ pub(crate) async fn tokens_per_loc_live(
 ) -> DbResult<Vec<LocRow>> {
     let sql = format!(
         "WITH {cte},
+        job_cost AS (
+            SELECT COALESCE(r.job_id, s.job_id) AS job_id,
+                   SUM(e.cost_usd) AS exact_cost,
+                   COUNT(e.cost_usd) AS exact_cost_count
+            FROM events e
+            LEFT JOIN runs r ON r.id = e.run_id
+            LEFT JOIN sessions s ON s.id = e.session_id
+            WHERE e.cost_usd IS NOT NULL
+            GROUP BY COALESCE(r.job_id, s.job_id)
+        ),
         job_tokens AS (
             SELECT te.job_id AS job_id,
                    SUM(te.billable_tokens) AS billable,
+                   SUM(te.input_tokens) AS input,
+                   SUM(te.cache_read_tokens) AS cache_read,
+                   SUM(te.cache_create_tokens) AS cache_create,
+                   SUM(te.output_tokens) AS output,
                    MAX(te.model) AS model,
-                   MAX(te.node_name) AS node_name
+                   MAX(te.node_name) AS node_name,
+                   MAX(te.backend) AS backend
             FROM token_events te
             WHERE te.job_id IS NOT NULL
               AND (?1 IS NULL OR te.project_id = ?1)
@@ -464,10 +670,18 @@ pub(crate) async fn tokens_per_loc_live(
                    ELSE COALESCE(jl.lines, 0)
                END AS lines_changed,
                jt.model,
-               jt.node_name
+               jt.node_name,
+               jt.backend,
+               jt.input,
+               jt.cache_read,
+               jt.cache_create,
+               jt.output,
+               COALESCE(jc.exact_cost, 0.0),
+               COALESCE(jc.exact_cost_count, 0)
         FROM job_tokens jt
         JOIN merge_requests mr ON mr.job_id = jt.job_id
         LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
+        LEFT JOIN job_cost jc ON jc.job_id = jt.job_id
         WHERE (CASE
                    WHEN (COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)) > 0
                        THEN COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)
@@ -486,6 +700,13 @@ pub(crate) async fn tokens_per_loc_live(
             lines: row.i64(3)?,
             model: row.opt_text(4)?,
             node_name: row.opt_text(5)?,
+            backend: row.text(6)?,
+            input: row.i64(7)?,
+            cache_read: row.i64(8)?,
+            cache_create: row.i64(9)?,
+            output: row.i64(10)?,
+            exact_cost: row.opt_f64(11)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(12)?,
         })
     })
     .await
@@ -519,8 +740,7 @@ pub(crate) async fn cost_components(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<CostComponentRow>> {
-    fold_token_rollup(db).await?;
-    let bucket_expr = bucket.bucket_expr("tr.day");
+    let bucket_expr = bucket.bucket_expr("tr.bucket_start");
     let sql = format!(
         "WITH tok AS (
             SELECT {bucket_expr} AS bucket_start,
@@ -533,7 +753,7 @@ pub(crate) async fn cost_components(
                    SUM(tr.billable_tokens) AS billable
             FROM token_rollup tr
             WHERE tr.token_event_count > 0 AND {filter}
-            GROUP BY bucket_start, tr.model, tr.backend
+            GROUP BY {bucket_expr}, tr.model, tr.backend
         ),
         cost AS (
             SELECT {bucket_expr} AS bucket_start,
@@ -543,7 +763,7 @@ pub(crate) async fn cost_components(
                    SUM(tr.exact_cost_count) AS exact_count
             FROM token_rollup tr
             WHERE tr.exact_cost_count > 0 AND {cost_filter}
-            GROUP BY bucket_start, tr.model, tr.backend
+            GROUP BY {bucket_expr}, tr.model, tr.backend
         )
         SELECT tok.bucket_start,
                tok.model,
@@ -581,7 +801,8 @@ pub(crate) async fn cost_components(
     .await
 }
 
-/// Event-scan oracle for [`cost_components`].
+/// Event-scan variant of [`cost_components`]: the `#[cfg(test)]` oracle the
+/// rollup read is proven equal to (no longer a production path).
 #[cfg(test)]
 pub(crate) async fn cost_components_live(
     db: &LocalDb,
@@ -697,7 +918,6 @@ pub(crate) async fn provider_model_components(
     scope: &Scope,
     range: &TimeRange,
 ) -> DbResult<Vec<ProviderModelComponentRow>> {
-    fold_token_rollup(db).await?;
     let sql = format!(
         "WITH tok AS (
             SELECT tr.model AS model,
@@ -853,6 +1073,12 @@ pub(crate) struct GranularRow {
     pub thinking: i64,
     pub billable: i64,
     pub runs: i64,
+    /// Real metered cost (`events.cost_usd`) for this group: the sum of every
+    /// metered event whose (model, agent, backend) group also has billable
+    /// tokens, independent of per-row time co-location. 0 when none reported.
+    pub exact_cost: f64,
+    /// Count of events contributing to `exact_cost`.
+    pub exact_cost_count: i64,
 }
 
 pub(crate) async fn economics_granular(
@@ -860,24 +1086,62 @@ pub(crate) async fn economics_granular(
     scope: &Scope,
     range: &TimeRange,
 ) -> DbResult<Vec<GranularRow>> {
-    fold_token_rollup(db).await?;
+    // Cost attribution is grain-invariant by construction: the `tok` CTE keeps
+    // only groups that HAVE billable tokens; the `cost` CTE sums each group's
+    // metered `exact_cost` INDEPENDENTLY of time co-location (no
+    // `token_event_count` gate); the LEFT JOIN gives each billable group ALL its
+    // metered cost. So a settlement event that lands in a different hour than
+    // its turn's billable tokens still attributes its cost -- and SUM(exact_cost)
+    // over hour rows equals the same sum over day rows, so the re-grain can never
+    // move economics cost. This mirrors `cost_by_project`, unifying cost
+    // attribution into one pattern across the module.
     let sql = format!(
-        "SELECT tr.model,
-               tr.agent_config_id,
-               tr.backend,
-               SUM(tr.input_tokens),
-               SUM(tr.cache_read_tokens),
-               SUM(tr.cache_create_tokens),
-               SUM(tr.output_tokens),
-               SUM(tr.thinking_tokens),
-               SUM(tr.billable_tokens),
-               COUNT(DISTINCT tr.run_id)
-        FROM token_rollup tr
-        WHERE tr.token_event_count > 0 AND {filter}
-        GROUP BY tr.model, tr.agent_config_id, tr.backend",
+        "WITH tok AS (
+            SELECT tr.model AS model,
+                   tr.agent_config_id AS agent_config_id,
+                   tr.backend AS backend,
+                   SUM(tr.input_tokens) AS input,
+                   SUM(tr.cache_read_tokens) AS cache_read,
+                   SUM(tr.cache_create_tokens) AS cache_create,
+                   SUM(tr.output_tokens) AS output,
+                   SUM(tr.thinking_tokens) AS thinking,
+                   SUM(tr.billable_tokens) AS billable,
+                   COUNT(DISTINCT tr.run_id) AS runs
+            FROM token_rollup tr
+            WHERE tr.token_event_count > 0 AND {filter}
+            GROUP BY tr.model, tr.agent_config_id, tr.backend
+        ),
+        cost AS (
+            SELECT tr.model AS model,
+                   tr.agent_config_id AS agent_config_id,
+                   tr.backend AS backend,
+                   SUM(tr.exact_cost) AS exact_cost,
+                   SUM(tr.exact_cost_count) AS exact_count
+            FROM token_rollup tr
+            WHERE tr.exact_cost_count > 0 AND {cost_filter}
+            GROUP BY tr.model, tr.agent_config_id, tr.backend
+        )
+        SELECT tok.model,
+               tok.agent_config_id,
+               tok.backend,
+               tok.input,
+               tok.cache_read,
+               tok.cache_create,
+               tok.output,
+               tok.thinking,
+               tok.billable,
+               tok.runs,
+               COALESCE(cost.exact_cost, 0.0),
+               COALESCE(cost.exact_count, 0)
+        FROM tok
+        LEFT JOIN cost
+            ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
+           AND IFNULL(cost.agent_config_id, '') = IFNULL(tok.agent_config_id, '')
+           AND cost.backend = tok.backend",
         filter = ROLLUP_SCOPE_RANGE,
+        cost_filter = ROLLUP_COST_SCOPE_RANGE,
     );
-    db.query_all(sql, scope_range_params(scope, range), |row| {
+    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
         Ok(GranularRow {
             model: row.opt_text(0)?,
             agent_config_id: row.opt_text(1)?,
@@ -889,12 +1153,22 @@ pub(crate) async fn economics_granular(
             thinking: row.i64(7)?,
             billable: row.i64(8)?,
             runs: row.i64(9)?,
+            exact_cost: row.opt_f64(10)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(11)?,
         })
     })
     .await
 }
 
 /// Event-scan oracle for [`economics_granular`].
+///
+/// Both sides attribute cost by the SAME independent rule: sum every metered
+/// event's `cost_usd` per `(model, agent_config_id, backend)` group, then keep
+/// only groups that also carry billable tokens (the `FROM tok LEFT JOIN cost`
+/// shape). There is no time co-location gate, so the attribution is invariant to
+/// the rollup's hour-vs-day grain -- which is exactly why the rollup-vs-oracle
+/// equality test cannot itself guard the co-location behavior (a dedicated
+/// cross-hour economics test does).
 #[cfg(test)]
 pub(crate) async fn economics_granular_live(
     db: &LocalDb,
@@ -902,24 +1176,67 @@ pub(crate) async fn economics_granular_live(
     range: &TimeRange,
 ) -> DbResult<Vec<GranularRow>> {
     let sql = format!(
-        "WITH {cte}
-        SELECT te.model,
-               te.agent_config_id,
-               te.backend,
-               SUM(te.input_tokens),
-               SUM(te.cache_read_tokens),
-               SUM(te.cache_create_tokens),
-               SUM(te.output_tokens),
-               SUM(te.thinking_tokens),
-               SUM(te.billable_tokens),
-               COUNT(DISTINCT te.run_id)
-        FROM token_events te
-        WHERE {filter}
-        GROUP BY te.model, te.agent_config_id, te.backend",
+        "WITH {cte},
+        cost_events AS (
+            SELECT j.model AS model,
+                   j.agent_config_id AS agent_config_id,
+                   LOWER(COALESCE(s.backend, 'claude')) AS backend,
+                   COALESCE(r.project_id, j.project_id) AS project_id,
+                   e.created_at AS ts,
+                   e.cost_usd AS cost_usd
+            FROM events e
+            LEFT JOIN runs r ON r.id = e.run_id
+            LEFT JOIN sessions s ON s.id = e.session_id
+            LEFT JOIN jobs j ON j.id = COALESCE(r.job_id, s.job_id)
+            WHERE e.cost_usd IS NOT NULL
+        ),
+        cost AS (
+            SELECT ce.model AS model,
+                   ce.agent_config_id AS agent_config_id,
+                   ce.backend AS backend,
+                   SUM(ce.cost_usd) AS exact_cost,
+                   COUNT(ce.cost_usd) AS exact_cost_count
+            FROM cost_events ce
+            WHERE {cost_filter}
+            GROUP BY ce.model, ce.agent_config_id, ce.backend
+        ),
+        tok AS (
+            SELECT te.model AS model,
+                   te.agent_config_id AS agent_config_id,
+                   te.backend AS backend,
+                   SUM(te.input_tokens) AS input,
+                   SUM(te.cache_read_tokens) AS cache_read,
+                   SUM(te.cache_create_tokens) AS cache_create,
+                   SUM(te.output_tokens) AS output,
+                   SUM(te.thinking_tokens) AS thinking,
+                   SUM(te.billable_tokens) AS billable,
+                   COUNT(DISTINCT te.run_id) AS runs
+            FROM token_events te
+            WHERE {filter}
+            GROUP BY te.model, te.agent_config_id, te.backend
+        )
+        SELECT tok.model,
+               tok.agent_config_id,
+               tok.backend,
+               tok.input,
+               tok.cache_read,
+               tok.cache_create,
+               tok.output,
+               tok.thinking,
+               tok.billable,
+               tok.runs,
+               COALESCE(cost.exact_cost, 0.0),
+               COALESCE(cost.exact_cost_count, 0)
+        FROM tok
+        LEFT JOIN cost
+            ON IFNULL(cost.model, '') = IFNULL(tok.model, '')
+           AND IFNULL(cost.agent_config_id, '') = IFNULL(tok.agent_config_id, '')
+           AND cost.backend = tok.backend",
         cte = TOKEN_EVENTS_CTE,
         filter = SCOPE_RANGE,
+        cost_filter = COST_SCOPE_RANGE,
     );
-    db.query_all(sql, scope_range_params(scope, range), |row| {
+    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
         Ok(GranularRow {
             model: row.opt_text(0)?,
             agent_config_id: row.opt_text(1)?,
@@ -931,6 +1248,8 @@ pub(crate) async fn economics_granular_live(
             thinking: row.i64(7)?,
             billable: row.i64(8)?,
             runs: row.i64(9)?,
+            exact_cost: row.opt_f64(10)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(11)?,
         })
     })
     .await
@@ -1191,6 +1510,272 @@ pub(crate) async fn tool_mix(
             bucket_start: row.i64(0)?,
             verb: row.text(1)?,
             count: row.i64(2)?,
+        })
+    })
+    .await
+}
+
+// --- New charts: token composition, cost-by-project, tool error rate, heatmap ---
+
+/// Summed token components (input / cache-read / cache-create / output /
+/// thinking) for one time bucket. Powers the stacked token-composition chart.
+#[derive(Debug, Clone)]
+pub(crate) struct TokenComponentRow {
+    pub bucket_start: i64,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub output: i64,
+    pub thinking: i64,
+}
+
+/// Token components per time bucket from the hour-grain rollup, served directly
+/// at every granularity (`bucket_expr(Hour)` on the hour-floored `bucket_start`
+/// is the identity floor).
+pub(crate) async fn token_components(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<TokenComponentRow>> {
+    let bucket_expr = bucket.bucket_expr("tr.bucket_start");
+    let sql = format!(
+        "SELECT {bucket_expr} AS bucket_start,
+                SUM(tr.input_tokens),
+                SUM(tr.cache_read_tokens),
+                SUM(tr.cache_create_tokens),
+                SUM(tr.output_tokens),
+                SUM(tr.thinking_tokens)
+        FROM token_rollup tr
+        WHERE tr.token_event_count > 0 AND {filter}
+        GROUP BY {bucket_expr}
+        ORDER BY {bucket_expr}",
+        filter = ROLLUP_SCOPE_RANGE,
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(TokenComponentRow {
+            bucket_start: row.i64(0)?,
+            input: row.i64(1)?,
+            cache_read: row.i64(2)?,
+            cache_create: row.i64(3)?,
+            output: row.i64(4)?,
+            thinking: row.i64(5)?,
+        })
+    })
+    .await
+}
+
+/// Event-scan variant of [`token_components`]: the `#[cfg(test)]` oracle the
+/// rollup read is proven equal to (no longer a production path).
+#[cfg(test)]
+pub(crate) async fn token_components_live(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<TokenComponentRow>> {
+    let bucket_expr = bucket.bucket_expr("te.ts");
+    let sql = format!(
+        "WITH {cte}
+        SELECT {bucket_expr} AS bucket_start,
+                SUM(te.input_tokens),
+                SUM(te.cache_read_tokens),
+                SUM(te.cache_create_tokens),
+                SUM(te.output_tokens),
+                SUM(te.thinking_tokens)
+        FROM token_events te
+        WHERE {filter}
+        GROUP BY bucket_start
+        ORDER BY bucket_start",
+        cte = TOKEN_EVENTS_CTE,
+        filter = SCOPE_RANGE,
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(TokenComponentRow {
+            bucket_start: row.i64(0)?,
+            input: row.i64(1)?,
+            cache_read: row.i64(2)?,
+            cache_create: row.i64(3)?,
+            output: row.i64(4)?,
+            thinking: row.i64(5)?,
+        })
+    })
+    .await
+}
+
+/// Per (project, model, backend) token components and real metered cost, with
+/// the project's display name joined. Folded to per-project totals in the parent
+/// module via the canonical exact-cost-preferred rule. The settlement cost lands
+/// on a non-billable event in the same (project, model, backend) group, so it is
+/// joined here exactly as [`cost_components`] does for its time buckets.
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectCostComponentRow {
+    pub project_id: String,
+    pub project_name: String,
+    pub model: Option<String>,
+    pub backend: String,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub output: i64,
+    pub billable: i64,
+    pub exact_cost: f64,
+    pub exact_cost_count: i64,
+}
+
+pub(crate) async fn cost_by_project(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<Vec<ProjectCostComponentRow>> {
+    let sql = format!(
+        "WITH tok AS (
+            SELECT tr.project_id AS project_id,
+                   tr.model AS model,
+                   tr.backend AS backend,
+                   SUM(tr.input_tokens) AS input,
+                   SUM(tr.cache_read_tokens) AS cache_read,
+                   SUM(tr.cache_create_tokens) AS cache_create,
+                   SUM(tr.output_tokens) AS output,
+                   SUM(tr.billable_tokens) AS billable
+            FROM token_rollup tr
+            WHERE tr.token_event_count > 0 AND tr.project_id IS NOT NULL AND {filter}
+            GROUP BY tr.project_id, tr.model, tr.backend
+        ),
+        cost AS (
+            SELECT tr.project_id AS project_id,
+                   tr.model AS model,
+                   tr.backend AS backend,
+                   SUM(tr.exact_cost) AS exact_cost,
+                   SUM(tr.exact_cost_count) AS exact_count
+            FROM token_rollup tr
+            WHERE tr.exact_cost_count > 0 AND tr.project_id IS NOT NULL AND {cost_filter}
+            GROUP BY tr.project_id, tr.model, tr.backend
+        )
+        SELECT tok.project_id,
+               COALESCE(p.name, tok.project_id) AS project_name,
+               tok.model,
+               tok.backend,
+               tok.input,
+               tok.cache_read,
+               tok.cache_create,
+               tok.output,
+               tok.billable,
+               COALESCE(cost.exact_cost, 0.0),
+               COALESCE(cost.exact_count, 0)
+        FROM tok
+        LEFT JOIN cost
+            ON cost.project_id = tok.project_id
+           AND IFNULL(cost.model, '') = IFNULL(tok.model, '')
+           AND cost.backend = tok.backend
+        LEFT JOIN projects p ON p.id = tok.project_id
+        ORDER BY tok.project_id",
+        filter = ROLLUP_SCOPE_RANGE,
+        cost_filter = ROLLUP_COST_SCOPE_RANGE,
+    );
+    db.query_all(sql, scope_range_params_doubled(scope, range), |row| {
+        Ok(ProjectCostComponentRow {
+            project_id: row.text(0)?,
+            project_name: row.text(1)?,
+            model: row.opt_text(2)?,
+            backend: row.text(3)?,
+            input: row.i64(4)?,
+            cache_read: row.i64(5)?,
+            cache_create: row.i64(6)?,
+            output: row.i64(7)?,
+            billable: row.i64(8)?,
+            exact_cost: row.opt_f64(9)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(10)?,
+        })
+    })
+    .await
+}
+
+/// Tool-call volume and error count for one time bucket. The `tool_invocations`
+/// table is at full `ts` resolution, so `bucket_expr("ti.ts")` serves every
+/// granularity (including hourly) directly -- no `_live` sibling needed.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolErrorBucketRow {
+    pub bucket_start: i64,
+    pub total: i64,
+    pub errors: i64,
+}
+
+pub(crate) async fn tool_error_rate(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<ToolErrorBucketRow>> {
+    let bucket_expr = bucket.bucket_expr("ti.ts");
+    let sql = format!(
+        "SELECT {bucket_expr} AS bucket_start,
+                COUNT(*) AS total,
+                SUM(ti.is_error) AS errors
+        {join}
+        WHERE {filter}
+        GROUP BY bucket_start
+        ORDER BY bucket_start",
+        join = TOOL_JOIN,
+        filter = TOOL_SCOPE_RANGE,
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(ToolErrorBucketRow {
+            bucket_start: row.i64(0)?,
+            total: row.i64(1)?,
+            errors: row.opt_i64(2)?.unwrap_or(0),
+        })
+    })
+    .await
+}
+
+/// Total billable tokens for one (day-of-week, hour) cell, in the user's local
+/// time. `day_of_week` is SQLite's `%w` (0 = Sunday); the frontend reorders to
+/// Mon-Sun.
+#[derive(Debug, Clone)]
+pub(crate) struct HeatmapBucketRow {
+    pub day_of_week: i64,
+    pub hour: i64,
+    pub tokens: i64,
+}
+
+/// Billable tokens summed per local-time day-of-week and hour, from the
+/// hour-grain `token_rollup`.
+///
+/// SQLite's `strftime` is UTC-only, so `tz_offset_seconds` shifts each bucket
+/// into the user's local time BEFORE the weekday/hour is extracted (`?4` carries
+/// the offset). Applying the offset in-SQL — rather than shifting hours on the
+/// frontend — keeps a late-night hour that crosses the UTC day boundary on its
+/// correct local weekday.
+///
+/// Precision caveat: rollup buckets are UTC-hour-floored, so adding the tz offset
+/// then extracting the local hour is EXACT for whole-hour offsets but APPROXIMATE
+/// (it smears activity into an adjacent local hour, and can misplace the weekday
+/// for an hour straddling local midnight) only for sub-hour offsets like +5:30 —
+/// a deliberate speed/precision trade against the retired full-`ts` event scan.
+pub(crate) async fn usage_heatmap(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    tz_offset_seconds: i64,
+) -> DbResult<Vec<HeatmapBucketRow>> {
+    let sql = format!(
+        "SELECT CAST(strftime('%w', tr.bucket_start + ?4, 'unixepoch') AS INTEGER) AS dow,
+                CAST(strftime('%H', tr.bucket_start + ?4, 'unixepoch') AS INTEGER) AS hour,
+                SUM(tr.billable_tokens) AS tokens
+        FROM token_rollup tr
+        WHERE tr.token_event_count > 0 AND {filter}
+        GROUP BY dow, hour
+        ORDER BY dow, hour",
+        filter = ROLLUP_SCOPE_RANGE,
+    );
+    let mut params = scope_range_params(scope, range);
+    params.push(Value::Integer(tz_offset_seconds));
+    db.query_all(sql, params, |row| {
+        Ok(HeatmapBucketRow {
+            day_of_week: row.i64(0)?,
+            hour: row.i64(1)?,
+            tokens: row.i64(2)?,
         })
     })
     .await

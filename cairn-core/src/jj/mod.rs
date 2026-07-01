@@ -792,6 +792,70 @@ fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, Str
     Ok(!hit.is_empty())
 }
 
+/// Outcome of folding a `when:write` check's tracked changes into the sealed
+/// commit: the repo-relative paths the check modified (also the inline summary's
+/// content). `fold_worktree_into_seal` returns `None` instead of an empty list
+/// when there was nothing to fold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoldOutcome {
+    pub folded_files: Vec<String>,
+}
+
+/// Fold a `when:write` check's tracked working-copy changes into the just-sealed
+/// commit (`jj squash` of `@` into `@-`), leaving `@` clean == the amended sealed
+/// tip.
+///
+/// A check is an observer of the sealed commit, but its command may legitimately
+/// rewrite tracked files (a formatter, `lint --fix`, regenerated snapshots).
+/// Folding does two jobs at once: it delivers those edits into the commit AND
+/// restores the seal-clean invariant, so a concurrent base-advance / reconcile in
+/// the lock-free check window can never snapshot or rebase a dirty `@` into the
+/// stale / divergent / behind-tip tangle that wedges the next seal (CAIRN-2260).
+///
+/// Only TRACKED changes fold: gitignored writes (vitest/tsc caches) are excluded
+/// from the working-copy snapshot (gitignore + `snapshot.auto-track`), so they
+/// never enter `@` and are never committed — they stay as ignored files on disk.
+/// `jj squash` keeps the sealed commit's message and author, so the folded edits
+/// ride the agent's original commit. The bookmark follows the rewrite onto the
+/// amended commit; the git ref and origin are re-published (best-effort) so they
+/// reflect the new tree (an amend-push jj tracks via the remote bookmark).
+///
+/// Returns `Ok(None)` when `@` carried no tracked change (a pure verify check) —
+/// the amend is then a no-op and `@` was already clean.
+pub fn fold_worktree_into_seal(jj: &JjEnv, ws: &Path) -> Result<Option<FoldOutcome>, String> {
+    // The tracked files the check changed. Empty => pure verify check: nothing to
+    // fold, `@` already clean. (A stale `@` makes this error and propagate, so the
+    // caller falls back to the next seal's stale recovery rather than amending
+    // blindly.)
+    let changed = jj.run(ws, &["diff", "-r", "@", "--name-only"], "jj fold diff")?;
+    let folded_files: Vec<String> = changed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if folded_files.is_empty() {
+        return Ok(None);
+    }
+    // Fold `@`'s tracked changes into the sealed parent and open a fresh empty `@`.
+    jj.run(ws, &["squash"], "jj squash (fold check changes)")?;
+    // Re-establish bookmark / git ref / origin at the amended commit, mirroring a
+    // seal. The bookmark auto-follows the rewrite; `bookmark set` is idempotent
+    // belt-and-braces, and the export/push propagate the amended tree.
+    if let Some(branch) = read_branch_marker(ws) {
+        if let Err(e) = jj.run(
+            ws,
+            &["bookmark", "set", &branch, "-r", "@-"],
+            "jj bookmark set (fold)",
+        ) {
+            log::warn!("fold: bookmark set after squash (best-effort): {e}");
+        }
+        let _ = jj.run(ws, &["git", "export"], "jj git export (fold)");
+        push_to_origin(jj, ws, &branch);
+    }
+    Ok(Some(FoldOutcome { folded_files }))
+}
+
 /// Discard working-copy changes by resetting `@` to its parent. Reversible via
 /// the operation log — replacing git's destructive `reset --hard`.
 ///
@@ -902,6 +966,76 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
         &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
         "jj log -r @-",
     )
+}
+
+/// The git directory backing the shared jj store. `ensure_project_store` points
+/// the store's git backend at the project's existing `.git` via
+/// `jj git init --git-repo`, and `jj git root` reports that path from any
+/// workspace off the store. This is the bridge that lets Cairn read genuine git
+/// objects (e.g. a sealed commit's tree) for content jj's template layer cannot
+/// expose.
+pub fn git_backend_root(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+    jj.run(ws, &["git", "root"], "jj git root")
+}
+
+/// Stable identity for the sealed tree content at `@-`.
+///
+/// Cairn's check-result cache keys verdicts by tree content so a clean
+/// rebase/squash that preserves file content carries the result forward, and the
+/// merge-gate baseline survives a squash that rewrites the commit id but not the
+/// tree. jj's git backend makes this reachable: a sealed `commit_id` *is* a git
+/// commit sha in the project's object database, so the commit's git tree object
+/// is the genuine content hash — identical tree content yields an identical hash
+/// regardless of message, author, parents, or timestamp. We resolve the backend
+/// git dir via [`git_backend_root`] and read the commit's tree with
+/// `git rev-parse <commit>^{tree}`.
+///
+/// jj 0.42.0 exposes no tree-id template keyword (`tree_id`, `root_tree`, and
+/// `commit.tree()` all fail to parse), so the git object is the only stable
+/// surface for this. If that resolution fails for any reason we fall back to the
+/// sealed commit id: correctness is preserved (a stable per-commit key) at the
+/// cost of cross-equivalent-tree reuse, and write-checks still run rather than
+/// being skipped on a transient git hiccup.
+pub fn sealed_tree_hash(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+    let commit = head_commit(jj, ws)?;
+    match sealed_tree_hash_via_git(jj, ws, &commit) {
+        Ok(tree) => Ok(tree),
+        Err(e) => {
+            log::warn!(
+                "sealed_tree_hash: git tree resolution failed ({e}); falling back to \
+                 the sealed commit id (cross-equivalent-tree cache reuse disabled)"
+            );
+            Ok(commit)
+        }
+    }
+}
+
+/// Resolve the git tree sha of a sealed commit through the store's git backend.
+/// Reads the object directly by sha (`<commit>^{tree}`), so it needs no git ref
+/// — the jj git backend writes commit objects into the project's object database
+/// as they are created, independent of bookmark export.
+fn sealed_tree_hash_via_git(jj: &JjEnv, ws: &Path, commit: &str) -> Result<String, String> {
+    let git_dir = git_backend_root(jj, ws)?;
+    let out = crate::env::git()
+        .args([
+            "--git-dir",
+            &git_dir,
+            "rev-parse",
+            &format!("{commit}^{{tree}}"),
+        ])
+        .output()
+        .map_err(|e| format!("git rev-parse tree: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse tree failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let tree = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if tree.is_empty() {
+        return Err("git rev-parse tree returned empty output".into());
+    }
+    Ok(tree)
 }
 
 /// One changed file derived from the live sealed jj graph: its repo-relative
@@ -1295,6 +1429,14 @@ pub fn forward_resolve_commit(
 /// guard the git path uses). jj 0.42 auto-tracks a new bookmark on push, so the
 /// removed `--allow-new` flag is not passed; seals only advance the bookmark, so
 /// the push is a fast-forward and needs no force.
+///
+/// `--ignore-working-copy`: a publish must never SNAPSHOT the live `@`. The
+/// bookmark already points at the sealed `@-`, so pushing needs no fresh
+/// snapshot — and snapshotting here would fold whatever transient dirt sits in
+/// `@` (e.g. a `when:write` check's caches, since the post-seal push runs from
+/// the workspace) into the working-copy commit, exactly the kind of working-copy
+/// mutation a concurrent store op can then wedge a later seal on. Matches
+/// `advance_workspace_onto` / `node_changed_files`, which pass it deliberately.
 pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) {
     if branch.is_empty() || branch == "main" || branch == "master" {
         log::debug!("Skipping jj push for branch: {branch}");
@@ -1302,7 +1444,15 @@ pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) {
     }
     match jj.run(
         ws,
-        &["git", "push", "--remote", "origin", "--bookmark", branch],
+        &[
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            branch,
+            "--ignore-working-copy",
+        ],
         "jj git push",
     ) {
         Ok(_) => log::info!("Pushed bookmark {branch} to origin (jj)"),
@@ -2344,6 +2494,162 @@ mod tests {
         );
     }
 
+    /// CAIRN-2260 (b)+(c): a `when:write` check that rewrites a TRACKED file folds
+    /// that edit into the just-sealed commit and leaves `@` clean; a GITIGNORED
+    /// write the same check makes is neither folded into the commit nor counted as
+    /// working-copy dirt.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn fold_worktree_into_seal_amends_tracked_and_skips_gitignored() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping fold_worktree_into_seal_amends_tracked_and_skips_gitignored: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let branch = "agent/CAIRN-1-builder-0";
+        let ws = wts.path().join("job");
+        add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+
+        // write1: a normal path-scoped seal of source + a .gitignore that ignores caches.
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("src/foo.ts"), "const x=1\n").unwrap();
+        std::fs::write(ws.join(".gitignore"), "*.cache\n").unwrap();
+        seal_paths(&jj, &ws, "edit1", None, &["src/foo.ts", ".gitignore"]).unwrap();
+        let sealed_before = head_commit(&jj, &ws).unwrap();
+
+        // The check reformats the tracked source AND writes a gitignored cache.
+        std::fs::write(ws.join("src/foo.ts"), "const x = 1;\n").unwrap();
+        std::fs::write(ws.join("vitest.cache"), "junk\n").unwrap();
+
+        let outcome = fold_worktree_into_seal(&jj, &ws)
+            .unwrap()
+            .expect("a tracked reformat folds into the seal");
+        assert_eq!(outcome.folded_files, vec!["src/foo.ts".to_string()]);
+
+        // `@` is clean == the amended tip; the seal's commit id changed (amended).
+        assert!(
+            !is_working_copy_dirty(&jj, &ws).unwrap(),
+            "@ is clean after the fold"
+        );
+        assert_ne!(
+            sealed_before,
+            head_commit(&jj, &ws).unwrap(),
+            "the seal was amended in place"
+        );
+
+        // The reformat is in the commit; the gitignored cache is not.
+        let foo_in_commit = jj
+            .run(&ws, &["file", "show", "-r", "@-", "src/foo.ts"], "show foo")
+            .unwrap();
+        assert!(
+            foo_in_commit.contains("const x = 1;"),
+            "the reformatted source is folded into the commit: {foo_in_commit}"
+        );
+        let committed = jj
+            .run(&ws, &["diff", "-r", "@-", "--name-only"], "committed files")
+            .unwrap();
+        assert!(
+            committed.contains("src/foo.ts"),
+            "the source file is in the amended commit: {committed}"
+        );
+        assert!(
+            !committed.contains("vitest.cache"),
+            "the gitignored cache must NOT be committed: {committed}"
+        );
+    }
+
+    /// CAIRN-2260 (a): with the check's changes folded into the seal, a concurrent
+    /// base advance (a sibling merge that rebases this workspace) in the lock-free
+    /// check window leaves the NEXT write's seal clean — no stale / divergent /
+    /// behind-tip wedge, and no divergent `@` twin (the bug's signature).
+    #[test]
+    #[serial_test::serial(jj)]
+    fn folded_check_keeps_next_seal_clean_under_a_concurrent_advance() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping folded_check_keeps_next_seal_clean_under_a_concurrent_advance: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        // Coordinator integration bookmark + one sibling builder branched off it.
+        let int = "agent/CAIRN-1-coordinator-0";
+        add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+        let branch = "agent/CAIRN-2-builder-0";
+        let ws = wts.path().join("builder");
+        add_workspace(&jj, &store, &ws, branch, int, None).unwrap();
+
+        // write1: a path-scoped seal on the builder.
+        std::fs::write(ws.join("a.rs"), "fn a() {}\n").unwrap();
+        seal_paths(&jj, &ws, "edit1", None, &["a.rs"]).unwrap();
+
+        // The check reformats a.rs (tracked dirt in @); the fix folds it into the seal.
+        std::fs::write(ws.join("a.rs"), "fn a() {} // fmt\n").unwrap();
+        fold_worktree_into_seal(&jj, &ws)
+            .unwrap()
+            .expect("the tracked reformat folds into the seal");
+        assert!(
+            !is_working_copy_dirty(&jj, &ws).unwrap(),
+            "@ is clean after the fold"
+        );
+
+        // A child merges into the integration branch: advance its tip with a
+        // different file, then reconcile rebases the sibling onto the new tip
+        // (the concurrent advance that, on a check-dirtied @, used to wedge).
+        jj.run(&store, &["new", int], "new on int").unwrap();
+        std::fs::write(store.join("z.rs"), "fn z() {}\n").unwrap();
+        jj.run(&store, &["describe", "-m", "child merged"], "describe")
+            .unwrap();
+        jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
+            .unwrap();
+        let report =
+            reconcile_siblings(&jj, &store, int, &[(branch.to_string(), ws.clone())]).unwrap();
+        assert_eq!(report.rebased_clean, vec![branch.to_string()]);
+
+        // write2: the next seal must SUCCEED and leave `@` clean == tip.
+        std::fs::write(ws.join("b.rs"), "fn b() {}\n").unwrap();
+        seal_paths(&jj, &ws, "edit2", None, &["b.rs"])
+            .expect("the second seal succeeds after a concurrent advance");
+        assert!(
+            !is_working_copy_dirty(&jj, &ws).unwrap(),
+            "@ is clean after the second seal"
+        );
+
+        // No divergent twin of `@` (the bug's signature): change_id(@) resolves to one.
+        let cid = snapshot_change_id(&jj, &ws).unwrap();
+        let twins = jj
+            .run(
+                &ws,
+                &[
+                    "log",
+                    "-r",
+                    &format!("change_id({})", cid.trim()),
+                    "--no-graph",
+                    "-T",
+                    "commit_id ++ \"\\n\"",
+                ],
+                "divergence check",
+            )
+            .unwrap();
+        assert_eq!(
+            twins.lines().filter(|l| !l.trim().is_empty()).count(),
+            1,
+            "no divergent @ twin after the fold + advance + reseal"
+        );
+    }
+
     #[test]
     #[serial_test::serial(jj)]
     fn resolve_falls_back_to_path_when_bundled_jj_is_unspawnable() {
@@ -3075,6 +3381,82 @@ index 1111111111..2222222222 100644
             head.starts_with(&sealed.sha),
             "head_commit ({head}) is the sealed commit ({})",
             sealed.sha
+        );
+    }
+
+    /// `sealed_tree_hash` returns the sealed commit's git **tree** object, so it
+    /// is content-addressed: two genuinely distinct commits with identical tree
+    /// content (different branches, messages, and authors) hash identically,
+    /// which is what lets the check cache and the merge-gate baseline carry
+    /// forward across an equivalent-tree squash/rebase. Different content hashes
+    /// differently, and the hash is distinct from the commit id itself.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn sealed_tree_hash_is_content_addressed() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping sealed_tree_hash_is_content_addressed: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        // Two sibling workspaces off `main` seal IDENTICAL file content under
+        // different branches, messages, and authors — distinct commit ids over
+        // one tree.
+        let a = wts.path().join("a");
+        let b = wts.path().join("b");
+        add_workspace(&jj, &store, &a, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+        add_workspace(&jj, &store, &b, "agent/CAIRN-2-builder-0", "main", None).unwrap();
+        std::fs::write(a.join("mod.rs"), "code\n").unwrap();
+        std::fs::write(b.join("mod.rs"), "code\n").unwrap();
+        let author_a = GitAuthor::new("Alice", "alice@example.com");
+        let author_b = GitAuthor::new("Bob", "bob@example.com");
+        seal(&jj, &a, "message one", Some(&author_a)).unwrap();
+        seal(&jj, &b, "a totally different message", Some(&author_b)).unwrap();
+
+        let hash_a = sealed_tree_hash(&jj, &a).unwrap();
+        let hash_b = sealed_tree_hash(&jj, &b).unwrap();
+
+        // Stable for repeated reads of the same sealed revision.
+        assert_eq!(
+            hash_a,
+            sealed_tree_hash(&jj, &a).unwrap(),
+            "helper is stable for repeated reads"
+        );
+
+        // The two sealed commits are genuinely distinct ids …
+        assert_ne!(
+            head_commit(&jj, &a).unwrap(),
+            head_commit(&jj, &b).unwrap(),
+            "the two sealed commits are distinct commit ids"
+        );
+        // … yet identical tree content yields an identical content hash.
+        assert_eq!(
+            hash_a, hash_b,
+            "identical tree content hashes identically across distinct commits"
+        );
+        // The hash is the git tree object, NOT the commit id — true content
+        // addressing, which is exactly what the old commit-id fallback lacked.
+        assert_ne!(
+            hash_a,
+            head_commit(&jj, &a).unwrap(),
+            "sealed_tree_hash is the content tree, distinct from the sealed commit id"
+        );
+
+        // Different tree content hashes differently.
+        let c = wts.path().join("c");
+        add_workspace(&jj, &store, &c, "agent/CAIRN-3-builder-0", "main", None).unwrap();
+        std::fs::write(c.join("mod.rs"), "different content\n").unwrap();
+        seal(&jj, &c, "message one", Some(&author_a)).unwrap();
+        assert_ne!(
+            hash_a,
+            sealed_tree_hash(&jj, &c).unwrap(),
+            "different tree content yields a different hash"
         );
     }
 

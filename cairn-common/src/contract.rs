@@ -97,6 +97,7 @@ pub enum ResourceKind {
     JobTodos,
     NodeTasks,
     NodeWakes,
+    NodeChecks,
     NodeQuestions,
     NodeQuestion,
     NodePermissions,
@@ -178,6 +179,7 @@ impl ResourceKind {
         ResourceKind::JobTodos,
         ResourceKind::NodeTasks,
         ResourceKind::NodeWakes,
+        ResourceKind::NodeChecks,
         ResourceKind::NodeQuestions,
         ResourceKind::NodeQuestion,
         ResourceKind::NodePermissions,
@@ -978,6 +980,11 @@ const PS_REFERENCES: KeySpec = KeySpec::new(
     KeyType::Object,
     "{add[{name, git|path, description?, branch?}], remove[names], refresh[names]}",
 );
+const PS_CHECKS: KeySpec = KeySpec::new(
+    "checks",
+    KeyType::Object,
+    "{name: {full, select?{mode,command,targetsFrom?}, impact?[], parse?, policy?, when?, deterministic?}}; empty object clears all",
+);
 
 pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     ResourceContract {
@@ -1194,7 +1201,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         kind: ResourceKind::ProjectSettings,
         uri_template: "cairn://p/{project}/settings",
         name: "Project settings",
-        description: "Project-scoped configuration: setup/terminal commands, worktree populate rules, default branch, per-project identity overrides, and external references. patch routes each present key to its store (project-settings.yaml, the projects DB row, or the global references store).",
+        description: "Project-scoped configuration: setup/terminal commands, worktree populate rules, default branch, per-project identity overrides, external references, and background-testing checks. patch routes each present key to its store (project-settings.yaml, the projects DB row, or the global references store).",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -1208,6 +1215,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
                 PROJECT_DEFAULT_BRANCH,
                 PS_ACCOUNT_OVERRIDES,
                 PS_REFERENCES,
+                PS_CHECKS,
             ],
             label: "patch project settings",
             example: "write({changes:[{target:\"cairn://p/PROJECT/settings\",mode:\"patch\",payload:{setupCommands:[\"bun install\"]}}]})",
@@ -2047,6 +2055,16 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
                 example: "write({changes:[{target:\"cairn:~/todos\",mode:\"patch\",payload:{updates:[{id:\"...\",status:\"completed\"}]}}]})",
             },
         ],
+    },
+    ResourceContract {
+        kind: ResourceKind::NodeChecks,
+        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/checks",
+        name: "Node checks",
+        description: "Turn-end project check results for a node job — running: live log tail; done: cached pass/fail verdicts (read-only)",
+        read_projections: NO_PROJECTIONS,
+        related: NO_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: NO_MUTATIONS,
     },
     ResourceContract {
         kind: ResourceKind::NodeWakes,

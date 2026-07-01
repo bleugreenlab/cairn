@@ -43,51 +43,83 @@ impl ToolInvocation {
 }
 
 /// Extract every tool invocation from a run's reconstructed events.
+///
+/// Two passes, composed from the per-event primitives so the run-level backfill
+/// and the per-event live maintenance share one extraction/classification path:
+/// first [`tool_result_error`] over every `tool_result` event builds the
+/// tool-use-id -> is_error map, then [`extract_event_invocations`] over every
+/// assistant event yields the rows (is_error linked from the map).
 pub fn extract_run_invocations(events: &[Event]) -> Vec<ToolInvocation> {
-    // First pass: tool-use id -> is_error, from tool_result events.
     let mut errors: HashMap<String, bool> = HashMap::new();
     for event in events {
         if event.event_type != "tool_result" {
             continue;
         }
-        if let Ok(parsed) = serde_json::from_str::<TranscriptEvent>(&event.data) {
-            if let Some(id) = parsed.tool_use_id {
-                errors.insert(id, parsed.is_error);
-            }
+        if let Some((id, is_error)) = tool_result_error(&event.data) {
+            errors.insert(id, is_error);
         }
     }
 
-    // Second pass: one row per assistant tool use.
     let mut out = Vec::new();
     for event in events {
         if event.event_type != "assistant" {
             continue;
         }
-        let Ok(parsed) = serde_json::from_str::<TranscriptEvent>(&event.data) else {
-            continue;
-        };
-        let Some(uses) = parsed.tool_uses else {
-            continue;
-        };
-        for use_info in uses {
-            let base = normalize_base(&use_info.name);
-            let verb = verb_for(&base).to_string();
-            let (scheme, kind, path) = classify(&base, &use_info.input);
-            out.push(ToolInvocation {
-                event_id: event.id.clone(),
-                tool_use_id: use_info.id.clone(),
-                run_id: event.run_id.clone(),
-                ts: event.created_at,
-                verb,
-                tool_name: base,
-                target_scheme: scheme,
-                target_kind: kind,
-                target_path: path,
-                is_error: errors.get(&use_info.id).copied().unwrap_or(false),
-            });
+        for mut row in
+            extract_event_invocations(&event.id, &event.run_id, event.created_at, &event.data)
+        {
+            row.is_error = errors.get(&row.tool_use_id).copied().unwrap_or(false);
+            out.push(row);
         }
     }
     out
+}
+
+/// Extract the tool invocations carried by a SINGLE assistant event's `data`
+/// JSON, with `is_error = false` (the matching `tool_result` arrives as its own
+/// later event). The per-event counterpart of [`extract_run_invocations`]'s
+/// second pass, used by the live insert-time Tier B maintenance so a streamed
+/// assistant event's tool uses are indexed without reconstructing the whole run.
+pub fn extract_event_invocations(
+    event_id: &str,
+    run_id: &str,
+    created_at: i64,
+    data: &str,
+) -> Vec<ToolInvocation> {
+    let Ok(parsed) = serde_json::from_str::<TranscriptEvent>(data) else {
+        return Vec::new();
+    };
+    let Some(uses) = parsed.tool_uses else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for use_info in uses {
+        let base = normalize_base(&use_info.name);
+        let verb = verb_for(&base).to_string();
+        let (scheme, kind, path) = classify(&base, &use_info.input);
+        out.push(ToolInvocation {
+            event_id: event_id.to_string(),
+            tool_use_id: use_info.id.clone(),
+            run_id: run_id.to_string(),
+            ts: created_at,
+            verb,
+            tool_name: base,
+            target_scheme: scheme,
+            target_kind: kind,
+            target_path: path,
+            is_error: false,
+        });
+    }
+    out
+}
+
+/// The `(tool_use_id, is_error)` a SINGLE `tool_result` event links, or `None`
+/// when its data carries no tool-use id. Used both by the run-level error map
+/// and by the per-event Tier B maintenance (which updates the matching row).
+pub fn tool_result_error(data: &str) -> Option<(String, bool)> {
+    let parsed = serde_json::from_str::<TranscriptEvent>(data).ok()?;
+    let id = parsed.tool_use_id?;
+    Some((id, parsed.is_error))
 }
 
 /// Strip an MCP prefix (`mcp__cairn__read` -> `read`) and lowercase.

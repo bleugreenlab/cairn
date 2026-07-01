@@ -35,6 +35,10 @@ impl TimeRange {
 /// Trend bucketing granularity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bucket {
+    /// Hourly buckets. Served directly from the hour-grain `token_rollup`, whose
+    /// stored `bucket_start` is already the UTC-hour floor, so `bucket_expr(Hour)`
+    /// on it is the identity floor; see `analytics::queries`.
+    Hour,
     Day,
     Week,
     Month,
@@ -48,6 +52,7 @@ impl Bucket {
     /// column name (never user text), so direct interpolation is safe.
     pub(crate) fn bucket_expr(self, ts_col: &str) -> String {
         match self {
+            Bucket::Hour => format!("({ts_col} / 3600) * 3600"),
             Bucket::Day => format!("({ts_col} / 86400) * 86400"),
             Bucket::Week => format!("({ts_col} / 604800) * 604800"),
             Bucket::Month => {
@@ -56,9 +61,10 @@ impl Bucket {
         }
     }
 
-    /// Parse a raw frontend string: `week`, `month`, else `day`.
+    /// Parse a raw frontend string: `hour`, `week`, `month`, else `day`.
     pub fn parse(raw: Option<&str>) -> Self {
         match raw {
+            Some(s) if s.eq_ignore_ascii_case("hour") => Bucket::Hour,
             Some(s) if s.eq_ignore_ascii_case("week") => Bucket::Week,
             Some(s) if s.eq_ignore_ascii_case("month") => Bucket::Month,
             _ => Bucket::Day,
@@ -86,8 +92,68 @@ pub struct TokensPerLocPoint {
     pub billable_tokens: i64,
     pub lines_changed: i64,
     pub tokens_per_line: f64,
+    /// Real metered cost for this PR's job (exact `events.cost_usd` when
+    /// reported, else the price-table estimate). Drives the cost-per-line chart.
+    pub cost_usd: f64,
     pub model: Option<String>,
     pub role: String,
+}
+
+/// Priced cost for one (time bucket, backend) group; the stacked provider-split
+/// cost chart. Per-bucket backend stack heights sum to the blended cost total.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendCostPoint {
+    pub bucket_start: i64,
+    pub backend: String,
+    pub cost_usd: f64,
+    pub billable_tokens: i64,
+}
+
+/// Token components (by type) for one time bucket; the stacked token-composition
+/// chart. Input / cache-read / cache-create / output / thinking sum to the
+/// bucket's total tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenCompositionPoint {
+    pub bucket_start: i64,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub output: i64,
+    pub thinking: i64,
+}
+
+/// Total real cost for one project across the range; the cost-by-project chart
+/// (workspace scope only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCost {
+    pub project_id: String,
+    pub project_name: String,
+    pub cost_usd: f64,
+    pub billable_tokens: i64,
+}
+
+/// Tool-call error rate for one time bucket; the tool-error-rate trend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolErrorRatePoint {
+    pub bucket_start: i64,
+    pub total: i64,
+    pub errors: i64,
+    /// `errors / total`; 0 when no calls in the bucket.
+    pub error_rate: f64,
+}
+
+/// Total billable tokens for one (day-of-week, hour) cell, in the user's local
+/// time; the usage heatmap. `day_of_week` is SQLite `%w` (0 = Sunday).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HeatmapCell {
+    pub day_of_week: i64,
+    pub hour: i64,
+    pub tokens: i64,
 }
 
 /// One trend point of priced cost.
@@ -99,14 +165,21 @@ pub struct CostPoint {
     pub billable_tokens: i64,
 }
 
-/// One (month, backend) effective-cost point. `effective_cost` allocates a
+/// One (fine-bucket, backend) effective-cost point. `effective_cost` allocates a
 /// provider's flat subscription fee across its usage, or passes through real
-/// metered cost. See `analytics::effective_cost`.
+/// metered cost. The flat fee is allocated per calendar month, but points are
+/// emitted at the page's bucket granularity (`bucket_start`) so the trend can
+/// follow the range selector; each fine bucket inherits the ratio of the month
+/// that contains it. See `analytics::effective_cost`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveCostPoint {
-    /// First-of-month epoch seconds (UTC).
+    /// First-of-month epoch seconds (UTC) of the month this point belongs to;
+    /// the ratio/fee allocation is keyed on this.
     pub month_start: i64,
+    /// Start epoch seconds of the fine bucket (day/week/hour/month) this point
+    /// covers. Equals `month_start` when the page bucket is Month.
+    pub bucket_start: i64,
     pub backend: String,
     /// True only when this backend reports a real per-generation cost
     /// (genuinely pay-as-you-go, e.g. OpenRouter). Subscription backends
@@ -126,8 +199,17 @@ pub struct EffectiveCostPoint {
     /// Effective cost of the scoped usage: `scoped_cost * ratio` for a
     /// subscription, or real metered cost. 0 when the fee is unrecovered.
     pub effective_cost: f64,
-    /// Billable tokens in the scoped usage for this (month, backend).
+    /// Billable tokens in the scoped usage for this (bucket, backend).
     pub billable_tokens: i64,
+    /// Input-side token denominator (`input + cache_read + cache_create`).
+    pub input_tokens: i64,
+    /// Output-side token denominator.
+    pub output_tokens: i64,
+    /// Effective cost attributed to input tokens; sums with
+    /// `effective_output_cost` to `effective_cost`.
+    pub effective_input_cost: f64,
+    /// Effective cost attributed to output tokens.
+    pub effective_output_cost: f64,
 }
 
 /// Economics for one grouping key (a model alias or a normalized role).

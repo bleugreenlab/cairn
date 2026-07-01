@@ -54,8 +54,9 @@ pub fn create_resolved_push(orch: &Orchestrator, event: &AttentionEvent) {
         )
         .await
     });
-    if let Err(e) = result {
-        log::warn!("resolved push creation failed: {}", e);
+    match result {
+        Ok(_) => orch.notifier.emit_change("attention_pushes"),
+        Err(e) => log::warn!("resolved push creation failed: {}", e),
     }
 }
 

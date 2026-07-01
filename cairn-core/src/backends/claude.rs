@@ -615,6 +615,47 @@ fn finalize_streaming_message(
     }
 }
 
+/// Fold a newly-arrived consolidated assistant event into one already parked
+/// for deferred finalization. claude-code can emit more than one consolidated
+/// `assistant` event under a single stream before the trailing `message_delta`
+/// (a batched multi-tool turn); parking is a single slot, so without merging
+/// the earlier event's tool calls are lost. Dedup by tool id so this is correct
+/// whether the events are cumulative or disjoint.
+fn merge_pending_assistant(parked: &mut TranscriptEvent, incoming: &TranscriptEvent) {
+    // tool_uses: append, skipping ids already present.
+    let mut uses = parked.tool_uses.take().unwrap_or_default();
+    if let Some(incoming_uses) = incoming.tool_uses.as_ref() {
+        for u in incoming_uses {
+            if !uses.iter().any(|existing| existing.id == u.id) {
+                uses.push(u.clone());
+            }
+        }
+    }
+    // content: keep parked unless empty; append new only if distinct (guards the
+    // cumulative case where incoming repeats the parked text).
+    match (&parked.content, &incoming.content) {
+        (None, Some(c)) => parked.content = Some(c.clone()),
+        (Some(p), Some(c)) if c != p && !p.contains(c.as_str()) && !c.contains(p.as_str()) => {
+            parked.content = Some(format!("{p}\n{c}"));
+        }
+        (Some(p), Some(c)) if c.contains(p.as_str()) => parked.content = Some(c.clone()),
+        _ => {}
+    }
+    // thinking: keep parked unless empty.
+    if parked.thinking.is_none() {
+        parked.thinking = incoming.thinking.clone();
+    }
+    // Recompute legacy single-tool fields to match from_claude_event semantics.
+    if uses.len() == 1 {
+        parked.tool_name = Some(uses[0].name.clone());
+        parked.tool_input = Some(uses[0].input.clone());
+    } else {
+        parked.tool_name = None;
+        parked.tool_input = None;
+    }
+    parked.tool_uses = if uses.is_empty() { None } else { Some(uses) };
+}
+
 /// Commit a genuine, fully-emitted assistant message that is still awaiting
 /// deferred finalization, before a suppression path would discard the in-flight
 /// stream (CAIRN-1611).
@@ -1790,7 +1831,17 @@ impl ClaudeBackend {
                                 sequence += 1;
                             }
                         } else {
-                            pending_final_assistant_event = Some(transcript_event.clone());
+                            // claude-code can emit a second consolidated assistant
+                            // event before the trailing message_delta (a batched
+                            // multi-tool turn). Merge into the parked slot rather
+                            // than overwriting it, or the earlier event's tool
+                            // calls are lost (CAIRN-2249).
+                            match pending_final_assistant_event.as_mut() {
+                                Some(parked) => merge_pending_assistant(parked, &transcript_event),
+                                None => {
+                                    pending_final_assistant_event = Some(transcript_event.clone())
+                                }
+                            }
                         }
                         continue;
                     }
@@ -2257,7 +2308,7 @@ mod terminal_tool_tests {
 /// host-interrupt guard suppresses the in-flight stream.
 #[cfg(test)]
 mod flush_pending_tests {
-    use super::{flush_pending_assistant_before_suppress, StreamingState};
+    use super::{flush_pending_assistant_before_suppress, merge_pending_assistant, StreamingState};
     use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
     use crate::db::DbState;
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
@@ -2326,6 +2377,28 @@ mod flush_pending_tests {
                 id: tool_use_id.to_string(),
                 name: "mcp__cairn__write".to_string(),
                 input: serde_json::json!({ "changes": [] }),
+            }]),
+            tool_use_id: None,
+            tool_result: None,
+            is_error: false,
+            thinking_ms: None,
+            raw: None,
+        }
+    }
+
+    fn read_tool_assistant(tool_use_id: &str) -> TranscriptEvent {
+        TranscriptEvent {
+            event_type: "assistant".to_string(),
+            session_id: Some("session-1".to_string()),
+            parent_tool_use_id: None,
+            content: None,
+            thinking: None,
+            tool_name: None,
+            tool_input: None,
+            tool_uses: Some(vec![ToolUseInfo {
+                id: tool_use_id.to_string(),
+                name: "mcp__cairn__read".to_string(),
+                input: serde_json::json!({ "paths": [] }),
             }]),
             tool_use_id: None,
             tool_result: None,
@@ -2441,5 +2514,121 @@ mod flush_pending_tests {
         );
 
         assert!(!committed, "no pending message means nothing to commit");
+    }
+
+    // CAIRN-2249: a batched multi-tool turn arrives as two consolidated
+    // assistant events before the trailing message_delta. The park slot must
+    // merge them rather than overwrite, so every tool call survives.
+    #[test]
+    fn merge_appends_disjoint_tool_uses() {
+        let mut parked = read_tool_assistant("toolu_read");
+        let incoming = write_tool_assistant("toolu_write");
+        merge_pending_assistant(&mut parked, &incoming);
+        let uses = parked.tool_uses.as_ref().unwrap();
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[0].id, "toolu_read");
+        assert_eq!(uses[1].id, "toolu_write");
+        assert!(
+            parked.tool_name.is_none(),
+            "multi-tool event must clear the legacy single-tool name"
+        );
+    }
+
+    #[test]
+    fn merge_dedups_cumulative_tool_uses() {
+        // The cumulative shape: incoming repeats the parked `read` then adds
+        // `write`. Dedup-by-id must keep a single `read`.
+        let mut parked = read_tool_assistant("toolu_read");
+        let mut incoming = read_tool_assistant("toolu_read");
+        incoming.tool_uses = Some(vec![
+            ToolUseInfo {
+                id: "toolu_read".to_string(),
+                name: "mcp__cairn__read".to_string(),
+                input: serde_json::json!({ "paths": [] }),
+            },
+            ToolUseInfo {
+                id: "toolu_write".to_string(),
+                name: "mcp__cairn__write".to_string(),
+                input: serde_json::json!({ "changes": [] }),
+            },
+        ]);
+        merge_pending_assistant(&mut parked, &incoming);
+        let uses = parked.tool_uses.as_ref().unwrap();
+        assert_eq!(uses.len(), 2, "duplicate read must not be re-added");
+        assert_eq!(uses[0].id, "toolu_read");
+        assert_eq!(uses[1].id, "toolu_write");
+    }
+
+    #[test]
+    fn merge_retains_parked_content_when_incoming_empty() {
+        let mut parked = read_tool_assistant("toolu_read");
+        parked.content = Some("I'll dig".to_string());
+        let incoming = write_tool_assistant("toolu_write");
+        merge_pending_assistant(&mut parked, &incoming);
+        assert_eq!(parked.content.as_deref(), Some("I'll dig"));
+    }
+
+    #[test]
+    fn merge_keeps_single_tool_legacy_fields() {
+        let mut parked = read_tool_assistant("toolu_read");
+        let incoming = read_tool_assistant("toolu_read");
+        merge_pending_assistant(&mut parked, &incoming);
+        let uses = parked.tool_uses.as_ref().unwrap();
+        assert_eq!(uses.len(), 1, "the repeated read collapses to one");
+        assert_eq!(
+            parked.tool_name.as_deref(),
+            Some("mcp__cairn__read"),
+            "a sole surviving tool repopulates the legacy single-tool name"
+        );
+    }
+
+    // Reader-level regression: parking a `read` event then merging a `write`
+    // event (no pending_delta_usage) and finalizing must persist a single
+    // assistant event that carries BOTH tool calls.
+    #[tokio::test]
+    async fn merge_then_flush_persists_all_batched_tool_calls() {
+        let orch = build_orch(test_db().await);
+        insert_run(&orch, "run-merge").await;
+        let opened = open_stream(
+            orch.db.local.clone(),
+            "run-merge",
+            Some("session-1"),
+            None,
+            "claude",
+            Some(0),
+        )
+        .unwrap();
+        let mut streaming_state = Some(StreamingState::new(&opened));
+
+        // Simulate the park site for a batched turn: read parked, write merged.
+        let mut pending = Some(read_tool_assistant("toolu_read"));
+        let write_event = write_tool_assistant("toolu_write");
+        match pending.as_mut() {
+            Some(parked) => merge_pending_assistant(parked, &write_event),
+            None => pending = Some(write_event.clone()),
+        }
+
+        let committed = flush_pending_assistant_before_suppress(
+            &orch,
+            &orch.db.local,
+            "run-merge",
+            Some("session-1"),
+            0,
+            &mut streaming_state,
+            &mut pending,
+            None,
+        );
+
+        assert!(committed, "the merged pending assistant should commit");
+        assert_eq!(
+            count_assistant_with_tooluse(&orch, "run-merge", "toolu_read").await,
+            1,
+            "the read tool call must survive the batched turn"
+        );
+        assert_eq!(
+            count_assistant_with_tooluse(&orch, "run-merge", "toolu_write").await,
+            1,
+            "the write tool call must survive the batched turn"
+        );
     }
 }

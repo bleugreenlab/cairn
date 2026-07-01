@@ -787,6 +787,34 @@ fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
     true
 }
 
+/// Fire the turn-end (`when:idle`/`when:review`) project checks for a job that
+/// just idled, detached onto a background task so the minutes-long suite never
+/// blocks the turn from ending. Skipped for a trailing memory-review turn (not a
+/// work turn) and when a run is already in flight for the job (single-flight).
+/// Runs UNSANDBOXED in the background; on any check failure it resumes the idle
+/// builder with the failure inlined. Invoked at BOTH turn-end callers
+/// (`finalize_run` and `transition_to_warm_state`) so the two stay mirrored.
+fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
+    if latest_turn_is_memory_review(orch, job_id) {
+        return;
+    }
+    // Claim the single-flight slot; a concurrent run for this job means skip.
+    if !orch.try_begin_turn_end_checks(job_id) {
+        return;
+    }
+    let orch_clone = orch.clone();
+    let job_id_owned = job_id.to_string();
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::spawn(async move {
+            crate::execution::checks_turn_end::run_turn_end_checks(orch_clone, job_id_owned).await;
+        });
+    } else {
+        // No runtime to detach onto (not expected at turn-end): release the slot
+        // so a later turn-end can retry rather than being permanently blocked.
+        orch.end_turn_end_checks(job_id);
+    }
+}
+
 /// Create the review push at this work-turn idle edge (CAIRN-1882).
 ///
 /// The node-idle edge of the review push (the second edge — when a PR opens
@@ -825,7 +853,10 @@ fn create_review_push_on_turn_end(
         create_review_push_rows(&db, &job_id_owned, &issue_id_owned, &ctx_owned).await
     });
     match result {
-        Ok(recipients) => wake_review_recipients(orch, &recipients),
+        Ok(recipients) => {
+            orch.notifier.emit_change("attention_pushes");
+            wake_review_recipients(orch, &recipients);
+        }
         Err(e) => log::warn!(
             "review push creation for job {} failed: {}",
             &job_id[..job_id.len().min(8)],
@@ -939,6 +970,7 @@ pub async fn create_review_push_for_pr_open(
                 recipients.len(),
                 &issue_id[..issue_id.len().min(8)]
             );
+            orch.notifier.emit_change("attention_pushes");
             wake_review_recipients(orch, &recipients);
         }
         Err(e) => log::warn!(
@@ -1465,6 +1497,9 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
             // without depending on the recompute sweep poke that this work
             // is replacing.
             let needs_attention = emit_for_turn_end(orch, &job_id);
+            // Turn-end project checks (when:idle/when:review), detached so the
+            // suite never blocks the turn from ending.
+            spawn_turn_end_checks(orch, &job_id);
             // Raise the desktop "completed" toast only when that idle left
             // something for the driver/user to act on — a plan awaiting
             // confirmation, a PR awaiting merge, a pending question, or a
@@ -1866,6 +1901,10 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
             // hears about it through this fact rather than the recompute-sweep
             // poke this work removes.
             emit_for_turn_end(orch, &job_id);
+            // Turn-end project checks (when:idle/when:review), detached so the
+            // suite never blocks the turn from ending. Mirrors the warm-transition
+            // turn-end caller above.
+            spawn_turn_end_checks(orch, &job_id);
             // Run-terminal idle: flush any directs/side-channel notices still
             // pending for this run so a queued child-attention update is not
             // stranded when the run never takes another turn (CAIRN-1297).

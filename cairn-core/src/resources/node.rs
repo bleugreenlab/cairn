@@ -18,7 +18,7 @@ use super::transcript::{
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
 use cairn_common::uri::{
-    build_job_todos_uri, build_node_artifact_uri_named, build_node_chat_uri,
+    build_job_todos_uri, build_node_artifact_uri_named, build_node_chat_uri, build_node_checks_uri,
     build_node_permission_uri, build_node_question_uri, build_node_uri, build_node_wakes_uri,
     build_task_artifact_uri, build_task_artifact_uri_named, build_task_chat_uri,
     build_task_permission_uri,
@@ -328,6 +328,37 @@ pub(super) async fn read_node_wakes(
         out.push('\n');
     }
     out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- patch `{unmute:{kind,ref?}}`\n- delete `{unsubscribe:{kind,ref?}}`\n");
+    out
+}
+
+/// Read the `/checks` projection for a node: the turn-end (`when:idle`/`when:review`)
+/// project-check surface. Renders the live log tail while a suite is in flight and
+/// the cached per-check verdicts for the node's current sealed tree. This is the
+/// resolvable `content_ref` the failure-resume push inlines, and a general
+/// human-readable surface independent of a PR.
+pub(super) async fn read_node_checks(
+    orch: &crate::orchestrator::Orchestrator,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+) -> String {
+    let (_conn, job) =
+        match connect_and_find_node_job(&orch.db.local, project_key, number, exec_seq, node_name)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
+    let uri = build_node_checks_uri(project_key, number, exec_seq, node_name);
+    let mut out = format!("# Checks \u{2014} {node_name}\n\n`{uri}`\n");
+    match crate::execution::checks_turn_end::render_turn_end_checks_section(orch, &job.id).await {
+        Some(section) => {
+            out.push('\n');
+            out.push_str(section.trim_start_matches('\n'));
+        }
+        None => out.push_str("\nNo turn-end check results yet for the current tree.\n"),
+    }
     out
 }
 

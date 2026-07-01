@@ -26,6 +26,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "memories",
     "tasks",
     "wakes",
+    "checks",
     "questions",
     "question",
     "terminal",
@@ -225,6 +226,13 @@ pub enum CairnResource {
     },
     /// Wake subscriptions owned by a node job (collection).
     NodeWakes {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// Turn-end project check results owned by a node job (collection).
+    NodeChecks {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -531,6 +539,7 @@ impl CairnResource {
             | JobTodos { project, .. }
             | NodeTasks { project, .. }
             | NodeWakes { project, .. }
+            | NodeChecks { project, .. }
             | NodeQuestions { project, .. }
             | NodeQuestion { project, .. }
             | NodePermissions { project, .. }
@@ -833,6 +842,10 @@ pub fn build_node_tasks_uri(project: &str, number: i32, exec_seq: i32, node_id: 
 
 pub fn build_node_wakes_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "wakes")
+}
+
+pub fn build_node_checks_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "checks")
 }
 
 pub fn build_node_questions_uri(
@@ -1252,6 +1265,12 @@ impl CairnResource {
                 exec_seq,
                 node_id,
             } => build_node_wakes_uri(project, *number, *exec_seq, node_id),
+            Self::NodeChecks {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_checks_uri(project, *number, *exec_seq, node_id),
             Self::NodeQuestions {
                 project,
                 number,
@@ -1542,6 +1561,7 @@ impl CairnResource {
             | Self::JobTodos { .. }
             | Self::NodeTasks { .. }
             | Self::NodeWakes { .. }
+            | Self::NodeChecks { .. }
             | Self::NodeQuestions { .. }
             | Self::NodeQuestion { .. }
             | Self::NodePermissions { .. }
@@ -1619,6 +1639,7 @@ impl CairnResource {
             | Self::JobTodos { project, .. }
             | Self::NodeTasks { project, .. }
             | Self::NodeWakes { project, .. }
+            | Self::NodeChecks { project, .. }
             | Self::NodeQuestions { project, .. }
             | Self::NodeQuestion { project, .. }
             | Self::NodePermissions { project, .. }
@@ -1696,6 +1717,7 @@ impl CairnResource {
             | Self::JobTodos { number, .. }
             | Self::NodeTasks { number, .. }
             | Self::NodeWakes { number, .. }
+            | Self::NodeChecks { number, .. }
             | Self::NodeQuestions { number, .. }
             | Self::NodeQuestion { number, .. }
             | Self::NodePermissions { number, .. }
@@ -1829,6 +1851,7 @@ impl CairnResource {
             Self::JobTodos { .. } => ResourceKind::JobTodos,
             Self::NodeTasks { .. } => ResourceKind::NodeTasks,
             Self::NodeWakes { .. } => ResourceKind::NodeWakes,
+            Self::NodeChecks { .. } => ResourceKind::NodeChecks,
             Self::NodeQuestions { .. } => ResourceKind::NodeQuestions,
             Self::NodeQuestion { .. } => ResourceKind::NodeQuestion,
             Self::NodePermissions { .. } => ResourceKind::NodePermissions,
@@ -2183,6 +2206,14 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "wakes"] => {
             Some(CairnResource::NodeWakes {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "checks"] => {
+            Some(CairnResource::NodeChecks {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,

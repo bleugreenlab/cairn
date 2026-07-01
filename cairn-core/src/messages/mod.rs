@@ -6,6 +6,7 @@
 
 pub mod db;
 pub mod delivery;
+pub mod pending;
 pub mod queued;
 pub mod render;
 pub mod side_channel;

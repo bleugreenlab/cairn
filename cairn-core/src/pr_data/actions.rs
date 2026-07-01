@@ -1468,6 +1468,14 @@ pub async fn render_live_pr_section(
         }
     }
 
+    // Turn-end (when:idle/when:review) project checks: live log tail while a suite
+    // is in flight, else the cached per-check verdicts for this node's sealed tree.
+    if let Some(section) =
+        crate::execution::checks_turn_end::render_turn_end_checks_section(orch, job_id).await
+    {
+        out.push_str(&section);
+    }
+
     if !files.is_empty() {
         out.push_str("\n### Files\n\n");
         for f in &files {

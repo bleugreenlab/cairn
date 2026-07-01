@@ -713,6 +713,7 @@ pub fn resume_suspended_parent_after_task_completion(
             recipient,
             wake_idle,
         }) => {
+            orch.notifier.emit_change("attention_pushes");
             // A settled background batch upgrades to a `wake`; nudge an idle
             // spawner so it drains the push now. A passive in-flight push
             // reports `wake_idle == false` and rides along on the next run.

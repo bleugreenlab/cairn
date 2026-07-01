@@ -1,6 +1,8 @@
 //! Project types.
 
+use crate::config::project_settings::CheckCommand;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +18,8 @@ pub struct Project {
     pub next_issue_number: i32,
     pub setup_commands: Option<String>,
     pub terminal_commands: Option<String>,
+    /// Background-testing checks as JSON (map of check name → CheckCommand).
+    pub checks: Option<String>,
     /// Worktree populate config as JSON (copy/symlink pattern lists).
     pub worktree_populate: Option<String>,
     pub created_at: i64,
@@ -84,6 +88,9 @@ pub struct UpdateProject {
     pub id: String,
     pub setup_commands: Option<Vec<String>>,
     pub terminal_commands: Option<Vec<TerminalCommand>>,
+    /// Background-testing checks keyed by name. An empty map clears all checks
+    /// from `.cairn/config.yaml`; `None` leaves the existing checks untouched.
+    pub checks: Option<HashMap<String, CheckCommand>>,
     pub worktree_populate: Option<crate::config::project_settings::PopulateConfig>,
     pub default_branch: Option<String>,
 }

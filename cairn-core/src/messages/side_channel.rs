@@ -204,14 +204,15 @@ pub async fn record_user_child_side_channel_async(
     // parent; it rides along on the parent's next run and renders the child's chat
     // from the message through the child's current tail. The child still receives
     // the message live through its own delivery path.
-    if let Err(e) = crate::orchestrator::attention_delivery::create_catchup_push(
+    match crate::orchestrator::attention_delivery::create_catchup_push(
         &orch.db.local,
         &parent_job_id,
         child_uri,
     )
     .await
     {
-        log::warn!("catch-up push creation failed: {e}");
+        Ok(()) => orch.notifier.emit_change("attention_pushes"),
+        Err(e) => log::warn!("catch-up push creation failed: {e}"),
     }
     Ok(None)
 }
@@ -432,6 +433,34 @@ pub async fn claim_pending_side_channel_for_job_async(
     crate::orchestrator::wakes::claim_pending_live_side_channel_for_job_async(db, job_id)
         .await
         .map(|rows| rows.into_iter().map(notice_from_wake).collect())
+}
+
+pub fn stamp_delivered_by_id(db: &LocalDb, id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    run_db_blocking(move || async move { stamp_delivered_by_id_async(db, &id).await })
+}
+
+pub async fn stamp_delivered_by_id_async(db: &LocalDb, id: &str) -> Result<(), String> {
+    let id = id.to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.write(|conn| {
+        let id = id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE suppressed_wakes
+                 SET delivered_at = ?1, updated_at = ?1
+                 WHERE id = ?2 AND delivered_at IS NULL
+                   AND subscription_id IS NULL AND content IS NOT NULL
+                   AND fact_kind = 'message'",
+                params![now, id.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("Failed to dismiss pending side-channel wake message: {error}"))
 }
 
 pub async fn job_id_for_run(db: &LocalDb, run_id: &str) -> Option<String> {

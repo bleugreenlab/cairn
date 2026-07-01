@@ -19,10 +19,10 @@ use super::memories::{read_node_memories_collection, read_node_memory};
 use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
 use super::node::{
     read_job_todos, read_node, read_node_artifact, read_node_chat, read_node_chat_event,
-    read_node_chat_raw, read_node_chat_turn, read_node_permission, read_node_permissions,
-    read_node_question, read_node_questions, read_node_tasks, read_node_wakes, read_task,
-    read_task_artifact, read_task_chat, read_task_chat_event, read_task_chat_raw,
-    read_task_chat_turn, read_task_permission, read_task_permissions,
+    read_node_chat_raw, read_node_chat_turn, read_node_checks, read_node_permission,
+    read_node_permissions, read_node_question, read_node_questions, read_node_tasks,
+    read_node_wakes, read_task, read_task_artifact, read_task_chat, read_task_chat_event,
+    read_task_chat_raw, read_task_chat_turn, read_task_permission, read_task_permissions,
 };
 use super::symbols::{read_node_symbols, read_project_symbols};
 
@@ -1426,6 +1426,18 @@ async fn render_resource_body(
                 error
             } else {
                 read_node_wakes(db, &project, number, exec_seq, &node_id).await
+            }
+        }
+        CairnResource::NodeChecks {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => {
+            if let Some(error) = reject_query_params("node checks", &params) {
+                error
+            } else {
+                read_node_checks(orch, &project, number, exec_seq, &node_id).await
             }
         }
         CairnResource::NodeQuestions {

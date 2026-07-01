@@ -312,6 +312,7 @@ impl OrchestratorBuilder {
             setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
+            turn_end_checks_in_flight: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -408,6 +409,11 @@ pub struct Orchestrator {
     pub jj_binary_path: String,
     /// Directory for writing MCP config files
     pub config_dir: PathBuf,
+    /// Job ids with an in-flight turn-end (`when:idle`/`when:review`) check run.
+    /// Single-flight guard so a rapid re-idle does not stack suites, and the
+    /// signal the PR-node / `/checks` render reads to show a "running" state.
+    /// Runtime-only; never persisted.
+    pub turn_end_checks_in_flight: Arc<Mutex<HashSet<String>>>,
     /// Directory containing bundled preset schemas (None if not available)
     pub schema_dir: Option<PathBuf>,
     /// Port for the MCP callback server
@@ -702,6 +708,33 @@ impl Orchestrator {
         }
     }
 
+    /// Claim the turn-end-check single-flight slot for a job. Returns `true` when
+    /// this call newly claimed it (no run was already in flight), `false` when a
+    /// run is already active for the job — in which case the caller must NOT spawn
+    /// another suite. The claim is released with [`Self::end_turn_end_checks`].
+    pub fn try_begin_turn_end_checks(&self, job_id: &str) -> bool {
+        self.turn_end_checks_in_flight
+            .lock()
+            .map(|mut set| set.insert(job_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    /// Release the turn-end-check single-flight slot for a job. Idempotent.
+    pub fn end_turn_end_checks(&self, job_id: &str) {
+        if let Ok(mut set) = self.turn_end_checks_in_flight.lock() {
+            set.remove(job_id);
+        }
+    }
+
+    /// Whether a turn-end check run is currently in flight for a job — the signal
+    /// the PR-node / `/checks` render reads to show the "running" state.
+    pub fn turn_end_checks_in_flight(&self, job_id: &str) -> bool {
+        self.turn_end_checks_in_flight
+            .lock()
+            .map(|set| set.contains(job_id))
+            .unwrap_or(false)
+    }
+
     /// Token provider for the `/embed` gateway: prefers the connected account's
     /// JWT, falling back to the anonymous device JWT when logged out. Returns
     /// `None` only when neither is available (embedding then no-ops).
@@ -746,6 +779,24 @@ impl Orchestrator {
         tokio::spawn(async move {
             if let Err(e) = crate::archival::run_archival_maintenance(&db).await {
                 log::warn!("archival maintenance failed: {e}");
+            }
+        });
+    }
+
+    /// Spawn the one-time historical analytics-rollup backfill on a background
+    /// task.
+    ///
+    /// Call once at startup, on a tokio runtime. Live event inserts now maintain
+    /// the token/cost and tool-invocation rollups incrementally, so the analytics
+    /// page never folds/backfills on open; this fills both rollups in for events
+    /// that predate that per-event seam. Gated by `analytics_rollup_backfill_state`
+    /// so it runs once, never on every startup, and detached so it never blocks
+    /// startup or the UI (best-effort: a failure logs and is retried next start).
+    pub fn spawn_analytics_rollup_backfill(&self) {
+        let db = self.db.local.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::analytics::run_historical_backfill(&db).await {
+                log::warn!("analytics rollup backfill failed: {e}");
             }
         });
     }

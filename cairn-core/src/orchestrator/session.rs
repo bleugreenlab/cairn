@@ -10,7 +10,7 @@ use crate::agent_process::stream::{ClaudeEvent, TranscriptEvent};
 use crate::backends::{self, SessionConfig, SessionStart};
 use crate::models::Model;
 
-use crate::storage::{run_db_blocking, DbError, DbResult, RowExt};
+use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -488,6 +488,32 @@ fn build_orientation_block(
 /// The example carries the command in the payload because terminal `create`
 /// requires it (see the terminal contracts in `cairn-common`) — a slug alone
 /// would be rejected.
+fn build_project_checks_section(
+    checks: &std::collections::HashMap<String, crate::config::project_settings::CheckCommand>,
+) -> Option<String> {
+    if checks.is_empty() {
+        return None;
+    }
+
+    let mut entries: Vec<_> = checks.iter().collect();
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    let mut out = String::from("## Project checks\n\n");
+    out.push_str(
+        "Configured checks from `.cairn/config.yaml`. They are not run automatically by this slice yet; use them as the canonical project test contract.\n\n",
+    );
+    for (name, check) in entries {
+        out.push_str(&format!(
+            "- **{}**: `{}` (policy: `{}`, when: `{}`)\n",
+            name,
+            check.command,
+            check.policy.as_str(),
+            check.when.as_str()
+        ));
+    }
+    Some(out)
+}
+
 fn build_available_terminals_section(
     terminal_commands: &[crate::models::TerminalCommand],
 ) -> Option<String> {
@@ -522,13 +548,13 @@ fn build_available_terminals_section(
     Some(out)
 }
 
-struct PromptMessage {
+pub struct PromptMessage {
     /// `messages.rowid` — monotonic with insertion order; the key for the
     /// per-session channel-injection cursor (`Option<i64>`).
-    rowid: i64,
-    sender_name: String,
-    content: String,
-    created_at: i64,
+    pub rowid: i64,
+    pub sender_name: String,
+    pub content: String,
+    pub created_at: i64,
 }
 
 struct PeerAgent {
@@ -789,6 +815,88 @@ async fn recent_messages_for_run(
     }
     messages.reverse();
     Ok(messages)
+}
+
+/// Non-stamping peek at project/issue channel messages that would be injected
+/// for `job_id` on the next messaging-context build. This shares the same
+/// filtering as `recent_messages_for_run` but deliberately skips the cursor
+/// advance so the UI can show pending chips without delivering them.
+pub async fn pending_channel_messages_for_job(
+    db: &LocalDb,
+    job_id: &str,
+    limit: i64,
+) -> DbResult<Vec<PromptMessage>> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT p.key, i.id, i.number, j.current_session_id,
+                            (SELECT r.id FROM runs r WHERE r.job_id = j.id ORDER BY r.created_at DESC LIMIT 1)
+                     FROM jobs j
+                     JOIN issues i ON i.id = j.issue_id
+                     JOIN projects p ON p.id = i.project_id
+                     WHERE j.id = ?1
+                     LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(Vec::new());
+            };
+            let project_key = row.text(0)?;
+            let issue_number = row.i64(2)?;
+            let session_id = row.opt_text(3)?;
+            let exclude_run_id = row.opt_text(4)?.unwrap_or_default();
+            let Some(session_id) = session_id else {
+                return Ok(Vec::new());
+            };
+            let issue_key = format!("{project_key}/{issue_number}");
+            let cursor = read_channel_cursor(conn, &session_id).await?;
+            recent_messages_for_run(
+                conn,
+                &project_key,
+                Some(&issue_key),
+                &exclude_run_id,
+                cursor,
+                limit,
+            )
+            .await
+        })
+    })
+    .await
+}
+
+/// Mark channel messages seen through `rowid` for the job's current session.
+/// The cursor is monotonic and channel-scoped: dismissing one channel chip marks
+/// that message and all older pending channel messages caught up, matching the
+/// injection cursor used when messages are delivered to the agent.
+pub async fn dismiss_channel_message_for_job(
+    db: &LocalDb,
+    job_id: &str,
+    rowid: i64,
+) -> DbResult<()> {
+    let job_id = job_id.to_string();
+    db.write(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT current_session_id FROM jobs WHERE id = ?1 LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(());
+            };
+            let Some(session_id) = row.opt_text(0)? else {
+                return Ok(());
+            };
+            advance_channel_cursor(conn, &session_id, rowid).await
+        })
+    })
+    .await
 }
 
 /// Resolve the session id backing a run, used to scope the channel-injection
@@ -1547,6 +1655,15 @@ pub fn start_agent_session(
                 let proj_config =
                     crate::config::project_settings::load_project_settings(project_path);
 
+                if let Some(ref checks) = proj_config.checks {
+                    if let Some(section) = build_project_checks_section(checks) {
+                        if !content.is_empty() {
+                            content.push_str("\n\n");
+                        }
+                        content.push_str(&section);
+                    }
+                }
+
                 // Available Terminals: the project's named terminal shortcuts.
                 // Terminals are created via `write`, so gate on it (mirroring
                 // the Available Agents gate). Absent when none are configured.
@@ -1736,6 +1853,39 @@ mod tests {
     use crate::storage::{LocalDb, RowExt, SearchIndex};
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[test]
+    fn project_checks_section_lists_check_contract() {
+        let checks = std::collections::HashMap::from([
+            (
+                "rust".to_string(),
+                crate::config::project_settings::CheckCommand {
+                    command: "cargo test {targets}".to_string(),
+                    impact: Some(vec!["src-tauri/**".to_string()]),
+                    policy: crate::config::project_settings::CheckPolicy::Gate,
+                    when: crate::config::project_settings::CheckWhen::Review,
+                },
+            ),
+            (
+                "frontend".to_string(),
+                crate::config::project_settings::CheckCommand {
+                    command: "vitest run".to_string(),
+                    impact: None,
+                    policy: crate::config::project_settings::CheckPolicy::Advisory,
+                    when: crate::config::project_settings::CheckWhen::Write,
+                },
+            ),
+        ]);
+
+        let section = build_project_checks_section(&checks).unwrap();
+        assert!(section.contains("## Project checks"));
+        assert!(section.contains("**frontend**: `vitest run`"));
+        assert!(section.contains("policy: `advisory`"));
+        assert!(section.contains("when: `write`"));
+        assert!(section.contains("**rust**: `cargo test {targets}`"));
+        assert!(section.contains("policy: `gate`"));
+        assert!(section.contains("when: `review`"));
+    }
 
     #[test]
     fn orientation_block_states_run_coordinates() {

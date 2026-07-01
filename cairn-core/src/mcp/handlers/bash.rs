@@ -754,6 +754,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     let worktree_path = std::path::Path::new(&cwd);
     let author = match payload.commit_msg.as_deref() {
         Some(_) => run_context
+            .as_ref()
             .and_then(|ctx| orch.resolve_git_identity_for_project(Some(&ctx.project_id)))
             .map(|(name, email)| GitAuthor::new(name, email)),
         None => None,
@@ -790,6 +791,26 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             result.push_str("\n\n");
         }
         result.push_str(&barrier.message);
+    }
+    // Synchronous when:write check runner: a sealed source-touching commit fires
+    // the affected when:write checks against that commit, streams their output
+    // live into this tool's transcript, runs them to completion, and appends a
+    // compact inline pass/fail line. Gated on an actually-landed commit
+    // (`committed` is true only with commit_msg + a successful seal).
+    if barrier.committed {
+        if let Some(summary) = crate::execution::checks::run_write_checks_after_seal(
+            orch,
+            run_context.as_ref(),
+            &cwd,
+            &tool_use_id,
+        )
+        .await
+        {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(&summary);
+        }
     }
     // A commit_msg on a non-worktree cwd (the project's live checkout) cannot
     // commit: changes only happen in worktrees. The commands already ran, so
@@ -828,9 +849,9 @@ pub(super) struct CommitBarrierOutcome {
     pub worktree_changed: bool,
     /// Whether a real commit (or amend) landed. True only when the seal
     /// succeeded — not on a restore, a clean no-op, or a missing commit_msg.
-    /// Part of the barrier's result contract and asserted by the commit-hygiene
-    /// tests; no production reader consumes it today.
-    #[allow(dead_code)]
+    /// Part of the barrier's result contract, asserted by the commit-hygiene
+    /// tests, and read by `handle_run` to gate the synchronous when:write check
+    /// runner on an actually-sealed commit.
     pub committed: bool,
 }
 
@@ -1216,8 +1237,94 @@ fn resolve_interpreter(script_path: &std::path::Path) -> Result<(String, Vec<Str
     Ok((program.to_string(), Vec::new()))
 }
 
-fn run_item_stream_id(tool_use_id: &str, index: usize) -> String {
+pub(crate) fn run_item_stream_id(tool_use_id: &str, index: usize) -> String {
     format!("{tool_use_id}:{index}")
+}
+
+/// Run one project-declared `when:write` check command to completion under the
+/// same OS sandbox / fence env / live-streaming machinery the `run` verb uses,
+/// returning its exit code plus combined captured output.
+///
+/// Spawned via `bash -c`, exactly how a [`RunSpec::Shell`] item executes, so the
+/// check inherits `CAIRN_WORKTREE`, the git/jj env, the sccache build-service
+/// env, and the per-job `TMPDIR` scratch. A sandbox denial surfaces here as a
+/// non-zero / `None` exit (a clear check failure), never an interactive fence
+/// prompt: the synchronous when:write runner intentionally does not route checks
+/// through `run_one`/`raise_fence` (that is the when:review cargo path, Wave 4).
+pub(crate) async fn run_check_command(
+    orch: &Orchestrator,
+    cwd: &str,
+    stream_id: &str,
+    run_context: Option<&super::RunContext>,
+    command: &str,
+    timeout_ms: u32,
+) -> Result<(Option<i32>, String), String> {
+    let args = ["-c".to_string(), command.to_string()];
+    let out = execute_process(
+        orch,
+        cwd,
+        stream_id,
+        run_context,
+        "bash",
+        &args,
+        timeout_ms,
+        Some(command),
+        true,  // sandbox_enabled
+        false, // branch_scoped_run
+    )
+    .await?;
+    let combined = match (out.stdout.is_empty(), out.stderr.is_empty()) {
+        (false, false) => format!("{}\n{}", out.stdout, out.stderr),
+        (false, true) => out.stdout,
+        (true, false) => out.stderr,
+        (true, true) => String::new(),
+    };
+    Ok((out.exit_code, combined))
+}
+
+/// Run one project-declared check command UNSANDBOXED and with no run context,
+/// teeing combined output to a host-readable, job-scoped log file so a PR-node or
+/// `/checks` render can tail it live while the run is in flight.
+///
+/// This is the turn-end (`when:idle`/`when:review`) cadence's vehicle: at
+/// turn-end the agent is idle, so a fence permission prompt would hang with no
+/// one to answer. Passing `sandbox_enabled=false` takes the same unconditional
+/// `sandbox = None` path the post-fence-grant re-execution uses (bash.rs), so no
+/// interactive fence prompt is reachable. `set -o pipefail` preserves the
+/// check's own exit code through the `tee` pipe (otherwise `bash -c` would return
+/// tee's exit, masking a failing check).
+pub(crate) async fn run_check_command_unsandboxed(
+    orch: &Orchestrator,
+    cwd: &str,
+    stream_id: &str,
+    command: &str,
+    timeout_ms: u32,
+    log_path: &std::path::Path,
+) -> Result<(Option<i32>, String), String> {
+    // Single-quote the log path for the shell; escape any embedded single quote.
+    let log = log_path.to_string_lossy().replace('\'', "'\\''");
+    let wrapped = format!("set -o pipefail; {{ {command}; }} 2>&1 | tee -a '{log}'");
+    let args = ["-c".to_string(), wrapped];
+    let out = execute_process(
+        orch,
+        cwd,
+        stream_id,
+        None, // no run context — turn is over, nothing to stream into
+        "bash",
+        &args,
+        timeout_ms,
+        Some(command),
+        false, // sandbox_enabled=false — idle agent can't answer a fence prompt
+        false, // branch_scoped_run
+    )
+    .await?;
+    let combined = match (out.stdout.is_empty(), out.stderr.is_empty()) {
+        (false, false) => format!("{}\n{}", out.stdout, out.stderr),
+        (false, true) => out.stdout,
+        (true, false) => out.stderr,
+        (true, true) => String::new(),
+    };
+    Ok((out.exit_code, combined))
 }
 
 /// Percent of an item's char budget reserved for the head (leading context: the

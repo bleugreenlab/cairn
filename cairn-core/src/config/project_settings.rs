@@ -44,6 +44,80 @@ impl PopulateConfig {
     }
 }
 
+/// One project check: a single command run at one cadence. Selectivity is
+/// expressed by a `{changedFiles}` or `{targets}` placeholder inside the
+/// command — the placeholder *is* the selector, and a placeholder-less command
+/// runs as-is (a full run).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckCommand {
+    /// The command to run. A `{changedFiles}` or `{targets}` placeholder makes
+    /// it selective; a placeholder-less command runs as-is.
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<Vec<String>>,
+    #[serde(
+        default = "default_check_policy",
+        skip_serializing_if = "is_default_check_policy"
+    )]
+    pub policy: CheckPolicy,
+    #[serde(
+        default = "default_check_when",
+        skip_serializing_if = "is_default_check_when"
+    )]
+    pub when: CheckWhen,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckPolicy {
+    Advisory,
+    Gate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckWhen {
+    Write,
+    Idle,
+    Review,
+}
+
+fn default_check_policy() -> CheckPolicy {
+    CheckPolicy::Advisory
+}
+
+fn is_default_check_policy(policy: &CheckPolicy) -> bool {
+    *policy == default_check_policy()
+}
+
+fn default_check_when() -> CheckWhen {
+    CheckWhen::Write
+}
+
+fn is_default_check_when(when: &CheckWhen) -> bool {
+    *when == default_check_when()
+}
+
+impl CheckPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckPolicy::Advisory => "advisory",
+            CheckPolicy::Gate => "gate",
+        }
+    }
+}
+
+impl CheckWhen {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckWhen::Write => "write",
+            CheckWhen::Idle => "idle",
+            CheckWhen::Review => "review",
+        }
+    }
+}
+
 /// Project settings as stored in YAML file.
 /// All fields are optional - missing fields use defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,6 +127,8 @@ pub struct ProjectSettingsFile {
     pub setup_commands: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_commands: Option<Vec<TerminalCommand>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<HashMap<String, CheckCommand>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +171,8 @@ struct LegacyProjectSettingsFile {
     copy_files: Option<Vec<String>>,
     #[serde(default)]
     terminal_commands: Option<Vec<LegacyTerminalCommand>>,
+    #[serde(default)]
+    checks: Option<HashMap<String, CheckCommand>>,
     #[serde(default)]
     default_branch: Option<String>,
     #[serde(default)]
@@ -227,6 +305,7 @@ fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFil
                 })
                 .collect()
         }),
+        checks: legacy.checks,
         default_branch: legacy.default_branch,
         references: legacy.references,
         worktree: legacy.worktree,
@@ -248,6 +327,21 @@ pub fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::Termina
     load_project_settings_file(project_path)
         .map(|(file, _)| file.terminal_commands.unwrap_or_default())
         .unwrap_or_default()
+}
+
+/// Load just the `checks` contract from a project's `.cairn/config.yaml`.
+///
+/// Reads the file directly without the migration rewrite (and its scoped git
+/// commit) that `load_project_settings` performs, mirroring
+/// [`load_terminal_commands`]. The synchronous `when:write` check runner calls
+/// this against the project's LIVE main checkout on every sealed commit, so it
+/// must stay side-effect free — a migration commit fired from inside an agent
+/// run would be surprising. Returns `None` when the file is absent, invalid, or
+/// declares no checks.
+pub fn load_checks(project_path: &Path) -> Option<HashMap<String, CheckCommand>> {
+    load_project_settings_file(project_path)
+        .ok()
+        .and_then(|(file, _)| file.checks)
 }
 
 /// Save project settings to file
@@ -362,6 +456,7 @@ mod tests {
         let settings = ProjectSettingsFile::default();
         assert!(settings.setup_commands.is_none());
         assert!(settings.terminal_commands.is_none());
+        assert!(settings.checks.is_none());
         assert!(settings.default_branch.is_none());
         assert!(settings.populate_config().is_empty());
     }
@@ -385,6 +480,168 @@ mod tests {
         assert_eq!(parsed.setup_commands, settings.setup_commands);
         assert_eq!(parsed.default_branch, settings.default_branch);
         assert_eq!(parsed.terminal_commands.as_ref().map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn test_checks_parse_and_roundtrip() {
+        let yaml = r#"
+checks:
+  frontend:
+    command: vitest related {changedFiles}
+    impact:
+      - src/**
+      - packages/ui/**
+    policy: gate
+    when: idle
+  typecheck:
+    command: tsc --noEmit
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let checks = settings.checks.as_ref().unwrap();
+        let frontend = checks.get("frontend").unwrap();
+        assert_eq!(frontend.command, "vitest related {changedFiles}");
+        assert_eq!(frontend.policy, CheckPolicy::Gate);
+        assert_eq!(frontend.when, CheckWhen::Idle);
+        assert_eq!(
+            frontend.impact.as_deref(),
+            Some(&["src/**".to_string(), "packages/ui/**".to_string()][..])
+        );
+
+        let typecheck = checks.get("typecheck").unwrap();
+        assert_eq!(typecheck.command, "tsc --noEmit");
+        assert_eq!(typecheck.policy, CheckPolicy::Advisory);
+        assert_eq!(typecheck.when, CheckWhen::Write);
+
+        let serialized = serde_yaml::to_string(&settings).unwrap();
+        let reparsed: ProjectSettingsFile = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.checks, settings.checks);
+    }
+
+    #[test]
+    fn test_checks_reject_unknown_enums() {
+        let bad_policy = r#"
+checks:
+  frontend:
+    command: vitest run
+    policy: blocking
+"#;
+        let err = serde_yaml::from_str::<ProjectSettingsFile>(bad_policy)
+            .expect_err("unknown policy should fail");
+        assert!(err.to_string().contains("blocking"));
+        assert!(err.to_string().contains("advisory") || err.to_string().contains("Advisory"));
+
+        let bad_when = r#"
+checks:
+  frontend:
+    command: vitest run
+    when: commit
+"#;
+        let err = serde_yaml::from_str::<ProjectSettingsFile>(bad_when)
+            .expect_err("unknown cadence should fail");
+        assert!(err.to_string().contains("commit"));
+        assert!(err.to_string().contains("write") || err.to_string().contains("Write"));
+
+        // `pr` was the old cadence name; it is now rejected in favor of `review`.
+        let legacy_pr = r#"
+checks:
+  frontend:
+    command: vitest run
+    when: pr
+"#;
+        let err = serde_yaml::from_str::<ProjectSettingsFile>(legacy_pr)
+            .expect_err("legacy `pr` cadence should fail");
+        assert!(err.to_string().contains("pr"));
+
+        // `review` is the current full-suite cadence and parses.
+        let review = r#"
+checks:
+  frontend:
+    command: vitest run
+    when: review
+"#;
+        let settings = serde_yaml::from_str::<ProjectSettingsFile>(review)
+            .expect("`review` cadence should parse");
+        assert_eq!(
+            settings.checks.unwrap().get("frontend").unwrap().when,
+            CheckWhen::Review
+        );
+    }
+
+    #[test]
+    fn test_checks_survive_legacy_migration() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+        let legacy_content = r#"ciCommands:
+  - npm test
+checks:
+  frontend:
+    command: vitest run
+    policy: gate
+"#;
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, legacy_content).unwrap();
+
+        let loaded = load_project_settings(project_path);
+        let frontend = loaded
+            .checks
+            .as_ref()
+            .and_then(|checks| checks.get("frontend"))
+            .expect("checks should survive migration-triggering load");
+        assert_eq!(frontend.command, "vitest run");
+        assert_eq!(frontend.policy, CheckPolicy::Gate);
+
+        let migrated_content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(migrated_content.contains("checks:"));
+        assert!(migrated_content.contains("frontend:"));
+        assert!(!migrated_content.contains("ciCommands"));
+    }
+
+    #[test]
+    fn load_checks_reads_without_migrating() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+        // A legacy config (ciCommands) that `load_project_settings` would rewrite
+        // and commit. `load_checks` must read the checks WITHOUT that side effect.
+        let legacy =
+            "ciCommands:\n  - npm test\nchecks:\n  frontend:\n    command: vitest run\n    when: write\n";
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, legacy).unwrap();
+
+        let checks = load_checks(project_path).expect("checks present");
+        assert!(checks.contains_key("frontend"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            legacy,
+            "load_checks must not rewrite the file"
+        );
+    }
+
+    #[test]
+    fn load_checks_none_when_absent_or_no_checks() {
+        let temp = TempDir::new().unwrap();
+        assert!(load_checks(temp.path()).is_none(), "absent file ⇒ None");
+
+        let config_path = get_project_config_path(temp.path());
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "setupCommands:\n  - npm install\n").unwrap();
+        assert!(load_checks(temp.path()).is_none(), "no checks key ⇒ None");
+    }
+
+    #[test]
+    fn test_project_settings_without_checks_is_load_save_stable() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+        let content =
+            "# Cairn Project Configuration\nsetupCommands:\n- npm install\ndefaultBranch: main\n";
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, content).unwrap();
+
+        let (_loaded, needs_migration) = load_project_settings_file(project_path).unwrap();
+        assert!(!needs_migration);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), content);
     }
 
     #[test]

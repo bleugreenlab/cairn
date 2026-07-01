@@ -238,6 +238,7 @@ pub async fn ask_questions(
                     // shared resume-ladder primitive (idle -> resume; busy or
                     // self-suspended -> no-op).
                     Ok(recipients) => {
+                        orch.notifier.emit_change("attention_pushes");
                         for recipient in &recipients {
                             if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
                                 orch,
