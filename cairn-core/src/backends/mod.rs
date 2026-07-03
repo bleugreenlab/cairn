@@ -232,7 +232,7 @@ pub struct SessionConfig {
     pub disallowed_tools: Vec<String>,
     /// The MCP config as a self-contained JSON string (built per run, never
     /// shared on disk). Claude passes it inline via `--mcp-config <json>`; Codex
-    /// parses it to extract the cairn-cli args.
+    /// parses it to extract the cairn-cmd args.
     pub mcp_config_json: String,
     /// Stable home URI for this run (full node URI). Forwarded to the MCP child
     /// as `CAIRN_HOME_URI` so `cairn:~/...` shorthand resolves. Claude bakes this

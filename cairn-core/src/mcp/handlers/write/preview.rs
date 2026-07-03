@@ -1,10 +1,10 @@
 use super::file_mutations::{hash_file_target_uri, prepare_file_changes};
-use super::handle_change;
+use super::handle_write;
 use super::types::{
     build_failure, empty_change_report, mode_name, resource_failure, AppliedChange, ChangeFailure,
     ChangeReport, IndexedChange,
 };
-use crate::mcp::handlers::files::target::{target_family, TargetFamily};
+use crate::mcp::handlers::target::{target_family, TargetFamily};
 use crate::mcp::types::{ChangeMode, ChangePayload, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::resources::mutations::{dispatch_resource_change, hash_resource_target};
@@ -825,7 +825,7 @@ pub(super) async fn handle_apply_change(
             ));
         }
     };
-    let result = Box::pin(handle_change(orch, &apply_request)).await;
+    let result = Box::pin(handle_write(orch, &apply_request)).await;
     if let Ok(report) = serde_json::from_str::<ChangeReport>(&result) {
         if report.failures.is_empty() {
             let now = chrono::Utc::now().timestamp();

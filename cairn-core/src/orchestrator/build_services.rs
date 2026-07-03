@@ -26,6 +26,36 @@ use super::Orchestrator;
 /// Timeout for a TCP reachability probe. Short — this can gate fenced builds.
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// The rustc-wrapper / CMake compiler launcher, compiled into the binary from
+/// its single source of truth `scripts/cache-wrapper.sh`. Installed to a stable
+/// host path at startup (see `install_cache_wrapper`) so the `RUSTC_WRAPPER` the
+/// default sccache service injects always resolves to one wrapper identity.
+const CACHE_WRAPPER: &str = include_str!("../../../../../scripts/cache-wrapper.sh");
+
+/// Install the embedded cache wrapper to `{cairn_home}/bin/cache-wrapper.sh`,
+/// executable, overwriting any prior copy so upgrades propagate on every startup.
+///
+/// This is the stable path the default sccache service injects as `RUSTC_WRAPPER`.
+/// Keeping it in one host location (rather than the repo-relative
+/// `scripts/cache-wrapper.sh`) means every worktree's cargo shares one wrapper
+/// identity, so cargo fingerprints never flip between a bare `cargo` in an agent
+/// shell and the `bun run` scripts. The wrapper degrades safely with no sccache
+/// on PATH (`exec "$@"`), so installing it is harmless even where the injected
+/// env is never used. Best-effort at the call site: a failure is logged, never
+/// fatal.
+pub(crate) fn install_cache_wrapper(cairn_home: &Path) -> std::io::Result<PathBuf> {
+    let bin_dir = cairn_home.join("bin");
+    std::fs::create_dir_all(&bin_dir)?;
+    let dest = bin_dir.join("cache-wrapper.sh");
+    std::fs::write(&dest, CACHE_WRAPPER)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(dest)
+}
+
 /// Build the spawn config for launching a service daemon under its service
 /// sandbox. Pure (no spawning), so it can be asserted directly in tests.
 ///
@@ -174,6 +204,14 @@ impl Orchestrator {
     /// Best-effort — a launch failure is logged, never fatal, because the client
     /// wrapper falls back to a plain compiler when the daemon is unreachable.
     pub fn start_build_services(&self) {
+        // Install the embedded rustc wrapper to `{cairnHome}/bin` first, before
+        // any early return, so the `RUSTC_WRAPPER` the default sccache service
+        // injects always resolves — even on a host without a service sandbox,
+        // where clients run uncached but the wrapper must still exist to exec the
+        // compiler. Overwrite each startup so upgrades propagate.
+        if let Err(e) = install_cache_wrapper(&self.config_dir) {
+            log::warn!("failed to install cache wrapper: {e}");
+        }
         if !sandbox::is_available() {
             // No service sandbox on this host; clients run uncached (the
             // cache-wrapper guard never auto-starts a confined server).
@@ -360,5 +398,25 @@ mod tests {
         // A port we just closed is almost certainly unbound now.
         let closed = ReadyProbe::tcp(addr.to_string());
         assert!(!probe_ready(&closed), "a closed port must not probe ready");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_cache_wrapper_writes_executable_wrapper() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let dest = install_cache_wrapper(temp.path()).unwrap();
+        assert_eq!(dest, temp.path().join("bin").join("cache-wrapper.sh"));
+
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert!(
+            meta.permissions().mode() & 0o111 != 0,
+            "installed wrapper must be executable"
+        );
+        // The embedded body is the real script (has its sccache guard), and a
+        // second install overwrites cleanly so upgrades propagate.
+        let body = std::fs::read_to_string(&dest).unwrap();
+        assert!(body.contains("command -v sccache"));
+        assert_eq!(install_cache_wrapper(temp.path()).unwrap(), dest);
     }
 }

@@ -1,6 +1,6 @@
 //! MCP config file generation for Claude CLI.
 //!
-//! Generates the JSON config that tells Claude CLI where to find the cairn-cli binary
+//! Generates the JSON config that tells Claude CLI where to find the cairn-cmd binary
 //! and how to connect to the callback server.
 
 /// Build MCP config JSON for Claude CLI.
@@ -21,7 +21,7 @@
 /// `CAIRN_LOG_LEVEL` so the child's `logging::init` resolves the same file-log
 /// verbosity as the app that spawned it.
 pub fn build_mcp_config_json(
-    cairn_cli_path: &str,
+    cairn_cmd_path: &str,
     callback_url: &str,
     available_agents: Option<&str>,
     home_uri: Option<&str>,
@@ -49,7 +49,7 @@ pub fn build_mcp_config_json(
     let servers = serde_json::json!({
         "cairn": {
             "type": "stdio",
-            "command": cairn_cli_path,
+            "command": cairn_cmd_path,
             "args": args,
             "env": env
         }
@@ -68,7 +68,7 @@ pub fn build_mcp_config_json(
 /// delegated tasks) all resolved `cairn:~` to the same node. Passing the config
 /// inline removes the shared mutable file entirely.
 ///
-/// `mcp_binary_path` is the path to the cairn-cli binary.
+/// `mcp_binary_path` is the path to the cairn-cmd binary.
 /// `callback_port` is the MCP callback server port.
 pub fn build_mcp_config_string(
     mcp_binary_path: &str,
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn test_build_mcp_config_json_basic() {
         let config = build_mcp_config_json(
-            "/usr/bin/cairn-cli",
+            "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3847/api/mcp",
             None,
             None,
@@ -112,7 +112,7 @@ mod tests {
         let cairn = servers.get("cairn").unwrap();
         assert_eq!(
             cairn.get("command").unwrap().as_str().unwrap(),
-            "/usr/bin/cairn-cli"
+            "/usr/bin/cairn-cmd"
         );
         let env = cairn.get("env").unwrap();
         assert_eq!(
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn test_build_mcp_config_json_with_cairn_home() {
         let config = build_mcp_config_json(
-            "/usr/bin/cairn-cli",
+            "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3861/api/mcp",
             None,
             None,
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_build_mcp_config_json_with_home_uri() {
         let config = build_mcp_config_json(
-            "/usr/bin/cairn-cli",
+            "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3847/api/mcp",
             None,
             Some("cairn://p/CAIRN/42/1/builder"),
@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn test_build_mcp_config_string_is_parseable_and_run_specific() {
         let a = build_mcp_config_string(
-            "/usr/bin/cairn-cli",
+            "/usr/bin/cairn-cmd",
             3847,
             None,
             Some("cairn://p/CAIRN/1/1/planner/task/agent-spawn"),
@@ -182,7 +182,7 @@ mod tests {
             "standard",
         );
         let b = build_mcp_config_string(
-            "/usr/bin/cairn-cli",
+            "/usr/bin/cairn-cmd",
             3847,
             None,
             Some("cairn://p/CAIRN/1/1/planner/task/planbuild-recipe"),
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn test_build_mcp_config_json_with_agents() {
         let config = build_mcp_config_json(
-            "/usr/bin/cairn-cli",
+            "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3847/api/mcp",
             Some("[{\"name\":\"Explore\",\"description\":\"x\"}]"),
             None,

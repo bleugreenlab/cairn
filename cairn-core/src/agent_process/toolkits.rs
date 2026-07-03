@@ -239,13 +239,13 @@ mod tests {
     #[test]
     fn core_verbs_match_registered_mcp_tool_names() {
         // INVARIANT: the granted verb names must equal the MCP tool names the
-        // cairn-cli registers (`#[tool] async fn read/write/run` →
+        // cairn-cmd registers (`#[tool] async fn read/write/run` →
         // `mcp__cairn__read`/`write`/`run`). If the registered mutation tool is
         // renamed, this floor and the alias must move with it — otherwise every
         // call to the live verb is off the allow-list and trips the permission
-        // prompt (or is denied), wedging the run. cairn-cli is not a dependency
+        // prompt (or is denied), wedging the run. cairn-cmd is not a dependency
         // of cairn-core, so the names are pinned literally here; keep them in
-        // lockstep with `#[tool] async fn write` in cairn-cli/src/main.rs.
+        // lockstep with `#[tool] async fn write` in cairn-cmd/src/main.rs.
         assert_eq!(
             CORE_VERBS,
             ["mcp__cairn__read", "mcp__cairn__write", "mcp__cairn__run"]

@@ -459,6 +459,7 @@ pub async fn commit_user_file_edit(
         "modified",
         additions,
         deletions,
+        None,
     )
     .await
     {

@@ -130,6 +130,21 @@ impl BuildServiceConfig {
 /// Port and cache dir mirror `scripts/cache-wrapper.sh`'s defaults (4226,
 /// `$HOME/.cache/sccache`) so the Cairn-launched daemon and the client wrapper
 /// agree without further configuration.
+///
+/// The `RUSTC_WRAPPER` / `CARGO_BUILD_RUSTC_WRAPPER` env points every fenced
+/// cargo invocation at the wrapper installed at `{cairnHome}/bin/cache-wrapper.sh`
+/// (see `orchestrator::build_services::install_cache_wrapper`). That makes bare
+/// `cargo` from an agent shell cache identically to the `bun run` scripts, and
+/// gives every worktree one wrapper identity so cargo fingerprints never flip
+/// between the two. Unix only — the wrapper is a shell script. `SCCACHE_CACHE_SIZE`
+/// raises the daemon's max cache above the 10 GiB default (the daemon reads it
+/// from this same env map at launch) so a warm multi-worktree workspace stops
+/// evicting. `CARGO_INCREMENTAL=0` disables incremental compilation for fenced
+/// agent builds: sccache cannot cache incremental units, so leaving it on both
+/// misses the cache and grows an unbounded per-worktree `target/debug/incremental`
+/// tree (tens of GB per worktree). It rides the same unix block as the wrapper —
+/// the only place sccache is actually wired — and reaches only fenced agent
+/// spawns, never the user's own interactive `cargo` in their checkout.
 pub fn default_sccache_service() -> BuildServiceConfig {
     let mut env = HashMap::new();
     env.insert("SCCACHE_SERVER_PORT".to_string(), "4226".to_string());
@@ -137,6 +152,16 @@ pub fn default_sccache_service() -> BuildServiceConfig {
         "SCCACHE_DIR".to_string(),
         "{home}/.cache/sccache".to_string(),
     );
+    env.insert("SCCACHE_CACHE_SIZE".to_string(), "50G".to_string());
+    if cfg!(unix) {
+        let wrapper = "{cairnHome}/bin/cache-wrapper.sh".to_string();
+        env.insert("RUSTC_WRAPPER".to_string(), wrapper.clone());
+        env.insert("CARGO_BUILD_RUSTC_WRAPPER".to_string(), wrapper);
+        // sccache cannot cache incremental compilation (see the doc comment above);
+        // disabling it stops the unbounded per-worktree incremental cache and lifts
+        // the sccache hit rate. Rides the unix block with the wrapper it depends on.
+        env.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
+    }
     BuildServiceConfig {
         enabled: true,
         start: vec!["sccache".to_string(), "--start-server".to_string()],
@@ -246,5 +271,40 @@ env:
             svc.expanded_env(&t).get("SCCACHE_DIR").map(String::as_str),
             Some("/home/u/.cache/sccache")
         );
+    }
+
+    #[test]
+    fn default_sccache_service_raises_cache_size() {
+        // The daemon reads SCCACHE_CACHE_SIZE from this same env map at launch;
+        // it must be present on every platform so the server stops evicting.
+        let env = default_sccache_service().expanded_env(&templates());
+        assert_eq!(
+            env.get("SCCACHE_CACHE_SIZE").map(String::as_str),
+            Some("50G")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_sccache_service_injects_wrapper_env() {
+        // Both cargo spellings point at the installed wrapper at {cairnHome}/bin,
+        // so bare cargo and the bun scripts share one wrapper identity.
+        let env = default_sccache_service().expanded_env(&templates());
+        let wrapper = "/home/u/.cairn/bin/cache-wrapper.sh";
+        assert_eq!(env.get("RUSTC_WRAPPER").map(String::as_str), Some(wrapper));
+        assert_eq!(
+            env.get("CARGO_BUILD_RUSTC_WRAPPER").map(String::as_str),
+            Some(wrapper)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_sccache_service_disables_incremental() {
+        // sccache cannot cache incremental builds, so the service turns incremental
+        // off for fenced agent cargo — stopping the unbounded incremental cache and
+        // raising the cache hit rate. Unix-only, matching the wrapper it rides with.
+        let env = default_sccache_service().expanded_env(&templates());
+        assert_eq!(env.get("CARGO_INCREMENTAL").map(String::as_str), Some("0"));
     }
 }

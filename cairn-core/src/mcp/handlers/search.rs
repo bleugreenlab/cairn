@@ -9,6 +9,7 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::query::QueryParam;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Payload for search tool
@@ -179,7 +180,7 @@ fn should_walk_entry(entry_path: &Path, walk_root: &Path, deny_read: &[PathBuf])
         return true;
     }
 
-    !crate::mcp::git::path_within_any(entry_path, deny_read)
+    !crate::mcp::file_targets::path_within_any(entry_path, deny_read)
 }
 
 /// Format search results as human-readable text for the agent.
@@ -228,14 +229,14 @@ pub(crate) fn format_search_results(
 const WALK_TIMEOUT: Duration = Duration::from_secs(30);
 const GREP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Payload for glob tool (matches cairn-cli GlobInput)
+/// Payload for glob tool (matches cairn-cmd GlobInput)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GlobPayload {
     pub pattern: String,
     pub path: Option<String>,
 }
 
-/// Payload for grep tool (matches cairn-cli GrepInput)
+/// Payload for grep tool (matches cairn-cmd GrepInput)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GrepPayload {
     pub pattern: String,
@@ -319,7 +320,18 @@ pub(crate) struct GlobMatches {
 /// Resolve a glob to its matched files. Shared by the glob tool's list output
 /// and the read-projection's `output_mode=content`/`count` modes, so both walk
 /// the tree identically (gitignore-aware, path-scoped, timeout-bounded).
-pub(crate) fn glob_matched_paths(
+pub(crate) fn build_glob_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
+    let glob = globset::GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .build()
+        .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?;
+    globset::GlobSetBuilder::new()
+        .add(glob)
+        .build()
+        .map_err(|e| format!("Failed to build glob matcher: {}", e))
+}
+
+pub(crate) async fn glob_matched_paths(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
 ) -> Result<GlobMatches, String> {
@@ -333,18 +345,56 @@ pub(crate) fn glob_matched_paths(
         search_dir.display()
     );
 
-    // Build glob matcher
-    let glob = globset::GlobBuilder::new(&payload.pattern)
-        .literal_separator(false)
-        .build()
-        .map_err(|e| format!("Invalid glob pattern '{}': {}", payload.pattern, e))?;
-    let matcher = globset::GlobSetBuilder::new()
-        .add(glob)
-        .build()
-        .map_err(|e| format!("Failed to build glob matcher: {}", e))?;
+    // Validate with Cairn's exact matcher before the warm-index attempt so
+    // invalid-glob errors stay identical whether the index is warm or cold.
+    build_glob_matcher(&payload.pattern)?;
 
-    // Walk directory respecting .gitignore, with timeout
     let deny_read = orch.sandbox_deny_read();
+    if let Some(paths) =
+        try_worktree_index_glob(orch, request, &search_dir, &payload.pattern, &deny_read).await
+    {
+        return Ok(GlobMatches {
+            search_dir,
+            pattern: payload.pattern,
+            paths,
+            timed_out: false,
+        });
+    }
+
+    let pattern = payload.pattern.clone();
+    let search_dir_for_walk = search_dir.clone();
+    let result = tokio::time::timeout(
+        WALK_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            glob_matched_paths_walk(search_dir_for_walk, pattern, deny_read)
+        }),
+    )
+    .await;
+
+    let (paths, timed_out) = match result {
+        Ok(Ok(Ok((paths, timed_out)))) => (paths, timed_out),
+        Ok(Ok(Err(error))) => return Err(error),
+        Ok(Err(error)) => return Err(format!("glob task failed: {}", error)),
+        Err(_) => {
+            log::warn!("glob walk timed out after {:?}", WALK_TIMEOUT);
+            (Vec::new(), true)
+        }
+    };
+
+    Ok(GlobMatches {
+        search_dir,
+        pattern: payload.pattern,
+        paths,
+        timed_out,
+    })
+}
+
+pub(crate) fn glob_matched_paths_walk(
+    search_dir: PathBuf,
+    pattern: String,
+    deny_read: Vec<PathBuf>,
+) -> Result<(Vec<PathBuf>, bool), String> {
+    let matcher = build_glob_matcher(&pattern)?;
     let filter_root = search_dir.clone();
     let walker = ignore::WalkBuilder::new(&search_dir)
         .hidden(false)
@@ -383,15 +433,8 @@ pub(crate) fn glob_matched_paths(
         }
     }
 
-    // Sort by modification time, most recent first
     matches.sort_by(|a, b| b.1.cmp(&a.1));
-
-    Ok(GlobMatches {
-        search_dir,
-        pattern: payload.pattern,
-        paths: matches.into_iter().map(|(p, _)| p).collect(),
-        timed_out,
-    })
+    Ok((matches.into_iter().map(|(p, _)| p).collect(), timed_out))
 }
 
 /// Append the shared "search timed out" warning to a glob result body.
@@ -404,13 +447,13 @@ pub(crate) fn glob_timeout_warning() -> String {
 }
 
 /// Handle glob tool call — pattern-match files with path scoping.
-pub fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+pub async fn handle_glob(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
     let GlobMatches {
         search_dir,
         pattern,
         paths,
         timed_out,
-    } = match glob_matched_paths(orch, request) {
+    } = match glob_matched_paths(orch, request).await {
         Ok(matches) => matches,
         Err(error) => return error,
     };
@@ -476,6 +519,27 @@ pub async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> S
     let pattern = payload.pattern.clone();
     let deny_read = orch.sandbox_deny_read();
 
+    // Warm-index fast path (CAIRN-2303): a worktree-root grep is served by the
+    // resident fff index instead of re-walking the tree. Eligible only for a
+    // plain line-wise grep whose root is exactly a known worktree and whose
+    // shape the index supports; every other case (sub-directory root, multiline
+    // regex, file-type walk, or an index still warming its first scan) falls
+    // through to the ripgrep walk below, which remains the universal correct
+    // answer.
+    if let Some(body) = try_worktree_index_grep(
+        orch,
+        request,
+        &search_path,
+        &payload,
+        &output_mode,
+        show_line_numbers,
+        &deny_read,
+    )
+    .await
+    {
+        return finalize_grep_output(body, &pattern, offset, head_limit);
+    }
+
     let result = tokio::time::timeout(
         GREP_TIMEOUT,
         tokio::task::spawn_blocking(move || {
@@ -496,6 +560,157 @@ pub async fn handle_grep(orch: &Orchestrator, request: &McpCallbackRequest) -> S
         Ok(Err(e)) => format!("grep task failed: {}", e),
         Err(_) => format!("grep timed out after {:?}", GREP_TIMEOUT),
     }
+}
+
+/// Attempt the warm-index glob fast path for a worktree-root or subdirectory
+/// target. Returns
+/// `Some(paths)` when the resident fff index served the query, or `None` to
+/// fall through to the canonical filesystem walk.
+async fn try_worktree_index_glob(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    search_path: &Path,
+    pattern: &str,
+    deny_read: &[PathBuf],
+) -> Option<Vec<PathBuf>> {
+    let (ctx, _db) = super::run_context::lookup_run_routed(&orch.db, request)
+        .await
+        .ok()?;
+    let worktree_raw = PathBuf::from(ctx.worktree_path?);
+    let scope = resolve_worktree_scope(orch, search_path, &worktree_raw)?;
+
+    let pattern = pattern.to_string();
+    let subdir_for_search = scope.subdir.clone();
+    let deny = deny_read.to_vec();
+    let paths = tokio::task::spawn_blocking(move || {
+        scope
+            .search
+            .try_glob(&pattern, subdir_for_search.as_deref(), &deny)
+    })
+    .await
+    .ok()??;
+    log::debug!(
+        "worktree_search: served glob for {} from warm index{}",
+        scope.worktree_canon.display(),
+        scope
+            .subdir
+            .as_deref()
+            .map(|rel| format!(" subdir={rel}"))
+            .unwrap_or_default()
+    );
+    Some(paths)
+}
+
+/// Attempt the warm-index grep fast path for a worktree-root or subdirectory
+/// target. Returns
+/// `Some(body)` (the joined, unwindowed output lines) when the resident fff
+/// index served the query, or `None` to fall through to the ripgrep walk. Every
+/// `None` is deliberate: an unsupported query shape, a run with no worktree, a
+/// root outside the worktree, a file target, or an index that has not finished
+/// its first background scan yet.
+async fn try_worktree_index_grep(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    search_path: &Path,
+    payload: &GrepPayload,
+    output_mode: &str,
+    show_line_numbers: bool,
+    deny_read: &[PathBuf],
+) -> Option<String> {
+    // Line-wise index only: multiline regex and file-type walks stay on ripgrep
+    // (fff greps line by line; its file-type constraint semantics differ from
+    // ripgrep's `--type`, so that walk is left untouched).
+    if payload.multiline == Some(true) || payload.file_type.is_some() {
+        return None;
+    }
+
+    // Resolve the run's worktree; project-level runs (no worktree) are skipped.
+    let (ctx, _db) = super::run_context::lookup_run_routed(&orch.db, request)
+        .await
+        .ok()?;
+    // Key the pool on the raw DB `worktree_path` so teardown's `drop_worktree`
+    // (which reads the same column) matches the entry created here.
+    let worktree_raw = PathBuf::from(ctx.worktree_path?);
+    let scope = resolve_worktree_scope(orch, search_path, &worktree_raw)?;
+
+    let combined_context = payload.context_alias.or(payload.context);
+    let params = crate::worktree_search::WorktreeGrepParams {
+        pattern: payload.pattern.clone(),
+        subdir: scope.subdir.clone(),
+        globs: payload.glob.clone().into_iter().collect(),
+        max_per_file: None,
+        output_mode: output_mode.to_string(),
+        case_insensitive: payload.case_insensitive,
+        before_context: payload.before_context.or(combined_context).unwrap_or(0) as usize,
+        after_context: payload.after_context.or(combined_context).unwrap_or(0) as usize,
+        show_line_numbers,
+    };
+    let deny = deny_read.to_vec();
+
+    // fff grep is CPU-bound (up to its time budget), so run it off the async
+    // runtime exactly like the ripgrep walk it replaces.
+    let body = tokio::task::spawn_blocking(move || scope.search.try_grep(&params, &deny))
+        .await
+        .ok()??;
+    log::debug!(
+        "worktree_search: served grep for {} from warm index{}",
+        scope.worktree_canon.display(),
+        scope
+            .subdir
+            .as_deref()
+            .map(|rel| format!(" subdir={rel}"))
+            .unwrap_or_default()
+    );
+    Some(body)
+}
+
+pub(crate) struct WorktreeIndexScope {
+    pub(crate) search: Arc<crate::worktree_search::WorktreeSearch>,
+    pub(crate) subdir: Option<String>,
+    worktree_canon: PathBuf,
+}
+
+/// Resolve a candidate search root to a resident worktree index plus optional
+/// worktree-relative subdirectory. This is the shared canonical gate for warm
+/// `?grep=`, `?glob=`, and translated `run()` search commands: file targets,
+/// paths outside the run worktree, missing/cold worktrees, and vanished paths all
+/// return `None` so the caller can use its canonical fallback.
+pub(crate) fn resolve_worktree_scope(
+    orch: &Orchestrator,
+    search_path: &Path,
+    worktree_raw: &Path,
+) -> Option<WorktreeIndexScope> {
+    // Compare canonicalized paths so `.`/symlink/cwd spellings still match.
+    // Single-file greps stay on the byte-parity walk; subdirectories are served
+    // by prefix-filtering and rebasing worktree-relative index paths.
+    let search_canon = std::fs::canonicalize(search_path).ok()?;
+    let worktree_canon = std::fs::canonicalize(worktree_raw).ok()?;
+    let subdir = worktree_index_search_subdir(&search_canon, &worktree_canon)?;
+    let search = orch.worktree_search.get_or_create(worktree_raw)?;
+    Some(WorktreeIndexScope {
+        search,
+        subdir,
+        worktree_canon,
+    })
+}
+
+fn worktree_index_search_subdir(
+    search_canon: &Path,
+    worktree_canon: &Path,
+) -> Option<Option<String>> {
+    if !search_canon.is_dir() {
+        return None;
+    }
+    if search_canon == worktree_canon {
+        return Some(None);
+    }
+    let rel = search_canon.strip_prefix(worktree_canon).ok()?;
+    let rel = rel
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    (!rel.is_empty()).then_some(Some(rel))
 }
 
 /// A content source for a single-file grep: a filesystem path (live directory
@@ -567,7 +782,12 @@ fn build_grep_searcher(payload: &GrepPayload) -> grep_searcher::Searcher {
 /// web markdown, artifact, or transcript) the path prefix is dropped entirely,
 /// yielding `N:text` / `N-text`. `sep` is `':'` for a match line and `'-'` for a
 /// context line; both forms collapse to bare `text` when line numbers are off.
-fn format_grep_line(relative: &str, line_number: Option<u64>, sep: char, text: &str) -> String {
+pub(crate) fn format_grep_line(
+    relative: &str,
+    line_number: Option<u64>,
+    sep: char,
+    text: &str,
+) -> String {
     match (relative.is_empty(), line_number) {
         (true, Some(n)) => format!("{}{}{}", n, sep, text),
         (true, None) => text.to_string(),
@@ -684,7 +904,7 @@ fn grep_collect_into(
 /// Apply the post-search finalization shared by the directory grep and the
 /// single-file bytes renderer: the empty-result message, then the
 /// `offset`/`head_limit` match-window slice.
-fn finalize_grep_output(
+pub(crate) fn finalize_grep_output(
     output: String,
     pattern: &str,
     offset: usize,
@@ -1004,6 +1224,39 @@ pub fn grep_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worktree_index_search_subdir_accepts_root_and_subdir_but_not_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = root.join("src");
+        let file = src.join("main.rs");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let worktree_canon = std::fs::canonicalize(root).unwrap();
+        let src_canon = std::fs::canonicalize(&src).unwrap();
+        let file_canon = std::fs::canonicalize(&file).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_canon = std::fs::canonicalize(outside.path()).unwrap();
+
+        assert_eq!(
+            worktree_index_search_subdir(&worktree_canon, &worktree_canon),
+            Some(None)
+        );
+        assert_eq!(
+            worktree_index_search_subdir(&src_canon, &worktree_canon),
+            Some(Some("src".to_string()))
+        );
+        assert_eq!(
+            worktree_index_search_subdir(&file_canon, &worktree_canon),
+            None
+        );
+        assert_eq!(
+            worktree_index_search_subdir(&outside_canon, &worktree_canon),
+            None
+        );
+    }
 
     #[test]
     fn grep_default_mode_is_content_for_a_single_file() {

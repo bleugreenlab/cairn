@@ -4,8 +4,52 @@ use crate::storage::RowExt;
 use crate::transitions::Resolution;
 use turso::params;
 
-pub async fn update_status(orch: &Orchestrator, id: &str, status: &str) -> Result<(), String> {
+/// Who is driving a status resolution. Gates the fail-closed checks: a person
+/// acting through the UI is a deliberate override (the menu confirms first), so
+/// `User` skips them; an agent/recipe writing through MCP is held to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolutionActor {
+    /// A person acting through the UI — stop active work and resolve, no refusals.
+    User,
+    /// An agent/recipe via the MCP write path — refuse a `merged` resolution
+    /// while a PR is open, and refuse any terminal resolution that would strand
+    /// active dependent work (CAIRN-2287).
+    Agent,
+}
+
+pub async fn update_status(
+    orch: &Orchestrator,
+    id: &str,
+    status: &str,
+    actor: ResolutionActor,
+) -> Result<(), String> {
     let is_terminal_state = status == "merged" || status == "closed";
+
+    // Agent/recipe-initiated terminal resolutions fail closed. The user UI path
+    // is a deliberate override and skips these guards.
+    if is_terminal_state && matches!(actor, ResolutionActor::Agent) {
+        // `merged` while a PR is still OPEN would record a resolution WITHOUT
+        // merging — stranding the branch's commits and auto-closing the PR
+        // unmerged. Refuse and name the real merge lever (CAIRN-2287). Merging
+        // through the PR resolves the issue itself, so an agent never needs the
+        // status patch to merge.
+        if status == "merged" {
+            if let Some((project_key, number)) = open_merge_request_for_issue(orch, id).await? {
+                return Err(format!(
+                    "Refusing to mark {project_key}-{number} merged: it still has an OPEN pull request. Setting status=merged records a resolution WITHOUT merging the PR — it strands the branch's commits and auto-closes the PR unmerged. Merge through the PR instead:\n  write({{changes:[{{target:\"cairn://p/{project_key}/{number}/1/builder/create-pr\",mode:\"patch\",payload:{{action:\"merge\"}}}}]}})\nThat merge resolves this issue for you. If the PR was already merged externally, refresh it instead with payload:{{action:\"refresh\"}}."
+                ));
+            }
+        }
+        // Never resolve an issue out from under its own still-running work (e.g. a
+        // reviewer on a child a coordinator is about to merge).
+        let blockers = terminal_resolution_blockers(orch, id).await?;
+        if !blockers.is_empty() {
+            return Err(format!(
+                "Refusing to mark issue {status} while it still has {}; finish or stop the running work first (or resolve it from the UI, a deliberate override).",
+                blockers.join(", ")
+            ));
+        }
+    }
 
     if is_terminal_state {
         // A user marking an issue merged/closed from the UI is a deliberate
@@ -72,6 +116,15 @@ pub async fn update_status(orch: &Orchestrator, id: &str, status: &str) -> Resul
         let orch_clone = orch.clone();
         let issue_id = id.to_string();
         let status_label = status.to_string();
+        // A merged resolution recorded here did NOT run a fold (that is the PR
+        // action's job), so teardown must preserve any branch whose commits have
+        // not landed — the KMCP data-loss guard (CAIRN-2287). A closed resolution
+        // is an explicit discard and deletes branches as before.
+        let reason = if status == "merged" {
+            crate::execution::teardown::TeardownReason::Merged
+        } else {
+            crate::execution::teardown::TeardownReason::Discarded
+        };
 
         tokio::spawn(async move {
             log::info!(
@@ -83,6 +136,7 @@ pub async fn update_status(orch: &Orchestrator, id: &str, status: &str) -> Resul
             if let Err(error) = crate::execution::teardown::teardown_worktrees(
                 &orch_clone,
                 crate::execution::teardown::TeardownScope::Issue(issue_id),
+                reason,
             )
             .await
             {
@@ -92,6 +146,42 @@ pub async fn update_status(orch: &Orchestrator, id: &str, status: &str) -> Resul
     }
 
     Ok(())
+}
+
+/// The `(project_key, issue_number)` of an issue's OPEN merge request, or `None`
+/// when it has no unresolved PR. Used to refuse an agent `status:"merged"` and
+/// point it at the real merge lever. Reads `orch.db.local`, where all
+/// `merge_requests` access lives.
+async fn open_merge_request_for_issue(
+    orch: &Orchestrator,
+    issue_id: &str,
+) -> Result<Option<(String, i32)>, String> {
+    let issue_id = issue_id.to_string();
+    orch.db
+        .local
+        .read(|conn| {
+            let issue_id = issue_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT p.key, i.number
+                         FROM merge_requests mr
+                         JOIN issues i ON mr.issue_id = i.id
+                         JOIN projects p ON i.project_id = p.id
+                         WHERE mr.issue_id = ?1
+                           AND mr.status NOT IN ('merged', 'closed')
+                         LIMIT 1",
+                        params![issue_id.as_str()],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some((row.text(0)?, row.i64(1)? as i32))),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to check for an open merge request: {e}"))
 }
 
 /// Stop every live agent run owned by an issue heading into a terminal state.

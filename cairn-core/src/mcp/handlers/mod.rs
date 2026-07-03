@@ -2,14 +2,13 @@
 //!
 //! Framework-agnostic handler logic. Both Tauri and cairn-server dispatch to these.
 
-pub mod bash;
 pub(crate) mod branch;
-pub mod bug_report; // retained: used by files.rs change dispatch
+pub mod bug_report;
+pub mod comments_artifacts;
 pub mod executions;
 pub mod fence;
 pub mod fetch_web;
 pub mod files;
-pub mod implementation;
 pub mod issue_resources;
 pub mod issues;
 pub mod mcp_resources;
@@ -19,13 +18,18 @@ pub mod permission;
 pub mod planning;
 pub mod read;
 pub mod resources;
+pub mod run;
 pub(crate) mod run_context;
 pub mod search;
+pub(crate) mod search_translate;
 pub mod search_web;
 pub mod skills_resources;
 pub mod slug;
+pub(crate) mod target;
+pub mod terminal;
 pub mod watch;
 pub mod web;
+pub mod write;
 
 /// Payload for `agent-attention` events.
 pub struct AttentionEvent<'a> {

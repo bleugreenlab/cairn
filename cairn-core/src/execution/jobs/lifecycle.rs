@@ -60,6 +60,7 @@ pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<V
 /// The job status must already be set to `"running"` by the caller before this is
 /// invoked (Tauri does this synchronously so the UI sees the change immediately).
 pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, String> {
+    log::info!("[prepare_job] resolving owner for job {job_id}");
     // Resolve the job's owning database ONCE (fail-closed) and thread it through
     // every run/session/turn/event write below: a team job's rows live wholly in
     // its synced replica, so prepare must read and write there, not the private DB.
@@ -147,6 +148,10 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             };
             (needs_wt, false, "standalone".to_string())
         };
+
+    log::info!(
+        "[prepare_job] job {job_id}: behavior needs_worktree={needs_worktree} inherits_worktree={inherits_worktree} step={step_name}"
+    );
 
     // ---- Worktree setup -------------------------------------------------
     // Create / inherit owner for the worktree lifecycle. The unit is the
@@ -295,6 +300,10 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             );
         }
 
+        log::info!(
+            "[prepare_job] job {job_id}: creating worktree {} from {base_ref} on branch {branch}",
+            wt_path.display()
+        );
         let setup_result = prepare_worktree_for_job(
             orch,
             &repo_path,
@@ -344,6 +353,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             }
         }
 
+        log::info!("[prepare_job] job {job_id}: worktree setup complete");
         let wt_path_str = wt_path.to_string_lossy().to_string();
         // The freshly created worktree's HEAD is the tip of its base branch.
         let base_commit = worktree_head_commit(orch, &wt_path);
@@ -402,6 +412,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     let project_path = Some(PathBuf::from(repo_path.clone()));
 
     let agent_config = load_agent_config(orch, &job, project_path.as_deref())?;
+    log::info!("[prepare_job] job {job_id}: loaded agent config");
 
     // ---- Create session + run record --------------------------------------
     let run_id = ids::mint_child(job_id);
@@ -410,12 +421,14 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 
     // Ensure a Session record exists for this job and derive the first-start mode.
     let had_current_session = job.current_session_id.is_some();
+    log::info!("[prepare_job] job {job_id}: preparing session");
     let (session_id, session_start, run_start_mode) = run_db(prepare_session(
         owning_db.clone(),
         job_id.to_string(),
         job.clone(),
         now,
     ))?;
+    log::info!("[prepare_job] job {job_id}: session {session_id} prepared");
     if !had_current_session {
         // `prepare_session` backfills jobs.current_session_id for older/sessionless
         // jobs. The returned `start_job` value and earlier worktree invalidations
@@ -435,6 +448,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         );
     }
 
+    log::info!("[prepare_job] job {job_id}: inserting run {run_id}");
     let existing_active_count = run_db(insert_run(
         owning_db.clone(),
         RunInsert {
@@ -452,6 +466,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
         },
     ))?;
 
+    log::info!("[prepare_job] job {job_id}: run {run_id} inserted");
     if existing_active_count > 0 {
         log::warn!(
             "[prepare_job] Job {} already has {} active runs",

@@ -291,7 +291,7 @@ async fn run_self_task_spawn(
         payloads.push(delegated_task_payload(task.clone()));
     }
     let group_id = uuid::Uuid::new_v4().to_string();
-    // cairn-cli forwards no tool-use id on the callback, so correlate the
+    // cairn-cmd forwards no tool-use id on the callback, so correlate the
     // originating `write` tool-use id from the run transcript (the same
     // approach the preview→apply path uses). This is the id the frontend
     // links child jobs by; without it the live task windows can't resolve.

@@ -6,11 +6,14 @@
 //! enriched `=== uri [suffix] ===` header and an always-valid continue footer.
 
 pub mod batch;
+pub mod file;
 pub mod view;
 
 use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
 
 pub use batch::handle_read_batch;
+pub use file::handle_read_file;
+pub(crate) use file::{produce_archived_file_segment, produce_file_segment};
 
 /// A producer outcome: a finished segment, or a fence suspension that must abort
 /// the whole batch so the permission flow can re-dispatch it once approved.

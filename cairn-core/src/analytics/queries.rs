@@ -26,9 +26,11 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 // answers every time query: day/week/month floor an already-hour-floored epoch
 // (exact, since an hour nests wholly inside its day/week/month), and the 24h
 // window reads the rollup directly (`bucket_expr(Hour)` on an hour-floored
-// column is the identity floor). `fold_token_rollup` keeps it fresh
-// incrementally, watermark-gated per run, mirroring the tool-invocation rollup
-// (migration 0067). The retained `*_live` event-scan queries further below are
+// column is the identity floor). The rollup is kept fresh on the live read path
+// by per-event `maintain_rollups_on_insert` (hooked into the event-insert
+// transaction); `fold_token_rollup` is the startup historical-backfill pass and
+// an idempotent safety net, not a per-read call. Both mirror the
+// tool-invocation rollup (migration 0067). The retained `*_live` event-scan queries further below are
 // the `#[cfg(test)]` oracle the rollup is proven equal to -- no longer a
 // production read path.
 
@@ -160,7 +162,10 @@ fn rollup_insert_sql() -> String {
 
 /// Incrementally fold new events into `token_rollup`, watermark-gated per run.
 ///
-/// Called at the top of every rollup-backed read query. `events` is append-only
+/// Called once from the startup historical backfill (`run_historical_backfill`),
+/// not on the read path: live read-path freshness comes from per-event
+/// `maintain_rollups_on_insert`, and this batch fold is the historical catch-up
+/// pass plus an idempotent safety net. `events` is append-only
 /// and immutable, so the fold is forward-only: a run with new relevant events is
 /// re-derived wholesale (delete-then-reinsert per run, idempotent), every other
 /// run is skipped by its watermark.

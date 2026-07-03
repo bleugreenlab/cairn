@@ -1,4 +1,4 @@
-//! Change-tool MCP handler.
+//! Write-verb MCP handler.
 
 pub(crate) mod file_mutations;
 pub(crate) mod host_edit;
@@ -369,8 +369,8 @@ async fn recover_stale_file_commit(
 }
 
 /// Handle canonical change tool call.
-pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
-    // Authoritative validation gate, shared with cairn-cli's pre-flight check so
+pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+    // Authoritative validation gate, shared with cairn-cmd's pre-flight check so
     // the contract and error text are identical everywhere. Collects every
     // blocking problem (structural shape, target/mode, and the commit_msg
     // requirement) in one pass before any typed deserialize or side effect.
@@ -472,16 +472,18 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
                             continue;
                         }
                         let Ok(normalized) =
-                            crate::mcp::git::normalize_change_target(&item.target, true)
+                            crate::mcp::file_targets::normalize_change_target(&item.target, true)
                         else {
                             continue; // invalid target — the apply path reports it
                         };
-                        let Ok(full) =
-                            crate::mcp::git::resolve_change_target(worktree, &normalized, true)
-                        else {
+                        let Ok(full) = crate::mcp::file_targets::resolve_change_target(
+                            worktree,
+                            &normalized,
+                            true,
+                        ) else {
                             continue;
                         };
-                        if !crate::mcp::git::path_escapes_worktree(worktree, &full) {
+                        if !crate::mcp::file_targets::path_escapes_worktree(worktree, &full) {
                             continue;
                         }
                         // Temp dirs + toolchain caches are in the sandbox
@@ -489,7 +491,7 @@ pub async fn handle_change(orch: &Orchestrator, request: &McpCallbackRequest) ->
                         // in-sandbox (parity with a shell write under `run`) and
                         // takes no prompt. Mark the escape so the apply path
                         // permits the absolute target, but don't raise the fence.
-                        if crate::mcp::git::path_within_any(
+                        if crate::mcp::file_targets::path_within_any(
                             &full,
                             &crate::services::sandbox::default_writable_extra(),
                         ) {

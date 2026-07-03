@@ -61,13 +61,36 @@ macro_rules! shared_tail_check_result_cache {
     };
 }
 
-macro_rules! shared_lineage {
+/// CAIRN-2281: re-key check_result_cache by each check's impact-scoped input hash
+/// (the content of just the files matching its globs) instead of the whole sealed
+/// tree, so a commit touching none of a check's inputs reuses its cached verdict.
+/// A project-scoped SHARED table change, so it is written once here and appended
+/// after 0089 in each lineage.
+macro_rules! shared_tail_check_result_input_hash {
+    () => {
+        Migration::new(
+            "0090",
+            "check_result_cache_input_hash",
+            include_str!("../../../../turso_migrations/0090_check_result_cache_input_hash.sql"),
+        )
+    };
+}
+
+macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
             $($head,)*
             shared_tail!(),
             shared_tail_token_rollup_hourly!(),
             shared_tail_check_result_cache!(),
+            shared_tail_check_result_input_hash!(),
+            // ── TEAM_TAIL ───────────────────────────────────────────────────
+            // Intentionally empty for now. CAIRN-2277's team-side removal of
+            // `projects.server_id` lives in the team snapshot instead of a
+            // post-snapshot rebuild: destructive create-copy-drop-rename rebuilds
+            // on synced replica tables break Turso sync triggers. The unfenced
+            // `turso_sync_roundtrip` lane failed 8/15 tests when this was modeled
+            // as `0003_drop_projects_server_id`, so do not re-add that tail entry.
         ]
     };
 }
@@ -112,6 +135,19 @@ macro_rules! private_lineage {
                 include_str!("../../../../turso_migrations/0088_reopen_analytics_backfill.sql"),
             ),
             shared_tail_check_result_cache!(),
+            shared_tail_check_result_input_hash!(),
+            // CAIRN-2277: drop the dead `projects.server_id` column, its FK to the
+            // local `servers` table, and then that now-orphaned `servers` table. A
+            // rebuild_fk_off because many tables FK-reference `projects(id)` and
+            // `projects` itself referenced `servers`. Private-only: the team
+            // snapshot schema never carries the local `servers` column/table.
+            Migration::rebuild_fk_off(
+                "0091",
+                "drop_projects_server_id_and_servers",
+                include_str!(
+                    "../../../../turso_migrations/0091_drop_projects_server_id_and_servers.sql"
+                ),
+            ),
         ]
     };
 }
@@ -554,12 +590,15 @@ pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
 ///
 /// `TEAM_HEAD` is a single snapshot migration (`turso_migrations_team/0001`) of
 /// the FINAL schema of every project-scoped table, re-anchored from `workspaces`
-/// to a `teams` root. It composes the same (currently empty) `SHARED_TAIL` as the
-/// private lineage, so a future shared-table change written once in
-/// `shared_lineage!` reaches both. The `team_schema_matches_private` test proves
-/// the two lineages stay byte-equivalent (after whitespace normalization) for
-/// every shared table except the four intentional re-rootings.
-pub const TEAM_MIGRATIONS: &[Migration] = shared_lineage![
+/// to a `teams` root. It composes the same `SHARED_TAIL` as the private lineage,
+/// so a future shared-table change written once in a `shared_tail*!` macro reaches
+/// both. Beyond the shared tail it carries its own `TEAM_TAIL` — team-only
+/// migrations with no private counterpart, the mirror of `private_lineage!`'s
+/// PRIVATE_TAIL — hence the dedicated `team_lineage!` composer. The
+/// `team_schema_matches_private` test proves the two lineages stay byte-equivalent
+/// (after whitespace normalization) for every shared table except the four
+/// intentional re-rootings.
+pub const TEAM_MIGRATIONS: &[Migration] = team_lineage![
     Migration::new(
         "0001",
         "team_initial_schema",
@@ -614,7 +653,7 @@ pub enum ScopeTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrivateReason {
     /// Identity and credentials (account, device, GitHub app/installations,
-    /// webhook staging, server registry).
+    /// webhook staging).
     IdentityCredential,
     /// A structural root or the router itself (the private `workspaces` lineage
     /// root, the `project_routes` catalog).
@@ -752,10 +791,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "github_installations",
-        TableScope::Private(PrivateReason::IdentityCredential),
-    ),
-    (
-        "servers",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
     (
@@ -1194,7 +1229,9 @@ mod tests {
                 "0085_project_routes_local_path".to_string(),
                 "0086_analytics_rollup_backfill_state".to_string(),
                 "0088_reopen_analytics_backfill".to_string(),
-                "0089_check_result_cache".to_string()
+                "0089_check_result_cache".to_string(),
+                "0090_check_result_cache_input_hash".to_string(),
+                "0091_drop_projects_server_id_and_servers".to_string()
             ]
         );
         Ok(db)
@@ -1280,6 +1317,80 @@ mod tests {
             })
         })
         .await
+    }
+
+    /// CAIRN-2277: the FK-off rebuild that drops `projects.server_id` and the
+    /// local `servers` table must preserve every existing project and its FK
+    /// children (an orphaned child would mean the rebuild broke referential
+    /// carry-over). Seeds the pre-drop schema, then runs the full lineage.
+    #[tokio::test]
+    async fn drop_server_id_preserves_project_data() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("survival.turso.db"))
+            .await
+            .unwrap();
+
+        // Apply every private migration EXCEPT the final 0090 drop (last in array
+        // order), so the seed sees the pre-drop schema with `projects.server_id`
+        // and the `servers` table still present.
+        let head = &TURSO_MIGRATIONS[..TURSO_MIGRATIONS.len() - 1];
+        MigrationRunner::new(head.to_vec()).run(&db).await.unwrap();
+
+        // A server, a workspace, a project referencing that server, and a child
+        // issue. FK enforcement is ON here, so the server row must exist first.
+        db.execute_batch(
+            "INSERT INTO servers (id, name, url, created_at, updated_at)
+                 VALUES ('srv1', 's', 'u', 0, 0);
+             INSERT INTO workspaces (id, name, created_at, updated_at)
+                 VALUES ('ws1', 'w', 0, 0);
+             INSERT INTO projects
+                 (id, workspace_id, name, key, repo_path, server_id, created_at, updated_at)
+                 VALUES ('proj1', 'ws1', 'p', 'P', '/tmp/p', 'srv1', 0, 0);
+             INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+                 VALUES ('iss1', 'proj1', 1, 't', 0, 0);",
+        )
+        .await
+        .unwrap();
+
+        // Apply the full lineage, which now includes the 0090 FK-off rebuild.
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        // The project and its child issue survive the rebuild intact.
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM projects WHERE id = 'proj1'")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM issues WHERE id = 'iss1'")
+                .await
+                .unwrap(),
+            1
+        );
+        // The dead column is gone from the rebuilt table.
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'server_id'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        // The dead local `servers` table is dropped.
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'servers'"
+            )
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -2360,7 +2471,8 @@ mod tests {
                 // CAIRN-2270: the token_rollup hour re-grain is a shared-table
                 // change, so it lands in the team lineage too.
                 "0087_token_rollup_hourly".to_string(),
-                "0089_check_result_cache".to_string()
+                "0089_check_result_cache".to_string(),
+                "0090_check_result_cache_input_hash".to_string()
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.
@@ -2422,8 +2534,7 @@ mod tests {
             let expected = match table {
                 "projects" => p
                     .replace("workspace_id", "team_id")
-                    .replace("REFERENCES workspaces(id)", "REFERENCES teams(id)")
-                    .replace(", FOREIGN KEY(server_id) REFERENCES servers(id)", ""),
+                    .replace("REFERENCES workspaces(id)", "REFERENCES teams(id)"),
                 "action_configs" | "skill_configs" => p
                     .replace(
                         "workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE, ",

@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use cairn_core::internal::dispatch::dispatch_tool;
-use cairn_core::internal::mcp::handlers::files::handle_change;
 use cairn_core::internal::mcp::handlers::issue_resources::handle_read_issue_resource;
 use cairn_core::internal::mcp::handlers::messages::append_direct_message;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
@@ -619,7 +619,7 @@ async fn node_messages_append_routes_like_bare_node() {
         tool_use_id: None,
     };
 
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     assert!(
         result.contains("builder")
             && !result.to_lowercase().contains("invalid")

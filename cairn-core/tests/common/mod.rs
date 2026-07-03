@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::jj::{self, JjEnv};
-use cairn_core::internal::mcp::handlers::files::handle_change;
 use cairn_core::internal::mcp::handlers::issue_resources::handle_read_issue_resource;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
@@ -98,7 +98,7 @@ pub async fn change_resource(orch: &Orchestrator, changes: Value) -> String {
         payload: json!({ "changes": changes }),
         tool_use_id: None,
     };
-    handle_change(orch, &request).await
+    handle_write(orch, &request).await
 }
 
 pub async fn test_orchestrator() -> (tempfile::TempDir, Orchestrator) {

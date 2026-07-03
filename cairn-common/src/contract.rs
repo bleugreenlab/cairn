@@ -448,6 +448,11 @@ const FIELD: KeySpec = KeySpec::new(
     "top-level string artifact field to edit; defaults to content then body",
 );
 const COMMAND: KeySpec = KeySpec::new("command", KeyType::Str, "");
+const WAKE: KeySpec = KeySpec::new(
+    "wake",
+    KeyType::Str,
+    "\"exit\" to resume when the command finishes, or a literal output phrase to resume when it prints (also fires on exit)",
+);
 const BROWSER_URL: KeySpec = KeySpec::with_aliases(
     "url",
     &["navigate"],
@@ -1311,9 +1316,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[COMMAND],
-                optional: &[DESCRIPTION],
+                optional: &[DESCRIPTION, WAKE],
                 label: "start terminal",
-                example: "write({changes:[{target:\"cairn://p/PROJECT/terminal/SLUG\",mode:\"create\",payload:{command:\"...\"}}]})",
+                example: "write({changes:[{target:\"cairn://p/PROJECT/terminal/SLUG\",mode:\"create\",payload:{command:\"...\",wake:\"exit\"}}]})",
             },
             MutationSpec {
                 mode: ChangeMode::Append,
@@ -1408,7 +1413,11 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
                         KeyType::Array,
                         "full replacement label refs by name or slug",
                     ),
-                    KeySpec::new("status", KeyType::Str, "resolution: merged | closed"),
+                    KeySpec::new(
+                        "status",
+                        KeyType::Str,
+                        "record a resolution (merged | closed); to MERGE a PR, patch its create-pr artifact with action:\"merge\" instead — status:merged with an open PR is refused",
+                    ),
                     KeySpec::new(
                         "parent",
                         KeyType::Str,
@@ -1747,9 +1756,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[COMMAND],
-                optional: &[DESCRIPTION],
+                optional: &[DESCRIPTION, WAKE],
                 label: "start terminal",
-                example: "write({changes:[{target:\"cairn:~/terminal/SLUG\",mode:\"create\",payload:{command:\"...\"}}]})",
+                example: "write({changes:[{target:\"cairn:~/terminal/SLUG\",mode:\"create\",payload:{command:\"...\",wake:\"ready\"}}]})",
             },
             MutationSpec {
                 mode: ChangeMode::Append,
@@ -1830,9 +1839,9 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
             MutationSpec {
                 mode: ChangeMode::Create,
                 required: &[COMMAND],
-                optional: &[DESCRIPTION],
+                optional: &[DESCRIPTION, WAKE],
                 label: "start terminal",
-                example: "write({changes:[{target:\"cairn:~/terminal/SLUG\",mode:\"create\",payload:{command:\"...\"}}]})",
+                example: "write({changes:[{target:\"cairn:~/terminal/SLUG\",mode:\"create\",payload:{command:\"...\",wake:\"exit\"}}]})",
             },
             MutationSpec {
                 mode: ChangeMode::Append,

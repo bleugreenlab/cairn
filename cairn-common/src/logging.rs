@@ -18,16 +18,18 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 #[derive(Debug, Clone, Copy)]
 pub enum ProcessTag {
     App,
-    Mcp,
+    Cmd,
     Server,
+    Runner,
 }
 
 impl ProcessTag {
     fn prefix(self) -> &'static str {
         match self {
             ProcessTag::App => "cairn-app",
-            ProcessTag::Mcp => "cairn-mcp",
+            ProcessTag::Cmd => "cairn-cmd",
             ProcessTag::Server => "cairn-server",
+            ProcessTag::Runner => "cairn-runner",
         }
     }
 }
@@ -71,7 +73,7 @@ impl LogLevel {
             LogLevel::Quiet => "warn,profiler=off",
             LogLevel::Standard => "info,profiler=off",
             LogLevel::Verbose => {
-                "info,cairn_lib=debug,cairn_core=debug,cairn_cli=debug,profiler=info"
+                "info,cairn_lib=debug,cairn_core=debug,cairn_cmd=debug,profiler=info"
             }
         }
     }
@@ -227,7 +229,7 @@ mod tests {
         assert_eq!(LogLevel::Standard.directives(), "info,profiler=off");
         assert_eq!(
             LogLevel::Verbose.directives(),
-            "info,cairn_lib=debug,cairn_core=debug,cairn_cli=debug,profiler=info"
+            "info,cairn_lib=debug,cairn_core=debug,cairn_cmd=debug,profiler=info"
         );
     }
 

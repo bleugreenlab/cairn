@@ -5,10 +5,11 @@
 //! auto-rebased onto the new tip over the shared jj store. Each rebased sibling
 //! is then told its branch moved, split by outcome:
 //!
-//! - A sibling whose rebase recorded a **conflict** gets a **turn-interrupting**
-//!   `Interrupt` system direct (naming the conflicting files) so the agent stops
-//!   what it is doing and resolves the markers and re-seals — a conflicted commit
-//!   can neither push nor merge, so this is stop-the-line, not a convenience note.
+//! - A sibling whose rebase recorded a **conflict** gets a **Steer** system direct
+//!   (naming the conflicting files) so an idle agent wakes and an active agent sees
+//!   it at the next tool boundary without having its current tool call cancelled.
+//!   A conflicted commit can neither push nor merge, so this is stop-the-line work,
+//!   but it should steer the agent rather than interrupt the active turn.
 //! - A sibling that rebased **cleanly** gets a **passive** (non-waking) note that
 //!   rides along into its next natural run — its work moved underneath it but
 //!   there is nothing to resolve, so it is never mechanically resumed.
@@ -502,8 +503,9 @@ async fn reconcile_base_advance(
         })
         .collect();
 
-    // Conflicted siblings: a conflicted commit can never push, so an idle sibling
-    // is woken (via a `Steer` direct) to resolve the markers and re-seal.
+    // Conflicted siblings: a conflicted commit can never push, so the sibling
+    // is steered to resolve the markers and re-seal. Idle recipients wake;
+    // active recipients receive it at the next tool boundary without cancellation.
     let conflicted_rewritten = siblings_rewritten(&report.conflicted, &before, &after);
     if conflicted_rewritten.is_empty() {
         log::debug!("jj reconcile ({label}): conflicts unchanged since a prior reconcile; no redundant wake");
@@ -580,8 +582,8 @@ fn sibling_branch(sibling: &SiblingJob) -> Option<String> {
 /// only resolves the materialized conflict markers in its workspace, then lets it
 /// re-seal/push. A recorded conflict is STOP-THE-LINE: jj refuses to push or merge
 /// a conflicted commit, so this branch is wedged until it is resolved. Delivered
-/// via a turn-interrupting `Interrupt` system direct (see
-/// `notify_conflicted_siblings`).
+/// via a `Steer` system direct that wakes idle agents and lands at the next tool
+/// boundary without stopping an active turn (see `notify_conflicted_siblings`).
 fn build_jj_conflict_note(
     base_branch: &str,
     pr_number: Option<i64>,
@@ -759,7 +761,7 @@ async fn advance_on_branch_workspaces(
             }
             Ok(true) => {
                 log::warn!(
-                    "on-branch advance of {} recorded a conflict; interrupting it",
+                    "on-branch advance of {} recorded a conflict; steering it",
                     workspace.worktree_path
                 );
                 if let Some(run_id) = latest_run_for_job(db, &workspace.id) {
@@ -768,10 +770,10 @@ async fn advance_on_branch_workspaces(
                         crate::jj::conflicted_files(&jj, Path::new(&workspace.worktree_path));
                     let message = append_conflicting_files(&note, Some(&files));
                     if let Err(error) =
-                        queue_system_direct(orch, &run_id, &message, DeliveryUrgency::Interrupt)
+                        queue_system_direct(orch, &run_id, &message, DeliveryUrgency::Steer)
                     {
                         log::warn!(
-                            "on-branch advance: failed to interrupt {}: {error}",
+                            "on-branch advance: failed to steer {}: {error}",
                             workspace.id
                         );
                     }
@@ -790,7 +792,8 @@ async fn advance_on_branch_workspaces(
 /// carries no rebase commands — the advance already happened over the shared
 /// store; the agent only resolves the materialized markers in its workspace. A
 /// recorded conflict is STOP-THE-LINE (jj refuses to push or merge it), delivered
-/// via a turn-interrupting `Interrupt`.
+/// via a `Steer` system direct that wakes idle agents and lands at the next tool
+/// boundary without stopping an active turn.
 fn build_on_branch_advance_conflict_note(branch: &str) -> String {
     format!(
         "⛔ BLOCKING [Base branch update] Your branch `{branch}` advanced — a child merged into it. Your workspace was advanced onto the new tip over the shared store and the re-parent recorded a conflict. This branch cannot push or merge until you resolve it — jj refuses to push a conflicted commit. Resolve the conflict markers in your workspace now, verify build + tests, and re-seal before continuing other work."
@@ -839,11 +842,12 @@ fn append_conflicting_files(note: &str, files: Option<&Vec<String>>) -> String {
     }
 }
 
-/// Interrupt every sibling whose auto-rebase recorded a conflict: a conflicted
+/// Steer every sibling whose auto-rebase recorded a conflict: a conflicted
 /// sibling's PR can never advance (jj refuses to push a conflicted commit), so the
 /// branch is wedged until the agent resolves the materialized markers and
-/// re-seals. `queue_system_direct` enqueues an `Interrupt` delivery — it wakes an
-/// idle recipient and stops an active one's turn, the stop-the-line semantic.
+/// re-seals. `queue_system_direct` enqueues a `Steer` delivery — it wakes an idle
+/// recipient and lands at an active recipient's next tool boundary without
+/// cancelling the tool call in progress.
 /// `files_by_branch` supplies the conflicting file paths per branch, appended to
 /// the note so the agent knows exactly where to look. Cleanly-rebased siblings
 /// are not in `conflicted`; they receive a passive note via `notify_clean_siblings`.
@@ -864,15 +868,15 @@ fn notify_conflicted_siblings(
         }
         let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
             log::debug!(
-                "jj reconcile: no run for conflicted sibling {} to interrupt",
+                "jj reconcile: no run for conflicted sibling {} to steer",
                 sibling.id
             );
             continue;
         };
         let message = append_conflicting_files(note, files_by_branch.get(&branch));
-        queue_system_direct(orch, &run_id, &message, DeliveryUrgency::Interrupt)?;
+        queue_system_direct(orch, &run_id, &message, DeliveryUrgency::Steer)?;
         log::info!(
-            "Interrupted jj sibling job {} to resolve a recorded conflict",
+            "Steered jj sibling job {} to resolve a recorded conflict",
             sibling.id
         );
     }
@@ -1909,7 +1913,8 @@ mod tests {
             messages[0].1
         );
 
-        // The push is a turn-interrupting `interrupt` (stop-the-line), distinct
+        // The push is waking but non-interrupting: it steers the agent at the next
+        // boundary instead of cancelling an active tool call, and remains distinct
         // from the `passive` clean-rebase note asserted in
         // `notify_clean_siblings_passively`.
         let wake: String = orch
@@ -1933,8 +1938,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            wake, "interrupt",
-            "a base-advance conflict interrupts the agent — stop-the-line, not a convenience note"
+            wake, "wake",
+            "a base-advance conflict wakes or steers the agent without cancelling the active turn"
         );
     }
 
@@ -1993,7 +1998,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(wake, "interrupt");
+        assert_eq!(
+            wake, "wake",
+            "team base-advance conflicts steer without interrupting active turns"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

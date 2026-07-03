@@ -111,8 +111,7 @@ async fn produce_segment(
             limit: None,
             issue_history: None,
         };
-        return crate::mcp::handlers::files::produce_file_segment(orch, request, &file_payload)
-            .await;
+        return super::produce_file_segment(orch, request, &file_payload).await;
     }
     // Bare worktree-relative fallback (CAIRN-2030, bug #107): a scheme-less
     // target is read as a `file:` target when — with its `?query` split off — it
@@ -128,8 +127,7 @@ async fn produce_segment(
             limit: None,
             issue_history: None,
         };
-        return crate::mcp::handlers::files::produce_file_segment(orch, request, &file_payload)
-            .await;
+        return super::produce_file_segment(orch, request, &file_payload).await;
     }
     Produced::Segment(error_segment(
         target,
@@ -157,7 +155,8 @@ fn bare_worktree_file_target(cwd: &str, target: &str) -> Option<String> {
     }
     let worktree = std::path::Path::new(cwd);
     let candidate = worktree.join(&identity);
-    if candidate.exists() && !crate::mcp::git::path_escapes_worktree(worktree, &candidate) {
+    if candidate.exists() && !crate::mcp::file_targets::path_escapes_worktree(worktree, &candidate)
+    {
         Some(format!("file:{target}"))
     } else {
         None
@@ -311,7 +310,7 @@ async fn produce_resource_segment(
     let rendered = crate::resources::produce_cairn_resource(orch, request, target).await;
     let affordance = rendered.affordance;
     // Image blocks (e.g. a browser screenshot) ride alongside the text body into
-    // the segment; `assemble` lifts them into the envelope and cairn-cli emits
+    // the segment; `assemble` lifts them into the envelope and cairn-cmd emits
     // each as an MCP image content block.
     let images = rendered.images;
 

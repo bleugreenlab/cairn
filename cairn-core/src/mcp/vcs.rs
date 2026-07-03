@@ -100,9 +100,84 @@ impl JjBackend {
     /// Push the workspace's bookmark to origin after a seal so each `commit_msg`
     /// seal lands on origin. The branch comes from the workspace's marker;
     /// best-effort, so a local or remoteless jj project never fails a seal.
+    ///
+    /// Before the push, opportunistically HEAL a clean-tip / conflicted-
+    /// intermediate branch (see [`Self::heal_conflicted_intermediates`]) so a
+    /// coordinator's resolve-and-reseal immediately restores a pushable, mergeable
+    /// branch instead of a silently-failing push whose origin head goes stale until
+    /// the next base advance.
     fn push_after_seal(&self, worktree: &Path) {
-        if let Some(branch) = crate::jj::read_branch_marker(worktree) {
-            crate::jj::push_to_origin(&self.jj, worktree, &branch);
+        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
+            return;
+        };
+        self.heal_conflicted_intermediates(worktree, &branch);
+        crate::jj::push_to_origin(&self.jj, worktree, &branch);
+    }
+
+    /// After a successful seal, collapse a clean-tip / conflicted-intermediate
+    /// branch to one clean commit on its base so it is immediately pushable and
+    /// mergeable. This closes the between-advances gap that re-wedges an
+    /// integration branch: when a base advance bakes conflicts into a branch's
+    /// intermediate commits and the agent resolves the markers at the TIP and
+    /// re-seals, resealing `@` cannot clear the conflicted ancestors, so
+    /// [`crate::jj::push_to_origin`] silently refuses (jj won't push a conflicted
+    /// history) and origin's head goes stale until the next reconcile flatten
+    /// fires. Running the same guarded flatten the reconcile path uses, here at
+    /// reseal time, makes the resolve-and-reseal self-healing.
+    ///
+    /// Every step is BEST-EFFORT with logs — a heal failure must never fail a good
+    /// seal. A `TipConflicted` branch is left untouched (the agent must resolve the
+    /// markers; a flatten preserves the tip tree and cannot clear it). The jj ops
+    /// run with the worktree as cwd: it is a workspace over the shared store, and
+    /// every op is `--ignore-working-copy` and addresses commits by id/revset, so
+    /// they mutate the shared graph exactly as the reconcile path's store-cwd ops
+    /// do. `advance_workspace_onto` then re-parents this workspace's `@` onto the
+    /// flattened commit (via `update-stale`).
+    fn heal_conflicted_intermediates(&self, worktree: &Path, branch: &str) {
+        let Some((base_branch, _base_rev)) = crate::jj::read_base_marker(worktree) else {
+            return;
+        };
+        let Some(base_commit) = crate::jj::bookmark_commit(&self.jj, worktree, &base_branch) else {
+            return;
+        };
+        // Only a clean tip over conflicted intermediates is flatten-recoverable.
+        // Clean (nothing to do), TipConflicted (agent must resolve), and a probe
+        // error all fall through untouched.
+        if !matches!(
+            crate::jj::flatten_state(&self.jj, worktree, &base_commit, branch),
+            Ok(crate::jj::FlattenState::IntermediateOnly)
+        ) {
+            return;
+        }
+        let desc = crate::jj::branch_description(&self.jj, worktree, branch);
+        let message = if desc.is_empty() {
+            format!("Flatten {branch} onto base (auto-recovery)")
+        } else {
+            desc
+        };
+        match crate::jj::flatten_branch_recovery(&self.jj, worktree, branch, &base_commit, &message)
+        {
+            Ok(recovered) => {
+                if let Err(e) = crate::jj::advance_workspace_onto(
+                    &self.jj,
+                    worktree,
+                    worktree,
+                    branch,
+                    &recovered.flattened_commit,
+                ) {
+                    log::warn!(
+                        "reseal heal: re-parent workspace {branch} onto flattened tip failed: {e}"
+                    );
+                }
+                log::info!(
+                    "reseal heal: flattened {branch} ({} conflicted intermediate(s) collapsed, {} rider(s) re-pointed)",
+                    recovered.collapsed_conflicted_commits,
+                    recovered.repointed_bookmarks.len(),
+                );
+            }
+            Err(e) => log::warn!(
+                "reseal heal: flatten of {branch} refused ({e}); leaving branch for the reconcile/merge-time recovery"
+            ),
         }
     }
 }
@@ -1112,6 +1187,185 @@ mod tests {
                 .await
                 .is_none(),
             "a non-worktree cwd must not resolve a store lock"
+        );
+    }
+
+    // ---- Component D: reseal-time opportunistic heal in push_after_seal ----
+
+    /// Run a jj command directly with the managed config, asserting success
+    /// (`JjEnv::run` is private to the jj module, so vcs tests shell out).
+    fn jj_raw(bin: &str, cfg: &Path, cwd: &Path, args: &[&str]) {
+        let out = crate::env::command(bin)
+            .args(args)
+            .current_dir(cwd)
+            .env("JJ_CONFIG", cfg)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "jj {args:?} failed");
+    }
+
+    /// Count the commits a range revset resolves to, shelling `jj log` directly
+    /// with the managed config (`JjEnv::run` is private to the jj module).
+    fn count_commits(bin: &str, cfg: &Path, cwd: &Path, range: &str) -> usize {
+        let out = crate::env::command(bin)
+            .args([
+                "log",
+                "-r",
+                range,
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+                "--ignore-working-copy",
+            ])
+            .current_dir(cwd)
+            .env("JJ_CONFIG", cfg)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "jj log range failed");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    /// A resolve-and-reseal that leaves a CLEAN tip over conflicted INTERMEDIATE
+    /// commits is healed at reseal time: `push_after_seal` flattens the branch to
+    /// one clean commit on its base, re-parents `@`, and pushes it to origin — so a
+    /// coordinator's resolution immediately restores a pushable, mergeable branch
+    /// instead of a silently-failing push whose origin head goes stale.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn reseal_heals_conflicted_intermediates_and_pushes() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping reseal_heals_conflicted_intermediates_and_pushes: jj not resolvable"
+            );
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let origin = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        init_project(proj.path());
+        git(
+            proj.path(),
+            &["remote", "add", "origin", &origin.path().to_string_lossy()],
+        );
+        git(proj.path(), &["push", "-q", "origin", "main"]);
+        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let int = "agent/CAIRN-2288-coordinator-0";
+        crate::jj::add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None)
+            .unwrap();
+        crate::jj::ensure_bookmark_on_origin(&jj, &store, int).unwrap();
+
+        let builder = "agent/CAIRN-1-builder-0";
+        let ws = wts.path().join("builder");
+        crate::jj::add_workspace(&jj, &store, &ws, builder, int, None).unwrap();
+        std::fs::write(ws.join("shared.rs"), "builder-edit\n").unwrap();
+        crate::jj::seal(&jj, &ws, "builder edits shared", None).unwrap();
+        crate::jj::ensure_bookmark_on_origin(&jj, &store, builder).unwrap();
+        let origin_before = git_stdout(origin.path(), &["rev-parse", builder]);
+
+        // The integration tip advances conflictingly; the builder rebases onto it
+        // (recording a conflict on its INTERMEDIATE commit) and resolves at its tip.
+        let cfg = home.path().join("jj").join("config.toml");
+        jj_raw(&bin, &cfg, &store, &["new", int]);
+        std::fs::write(store.join("shared.rs"), "integration-advanced\n").unwrap();
+        jj_raw(&bin, &cfg, &store, &["describe", "-m", "int advances"]);
+        jj_raw(
+            &bin,
+            &cfg,
+            &store,
+            &["bookmark", "set", int, "-r", "@", "--ignore-working-copy"],
+        );
+        crate::jj::rebase_branch_onto(&jj, &store, builder, int).unwrap();
+        assert!(crate::jj::branch_has_conflict(&jj, &store, builder).unwrap());
+        crate::jj::update_stale(&jj, &ws).unwrap();
+        std::fs::write(ws.join("shared.rs"), "resolved\n").unwrap();
+        crate::jj::seal(&jj, &ws, "resolve conflict", None).unwrap();
+        assert!(!crate::jj::branch_has_conflict(&jj, &store, builder).unwrap());
+
+        // Record the base marker (the integration branch) so the heal can find its
+        // flatten dest, and confirm the pre-heal shape.
+        let int_tip = crate::jj::bookmark_commit(&jj, &store, int).unwrap();
+        crate::jj::write_base_marker(&ws, int, &int_tip).unwrap();
+        assert_eq!(
+            crate::jj::flatten_state(&jj, &store, &int_tip, builder).unwrap(),
+            crate::jj::FlattenState::IntermediateOnly
+        );
+        // Before the heal, jj refuses to push the conflicted-ancestor branch.
+        assert!(
+            crate::jj::push_store_bookmark(&jj, &store, builder).is_err(),
+            "the wedged branch is unpushable before the heal"
+        );
+
+        // The reseal heal flattens, re-parents `@`, and pushes.
+        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
+        backend.push_after_seal(&ws);
+
+        assert!(!crate::jj::branch_has_conflict(&jj, &store, builder).unwrap());
+        let range = format!("{int_tip}..bookmarks(exact:{builder:?})");
+        assert_eq!(
+            count_commits(&bin, &cfg, &ws, &range),
+            1,
+            "the branch is flattened to one commit on its base"
+        );
+        assert!(
+            crate::jj::conflicted_commits(&jj, &ws, &range).is_empty(),
+            "no conflicted commit survives the reseal heal"
+        );
+        let origin_after = git_stdout(origin.path(), &["rev-parse", builder]);
+        assert_ne!(
+            origin_before, origin_after,
+            "the healed branch's head advanced on origin"
+        );
+    }
+
+    /// A clean reseal takes NO extra rewrite: with no conflicted intermediate, the
+    /// heal is a no-op and the branch tip is unchanged (only the ordinary push
+    /// runs).
+    #[test]
+    #[serial_test::serial(jj)]
+    fn clean_reseal_takes_no_extra_rewrite() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping clean_reseal_takes_no_extra_rewrite: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = crate::jj::JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let int = "agent/CAIRN-2288-coordinator-0";
+        crate::jj::add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None)
+            .unwrap();
+        let builder = "agent/CAIRN-1-builder-0";
+        let ws = wts.path().join("builder");
+        crate::jj::add_workspace(&jj, &store, &ws, builder, int, None).unwrap();
+        std::fs::write(ws.join("clean.rs"), "clean\n").unwrap();
+        crate::jj::seal(&jj, &ws, "clean builder work", None).unwrap();
+
+        let int_tip = crate::jj::bookmark_commit(&jj, &store, int).unwrap();
+        crate::jj::write_base_marker(&ws, int, &int_tip).unwrap();
+        assert_eq!(
+            crate::jj::flatten_state(&jj, &store, &int_tip, builder).unwrap(),
+            crate::jj::FlattenState::Clean
+        );
+
+        let tip_before = crate::jj::bookmark_commit(&jj, &store, builder).unwrap();
+        let backend = JjBackend::new(crate::jj::JjEnv::resolve(&bin, home.path()));
+        backend.push_after_seal(&ws);
+        let tip_after = crate::jj::bookmark_commit(&jj, &store, builder).unwrap();
+        assert_eq!(
+            tip_before, tip_after,
+            "a clean seal is not rewritten by the reseal heal"
         );
     }
 }

@@ -1343,7 +1343,7 @@ pub fn start_agent_session(
     log::info!("[PROFILE] start_agent_session begin");
 
     // Ensure MCP config file exists and get its path. The output schema is no
-    // longer plumbed to cairn-cli — agents write their artifact via `write`
+    // longer plumbed to cairn-cmd — agents write their artifact via `write`
     // (validated server-side), and the schema is surfaced in the prompt.
     log::debug!("start_agent_session: ensuring MCP config");
 

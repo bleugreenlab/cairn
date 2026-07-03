@@ -290,7 +290,7 @@ pub fn render_targets(targets: &[(&str, &[u8])]) -> String {
     let segments: Vec<cairn_common::read::ReadSegment> = targets
         .iter()
         .map(|(target, bytes)| {
-            crate::mcp::handlers::files::produce_archived_file_segment(target, bytes)
+            crate::mcp::handlers::read::produce_archived_file_segment(target, bytes)
                 .expect("produce archived file segment")
         })
         .collect();
@@ -315,7 +315,7 @@ pub fn mixed_render_targets(sections: &[MixedSection]) -> String {
         .iter()
         .map(|section| match section {
             MixedSection::File(target, bytes) => {
-                crate::mcp::handlers::files::produce_archived_file_segment(target, bytes)
+                crate::mcp::handlers::read::produce_archived_file_segment(target, bytes)
                     .expect("produce archived file segment")
             }
             MixedSection::Resource(uri, body) => ReadSegment::text(

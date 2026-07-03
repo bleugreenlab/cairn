@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::jj::{self, JjEnv};
-use cairn_core::internal::mcp::handlers::files::handle_change;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
@@ -63,7 +63,7 @@ async fn change_report(
     cwd: &str,
     payload: serde_json::Value,
 ) -> serde_json::Value {
-    parse_report(&handle_change(orch, &make_request(cwd, payload)).await)
+    parse_report(&handle_write(orch, &make_request(cwd, payload)).await)
 }
 
 struct ChangeTestRepo {
@@ -142,7 +142,7 @@ impl ChangeTestRepo {
     }
 
     async fn preview_report(&self, payload: serde_json::Value) -> serde_json::Value {
-        parse_report(&handle_change(&self.orch, &make_preview_request(self.cwd(), payload)).await)
+        parse_report(&handle_write(&self.orch, &make_preview_request(self.cwd(), payload)).await)
     }
 }
 
@@ -570,7 +570,7 @@ async fn change_unified_patch_requires_commit_msg_for_file_targets() {
         }),
     );
 
-    let report = parse_report(&handle_change(&orch, &request).await);
+    let report = parse_report(&handle_write(&orch, &request).await);
 
     assert_eq!(failure_count(&report), 1, "{report:?}");
     assert!(report["failures"][0]["error"]
@@ -633,7 +633,7 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
         }),
     );
 
-    let report = parse_report(&handle_change(&repo.orch, &request).await);
+    let report = parse_report(&handle_write(&repo.orch, &request).await);
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 2);
     assert_eq!(failure_count(&report), 0, "{report:?}");
@@ -857,7 +857,7 @@ async fn node_memory_append_uses_target_node_and_scope_owner() {
         }),
     );
 
-    let report = parse_report(&handle_change(&orch, &request).await);
+    let report = parse_report(&handle_write(&orch, &request).await);
     assert_successful_change(&report, 1);
     let summary = report["applied"][0]["summary"].as_str().unwrap();
     assert!(
@@ -899,7 +899,7 @@ async fn change_default_non_atomic_resource_batch_continues_after_failure() {
         }),
     );
 
-    let report = parse_report(&handle_change(&orch, &request).await);
+    let report = parse_report(&handle_write(&orch, &request).await);
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 1);
     assert_eq!(report["applied"][0]["index"], 1);
@@ -929,7 +929,7 @@ async fn change_default_non_atomic_failures_are_reported_with_blocking_appends()
         }),
     );
 
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     let report = parse_report(result.split("\n\n").next().unwrap());
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 0);
@@ -957,7 +957,7 @@ async fn change_rejects_file_target_without_commit_msg() {
         }),
     );
 
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
     assert_eq!(failure_count(&report), 1, "{report:?}");
@@ -986,7 +986,7 @@ async fn change_allows_resource_only_batch_without_commit_msg() {
         }),
     );
 
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
     assert_eq!(failure_count(&report), 0, "{report:?}");
@@ -1040,7 +1040,7 @@ async fn change_creates_issue_resource_without_nested_runtime_panic() {
         }),
     );
 
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 1);
@@ -1076,7 +1076,7 @@ async fn change_appends_issue_comment_without_nested_runtime_panic() {
         }),
     );
 
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 1);
@@ -1122,8 +1122,8 @@ async fn change_appends_project_and_issue_messages_without_nested_runtime_panic(
         }),
     );
 
-    let project_report = parse_report(&handle_change(&orch, &project_request).await);
-    let issue_report = parse_report(&handle_change(&orch, &issue_request).await);
+    let project_report = parse_report(&handle_write(&orch, &project_request).await);
+    let issue_report = parse_report(&handle_write(&orch, &issue_request).await);
 
     assert_eq!(failure_count(&project_report), 0, "{project_report:?}");
     assert_eq!(failure_count(&issue_report), 0, "{issue_report:?}");
@@ -1162,7 +1162,7 @@ async fn change_patches_issue_resource_without_nested_runtime_panic() {
         }),
     );
 
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
     assert_eq!(report["applied"].as_array().unwrap().len(), 1);

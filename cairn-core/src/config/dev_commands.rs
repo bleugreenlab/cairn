@@ -163,12 +163,12 @@ mod tests {
     #[test]
     fn declared_but_unaccepted_is_inert() {
         let project = [terminal(
-            "bun run build:mcp && bun dev:instance",
+            "bun run build:cmd && bun dev:instance",
             &["~/.cairn-dev-*"],
         )];
         // The repo declares a write scope, but with no acceptance it does nothing.
         let r = resolve_carveouts(
-            "bun run build:mcp && bun dev:instance",
+            "bun run build:cmd && bun dev:instance",
             &project,
             &[],
             &deny(),
@@ -182,11 +182,11 @@ mod tests {
 
     #[test]
     fn accepted_with_scopes_grants_those_writes() {
-        let cmd = "bun run build:mcp && bun dev:instance";
+        let cmd = "bun run build:cmd && bun dev:instance";
         let project = [terminal(cmd, &["~/.cairn-dev-*"])];
         let accepted = [cmd.to_string()];
         // Accepted: the declared scope applies; trailing args still match.
-        for command in [cmd, "bun run build:mcp && bun dev:instance --seed empty"] {
+        for command in [cmd, "bun run build:cmd && bun dev:instance --seed empty"] {
             let r = resolve_carveouts(command, &project, &accepted, &deny(), &templates());
             assert_eq!(r.write_globs, vec!["/home/u/.cairn-dev-*".to_string()]);
             assert!(!r.unconfined);

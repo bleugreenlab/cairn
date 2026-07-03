@@ -34,6 +34,7 @@
 
 pub mod agents;
 pub mod build_services;
+pub mod check_exemption;
 pub mod dev_commands;
 pub mod keybinds;
 pub mod mcp_import;

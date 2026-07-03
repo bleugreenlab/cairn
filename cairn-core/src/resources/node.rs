@@ -1472,7 +1472,7 @@ pub(super) async fn artifact_affordance_block(
     let job_id = resolve_todos_job_id(&db, project_key, number, exec_seq, node_name, task_name)
         .await
         .ok()?;
-    let contract = crate::mcp::handlers::implementation::resolve_artifact_contract(
+    let contract = crate::mcp::handlers::comments_artifacts::resolve_artifact_contract(
         orch,
         &job_id,
         task_name,

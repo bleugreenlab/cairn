@@ -102,7 +102,7 @@ Database-backed handlers then resolve node/task/project-chat resources by exact 
 
 When an agent calls the `read` MCP tool with a `cairn://` URI, the URI flows through three layers:
 
-1. `cairn-cli` parses the URI with `parse_uri()` and decides dispatch target. Terminal URIs (`NodeTerminal`, `ProjectTerminal`) route to a callback that reads terminal output. All other URIs route to issue-resource handlers.
+1. `cairn-cmd` parses the URI with `parse_uri()` and decides dispatch target. Terminal URIs (`NodeTerminal`, `ProjectTerminal`) route to a callback that reads terminal output. All other URIs route to issue-resource handlers.
 2. The host callback server receives the request and forwards it to cairn-core.
 3. `handle_read_issue_resource()` in cairn-core pattern-matches on the `CairnResource` variant and executes the appropriate database query.
 

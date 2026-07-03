@@ -28,6 +28,7 @@ json5 = "0.4"
 base64 = "0.22"
 rand = "0.8"
 chacha20poly1305 = "0.10"
+crypto_box = "0.9"
 sha2 = "0.10"
 hostname = "0.4"
 whoami = "1"
@@ -62,6 +63,17 @@ ast-grep-core = "0.43"
 ast-grep-language = "0.43"
 ast-grep-config = "0.43"
 ast-grep-outline = { path = "../ast-grep-outline" }
+
+# In-process warm file-search index (CAIRN-2303). Wraps fff-search's resident
+# FilePicker so repeated ?grep=/?glob= reads and translated run() rg/grep in a
+# worktree hit a warm, watcher-maintained index instead of re-walking the tree
+# from scratch. Pinned exact: 0.9.x has no API-stability guarantee and the
+# worktree_search wrapper module is the sole consumer of its surface. No
+# features: `zlob` needs Zig at build time (the pure-Rust globset fallback is
+# fine), frecency/history LMDB stores are disabled at runtime (None paths), and
+# the process-wide SIGSEGV handler only installs via fff::log::init_tracing,
+# which cairn-core never calls.
+fff-search = { version = "=0.9.6", default-features = false }
 
 # Optional: test utilities (mocking)
 mockall = { version = "0.13", optional = true }

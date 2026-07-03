@@ -17,12 +17,69 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
 };
+use crypto_box::{aead::OsRng, PublicKey, SalsaBox, SecretKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 /// Machine identifier used to derive the at-rest key. Re-exported from the
 /// identity module so there is a single implementation across the crate.
 pub use crate::identity::crypto::get_machine_id;
+
+/// Generate a new X25519 relay keypair.
+///
+/// Returns `(public_key_base64, secret_key_base64)`.
+pub fn generate_keypair() -> (String, String) {
+    let secret_key = SecretKey::generate(&mut OsRng);
+    let public_key = secret_key.public_key();
+
+    (
+        BASE64.encode(public_key.as_bytes()),
+        BASE64.encode(secret_key.to_bytes()),
+    )
+}
+
+/// Decrypt a relay sealed-box payload using a base64-encoded X25519 secret key.
+pub fn decrypt_payload(encrypted_b64: &str, secret_key_b64: &str) -> Result<String, String> {
+    let encrypted = BASE64
+        .decode(encrypted_b64)
+        .map_err(|e| format!("Invalid base64: {e}"))?;
+    let secret_bytes = BASE64
+        .decode(secret_key_b64)
+        .map_err(|e| format!("Invalid secret key base64: {e}"))?;
+
+    if secret_bytes.len() != 32 {
+        return Err("Invalid secret key length".to_string());
+    }
+
+    let secret_key = SecretKey::from_slice(&secret_bytes)
+        .map_err(|_| "Invalid secret key format".to_string())?;
+    if encrypted.len() < 32 {
+        return Err("Encrypted payload too short".to_string());
+    }
+
+    let ephemeral_public_bytes: [u8; 32] = encrypted[..32]
+        .try_into()
+        .map_err(|_| "Invalid ephemeral public key")?;
+    let ciphertext = &encrypted[32..];
+
+    let ephemeral_public_key = PublicKey::from(ephemeral_public_bytes);
+    let recipient_public_key = secret_key.public_key();
+
+    let mut hasher = Sha256::new();
+    hasher.update(ephemeral_public_key.as_bytes());
+    hasher.update(recipient_public_key.as_bytes());
+    let hash_result = hasher.finalize();
+    let nonce: [u8; 24] = hash_result[..24]
+        .try_into()
+        .map_err(|_| "Failed to derive nonce")?;
+
+    let salsa_box = SalsaBox::new(&ephemeral_public_key, &secret_key);
+    let decrypted = salsa_box
+        .decrypt((&nonce).into(), ciphertext)
+        .map_err(|_| "Decryption failed")?;
+
+    String::from_utf8(decrypted).map_err(|e| format!("Invalid UTF-8: {e}"))
+}
 
 /// Version byte prefixing the ChaCha20-Poly1305 ciphertext format.
 const VERSION: u8 = 0x01;
@@ -145,6 +202,21 @@ pub fn decrypt_private_key(encrypted_b64: &str, machine_id: &str) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_relay_keypair_is_base64_x25519() {
+        let (public_key, secret_key) = generate_keypair();
+        assert_eq!(BASE64.decode(public_key).unwrap().len(), 32);
+        assert_eq!(BASE64.decode(secret_key).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn relay_payload_rejects_short_ciphertext() {
+        let secret_key = BASE64.encode([0u8; 32]);
+        let payload = BASE64.encode([1, 2, 3, 4]);
+        let err = decrypt_payload(&payload, &secret_key).unwrap_err();
+        assert!(err.contains("too short"));
+    }
 
     #[test]
     fn roundtrip_under_app_key_domain() {

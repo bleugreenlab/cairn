@@ -22,7 +22,7 @@ use cairn_common::uri::{parse_uri as parse_cairn_uri, CairnResource};
 
 /// Cairn MCP Server - tools for Claude to interact with Cairn
 #[derive(Parser)]
-#[command(name = "cairn", version)]
+#[command(name = "cairn-cmd", version)]
 struct Args {
     /// Subcommand. When omitted (or `mcp`), runs the stdio MCP server.
     #[command(subcommand)]
@@ -92,16 +92,16 @@ struct AgentInfo {
 }
 
 // ---------------------------------------------------------------------------
-// cairn-cli -> host HTTP callback timeout
+// cairn-cmd -> host HTTP callback timeout
 //
 // The host owns execution. Every outer layer's ceiling is derived to sit
 // strictly *above* the layer below it, so the HTTP socket never fires before
 // the host's own timeout returns a (partial) result. See
-// `mcp/handlers/bash.rs` for the host per-item budget this mirrors.
+// `mcp/handlers/run.rs` for the host per-item budget this mirrors.
 // ---------------------------------------------------------------------------
 
 /// Host per-item execution budget for `run` items, mirroring
-/// `mcp/handlers/bash.rs` (`timeout.unwrap_or(120_000).min(600_000)` ms). The
+/// `mcp/handlers/run.rs` (`timeout.unwrap_or(120_000).min(600_000)` ms). The
 /// host is the only layer that returns partial output on expiry.
 const HOST_ITEM_TIMEOUT_DEFAULT_MS: u64 = 120_000;
 const HOST_ITEM_TIMEOUT_MAX_MS: u64 = 600_000;
@@ -124,13 +124,13 @@ const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
 /// them. Six days is effectively "no ceiling" while still bounding a wedged
 /// socket, and sits strictly below the spawned agent's MCP tool timeout
 /// (`MCP_TOOL_TIMEOUT` / Codex `tool_timeout_sec`, set to 7 days) so the agent
-/// never abandons cairn-cli mid-await.
+/// never abandons cairn-cmd mid-await.
 const UNBOUNDED_CALLBACK_TIMEOUT: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 
 use cairn_common::protocol::{CallbackRequest, CallbackResponse};
 
 /// Effective host timeout for one `run` item, in milliseconds (mirrors
-/// `bash.rs`: caller value or the 120s default, clamped to the 600s ceiling).
+/// `run.rs`: caller value or the 120s default, clamped to the 600s ceiling).
 fn effective_run_item_timeout_ms(item: &RunItemInput) -> u64 {
     item.timeout
         .map(u64::from)
@@ -212,7 +212,7 @@ struct CallbackOutcome {
 
 /// Cairn MCP Server - tools for Claude to interact with Cairn during planning
 #[derive(Clone)]
-struct CairnMcp {
+struct CairnCmd {
     callback_url: Arc<String>,
     /// Current working directory - used by backend to identify the active run
     cwd: Arc<String>,
@@ -241,7 +241,7 @@ struct CairnMcp {
 /// or null, so this disambiguates the absent/null `changes` case (the reported
 /// `-32602` symptom). A present-but-wrong-typed `changes` (e.g. a string, or an
 /// item that isn't an object) still fails rmcp deserialization before `write()`;
-/// cairn-core's `handle_change` runs the same validator on the raw `Value` and
+/// cairn-core's `handle_write` runs the same validator on the raw `Value` and
 /// catches those shapes authoritatively.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ChangeItemInput {
@@ -725,7 +725,7 @@ fn split_uri_suffix(candidate: &str) -> (&str, &str) {
 }
 
 #[tool_router]
-impl CairnMcp {
+impl CairnCmd {
     #[cfg(test)]
     fn new(
         callback_url: String,
@@ -1197,7 +1197,7 @@ Partial failures never abort: a target that errors shows its message inline as t
     }
 }
 
-impl CairnMcp {
+impl CairnCmd {
     /// Call the Tauri callback server and return the full outcome (handler
     /// result plus augmentation reminders). Verbs assemble reminders into the
     /// model-visible text at the edge, after parsing any structured result.
@@ -1284,7 +1284,7 @@ impl CairnMcp {
     }
 }
 
-impl ServerHandler for CairnMcp {
+impl ServerHandler for CairnCmd {
     fn get_info(&self) -> ServerInfo {
         let mut instructions = "Cairn MCP server for agent orchestration.\n\n\
              Issue tools:\n\
@@ -1314,7 +1314,7 @@ impl ServerHandler for CairnMcp {
                 .enable_resources()
                 .build(),
             server_info: Implementation {
-                name: "cairn-cli".to_string(),
+                name: "cairn-cmd".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
             instructions: Some(instructions),
@@ -1456,9 +1456,9 @@ async fn main() -> Result<()> {
         Some(Command::Read { .. }) | Some(Command::Write { .. }) | Some(Command::Watch { .. })
     );
     // `None` level: the spawning app injects `CAIRN_LOG_LEVEL`, which the filter
-    // resolution picks up; a directly-launched cairn-cli falls back to Standard.
+    // resolution picks up; a directly-launched cairn-cmd falls back to Standard.
     let _log_guard = cairn_common::logging::init(cairn_common::logging::LogConfig {
-        process: cairn_common::logging::ProcessTag::Mcp,
+        process: cairn_common::logging::ProcessTag::Cmd,
         log_dir: None,
         stderr: !is_cli,
         level: None,
@@ -1510,7 +1510,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    tracing::info!("Starting cairn-cli server");
+    tracing::info!("Starting cairn-cmd server");
     tracing::info!("Callback URL: {}", callback_url);
     tracing::info!("Working directory: {}", cwd);
     if let Some(ref id) = run_id {
@@ -1536,7 +1536,7 @@ async fn main() -> Result<()> {
         Vec::new()
     };
 
-    let service = CairnMcp::new_with_home_uri(
+    let service = CairnCmd::new_with_home_uri(
         callback_url,
         cwd,
         run_id,
@@ -1560,7 +1560,7 @@ async fn main() -> Result<()> {
 // ============================================================================
 
 fn default_callback_url() -> String {
-    // Use the shared resolver so cairn-cli (built --release) targets the same
+    // Use the shared resolver so cairn-cmd (built --release) targets the same
     // port as the app that spawned it. The app sets CAIRN_ENV in the MCP child
     // env; manual terminal use selects the port via CAIRN_ENV=dev.
     let port = cairn_common::paths::callback_port();
@@ -1573,8 +1573,8 @@ fn cli_callback_url() -> String {
     env::var("CAIRN_CALLBACK_URL").unwrap_or_else(|_| default_callback_url())
 }
 
-/// Build a thin `CairnMcp` client from the environment for CLI forwarding.
-fn build_cli_client(callback_url: String) -> CairnMcp {
+/// Build a thin `CairnCmd` client from the environment for CLI forwarding.
+fn build_cli_client(callback_url: String) -> CairnCmd {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -1585,7 +1585,7 @@ fn build_cli_client(callback_url: String) -> CairnMcp {
     let home_uri = env::var("CAIRN_HOME_URI")
         .ok()
         .filter(|uri| parse_cairn_uri(uri).is_some());
-    CairnMcp::new_with_home_uri(callback_url, cwd, run_id, mcp_secret, Vec::new(), home_uri)
+    CairnCmd::new_with_home_uri(callback_url, cwd, run_id, mcp_secret, Vec::new(), home_uri)
 }
 
 /// Extract printable text and the error flag from a tool result
@@ -1888,8 +1888,8 @@ async fn run_cli_change(json: Option<String>, commit_msg: Option<String>) -> boo
 mod tests {
     use super::*;
 
-    fn create_test_mcp_with_home_uri(home_uri: Option<&str>) -> CairnMcp {
-        CairnMcp::new_with_home_uri(
+    fn create_test_mcp_with_home_uri(home_uri: Option<&str>) -> CairnCmd {
+        CairnCmd::new_with_home_uri(
             "http://localhost:3847".to_string(),
             "/test/path".to_string(),
             None,
@@ -1912,7 +1912,7 @@ mod tests {
             },
         ];
 
-        let mcp = CairnMcp::new(
+        let mcp = CairnCmd::new(
             "http://localhost:3847".to_string(),
             "/test/path".to_string(),
             None, // run_id
@@ -1940,7 +1940,7 @@ mod tests {
             description: "Search the codebase".to_string(),
         }];
 
-        let mcp = CairnMcp::new(
+        let mcp = CairnCmd::new(
             "http://localhost:3847".to_string(),
             "/test/path".to_string(),
             None, // run_id
@@ -1967,7 +1967,7 @@ mod tests {
 
     #[test]
     fn test_server_info_excludes_agents_when_empty() {
-        let mcp = CairnMcp::new(
+        let mcp = CairnCmd::new(
             "http://localhost:3847".to_string(),
             "/test/path".to_string(),
             None,   // run_id
@@ -2578,7 +2578,7 @@ mod tests {
 
     #[test]
     fn test_unified_edit_tool_visible() {
-        let mcp = CairnMcp::new(
+        let mcp = CairnCmd::new(
             "http://localhost:3847".to_string(),
             "/test/path".to_string(),
             None,

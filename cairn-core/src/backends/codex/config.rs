@@ -56,8 +56,8 @@ pub(crate) fn write_codex_config_for_provider(
     let callback_url = format!("http://127.0.0.1:{}/api/mcp", callback_port);
     let model_catalog_path = write_codex_model_catalog_override(&home, &codex_home)?;
 
-    // Extract the cairn-cli args from the shared Claude MCP config JSON (same
-    // args for cairn-cli regardless of backend).
+    // Extract the cairn-cmd args from the shared Claude MCP config JSON (same
+    // args for cairn-cmd regardless of backend).
     let mcp_args: Vec<String> = serde_json::from_str::<Value>(mcp_config_json)
         .ok()
         .and_then(|config| {
@@ -164,9 +164,9 @@ env_vars = ["CAIRN_RUN_ID", "CAIRN_MCP_SECRET", "CAIRN_HOME_URI", "CAIRN_HOME"]
 # callback. The host owns execution: `run` items are capped per-item (<=600s,
 # returning partial output on expiry) and blocking `write` appends to a node's
 # tasks/questions collection await a sub-agent task or user answer with no
-# host-side deadline. cairn-cli sizes its HTTP callback ceiling just under this
-# (see UNBOUNDED_CALLBACK_TIMEOUT in cairn-cli); Codex's default per-call
-# timeout would abandon the call above cairn-cli and leave the agent with no
+# host-side deadline. cairn-cmd sizes its HTTP callback ceiling just under this
+# (see UNBOUNDED_CALLBACK_TIMEOUT in cairn-cmd); Codex's default per-call
+# timeout would abandon the call above cairn-cmd and leave the agent with no
 # output while the host keeps running. 7 days is an effective "never" while
 # still bounding a truly wedged socket. This is a static, run-independent value,
 # so it is safe to bake into the shared config (unlike CAIRN_RUN_ID, which is
@@ -239,7 +239,7 @@ mod tests {
         // generated config defines exactly one [mcp_servers.*] block and that it
         // is cairn.
         let config = render_codex_config_toml(
-            "/path/to/cairn-cli",
+            "/path/to/cairn-cmd",
             "http://127.0.0.1:3847/api/mcp",
             "[\"mcp\"]",
             "",
@@ -263,7 +263,7 @@ mod tests {
         // external connector tools (mcp__codex_apps__*) outside the cairn
         // gateway. The generated config must disable it under [features].
         let config = render_codex_config_toml(
-            "/path/to/cairn-cli",
+            "/path/to/cairn-cmd",
             "http://127.0.0.1:3847/api/mcp",
             "[\"mcp\"]",
             "",
@@ -286,7 +286,7 @@ mod tests {
         // shell/exec tools (shell_tool, unified_exec) bypass Cairn's fence and
         // commit flow, so the generated config must turn them off.
         let config = render_codex_config_toml(
-            "/path/to/cairn-cli",
+            "/path/to/cairn-cmd",
             "http://127.0.0.1:3847/api/mcp",
             "[\"mcp\"]",
             "",
@@ -306,9 +306,9 @@ mod tests {
     fn test_codex_config_sets_generous_cairn_tool_timeout() {
         // The host owns execution; Codex's per-server tool timeout must sit far
         // above any legal Cairn callback (blocking task/question appends await
-        // an unbounded external event) so it never abandons cairn-cli mid-call.
+        // an unbounded external event) so it never abandons cairn-cmd mid-call.
         let config = render_codex_config_toml(
-            "/path/to/cairn-cli",
+            "/path/to/cairn-cmd",
             "http://127.0.0.1:3847/api/mcp",
             "[\"mcp\"]",
             "",

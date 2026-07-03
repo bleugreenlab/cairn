@@ -2,7 +2,8 @@ mod common;
 
 use std::sync::Arc;
 
-use cairn_core::internal::mcp::handlers::files::{handle_change, handle_read_file};
+use cairn_core::internal::mcp::handlers::read::handle_read_file;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use common::orchestrator;
@@ -89,7 +90,7 @@ async fn node_question_patch_answers_prompt_once() {
     let orch = orchestrator(&temp, db.clone());
 
     let target = "cairn://p/TQA/1/1/builder/questions/q-1";
-    let result = handle_change(
+    let result = handle_write(
         &orch,
         &change_request(json!({
             "changes": [{"target": target, "mode": "patch", "payload": {"answer": "Yes"}}]
@@ -102,7 +103,7 @@ async fn node_question_patch_answers_prompt_once() {
     );
     assert_eq!(prompt_response(&db).await.as_deref(), Some("Yes"));
 
-    let duplicate = handle_change(
+    let duplicate = handle_write(
         &orch,
         &change_request(json!({
             "changes": [{"target": target, "mode": "patch", "payload": {"answer": "Yes"}}]

@@ -2,7 +2,7 @@
 
 > Historical note: parts of this document describe an older session model. The current `cairn-core` implementation uses `idle` runs plus warm-process retention rather than the older `paused`/kill-first framing. For the current code shape, see `docs/cairn-core-shape-map.md`, `docs/state-machines.md`, and `docs/execution-lifecycle-map.md`.
 
-This document describes how cairn-core, Claude CLI, and cairn-cli work together — the session lifecycle, callback architecture, tool resolution, and process management.
+This document describes how cairn-core, Claude CLI, and cairn-cmd work together — the session lifecycle, callback architecture, tool resolution, and process management.
 
 ## Architecture
 
@@ -18,13 +18,13 @@ This document describes how cairn-core, Claude CLI, and cairn-cli work together 
          │                                  │
          ▼                                  │
 ┌──────────────────┐                 ┌──────┴───────────┐
-│   Claude CLI     │── stdio MCP ──►│   cairn-cli       │
+│   Claude CLI     │── stdio MCP ──►│   cairn-cmd       │
 │   (subprocess)   │                │   (MCP server)    │
 │                  │◄── stdio MCP ──│   stateless proxy │
 └──────────────────┘                └───────────────────┘
 ```
 
-The host process builds an `Orchestrator` and owns all state: the database, file system, git operations, and active processes. cairn-cli is a stateless proxy — it receives tool calls from Claude via stdio-based MCP, translates them into HTTP callbacks to the host, and returns the results.
+The host process builds an `Orchestrator` and owns all state: the database, file system, git operations, and active processes. cairn-cmd is a stateless proxy — it receives tool calls from Claude via stdio-based MCP, translates them into HTTP callbacks to the host, and returns the results.
 
 ## Session Startup
 
@@ -32,14 +32,14 @@ The host process builds an `Orchestrator` and owns all state: the database, file
 
 1. **Resolve output schema** — if the agent has a structured output requirement, resolve the schema reference, write it to a temp file, and extract the tool name and description.
 
-2. **Generate MCP config** — `ensure_mcp_config()` serializes available agents and tools to JSON arguments, resolves the cairn-cli binary path, and writes an `mcp-config.json` that tells Claude CLI how to start the MCP server (skills are read on demand via `cairn://skills` resources):
+2. **Generate MCP config** — `ensure_mcp_config()` serializes available agents and tools to JSON arguments, resolves the cairn-cmd binary path, and writes an `mcp-config.json` that tells Claude CLI how to start the MCP server (skills are read on demand via `cairn://skills` resources):
 
    ```json
    {
      "mcpServers": {
        "cairn": {
          "type": "stdio",
-         "command": "/path/to/cairn-cli",
+         "command": "/path/to/cairn-cmd",
          "args": ["--agents", "[...]", "--tools", "[...]"],
          "env": {
            "CAIRN_CALLBACK_URL": "http://127.0.0.1:3847/api/mcp",
@@ -62,7 +62,7 @@ For bidirectional mode (`--input-format stream-json`), the prompt is written to 
 
 When Claude calls a tool, the request flows through three layers:
 
-1. **Claude → cairn-cli** (stdio MCP): Claude CLI invokes a tool like `mcp__cairn__read`. cairn-cli's handler constructs a `CallbackRequest`:
+1. **Claude → cairn-cmd** (stdio MCP): Claude CLI invokes a tool like `mcp__cairn__read`. cairn-cmd's handler constructs a `CallbackRequest`:
 
    ```rust
    CallbackRequest {
@@ -74,17 +74,17 @@ When Claude calls a tool, the request flows through three layers:
    }
    ```
 
-2. **cairn-cli → host** (HTTP POST): the request is sent to the callback URL with bearer token authentication. The host validates the token, extracts the run ID and tool name, and dispatches to the appropriate handler.
+2. **cairn-cmd → host** (HTTP POST): the request is sent to the callback URL with bearer token authentication. The host validates the token, extracts the run ID and tool name, and dispatches to the appropriate handler.
 
-3. **Host → cairn-cli** (HTTP response): the handler executes (DB query, file I/O, process spawn, git operation) using the `Orchestrator`'s services, and returns a `CallbackResponse { result: String }`. cairn-cli parses the result and returns it to Claude as the tool output.
+3. **Host → cairn-cmd** (HTTP response): the handler executes (DB query, file I/O, process spawn, git operation) using the `Orchestrator`'s services, and returns a `CallbackResponse { result: String }`. cairn-cmd parses the result and returns it to Claude as the tool output.
 
-This design means cairn-cli never touches the database or filesystem directly. All state mutations go through the host, which maintains consistency and emits events for downstream consumers.
+This design means cairn-cmd never touches the database or filesystem directly. All state mutations go through the host, which maintains consistency and emits events for downstream consumers.
 
 ## Authentication
 
-The host generates a 32-byte random secret at startup, base64-encodes it, and stores it in `McpAuthState`. The same value is passed to cairn-cli via the `CAIRN_MCP_SECRET` environment variable in the MCP config.
+The host generates a 32-byte random secret at startup, base64-encodes it, and stores it in `McpAuthState`. The same value is passed to cairn-cmd via the `CAIRN_MCP_SECRET` environment variable in the MCP config.
 
-On every callback, cairn-cli sends the secret as a bearer token in the `Authorization` header. The host validates it against the stored value. Failed authentication returns 401.
+On every callback, cairn-cmd sends the secret as a bearer token in the `Authorization` header. The host validates it against the stored value. Failed authentication returns 401.
 
 ## Tool Resolution
 
@@ -102,7 +102,7 @@ Needs that native tools used to cover are served by Cairn: sub-agents and user q
 
 Claude processes have three states:
 
-**Active** — executing a turn. The host is streaming events from stdout, and the process may make tool calls via cairn-cli callbacks.
+**Active** — executing a turn. The host is streaming events from stdout, and the process may make tool calls via cairn-cmd callbacks.
 
 **Warm** — idle after completing a turn. The process is still alive with stdin open and the conversation cache preserved in memory. This avoids the cost of re-establishing context when a follow-up message arrives. Warm processes can be resumed by writing a new prompt to stdin, which transitions them back to Active.
 

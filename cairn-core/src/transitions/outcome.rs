@@ -211,11 +211,14 @@ async fn issue_progress_attention(
     } else if issue_count(
         conn,
         issue_id,
-        // A blocked job (embedded/standalone approval gate) OR a blocked
-        // action_run (an open `pr` node holding the DAG, see CAIRN-1220) both
-        // mean the issue awaits a human decision. One mechanism, counted together.
+        // A blocked job, a blocked action_run, or an open merge request all mean
+        // the issue awaits a human decision. The merge_requests arm is
+        // load-bearing: a coordinator can still need child wakes after its PR has
+        // opened, even if the PR action_run is not the durable blocked row. Only
+        // terminal PR states release the approval attention.
         "SELECT (SELECT COUNT(*) FROM jobs WHERE issue_id = ?1 AND status = 'blocked')
-              + (SELECT COUNT(*) FROM action_runs WHERE issue_id = ?1 AND status = 'blocked')",
+              + (SELECT COUNT(*) FROM action_runs WHERE issue_id = ?1 AND status = 'blocked')
+              + (SELECT COUNT(*) FROM merge_requests WHERE issue_id = ?1 AND status NOT IN ('merged', 'closed'))",
     )
     .await?
         > 0
@@ -248,4 +251,78 @@ async fn count(conn: &turso::Connection, sql: &'static str, id: &str) -> DbResul
 
 async fn issue_count(conn: &turso::Connection, issue_id: &str, sql: &'static str) -> DbResult<i64> {
     count(conn, sql, issue_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::LocalDb;
+
+    async fn migrated_db() -> LocalDb {
+        crate::storage::migrated_test_db("outcome-projection.db").await
+    }
+
+    async fn seed_completed_issue_with_pr(db: &LocalDb, pr_status: &str) {
+        db.execute_script(&format!(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at)
+              VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('i', 'p', 1, 'Issue', 'active', 'active', 'none', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e', 'recipe', 'i', 'p', 'complete', 1, 1);
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('j', 'e', 'i', 'p', 'complete', 'builder', 'builder', 1, 1);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+              VALUES('mr', 'j', 'p', 'i', 'PR', 'feature', 'main', '{pr_status}', 1, 1);
+            "
+        ))
+        .await
+        .unwrap();
+    }
+
+    async fn issue_status_attention(db: &LocalDb) -> (String, String) {
+        db.query_one(
+            "SELECT status, attention FROM issues WHERE id = 'i'",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_merge_request_keeps_completed_issue_waiting() {
+        let db = migrated_db().await;
+        seed_completed_issue_with_pr(&db, "open").await;
+
+        db.write(|conn| Box::pin(async move { recompute_issue_status_conn(conn, "i").await }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issue_status_attention(&db).await,
+            ("waiting".to_string(), "needs_approval".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_merge_request_releases_completed_issue() {
+        for pr_status in ["merged", "closed"] {
+            let db = migrated_db().await;
+            seed_completed_issue_with_pr(&db, pr_status).await;
+
+            db.write(|conn| Box::pin(async move { recompute_issue_status_conn(conn, "i").await }))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                issue_status_attention(&db).await,
+                ("complete".to_string(), "none".to_string()),
+                "{pr_status} is terminal and must not hold approval attention"
+            );
+        }
+    }
 }

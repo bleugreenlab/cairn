@@ -1,17 +1,11 @@
-//! File operation MCP handlers.
+//! Compatibility re-exports for host file commands.
 //!
-//! Handles: edit (unified file mutations), read
-
-pub(crate) mod change;
+//! The agent-facing `read` and `write` handlers live in sibling `read` and
+//! `write` modules. This module remains as the stable public path used by the
+//! Tauri `save_worktree_file` command for host-driven user file edits.
 
 /// Host-driven user file edit, reusing the agent `write` verb's VCS seal seam.
 /// Re-exported here so the Tauri `save_worktree_file` command can reach it
 /// through `cairn_core::internal::mcp::handlers::files`.
-pub use change::host_edit::commit_user_file_edit;
-mod read;
-mod target;
-
-pub use change::handle_change;
-pub use read::handle_read_file;
-pub(crate) use read::produce_archived_file_segment;
-pub(crate) use read::produce_file_segment;
+#[allow(unused_imports)]
+pub use super::write::host_edit::commit_user_file_edit;

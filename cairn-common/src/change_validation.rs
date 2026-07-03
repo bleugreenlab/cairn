@@ -3,12 +3,12 @@
 //! This is the one place that decides whether a `write` payload is well-formed,
 //! shared by every call site so the error text is identical everywhere:
 //!
-//! - `cairn-cli`'s `write()` runs it pre-flight on the raw arguments, so the
+//! - `cairn-cmd`'s `write()` runs it pre-flight on the raw arguments, so the
 //!   model gets every problem in one response with no server round-trip. The
 //!   rmcp-facing input type is deliberately lenient (all fields optional) so
 //!   serde never hard-rejects with an opaque `-32602 missing field 'changes'`;
 //!   this validator owns the message instead.
-//! - `cairn-core`'s `handle_change` runs the same function as the authoritative
+//! - `cairn-core`'s `handle_write` runs the same function as the authoritative
 //!   gate before the strict typed deserialize, so external MCP clients and the
 //!   headless server are held to the same contract.
 //!
@@ -153,7 +153,7 @@ pub fn validate_change_value(payload: &Value) -> Vec<ChangeValidationError> {
         return errors;
     }
 
-    // A null commit_msg is treated as absent (the lenient cairn-cli struct may
+    // A null commit_msg is treated as absent (the lenient cairn-cmd struct may
     // serialize a missing commit_msg as null).
     let commit_msg_present = obj
         .get("commit_msg")

@@ -16,7 +16,7 @@ use cairn_common::contract::{
     mutation_spec, ChangeMode, KeyType, MutationSpec, ResourceContract, RESOURCE_CONTRACTS,
 };
 use cairn_common::uri::parse_uri;
-use cairn_core::internal::mcp::handlers::files::handle_change;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use serde_json::json;
 
@@ -104,7 +104,7 @@ async fn table_and_dispatch_match_for_every_kind_and_mode() {
                 payload: json!({ "preview": true, "changes": [item] }),
                 tool_use_id: None,
             };
-            let result = handle_change(&orch, &request).await;
+            let result = handle_write(&orch, &request).await;
             let context = format!("{uri} mode={}", mode.as_str());
 
             if spec.is_some() {

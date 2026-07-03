@@ -4,7 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cairn_core::internal::mcp::handlers::fence::{raise_fence, Crossing, FenceDecision};
-use cairn_core::internal::mcp::handlers::files::{handle_change, handle_read_file};
+use cairn_core::internal::mcp::handlers::read::handle_read_file;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_core::models::Fence;
@@ -136,7 +137,7 @@ async fn node_permission_patch_allow_session_resolves_and_grants() {
     let orch = orchestrator(&temp, db.clone());
 
     let target = "cairn://p/TPA/1/1/builder/permissions/perm-1";
-    let result = handle_change(
+    let result = handle_write(
         &orch,
         &change_request(json!({
             "changes": [{"target": target, "mode": "patch", "payload": {"decision": "allow", "scope": "session"}}]
@@ -158,7 +159,7 @@ async fn node_permission_patch_allow_session_resolves_and_grants() {
         "session grant not recorded"
     );
 
-    let duplicate = handle_change(
+    let duplicate = handle_write(
         &orch,
         &change_request(json!({
             "changes": [{"target": target, "mode": "patch", "payload": {"decision": "allow", "scope": "session"}}]
@@ -179,7 +180,7 @@ async fn node_permission_patch_deny_resolves() {
     let orch = orchestrator(&temp, db.clone());
 
     let target = "cairn://p/TPA/1/1/builder/permissions/perm-1";
-    let result = handle_change(
+    let result = handle_write(
         &orch,
         &change_request(json!({
             "changes": [{"target": target, "mode": "patch", "payload": {"decision": "deny"}}]

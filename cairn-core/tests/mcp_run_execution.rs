@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cairn_core::internal::db::DbState;
-use cairn_core::internal::mcp::handlers::bash::handle_run;
+use cairn_core::internal::mcp::handlers::run::handle_run;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
@@ -307,10 +307,9 @@ async fn timed_out_item_with_run_context_promotes_to_terminal() {
     kill_all_sessions(&orch);
 }
 
-/// Sub-task jobs must NOT promote on timeout: terminals attach to top-level
-/// nodes only (CAIRN-1629), so a promoted task-job terminal URI would never
-/// resolve — the agent would hold a running detached process behind a dead
-/// pointer. Timeout falls back to the kill path instead.
+/// Sub-task jobs promote on timeout to a canonical task terminal URI. This keeps
+/// the process readable and killable while preserving the task address instead
+/// of incorrectly attaching the terminal to the parent node.
 #[tokio::test]
 async fn timed_out_item_in_subtask_job_kills_instead_of_promoting() {
     // Depends on a real long-running subprocess hitting the timeout-kill path;
@@ -348,26 +347,29 @@ async fn timed_out_item_in_subtask_job_kills_instead_of_promoting() {
     let result = handle_run(&orch, &request(&cwd, Some("run-subtask-sub"), payload)).await;
 
     assert!(
-        result.contains("timed out"),
-        "expected kill-fallback timeout result: {result}"
+        result.contains("Command still running; detached"),
+        "expected promoted terminal result: {result}"
     );
     assert!(
         result.contains("started"),
         "missing partial output: {result}"
     );
     assert!(
-        !result.contains("terminal/run-"),
-        "sub-task timeout must not return a promoted terminal URI: {result}"
+        result.contains("/task/map-things/terminal/run-1"),
+        "sub-task timeout must return the canonical task terminal URI: {result}"
     );
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM job_terminals").await,
-        0,
-        "no terminal row may be created for a sub-task timeout"
+        1,
+        "a terminal row should be created for the promoted sub-task timeout"
     );
-    assert!(
-        orch.pty_state.sessions.lock().unwrap().is_empty(),
-        "no promoted session may exist for a sub-task timeout"
+    assert_eq!(
+        orch.pty_state.sessions.lock().unwrap().len(),
+        1,
+        "a promoted session should exist for the sub-task timeout"
     );
+
+    kill_all_sessions(&orch);
 }
 
 #[tokio::test]

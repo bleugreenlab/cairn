@@ -36,7 +36,7 @@ use std::sync::Arc;
 use common::sync_server::SyncServer;
 
 use cairn_core::internal::db::{DbState, TeamConfig};
-use cairn_core::internal::mcp::handlers::{implementation, issues, messages};
+use cairn_core::internal::mcp::handlers::{comments_artifacts, issues, messages};
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
@@ -1164,7 +1164,7 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
     );
 
     // 2. COMMENT append through the routed handler.
-    implementation::append_issue_comment(&orch, &request, "TEAMP", number, "a routed comment")
+    comments_artifacts::append_issue_comment(&orch, &request, "TEAMP", number, "a routed comment")
         .await
         .expect("append comment");
     assert_eq!(

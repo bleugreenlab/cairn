@@ -5,11 +5,11 @@
 //! vs `.cairn-dev`) and the callback port that the app and its children share.
 //! Every other crate delegates here: logging (`logging::default_log_dir`),
 //! auth (`auth::load_local_mcp_token`), `cairn_core::config::get_config_dir`,
-//! the Tauri log viewer, and `cairn-cli`.
+//! the Tauri log viewer, and `cairn-cmd`.
 //!
 //! ## Mode signal: `CAIRN_ENV`, not `debug_assertions`
 //!
-//! `cfg!(debug_assertions)` is the wrong signal for child processes. `cairn-cli`
+//! `cfg!(debug_assertions)` is the wrong signal for child processes. `cairn-cmd`
 //! is built `--release` (so its `debug_assertions` is always false) even when it
 //! serves a dev app. Mode is therefore driven by an explicit `CAIRN_ENV`
 //! (`dev`/`prod`) env var, falling back to `cfg!(debug_assertions)` only when the
@@ -33,6 +33,10 @@ pub const MCP_CALLBACK_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const PROD_CALLBACK_PORT: u16 = 3847;
 /// Dev callback port (the `tauri dev` desktop app).
 const DEV_CALLBACK_PORT: u16 = 3857;
+
+/// Fixed production runner transport port. The desktop and runner both address
+/// the local execution daemon by this convention instead of a discovery file.
+pub const DEFAULT_RUNNER_PORT: u16 = 3849;
 
 /// True when running in dev mode.
 ///
@@ -90,19 +94,28 @@ pub fn cairn_log_dir() -> PathBuf {
 /// dev builds each bind a distinct callback port (and have their spawned MCP
 /// children resolve the matching `CAIRN_CALLBACK_URL`).
 pub fn callback_port() -> u16 {
-    if let Some(port) = std::env::var("CAIRN_CALLBACK_PORT")
+    env_port("CAIRN_CALLBACK_PORT").unwrap_or_else(|| {
+        if is_dev() {
+            DEV_CALLBACK_PORT
+        } else {
+            PROD_CALLBACK_PORT
+        }
+    })
+}
+
+/// The runner transport port for the current process.
+///
+/// `bun run dev:instance` sets `CAIRN_RUNNER_PORT` to a stable per-slot value;
+/// production and bare `tauri dev` use the fixed runner port by convention.
+pub fn runner_port() -> u16 {
+    env_port("CAIRN_RUNNER_PORT").unwrap_or(DEFAULT_RUNNER_PORT)
+}
+
+fn env_port(name: &str) -> Option<u16> {
+    std::env::var(name)
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|port| *port != 0)
-    {
-        return port;
-    }
-
-    if is_dev() {
-        DEV_CALLBACK_PORT
-    } else {
-        PROD_CALLBACK_PORT
-    }
 }
 
 // ============================================================================
@@ -118,6 +131,10 @@ pub fn callback_port() -> u16 {
 // under the real home even when the host app itself runs with a `CAIRN_HOME`
 // override.
 // ============================================================================
+
+/// Base runner transport port for `dev:instance` slots: slot `s` binds `BASE + s`.
+/// Mirrors `RUNNER_PORT_BASE` in scripts/dev-instance.ts.
+pub const DEV_INSTANCE_RUNNER_PORT_BASE: u16 = DEFAULT_RUNNER_PORT;
 
 /// Base MCP callback port for `dev:instance` slots: slot `s` binds `BASE + s`.
 /// Mirrors `CALLBACK_PORT_BASE` in scripts/dev-instance.ts.
@@ -192,6 +209,7 @@ mod tests {
         std::env::remove_var("CAIRN_HOME");
         std::env::remove_var("CAIRN_LOG_DIR");
         std::env::remove_var("CAIRN_CALLBACK_PORT");
+        std::env::remove_var("CAIRN_RUNNER_PORT");
     }
 
     #[test]
@@ -327,6 +345,20 @@ mod tests {
         assert_eq!(callback_port(), 3861);
         std::env::set_var("CAIRN_ENV", "prod");
         assert_eq!(callback_port(), 3861);
+
+        clear_env();
+    }
+
+    #[test]
+    fn runner_port_uses_env_or_default() {
+        let _guard = env_lock();
+        clear_env();
+
+        assert_eq!(runner_port(), DEFAULT_RUNNER_PORT);
+        std::env::set_var("CAIRN_RUNNER_PORT", "3999");
+        assert_eq!(runner_port(), 3999);
+        std::env::set_var("CAIRN_RUNNER_PORT", "0");
+        assert_eq!(runner_port(), DEFAULT_RUNNER_PORT);
 
         clear_env();
     }

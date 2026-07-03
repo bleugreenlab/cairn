@@ -34,7 +34,7 @@
 //!     the accepted contract and `content_render_sha` does not apply to writes.
 //! - **zstd**: everything else (run output, directory/glob reads, web/PDF/cairn
 //!   resource reads, out-of-repo paths, model text, thinking, artifacts) and any
-//!   read that fails the compare (replay drift, a dirty worktree, or cairn-cli's
+//!   read that fails the compare (replay drift, a dirty worktree, or cairn-cmd's
 //!   over-budget composition seam). The original `data` is compressed verbatim.
 //!
 //! The whole pass is one transaction per execution: the `execution_history`
@@ -119,7 +119,7 @@ where
 }
 
 /// Per-execution archival outcome: the measurement that later decides whether
-/// extracting cairn-cli's read-composition algorithm into cairn-common is worth
+/// extracting cairn-cmd's read-composition algorithm into cairn-common is worth
 /// it. `mismatch_fallback` counts reads that resolved bytes but failed the
 /// render-and-compare (replay drift, a dirty worktree, the composition seam).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

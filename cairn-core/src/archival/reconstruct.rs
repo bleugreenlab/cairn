@@ -988,7 +988,7 @@ pub(crate) fn splice_hybrid_skeleton(
 /// Build the [`ReadSegment`] for one archived read target from its blob, or an
 /// `Error` segment carrying a labeled coordinate stub when the blob cannot be
 /// resolved or rendered. The shared producer
-/// ([`crate::mcp::handlers::files::produce_archived_file_segment`]) guarantees the
+/// ([`crate::mcp::handlers::read::produce_archived_file_segment`]) guarantees the
 /// segment is identical to the one the live read built from the same bytes.
 fn build_archived_segment(
     commit: Option<&gix_hash::oid>,
@@ -1006,7 +1006,7 @@ fn build_archived_segment(
     };
     match store.resolve_path_at_commit(commit, &path) {
         Ok(bytes) => {
-            match crate::mcp::handlers::files::produce_archived_file_segment(target, &bytes) {
+            match crate::mcp::handlers::read::produce_archived_file_segment(target, &bytes) {
                 Ok(segment) => segment,
                 Err(error) => {
                     log::warn!("archived read render failed for {target}: {error}");

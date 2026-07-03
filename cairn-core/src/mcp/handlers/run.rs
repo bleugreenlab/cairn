@@ -1,26 +1,19 @@
-//! Bash command MCP handler.
+//! Run command MCP handler.
 //!
-//! Routes synchronous shell commands through inline execution and exposes
-//! terminal resource helpers for long-running PTY sessions.
+//! Routes synchronous shell commands through inline execution.
 
-use super::{normalize_command, unwrap_shell_launcher};
-use crate::services::{
-    ensure_submitted_line, get_default_shell, sandbox, submit_command_exiting_shell, PtySession,
-    SpawnConfig, TerminalChild,
-};
-use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_common::ids;
-use portable_pty::{CommandBuilder, PtySize};
+use super::{normalize_command, terminal, unwrap_shell_launcher};
+use crate::mcp::handlers::search_translate::{translate_search_command, TranslatedSearch};
+use crate::services::{sandbox, SpawnConfig};
+use crate::storage::{LocalDb, RowExt};
+use portable_pty::CommandBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
-use turso::params;
 use uuid::Uuid;
 
 use crate::config::mcp_servers::McpServerConfig;
@@ -30,22 +23,6 @@ use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 use cairn_common::read::{ImageBlock, RunBatchEnvelope};
 use cairn_common::uri::CairnResource;
-
-/// PTY data event payload (mirrors Tauri-side PtyDataPayload)
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PtyDataPayload {
-    pub session_id: String,
-    pub data: String,
-}
-
-/// PTY exit event payload (mirrors Tauri-side PtyExitPayload)
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PtyExitPayload {
-    pub session_id: String,
-    pub exit_code: Option<i32>,
-}
 
 /// Payload for run tool from MCP server.
 ///
@@ -191,16 +168,16 @@ struct ExecOutput {
 }
 
 /// A timed-out `run` item that was promoted to a durable terminal session.
-struct PromotedTerminal {
+pub(super) struct PromotedTerminal {
     /// The terminal's auto-allocated slug (`run-<n>`).
     #[allow(dead_code)]
-    slug: String,
+    pub(super) slug: String,
     /// Canonical terminal URI the agent can read and kill.
-    uri: String,
+    pub(super) uri: String,
     /// Whether the current job was subscribed to the terminal exit wake during
     /// promotion. Kept separate from promotion success so a wake persistence
     /// failure never strands the still-running process behind an unreported URI.
-    wake_subscribed: bool,
+    pub(super) wake_subscribed: bool,
 }
 
 /// Max chars in a composed batch result. Deliberately equal to the CLI's
@@ -209,38 +186,28 @@ struct PromotedTerminal {
 /// (no double truncation, no second elision marker).
 const MAX_RUN_RESULT_CHARS: usize = 45_000;
 
-/// Event payload for real-time bash output streaming
+/// Event payload for real-time run output streaming.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BashOutputPayload {
+pub struct RunOutputPayload {
     pub run_id: String,
     pub tool_use_id: String,
     pub chunk: String,
     pub stream: String, // "stdout" or "stderr"
 }
 
-/// Event payload for bash command completion
+/// Event payload for run command completion.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BashCompletePayload {
+pub struct RunCompletePayload {
     pub run_id: String,
     pub tool_use_id: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
 }
 
-/// Event payload when agent spawns a background terminal
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentTerminalCreatedPayload {
-    pub run_id: String,
-    pub session_id: String,
-    pub command: String,
-    pub description: Option<String>,
-}
-
 /// Maximum output buffer size (64KB)
-const MAX_BUFFER_SIZE: usize = 64 * 1024;
+pub(super) const MAX_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Default pager used for agent-launched commands.
 ///
@@ -256,7 +223,7 @@ fn apply_non_interactive_pager_env(mut config: SpawnConfig) -> SpawnConfig {
     config.env("PAGER", NON_INTERACTIVE_PAGER)
 }
 
-fn apply_non_interactive_pager_env_to_pty(cmd: &mut CommandBuilder) {
+pub(super) fn apply_non_interactive_pager_env_to_pty(cmd: &mut CommandBuilder) {
     cmd.env("GIT_PAGER", NON_INTERACTIVE_PAGER);
     cmd.env("PAGER", NON_INTERACTIVE_PAGER);
 }
@@ -501,7 +468,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // callback's run_id when present: cwd lookups are only a fallback and can
     // miss or pick the wrong run when multiple runs share a repo/worktree path.
     // The live bash preview subscribes by this run id, so using the exact
-    // request run is what wires emitted `bash-output` chunks to the visible tool.
+    // request run is what wires emitted `run-output` chunks to the visible tool.
     let run_context = super::run_context::lookup_run(&orch.db.local, request)
         .await
         .ok();
@@ -780,6 +747,37 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             author.as_ref(),
         )
     };
+    // Record the sealed commit's file changes so a run-path commit populates the
+    // same `file_changes` cache the write path does. This is what makes the
+    // node's diff facet appear, keeps the per-node change summary correct after
+    // worktree teardown, and feeds every other `file_changes` consumer (issue
+    // `/changed` cache fallback, PR data, analytics). Best-effort per file,
+    // mirroring the write path.
+    //
+    // This MUST run BEFORE the `worktree-changed` emit below: that event
+    // invalidates the DB-driven node change summary, whose refetch reads
+    // `file_changes`. The write path holds the same contract (record rows, then
+    // emit) for exactly this reason — emitting first races the async inserts and
+    // can cache an empty summary with no later invalidation to correct it.
+    if barrier.committed {
+        if let Some(patch) = barrier.committed_patch.as_deref() {
+            for change in crate::jj::parse_git_patch(patch) {
+                if let Err(e) = super::write::file_mutations::record_file_change_async(
+                    orch,
+                    &cwd,
+                    &change.path,
+                    &change.status,
+                    change.additions,
+                    change.deletions,
+                    change.previous_path.as_deref(),
+                )
+                .await
+                {
+                    log::warn!("Failed to record run-path file change: {}", e);
+                }
+            }
+        }
+    }
     if barrier.worktree_changed {
         let _ = orch.services.emitter.emit(
             "worktree-changed",
@@ -853,6 +851,13 @@ pub(super) struct CommitBarrierOutcome {
     /// tests, and read by `handle_run` to gate the synchronous when:write check
     /// runner on an actually-sealed commit.
     pub committed: bool,
+    /// The working-copy patch (`jj diff --git`) captured just before the seal,
+    /// carried out ONLY on a successful commit (`committed == true`).
+    /// `handle_run` parses it to record the sealed commit's file changes so the
+    /// run path populates the same `file_changes` cache the write path does.
+    /// `None` on a restore, a clean no-op, a missing commit_msg, or when the
+    /// backend produces no patch.
+    pub committed_patch: Option<String>,
 }
 
 /// Enforce the worktree==HEAD invariant after a `run` batch.
@@ -877,16 +882,21 @@ pub(super) fn run_commit_barrier(
     let mut message = String::new();
     let mut worktree_changed = false;
     let mut committed = false;
+    let mut committed_patch: Option<String> = None;
 
     match commit_msg {
         Some(commit_msg) => {
             // Commit the worktree even when some items failed: a partial-success
             // batch must not silently leave the successful items' dirt behind.
             if !matches!(vcs.is_dirty(worktree_path), Ok(false)) {
+                // Capture the working-copy patch BEFORE the seal empties `@`, so a
+                // successful commit can record its file changes on the run path.
+                let patch = vcs.capture_patch(worktree_path);
                 match vcs.seal_all(worktree_path, commit_msg, author) {
                     Ok(commit_result) => {
                         worktree_changed = true;
                         committed = true;
+                        committed_patch = patch;
                         let pr_suffix = commit_result
                             .pr_number
                             .map(|pr| format!(" updated PR#{}", pr))
@@ -987,6 +997,7 @@ pub(super) fn run_commit_barrier(
                                     message,
                                     worktree_changed,
                                     committed,
+                                    committed_patch,
                                 };
                             }
                             let reset_ok = vcs.discard(worktree_path);
@@ -1027,6 +1038,7 @@ pub(super) fn run_commit_barrier(
         message,
         worktree_changed,
         committed,
+        committed_patch,
     }
 }
 
@@ -1241,6 +1253,18 @@ pub(crate) fn run_item_stream_id(tool_use_id: &str, index: usize) -> String {
     format!("{tool_use_id}:{index}")
 }
 
+/// Stream id for a synchronous when:write check's live output. Namespaced with
+/// `check-` so a check's stream never collides with a run item's stream id
+/// (`run_item_stream_id`) at the same index: the frontend matches run items by
+/// the bare `:{index}` suffix, and a check runs while the committing batch's item
+/// rows are still in flight (the tool result lands only after checks finish), so
+/// a shared `:{index}` id would mis-attribute the check's output to the command
+/// row with the same index. The frontend `activeCheckStream` matcher keys off
+/// this `:check-` namespace instead.
+pub(crate) fn check_stream_id(tool_use_id: &str, index: usize) -> String {
+    format!("{tool_use_id}:check-{index}")
+}
+
 /// Run one project-declared `when:write` check command to completion under the
 /// same OS sandbox / fence env / live-streaming machinery the `run` verb uses,
 /// returning its exit code plus combined captured output.
@@ -1289,7 +1313,7 @@ pub(crate) async fn run_check_command(
 /// This is the turn-end (`when:idle`/`when:review`) cadence's vehicle: at
 /// turn-end the agent is idle, so a fence permission prompt would hang with no
 /// one to answer. Passing `sandbox_enabled=false` takes the same unconditional
-/// `sandbox = None` path the post-fence-grant re-execution uses (bash.rs), so no
+/// `sandbox = None` path the post-fence-grant re-execution uses (run.rs), so no
 /// interactive fence prompt is reachable. `set -o pipefail` preserves the
 /// check's own exit code through the `tee` pipe (otherwise `bash -c` would return
 /// tee's exit, masking a failing check).
@@ -1545,791 +1569,6 @@ fn compose_run_output(outcomes: &[ItemOutcome]) -> String {
     text
 }
 
-#[derive(Clone)]
-struct TerminalResourceTarget {
-    slug: String,
-    job_id: Option<String>,
-    project_id: String,
-    run_id: Option<String>,
-    cwd: String,
-}
-
-async fn resolve_terminal_resource_target(
-    db: &LocalDb,
-    resource: &CairnResource,
-) -> DbResult<TerminalResourceTarget> {
-    let resource = resource.clone();
-    db.read(|conn| {
-        Box::pin(async move {
-            match resource {
-                CairnResource::NodeTerminal {
-                    project,
-                    number,
-                    exec_seq,
-                    node_id,
-                    slug,
-                } => {
-                    let job_id = find_terminal_target_job_id(conn, &project, number, exec_seq, &node_id)
-                        .await?
-                        .ok_or_else(|| {
-                            crate::storage::DbError::Row(format!(
-                                "No node job found for terminal target {project}-{number}/{exec_seq}/{node_id}"
-                            ))
-                        })?;
-                    let mut rows = conn
-                        .query(
-                            "
-                            SELECT j.project_id, COALESCE(j.worktree_path, p.repo_path), r.id
-                            FROM jobs j
-                            JOIN projects p ON j.project_id = p.id
-                            LEFT JOIN runs r ON r.job_id = j.id
-                            WHERE j.id = ?1
-                            ORDER BY r.created_at DESC
-                            LIMIT 1
-                            ",
-                            (job_id.as_str(),),
-                        )
-                        .await?;
-                    let row = rows.next().await?.ok_or_else(|| {
-                        crate::storage::DbError::Row(format!("No job found for id {job_id}"))
-                    })?;
-                    Ok(TerminalResourceTarget {
-                        slug,
-                        job_id: Some(job_id),
-                        project_id: row.text(0)?,
-                        cwd: row.text(1)?,
-                        run_id: row.opt_text(2)?,
-                    })
-                }
-                CairnResource::TaskTerminal {
-                    project,
-                    number,
-                    exec_seq,
-                    node_id,
-                    task_name,
-                    slug,
-                } => {
-                    let job_id = find_task_terminal_target_job_id(
-                        conn,
-                        &project,
-                        number,
-                        exec_seq,
-                        &node_id,
-                        &task_name,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        crate::storage::DbError::Row(format!(
-                            "No task job found for terminal target {project}-{number}/{exec_seq}/{node_id}/task/{task_name}"
-                        ))
-                    })?;
-                    let mut rows = conn
-                        .query(
-                            "
-                            SELECT j.project_id, COALESCE(j.worktree_path, p.repo_path), r.id
-                            FROM jobs j
-                            JOIN projects p ON j.project_id = p.id
-                            LEFT JOIN runs r ON r.job_id = j.id
-                            WHERE j.id = ?1
-                            ORDER BY r.created_at DESC
-                            LIMIT 1
-                            ",
-                            (job_id.as_str(),),
-                        )
-                        .await?;
-                    let row = rows.next().await?.ok_or_else(|| {
-                        crate::storage::DbError::Row(format!("No job found for id {job_id}"))
-                    })?;
-                    Ok(TerminalResourceTarget {
-                        slug,
-                        job_id: Some(job_id),
-                        project_id: row.text(0)?,
-                        cwd: row.text(1)?,
-                        run_id: row.opt_text(2)?,
-                    })
-                }
-                CairnResource::ProjectTerminal { project, slug } => {
-                    let lookup_key = project.to_uppercase();
-                    let mut rows = conn
-                        .query(
-                            "SELECT id, repo_path FROM projects WHERE key = ?1 LIMIT 1",
-                            (lookup_key.as_str(),),
-                        )
-                        .await?;
-                    let row = rows.next().await?.ok_or_else(|| {
-                        crate::storage::DbError::Row(format!("No project found for key {project}"))
-                    })?;
-                    Ok(TerminalResourceTarget {
-                        slug,
-                        job_id: None,
-                        project_id: row.text(0)?,
-                        cwd: row.text(1)?,
-                        run_id: None,
-                    })
-                }
-                _ => Err(crate::storage::DbError::Row(
-                    "Resource is not a terminal URI".to_string(),
-                )),
-            }
-        })
-    })
-    .await
-}
-
-async fn ensure_terminal_slug_available(
-    db: &LocalDb,
-    target: &TerminalResourceTarget,
-) -> DbResult<()> {
-    let job_id = target.job_id.clone();
-    let project_id = target.project_id.clone();
-    let slug = target.slug.clone();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        let project_id = project_id.clone();
-        let slug = slug.clone();
-        Box::pin(async move {
-            // Only a *running* terminal blocks the slug. Exited rows linger (for
-            // post-exit reads and already-exited wake subscribes) and are
-            // reclaimed on insert, so they must not block re-creating the slug.
-            let exists = match job_id.as_deref() {
-                Some(job_id) => terminal_slug_running_for_job(conn, job_id, &slug).await?,
-                None => terminal_slug_running_for_project(conn, &project_id, &slug).await?,
-            };
-            if exists {
-                return Err(crate::storage::DbError::Row(format!(
-                    "A running terminal already exists in this scope: {slug}"
-                )));
-            }
-            Ok(())
-        })
-    })
-    .await
-}
-
-async fn insert_terminal_resource(
-    db: &LocalDb,
-    target: &TerminalResourceTarget,
-    session_id: &str,
-    command: &str,
-    description: Option<&str>,
-) -> DbResult<()> {
-    let job_id = target.job_id.clone();
-    let project_id = target.project_id.clone();
-    let run_id = target.run_id.clone();
-    let slug = target.slug.clone();
-    let session_id = session_id.to_string();
-    let command = command.to_string();
-    let description = description.map(ToOwned::to_owned);
-
-    db.write(|conn| {
-        let job_id = job_id.clone();
-        let project_id = project_id.clone();
-        let run_id = run_id.clone();
-        let slug = slug.clone();
-        let session_id = session_id.clone();
-        let command = command.clone();
-        let description = description.clone();
-        Box::pin(async move {
-            let now = chrono::Utc::now().timestamp() as i32;
-            let id = Uuid::new_v4().to_string();
-            // Reclaim a lingering exited row for this (scope, slug). The
-            // create-availability check only blocks running slugs, so an exited
-            // row could still collide with the unique (scope, slug) index.
-            match job_id.as_deref() {
-                Some(job_id) => {
-                    conn.execute(
-                        "DELETE FROM job_terminals WHERE job_id = ?1 AND slug = ?2",
-                        (job_id, slug.as_str()),
-                    )
-                    .await?;
-                }
-                None => {
-                    conn.execute(
-                        "DELETE FROM job_terminals WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2",
-                        (project_id.as_str(), slug.as_str()),
-                    )
-                    .await?;
-                }
-            }
-            conn.execute(
-                "
-                INSERT INTO job_terminals (
-                    id, job_id, project_id, run_id, session_id, command, title,
-                    description, status, exit_code, created_at, exited_at, slug
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 'running', NULL, ?8, NULL, ?9)
-                ",
-                (
-                    id.as_str(),
-                    job_id.as_deref(),
-                    if job_id.is_some() {
-                        None
-                    } else {
-                        Some(project_id.as_str())
-                    },
-                    run_id.as_deref(),
-                    session_id.as_str(),
-                    command.as_str(),
-                    description.as_deref(),
-                    now,
-                    slug.as_str(),
-                ),
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-}
-
-async fn update_terminal_resource_session(
-    db: &LocalDb,
-    target: &TerminalResourceTarget,
-    session_id: &str,
-) -> DbResult<()> {
-    let job_id = target.job_id.clone();
-    let project_id = target.project_id.clone();
-    let slug = target.slug.clone();
-    let session_id = session_id.to_string();
-    db.write(|conn| {
-        let job_id = job_id.clone();
-        let project_id = project_id.clone();
-        let slug = slug.clone();
-        let session_id = session_id.clone();
-        Box::pin(async move {
-            if let Some(job_id) = job_id {
-                conn.execute(
-                    "
-                    UPDATE job_terminals
-                    SET session_id = ?3, status = 'running', exit_code = NULL, exited_at = NULL
-                    WHERE job_id = ?1 AND slug = ?2
-                    ",
-                    (job_id.as_str(), slug.as_str(), session_id.as_str()),
-                )
-                .await?;
-            } else {
-                conn.execute(
-                    "
-                    UPDATE job_terminals
-                    SET session_id = ?3, status = 'running', exit_code = NULL, exited_at = NULL
-                    WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2
-                    ",
-                    (project_id.as_str(), slug.as_str(), session_id.as_str()),
-                )
-                .await?;
-            }
-            Ok(())
-        })
-    })
-    .await
-}
-
-async fn find_terminal_target_job_id(
-    conn: &turso::Connection,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    node_id: &str,
-) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut issue_rows = conn
-        .query(
-            "
-            SELECT i.id
-            FROM issues i
-            JOIN projects p ON i.project_id = p.id
-            WHERE p.key = ?1 AND i.number = ?2
-            LIMIT 1
-            ",
-            (lookup_key.as_str(), issue_number),
-        )
-        .await?;
-
-    let Some(issue_row) = issue_rows.next().await? else {
-        return Ok(None);
-    };
-    let issue_id = issue_row.text(0)?;
-
-    let mut exec_rows = conn
-        .query(
-            "
-            SELECT id
-            FROM executions
-            WHERE issue_id = ?1 AND seq = ?2
-            LIMIT 1
-            ",
-            (issue_id.as_str(), exec_seq),
-        )
-        .await?;
-
-    let Some(exec_row) = exec_rows.next().await? else {
-        return Ok(None);
-    };
-    let exec_id = exec_row.text(0)?;
-
-    let mut exact_rows = conn
-        .query(
-            "
-            SELECT id
-            FROM jobs
-            WHERE issue_id = ?1
-              AND execution_id = ?2
-              AND parent_job_id IS NULL
-              AND uri_segment = ?3
-            LIMIT 1
-            ",
-            (issue_id.as_str(), exec_id.as_str(), node_id),
-        )
-        .await?;
-
-    if let Some(row) = exact_rows.next().await? {
-        return Ok(Some(row.text(0)?));
-    }
-
-    Ok(None)
-}
-
-async fn find_task_terminal_target_job_id(
-    conn: &turso::Connection,
-    project_key: &str,
-    issue_number: i32,
-    exec_seq: i32,
-    parent_node_id: &str,
-    task_name: &str,
-) -> DbResult<Option<String>> {
-    let lookup_key = project_key.to_uppercase();
-    let mut rows = conn
-        .query(
-            "
-            SELECT child.id
-            FROM jobs parent
-            JOIN jobs child ON child.parent_job_id = parent.id
-            JOIN issues i ON parent.issue_id = i.id
-            JOIN projects p ON i.project_id = p.id
-            JOIN executions e ON parent.execution_id = e.id
-            WHERE p.key = ?1
-              AND i.number = ?2
-              AND e.seq = ?3
-              AND parent.parent_job_id IS NULL
-              AND parent.uri_segment = ?4
-              AND child.uri_segment = ?5
-            LIMIT 1
-            ",
-            (
-                lookup_key.as_str(),
-                issue_number,
-                exec_seq,
-                parent_node_id,
-                task_name,
-            ),
-        )
-        .await?;
-    rows.next().await?.map(|row| row.text(0)).transpose()
-}
-
-async fn terminal_slug_exists_for_job(
-    conn: &turso::Connection,
-    job_id: &str,
-    slug: &str,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM job_terminals WHERE job_id = ?1 AND slug = ?2",
-            (job_id, slug),
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| crate::storage::DbError::Row("missing terminal count".to_string()))?;
-    Ok(row.i64(0)? > 0)
-}
-
-async fn terminal_slug_exists_for_project(
-    conn: &turso::Connection,
-    project_id: &str,
-    slug: &str,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            "
-            SELECT COUNT(*)
-            FROM job_terminals
-            WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2
-            ",
-            (project_id, slug),
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| crate::storage::DbError::Row("missing terminal count".to_string()))?;
-    Ok(row.i64(0)? > 0)
-}
-
-/// Whether a *running* terminal with this slug exists in the job scope. Used by
-/// create-availability so a lingering exited row does not block re-use.
-async fn terminal_slug_running_for_job(
-    conn: &turso::Connection,
-    job_id: &str,
-    slug: &str,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM job_terminals
-             WHERE job_id = ?1 AND slug = ?2 AND status = 'running'",
-            (job_id, slug),
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| crate::storage::DbError::Row("missing terminal count".to_string()))?;
-    Ok(row.i64(0)? > 0)
-}
-
-async fn terminal_slug_running_for_project(
-    conn: &turso::Connection,
-    project_id: &str,
-    slug: &str,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT COUNT(*) FROM job_terminals
-             WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2 AND status = 'running'",
-            (project_id, slug),
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| crate::storage::DbError::Row("missing terminal count".to_string()))?;
-    Ok(row.i64(0)? > 0)
-}
-
-/// A job-owned terminal row, loaded for terminal-exit wake subscribe validation
-/// and the already-exited immediate-fire path.
-pub(crate) struct TerminalWakeRow {
-    pub status: String,
-    pub exit_code: Option<i32>,
-    pub created_at: i64,
-    pub exited_at: Option<i64>,
-    pub output_tail: Option<String>,
-    /// The live PTY session id, used to reach the session's in-memory output
-    /// buffer and phrase-watcher registry when subscribing an output wake.
-    pub session_id: Option<String>,
-}
-
-/// Look up a terminal by job scope + slug for wake subscription.
-pub(crate) async fn lookup_terminal_for_wake(
-    db: &LocalDb,
-    job_id: &str,
-    slug: &str,
-) -> DbResult<Option<TerminalWakeRow>> {
-    let job_id = job_id.to_string();
-    let slug = slug.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        let slug = slug.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
-                     FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
-                    params![job_id.as_str(), slug.as_str()],
-                )
-                .await?;
-            let Some(row) = rows.next().await? else {
-                return Ok(None);
-            };
-            Ok(Some(TerminalWakeRow {
-                status: row.text(0)?,
-                exit_code: row.opt_i64(1)?.map(|code| code as i32),
-                created_at: row.i64(2)?,
-                exited_at: row.opt_i64(3)?,
-                output_tail: row.opt_text(4)?,
-                session_id: row.opt_text(5)?,
-            }))
-        })
-    })
-    .await
-}
-
-/// List the terminal slugs owned by a job, for a precise unknown-slug error.
-pub(crate) async fn list_job_terminal_slugs(db: &LocalDb, job_id: &str) -> DbResult<Vec<String>> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT slug FROM job_terminals
-                     WHERE job_id = ?1 AND slug IS NOT NULL ORDER BY slug",
-                    params![job_id.as_str()],
-                )
-                .await?;
-            let mut slugs = Vec::new();
-            while let Some(row) = rows.next().await? {
-                slugs.push(row.text(0)?);
-            }
-            Ok(slugs)
-        })
-    })
-    .await
-}
-
-/// Whether a terminal with this slug exists in any state (running or exited).
-/// The promote `run-N` auto-allocation scan uses this so exited run slugs stay
-/// taken and run numbers remain monotonic.
-async fn terminal_slug_taken_any(db: &LocalDb, target: &TerminalResourceTarget) -> DbResult<bool> {
-    let job_id = target.job_id.clone();
-    let project_id = target.project_id.clone();
-    let slug = target.slug.clone();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        let project_id = project_id.clone();
-        let slug = slug.clone();
-        Box::pin(async move {
-            match job_id.as_deref() {
-                Some(job_id) => terminal_slug_exists_for_job(conn, job_id, &slug).await,
-                None => terminal_slug_exists_for_project(conn, &project_id, &slug).await,
-            }
-        })
-    })
-    .await
-}
-
-fn block_on_background_db<T>(fut: impl std::future::Future<Output = DbResult<T>>) -> DbResult<T> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(crate::storage::DbError::from)?
-        .block_on(fut)
-}
-
-/// Context loaded while marking a terminal exited: the row's `created_at` (for
-/// runtime) and, for a nonzero exit on a job-owned terminal, the injection
-/// target (the owning job's current session + the exit code).
-struct TerminalExitContext {
-    created_at: Option<i64>,
-    injection: Option<(String, i32)>,
-}
-
-/// Mark a terminal row exited and retain its output tail (always), and load the
-/// context the exit path needs. Supersedes the old delete-on-exit: the row now
-/// lingers as `status='exited'` so post-exit reads and already-exited wake
-/// subscribes can still see it. Mark-exited is decoupled from the nonzero-only
-/// injection-target lookup so the two concerns are independent.
-///
-/// The UPDATE is gated on `status='running'`: it is the single idempotency guard
-/// for finalize. Returns `Ok(None)` when no running row matched (already exited
-/// or gone), so every caller — the reader EOF, the promoted watcher, and the
-/// external kill entry point — converges here without ever finalizing twice with
-/// different codes.
-async fn mark_terminal_exited_and_load_context(
-    db: Arc<LocalDb>,
-    terminal_session_id: String,
-    job_id: Option<String>,
-    exit_code: Option<i32>,
-    output_tail: Option<String>,
-) -> DbResult<Option<TerminalExitContext>> {
-    db.write(|conn| {
-        let terminal_session_id = terminal_session_id.clone();
-        let job_id = job_id.clone();
-        let output_tail = output_tail.clone();
-        Box::pin(async move {
-            let now = chrono::Utc::now().timestamp();
-            let transitioned = conn
-                .execute(
-                    "UPDATE job_terminals
-                 SET status = 'exited', exit_code = ?2, exited_at = ?3, output_tail = ?4
-                 WHERE session_id = ?1 AND status = 'running'",
-                    params![
-                        terminal_session_id.as_str(),
-                        exit_code.map(|code| code as i64),
-                        now,
-                        output_tail.as_deref()
-                    ],
-                )
-                .await?;
-            if transitioned == 0 {
-                return Ok(None);
-            }
-
-            let mut rows = conn
-                .query(
-                    "SELECT created_at FROM job_terminals WHERE session_id = ?1 LIMIT 1",
-                    params![terminal_session_id.as_str()],
-                )
-                .await?;
-            let created_at = rows.next().await?.map(|row| row.i64(0)).transpose()?;
-            drop(rows);
-
-            // Nonzero-exit injection target: the owning job's current session.
-            let injection = match (job_id, exit_code.filter(|code| *code != 0)) {
-                (Some(job_id), Some(code)) => {
-                    let mut rows = conn
-                        .query(
-                            "SELECT current_session_id FROM jobs WHERE id = ?1 LIMIT 1",
-                            params![job_id.as_str()],
-                        )
-                        .await?;
-                    rows.next()
-                        .await?
-                        .map(|row| row.opt_text(0))
-                        .transpose()?
-                        .flatten()
-                        .map(|session_id| (session_id, code))
-                }
-                _ => None,
-            };
-
-            Ok(Some(TerminalExitContext {
-                created_at,
-                injection,
-            }))
-        })
-    })
-    .await
-}
-
-/// Capture the last ~2000 chars of a terminal's buffer for the retained
-/// `output_tail` and the wake message.
-fn capture_output_tail(buffer: &Arc<Mutex<VecDeque<u8>>>) -> Option<String> {
-    let bytes: Vec<u8> = buffer
-        .lock()
-        .map(|b| b.iter().copied().collect())
-        .unwrap_or_default();
-    if bytes.is_empty() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let chars: Vec<char> = text.chars().collect();
-    let start = chars.len().saturating_sub(2000);
-    let tail: String = chars[start..].iter().collect();
-    if tail.trim().is_empty() {
-        None
-    } else {
-        Some(tail)
-    }
-}
-
-/// Outcome of registering an output-phrase watcher on a live terminal session.
-pub(crate) enum OutputWatchRegistration {
-    /// The phrase is already present in the terminal's current buffer; the
-    /// caller should fire the wake immediately rather than register a watcher.
-    AlreadyPresent { excerpt: Option<String> },
-    /// A live watcher was registered; it fires when the phrase next appears.
-    Registered,
-    /// No live agent PTY session backs this terminal, so its output cannot be
-    /// watched (e.g. a promoted-run or already-finalized session).
-    NotLive,
-}
-
-/// Register a phrase watcher on a live terminal session, after first scanning
-/// the session's current output buffer so an already-printed phrase fires
-/// immediately instead of waiting for new output.
-pub(crate) fn register_terminal_output_watcher(
-    orch: &Orchestrator,
-    session_id: &str,
-    subscription_id: &str,
-    job_id: &str,
-    phrase: &str,
-    terminal_uri: &str,
-) -> OutputWatchRegistration {
-    let session_arc = {
-        let Ok(sessions) = orch.pty_state.sessions.lock() else {
-            return OutputWatchRegistration::NotLive;
-        };
-        match sessions.get(session_id) {
-            Some(arc) => arc.clone(),
-            None => return OutputWatchRegistration::NotLive,
-        }
-    };
-    let (watchers, buffer) = {
-        let Ok(session) = session_arc.lock() else {
-            return OutputWatchRegistration::NotLive;
-        };
-        let Some(watchers) = session.output_watchers.clone() else {
-            return OutputWatchRegistration::NotLive;
-        };
-        (watchers, session.output_buffer.clone())
-    };
-    if let Some(buffer) = buffer {
-        let bytes: Vec<u8> = buffer
-            .lock()
-            .map(|b| b.iter().copied().collect())
-            .unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes);
-        let scan = crate::services::scan_for_phrase("", &text, phrase);
-        if scan.matched_excerpt.is_some() {
-            return OutputWatchRegistration::AlreadyPresent {
-                excerpt: scan.matched_excerpt,
-            };
-        }
-    }
-    // Bind to a local so the lock-guard temporary drops here, before the
-    // function's `watchers`/`buffer` locals (a tail-position match would keep
-    // the guard's borrow alive past their drop — E0597).
-    let outcome = match watchers.lock() {
-        Ok(mut guard) => {
-            // Replace any existing watcher for this subscription (a re-subscribe
-            // may change the phrase) so the session never carries a stale one,
-            // and a subscribe that lands on a session already hydrated for this
-            // same row does not double-register it.
-            guard.retain(|w| w.subscription_id != subscription_id);
-            guard.push(crate::services::TerminalOutputWatcher {
-                subscription_id: subscription_id.to_string(),
-                job_id: job_id.to_string(),
-                phrase: phrase.to_string(),
-                carry: String::new(),
-                terminal_uri: terminal_uri.to_string(),
-            });
-            OutputWatchRegistration::Registered
-        }
-        Err(_) => OutputWatchRegistration::NotLive,
-    };
-    outcome
-}
-
-async fn lookup_terminal_session_id_for_target(
-    db: &LocalDb,
-    target: &TerminalResourceTarget,
-) -> DbResult<Option<String>> {
-    let job_id = target.job_id.clone();
-    let project_id = target.project_id.clone();
-    let slug = target.slug.clone();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = if let Some(job_id) = job_id {
-                conn.query(
-                    "
-                    SELECT session_id
-                    FROM job_terminals
-                    WHERE job_id = ?1 AND slug = ?2
-                    LIMIT 1
-                    ",
-                    (job_id.as_str(), slug.as_str()),
-                )
-                .await?
-            } else {
-                conn.query(
-                    "
-                    SELECT session_id
-                    FROM job_terminals
-                    WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2
-                    LIMIT 1
-                    ",
-                    (project_id.as_str(), slug.as_str()),
-                )
-                .await?
-            };
-            crate::storage::next_text(&mut rows, 0).await
-        })
-    })
-    .await
-}
-
 /// Run a single resolved item: execute it, format its body, and (for shell
 /// items only) cache checkpoint results and auto-push on `git commit`.
 #[allow(clippy::too_many_arguments)]
@@ -2380,6 +1619,16 @@ async fn run_one(
     };
 
     let timeout_ms = timeout.unwrap_or(120_000).min(600_000);
+
+    if let Some(command) = shell_command.as_deref() {
+        if !branch_scoped_run {
+            if let Some(outcome) =
+                try_run_warm_search(orch, run_context, cwd, header.clone(), command).await
+            {
+                return outcome;
+            }
+        }
+    }
 
     let mut exec = match execute_process(
         orch,
@@ -2520,6 +1769,103 @@ async fn run_one(
         header,
         body,
         succeeded,
+        suspended: false,
+        images: Vec::new(),
+    }
+}
+
+async fn try_run_warm_search(
+    orch: &Orchestrator,
+    run_context: Option<&super::RunContext>,
+    cwd: &str,
+    header: String,
+    command: &str,
+) -> Option<ItemOutcome> {
+    let translated = translate_search_command(command)?;
+    let worktree_raw = PathBuf::from(run_context?.worktree_path.as_ref()?);
+    let deny_read = orch.sandbox_deny_read();
+    match translated {
+        TranslatedSearch::Grep {
+            pattern,
+            globs,
+            output_mode,
+            case_insensitive,
+            before_context,
+            after_context,
+            show_line_numbers,
+            max_per_file,
+            path,
+        } => {
+            let search_root = resolve_run_search_root(cwd, path.as_deref());
+            let scope = super::search::resolve_worktree_scope(orch, &search_root, &worktree_raw)?;
+            let params = crate::worktree_search::WorktreeGrepParams {
+                pattern: pattern.clone(),
+                subdir: scope.subdir,
+                globs,
+                max_per_file,
+                output_mode,
+                case_insensitive,
+                before_context,
+                after_context,
+                show_line_numbers,
+            };
+            let body =
+                tokio::task::spawn_blocking(move || scope.search.try_grep(&params, &deny_read))
+                    .await
+                    .ok()??;
+            let body = super::search::finalize_grep_output(body, &pattern, 0, None);
+            Some(warm_search_outcome(header, body))
+        }
+        TranslatedSearch::Files { globs, path } => {
+            let pattern = match globs.as_slice() {
+                [] => "**".to_string(),
+                [glob] if !glob.starts_with('!') => glob.clone(),
+                _ => return None,
+            };
+            let search_root = resolve_run_search_root(cwd, path.as_deref());
+            let scope = super::search::resolve_worktree_scope(orch, &search_root, &worktree_raw)?;
+            let subdir = scope.subdir.clone();
+            let paths = tokio::task::spawn_blocking(move || {
+                scope
+                    .search
+                    .try_glob(&pattern, subdir.as_deref(), &deny_read)
+            })
+            .await
+            .ok()??;
+            let body = paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(warm_search_outcome(header, body))
+        }
+    }
+}
+
+fn resolve_run_search_root(cwd: &str, path: Option<&str>) -> PathBuf {
+    match path {
+        Some(path) => {
+            let expanded = expand_tilde(path);
+            let path = Path::new(&expanded);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                Path::new(cwd).join(path)
+            }
+        }
+        None => PathBuf::from(cwd),
+    }
+}
+
+fn warm_search_outcome(header: String, mut body: String) -> ItemOutcome {
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.push_str("[served from Cairn's warm search index, not a spawned process]");
+    ItemOutcome {
+        header: format!("{header} [warm index]"),
+        body,
+        succeeded: true,
         suspended: false,
         images: Vec::new(),
     }
@@ -2801,8 +2147,8 @@ async fn execute_process(
                     // Stream to frontend if we have run context
                     if let Some(ref rid) = run_id {
                         let _ = emitter.emit(
-                            "bash-output",
-                            serde_json::to_value(BashOutputPayload {
+                            "run-output",
+                            serde_json::to_value(RunOutputPayload {
                                 run_id: rid.clone(),
                                 tool_use_id: tool_id.clone(),
                                 chunk: format!("{}\n", line),
@@ -2841,8 +2187,8 @@ async fn execute_process(
                     // Stream to frontend if we have run context
                     if let Some(ref rid) = run_id {
                         let _ = emitter.emit(
-                            "bash-output",
-                            serde_json::to_value(BashOutputPayload {
+                            "run-output",
+                            serde_json::to_value(RunOutputPayload {
                                 run_id: rid.clone(),
                                 tool_use_id: tool_id.clone(),
                                 chunk: format!("{}\n", line),
@@ -2930,7 +2276,7 @@ async fn execute_process(
                     .clone()
                     .expect("combined buffer is created whenever run_context is set");
                 let display_cmd = shell_command.unwrap_or(program);
-                match promote_to_terminal(
+                match terminal::promote_to_terminal(
                     orch,
                     ctx,
                     cwd,
@@ -2972,8 +2318,8 @@ async fn execute_process(
 
         if let Some(ctx) = run_context {
             let _ = orch.services.emitter.emit(
-                "bash-complete",
-                serde_json::to_value(BashCompletePayload {
+                "run-complete",
+                serde_json::to_value(RunCompletePayload {
                     run_id: ctx.run_id.clone(),
                     tool_use_id: tool_use_id.clone(),
                     exit_code: None,
@@ -3008,8 +2354,8 @@ async fn execute_process(
 
     if let Some(ctx) = run_context {
         let _ = orch.services.emitter.emit(
-            "bash-complete",
-            serde_json::to_value(BashCompletePayload {
+            "run-complete",
+            serde_json::to_value(RunCompletePayload {
                 run_id: ctx.run_id.clone(),
                 tool_use_id: tool_use_id.clone(),
                 exit_code,
@@ -3092,520 +2438,6 @@ async fn reap_readers_bounded(
         }),
     )
     .await;
-}
-
-/// Promote a still-running, timed-out inline command to a durable terminal.
-///
-/// The inline child becomes the terminal's `TerminalChild`; the combined capture
-/// buffer (already seeded and still fed by the reader threads) becomes the
-/// terminal's output buffer. Inline-command bookkeeping is handed off here; the
-/// caller must disarm the kill-on-drop guard. A background watcher thread
-/// finalizes the terminal when the process eventually exits.
-#[allow(clippy::too_many_arguments)]
-async fn promote_to_terminal(
-    orch: &Orchestrator,
-    ctx: &super::RunContext,
-    cwd: &str,
-    command: &str,
-    child: Arc<Mutex<Box<dyn crate::services::ChildProcess>>>,
-    output_buffer: Arc<Mutex<VecDeque<u8>>>,
-    last_output_at: Option<Arc<Mutex<SystemTime>>>,
-    inline_command_id: &str,
-) -> Result<PromotedTerminal, String> {
-    let mut target = TerminalResourceTarget {
-        slug: String::new(),
-        job_id: Some(ctx.job_id.clone()),
-        project_id: ctx.project_id.clone(),
-        run_id: Some(ctx.run_id.clone()),
-        cwd: cwd.to_string(),
-    };
-
-    // Auto slug: run-1, run-2, ... until one is free in this job's scope.
-    let mut slug = String::new();
-    for n in 1..=10_000 {
-        let candidate = format!("run-{n}");
-        target.slug = candidate.clone();
-        // Any-state check: an exited run slug stays taken so run numbers remain
-        // monotonic across promotions within a job.
-        if !terminal_slug_taken_any(&orch.db.local, &target)
-            .await
-            .unwrap_or(true)
-        {
-            slug = candidate;
-            break;
-        }
-    }
-    if slug.is_empty() {
-        return Err("could not allocate a terminal slug".to_string());
-    }
-
-    let session_id = ids::mint_session_id().into_string();
-    insert_terminal_resource(&orch.db.local, &target, &session_id, command, None)
-        .await
-        .map_err(|e| format!("Database error: {e}"))?;
-
-    // A pipe-backed session: no PTY master/writer (input/resize unavailable),
-    // while exit tracking and buffer reads work the same as any terminal.
-    let session = PtySession {
-        master: None,
-        writer: None,
-        child: Box::new(crate::services::InlineTerminalChild::new(child.clone())),
-        output_buffer: Some(output_buffer.clone()),
-        is_agent_spawned: true,
-        last_output_at,
-        // Agent/promoted sessions are non-interactive: no prompt markers, no busy signal.
-        command_state: None,
-        // Promoted runs have no chunked read loop to scan; output phrase wakes
-        // are an agent-PTY-terminal feature only.
-        output_watchers: None,
-    };
-    {
-        let mut sessions = orch
-            .pty_state
-            .sessions
-            .lock()
-            .map_err(|e| format!("Failed to store session: {e}"))?;
-        sessions.insert(session_id.clone(), Arc::new(Mutex::new(session)));
-    }
-
-    // Ownership of the process has moved to the terminal; stop the inline
-    // interrupt bookkeeping for it.
-    orch.pty_state
-        .unregister_inline_command(&ctx.run_id, inline_command_id);
-
-    // Round-trips for a top-level node; a sub-task job still gets a readable,
-    // killable terminal via the UI and job teardown.
-    let uri = build_promoted_terminal_uri(orch, ctx, &slug).await;
-
-    let wake_subscribed = subscribe_promoted_terminal_exit_wake(orch, &ctx.job_id, &uri).await;
-
-    // Promoted-process exit watcher: block on the inline child, then run the same
-    // finalization a PTY terminal does on EOF. Plain OS thread, so the blocking
-    // wait and `block_on_background_db` inside finalize are safe.
-    {
-        let orch_t = orch.clone();
-        let job_id = ctx.job_id.clone();
-        let command_t = command.to_string();
-        let buffer_t = output_buffer.clone();
-        let watch_child = child.clone();
-        let sid = session_id.clone();
-        let process_ref = slug.clone();
-        let detail_uri = uri.clone();
-        thread::spawn(move || {
-            let mut tc = crate::services::InlineTerminalChild::new(watch_child);
-            let _ = tc.wait();
-            let exit_code = tc.try_wait_exit();
-            finalize_terminal_session(
-                &orch_t,
-                &sid,
-                exit_code,
-                &buffer_t,
-                &command_t,
-                Some(job_id),
-                &process_ref,
-                &detail_uri,
-            );
-        });
-    }
-
-    // Surface the new terminal to the UI.
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "job_terminals", "action": "update"}),
-    );
-    let _ = orch.services.emitter.emit(
-        "agent-terminal-created",
-        serde_json::to_value(AgentTerminalCreatedPayload {
-            run_id: ctx.run_id.clone(),
-            session_id,
-            command: command.to_string(),
-            description: None,
-        })
-        .unwrap_or_default(),
-    );
-
-    Ok(PromotedTerminal {
-        slug,
-        uri,
-        wake_subscribed,
-    })
-}
-
-async fn subscribe_promoted_terminal_exit_wake(
-    orch: &Orchestrator,
-    job_id: &str,
-    terminal_uri: &str,
-) -> bool {
-    let fact_kinds = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
-    match crate::orchestrator::wakes::subscribe_one_shot(
-        &orch.db.local,
-        job_id,
-        "process",
-        Some(terminal_uri),
-        Some(&fact_kinds),
-        "agent",
-    )
-    .await
-    {
-        Ok(_) => true,
-        Err(error) => {
-            log::warn!(
-                "failed to subscribe promoted terminal exit wake for {terminal_uri}: {error}"
-            );
-            false
-        }
-    }
-}
-
-/// Build the canonical readable/killable URI for a promoted terminal.
-async fn build_promoted_terminal_uri(
-    orch: &Orchestrator,
-    ctx: &super::RunContext,
-    slug: &str,
-) -> String {
-    if let (Some(num), Some(seq)) = (ctx.issue_number, ctx.exec_seq) {
-        if let Some(parent_segment) =
-            crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, &ctx.job_id).await
-        {
-            if let Some(task_segment) =
-                crate::jobs::queries::task_uri_segment_for_job(&orch.db.local, &ctx.job_id).await
-            {
-                return cairn_common::uri::build_task_terminal_uri(
-                    &ctx.project_key,
-                    num,
-                    seq,
-                    &parent_segment,
-                    &task_segment,
-                    slug,
-                );
-            }
-        }
-        if let Some(segment) =
-            crate::jobs::queries::node_uri_segment_for_job(&orch.db.local, &ctx.job_id).await
-        {
-            return cairn_common::uri::build_node_terminal_uri(
-                &ctx.project_key,
-                num,
-                seq,
-                &segment,
-                slug,
-            );
-        }
-    }
-    cairn_common::uri::build_project_terminal_uri(&ctx.project_key, slug)
-}
-
-/// Remove a dead terminal session from the live PTY map without killing (the
-/// child has already exited). Idempotent: removing an absent session no-ops.
-fn remove_pty_session(pty_state: &crate::services::PtyState, session_id: &str) {
-    if let Ok(mut sessions) = pty_state.sessions.lock() {
-        sessions.remove(session_id);
-    }
-}
-
-/// The single terminal end-of-life sink. Attempts the conditional mark-exited
-/// first; on a real `running`→`exited` transition it emits `pty-exit` +
-/// `db-change`, routes the rich `terminal_exit` wake, runs nonzero-exit
-/// injection, and finally drops the dead session from the live map. When no row
-/// transitioned (already exited, or gone) it is a pure no-op beyond dropping the
-/// session — no second `pty-exit`, wake, or injection. This makes finalize
-/// idempotent across every caller (reader EOF, promoted watcher, external kill,
-/// fence-deny, reader-error) at the DB boundary.
-#[allow(clippy::too_many_arguments)]
-fn finalize_terminal_session(
-    orch: &Orchestrator,
-    session_id: &str,
-    exit_code: Option<i32>,
-    buffer: &Arc<Mutex<VecDeque<u8>>>,
-    command: &str,
-    job_id: Option<String>,
-    process_ref: &str,
-    detail_uri: &str,
-) {
-    let output_tail = capture_output_tail(buffer);
-
-    let context = match block_on_background_db(mark_terminal_exited_and_load_context(
-        orch.db.local.clone(),
-        session_id.to_string(),
-        job_id,
-        exit_code,
-        output_tail.clone(),
-    )) {
-        Ok(Some(context)) => context,
-        // No running row matched: another path already finalized (or the row is
-        // gone). Stay idempotent — drop the dead session and return without a
-        // second pty-exit/wake/injection.
-        Ok(None) => {
-            remove_pty_session(&orch.pty_state, session_id);
-            return;
-        }
-        Err(error) => {
-            log::warn!("failed to mark terminal exited for {process_ref}: {error}");
-            remove_pty_session(&orch.pty_state, session_id);
-            return;
-        }
-    };
-
-    let _ = orch.services.emitter.emit(
-        "pty-exit",
-        serde_json::to_value(PtyExitPayload {
-            session_id: session_id.to_string(),
-            exit_code,
-        })
-        .unwrap_or_default(),
-    );
-
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "job_terminals", "action": "update"}),
-    );
-
-    let runtime_secs = context
-        .created_at
-        .map(|created| (chrono::Utc::now().timestamp() - created).max(0));
-
-    if let Err(error) = crate::orchestrator::wakes::route_terminal_exit(
-        orch,
-        process_ref,
-        detail_uri,
-        exit_code,
-        runtime_secs,
-        output_tail.as_deref(),
-    ) {
-        log::warn!("failed to route terminal-exit wake for {process_ref}: {error}");
-    }
-
-    if let Some((injection_session_id, code)) = context.injection {
-        send_terminal_exit_context(
-            orch,
-            &injection_session_id,
-            session_id,
-            code,
-            buffer,
-            command,
-        );
-    }
-
-    // The process is dead and finalize has captured everything it needs from the
-    // session (buffer/exit were passed in). Drop it from the live map.
-    remove_pty_session(&orch.pty_state, session_id);
-}
-
-/// Exit code recorded for a terminal we intentionally killed: the SIGKILL
-/// convention (128 + 9). A killed-mid-run command must never read as success.
-const KILLED_EXIT_CODE: i32 = 137;
-
-/// The fields finalize-by-session needs from a `job_terminals` row.
-struct TerminalFinalizeRow {
-    status: String,
-    job_id: Option<String>,
-    project_id: Option<String>,
-    slug: Option<String>,
-    command: String,
-}
-
-async fn load_terminal_finalize_row(
-    db: &LocalDb,
-    session_id: &str,
-) -> DbResult<Option<TerminalFinalizeRow>> {
-    let session_id = session_id.to_string();
-    db.query_opt(
-        "SELECT status, job_id, project_id, slug, command
-         FROM job_terminals WHERE session_id = ?1 LIMIT 1",
-        params![session_id.as_str()],
-        |row| {
-            Ok(TerminalFinalizeRow {
-                status: row.text(0)?,
-                job_id: row.opt_text(1)?,
-                project_id: row.opt_text(2)?,
-                slug: row.opt_text(3)?,
-                command: row.text(4)?,
-            })
-        },
-    )
-    .await
-}
-
-/// Reconstruct a terminal's canonical detail URI from its row. Mirrors
-/// `build_promoted_terminal_uri` and the subscribe path (`dispatch.rs`) so the
-/// `terminal_exit` wake's match key matches what a subscriber stored, without a
-/// stored-URI column: job-owned with a resolvable issue/exec/node → node URI;
-/// otherwise the project URI.
-async fn build_terminal_detail_uri(
-    orch: &Orchestrator,
-    job_id: Option<&str>,
-    project_id: Option<&str>,
-    slug: &str,
-) -> String {
-    if let Some(job_id) = job_id {
-        if let Some((project_key, number, exec_seq)) =
-            load_job_uri_parts(&orch.db.local, job_id).await
-        {
-            if let Some(parent_segment) =
-                crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, job_id).await
-            {
-                if let Some(task_segment) =
-                    crate::jobs::queries::task_uri_segment_for_job(&orch.db.local, job_id).await
-                {
-                    return cairn_common::uri::build_task_terminal_uri(
-                        &project_key,
-                        number,
-                        exec_seq,
-                        &parent_segment,
-                        &task_segment,
-                        slug,
-                    );
-                }
-            }
-            if let Some(segment) =
-                crate::jobs::queries::node_uri_segment_for_job(&orch.db.local, job_id).await
-            {
-                return cairn_common::uri::build_node_terminal_uri(
-                    &project_key,
-                    number,
-                    exec_seq,
-                    &segment,
-                    slug,
-                );
-            }
-            return cairn_common::uri::build_project_terminal_uri(&project_key, slug);
-        }
-    }
-    if let Some(project_id) = project_id {
-        if let Some(project_key) = load_project_key(&orch.db.local, project_id).await {
-            return cairn_common::uri::build_project_terminal_uri(&project_key, slug);
-        }
-    }
-    cairn_common::uri::build_project_terminal_uri(project_id.unwrap_or_default(), slug)
-}
-
-async fn load_job_uri_parts(db: &LocalDb, job_id: &str) -> Option<(String, i32, i32)> {
-    let job_id = job_id.to_string();
-    db.query_opt(
-        "SELECT p.key, i.number, e.seq
-         FROM jobs j
-         JOIN issues i ON i.id = j.issue_id
-         JOIN projects p ON p.id = i.project_id
-         LEFT JOIN executions e ON e.id = j.execution_id
-         WHERE j.id = ?1 LIMIT 1",
-        params![job_id.as_str()],
-        |row| Ok((row.text(0)?, row.i64(1)? as i32, row.opt_i64(2)?)),
-    )
-    .await
-    .ok()
-    .flatten()
-    .and_then(|(key, number, seq)| seq.map(|seq| (key, number, seq as i32)))
-}
-
-async fn load_project_key(db: &LocalDb, project_id: &str) -> Option<String> {
-    db.query_opt_text(
-        "SELECT key FROM projects WHERE id = ?1 LIMIT 1",
-        params![project_id.to_string()],
-    )
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Take a live session out of the PTY map, capture its buffer, kill the child,
-/// and derive an honest non-success exit code. `try_wait_exit` can report `0`
-/// (or `None`) for a signalled child — portable_pty drops the signal and std's
-/// `ExitStatus::code()` is `None` on signal death — so any zero/unknown is
-/// normalized to the SIGKILL convention. Neither the row's `exit_code` nor the
-/// wake message can then read as success for a killed terminal.
-fn take_and_kill_session(
-    pty_state: &crate::services::PtyState,
-    session_id: &str,
-) -> (Arc<Mutex<VecDeque<u8>>>, Option<i32>) {
-    let session_arc = pty_state
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|mut sessions| sessions.remove(session_id));
-    let empty = || Arc::new(Mutex::new(VecDeque::new()));
-    match session_arc {
-        Some(arc) => match arc.lock() {
-            Ok(mut session) => {
-                let buffer = session.output_buffer.clone().unwrap_or_else(empty);
-                let _ = session.child.kill();
-                let _ = session.child.wait();
-                let exit_code = session
-                    .child
-                    .try_wait_exit()
-                    .filter(|code| *code != 0)
-                    .or(Some(KILLED_EXIT_CODE));
-                (buffer, exit_code)
-            }
-            Err(_) => (empty(), Some(KILLED_EXIT_CODE)),
-        },
-        None => (empty(), Some(KILLED_EXIT_CODE)),
-    }
-}
-
-/// Converge an externally-triggered terminal end-of-life (UI tab close, resource
-/// "stop", session hard kill) on the single finalize sink: kill the live child,
-/// mark the row exited with an honest non-success code, route the exit wake, and
-/// retain the row. No-ops when the row is missing or already exited — the reader
-/// EOF that follows the kill hits the conditional UPDATE (0 rows) and no-ops too.
-/// Deletion is reserved for job teardown.
-///
-/// The work runs on a dedicated plain thread because finalize blocks on a fresh
-/// current-thread runtime, which panics on any thread that carries a tokio
-/// context (a `spawn_blocking` worker or a runtime thread). Callers come from
-/// both sync and async contexts, so this isolates uniformly. Async callers
-/// should still wrap the call in `spawn_blocking` so the join does not stall an
-/// executor worker.
-pub fn finalize_terminal_by_session_id(
-    orch: &Orchestrator,
-    session_id: &str,
-) -> Result<(), String> {
-    let orch = orch.clone();
-    let session_id = session_id.to_string();
-    std::thread::spawn(move || finalize_terminal_by_session_id_inner(&orch, &session_id))
-        .join()
-        .map_err(|_| "terminal finalize thread panicked".to_string())?
-}
-
-fn finalize_terminal_by_session_id_inner(
-    orch: &Orchestrator,
-    session_id: &str,
-) -> Result<(), String> {
-    let loaded = block_on_background_db(async {
-        let Some(row) = load_terminal_finalize_row(&orch.db.local, session_id).await? else {
-            return Ok(None);
-        };
-        if row.status != "running" {
-            return Ok(None);
-        }
-        let slug = row.slug.clone().unwrap_or_default();
-        let detail_uri = build_terminal_detail_uri(
-            orch,
-            row.job_id.as_deref(),
-            row.project_id.as_deref(),
-            &slug,
-        )
-        .await;
-        Ok(Some((row, detail_uri)))
-    })
-    .map_err(|e: crate::storage::DbError| e.to_string())?;
-
-    let Some((row, detail_uri)) = loaded else {
-        return Ok(());
-    };
-
-    let (buffer, exit_code) = take_and_kill_session(&orch.pty_state, session_id);
-    let process_ref = row.slug.as_deref().unwrap_or("terminal");
-    finalize_terminal_session(
-        orch,
-        session_id,
-        exit_code,
-        &buffer,
-        &row.command,
-        row.job_id.clone(),
-        process_ref,
-        &detail_uri,
-    );
-    Ok(())
 }
 
 /// Build the OS sandbox policy for a run, or `None` when no confinement applies.
@@ -3707,7 +2539,7 @@ fn apply_safe_jj_workspace_refresh_status_carveout(
 }
 
 /// Build the OS sandbox policy for a run, or `None` when no confinement applies.
-async fn build_run_sandbox_policy(
+pub(super) async fn build_run_sandbox_policy(
     orch: &Orchestrator,
     cwd: &str,
     run_id: Option<&str>,
@@ -3759,6 +2591,41 @@ async fn build_run_sandbox_policy(
     if !readonly_non_worktree {
         if let Some(cmd) = command_for_grant {
             if granted.contains(&normalize_command(cmd)) {
+                return None;
+            }
+        }
+    }
+
+    // Project-declared check/test commands are trusted, not risky mutations: run
+    // them with host permissions (no fence prompt, no idle-hang), matching the
+    // turn-end cadence which already runs these exact commands unconfined.
+    // Worktree-only — the live checkout stays read-only.
+    //
+    // The trust source is the CANONICAL main checkout, not the agent-mutable
+    // worktree: the `checks` contract and package.json `scripts` are resolved from
+    // the project's live main checkout (worktree used only as a fallback when the
+    // project repo is unresolved), mirroring the check cadences'
+    // `load_live_project_checks`. This runs host-side (not in the fenced agent
+    // subprocess), so reading the main checkout is not a fence crossing, and a
+    // branch cannot self-grant an unconfined run by committing its own check or
+    // package script. See `crate::config::check_exemption` and
+    // docs/worktree-fence.md.
+    if !readonly_non_worktree {
+        if let (Some(cmd), Some(pid)) = (command_for_grant, project_id) {
+            let main_repo = crate::projects::crud::resolve_local_repo_path_and_key(&orch.db, pid)
+                .await
+                .ok()
+                .and_then(|(path, _key)| path);
+            let source = main_repo
+                .as_deref()
+                .map(std::path::Path::new)
+                .unwrap_or_else(|| std::path::Path::new(cwd));
+            let checks = crate::config::project_settings::load_checks(source).unwrap_or_default();
+            let scripts = crate::config::check_exemption::load_project_scripts(source);
+            if crate::config::check_exemption::is_exempt_check_command(cmd, &checks, &scripts) {
+                log::info!(
+                    "check-command exemption: running declared check/test unconfined (cwd={cwd})"
+                );
                 return None;
             }
         }
@@ -3852,821 +2719,6 @@ async fn build_run_sandbox_policy(
     }
 
     Some((policy, fence))
-}
-
-#[derive(Clone, Copy)]
-enum TerminalSpawnMode {
-    Create,
-    Respawn,
-}
-
-pub async fn create_terminal_from_resource(
-    orch: &Orchestrator,
-    resource: &CairnResource,
-    command: &str,
-    description: Option<&str>,
-) -> Result<String, String> {
-    let target = resolve_terminal_resource_target(&orch.db.local, resource)
-        .await
-        .map_err(|e| e.to_string())?;
-    ensure_terminal_slug_available(&orch.db.local, &target)
-        .await
-        .map_err(|e| e.to_string())?;
-    spawn_terminal_session(
-        orch,
-        resource.clone(),
-        target,
-        command.to_string(),
-        description.map(ToOwned::to_owned),
-        TerminalSpawnMode::Create,
-    )
-    .await?;
-    Ok(format!("Started terminal {}", resource_slug(resource)))
-}
-
-fn resource_slug(resource: &CairnResource) -> String {
-    match resource {
-        CairnResource::NodeTerminal { slug, .. }
-        | CairnResource::ProjectTerminal { slug, .. }
-        | CairnResource::TaskTerminal { slug, .. } => slug.clone(),
-        _ => "terminal".to_string(),
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn spawn_terminal_session(
-    orch: &Orchestrator,
-    resource: CairnResource,
-    target: TerminalResourceTarget,
-    command: String,
-    description: Option<String>,
-    mode: TerminalSpawnMode,
-) -> Result<String, String> {
-    let services = &orch.services;
-    let pty_state = &orch.pty_state;
-
-    let pair = services
-        .pty_factory
-        .create_pty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("Failed to create PTY: {e}"))?;
-
-    let shell_path = get_default_shell();
-
-    // Sandbox the interactive shell for worktree agents. On macOS the shell runs
-    // under `sandbox-exec`; on Linux Landlock needs a `pre_exec` hook and the PTY
-    // spawning backend does not expose one, so terminal async fence detection is
-    // macOS-only until PTY spawning can apply Landlock before exec.
-    let sandbox = build_run_sandbox_policy(
-        orch,
-        &target.cwd,
-        target.run_id.as_deref(),
-        Some(target.project_id.as_str()),
-        Some(&command),
-        false,
-    )
-    .await;
-    let fence_mode = sandbox.as_ref().map(|(_, fence)| *fence);
-    let sandbox_applied = sandbox.is_some() && cfg!(target_os = "macos");
-    let sandbox_policy = sandbox.map(|(policy, _)| policy);
-    let (shell_program, shell_args): (String, Vec<String>) = match &sandbox_policy {
-        Some(policy) if cfg!(target_os = "macos") => sandbox::wrap_argv(&shell_path, &[], policy),
-        Some(_) => {
-            log::warn!(
-                "PTY terminal not OS-sandboxed on this platform (cwd={}); inline run is confined",
-                target.cwd
-            );
-            (shell_path.clone(), Vec::new())
-        }
-        None => (shell_path.clone(), Vec::new()),
-    };
-
-    let spawn_started = SystemTime::now();
-    let mut cmd = CommandBuilder::new(&shell_program);
-    for arg in &shell_args {
-        cmd.arg(arg);
-    }
-    cmd.cwd(&target.cwd);
-    for (key, value) in std::env::vars() {
-        cmd.env(key, value);
-    }
-    cmd.env("PATH", crate::env::get_user_path());
-    apply_non_interactive_pager_env_to_pty(&mut cmd);
-    // Same jj-only worktree VCS env as the inline spawn path, applied to the PTY /
-    // background-terminal spawn too (the background-terminal regression hides if
-    // only the inline path is patched). Empty for a non-worktree cwd.
-    for (k, v) in crate::mcp::vcs::worktree_shell_vcs_env(orch, std::path::Path::new(&target.cwd)) {
-        cmd.env(k, v);
-    }
-    cmd.env("CAIRN_WORKTREE", &target.cwd);
-    cmd.env(
-        "CAIRN_CALLBACK_URL",
-        format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
-    );
-    if let Ok(secret) = orch.mcp_auth.get_secret_for_mcp() {
-        cmd.env("CAIRN_MCP_SECRET", secret);
-    }
-    if let Some(run_id) = target.run_id.as_deref() {
-        cmd.env("CAIRN_RUN_ID", run_id);
-    }
-    // Managed Build Services: the interactive PTY shell (e.g. the Dev terminal
-    // running `bun run build:mcp`) is fenced on macOS, so inject the build-
-    // service client env + CAIRN_SANDBOXED here too. The PTY path uses
-    // CommandBuilder, not the process spawner, so CAIRN_SANDBOXED is set
-    // explicitly rather than by `build_command`.
-    if sandbox_applied {
-        cmd.env("CAIRN_SANDBOXED", "1");
-        for (k, v) in orch.build_service_client_env(Some(std::path::Path::new(&target.cwd))) {
-            cmd.env(k, v);
-        }
-    }
-
-    let components = pair
-        .spawn_and_split(cmd)
-        .map_err(|e| format!("Failed to spawn shell: {e}"))?;
-    let mut reader = components.reader;
-    let child_pid = components.child.process_id();
-    let session_id = ids::mint_session_id().into_string();
-    let output_buffer: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let last_output_at: Arc<Mutex<SystemTime>> = Arc::new(Mutex::new(SystemTime::now()));
-    // Shared phrase-watcher registry: the read loop below scans output against it,
-    // and the wake-subscribe path registers watchers into the same `Arc` while the
-    // terminal runs.
-    let output_watchers: Arc<Mutex<Vec<crate::services::TerminalOutputWatcher>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let session = PtySession {
-        master: Some(components.master),
-        writer: Some(components.writer),
-        child: Box::new(crate::services::PortableTerminalChild::new(
-            components.child,
-        )),
-        output_buffer: Some(output_buffer.clone()),
-        is_agent_spawned: true,
-        last_output_at: Some(last_output_at.clone()),
-        // Agent terminals are non-interactive: no prompt markers, no busy signal.
-        command_state: None,
-        output_watchers: Some(output_watchers.clone()),
-    };
-    let session_arc = Arc::new(Mutex::new(session));
-
-    {
-        let mut sessions = pty_state
-            .sessions
-            .lock()
-            .map_err(|e| format!("Failed to store session: {e}"))?;
-        sessions.insert(session_id.clone(), session_arc.clone());
-    }
-
-    // Hydrate persisted output-phrase watchers for this terminal so an output
-    // wake is durable across sessions: a respawn (e.g. after a worktree-fence
-    // approval restarts the terminal) and a subscribe made while no session was
-    // live both re-attach their watchers here. The wake_subscriptions row is the
-    // source of truth; this in-memory list is only the per-session cache the
-    // read loop scans.
-    {
-        let detail_uri = resource.to_uri();
-        match crate::orchestrator::wakes::list_terminal_output_watchers(&orch.db.local, &detail_uri)
-            .await
-        {
-            Ok(persisted) if !persisted.is_empty() => {
-                if let Ok(mut guard) = output_watchers.lock() {
-                    for (subscription_id, watcher_job_id, phrase, terminal_uri) in persisted {
-                        guard.push(crate::services::TerminalOutputWatcher {
-                            subscription_id,
-                            job_id: watcher_job_id,
-                            phrase,
-                            carry: String::new(),
-                            terminal_uri,
-                        });
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                log::warn!("failed to hydrate terminal output watchers: {error}")
-            }
-        }
-    }
-
-    let db_result = match mode {
-        TerminalSpawnMode::Create => {
-            insert_terminal_resource(
-                &orch.db.local,
-                &target,
-                &session_id,
-                &command,
-                description.as_deref(),
-            )
-            .await
-        }
-        TerminalSpawnMode::Respawn => {
-            update_terminal_resource_session(&orch.db.local, &target, &session_id).await
-        }
-    };
-    if let Err(e) = db_result {
-        if let Ok(mut sessions) = pty_state.sessions.lock() {
-            sessions.remove(&session_id);
-        }
-        if let Ok(mut session) = session_arc.lock() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-        }
-        return Err(format!("Database error: {e}"));
-    }
-
-    let _ = services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "job_terminals", "action": "update"}),
-    );
-
-    let sid = session_id.clone();
-    let orch_t = orch.clone();
-    let emitter = services.emitter.clone();
-    let buffer = output_buffer.clone();
-    let last_output_thread = last_output_at.clone();
-    let job_id = target.job_id.clone();
-    let command_for_thread = command.clone();
-    let target_for_thread = target.clone();
-    let resource_for_thread = resource.clone();
-    let description_for_thread = description.clone();
-    let watchers_for_thread = output_watchers.clone();
-    let fence_handled = Arc::new(AtomicBool::new(false));
-    let suppress_cleanup = Arc::new(AtomicBool::new(false));
-    let fence_handled_thread = fence_handled.clone();
-    let suppress_cleanup_thread = suppress_cleanup.clone();
-
-    thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    if suppress_cleanup_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let exit_code = get_exit_code_from_session(&orch_t.pty_state, &sid);
-                    let process_ref = resource_slug(&resource_for_thread);
-                    let detail_uri = resource_for_thread.to_uri();
-                    finalize_terminal_session(
-                        &orch_t,
-                        &sid,
-                        exit_code,
-                        &buffer,
-                        &command_for_thread,
-                        job_id.clone(),
-                        &process_ref,
-                        &detail_uri,
-                    );
-                    break;
-                }
-                Ok(n) => {
-                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    emit_terminal_data(&*emitter, &sid, &data, &buffer);
-                    if let Ok(mut last) = last_output_thread.lock() {
-                        *last = SystemTime::now();
-                    }
-                    crate::orchestrator::wakes::scan_and_route_terminal_output(
-                        &orch_t,
-                        &watchers_for_thread,
-                        &data,
-                    );
-                    if should_handle_terminal_denial(sandbox_applied, fence_mode, &data)
-                        && !fence_handled_thread.swap(true, Ordering::SeqCst)
-                    {
-                        let crossing =
-                            terminal_denial_crossing(child_pid, spawn_started, &command_for_thread);
-                        match fence_mode {
-                            Some(Fence::Deny) => {
-                                emit_terminal_data(
-                                    &*emitter,
-                                    &sid,
-                                    &format!(
-                                        "\r\nDenied by agent fence policy (fence: deny): {}\r\n",
-                                        crossing.summary
-                                    ),
-                                    &buffer,
-                                );
-                                suppress_cleanup_thread.store(true, Ordering::SeqCst);
-                                // Kill the denied process, then converge on
-                                // finalize so the row is marked exited (denied →
-                                // exit code unknown) and retained, not deleted.
-                                // The buffer is an independent Arc, so the tail
-                                // survives the session removal terminate performs.
-                                let process_ref = resource_slug(&resource_for_thread);
-                                let detail_uri = resource_for_thread.to_uri();
-                                terminate_pty_session(&orch_t, &sid);
-                                finalize_terminal_session(
-                                    &orch_t,
-                                    &sid,
-                                    None,
-                                    &buffer,
-                                    &command_for_thread,
-                                    job_id.clone(),
-                                    &process_ref,
-                                    &detail_uri,
-                                );
-                                break;
-                            }
-                            Some(Fence::Ask) => {
-                                emit_terminal_data(
-                                    &*emitter,
-                                    &sid,
-                                    "\r\nTerminal is waiting for worktree-fence approval. The command will restart if allowed for the session.\r\n",
-                                    &buffer,
-                                );
-                                suppress_cleanup_thread.store(true, Ordering::SeqCst);
-                                let orch_bg = orch_t.clone();
-                                let sid_bg = sid.clone();
-                                let buffer_bg = buffer.clone();
-                                let target_bg = target_for_thread.clone();
-                                let resource_bg = resource_for_thread.clone();
-                                let command_bg = command_for_thread.clone();
-                                let description_bg = description_for_thread.clone();
-                                thread::spawn(move || {
-                                    handle_terminal_fence_prompt(
-                                        orch_bg,
-                                        sid_bg,
-                                        buffer_bg,
-                                        target_bg,
-                                        resource_bg,
-                                        command_bg,
-                                        description_bg,
-                                        crossing,
-                                    );
-                                });
-                                terminate_pty_session(&orch_t, &sid);
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Err(e) => {
-                    if suppress_cleanup_thread.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    log::error!("Agent PTY read error: {e}");
-                    // Converge on finalize (emits pty-exit, marks exited with
-                    // exit code unknown, routes the wake, drops the session)
-                    // rather than a bare delete.
-                    let process_ref = resource_slug(&resource_for_thread);
-                    let detail_uri = resource_for_thread.to_uri();
-                    finalize_terminal_session(
-                        &orch_t,
-                        &sid,
-                        None,
-                        &buffer,
-                        &command_for_thread,
-                        job_id.clone(),
-                        &process_ref,
-                        &detail_uri,
-                    );
-                    break;
-                }
-            }
-        }
-    });
-
-    // Wrap so the shell exits with the command: EOF (which drives
-    // `finalize_terminal_session`) then coincides with command completion and the
-    // shell's exit code equals the command's. Respawn-after-fence-approval routes
-    // through this same site, so it stays consistent.
-    write_terminal_input_by_session(orch, &session_id, &submit_command_exiting_shell(&command))
-        .await?;
-
-    if let Some(run_id) = target.run_id.clone() {
-        let _ = services.emitter.emit(
-            "agent-terminal-created",
-            serde_json::to_value(AgentTerminalCreatedPayload {
-                run_id,
-                session_id: session_id.clone(),
-                command: command.to_string(),
-                description,
-            })
-            .unwrap_or_default(),
-        );
-    }
-
-    Ok(session_id)
-}
-
-fn emit_terminal_data(
-    emitter: &dyn crate::services::EventEmitter,
-    session_id: &str,
-    data: &str,
-    buffer: &Arc<Mutex<VecDeque<u8>>>,
-) {
-    let _ = emitter.emit(
-        "pty-data",
-        serde_json::to_value(PtyDataPayload {
-            session_id: session_id.to_string(),
-            data: data.to_string(),
-        })
-        .unwrap_or_default(),
-    );
-    if let Ok(mut buf_guard) = buffer.lock() {
-        buf_guard.extend(data.as_bytes());
-        while buf_guard.len() > MAX_BUFFER_SIZE {
-            buf_guard.pop_front();
-        }
-    }
-}
-
-fn should_handle_terminal_denial(sandbox_applied: bool, fence: Option<Fence>, data: &str) -> bool {
-    cfg!(target_os = "macos")
-        && sandbox_applied
-        && matches!(fence, Some(Fence::Ask | Fence::Deny))
-        && sandbox::has_denial_signature(data)
-}
-
-fn terminal_denial_crossing(
-    child_pid: Option<u32>,
-    spawned_at: SystemTime,
-    command: &str,
-) -> crate::mcp::handlers::fence::Crossing {
-    use crate::mcp::handlers::fence::Crossing;
-    #[cfg(target_os = "macos")]
-    if let Some(path) = child_pid.and_then(|pid| sandbox::macos::detect_violation(pid, spawned_at))
-    {
-        return Crossing::shell_path(path.as_path(), &path.display().to_string());
-    }
-    let _ = (child_pid, spawned_at);
-    Crossing::shell_command(
-        format!("terminal command blocked by the worktree sandbox: {command}"),
-        command,
-    )
-}
-
-fn terminate_pty_session(orch: &Orchestrator, session_id: &str) {
-    let session_arc = orch
-        .pty_state
-        .sessions
-        .lock()
-        .ok()
-        .and_then(|mut sessions| sessions.remove(session_id));
-    if let Some(session_arc) = session_arc {
-        if let Ok(mut session) = session_arc.lock() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_terminal_fence_prompt(
-    orch: Orchestrator,
-    old_session_id: String,
-    buffer: Arc<Mutex<VecDeque<u8>>>,
-    target: TerminalResourceTarget,
-    resource: CairnResource,
-    command: String,
-    description: Option<String>,
-    crossing: crate::mcp::handlers::fence::Crossing,
-) {
-    let Some(run_id) = target.run_id.clone() else {
-        return;
-    };
-    let request_id = match block_on_background_db(async {
-        let request = McpCallbackRequest {
-            cwd: target.cwd.clone(),
-            run_id: Some(run_id.clone()),
-            tool: "run".to_string(),
-            payload: serde_json::Value::Null,
-            tool_use_id: Some(format!("terminal-{}", old_session_id)),
-        };
-        let tool_input = serde_json::json!({
-            "kind": crossing.kind.tag(),
-            "verb": crossing.verb,
-            "descriptor": crossing.descriptor.clone(),
-            "summary": crossing.summary.clone(),
-            "request": request,
-            "origin": "terminal",
-        });
-        crate::mcp::handlers::permission::create_background_permission_request(
-            &orch,
-            &run_id,
-            &format!("terminal-{}", old_session_id),
-            crossing.verb,
-            &tool_input,
-        )
-        .await
-        .map_err(crate::storage::DbError::Row)
-    }) {
-        Ok(id) => id,
-        Err(e) => {
-            emit_terminal_data(
-                &*orch.services.emitter,
-                &old_session_id,
-                &format!("\r\nFailed to create worktree-fence permission request: {e}\r\n"),
-                &buffer,
-            );
-            return;
-        }
-    };
-
-    let mut rx = orch.permission_responses.subscribe();
-    let response = match block_on_background_db(async move {
-        loop {
-            match rx.recv().await {
-                Ok((resp_request_id, response_json)) if resp_request_id == request_id => {
-                    return Ok(response_json)
-                }
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err(crate::storage::DbError::Row(
-                        "permission response channel closed".to_string(),
-                    ))
-                }
-            }
-        }
-    }) {
-        Ok(response) => response,
-        Err(e) => {
-            emit_terminal_data(
-                &*orch.services.emitter,
-                &old_session_id,
-                &format!("\r\nWorktree-fence permission wait failed: {e}\r\n"),
-                &buffer,
-            );
-            return;
-        }
-    };
-
-    let allowed = serde_json::from_str::<serde_json::Value>(&response)
-        .ok()
-        .and_then(|v| {
-            v.get("behavior")
-                .and_then(|b| b.as_str())
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some("allow");
-
-    if !allowed {
-        emit_terminal_data(
-            &*orch.services.emitter,
-            &old_session_id,
-            &format!("\r\nDenied by worktree fence: {}\r\n", crossing.summary),
-            &buffer,
-        );
-        // Converge on finalize: mark the row exited (denied → exit code unknown)
-        // and route the wake, retaining the row. The session was already removed
-        // by the reader thread's terminate before this prompt handler ran, so
-        // there is no child to kill here.
-        let process_ref = resource_slug(&resource);
-        let detail_uri = resource.to_uri();
-        finalize_terminal_session(
-            &orch,
-            &old_session_id,
-            None,
-            &buffer,
-            &command,
-            target.job_id.clone(),
-            &process_ref,
-            &detail_uri,
-        );
-        return;
-    }
-
-    let session_granted = orch
-        .session_allowed_crossings
-        .lock()
-        .ok()
-        .is_some_and(|allowed| allowed.contains(&crossing.descriptor));
-    if !session_granted {
-        emit_terminal_data(
-            &*orch.services.emitter,
-            &old_session_id,
-            "\r\nTerminal worktree-fence approvals must be allowed for the session; not restarting.\r\n",
-            &buffer,
-        );
-        // Converge on finalize: mark the row exited (denied → exit code unknown)
-        // and route the wake, retaining the row. The session was already removed
-        // by the reader thread's terminate before this prompt handler ran, so
-        // there is no child to kill here.
-        let process_ref = resource_slug(&resource);
-        let detail_uri = resource.to_uri();
-        finalize_terminal_session(
-            &orch,
-            &old_session_id,
-            None,
-            &buffer,
-            &command,
-            target.job_id.clone(),
-            &process_ref,
-            &detail_uri,
-        );
-        return;
-    }
-
-    emit_terminal_data(
-        &*orch.services.emitter,
-        &old_session_id,
-        "\r\nWorktree-fence approval granted for this session; restarting terminal.\r\n",
-        &buffer,
-    );
-    let respawn = block_on_background_db(async {
-        spawn_terminal_session(
-            &orch,
-            resource,
-            target,
-            command,
-            description,
-            TerminalSpawnMode::Respawn,
-        )
-        .await
-        .map_err(crate::storage::DbError::Row)
-    });
-    if let Err(e) = respawn {
-        emit_terminal_data(
-            &*orch.services.emitter,
-            &old_session_id,
-            &format!("\r\nFailed to restart terminal after worktree-fence approval: {e}\r\n"),
-            &buffer,
-        );
-    }
-}
-
-async fn write_terminal_input_by_session(
-    orch: &Orchestrator,
-    session_id: &str,
-    content: &str,
-) -> Result<(), String> {
-    let sessions = orch
-        .pty_state
-        .sessions
-        .lock()
-        .map_err(|e| format!("Failed to access sessions: {e}"))?;
-    let session = sessions
-        .get(session_id)
-        .ok_or_else(|| format!("Terminal session not running: {session_id}"))?;
-    let mut session = session
-        .lock()
-        .map_err(|e| format!("Failed to lock terminal session: {e}"))?;
-    let writer = session
-        .writer
-        .as_mut()
-        .ok_or_else(|| "This terminal does not accept input".to_string())?;
-    writer
-        .write_all(content.as_bytes())
-        .map_err(|e| format!("Failed to write terminal input: {e}"))?;
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to flush terminal input: {e}"))?;
-    Ok(())
-}
-
-pub async fn append_terminal_input(
-    orch: &Orchestrator,
-    resource: &CairnResource,
-    content: &str,
-    submit: bool,
-) -> Result<String, String> {
-    let target = resolve_terminal_resource_target(&orch.db.local, resource)
-        .await
-        .map_err(|e| e.to_string())?;
-    let session_id = lookup_terminal_session_id_for_target(&orch.db.local, &target)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Terminal not found: {}", target.slug))?;
-
-    let sessions = orch
-        .pty_state
-        .sessions
-        .lock()
-        .map_err(|e| format!("Failed to access sessions: {e}"))?;
-    let session = sessions
-        .get(&session_id)
-        .ok_or_else(|| format!("Terminal session not running: {}", target.slug))?;
-    let mut session = session
-        .lock()
-        .map_err(|e| format!("Failed to lock terminal session: {e}"))?;
-    let to_write = if submit {
-        ensure_submitted_line(content)
-    } else {
-        std::borrow::Cow::Borrowed(content)
-    };
-    let writer = session
-        .writer
-        .as_mut()
-        .ok_or_else(|| "This terminal does not accept input".to_string())?;
-    writer
-        .write_all(to_write.as_bytes())
-        .map_err(|e| format!("Failed to write terminal input: {e}"))?;
-    writer
-        .flush()
-        .map_err(|e| format!("Failed to flush terminal input: {e}"))?;
-
-    Ok(format!(
-        "Sent {} chars to terminal {}",
-        to_write.len(),
-        target.slug
-    ))
-}
-
-pub async fn delete_terminal_by_resource(
-    orch: &Orchestrator,
-    resource: &CairnResource,
-) -> Result<String, String> {
-    let target = resolve_terminal_resource_target(&orch.db.local, resource)
-        .await
-        .map_err(|e| e.to_string())?;
-    let session_id = lookup_terminal_session_id_for_target(&orch.db.local, &target)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Terminal not found: {}", target.slug))?;
-
-    // "Stop" converges on the single finalize sink: kill the child, mark the row
-    // exited (honest non-success code) + route the wake, and retain the row.
-    // Deletion is reserved for job teardown. Run on a blocking worker so the
-    // finalize thread's join does not stall the async executor.
-    let orch_for_finalize = orch.clone();
-    let session_for_finalize = session_id.clone();
-    tokio::task::spawn_blocking(move || {
-        finalize_terminal_by_session_id(&orch_for_finalize, &session_for_finalize)
-    })
-    .await
-    .map_err(|e| format!("terminal finalize task failed: {e}"))??;
-
-    Ok(format!("Stopped terminal {}", target.slug))
-}
-
-/// Get exit code from PTY session using non-blocking try_wait.
-fn get_exit_code_from_session(
-    pty_state: &crate::services::PtyState,
-    session_id: &str,
-) -> Option<i32> {
-    let sessions = pty_state.sessions.lock().ok()?;
-    let session_arc = sessions.get(session_id)?;
-    let mut session = session_arc.lock().ok()?;
-
-    // Use try_wait to avoid blocking - process should have exited if we got EOF
-    session.child.try_wait_exit()
-}
-
-/// Send terminal context to Claude via stdin when a background process exits with error.
-fn send_terminal_exit_context(
-    orch: &Orchestrator,
-    session_id: &str,
-    _terminal_session_id: &str,
-    exit_code: i32,
-    buffer: &Arc<Mutex<VecDeque<u8>>>,
-    command: &str,
-) {
-    // Get recent output from buffer
-    let output = {
-        let buf_guard = buffer.lock().unwrap();
-        let bytes: Vec<u8> = buf_guard.iter().copied().collect();
-        String::from_utf8_lossy(&bytes).to_string()
-    };
-
-    // Truncate for display
-    let cmd_display: String = command.chars().take(100).collect();
-    let truncated_output: String = output.chars().take(2000).collect();
-
-    let content = format!(
-        "[Terminal Update] Background command '{}' exited with code {}:\n```\n{}\n```",
-        cmd_display, exit_code, truncated_output
-    );
-
-    // Find the process and send via stdin
-    let process_state = orch.process_state.clone();
-
-    let run_id = match process_state.find_process_by_session(session_id) {
-        Some(rid) => rid,
-        None => {
-            log::info!(
-                "No active process for session {}, skipping terminal context",
-                &session_id[..8.min(session_id.len())]
-            );
-            return;
-        }
-    };
-
-    match crate::backends::stdin::send_user_message(
-        &process_state,
-        &run_id,
-        &content,
-        session_id,
-        None,
-        None,
-    ) {
-        Ok(()) => {
-            log::info!(
-                "Sent terminal context to session {}: command='{}' exit_code={}",
-                &session_id[..8.min(session_id.len())],
-                cmd_display,
-                exit_code
-            );
-        }
-        Err(e) => {
-            log::warn!("Failed to send terminal context: {}", e);
-        }
-    }
 }
 
 /// Cache a checkpoint command result if the executed command matches the job's checkpoint command.
@@ -4917,6 +2969,26 @@ mod tests {
         assert!(!glob_covers_checkout("/other/**", checkout));
         assert!(!glob_covers_checkout("/home/u/.cairn-dev/**", checkout));
         assert!(!glob_covers_checkout("/scratch/ok", checkout));
+    }
+
+    #[test]
+    fn warm_search_outcome_marks_header_and_body() {
+        let outcome = warm_search_outcome("rg needle".to_string(), "src/lib.rs:needle".to_string());
+        assert_eq!(outcome.header, "rg needle [warm index]");
+        assert!(outcome.succeeded);
+        assert_eq!(
+            outcome.body,
+            "src/lib.rs:needle\n[served from Cairn's warm search index, not a spawned process]"
+        );
+    }
+
+    #[test]
+    fn warm_search_outcome_trailer_is_present_without_result_lines() {
+        let outcome = warm_search_outcome("rg absent".to_string(), String::new());
+        assert_eq!(
+            outcome.body,
+            "[served from Cairn's warm search index, not a spawned process]"
+        );
     }
 
     #[test]
@@ -5306,7 +3378,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_bash_command_unwrap_uses_semantic_inner_command() {
+    fn test_handle_run_command_unwrap_uses_semantic_inner_command() {
         assert_eq!(
             unwrap_shell_launcher(r#"/bin/zsh -lc "sed -n '120,520p' src/app.tsx""#),
             "sed -n '120,520p' src/app.tsx"
@@ -5630,24 +3702,24 @@ mod tests {
     fn terminal_denial_detection_requires_macos_sandbox_and_policy() {
         let denied = "bash: /Users/me/probe: Operation not permitted";
         assert_eq!(
-            should_handle_terminal_denial(true, Some(Fence::Ask), denied),
+            terminal::should_handle_terminal_denial(true, Some(Fence::Ask), denied),
             cfg!(target_os = "macos")
         );
         assert_eq!(
-            should_handle_terminal_denial(true, Some(Fence::Deny), denied),
+            terminal::should_handle_terminal_denial(true, Some(Fence::Deny), denied),
             cfg!(target_os = "macos")
         );
-        assert!(!should_handle_terminal_denial(
+        assert!(!terminal::should_handle_terminal_denial(
             false,
             Some(Fence::Ask),
             denied
         ));
-        assert!(!should_handle_terminal_denial(
+        assert!(!terminal::should_handle_terminal_denial(
             true,
             Some(Fence::Allow),
             denied
         ));
-        assert!(!should_handle_terminal_denial(
+        assert!(!terminal::should_handle_terminal_denial(
             true,
             Some(Fence::Ask),
             "ordinary failure"
@@ -5656,7 +3728,8 @@ mod tests {
 
     #[test]
     fn terminal_denial_crossing_falls_back_to_command_scope() {
-        let crossing = terminal_denial_crossing(None, SystemTime::now(), "echo hi > $HOME/probe");
+        let crossing =
+            terminal::terminal_denial_crossing(None, SystemTime::now(), "echo hi > $HOME/probe");
         assert_eq!(crossing.verb, "run");
         assert!(crossing.summary.contains("terminal command blocked"));
         assert_eq!(
@@ -5764,6 +3837,48 @@ mod commit_barrier_tests {
         assert_eq!(vcs.discards(), 0, "nothing-to-commit must not restore");
         assert!(!out.committed);
         assert!(out.message.is_empty(), "got: {}", out.message);
+    }
+
+    #[test]
+    fn committed_patch_carried_only_on_successful_seal() {
+        // The pre-seal working-copy patch rides out on the outcome ONLY when a
+        // real commit landed, so `handle_run` can record its file changes. On a
+        // restore, a clean no-op, and a no-commit_msg run it is `None`.
+        let patch = "diff --git a/x.rs b/x.rs\n";
+
+        // Success: the captured patch is carried out.
+        let ok = FakeVcs::new()
+            .dirty(Ok(true))
+            .capture(Some(patch.to_string()));
+        let out = run_commit_barrier(&ok, wt(), Some("add x"), true, None, None);
+        assert!(out.committed);
+        assert_eq!(out.committed_patch.as_deref(), Some(patch));
+
+        // Seal fails → restore → no patch even though one was captured.
+        let fail = FakeVcs::new()
+            .dirty(Ok(true))
+            .capture(Some(patch.to_string()))
+            .seal(Err("pre-commit hook failed".to_string()));
+        let out = run_commit_barrier(&fail, wt(), Some("add x"), true, None, None);
+        assert!(!out.committed);
+        assert_eq!(out.committed_patch, None, "a restore carries no patch");
+
+        // Clean no-op: nothing captured, nothing carried.
+        let clean = FakeVcs::new()
+            .dirty(Ok(false))
+            .capture(Some(patch.to_string()));
+        let out = run_commit_barrier(&clean, wt(), Some("noop"), true, None, None);
+        assert!(!out.committed);
+        assert_eq!(out.committed_patch, None);
+
+        // No commit_msg: the barrier never seals, so it never carries a patch.
+        let before = VcsSnapshot("entry".to_string());
+        let none = FakeVcs::new()
+            .changed(Ok(true))
+            .capture(Some(patch.to_string()));
+        let out = run_commit_barrier(&none, wt(), None, true, Some(&before), None);
+        assert!(!out.committed);
+        assert_eq!(out.committed_patch, None);
     }
 
     #[test]
@@ -5940,239 +4055,5 @@ mod commit_barrier_tests {
         assert_eq!(vcs.discards(), 0, "the live checkout is never reverted");
         assert!(!out.worktree_changed);
         assert!(out.message.is_empty(), "got: {}", out.message);
-    }
-}
-
-#[cfg(test)]
-mod terminal_finalize_tests {
-    use super::*;
-    use crate::db::DbState;
-    use crate::services::testing::TestServicesBuilder;
-    use crate::storage::SearchIndex;
-    use tempfile::tempdir;
-
-    /// Run an async block on a throwaway current-thread runtime. Each call
-    /// creates and drops its own runtime, so the test thread carries no ambient
-    /// runtime between calls — finalize's internal `block_on` then runs safely.
-    fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(fut)
-    }
-
-    fn test_orchestrator(db: LocalDb) -> Orchestrator {
-        let temp = tempdir().unwrap();
-        let config_dir = temp.keep();
-        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
-        let db_state = Arc::new(DbState::new(Arc::new(db), search));
-        let services = Arc::new(TestServicesBuilder::new().build());
-        Orchestrator::builder(db_state, services, config_dir).build()
-    }
-
-    async fn seed(db: &LocalDb) {
-        db.execute_script(
-            "
-            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
-            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
-            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',7,'I','active','active','none',1,1);
-            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES('e','rec','i','p','running',1,2);
-            INSERT INTO jobs(id, project_id, issue_id, execution_id, uri_segment, status, created_at, updated_at) VALUES('j','p','i','e','builder','running',1,1);
-            INSERT INTO jobs(id, project_id, issue_id, execution_id, parent_job_id, uri_segment, status, created_at, updated_at) VALUES('task-j','p','i','e','j','Explore','running',1,1);
-            INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug) VALUES('t','j','s1','sleep 100','running',1,'run-1');
-            INSERT INTO job_terminals(id, job_id, session_id, command, status, created_at, slug) VALUES('task-t','task-j','task-s1','sleep 100','running',1,'run-1');
-            ",
-        )
-        .await
-        .unwrap();
-    }
-
-    async fn read_terminal(
-        db: &LocalDb,
-        session_id: &str,
-    ) -> (String, Option<i32>, Option<String>) {
-        let session_id = session_id.to_string();
-        db.query_opt(
-            "SELECT status, exit_code, output_tail FROM job_terminals WHERE session_id = ?1",
-            params![session_id.as_str()],
-            |row| {
-                Ok((
-                    row.text(0)?,
-                    row.opt_i64(1)?.map(|v| v as i32),
-                    row.opt_text(2)?,
-                ))
-            },
-        )
-        .await
-        .unwrap()
-        .expect("terminal row present")
-    }
-
-    fn node_uri() -> String {
-        cairn_common::uri::build_node_terminal_uri("P", 7, 2, "builder", "run-1")
-    }
-
-    fn task_uri() -> String {
-        cairn_common::uri::build_task_terminal_uri("P", 7, 2, "builder", "Explore", "run-1")
-    }
-
-    #[test]
-    fn finalize_marks_exited_retains_tail_and_is_idempotent() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_a.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-
-        let buffer: Arc<Mutex<VecDeque<u8>>> =
-            Arc::new(Mutex::new(b"all done\n".iter().copied().collect()));
-        let uri = node_uri();
-        finalize_terminal_session(
-            &orch,
-            "s1",
-            Some(0),
-            &buffer,
-            "sleep 100",
-            Some("j".to_string()),
-            "run-1",
-            &uri,
-        );
-
-        let (status, code, tail) = block_on(read_terminal(&orch.db.local, "s1"));
-        assert_eq!(status, "exited");
-        assert_eq!(code, Some(0));
-        assert!(tail.unwrap_or_default().contains("all done"));
-
-        // A second finalize with a different code must not re-transition the row.
-        finalize_terminal_session(
-            &orch,
-            "s1",
-            Some(99),
-            &buffer,
-            "sleep 100",
-            Some("j".to_string()),
-            "run-1",
-            &uri,
-        );
-        let (status2, code2, _) = block_on(read_terminal(&orch.db.local, "s1"));
-        assert_eq!(status2, "exited");
-        assert_eq!(
-            code2,
-            Some(0),
-            "idempotent finalize must not overwrite the recorded exit code"
-        );
-    }
-
-    #[test]
-    fn mark_terminal_exited_is_conditional_on_running() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_b.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-
-        let first = block_on(mark_terminal_exited_and_load_context(
-            orch.db.local.clone(),
-            "s1".to_string(),
-            Some("j".to_string()),
-            Some(0),
-            Some("tail".to_string()),
-        ))
-        .unwrap();
-        assert!(first.is_some(), "first mark transitions a running row");
-
-        let second = block_on(mark_terminal_exited_and_load_context(
-            orch.db.local.clone(),
-            "s1".to_string(),
-            Some("j".to_string()),
-            Some(5),
-            Some("tail".to_string()),
-        ))
-        .unwrap();
-        assert!(
-            second.is_none(),
-            "an already-exited row must not transition again"
-        );
-    }
-
-    #[test]
-    fn build_terminal_detail_uri_matches_node_builder() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_c.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-
-        let uri = block_on(build_terminal_detail_uri(&orch, Some("j"), None, "run-1"));
-        assert_eq!(uri, node_uri());
-    }
-
-    #[test]
-    fn build_terminal_detail_uri_matches_task_builder() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_task.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-
-        let uri = block_on(build_terminal_detail_uri(
-            &orch,
-            Some("task-j"),
-            None,
-            "run-1",
-        ));
-        assert_eq!(uri, task_uri());
-    }
-
-    #[test]
-    fn resolve_task_terminal_targets_child_job_and_scopes_slug_collisions() {
-        let db = block_on(crate::storage::migrated_test_db("term_resolve_task.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-        let resource = CairnResource::TaskTerminal {
-            project: "P".to_string(),
-            number: 7,
-            exec_seq: 2,
-            node_id: "builder".to_string(),
-            task_name: "Explore".to_string(),
-            slug: "run-1".to_string(),
-        };
-
-        let target = block_on(resolve_terminal_resource_target(&orch.db.local, &resource)).unwrap();
-        assert_eq!(target.job_id.as_deref(), Some("task-j"));
-        assert_eq!(target.slug, "run-1");
-        assert!(block_on(ensure_terminal_slug_available(&orch.db.local, &target)).is_err());
-
-        let parent_resource = CairnResource::NodeTerminal {
-            project: "P".to_string(),
-            number: 7,
-            exec_seq: 2,
-            node_id: "builder".to_string(),
-            slug: "task-only".to_string(),
-        };
-        let parent_target = block_on(resolve_terminal_resource_target(
-            &orch.db.local,
-            &parent_resource,
-        ))
-        .unwrap();
-        assert!(block_on(ensure_terminal_slug_available(
-            &orch.db.local,
-            &parent_target
-        ))
-        .is_ok());
-    }
-
-    #[test]
-    fn finalize_by_session_records_honest_kill_code_and_retains_row() {
-        let db = block_on(crate::storage::migrated_test_db("term_finalize_d.db"));
-        let orch = test_orchestrator(db);
-        block_on(seed(&orch.db.local));
-
-        // No live session in the PTY map: finalize-by-session records the SIGKILL
-        // convention (never success) and retains the row, not deletes it.
-        finalize_terminal_by_session_id(&orch, "s1").unwrap();
-
-        let (status, code, _) = block_on(read_terminal(&orch.db.local, "s1"));
-        assert_eq!(status, "exited");
-        assert_eq!(code, Some(KILLED_EXIT_CODE));
-
-        // Idempotent: a second stop no-ops because the row is no longer running.
-        finalize_terminal_by_session_id(&orch, "s1").unwrap();
-        let (status2, code2, _) = block_on(read_terminal(&orch.db.local, "s1"));
-        assert_eq!(status2, "exited");
-        assert_eq!(code2, Some(KILLED_EXIT_CODE));
     }
 }

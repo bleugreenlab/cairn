@@ -1171,7 +1171,7 @@ fn terminal_slug_from_uri(uri: &str) -> &str {
 /// Scan one freshly read output chunk against a terminal's live phrase-watcher
 /// registry and route a one-shot `terminal_output` wake for each matched phrase,
 /// dropping the matched watcher. Shared by both terminal readers — the agent-MCP
-/// reader in `mcp::handlers::bash` and the interactive reader in the app's
+/// reader in `mcp::handlers::run` and the interactive reader in the app's
 /// terminal command — so output watching behaves identically regardless of which
 /// path created the terminal. Each watcher carries its own canonical
 /// `terminal_uri`, so routing needs no `CairnResource`. A cheap no-op when no

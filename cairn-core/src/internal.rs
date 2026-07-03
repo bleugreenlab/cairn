@@ -123,6 +123,10 @@ pub mod storage {
     pub use crate::storage::*;
 }
 
+pub mod terminal_host {
+    pub use crate::terminal_host::*;
+}
+
 pub mod workspace {
     pub use crate::workspace::*;
 }

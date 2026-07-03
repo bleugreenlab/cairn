@@ -19,33 +19,39 @@ pub struct CheckpointCacheResult {
     pub ran_at: i32,
 }
 
-/// Get a cached project-declared check result by project, sealed tree identity,
-/// and check name.
+/// Get a cached project-declared check result by project, check name, and the
+/// per-check INPUT hash (the content identity of just that check's impact-matched
+/// files). Keying on the input hash — rather than the whole sealed tree — is what
+/// lets a commit that touched none of a check's inputs reuse the stored verdict.
 pub fn get_check_result(
     db: Arc<LocalDb>,
     project_id: &str,
-    tree_hash: &str,
     check_name: &str,
+    input_hash: &str,
 ) -> Result<Option<CheckResultCacheEntry>, String> {
     let project_id = project_id.to_string();
-    let tree_hash = tree_hash.to_string();
     let check_name = check_name.to_string();
+    let input_hash = input_hash.to_string();
 
     run_checkpoint_cache_db(async move {
         db.read(|conn| {
             let project_id = project_id.clone();
-            let tree_hash = tree_hash.clone();
             let check_name = check_name.clone();
+            let input_hash = input_hash.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
                         "
-                        SELECT project_id, tree_hash, check_name, exit_code, passed,
-                               output_tail, duration_ms, ran_at, target_results_json
+                        SELECT project_id, tree_hash, input_hash, check_name, exit_code,
+                               passed, output_tail, duration_ms, ran_at, target_results_json
                         FROM check_result_cache
-                        WHERE project_id = ?1 AND tree_hash = ?2 AND check_name = ?3
+                        WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
                         ",
-                        params![project_id.as_str(), tree_hash.as_str(), check_name.as_str()],
+                        params![
+                            project_id.as_str(),
+                            check_name.as_str(),
+                            input_hash.as_str()
+                        ],
                     )
                     .await?;
 
@@ -55,13 +61,14 @@ pub fn get_check_result(
                         Ok::<_, crate::storage::DbError>(CheckResultCacheEntry {
                             project_id: row.text(0)?,
                             tree_hash: row.text(1)?,
-                            check_name: row.text(2)?,
-                            exit_code: row.i64(3)? as i32,
-                            passed: row.i64(4)? != 0,
-                            output_tail: row.text(5)?,
-                            duration_ms: row.i64(6)?,
-                            ran_at: row.i64(7)?,
-                            target_results_json: row.opt_text(8)?,
+                            input_hash: row.text(2)?,
+                            check_name: row.text(3)?,
+                            exit_code: row.i64(4)? as i32,
+                            passed: row.i64(5)? != 0,
+                            output_tail: row.text(6)?,
+                            duration_ms: row.i64(7)?,
+                            ran_at: row.i64(8)?,
+                            target_results_json: row.opt_text(9)?,
                         })
                     })
                     .transpose()
@@ -72,7 +79,10 @@ pub fn get_check_result(
     })
 }
 
-/// Store or replace a cached project-declared check result.
+/// Store or replace a cached project-declared check result. Keyed by
+/// `(project_id, check_name, input_hash)`; a conflicting write re-stamps
+/// `tree_hash` (the whole-tree pointer the `/checks` listing reads) onto the
+/// current tree along with the refreshed verdict.
 pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Result<(), String> {
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
@@ -82,11 +92,12 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                 conn.execute(
                     "
                     INSERT INTO check_result_cache (
-                        project_id, tree_hash, check_name, exit_code, passed, output_tail,
-                        duration_ms, ran_at, target_results_json
+                        project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                        output_tail, duration_ms, ran_at, target_results_json
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                    ON CONFLICT(project_id, tree_hash, check_name) DO UPDATE SET
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    ON CONFLICT(project_id, check_name, input_hash) DO UPDATE SET
+                        tree_hash = excluded.tree_hash,
                         exit_code = excluded.exit_code,
                         passed = excluded.passed,
                         output_tail = excluded.output_tail,
@@ -97,6 +108,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                     params![
                         result.project_id.as_str(),
                         result.tree_hash.as_str(),
+                        result.input_hash.as_str(),
                         result.check_name.as_str(),
                         result.exit_code as i64,
                         if result.passed { 1_i64 } else { 0_i64 },
@@ -133,13 +145,77 @@ pub fn list_check_results(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT project_id, tree_hash, check_name, exit_code, passed,
-                               output_tail, duration_ms, ran_at, target_results_json
+                        SELECT project_id, tree_hash, input_hash, check_name, exit_code,
+                               passed, output_tail, duration_ms, ran_at, target_results_json
                         FROM check_result_cache
                         WHERE project_id = ?1 AND tree_hash = ?2
                         ORDER BY check_name ASC
                         ",
                         params![project_id.as_str(), tree_hash.as_str()],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(CheckResultCacheEntry {
+                        project_id: row.text(0)?,
+                        tree_hash: row.text(1)?,
+                        input_hash: row.text(2)?,
+                        check_name: row.text(3)?,
+                        exit_code: row.i64(4)? as i32,
+                        passed: row.i64(5)? != 0,
+                        output_tail: row.text(6)?,
+                        duration_ms: row.i64(7)?,
+                        ran_at: row.i64(8)?,
+                        target_results_json: row.opt_text(9)?,
+                    });
+                }
+                Ok::<_, crate::storage::DbError>(out)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to list check result cache rows: {e}"))
+    })
+}
+
+/// List the MOST RECENT cached result per check name for a project, across every
+/// sealed tree the project has ever run against. Where [`list_check_results`] is
+/// keyed to one tree (the node/PR views, which show a single tree's verdicts),
+/// this powers the project-settings Checks editor, which has no worktree in scope
+/// and wants "how did each configured check last do".
+///
+/// One row per `check_name` is selected by an anti-join: keep the row for which no
+/// newer row (by `ran_at`, tie-broken by `tree_hash`) exists for the same check.
+/// The tie-break makes the pick deterministic when two trees share a `ran_at`
+/// second. Ordered by check name for a stable render. Backed by
+/// `idx_check_result_cache_project_ran_at`.
+pub fn list_latest_check_results_for_project(
+    db: Arc<LocalDb>,
+    project_id: &str,
+) -> Result<Vec<CheckResultCacheEntry>, String> {
+    let project_id = project_id.to_string();
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let project_id = project_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT c.project_id, c.tree_hash, c.check_name, c.exit_code,
+                               c.passed, c.output_tail, c.duration_ms, c.ran_at,
+                               c.target_results_json, c.input_hash
+                        FROM check_result_cache c
+                        WHERE c.project_id = ?1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM check_result_cache newer
+                              WHERE newer.project_id = c.project_id
+                                AND newer.check_name = c.check_name
+                                AND (newer.ran_at > c.ran_at
+                                     OR (newer.ran_at = c.ran_at
+                                         AND newer.tree_hash > c.tree_hash))
+                          )
+                        ORDER BY c.check_name ASC
+                        ",
+                        params![project_id.as_str()],
                     )
                     .await?;
                 let mut out = Vec::new();
@@ -154,13 +230,14 @@ pub fn list_check_results(
                         duration_ms: row.i64(6)?,
                         ran_at: row.i64(7)?,
                         target_results_json: row.opt_text(8)?,
+                        input_hash: row.text(9)?,
                     });
                 }
                 Ok::<_, crate::storage::DbError>(out)
             })
         })
         .await
-        .map_err(|e| format!("Failed to list check result cache rows: {e}"))
+        .map_err(|e| format!("Failed to list latest check result cache rows: {e}"))
     })
 }
 
@@ -170,6 +247,9 @@ pub fn list_check_results(
 pub struct CheckResultCacheEntry {
     pub project_id: String,
     pub tree_hash: String,
+    /// Per-check input hash: the content identity of just this check's impact-
+    /// matched files. The cache's real key (with project + check name).
+    pub input_hash: String,
     pub check_name: String,
     pub exit_code: i32,
     pub passed: bool,
@@ -184,6 +264,8 @@ pub struct CheckResultCacheEntry {
 pub struct CheckResultCacheWrite {
     pub project_id: String,
     pub tree_hash: String,
+    /// Per-check input hash — see [`CheckResultCacheEntry::input_hash`].
+    pub input_hash: String,
     pub check_name: String,
     pub exit_code: i32,
     pub passed: bool,
@@ -322,10 +404,15 @@ where
 mod tests {
     use super::*;
 
-    fn test_result(project_id: &str, tree_hash: &str, check_name: &str) -> CheckResultCacheWrite {
+    /// A passing write. The middle argument seeds both `tree_hash` and
+    /// `input_hash` to the same value so tests that don't care about the
+    /// distinction stay terse; tests that exercise the two independently set
+    /// `input_hash` explicitly on the returned struct.
+    fn test_result(project_id: &str, hash: &str, check_name: &str) -> CheckResultCacheWrite {
         CheckResultCacheWrite {
             project_id: project_id.to_string(),
-            tree_hash: tree_hash.to_string(),
+            tree_hash: hash.to_string(),
+            input_hash: hash.to_string(),
             check_name: check_name.to_string(),
             exit_code: 0,
             passed: true,
@@ -353,17 +440,17 @@ mod tests {
     #[tokio::test]
     async fn check_result_cache_hit_and_miss() {
         let db = cache_db().await;
-        assert!(get_check_result(db.clone(), "project-a", "tree-a", "rust")
+        assert!(get_check_result(db.clone(), "project-a", "rust", "input-a")
             .unwrap()
             .is_none());
 
-        store_check_result(db.clone(), test_result("project-a", "tree-a", "rust")).unwrap();
+        store_check_result(db.clone(), test_result("project-a", "input-a", "rust")).unwrap();
 
-        let row = get_check_result(db, "project-a", "tree-a", "rust")
+        let row = get_check_result(db, "project-a", "rust", "input-a")
             .unwrap()
             .expect("stored result should be cached");
         assert_eq!(row.project_id, "project-a");
-        assert_eq!(row.tree_hash, "tree-a");
+        assert_eq!(row.input_hash, "input-a");
         assert_eq!(row.check_name, "rust");
         assert_eq!(row.exit_code, 0);
         assert!(row.passed);
@@ -379,27 +466,27 @@ mod tests {
         // hash, so the pre-squash verdict is returned for the post-squash commit
         // without re-running the check — the carry-forward this whole change buys.
         let db = cache_db().await;
-        let equivalent_tree = "shared-tree-sha";
+        let equivalent_input = "shared-input-sha";
         store_check_result(
             db.clone(),
-            test_result("project-a", equivalent_tree, "rust"),
+            test_result("project-a", equivalent_input, "rust"),
         )
         .unwrap();
 
-        // A distinct commit that hashes to the same tree hits the stored verdict.
-        let row = get_check_result(db, "project-a", equivalent_tree, "rust")
+        // A distinct commit whose matching files hash the same hits the verdict.
+        let row = get_check_result(db, "project-a", "rust", equivalent_input)
             .unwrap()
-            .expect("equivalent-tree commit reuses the cached verdict");
+            .expect("equivalent-input commit reuses the cached verdict");
         assert!(row.passed);
-        assert_eq!(row.tree_hash, equivalent_tree);
+        assert_eq!(row.input_hash, equivalent_input);
     }
 
     #[tokio::test]
-    async fn check_result_cache_isolates_trees() {
+    async fn check_result_cache_isolates_input_hashes() {
         let db = cache_db().await;
-        store_check_result(db.clone(), test_result("project-a", "tree-a", "rust")).unwrap();
+        store_check_result(db.clone(), test_result("project-a", "input-a", "rust")).unwrap();
 
-        assert!(get_check_result(db, "project-a", "tree-b", "rust")
+        assert!(get_check_result(db, "project-a", "rust", "input-b")
             .unwrap()
             .is_none());
     }
@@ -407,9 +494,9 @@ mod tests {
     #[tokio::test]
     async fn check_result_cache_isolates_check_names() {
         let db = cache_db().await;
-        store_check_result(db.clone(), test_result("project-a", "tree-a", "rust")).unwrap();
+        store_check_result(db.clone(), test_result("project-a", "input-a", "rust")).unwrap();
 
-        assert!(get_check_result(db, "project-a", "tree-a", "frontend")
+        assert!(get_check_result(db, "project-a", "frontend", "input-a")
             .unwrap()
             .is_none());
     }
@@ -417,19 +504,64 @@ mod tests {
     #[tokio::test]
     async fn check_result_cache_isolates_projects() {
         let db = cache_db().await;
-        store_check_result(db.clone(), test_result("project-a", "tree-a", "rust")).unwrap();
+        store_check_result(db.clone(), test_result("project-a", "input-a", "rust")).unwrap();
 
-        assert!(get_check_result(db, "project-b", "tree-a", "rust")
+        assert!(get_check_result(db, "project-b", "rust", "input-a")
             .unwrap()
             .is_none());
+    }
+
+    /// The hit/miss key is the input hash; `tree_hash` is only the listing
+    /// pointer. Two rows with the same tree but different inputs are distinct.
+    #[tokio::test]
+    async fn get_keys_by_input_hash_not_tree_hash() {
+        let db = cache_db().await;
+        let mut row = test_result("project-a", "tree-1", "rust");
+        row.input_hash = "input-a".to_string();
+        store_check_result(db.clone(), row).unwrap();
+
+        assert!(get_check_result(db.clone(), "project-a", "rust", "input-a")
+            .unwrap()
+            .is_some());
+        assert!(get_check_result(db, "project-a", "rust", "other-input")
+            .unwrap()
+            .is_none());
+    }
+
+    /// A later commit with the SAME input hash but a new whole-tree hash re-stamps
+    /// the single input-keyed row (upsert updates `tree_hash`) rather than adding
+    /// a second row — so the tree-keyed listing follows the current tree.
+    #[tokio::test]
+    async fn restamp_moves_tree_pointer_for_listing() {
+        let db = cache_db().await;
+        let mut r1 = test_result("project-a", "tree-1", "rust");
+        r1.input_hash = "IH".to_string();
+        store_check_result(db.clone(), r1).unwrap();
+        assert_eq!(
+            list_check_results(db.clone(), "project-a", "tree-1")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut r2 = test_result("project-a", "tree-2", "rust");
+        r2.input_hash = "IH".to_string();
+        store_check_result(db.clone(), r2).unwrap();
+
+        assert!(list_check_results(db.clone(), "project-a", "tree-1")
+            .unwrap()
+            .is_empty());
+        let rows = list_check_results(db, "project-a", "tree-2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].check_name, "rust");
     }
 
     #[tokio::test]
     async fn store_check_result_replaces_same_key() {
         let db = cache_db().await;
-        store_check_result(db.clone(), test_result("project-a", "tree-a", "rust")).unwrap();
+        store_check_result(db.clone(), test_result("project-a", "input-a", "rust")).unwrap();
 
-        let mut replacement = test_result("project-a", "tree-a", "rust");
+        let mut replacement = test_result("project-a", "input-a", "rust");
         replacement.exit_code = 1;
         replacement.passed = false;
         replacement.output_tail = "failed".to_string();
@@ -437,7 +569,7 @@ mod tests {
         replacement.target_results_json = Some("{\"targets\":[]}".to_string());
         store_check_result(db.clone(), replacement).unwrap();
 
-        let row = get_check_result(db, "project-a", "tree-a", "rust")
+        let row = get_check_result(db, "project-a", "rust", "input-a")
             .unwrap()
             .expect("replacement should keep the cache row");
         assert_eq!(row.exit_code, 1);
@@ -445,5 +577,75 @@ mod tests {
         assert_eq!(row.output_tail, "failed");
         assert_eq!(row.duration_ms, 456);
         assert_eq!(row.target_results_json.as_deref(), Some("{\"targets\":[]}"));
+    }
+
+    /// Insert a row with an explicit `ran_at`/`tree_hash` so recency and the
+    /// tie-break are deterministic (the public `store_check_result` stamps
+    /// `ran_at` with the wall clock, which can't order two same-second writes).
+    async fn insert_row(
+        db: &LocalDb,
+        project_id: &str,
+        tree_hash: &str,
+        check_name: &str,
+        passed: bool,
+        output_tail: &str,
+        ran_at: i64,
+    ) {
+        // `input_hash` is the cache key; here it mirrors `tree_hash` so each
+        // distinct-tree insert stays a distinct row under the
+        // `(project_id, check_name, input_hash)` primary key.
+        db.execute_script(&format!(
+            "INSERT INTO check_result_cache
+               (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                output_tail, duration_ms, ran_at)
+             VALUES ('{project_id}', '{tree_hash}', '{tree_hash}', '{check_name}', {exit}, {passed},
+                '{output_tail}', 10, {ran_at});",
+            exit = if passed { 0 } else { 1 },
+            passed = if passed { 1 } else { 0 },
+        ))
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_per_check_picks_newest_tree_and_isolates_projects() {
+        let db = cache_db().await;
+        // `rust` ran against an old failing tree, then a newer passing tree.
+        insert_row(&db, "project-a", "tree-old", "rust", false, "old fail", 100).await;
+        insert_row(&db, "project-a", "tree-new", "rust", true, "new pass", 200).await;
+        // A second check, and a same-named check in another project that must not leak.
+        insert_row(&db, "project-a", "tree-new", "frontend", true, "fe", 150).await;
+        insert_row(&db, "project-b", "tree-new", "rust", true, "other", 999).await;
+
+        let rows = list_latest_check_results_for_project(db, "project-a").unwrap();
+        // One row per check name, ordered by name: frontend, then rust.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].check_name, "frontend");
+        assert_eq!(rows[1].check_name, "rust");
+        // The `rust` verdict is the NEWER tree's pass, not the older fail.
+        assert!(rows[1].passed);
+        assert_eq!(rows[1].tree_hash, "tree-new");
+        assert_eq!(rows[1].output_tail, "new pass");
+    }
+
+    #[tokio::test]
+    async fn latest_per_check_breaks_ran_at_ties_deterministically() {
+        let db = cache_db().await;
+        // Same check at two trees with an IDENTICAL ran_at: the tie-break on
+        // tree_hash keeps exactly one row (the lexicographically greater hash).
+        insert_row(&db, "project-a", "tree-aaa", "rust", false, "a", 500).await;
+        insert_row(&db, "project-a", "tree-bbb", "rust", true, "b", 500).await;
+
+        let rows = list_latest_check_results_for_project(db, "project-a").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tree_hash, "tree-bbb");
+    }
+
+    #[tokio::test]
+    async fn latest_per_check_empty_when_no_results() {
+        let db = cache_db().await;
+        assert!(list_latest_check_results_for_project(db, "project-a")
+            .unwrap()
+            .is_empty());
     }
 }

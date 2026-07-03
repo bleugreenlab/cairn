@@ -1066,7 +1066,7 @@ ciCommands:
   - npm test
 terminalCommands:
   - name: Dev
-    command: "bun run build:mcp && bun dev:instance"
+    command: "bun run build:cmd && bun dev:instance"
     write:
       - "~/.cairn-dev-*"
 "#;

@@ -23,36 +23,51 @@
 //! the check commands' working directory — still targets the sealed worktree
 //! commit. See [`load_live_project_checks`].
 //!
-//! ## Scope (Wave 3)
+//! ## Scope
 //!
-//! Only the `when:write` cadence runs here; `when:idle`/`when:review` are out of
-//! scope. There is no regression-delta/baseline/inheritance and no per-test
-//! parsing — a check passes iff its command exits `0`, and a spawn error or
-//! sandbox denial is a clear failure, never a silent pass. Checks are invoked
-//! through the `run` verb's process machinery directly (not `run_one`), so a
-//! sandbox-blocked syscall surfaces as a failed exit rather than an interactive
-//! fence prompt; routing the fence-prompting `when:review` cargo check through the
-//! suspend/resume re-drive is deferred to Wave 4.
+//! Only the `when:write` cadence runs here; `when:idle`/`when:review` run at
+//! turn-end ([`crate::execution::checks_turn_end`]). A check passes iff its
+//! command exits `0` — output parsing ([`crate::execution::check_parsers`]) is
+//! pure enrichment (failing test names + excerpt) and never changes a verdict;
+//! a spawn error or sandbox denial is a clear failure, never a silent pass.
+//! Placeholder selectors narrow to the delta since the check's last PASSING
+//! baseline and fall back to the cumulative branch diff on any uncertainty (see
+//! `baseline_delta_changed_files`). Checks are invoked through the `run` verb's
+//! process machinery directly (not `run_one`), so a sandbox-blocked syscall
+//! surfaces as a failed exit rather than an interactive fence prompt.
 //!
 //! ## Cache key
 //!
-//! The cache is keyed by the sealed tree identity ([`crate::jj::sealed_tree_hash`]),
-//! which is the git tree object of the sealed `@-` commit — a genuine content
-//! hash. Two separately-created commits with identical tree content therefore
-//! share a key, so a clean rebase/squash that preserves file content reuses the
-//! prior verdict instead of re-running. (If the git-backend resolution ever
-//! fails, `sealed_tree_hash` falls back to the commit id: still correct, just
-//! per-commit rather than per-tree.)
+//! Each check's verdict is keyed by its INPUT hash: the content identity of only
+//! the files in the sealed tree matching that check's `impact` globs (see
+//! [`input_hash_for`] / [`crate::execution::selection::check_input_hash`]). A
+//! commit that changed none of a check's inputs — a doc-only commit landing after
+//! a source commit — hits the cache even though the whole-tree hash moved, so the
+//! check is not re-run. A check with no `impact` globs keeps whole-tree keying
+//! ([`crate::jj::sealed_tree_hash`]). The row also stores that whole-tree hash and
+//! re-stamps it on every evaluation (run OR hit), so the `/checks` listing — which
+//! looks rows up by whole-tree hash — still surfaces every applicable check at the
+//! current tree. If the sealed tree can't be read, an impact-scoped check falls
+//! back to whole-tree keying: conservative (re-runs on any change), never a false
+//! reuse.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::config::project_settings::{load_checks, CheckCommand, CheckWhen};
-use crate::execution::cache::{get_check_result, store_check_result, CheckResultCacheWrite};
+use crate::execution::cache::{
+    get_check_result, list_latest_check_results_for_project, store_check_result,
+    CheckResultCacheEntry, CheckResultCacheWrite,
+};
+use crate::execution::check_parsers::{
+    format_failure_excerpt, format_failure_names, parse_check_output, ParsedCheckResult,
+};
 use crate::execution::selection::{plan_checks, CheckPlan};
-use crate::jj::{node_changed_files, sealed_tree_hash, GraphFileChange, JjEnv};
+use crate::jj::{
+    node_changed_files, sealed_tree_entries, sealed_tree_hash, tree_entries, GraphFileChange, JjEnv,
+};
 use crate::mcp::handlers::RunContext;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -110,7 +125,9 @@ pub async fn run_write_checks_after_seal(
         return None;
     }
 
-    // 3 + 4. Plan, then filter to the applicable `when:write` checks (the gate).
+    // 3 + 4. Plan against the cumulative branch diff first. This remains the
+    // conservative impact gate: a cumulative match may over-apply a check, but the
+    // input-hash cache below turns unchanged inputs into hits so no command runs.
     let plans = applicable_write_checks(&checks, &changed, repo_root);
     if plans.is_empty() {
         return None;
@@ -130,14 +147,80 @@ pub async fn run_write_checks_after_seal(
     // defaults to "not clean" so a doubtful case never folds.
     let clean_before = !crate::jj::is_working_copy_dirty(&jj, repo_root).unwrap_or(true);
 
+    // Per-check input hash: key each verdict by the content identity of ONLY the
+    // files matching that check's impact globs, so a commit touching none of a
+    // check's inputs (a doc-only commit after a src-tauri commit) reuses the
+    // stored verdict instead of re-running. Read the sealed tree once, and only
+    // when some applicable check is impact-scoped.
+    let entries = if plans
+        .iter()
+        .any(|p| checks.get(&p.name).is_some_and(|c| c.impact.is_some()))
+    {
+        sealed_tree_entries(&jj, repo_root).ok()
+    } else {
+        None
+    };
+    let latest_by_check: HashMap<String, CheckResultCacheEntry> =
+        list_latest_check_results_for_project(orch.db.local.clone(), &run_context.project_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| (row.check_name.clone(), row))
+            .collect();
+    let keyed: Vec<(CheckPlan, String)> = plans
+        .into_iter()
+        .map(|plan| {
+            let check = checks.get(&plan.name);
+            let impact = check.and_then(|c| c.impact.as_ref());
+            let input_hash = input_hash_for(impact, entries.as_deref(), &tree_hash);
+
+            // If this input is already cached, keep the cumulative plan: the runner
+            // will re-stamp the row and skip execution. Only a cache MISS needs a
+            // concrete selector. For misses, a PASSING latest baseline lets us
+            // narrow `{changedFiles}` / `{targets}` to the tree-vs-tree delta since
+            // that verdict; a failing or unreadable baseline falls back to the full
+            // cumulative branch diff. That fallback is required for soundness:
+            // structured failures name tests, not necessarily files, so we cannot
+            // feed a previous failure into file-based selectors like `vitest related`.
+            let should_reselect = get_check_result(
+                orch.db.local.clone(),
+                &run_context.project_id,
+                &plan.name,
+                &input_hash,
+            )
+            .ok()
+            .flatten()
+            .is_none();
+            let selected_plan = if should_reselect {
+                match check {
+                    Some(check) => {
+                        let selected_changed = selected_changed_files_for_miss(
+                            latest_by_check.get(&plan.name),
+                            entries.as_deref(),
+                            impact,
+                            &changed,
+                            &jj,
+                            repo_root,
+                        );
+                        replan_one_check(&plan.name, check, &selected_changed, repo_root)
+                            .unwrap_or(plan)
+                    }
+                    None => plan,
+                }
+            } else {
+                plan
+            };
+            (selected_plan, input_hash)
+        })
+        .collect();
+
     let results = run_planned_checks(
         orch.db.local.clone(),
         &run_context.project_id,
         &tree_hash,
-        &plans,
+        &keyed,
         tool_use_id,
         move |command, stream_id| async move {
-            crate::mcp::handlers::bash::run_check_command(
+            crate::mcp::handlers::run::run_check_command(
                 orch,
                 cwd,
                 &stream_id,
@@ -149,6 +232,15 @@ pub async fn run_write_checks_after_seal(
         },
     )
     .await;
+
+    // Nudge any open Checks settings view (and other `check_result_cache`
+    // consumers) to re-read the freshly stored verdicts. The turn-end cadence
+    // emits the same signal; the write cadence must too, or per-commit results
+    // never surface live in the settings editor.
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "check_result_cache", "action": "update"}),
+    );
 
     // Fold any tracked changes the checks made into the just-sealed commit, leaving
     // `@` clean == the amended tip. One mechanism, two jobs: a formatter's edits
@@ -339,32 +431,239 @@ pub fn applicable_write_checks(
         .collect()
 }
 
+fn replan_one_check(
+    name: &str,
+    check: &CheckCommand,
+    changed: &[GraphFileChange],
+    repo_root: &Path,
+) -> Option<CheckPlan> {
+    let mut one = HashMap::new();
+    one.insert(name.to_string(), check.clone());
+    plan_checks(&one, changed, repo_root)
+        .into_iter()
+        .next()
+        .filter(|plan| plan.applies)
+}
+
+/// Changed-file selector for a cache miss. The planner stays pure: this runner
+/// reads cache rows and tree objects, then hands `plan_checks` either the narrowed
+/// delta or the conservative cumulative branch diff as ordinary data.
+fn selected_changed_files_for_miss(
+    latest: Option<&CheckResultCacheEntry>,
+    current_entries: Option<&[(String, String)]>,
+    impact: Option<&Vec<String>>,
+    cumulative: &[GraphFileChange],
+    jj: &JjEnv,
+    repo_root: &Path,
+) -> Vec<GraphFileChange> {
+    let Some(latest) = latest.filter(|row| row.passed) else {
+        return cumulative.to_vec();
+    };
+    let Some(current_entries) = current_entries else {
+        return cumulative.to_vec();
+    };
+    let baseline_entries = match tree_entries(jj, repo_root, &latest.tree_hash) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!(
+                "when:write checks: failed to read cached baseline tree {} for {}: {e}; \
+                 using cumulative selection",
+                latest.tree_hash,
+                latest.check_name
+            );
+            return cumulative.to_vec();
+        }
+    };
+    baseline_delta_changed_files(
+        Some(latest),
+        Some(&baseline_entries),
+        Some(current_entries),
+        impact,
+        cumulative,
+    )
+}
+
+/// Pure decision rule for choosing a placeholder-selection change set. A passing
+/// baseline means the cached verdict covered the baseline tree's impact-matched
+/// subset, so the next run only has to select tests/targets reachable from the
+/// paths whose matching tree entries changed since then. The baseline row is
+/// project-global: it may have been re-stamped by another branch, but comparing
+/// tree objects under the same impact globs is still sound. If the other branch's
+/// tree differs in extra matching paths, the delta over-includes; it cannot hide a
+/// current change from a passing baseline.
+fn baseline_delta_changed_files(
+    latest: Option<&CheckResultCacheEntry>,
+    baseline_entries: Option<&[(String, String)]>,
+    current_entries: Option<&[(String, String)]>,
+    impact: Option<&Vec<String>>,
+    cumulative: &[GraphFileChange],
+) -> Vec<GraphFileChange> {
+    if !latest.is_some_and(|row| row.passed) {
+        return cumulative.to_vec();
+    }
+    let (Some(baseline), Some(current)) = (baseline_entries, current_entries) else {
+        return cumulative.to_vec();
+    };
+    match diff_tree_entries_for_impact(baseline, current, impact) {
+        Some(delta) if !delta.is_empty() => delta,
+        _ => cumulative.to_vec(),
+    }
+}
+
+fn diff_tree_entries_for_impact(
+    baseline: &[(String, String)],
+    current: &[(String, String)],
+    impact: Option<&Vec<String>>,
+) -> Option<Vec<GraphFileChange>> {
+    let matcher = match impact {
+        Some(globs) => Some(crate::execution::selection::build_glob_set(globs).ok()?),
+        None => None,
+    };
+    let is_match = |path: &str| {
+        matcher
+            .as_ref()
+            .map(|set| set.is_match(path))
+            .unwrap_or(true)
+    };
+    let baseline: BTreeMap<&str, &str> = baseline
+        .iter()
+        .filter(|(path, _)| is_match(path))
+        .map(|(path, blob)| (path.as_str(), blob.as_str()))
+        .collect();
+    let current: BTreeMap<&str, &str> = current
+        .iter()
+        .filter(|(path, _)| is_match(path))
+        .map(|(path, blob)| (path.as_str(), blob.as_str()))
+        .collect();
+    let paths: BTreeSet<&str> = baseline.keys().chain(current.keys()).copied().collect();
+    let mut changes = Vec::new();
+    for path in paths {
+        let before = baseline.get(path);
+        let after = current.get(path);
+        if before == after {
+            continue;
+        }
+        changes.push(GraphFileChange {
+            path: path.to_string(),
+            previous_path: None,
+            status: match (before, after) {
+                (None, Some(_)) => "added",
+                (Some(_), None) => "deleted",
+                (Some(_), Some(_)) => "modified",
+                (None, None) => unreachable!(),
+            }
+            .to_string(),
+            additions: 0,
+            deletions: 0,
+        });
+    }
+    Some(changes)
+}
+
+/// The outcome of one planned check: its exit-code-driven verdict, the parsed
+/// per-test detail (enrichment, may be absent), and the retained combined-output
+/// tail used as the excerpt fallback. Carried out of [`run_planned_checks`] so
+/// the inline summary can render WHAT failed, not just the exit code.
+pub struct CheckOutcome {
+    pub name: String,
+    pub passed: bool,
+    pub exit_code: Option<i32>,
+    /// Structured per-test result, when the runner's output could be parsed.
+    pub parsed: Option<ParsedCheckResult>,
+    /// Retained combined-output tail — the excerpt source when the parse carries
+    /// no per-failure messages (nextest) or there is no parse at all.
+    pub output_tail: String,
+}
+
+/// The cache key for one check's verdict: the content identity of ONLY the files
+/// in the sealed tree matching that check's impact globs (its "input hash"). A
+/// check with NO impact globs keeps whole-tree keying (`tree_hash`), since every
+/// change is one of its inputs. When the sealed tree can't be read (`entries` is
+/// `None` after a git hiccup), an impact-scoped check falls back to the whole-tree
+/// hash — conservative: it re-runs on any change and never falsely reuses a
+/// verdict. Glob matching reuses the planner's globset
+/// ([`crate::execution::selection::check_input_hash`]), so there is one glob
+/// semantics in the codebase.
+pub(crate) fn input_hash_for(
+    impact: Option<&Vec<String>>,
+    entries: Option<&[(String, String)]>,
+    tree_hash: &str,
+) -> String {
+    match impact {
+        None => tree_hash.to_string(),
+        Some(globs) => match entries {
+            Some(entries) => crate::execution::selection::check_input_hash(entries, globs),
+            None => tree_hash.to_string(),
+        },
+    }
+}
+
 /// Execute the planned checks against the sealed tree, consulting the cache
-/// first. Generic over the spawn closure so the cache hit/miss behavior is
-/// unit-testable without spawning a real process. Returns `(name, passed,
-/// exit_code)` per check in plan order.
+/// first. Each plan is paired with its per-check input hash (the cache key);
+/// `tree_hash` is the whole-tree pointer re-stamped onto every evaluated row so
+/// the `/checks` listing still surfaces the check at the current tree. Generic
+/// over the spawn closure so the cache hit/miss behavior is unit-testable without
+/// spawning a real process. Returns one [`CheckOutcome`] per check in plan order.
+///
+/// A miss parses the runner's output into structured per-test results
+/// ([`parse_check_output`]) and persists them in the cache row's
+/// `target_results_json`; a hit rehydrates that column. Parsing is pure
+/// enrichment — `passed` / `exit_code` stay exit-code-driven either way, so a
+/// parser miss can never turn a failing exit into a pass.
 async fn run_planned_checks<F, Fut>(
     db: Arc<LocalDb>,
     project_id: &str,
     tree_hash: &str,
-    plans: &[CheckPlan],
+    plans: &[(CheckPlan, String)],
     tool_use_id: &str,
     execute: F,
-) -> Vec<(String, bool, Option<i32>)>
+) -> Vec<CheckOutcome>
 where
     F: Fn(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<(Option<i32>, String), String>>,
 {
     let mut results = Vec::with_capacity(plans.len());
-    for (index, plan) in plans.iter().enumerate() {
-        // Cache hit ⇒ use the stored verdict, run nothing.
-        if let Ok(Some(entry)) = get_check_result(db.clone(), project_id, tree_hash, &plan.name) {
-            results.push((plan.name.clone(), entry.passed, Some(entry.exit_code)));
+    for (index, (plan, input_hash)) in plans.iter().enumerate() {
+        // Cache hit ⇒ reuse the stored verdict and rehydrate the structured
+        // detail; run nothing. The lookup is keyed by the per-check INPUT hash, so
+        // a commit that changed none of this check's impact-matched files hits even
+        // though the whole-tree hash moved.
+        if let Ok(Some(entry)) = get_check_result(db.clone(), project_id, &plan.name, input_hash) {
+            // Re-stamp the row onto the current whole tree so the `/checks` listing
+            // (keyed by whole-tree hash) still surfaces this check at the current
+            // tree — without re-running it.
+            let _ = store_check_result(
+                db.clone(),
+                CheckResultCacheWrite {
+                    project_id: project_id.to_string(),
+                    tree_hash: tree_hash.to_string(),
+                    input_hash: input_hash.clone(),
+                    check_name: plan.name.clone(),
+                    exit_code: entry.exit_code,
+                    passed: entry.passed,
+                    output_tail: entry.output_tail.clone(),
+                    duration_ms: entry.duration_ms,
+                    target_results_json: entry.target_results_json.clone(),
+                },
+            );
+            // Rehydrate the structured per-test detail persisted at run time.
+            let parsed = entry
+                .target_results_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<ParsedCheckResult>(s).ok());
+            results.push(CheckOutcome {
+                name: plan.name.clone(),
+                passed: entry.passed,
+                exit_code: Some(entry.exit_code),
+                parsed,
+                output_tail: entry.output_tail,
+            });
             continue;
         }
 
-        // Miss ⇒ run to completion (streaming) and record the result.
-        let stream_id = crate::mcp::handlers::bash::run_item_stream_id(tool_use_id, index);
+        // Miss ⇒ run to completion (streaming) and record the result keyed by the
+        // input hash, stamped with the current whole tree.
+        let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
         let started = Instant::now();
         let (exit_code, passed, output) = match execute(plan.command.clone(), stream_id).await {
             Ok((code, combined)) => (code, code == Some(0), combined),
@@ -373,42 +672,83 @@ where
         };
         let duration_ms = started.elapsed().as_millis() as i64;
 
+        // Enrich (fail-closed): a parse only adds detail, never changes `passed`.
+        let parsed = parse_check_output(&plan.command, &output);
+        let target_results_json = parsed.as_ref().and_then(|p| serde_json::to_string(p).ok());
+        let output_tail = tail(&output, OUTPUT_TAIL_CHARS);
+
         let _ = store_check_result(
             db.clone(),
             CheckResultCacheWrite {
                 project_id: project_id.to_string(),
                 tree_hash: tree_hash.to_string(),
+                input_hash: input_hash.clone(),
                 check_name: plan.name.clone(),
                 exit_code: exit_code.unwrap_or(-1),
                 passed,
-                output_tail: tail(&output, OUTPUT_TAIL_CHARS),
+                output_tail: output_tail.clone(),
                 duration_ms,
-                target_results_json: None,
+                target_results_json,
             },
         );
 
-        results.push((plan.name.clone(), passed, exit_code));
+        results.push(CheckOutcome {
+            name: plan.name.clone(),
+            passed,
+            exit_code,
+            parsed,
+            output_tail,
+        });
     }
     results
 }
 
-/// Render the per-check pass/fail line, e.g. `\u{2713} frontend \u{b7} \u{2717}
-/// typecheck (exit 1)`. Pure, so it is unit-tested directly.
-pub fn format_check_summary(results: &[(String, bool, Option<i32>)]) -> String {
-    results
+/// Render the inline pass/fail summary appended to the originating tool result.
+/// The first line is the compact per-check status
+/// (`\u{2713} frontend \u{b7} \u{2717} typecheck (exit 1)`); each failing check
+/// then gets a detail block naming the failing tests and a bounded output
+/// excerpt, so the agent learns WHAT broke without re-running the suite. Pure, so
+/// it is unit-tested directly.
+pub fn format_check_summary(results: &[CheckOutcome]) -> String {
+    let header = results
         .iter()
-        .map(|(name, passed, exit_code)| {
-            if *passed {
-                format!("\u{2713} {name}")
-            } else {
-                match exit_code {
-                    Some(code) => format!("\u{2717} {name} (exit {code})"),
-                    None => format!("\u{2717} {name} (failed to run)"),
-                }
-            }
+        .map(|o| match (o.passed, o.exit_code) {
+            (true, _) => format!("\u{2713} {}", o.name),
+            (false, Some(code)) => format!("\u{2717} {} (exit {code})", o.name),
+            (false, None) => format!("\u{2717} {} (failed to run)", o.name),
         })
         .collect::<Vec<_>>()
-        .join(" \u{b7} ")
+        .join(" \u{b7} ");
+
+    let mut out = header;
+    for o in results.iter().filter(|o| !o.passed) {
+        if let Some(detail) = format_check_detail(o) {
+            out.push_str("\n\n");
+            out.push_str(&detail);
+        }
+    }
+    out
+}
+
+/// One failing check's detail block: a `\u{2717} <name> \u{2014} N failed: ...`
+/// line (when structured names are available) over a fenced, bounded excerpt.
+/// `None` when there is nothing to add beyond the header status (no structured
+/// names and no output to excerpt). Pure.
+fn format_check_detail(o: &CheckOutcome) -> Option<String> {
+    let names = o.parsed.as_ref().and_then(format_failure_names);
+    let excerpt = format_failure_excerpt(o.parsed.as_ref(), &o.output_tail);
+    let head = match names {
+        Some(n) => format!("\u{2717} {} \u{2014} {n}", o.name),
+        None if excerpt.trim().is_empty() => return None,
+        None => format!("\u{2717} {}:", o.name),
+    };
+    let mut block = head;
+    if !excerpt.trim().is_empty() {
+        block.push_str("\n```\n");
+        block.push_str(excerpt.trim_end());
+        block.push_str("\n```");
+    }
+    Some(block)
 }
 
 /// Last `max_chars` characters of `s`, on a char boundary.
@@ -477,6 +817,21 @@ mod tests {
             impact: impact.map(|globs| globs.iter().map(|s| s.to_string()).collect()),
             policy: CheckPolicy::Advisory,
             when,
+        }
+    }
+
+    fn cache_entry(check_name: &str, tree_hash: &str, passed: bool) -> CheckResultCacheEntry {
+        CheckResultCacheEntry {
+            project_id: "project-a".to_string(),
+            tree_hash: tree_hash.to_string(),
+            input_hash: format!("input-{tree_hash}"),
+            check_name: check_name.to_string(),
+            exit_code: if passed { 0 } else { 1 },
+            passed,
+            output_tail: String::new(),
+            duration_ms: 1,
+            ran_at: 1,
+            target_results_json: None,
         }
     }
 
@@ -598,6 +953,142 @@ mod tests {
         assert!(checks_from_source(Some(project.path()), worktree.path()).is_none());
     }
 
+    // --- passing-baseline delta selection ---------------------------------
+
+    #[test]
+    fn tree_entry_delta_reports_added_changed_removed_under_impact_globs() {
+        let baseline = vec![
+            ("src/a.ts".to_string(), "a1".to_string()),
+            ("src/b.ts".to_string(), "b1".to_string()),
+            ("src/removed.ts".to_string(), "r1".to_string()),
+            ("docs/ignored.md".to_string(), "d1".to_string()),
+        ];
+        let current = vec![
+            ("src/a.ts".to_string(), "a2".to_string()),
+            ("src/b.ts".to_string(), "b1".to_string()),
+            ("src/added.ts".to_string(), "n1".to_string()),
+            ("docs/ignored.md".to_string(), "d2".to_string()),
+        ];
+        let impact = vec!["src/**".to_string()];
+
+        let delta = diff_tree_entries_for_impact(&baseline, &current, Some(&impact)).unwrap();
+        let observed: Vec<(&str, &str)> = delta
+            .iter()
+            .map(|change| (change.path.as_str(), change.status.as_str()))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                ("src/a.ts", "modified"),
+                ("src/added.ts", "added"),
+                ("src/removed.ts", "deleted"),
+            ]
+        );
+    }
+
+    #[test]
+    fn baseline_decision_uses_delta_only_from_passing_baseline() {
+        let baseline = vec![("src/a.ts".to_string(), "a1".to_string())];
+        let current = vec![
+            ("src/a.ts".to_string(), "a1".to_string()),
+            ("src/b.ts".to_string(), "b1".to_string()),
+        ];
+        let impact = vec!["src/**".to_string()];
+        let cumulative = vec![change("src/a.ts"), change("src/b.ts")];
+        let passing = cache_entry("frontend", "tree-a", true);
+        let failing = cache_entry("frontend", "tree-a", false);
+
+        let narrowed = baseline_delta_changed_files(
+            Some(&passing),
+            Some(&baseline),
+            Some(&current),
+            Some(&impact),
+            &cumulative,
+        );
+        assert_eq!(
+            narrowed.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec!["src/b.ts"]
+        );
+
+        let from_fail = baseline_delta_changed_files(
+            Some(&failing),
+            Some(&baseline),
+            Some(&current),
+            Some(&impact),
+            &cumulative,
+        );
+        assert_eq!(from_fail, cumulative);
+
+        let from_missing = baseline_delta_changed_files(
+            None,
+            Some(&baseline),
+            Some(&current),
+            Some(&impact),
+            &cumulative,
+        );
+        assert_eq!(from_missing, cumulative);
+    }
+
+    #[test]
+    fn baseline_decision_falls_back_to_cumulative_on_empty_or_uncertain_delta() {
+        let entries = vec![("src/a.ts".to_string(), "a1".to_string())];
+        let impact = vec!["src/**".to_string()];
+        let cumulative = vec![change("src/a.ts")];
+        let passing = cache_entry("frontend", "tree-a", true);
+
+        let empty_delta = baseline_delta_changed_files(
+            Some(&passing),
+            Some(&entries),
+            Some(&entries),
+            Some(&impact),
+            &cumulative,
+        );
+        assert_eq!(empty_delta, cumulative);
+
+        let unreadable_current = baseline_delta_changed_files(
+            Some(&passing),
+            Some(&entries),
+            None,
+            Some(&impact),
+            &cumulative,
+        );
+        assert_eq!(unreadable_current, cumulative);
+    }
+
+    #[test]
+    fn passing_baseline_delta_replans_changed_files_selector_to_new_file_only() {
+        // Commit A touched f1 and passed, so the cached baseline tree contains f1.
+        let baseline = vec![("src/f1.ts".to_string(), "f1-a".to_string())];
+        // Commit B touches f2. The cumulative branch diff still contains f1 and f2,
+        // but a passing baseline makes the safe selector just the tree delta: f2.
+        let current = vec![
+            ("src/f1.ts".to_string(), "f1-a".to_string()),
+            ("src/f2.ts".to_string(), "f2-b".to_string()),
+        ];
+        let impact = vec!["src/**".to_string()];
+        let cumulative = vec![change("src/f1.ts"), change("src/f2.ts")];
+        let passing = cache_entry("frontend", "tree-a", true);
+        let selected = baseline_delta_changed_files(
+            Some(&passing),
+            Some(&baseline),
+            Some(&current),
+            Some(&impact),
+            &cumulative,
+        );
+        let check = check(
+            "bunx vitest related --reporter=json {changedFiles}",
+            Some(&["src/**"]),
+            CheckWhen::Write,
+        );
+
+        let plan = replan_one_check("frontend", &check, &selected, Path::new("/repo")).unwrap();
+        assert_eq!(
+            plan.command,
+            "bunx vitest related --reporter=json src/f2.ts"
+        );
+        assert_eq!(plan.scope, CheckScope::Partial);
+    }
+
     // --- the turn-end-cadence gate ----------------------------------------
 
     /// A checks map with one check per cadence, all scoped to `src/**`.
@@ -661,19 +1152,53 @@ mod tests {
 
     // --- summary formatting -----------------------------------------------
 
+    /// A bare outcome with no structured detail and no output tail, so the
+    /// summary renders only the header status line.
+    fn outcome(name: &str, passed: bool, exit_code: Option<i32>) -> CheckOutcome {
+        CheckOutcome {
+            name: name.to_string(),
+            passed,
+            exit_code,
+            parsed: None,
+            output_tail: String::new(),
+        }
+    }
+
     #[test]
     fn summary_renders_pass_and_fail() {
+        // No structured detail / output ⇒ header line only.
         let s = format_check_summary(&[
-            ("frontend".to_string(), true, Some(0)),
-            ("typecheck".to_string(), false, Some(1)),
+            outcome("frontend", true, Some(0)),
+            outcome("typecheck", false, Some(1)),
         ]);
         assert_eq!(s, "\u{2713} frontend \u{b7} \u{2717} typecheck (exit 1)");
     }
 
     #[test]
     fn summary_renders_spawn_failure_without_exit_code() {
-        let s = format_check_summary(&[("frontend".to_string(), false, None)]);
+        let s = format_check_summary(&[outcome("frontend", false, None)]);
         assert_eq!(s, "\u{2717} frontend (failed to run)");
+    }
+
+    #[test]
+    fn summary_appends_failing_test_names_and_excerpt() {
+        let parsed = crate::execution::check_parsers::parse_check_output(
+            "bunx tsc --noEmit",
+            "a.ts(1,7): error TS2322: Type 'string' is not assignable to type 'number'.",
+        );
+        let results = vec![CheckOutcome {
+            name: "typecheck".to_string(),
+            passed: false,
+            exit_code: Some(1),
+            parsed,
+            output_tail: "raw output tail".to_string(),
+        }];
+        let s = format_check_summary(&results);
+        // Header status line first.
+        assert!(s.starts_with("\u{2717} typecheck (exit 1)"));
+        // Then a detail block naming the failing test and quoting the error.
+        assert!(s.contains("\u{2717} typecheck \u{2014} 1 failed: a.ts(1,7)"));
+        assert!(s.contains("TS2322: Type 'string' is not assignable"));
     }
 
     #[test]
@@ -722,6 +1247,7 @@ mod tests {
             CheckResultCacheWrite {
                 project_id: "project-a".to_string(),
                 tree_hash: "tree-a".to_string(),
+                input_hash: "ih-frontend".to_string(),
                 check_name: "frontend".to_string(),
                 exit_code: 0,
                 passed: true,
@@ -732,7 +1258,10 @@ mod tests {
         )
         .unwrap();
 
-        let plans = vec![plan("frontend", "bunx vitest run")];
+        let plans = vec![(
+            plan("frontend", "bunx vitest run"),
+            "ih-frontend".to_string(),
+        )];
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         let results = run_planned_checks(
@@ -756,13 +1285,16 @@ mod tests {
             0,
             "a cache hit must not re-run the check"
         );
-        assert_eq!(results, vec![("frontend".to_string(), true, Some(0))]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "frontend");
+        assert!(results[0].passed);
+        assert_eq!(results[0].exit_code, Some(0));
     }
 
     #[tokio::test]
     async fn cache_miss_runs_then_stores() {
         let db = cache_db().await;
-        let plans = vec![plan("frontend", "bunx vitest run")];
+        let plans = vec![(plan("frontend", "bunx vitest run"), "ih-b".to_string())];
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         let results = run_planned_checks(
@@ -786,13 +1318,134 @@ mod tests {
             1,
             "a miss runs the check once"
         );
-        assert_eq!(results, vec![("frontend".to_string(), false, Some(1))]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "frontend");
+        assert!(!results[0].passed);
+        assert_eq!(results[0].exit_code, Some(1));
 
-        let stored = get_check_result(db, "project-a", "tree-b", "frontend")
+        let stored = get_check_result(db, "project-a", "frontend", "ih-b")
             .unwrap()
             .expect("a miss stores the result");
         assert_eq!(stored.exit_code, 1);
         assert!(!stored.passed);
         assert_eq!(stored.output_tail, "vitest failed");
+    }
+
+    #[tokio::test]
+    async fn cache_miss_persists_structured_results() {
+        let db = cache_db().await;
+        let plans = vec![(
+            plan("rust", "bun run test:rust:nextest"),
+            "ih-structured".to_string(),
+        )];
+        let nextest_output = "     Summary [   0.1s] 3 tests run: 1 passed, 2 failed, 0 skipped\n\
+            \x20       FAIL [   0.0s] (1/3) mycrate mod::test_a\n\
+            \x20       FAIL [   0.0s] (2/3) mycrate mod::test_b"
+            .to_string();
+        let results = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-structured",
+            &plans,
+            "tool",
+            move |_command, _stream_id| {
+                let out = nextest_output.clone();
+                async move { Ok((Some(100), out)) }
+            },
+        )
+        .await;
+
+        // The outcome carries the parsed per-test detail.
+        let parsed = results[0].parsed.as_ref().expect("nextest output parses");
+        assert_eq!(parsed.parser, "nextest");
+        assert_eq!(parsed.failed, 2);
+        assert_eq!(parsed.failures.len(), 2);
+
+        // And it is persisted in target_results_json for future baseline work.
+        let stored = get_check_result(db, "project-a", "rust", "ih-structured")
+            .unwrap()
+            .expect("a miss stores the result");
+        let json = stored
+            .target_results_json
+            .expect("structured results persisted");
+        assert!(json.contains("\"parser\":\"nextest\""));
+        assert!(json.contains("mycrate mod::test_a"));
+    }
+
+    /// The repro this whole change fixes. A src-tauri commit runs the rust check
+    /// and caches its verdict keyed by the src-tauri input hash. A following
+    /// doc-only commit moves the WHOLE-tree hash but leaves that input hash
+    /// unchanged, so the verdict is a cache HIT — rust does not re-run — and the
+    /// row is re-stamped onto the doc commit's tree so the `/checks` listing still
+    /// surfaces it.
+    #[tokio::test]
+    async fn doc_only_commit_reuses_impact_scoped_verdict() {
+        let db = cache_db().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // Commit 1 touches src-tauri: rust runs and caches its verdict for input
+        // hash IH1 at whole-tree tree-1.
+        let plans = vec![(plan("rust", "bun run test:rust"), "IH1".to_string())];
+        let counted = calls.clone();
+        let r1 = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-1",
+            &plans,
+            "tool",
+            move |_command, _stream_id| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok((Some(0), "ran".to_string()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(r1.len(), 1);
+        assert_eq!(r1[0].name, "rust");
+        assert!(r1[0].passed);
+        assert_eq!(r1[0].exit_code, Some(0));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Commit 2 is doc-only: the whole tree changes to tree-2, but the rust
+        // input hash is UNCHANGED (still IH1), so the verdict is a cache hit and
+        // the check does not re-run.
+        let plans2 = vec![(plan("rust", "bun run test:rust"), "IH1".to_string())];
+        let counted = calls.clone();
+        let r2 = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-2",
+            &plans2,
+            "tool",
+            move |_command, _stream_id| {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok((Some(0), "ran".to_string()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].name, "rust");
+        assert!(r2[0].passed);
+        assert_eq!(r2[0].exit_code, Some(0));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a doc-only commit must not re-run the rust check"
+        );
+
+        // The reused verdict was re-stamped onto the doc commit's tree, so the
+        // tree-keyed `/checks` listing surfaces rust at the current tree.
+        let stamped = get_check_result(db.clone(), "project-a", "rust", "IH1")
+            .unwrap()
+            .expect("the verdict is still cached");
+        assert_eq!(stamped.tree_hash, "tree-2");
+        let rows = crate::execution::cache::list_check_results(db, "project-a", "tree-2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].check_name, "rust");
     }
 }

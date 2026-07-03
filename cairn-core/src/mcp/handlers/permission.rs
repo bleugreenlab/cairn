@@ -1146,12 +1146,12 @@ async fn has_pending_permission_request(db: &LocalDb, run_id: &str) -> bool {
 /// output string becomes the synthetic tool_result the resumed agent sees.
 ///
 /// The futures are boxed: a `write` that answers a `permissions` patch can
-/// resolve a fenced `write` crossing, which re-enters `handle_change` here — an
+/// resolve a fenced `write` crossing, which re-enters `handle_write` here — an
 /// indirectly recursive async fn that must be heap-allocated.
 async fn re_dispatch_verb(orch: &Orchestrator, detail: &CrossingDetail) -> String {
     match detail.verb.as_str() {
         "read" => {
-            Box::pin(crate::mcp::handlers::files::handle_read_file(
+            Box::pin(crate::mcp::handlers::read::handle_read_file(
                 orch,
                 &detail.request,
             ))
@@ -1172,19 +1172,13 @@ async fn re_dispatch_verb(orch: &Orchestrator, detail: &CrossingDetail) -> Strin
         // `write` is the current verb; `change` is the legacy name a crossing
         // suspended before the rename may still carry.
         "write" | "change" => {
-            Box::pin(crate::mcp::handlers::files::handle_change(
+            Box::pin(crate::mcp::handlers::write::handle_write(
                 orch,
                 &detail.request,
             ))
             .await
         }
-        "run" => {
-            Box::pin(crate::mcp::handlers::bash::handle_run(
-                orch,
-                &detail.request,
-            ))
-            .await
-        }
+        "run" => Box::pin(crate::mcp::handlers::run::handle_run(orch, &detail.request)).await,
         other => format!(
             "Cannot re-execute unknown verb '{}' after fence allow",
             other

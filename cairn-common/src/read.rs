@@ -1,4 +1,4 @@
-//! Structured read segments shared by the cairn-cli client and the cairn-core
+//! Structured read segments shared by the cairn-cmd client and the cairn-core
 //! backend.
 //!
 //! A `read` tool call resolves an array of targets and forwards them to the
@@ -6,7 +6,7 @@
 //! runs its producer to a [`ReadSegment`], windows and truncates it under one
 //! shared budget, and assembles the whole batch into a [`ReadBatchEnvelope`].
 //!
-//! The envelope is the lossless *internal* contract over the cairn-cli↔cairn-core
+//! The envelope is the lossless *internal* contract over the cairn-cmd↔cairn-core
 //! HTTP boundary: it carries the fully composed `=== uri [suffix] ===` text, any
 //! image blocks, and the per-segment metadata used in tests and (later) by the
 //! frontend. The agent- and frontend-facing channel is the composed `text`
@@ -135,7 +135,7 @@ impl ReadSegment {
     }
 }
 
-/// The `read_batch` callback result over the cairn-cli↔cairn-core boundary.
+/// The `read_batch` callback result over the cairn-cmd↔cairn-core boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadBatchEnvelope {
     /// Fully composed `=== uri [suffix] ===` batch text.
@@ -145,7 +145,7 @@ pub struct ReadBatchEnvelope {
     pub segments: Vec<SegmentMeta>,
 }
 
-/// The `run` callback result over the cairn-cli↔cairn-core boundary.
+/// The `run` callback result over the cairn-cmd↔cairn-core boundary.
 ///
 /// Mirrors [`ReadBatchEnvelope`]: the composed batch text plus any image content
 /// blocks an external MCP `tools/call` returned (e.g. `cairn://mcp/axon/look`

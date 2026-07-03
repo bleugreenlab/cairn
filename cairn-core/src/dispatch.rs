@@ -113,8 +113,8 @@ async fn execute_tool(
 ) -> String {
     match request.tool.as_str() {
         // File and resource mutation tool
-        "write" => crate::mcp::handlers::files::handle_change(orch, request).await,
-        "read" => crate::mcp::handlers::files::handle_read_file(orch, request).await,
+        "write" => crate::mcp::handlers::write::handle_write(orch, request).await,
+        "read" => crate::mcp::handlers::read::handle_read_file(orch, request).await,
         "read_batch" => {
             crate::mcp::handlers::read::handle_read_batch(orch, request, read_cursors).await
         }
@@ -124,8 +124,8 @@ async fn execute_tool(
         // channel to learn the instance's pid authoritatively (no `lsof`).
         "process_info" => std::process::id().to_string(),
 
-        // Bash tools
-        "run" => crate::mcp::handlers::bash::handle_run(orch, request).await,
+        // Run tool
+        "run" => crate::mcp::handlers::run::handle_run(orch, request).await,
 
         // Externally-driven attention long-poll (no polling)
         "watch" => crate::mcp::handlers::watch::handle_watch(orch, request).await,

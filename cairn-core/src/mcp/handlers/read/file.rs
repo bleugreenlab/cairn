@@ -1,8 +1,8 @@
-//! Read-file MCP handler.
+//! File target producers and the legacy single-target `read` callback.
 
-use super::target::invalid_target_error;
-use crate::mcp::git::validate_read_path;
+use crate::mcp::file_targets::validate_read_path;
 use crate::mcp::handlers::read::{error_segment, grep_counts, Produced};
+use crate::mcp::handlers::target::invalid_target_error;
 use crate::mcp::types::{IssueHistoryMode, McpCallbackRequest, ReadFilePayload};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
@@ -515,7 +515,7 @@ fn parse_file_projection(
     // when no explicit head_limit is present. Checked
     // before the allowed-keys scan so the message is specific rather than a
     // generic "unsupported parameter". offset/limit may arrive via the query
-    // string (direct callers) or the payload (cairn-cli peels them off); both
+    // string (direct callers) or the payload (cairn-cmd peels them off); both
     // are folded into the locals above.
     if grep.is_some() && offset.is_some() {
         return Err("'offset' is a line-window and does not combine with 'grep'; use 'head_limit' or 'limit' to cap the number of matches".to_string());
@@ -632,7 +632,7 @@ fn parse_file_projection(
 ///   `path:count` shape consistent with grep and the `/changed` projection.
 /// - `content`: the contents of the matched files (sliced by offset/limit),
 ///   each under a `=== <path> ===` header, with oversized files elided.
-fn run_glob_projection(
+async fn run_glob_projection(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     offset: Option<i64>,
@@ -642,8 +642,10 @@ fn run_glob_projection(
     use crate::mcp::handlers::search::{glob_matched_paths, glob_timeout_warning, handle_glob};
 
     match output_mode {
-        None | Some("files_with_matches") => slice_lines(handle_glob(orch, request), offset, limit),
-        Some("count") => match glob_matched_paths(orch, request) {
+        None | Some("files_with_matches") => {
+            slice_lines(handle_glob(orch, request).await, offset, limit)
+        }
+        Some("count") => match glob_matched_paths(orch, request).await {
             Ok(matches) => {
                 let start = resolve_offset(offset, matches.paths.len());
                 matches
@@ -658,7 +660,7 @@ fn run_glob_projection(
             Err(error) => error,
         },
         Some("content") => {
-            let matches = match glob_matched_paths(orch, request) {
+            let matches = match glob_matched_paths(orch, request).await {
                 Ok(matches) => matches,
                 Err(error) => return error,
             };
@@ -820,9 +822,10 @@ pub(crate) async fn produce_file_segment(
 
     // Worktree fence (reads): a denylisted target outside the worktree is gated
     // before existence validation, on a leniently-resolved path.
-    if let Ok(full) = crate::mcp::git::resolve_file_path_lenient(worktree, &split.identity) {
-        if crate::mcp::git::path_escapes_worktree(worktree, &full)
-            && crate::mcp::git::path_within_any(&full, &orch.sandbox_deny_read())
+    if let Ok(full) = crate::mcp::file_targets::resolve_file_path_lenient(worktree, &split.identity)
+    {
+        if crate::mcp::file_targets::path_escapes_worktree(worktree, &full)
+            && crate::mcp::file_targets::path_within_any(&full, &orch.sandbox_deny_read())
         {
             use crate::mcp::handlers::fence;
             if let Some((run_id, fence_mode)) = fence::resolve_run_fence(orch, request).await {
@@ -852,7 +855,7 @@ pub(crate) async fn produce_file_segment(
     }
 
     let resolved_target = match if branch.is_some() {
-        crate::mcp::git::resolve_read_target_lenient(worktree, &split.identity)
+        crate::mcp::file_targets::resolve_read_target_lenient(worktree, &split.identity)
     } else {
         validate_read_path(worktree, &split.identity)
     } {
@@ -906,7 +909,8 @@ pub(crate) async fn produce_file_segment(
                 tool_use_id: request.tool_use_id.clone(),
             };
             let body =
-                run_glob_projection(orch, &glob_request, offset, limit, output_mode.as_deref());
+                run_glob_projection(orch, &glob_request, offset, limit, output_mode.as_deref())
+                    .await;
             let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
             if output_mode.as_deref().unwrap_or("files_with_matches") == "files_with_matches" {
                 meta.file_count = Some(body.lines().filter(|l| !l.is_empty()).count());

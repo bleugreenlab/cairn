@@ -760,7 +760,13 @@ pub async fn update_issue_by_project_number(
     // final issue state; the field sync above would otherwise overwrite it with a
     // stale (pre-resolution) snapshot.
     if let Some(status) = status.as_deref() {
-        crate::issues::status::update_status(orch, &issue.id, status).await?;
+        crate::issues::status::update_status(
+            orch,
+            &issue.id,
+            status,
+            crate::issues::status::ResolutionActor::Agent,
+        )
+        .await?;
     }
 
     Ok(format!(

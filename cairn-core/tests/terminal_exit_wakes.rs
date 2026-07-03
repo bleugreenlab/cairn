@@ -4,11 +4,89 @@
 
 mod common;
 
-use cairn_core::internal::orchestrator::wakes;
-use cairn_core::internal::storage::LocalDb;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use cairn_core::internal::db::DbState;
+use cairn_core::internal::mcp::handlers::write::handle_write;
+use cairn_core::internal::mcp::types::McpCallbackRequest;
+use cairn_core::internal::orchestrator::{wakes, Orchestrator};
+use cairn_core::internal::services::{
+    testing::TestServicesBuilder, RealPtyFactory, TerminalOutputWatcher,
+};
+use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use common::{change_resource, resource_orchestrator_fixture};
-use serde_json::json;
+use serde_json::{json, Value};
 use turso::params;
+
+async fn real_pty_orchestrator_fixture() -> (tempfile::TempDir, Arc<LocalDb>, Orchestrator) {
+    let temp = tempfile::tempdir().unwrap();
+    let (_db_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(db.clone(), search_index));
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_pty_factory(RealPtyFactory)
+            .build(),
+    );
+    let orch = Orchestrator::builder(db_state, services, temp.path().join("config")).build();
+    (temp, db, orch)
+}
+
+async fn set_project_repo_path(db: &LocalDb, repo_path: &std::path::Path) {
+    let repo_path = repo_path.to_string_lossy().to_string();
+    db.execute(
+        "UPDATE projects SET repo_path = ?1 WHERE key = 'TXW'",
+        params![repo_path.as_str()],
+    )
+    .await
+    .unwrap();
+}
+
+async fn change_resource_as_run(orch: &Orchestrator, changes: Value, run_id: &str) -> String {
+    let request = McpCallbackRequest {
+        cwd: String::new(),
+        run_id: Some(run_id.to_string()),
+        tool: "write".to_string(),
+        payload: json!({ "changes": changes }),
+        tool_use_id: None,
+    };
+    handle_write(orch, &request).await
+}
+
+async fn terminal_count(db: &LocalDb, slug: &str) -> i64 {
+    let slug = slug.to_string();
+    db.read(|conn| {
+        let slug = slug.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM job_terminals WHERE slug = ?1",
+                    params![slug.as_str()],
+                )
+                .await?;
+            let row = rows.next().await?.expect("count row");
+            row.i64(0)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+async fn wait_for_output_wake_consumed(db: &LocalDb, job_id: &str, phrase: &str) {
+    for _ in 0..50 {
+        let subs = wakes::list_subscriptions_for_job(db, job_id).await.unwrap();
+        if !subs
+            .iter()
+            .any(|sub| sub.match_phrase.as_deref() == Some(phrase))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("output wake for {phrase:?} was not consumed");
+}
 
 async fn seed_node(db: &LocalDb) {
     let project_id = common::create_project(db, "TXW").await;
@@ -267,4 +345,215 @@ async fn subscribe_unknown_terminal_errors_with_existing_slugs() {
         .await
         .unwrap();
     assert!(!subs.iter().any(|s| s.source_kind == "process"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_terminal_with_exit_wake_subscribes_to_canonical_uri() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    seed_node(&db).await;
+    set_project_repo_path(&db, &repo_path).await;
+
+    let out = change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/wait-exit",
+            "mode": "create",
+            "payload": {"command": "sleep 30", "wake": "exit"}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert!(out.contains("subscribed to exit"), "{out}");
+    assert!(
+        out.contains("cairn://p/TXW/1/1/builder/terminal/wait-exit"),
+        "{out}"
+    );
+    assert!(out.contains("end your turn"), "{out}");
+
+    let subs = wakes::list_subscriptions_for_job(&db, "job-1")
+        .await
+        .unwrap();
+    let term = subs
+        .iter()
+        .find(|s| s.source_kind == "process")
+        .expect("terminal subscription normalized to a process source");
+    assert!(term.one_shot);
+    assert_eq!(
+        term.source_ref.as_deref(),
+        Some("cairn://p/TXW/1/1/builder/terminal/wait-exit")
+    );
+    assert_eq!(
+        term.fact_kinds.as_deref(),
+        Some(&["terminal_exit".to_string()][..])
+    );
+
+    let _ = change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/wait-exit",
+            "mode": "delete"
+        }]),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_terminal_with_output_wake_routes_when_phrase_prints() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    seed_node(&db).await;
+    set_project_repo_path(&db, &repo_path).await;
+
+    let out = change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/wait-ready",
+            "mode": "create",
+            "payload": {"command": "sleep 1; echo x y z | tr -d ' '; sleep 30", "wake": "xyz"}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert!(out.contains("watching output for \\\"xyz\\\""), "{out}");
+
+    let subs = wakes::list_subscriptions_for_job(&db, "job-1")
+        .await
+        .unwrap();
+    let term = subs
+        .iter()
+        .find(|s| s.match_phrase.as_deref() == Some("xyz"))
+        .expect("output wake row exists before phrase routes");
+    assert_eq!(
+        term.source_ref.as_deref(),
+        Some("cairn://p/TXW/1/1/builder/terminal/wait-ready")
+    );
+    let fact_kinds = term.fact_kinds.as_deref().expect("terminal fact kinds");
+    assert!(fact_kinds.contains(&"terminal_output".to_string()));
+    assert!(fact_kinds.contains(&"terminal_exit".to_string()));
+
+    let watchers = Arc::new(Mutex::new(vec![TerminalOutputWatcher {
+        subscription_id: term.id.clone(),
+        job_id: "job-1".to_string(),
+        phrase: "xyz".to_string(),
+        carry: String::new(),
+        terminal_uri: "cairn://p/TXW/1/1/builder/terminal/wait-ready".to_string(),
+    }]));
+    wakes::scan_and_route_terminal_output(&orch, &watchers, "xyz\n");
+    wait_for_output_wake_consumed(&db, "job-1", "xyz").await;
+
+    let _ = change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/wait-ready",
+            "mode": "delete"
+        }]),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_terminal_rejects_invalid_wake_before_spawning() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    seed_node(&db).await;
+    set_project_repo_path(&db, &repo_path).await;
+
+    let empty = change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/bad-empty",
+            "mode": "create",
+            "payload": {"command": "sleep 30", "wake": ""}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert!(empty.contains("payload.wake must not be empty"), "{empty}");
+    assert_eq!(terminal_count(&db, "bad-empty").await, 0);
+
+    let non_string = change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/1/1/builder/terminal/bad-type",
+            "mode": "create",
+            "payload": {"command": "sleep 30", "wake": {"on": "exit"}}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert!(
+        non_string.contains("payload.wake must be a string"),
+        "{non_string}"
+    );
+    assert_eq!(terminal_count(&db, "bad-type").await, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn project_terminal_create_wake_subscribes_calling_job() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    seed_node(&db).await;
+    set_project_repo_path(&db, &repo_path).await;
+
+    let out = change_resource_as_run(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/terminal/project-wait",
+            "mode": "create",
+            "payload": {"command": "sleep 30", "wake": "exit"}
+        }]),
+        "r-1",
+    )
+    .await;
+    assert!(out.contains("subscribed to exit"), "{out}");
+
+    let subs = wakes::list_subscriptions_for_job(&db, "job-1")
+        .await
+        .unwrap();
+    let term = subs
+        .iter()
+        .find(|s| s.source_kind == "process")
+        .expect("project terminal exit subscription");
+    assert_eq!(
+        term.source_ref.as_deref(),
+        Some("cairn://p/TXW/terminal/project-wait")
+    );
+
+    let _ = change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/terminal/project-wait",
+            "mode": "delete"
+        }]),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn project_terminal_wake_requires_agent_caller_before_spawning() {
+    let (t, db, orch) = real_pty_orchestrator_fixture().await;
+    let repo_path = t.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    seed_node(&db).await;
+    set_project_repo_path(&db, &repo_path).await;
+
+    let out = change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/TXW/terminal/no-agent",
+            "mode": "create",
+            "payload": {"command": "sleep 30", "wake": "exit"}
+        }]),
+    )
+    .await;
+    assert!(
+        out.contains("payload.wake requires an agent caller"),
+        "{out}"
+    );
+    assert_eq!(terminal_count(&db, "no-agent").await, 0);
 }

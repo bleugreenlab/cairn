@@ -4,10 +4,10 @@ use super::types::{
 };
 use crate::config::agents as config_agents;
 use crate::mcp::diff::PatchEnvelopeFileChange;
-use crate::mcp::git::{
+use crate::mcp::file_targets::{
     did_you_mean_block, normalize_change_target, path_escapes_worktree, resolve_change_target,
-    GitAuthor,
 };
+use crate::mcp::git::GitAuthor;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
@@ -140,16 +140,19 @@ pub(crate) async fn record_file_change_async(
     status: &str,
     additions: i32,
     deletions: i32,
+    previous_path: Option<&str>,
 ) -> Result<(), String> {
     let cwd = cwd.to_string();
     let file_path = file_path.to_string();
     let status = status.to_string();
+    let previous_path = previous_path.map(str::to_string);
     orch.db
         .local
         .write(|conn| {
             let cwd = cwd.clone();
             let file_path = file_path.clone();
             let status = status.clone();
+            let previous_path = previous_path.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
@@ -181,7 +184,7 @@ pub(crate) async fn record_file_change_async(
                     INSERT INTO file_changes (
                         id, job_id, file_path, status, additions, deletions, previous_path, created_at
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                     ",
                     params![
                         id.as_str(),
@@ -190,6 +193,7 @@ pub(crate) async fn record_file_change_async(
                         status.as_str(),
                         additions,
                         deletions,
+                        previous_path.as_deref(),
                         now
                     ],
                 )
@@ -284,7 +288,7 @@ pub(super) struct FileBatchSuccess {
 /// `Done` is the normal terminal state (sealed, or nothing to seal). `StaleRetry`
 /// means the seal hit a STALE working copy: a sibling rewrote `@` over the shared
 /// store between apply and seal. The edits are deliberately left ON DISK (not
-/// discarded), so `handle_change` can update-stale, re-apply against the advanced
+/// discarded), so `handle_write` can update-stale, re-apply against the advanced
 /// base, and re-seal — recovering the batch instead of losing it. It carries the
 /// seal error string so the giveup path can report what went wrong. Only the
 /// write+commit_msg path can recover (the handler can re-derive its intended
@@ -295,7 +299,7 @@ pub(super) struct FileBatchSuccess {
 /// resolve-at-base flatten). It is NEITHER `Done` nor `StaleRetry` — the edits
 /// must be PRESERVED on disk (discarding destroys the resolved flatten) and the
 /// update-stale → re-apply → re-seal loop can never converge (the workspace is
-/// not stale). `handle_change` surfaces a typed error pointing at the flatten
+/// not stale). `handle_write` surfaces a typed error pointing at the flatten
 /// procedure instead of discarding or retrying.
 pub(super) enum CommitOutcome {
     Done(Option<CommitReport>),
@@ -1238,6 +1242,7 @@ pub(super) async fn finalize_file_commit(
             change.status,
             change.additions,
             change.deletions,
+            None,
         )
         .await
         {
@@ -1246,7 +1251,7 @@ pub(super) async fn finalize_file_commit(
     }
 
     // Route worktree mutations through the VCS seam (jj for a worktree). A
-    // non-worktree cwd is rejected up front in `handle_change`, so this path
+    // non-worktree cwd is rejected up front in `handle_write`, so this path
     // always sees a jj workspace.
     let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&request.cwd));
 
@@ -1357,7 +1362,7 @@ pub(super) async fn finalize_file_commit(
             // discard — `@` holds the agent's resolved work the discard would
             // destroy — and do NOT StaleRetry: the update-stale → re-apply →
             // re-seal loop can never converge because the workspace is not stale.
-            // Hand the typed outcome up so `handle_change` preserves the on-disk
+            // Hand the typed outcome up so `handle_write` preserves the on-disk
             // edits and surfaces the flatten guidance.
             Ok(CommitOutcome::ConflictedBranch { seal_error: e })
         }
@@ -1366,7 +1371,7 @@ pub(super) async fn finalize_file_commit(
             // either going stale (refused) or letting the seal capture an
             // empty/divergent commit (the lost-seal case, already backed out in
             // `seal_paths`). Both recover the same way: do NOT discard here — the
-            // recorded edits drive a re-apply, so `handle_change` can update-stale
+            // recorded edits drive a re-apply, so `handle_write` can update-stale
             // (a no-op when not stale), re-apply against the current base, and
             // re-seal, recovering the batch rather than losing it. The fallback (if
             // that recovery can't land) is the stale-resilient discard, which keeps

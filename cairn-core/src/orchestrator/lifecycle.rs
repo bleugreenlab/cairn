@@ -2411,7 +2411,7 @@ fn cleanup_job_terminals(orch: &Orchestrator, run_id: &str) {
 
     for (_terminal_id, session_id) in running_terminals {
         if let Err(error) =
-            crate::mcp::handlers::bash::finalize_terminal_by_session_id(orch, &session_id)
+            crate::mcp::handlers::terminal::finalize_terminal_by_session_id(orch, &session_id)
         {
             log::warn!("failed to finalize terminal {session_id} on session kill: {error}");
         }

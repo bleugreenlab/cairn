@@ -13,7 +13,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cairn_core::internal::mcp::handlers::files::handle_change;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::LocalDb;
 use cairn_core::models::{
@@ -158,7 +158,7 @@ async fn workspace_mcp_create_denied_by_fence_changes_nothing() {
     let original = "# Cairn Workspace Settings\nbranchPrefix: keep-me\n";
     std::fs::write(&path, original).unwrap();
 
-    let result = handle_change(&orch, &create_request()).await;
+    let result = handle_write(&orch, &create_request()).await;
 
     // The write is rejected through the worktree fence (the onEscape: deny path).
     assert!(
@@ -190,7 +190,7 @@ async fn workspace_mcp_create_allowed_lands_server() {
     let path = settings_path(&temp);
     assert!(!path.exists(), "precondition: no settings file yet");
 
-    let result = handle_change(&orch, &create_request()).await;
+    let result = handle_write(&orch, &create_request()).await;
     assert!(
         result.contains("Added workspace MCP server 'axon'") || result.contains("\"applied\""),
         "expected a success report, got: {result}"

@@ -1,7 +1,7 @@
-//! Unified diff application for the filechange tool.
+//! Unified diff application for file changes submitted through the `write` verb.
 //!
 //! Parses and applies standard unified diffs (`@@ -start,count +start,count @@`)
-//! to file content. Used by the Codex filechange handler to apply `kind=update` changes.
+//! and supported patch envelopes to file content.
 
 const ACCEPTED_PATCH_FORMATS_ERROR: &str = "patch text must be a unified diff with `@@ -old,+new @@` hunks or a supported `*** Begin Patch` envelope";
 

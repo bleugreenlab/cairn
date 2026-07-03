@@ -811,7 +811,7 @@ pub(crate) fn replace_artifact_text(
     let literal_old = crate::mcp::wildcard::unescape_literal(old);
     if !current.contains(literal_old.as_str()) {
         return Err(
-            crate::mcp::handlers::files::change::file_mutations::literal_not_found_diagnostic(
+            crate::mcp::handlers::write::file_mutations::literal_not_found_diagnostic(
                 &literal_old,
                 new,
             ),

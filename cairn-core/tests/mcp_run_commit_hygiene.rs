@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::dispatch::dispatch_tool;
 use cairn_core::internal::jj::{self, JjEnv};
-use cairn_core::internal::mcp::handlers::bash::handle_run;
+use cairn_core::internal::mcp::handlers::run::handle_run;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;

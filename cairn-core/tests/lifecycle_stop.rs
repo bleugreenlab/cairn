@@ -146,9 +146,14 @@ async fn marking_issue_closed_stops_active_runs() {
     let project_id = common::create_project(&orch.db.local, "CLOSE").await;
     insert_issue_job_run_turn(&orch.db.local, &project_id).await;
 
-    cairn_core::issues::status::update_status(&orch, "issue-1", "closed")
-        .await
-        .unwrap();
+    cairn_core::issues::status::update_status(
+        &orch,
+        "issue-1",
+        "closed",
+        cairn_core::issues::status::ResolutionActor::User,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         common::scalar_text_by_id(

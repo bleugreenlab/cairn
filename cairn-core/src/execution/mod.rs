@@ -15,6 +15,7 @@ pub mod accumulator;
 pub mod actions;
 pub mod advancement;
 pub mod cache;
+pub mod check_parsers;
 pub mod checkpoint_runs;
 pub mod checkpoints;
 pub mod checks;
@@ -33,6 +34,7 @@ pub mod snapshot_edit;
 pub mod step_behavior;
 pub mod teardown;
 pub mod triggers;
+pub mod worktree_gc;
 
 use serde::{Deserialize, Serialize};
 

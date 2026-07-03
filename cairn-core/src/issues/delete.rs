@@ -57,6 +57,8 @@ pub async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<(), Str
     crate::execution::teardown::teardown_worktrees(
         orch,
         crate::execution::teardown::TeardownScope::Issue(issue_id.to_string()),
+        // Deleting the issue is an explicit discard — remove branches as before.
+        crate::execution::teardown::TeardownReason::Discarded,
     )
     .await?;
 

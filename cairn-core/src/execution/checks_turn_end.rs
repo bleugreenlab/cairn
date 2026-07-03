@@ -15,13 +15,13 @@
 //! `when:write` never runs here. Selection reuses the write cadence's machinery
 //! ([`crate::execution::selection::plan_checks`], the impact gate, placeholder
 //! substitution) via [`crate::execution::checks::applicable_turn_end_checks`], and
-//! results share the `check_result_cache` keyed by the sealed tree identity.
+//! results share the `check_result_cache` keyed by each check's input hash.
 //!
 //! ## Unsandboxed by design
 //!
 //! At turn-end the agent is idle, so an interactive fence permission prompt would
 //! hang with no one to answer. The suite therefore runs UNSANDBOXED
-//! ([`crate::mcp::handlers::bash::run_check_command_unsandboxed`], `sandbox_enabled=false`),
+//! ([`crate::mcp::handlers::run::run_check_command_unsandboxed`], `sandbox_enabled=false`),
 //! taking the same no-fence path the post-fence-grant re-execution uses. These are
 //! trusted, system-driven project-config commands — the identical trust basis as
 //! the write cadence.
@@ -37,12 +37,12 @@
 //!
 //! - Single-flight (`Orchestrator::try_begin_turn_end_checks`): a rapid re-idle
 //!   never stacks a second suite for the same job.
-//! - Loop-break (the cache): a plan whose `(project_id, tree_hash, name)` is already
+//! - Loop-break (the cache): a plan whose `(project_id, name, input_hash)` is already
 //!   cached is dropped before launch. A resume from a failing check produces a
-//!   follow-up turn; if it commits a fix the tree changes and the new tree's checks
-//!   run once; if it commits nothing the tree is unchanged, every check is already
-//!   cached, and nothing relaunches — so the agent is resumed at most ONCE per
-//!   failing tree.
+//!   follow-up turn; if it commits a fix the affected check's input hash changes
+//!   and it runs once; if it commits nothing every input hash is unchanged, every
+//!   check is already cached, and nothing relaunches — so the agent is resumed at
+//!   most ONCE per failing tree.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -52,8 +52,14 @@ use cairn_common::uri::build_node_checks_uri;
 use crate::execution::cache::{
     get_check_result, list_check_results, store_check_result, CheckResultCacheWrite,
 };
-use crate::execution::checks::{applicable_turn_end_checks, load_live_project_checks};
-use crate::jj::{node_changed_files, sealed_tree_hash, JjEnv};
+use crate::execution::check_parsers::{
+    format_failure_excerpt, format_failure_names, parse_check_output, ParsedCheckResult,
+};
+use crate::execution::checks::{
+    applicable_turn_end_checks, input_hash_for, load_live_project_checks,
+};
+use crate::execution::selection::CheckPlan;
+use crate::jj::{node_changed_files, sealed_tree_entries, sealed_tree_hash, JjEnv};
 use crate::orchestrator::{attention_push, Orchestrator};
 use crate::storage::{LocalDb, RowExt};
 
@@ -63,8 +69,6 @@ const CHECK_TIMEOUT_MS: u32 = 600_000;
 const OUTPUT_TAIL_CHARS: usize = 4_000;
 /// Chars of the live log file surfaced in the "running" render.
 const LOG_TAIL_CHARS: usize = 2_000;
-/// Chars of a failing check's `output_tail` inlined into the rendered section.
-const SECTION_OUTPUT_CHARS: usize = 1_500;
 
 /// Background entry point: run the affected turn-end checks for a job, then
 /// release the single-flight slot. The caller ([`spawn_turn_end_checks`] in
@@ -130,19 +134,51 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
     // 6. Resolve the sealed tree identity used as the cache key.
     let tree_hash = sealed_tree_hash(&jj, repo_root).map_err(|e| e.to_string())?;
 
-    // 7. Loop-break gate: drop any plan already cached for this tree. If none
-    // remain, the tree has already been fully checked (e.g. a resume that
-    // committed nothing) — return WITHOUT launching so the agent is never nagged
-    // on the same break.
+    // 7. Loop-break gate: drop any plan already cached for its INPUT hash (the
+    // content of just that check's impact-matched files). A covered plan is
+    // re-stamped onto the current whole tree so the `/checks` listing still shows
+    // it, then skipped; only genuinely-uncovered plans run. If none remain, the
+    // tree has already been fully checked (e.g. a resume that committed nothing) —
+    // return WITHOUT launching so the agent is never nagged on the same break.
     let db = orch.db.local.clone();
-    let mut to_run = Vec::new();
+    let entries = if plans
+        .iter()
+        .any(|p| checks.get(&p.name).is_some_and(|c| c.impact.is_some()))
+    {
+        sealed_tree_entries(&jj, repo_root).ok()
+    } else {
+        None
+    };
+    let mut to_run: Vec<(CheckPlan, String)> = Vec::new();
     for plan in plans {
-        let cached = get_check_result(db.clone(), &coords.project_id, &tree_hash, &plan.name)
+        let input_hash = input_hash_for(
+            checks.get(&plan.name).and_then(|c| c.impact.as_ref()),
+            entries.as_deref(),
+            &tree_hash,
+        );
+        match get_check_result(db.clone(), &coords.project_id, &plan.name, &input_hash)
             .ok()
             .flatten()
-            .is_some();
-        if !cached {
-            to_run.push(plan);
+        {
+            Some(entry) => {
+                // Covered for this input; re-stamp onto the current tree so the
+                // `/checks` listing surfaces it, then skip (no re-run).
+                let _ = store_check_result(
+                    db.clone(),
+                    CheckResultCacheWrite {
+                        project_id: coords.project_id.clone(),
+                        tree_hash: tree_hash.clone(),
+                        input_hash,
+                        check_name: plan.name.clone(),
+                        exit_code: entry.exit_code,
+                        passed: entry.passed,
+                        output_tail: entry.output_tail,
+                        duration_ms: entry.duration_ms,
+                        target_results_json: entry.target_results_json,
+                    },
+                );
+            }
+            None => to_run.push((plan, input_hash)),
         }
     }
     if to_run.is_empty() {
@@ -156,11 +192,11 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
 
     // 9. Run each remaining check UNSANDBOXED, capturing to the cache and log.
     let mut any_failed = false;
-    for (index, plan) in to_run.iter().enumerate() {
+    for (index, (plan, input_hash)) in to_run.iter().enumerate() {
         let stream_id = format!("turn-checks:{job_id}:{index}");
         let started = Instant::now();
         let (exit_code, passed, output) =
-            match crate::mcp::handlers::bash::run_check_command_unsandboxed(
+            match crate::mcp::handlers::run::run_check_command_unsandboxed(
                 orch,
                 &worktree_path,
                 &stream_id,
@@ -176,17 +212,22 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
             };
         let duration_ms = started.elapsed().as_millis() as i64;
 
+        // Enrich with structured per-test results (fail-closed: `passed` above is
+        // exit-code-driven and unaffected by whether the parse succeeds).
+        let target_results_json =
+            parse_check_output(&plan.command, &output).and_then(|p| serde_json::to_string(&p).ok());
         let _ = store_check_result(
             db.clone(),
             CheckResultCacheWrite {
                 project_id: coords.project_id.clone(),
                 tree_hash: tree_hash.clone(),
+                input_hash: input_hash.clone(),
                 check_name: plan.name.clone(),
                 exit_code: exit_code.unwrap_or(-1),
                 passed,
                 output_tail: tail(&output, OUTPUT_TAIL_CHARS),
                 duration_ms,
-                target_results_json: None,
+                target_results_json,
             },
         );
         if !passed {
@@ -264,6 +305,7 @@ pub async fn render_turn_end_checks_section(orch: &Orchestrator, job_id: &str) -
             passed: r.passed,
             duration_ms: r.duration_ms,
             output_tail: r.output_tail,
+            target_results_json: r.target_results_json,
         })
         .collect();
     let log_tail = if in_flight {
@@ -274,12 +316,14 @@ pub async fn render_turn_end_checks_section(orch: &Orchestrator, job_id: &str) -
     format_checks_section(in_flight, log_tail.as_deref(), &tuples)
 }
 
-/// One rendered check row (name + verdict + duration + failure output tail).
+/// One rendered check row (name + verdict + duration + failure output tail +
+/// the persisted structured per-test detail, when present).
 struct CheckRow {
     name: String,
     passed: bool,
     duration_ms: i64,
     output_tail: String,
+    target_results_json: Option<String>,
 }
 
 /// Pure renderer for the `### Systematic checks` section. Returns `None` when the
@@ -308,17 +352,29 @@ fn format_checks_section(
                 "- \u{2713} {} ({}ms)\n",
                 row.name, row.duration_ms
             ));
-        } else {
-            out.push_str(&format!(
+            continue;
+        }
+        // Rehydrate the structured per-test detail (enrichment; the stored
+        // `passed` flag stays the authority for the verdict).
+        let parsed = row
+            .target_results_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<ParsedCheckResult>(s).ok());
+        match parsed.as_ref().and_then(format_failure_names) {
+            Some(names) => out.push_str(&format!(
+                "- \u{2717} {} \u{2014} {names} ({}ms)\n",
+                row.name, row.duration_ms
+            )),
+            None => out.push_str(&format!(
                 "- \u{2717} {} ({}ms)\n",
                 row.name, row.duration_ms
-            ));
-            let detail = tail(row.output_tail.trim_end(), SECTION_OUTPUT_CHARS);
-            if !detail.trim().is_empty() {
-                out.push_str("\n```\n");
-                out.push_str(detail.trim_end());
-                out.push_str("\n```\n");
-            }
+            )),
+        }
+        let detail = format_failure_excerpt(parsed.as_ref(), row.output_tail.trim_end());
+        if !detail.trim().is_empty() {
+            out.push_str("\n```\n");
+            out.push_str(detail.trim_end());
+            out.push_str("\n```\n");
         }
     }
     Some(out)
@@ -424,6 +480,7 @@ mod tests {
             passed,
             duration_ms: ms,
             output_tail: tail.to_string(),
+            target_results_json: None,
         }
     }
 
@@ -459,6 +516,31 @@ mod tests {
         assert!(s.contains("\u{2717} frontend (2100ms)"));
         // A failing check inlines its output tail; a passing one does not.
         assert!(s.contains("assertion failed: left == right"));
+    }
+
+    #[test]
+    fn section_renders_structured_failure_names() {
+        let json = serde_json::to_string(
+            &crate::execution::check_parsers::parse_check_output(
+                "bunx tsc --noEmit",
+                "a.ts(1,7): error TS2322: bad type",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rows = [CheckRow {
+            name: "typecheck".to_string(),
+            passed: false,
+            duration_ms: 900,
+            output_tail: "raw tail".to_string(),
+            target_results_json: Some(json),
+        }];
+        let s = format_checks_section(false, None, &rows).unwrap();
+        // The failing row leads with the structured name list...
+        assert!(s.contains("\u{2717} typecheck \u{2014} 1 failed: a.ts(1,7) (900ms)"));
+        // ...and inlines the composed failure message rather than the raw tail.
+        assert!(s.contains("TS2322: bad type"));
+        assert!(!s.contains("raw tail"));
     }
 
     #[test]

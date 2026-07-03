@@ -932,10 +932,10 @@ impl AgentBackend for ClaudeBackend {
             // Cairn callback. The host owns execution: `run` items are capped
             // per-item (≤600s, returning partial output on expiry) and blocking
             // `write` appends to a node's tasks/questions collection await a
-            // sub-agent task or user answer with no host-side deadline. cairn-cli
+            // sub-agent task or user answer with no host-side deadline. cairn-cmd
             // sizes its HTTP callback ceiling just under this (see
-            // `UNBOUNDED_CALLBACK_TIMEOUT` in cairn-cli). The CLI default (~120s,
-            // observed) would abandon the call above cairn-cli and leave the
+            // `UNBOUNDED_CALLBACK_TIMEOUT` in cairn-cmd). The CLI default (~120s,
+            // observed) would abandon the call above cairn-cmd and leave the
             // agent with no output while the host keeps running. 7 days is an
             // effective "never" while still bounding a truly wedged socket;
             // promote-to-terminal means nothing should ever actually run this

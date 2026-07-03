@@ -1,11 +1,11 @@
 //! Web and local-PDF reads, routed through typed services.
 //!
-//! `read` detects `http(s)://` targets and local `.pdf` paths in `cairn-cli`
+//! `read` detects `http(s)://` targets and local `.pdf` paths in `cairn-cmd`
 //! and forwards them here as a `read_web` callback. PDF targets (local files and
 //! remote `.pdf` URLs) route to the typed PDF service ([`super::pdf`]);
 //! everything else routes to the typed web-fetch service ([`super::fetch_web`]).
 //!
-//! Running through cairn-core (rather than directly in `cairn-cli`) keeps PATH
+//! Running through cairn-core (rather than directly in `cairn-cmd`) keeps PATH
 //! and MCP resolution correct in the signed app and gives `cairn-server`
 //! headless parity via the shared dispatcher. Fetch / extraction failures
 //! surface as clean guidance text — never a panic.
@@ -44,7 +44,7 @@ pub(crate) async fn read_web_markdown(
     let is_file = payload.target.starts_with("file:");
     let resolved_target = if is_file {
         let worktree = std::path::Path::new(&request.cwd);
-        match crate::mcp::git::validate_read_path(worktree, &payload.target) {
+        match crate::mcp::file_targets::validate_read_path(worktree, &payload.target) {
             Ok(resolved) => resolved.full_path.display().to_string(),
             Err(error) => return Err(format!("Invalid file target: {error}")),
         }

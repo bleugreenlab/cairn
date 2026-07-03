@@ -7,7 +7,7 @@ mod common;
 
 use std::sync::Arc;
 
-use cairn_core::internal::mcp::handlers::files::handle_change;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::LocalDb;
@@ -76,7 +76,7 @@ async fn change(orch: &Orchestrator, payload: serde_json::Value, preview: bool) 
         }),
         tool_use_id: None,
     };
-    handle_change(orch, &request).await
+    handle_write(orch, &request).await
 }
 
 async fn pr_action_node_fixture() -> (tempfile::TempDir, Arc<LocalDb>, String, String) {

@@ -196,9 +196,40 @@ fn matched_paths(globs: &[String], changed_files: &[GraphFileChange]) -> MatchOu
     MatchOutcome::Matched(matched)
 }
 
+/// The content identity of the tree entries a check's impact globs select — its
+/// "input hash". `entries` are `(path, blob_id)` pairs from the sealed tree; the
+/// matching subset is hashed (sorted for order-independence) so the value changes
+/// iff a matching file's content changes or the matched path set changes. Reuses
+/// [`build_glob_set`], so glob semantics are byte-identical to the application
+/// gate above (`literal_separator(false)`) — one glob semantics in the codebase.
+/// A glob-compile error conservatively includes every entry (over-invalidate,
+/// never a false reuse).
+pub(crate) fn check_input_hash(entries: &[(String, String)], globs: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let matcher = build_glob_set(globs).ok();
+    let mut matched: Vec<&(String, String)> = entries
+        .iter()
+        .filter(|(path, _)| {
+            matcher
+                .as_ref()
+                .map(|set| set.is_match(path))
+                .unwrap_or(true)
+        })
+        .collect();
+    matched.sort();
+    let mut hasher = Sha256::new();
+    for (path, blob) in matched {
+        hasher.update(path.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(blob.as_bytes());
+        hasher.update([0u8]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Build a [`globset::GlobSet`] from pattern strings, matching the worktree
 /// populate matcher's `literal_separator(false)` semantics.
-fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, String> {
+pub(crate) fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, String> {
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
         let glob = globset::GlobBuilder::new(pattern)
@@ -504,6 +535,50 @@ mod tests {
 
     // --- deterministic ordering of multiple checks -------------------------
 
+    // --- per-check input hash ---------------------------------------------
+
+    #[test]
+    fn check_input_hash_ignores_non_matching_files() {
+        let globs = vec!["src-tauri/**".to_string()];
+        let base = vec![
+            ("src-tauri/a.rs".to_string(), "blobA".to_string()),
+            ("docs/x.md".to_string(), "blobX".to_string()),
+        ];
+        // Changing a NON-matching (doc) blob leaves the input hash unchanged.
+        let doc_changed = vec![
+            ("src-tauri/a.rs".to_string(), "blobA".to_string()),
+            ("docs/x.md".to_string(), "blobY".to_string()),
+        ];
+        assert_eq!(
+            check_input_hash(&base, &globs),
+            check_input_hash(&doc_changed, &globs),
+            "a doc-only change must not alter a src-tauri check's input hash"
+        );
+        // Changing a MATCHING blob changes it.
+        let src_changed = vec![
+            ("src-tauri/a.rs".to_string(), "blobB".to_string()),
+            ("docs/x.md".to_string(), "blobX".to_string()),
+        ];
+        assert_ne!(
+            check_input_hash(&base, &globs),
+            check_input_hash(&src_changed, &globs)
+        );
+    }
+
+    #[test]
+    fn check_input_hash_is_order_independent() {
+        let globs = vec!["src/**".to_string()];
+        let a = vec![
+            ("src/a.ts".to_string(), "1".to_string()),
+            ("src/b.ts".to_string(), "2".to_string()),
+        ];
+        let b = vec![
+            ("src/b.ts".to_string(), "2".to_string()),
+            ("src/a.ts".to_string(), "1".to_string()),
+        ];
+        assert_eq!(check_input_hash(&a, &globs), check_input_hash(&b, &globs));
+    }
+
     #[test]
     fn plans_are_sorted_by_name() {
         let mut map = HashMap::new();
@@ -518,7 +593,7 @@ mod tests {
     // --- crate-graph resolver (hermetic, fixture metadata) -----------------
 
     /// A 4-member workspace mirroring this repo's shape: cairn-common is a leaf
-    /// dependency; cairn-core and cairn-cli depend on it; cairn (the app)
+    /// dependency; cairn-core and cairn-cmd depend on it; cairn (the app)
     /// depends on cairn-core. Manifest paths are anchored under `/repo`.
     fn fixture_metadata() -> String {
         serde_json::json!({
@@ -534,8 +609,8 @@ mod tests {
                     "dependencies": [{ "name": "cairn-common" }]
                 },
                 {
-                    "name": "cairn-cli",
-                    "manifest_path": "/repo/src-tauri/os/cairn-cli/Cargo.toml",
+                    "name": "cairn-cmd",
+                    "manifest_path": "/repo/src-tauri/os/cairn-cmd/Cargo.toml",
                     "dependencies": [{ "name": "cairn-common" }]
                 },
                 {
@@ -558,21 +633,21 @@ mod tests {
 
     #[test]
     fn crate_graph_leaf_crate_selects_only_itself() {
-        // cairn-cli has no workspace dependents.
-        let targets = resolve(&["src-tauri/os/cairn-cli/src/main.rs"]).unwrap();
-        assert_eq!(targets, vec!["cairn-cli".to_string()]);
+        // cairn-cmd has no workspace dependents.
+        let targets = resolve(&["src-tauri/os/cairn-cmd/src/main.rs"]).unwrap();
+        assert_eq!(targets, vec!["cairn-cmd".to_string()]);
     }
 
     #[test]
     fn crate_graph_depended_on_crate_selects_transitive_dependents() {
-        // cairn-common is depended on by cairn-core and cairn-cli; cairn-core is
+        // cairn-common is depended on by cairn-core and cairn-cmd; cairn-core is
         // depended on by the app. So a change in cairn-common affects all four.
         let targets = resolve(&["src-tauri/os/cairn-common/src/uri.rs"]).unwrap();
         assert_eq!(
             targets,
             vec![
                 "cairn".to_string(),
-                "cairn-cli".to_string(),
+                "cairn-cmd".to_string(),
                 "cairn-common".to_string(),
                 "cairn-core".to_string(),
             ]
@@ -602,12 +677,12 @@ mod tests {
 
     #[test]
     fn crate_graph_mixed_mappable_and_unmappable_returns_none() {
-        assert!(resolve(&["src-tauri/os/cairn-cli/src/main.rs", "docs/x.md"]).is_none());
+        assert!(resolve(&["src-tauri/os/cairn-cmd/src/main.rs", "docs/x.md"]).is_none());
     }
 
     #[test]
     fn crate_graph_malformed_metadata_returns_none() {
-        let owned = vec!["src-tauri/os/cairn-cli/src/main.rs".to_string()];
+        let owned = vec!["src-tauri/os/cairn-cmd/src/main.rs".to_string()];
         assert!(
             resolve_crate_targets_from_metadata("not json", &owned, Path::new("/repo")).is_none()
         );
@@ -615,9 +690,9 @@ mod tests {
 
     #[test]
     fn crate_graph_multiple_seeds_union_their_closures() {
-        // A change in both cairn-cli (leaf) and cairn-core (depended on by app).
+        // A change in both cairn-cmd (leaf) and cairn-core (depended on by app).
         let targets = resolve(&[
-            "src-tauri/os/cairn-cli/src/main.rs",
+            "src-tauri/os/cairn-cmd/src/main.rs",
             "src-tauri/os/cairn-core/src/lib.rs",
         ])
         .unwrap();
@@ -625,7 +700,7 @@ mod tests {
             targets,
             vec![
                 "cairn".to_string(),
-                "cairn-cli".to_string(),
+                "cairn-cmd".to_string(),
                 "cairn-core".to_string(),
             ]
         );
@@ -639,13 +714,13 @@ mod tests {
         // shells out to cargo metadata against repo_root/src-tauri; in the test
         // worktree that path is real, but to stay hermetic we instead assert the
         // pure resolver+substitution wiring via a direct command build.
-        let resolved = resolve(&["src-tauri/os/cairn-cli/src/main.rs"]).unwrap();
+        let resolved = resolve(&["src-tauri/os/cairn-cmd/src/main.rs"]).unwrap();
         let args = resolved
             .iter()
             .map(|c| format!("-p {c}"))
             .collect::<Vec<_>>()
             .join(" ");
         let command = substitute("cargo test {targets}", TARGETS_PLACEHOLDER, &args);
-        assert_eq!(command, "cargo test -p cairn-cli");
+        assert_eq!(command, "cargo test -p cairn-cmd");
     }
 }

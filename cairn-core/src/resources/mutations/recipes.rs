@@ -198,8 +198,12 @@ fn recipe_text_replacement(
     new: &str,
     replace_all: bool,
 ) -> Result<String, String> {
-    let updated =
-        crate::mcp::handlers::implementation::replace_artifact_text(source, old, new, replace_all)?;
+    let updated = crate::mcp::handlers::comments_artifacts::replace_artifact_text(
+        source,
+        old,
+        new,
+        replace_all,
+    )?;
     // Re-validate through the same loader/validator the full-content path uses.
     parse_and_validate(&updated)?;
     Ok(updated)

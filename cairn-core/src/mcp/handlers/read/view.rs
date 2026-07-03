@@ -6,7 +6,7 @@
 //! footer, and the enriched `=== uri [suffix] ===` header. The per-source line
 //! extraction (numbered file text vs plain web/resource markdown) is thin and
 //! lives with the producers; everything that was previously duplicated in the
-//! cairn-cli composer lives here.
+//! cairn-cmd composer lives here.
 
 use cairn_common::query::{encode_query_params, split_target_query, QueryParam};
 use cairn_common::read::{
@@ -105,7 +105,7 @@ pub fn fair_share_budgets(lengths: &[usize], total_budget: usize) -> Vec<usize> 
 }
 
 // ---------------------------------------------------------------------------
-// Continue-URI helpers (ported from the cairn-cli composer).
+// Continue-URI helpers (ported from the cairn-cmd composer).
 // ---------------------------------------------------------------------------
 
 fn target_with_query_param(uri: &str, key: &str, value: usize) -> String {

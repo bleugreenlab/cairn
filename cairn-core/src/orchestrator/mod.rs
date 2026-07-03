@@ -121,7 +121,7 @@ impl OrchestratorBuilder {
             session_allowed_tools,
             session_allowed_crossings,
             identity_store,
-            mcp_binary_path: "cairn-cli".to_string(),
+            mcp_binary_path: "cairn-cmd".to_string(),
             jj_binary_path: "jj".to_string(),
             config_dir,
             schema_dir: None,
@@ -278,6 +278,7 @@ impl OrchestratorBuilder {
             mcp_auth: self.mcp_auth,
             warm_gc: self.warm_gc,
             pty_state: self.pty_state,
+            worktree_search: Arc::new(crate::worktree_search::WorktreeSearchPool::default()),
             permission_responses: self.permission_responses,
             run_completions: self.run_completions,
             prompt_responses: self.prompt_responses,
@@ -341,6 +342,11 @@ pub struct Orchestrator {
     pub warm_gc: Option<Arc<crate::agent_process::gc::WarmProcessGC>>,
     /// Active PTY sessions (terminals)
     pub pty_state: Arc<PtyState>,
+    /// Bounded pool of per-worktree warm search indexes (CAIRN-2303). Repeated
+    /// `?grep=` reads in a worktree hit a resident fff index instead of
+    /// re-walking the tree; cold/ineligible queries fall back to the ripgrep
+    /// walk. Dropped per worktree at teardown and LRU-evicted at capacity.
+    pub worktree_search: Arc<crate::worktree_search::WorktreeSearchPool>,
 
     // === Broadcast channels for cross-component communication ===
     /// Permission response broadcast: (request_id, response_json)
@@ -403,7 +409,7 @@ pub struct Orchestrator {
     pub identity_store: Arc<Mutex<Option<IdentityStore>>>,
 
     // === Host-specific paths (set by Tauri or cairn-server) ===
-    /// Path to the cairn-cli binary
+    /// Path to the cairn-cmd binary
     pub mcp_binary_path: String,
     /// Path to the jj binary (bundled sidecar; falls back to PATH `jj`).
     pub jj_binary_path: String,
@@ -779,6 +785,30 @@ impl Orchestrator {
         tokio::spawn(async move {
             if let Err(e) = crate::archival::run_archival_maintenance(&db).await {
                 log::warn!("archival maintenance failed: {e}");
+            }
+        });
+    }
+
+    /// Spawn the periodic worktree garbage collector: once shortly after startup
+    /// (a short delay so it does not compete with launch), then every ~24h.
+    ///
+    /// Reclaims worktree disk that teardown never got to — worktrees of jobs whose
+    /// issue reached a terminal state (the DB pass) and row-less filesystem debris
+    /// plus leftover `*.trash-*` tombstones (the canonical-instance filesystem
+    /// pass), both bounded by the `orphan_cleanup_days` age cutoff. Best-effort;
+    /// errors log and never abort the loop. Must be called from within a tokio
+    /// runtime. Both hosts (cairn-runner, cairn-server) spawn it at startup.
+    pub fn spawn_worktree_gc(&self) {
+        /// Delay before the first pass so it does not compete with launch.
+        const STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
+        /// Cadence after the startup pass.
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+        let orch = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STARTUP_DELAY).await;
+            loop {
+                crate::execution::worktree_gc::run_worktree_gc(&orch).await;
+                tokio::time::sleep(INTERVAL).await;
             }
         });
     }

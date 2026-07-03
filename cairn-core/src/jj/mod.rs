@@ -1038,6 +1038,57 @@ fn sealed_tree_hash_via_git(jj: &JjEnv, ws: &Path, commit: &str) -> Result<Strin
     Ok(tree)
 }
 
+/// The sealed commit's tree as flat `(path, blob_id)` entries, read through the
+/// git backend. This is the substrate for per-check INPUT hashing: filtering
+/// these entries by a check's impact globs and hashing the matching
+/// `(path, blob_id)` pairs yields a content identity that changes iff a matching
+/// file's content (or the matched path set) changes — so a check's cached verdict
+/// can be keyed by just its own inputs rather than the whole tree. Entries are
+/// sorted by path. Errs (so callers fall back to whole-tree keying) when the git
+/// backend can't be resolved or `git ls-tree` fails.
+pub fn sealed_tree_entries(jj: &JjEnv, ws: &Path) -> Result<Vec<(String, String)>, String> {
+    let commit = head_commit(jj, ws)?;
+    tree_entries(jj, ws, &commit)
+}
+
+/// Flat `(path, blob_id)` entries for an arbitrary commit or tree object in the
+/// jj workspace's git backend. This is intentionally treeish-based so check-cache
+/// consumers can compare the current sealed tree with a previously cached baseline
+/// tree even when that baseline was re-stamped by another branch or node.
+pub fn tree_entries(jj: &JjEnv, ws: &Path, treeish: &str) -> Result<Vec<(String, String)>, String> {
+    let git_dir = git_backend_root(jj, ws)?;
+    let out = crate::env::git()
+        .args(["--git-dir", &git_dir, "ls-tree", "-r", "-z", treeish])
+        .output()
+        .map_err(|e| format!("git ls-tree: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-tree failed for {treeish}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(parse_ls_tree(&String::from_utf8_lossy(&out.stdout)))
+}
+
+/// Parse `git ls-tree -r -z` output into sorted `(path, blob_id)` pairs. Each
+/// NUL-terminated record is `<mode> SP <type> SP <object>\t<path>`; `-z` leaves
+/// paths unquoted (no C-escaping), so the tab split is unambiguous. Records that
+/// don't parse are skipped rather than failing the whole read. Pure, so it is
+/// unit-tested.
+fn parse_ls_tree(output: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = output
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let (meta, path) = record.split_once('\t')?;
+            let object = meta.split_whitespace().nth(2)?;
+            Some((path.to_string(), object.to_string()))
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
 /// One changed file derived from the live sealed jj graph: its repo-relative
 /// path, status, and `+`/`-` line counts, plus the previous path for a rename.
 /// The substrate for the node `/changed` projection, which derives the changed
@@ -1246,6 +1297,15 @@ fn parse_git_diff(diff: &str) -> Vec<GraphFileChange> {
         files.push(done.finish());
     }
     files
+}
+
+/// Public wrapper over [`parse_git_diff`]: turn a captured `git`/`jj diff --git`
+/// patch into structured [`GraphFileChange`] rows. Lets callers outside `jj`
+/// (the run-path commit barrier) record a just-sealed commit's file changes from
+/// the working-copy patch captured before the seal, feeding the same
+/// `file_changes` cache the write path records into.
+pub fn parse_git_patch(diff: &str) -> Vec<GraphFileChange> {
+    parse_git_diff(diff)
 }
 
 /// Accumulator for one `diff --git` file block while [`parse_git_diff`] scans.
@@ -1467,6 +1527,29 @@ pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) {
 pub fn bookmark_commit(jj: &JjEnv, store: &Path, branch: &str) -> Option<String> {
     let revset = format!("bookmarks(exact:{:?})", branch);
     revset_commit(jj, store, &revset)
+}
+
+/// Whether the `src` bookmark's tip has already landed in `dst` — its commit is
+/// an ancestor of (or equal to) the `dst` bookmark's tip in the shared store.
+///
+/// `bookmarks(exact:SRC) & ::bookmarks(exact:DST)` intersects SRC's target commit
+/// with DST's ancestor set (inclusive); a non-empty result means SRC's tip lies
+/// on DST's history, i.e. a fold already carried SRC into DST. Returns `false`
+/// when either bookmark is missing or the revset is empty — a landed check fails
+/// closed ("cannot prove landed" is treated as "not landed"), so a caller that
+/// deletes only landed branches preserves anything it cannot verify.
+///
+/// Note this is a *lineage* test: a squash landing rewrites SRC onto DST before
+/// the fold, so the rewritten SRC bookmark is an ancestor of DST and this holds;
+/// but an out-of-band squash that discards SRC's commits (e.g. GitHub's own
+/// squash-merge) leaves SRC off DST's history and returns `false`. Use it only
+/// where the store owns the fold (the local jj merge path and its teardown).
+pub fn bookmark_landed_in(jj: &JjEnv, store: &Path, src: &str, dst: &str) -> bool {
+    if src.is_empty() || dst.is_empty() {
+        return false;
+    }
+    let revset = format!("bookmarks(exact:{src:?}) & ::bookmarks(exact:{dst:?})");
+    revset_commit(jj, store, &revset).is_some()
 }
 
 /// Resolve a single revset to a commit id over the shared store, or `None` when
@@ -2379,6 +2462,95 @@ fn restore_bookmark(jj: &JjEnv, store: &Path, branch: &str, tip: &str) -> Result
     Ok(())
 }
 
+/// The store's current operation id (the newest entry in the op log). Paired with
+/// [`restore_operation`] to snapshot store state before a multi-step mutation and
+/// rewind to it if a later step fails.
+///
+/// EXACT ONLY UNDER THE PER-STORE LOCK: the id is only a faithful "pre-mutation"
+/// marker if no other writer interleaves an op before the matching restore. The
+/// caller MUST hold the per-store lock (as the merge fold and every Cairn jj
+/// writer do via `resolve_store_lock`), under which every op between snapshot and
+/// restore is the caller's own.
+pub fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
+    jj.run(
+        store,
+        &[
+            "op",
+            "log",
+            "--no-graph",
+            "-n",
+            "1",
+            "-T",
+            "id",
+            "--ignore-working-copy",
+        ],
+        "jj op id",
+    )
+    .map(|s| s.trim().to_string())
+}
+
+/// Rewind the whole store to a prior operation `op_id` (an exact undo of every
+/// bookmark move and commit rewrite since it), then re-export the backing git
+/// refs so `refs/heads/*` realign with the restored bookmarks. Used to roll a
+/// partially-applied merge back to its pre-merge snapshot so a push failure never
+/// leaves local bookmarks diverged from origin.
+///
+/// EXACT ONLY UNDER THE PER-STORE LOCK: `jj op restore` restores whole-store
+/// state, so any op another writer interleaved between the [`operation_id`]
+/// snapshot and this restore would also be undone. The caller MUST hold the
+/// per-store lock; under it every op since the snapshot is the caller's own and
+/// the restore is precise.
+pub fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), String> {
+    jj.run(
+        store,
+        &["op", "restore", op_id, "--ignore-working-copy"],
+        "jj op restore",
+    )?;
+    jj.run(
+        store,
+        &["git", "export", "--ignore-working-copy"],
+        "jj git export (after op restore)",
+    )
+    .map(|_| ())
+}
+
+/// Local bookmarks that ride a commit inside `range_revset`, excluding `exclude`.
+/// A base advance that bakes conflicts into a branch's intermediate commits can
+/// leave a SIBLING bookmark pointing at one of those intermediates (its own tip
+/// is one of this branch's lineage commits, so it has no seals of its own). When
+/// this branch is flattened, that rider is orphaned onto an abandoned lineage;
+/// [`flatten_branch_recovery`] re-points each such rider onto the flattened
+/// commit. `local_bookmarks` is the jj 0.42 template keyword for a commit's local
+/// bookmarks; `--ignore-working-copy` keeps the enumeration store-driven.
+fn local_bookmarks_in_range(
+    jj: &JjEnv,
+    store: &Path,
+    range_revset: &str,
+    exclude: &str,
+) -> Vec<String> {
+    jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            range_revset,
+            "--no-graph",
+            "-T",
+            "local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+            "--ignore-working-copy",
+        ],
+        "jj log (rider bookmarks in range)",
+    )
+    .unwrap_or_default()
+    .lines()
+    .map(str::trim)
+    .filter(|name| !name.is_empty() && *name != exclude)
+    .map(ToOwned::to_owned)
+    .collect::<std::collections::BTreeSet<_>>()
+    .into_iter()
+    .collect()
+}
+
 /// The outcome of a guarded flatten recovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlattenReport {
@@ -2391,6 +2563,10 @@ pub struct FlattenReport {
     /// Orphaned twins of the PRE-flatten change-id that were abandoned in the
     /// twin-cleanup pass.
     pub abandoned_twins: Vec<String>,
+    /// Sibling bookmarks that rode a flattened-away intermediate commit and were
+    /// re-pointed onto the flattened commit (so a later `reconcile_siblings` does
+    /// not resurrect the orphaned lineage).
+    pub repointed_bookmarks: Vec<String>,
 }
 
 /// Guarded flatten recovery for a clean-tip / conflicted-intermediate branch.
@@ -2444,6 +2620,18 @@ pub fn flatten_branch_recovery(
     let pre_tree = sealed_tree_hash_via_git(jj, store, &pre_tip).ok();
     let collapsed_conflicted_commits =
         conflicted_commits(jj, store, &format!("{dest_commit}..{branch_revset}")).len();
+
+    // Enumerate sibling bookmarks riding the about-to-be-flattened lineage BEFORE
+    // the squash (afterwards the range collapses and their commits leave it). Any
+    // bookmark in `dest..branch` other than `branch` itself sits on one of this
+    // branch's own lineage commits and would be orphaned onto an abandoned line by
+    // the flatten; it is re-pointed onto the flattened commit once the guards pass.
+    let riders = local_bookmarks_in_range(
+        jj,
+        store,
+        &format!("{dest_commit}..{branch_revset}"),
+        branch,
+    );
 
     // Collapse the branch to one commit on dest whose tree = the clean rebased tip.
     squash_branch_onto(jj, store, branch, dest_commit, message)?;
@@ -2503,6 +2691,38 @@ pub fn flatten_branch_recovery(
         }
     }
 
+    // Re-point every rider sibling onto the flattened commit BEFORE the twin
+    // cleanup, so a rider that happened to sit on the pre-flatten tip is moved off
+    // it before that lineage is abandoned. Best-effort per bookmark with logging: a
+    // failed re-point leaves the rider on the orphaned lineage (the same state as
+    // before this recovery existed), so the good flatten still stands.
+    let mut repointed_bookmarks = Vec::new();
+    for rider in riders {
+        match jj.run(
+            store,
+            &[
+                "bookmark",
+                "set",
+                &rider,
+                "-r",
+                &post_tip,
+                "--allow-backwards",
+                "--ignore-working-copy",
+            ],
+            "flatten: re-point rider bookmark",
+        ) {
+            Ok(_) => {
+                let _ = jj.run(
+                    store,
+                    &["git", "export", "--ignore-working-copy"],
+                    "flatten: git export after rider re-point",
+                );
+                repointed_bookmarks.push(rider);
+            }
+            Err(e) => log::warn!("flatten: re-pointing rider bookmark {rider} failed: {e}"),
+        }
+    }
+
     // Twin cleanup: the squash minted a fresh change-id, so any commit still
     // sharing the PRE-flatten change-id is an orphaned twin (the old lineage tip,
     // or every twin of an ambiguous conflicted divergence). Drop them now that a
@@ -2529,6 +2749,7 @@ pub fn flatten_branch_recovery(
         flattened_commit: post_tip,
         collapsed_conflicted_commits,
         abandoned_twins,
+        repointed_bookmarks,
     })
 }
 
@@ -3852,6 +4073,21 @@ index 1111111111..2222222222 100644
             hash_a,
             sealed_tree_hash(&jj, &c).unwrap(),
             "different tree content yields a different hash"
+        );
+    }
+
+    /// `parse_ls_tree` extracts `(path, blob)` from `-z` records, ignores
+    /// mode/type, tolerates a trailing NUL, and sorts by path. Pure — no jj
+    /// binary needed.
+    #[test]
+    fn parse_ls_tree_extracts_sorted_path_blob_pairs() {
+        let out = "100644 blob aaa\tsrc/b.rs\x00100644 blob bbb\tsrc/a.rs\x00";
+        assert_eq!(
+            super::parse_ls_tree(out),
+            vec![
+                ("src/a.rs".to_string(), "bbb".to_string()),
+                ("src/b.rs".to_string(), "aaa".to_string()),
+            ]
         );
     }
 
@@ -5609,6 +5845,53 @@ index 1111111111..2222222222 100644
         );
     }
 
+    /// `bookmark_landed_in` is the ancestor test the merge postcondition and the
+    /// merged-teardown guard both rely on: a child sealed ON TOP of integration is
+    /// NOT landed until the fold, and IS landed once `merge_into_bookmark`
+    /// fast-forwards integration onto it. Empty/missing bookmarks fail closed.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn bookmark_landed_in_tracks_the_fold() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping bookmark_landed_in_tracks_the_fold: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let int = "agent/CAIRN-2287-coordinator-0";
+        let child = "agent/CAIRN-1-builder-0";
+        add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+        let ws_child = wts.path().join("child");
+        add_workspace(&jj, &store, &ws_child, child, int, None).unwrap();
+
+        // The child seals a commit ON TOP of integration: its tip descends from
+        // int, so it has NOT yet landed in int.
+        std::fs::write(ws_child.join("child.rs"), "child work\n").unwrap();
+        seal(&jj, &ws_child, "child work", None).unwrap();
+        assert!(
+            !bookmark_landed_in(&jj, &store, child, int),
+            "an un-folded child is not landed in integration"
+        );
+
+        // Fold it, and now the child's tip IS an ancestor of (equal to) int.
+        merge_into_bookmark(&jj, &store, int, child).unwrap();
+        assert!(
+            bookmark_landed_in(&jj, &store, child, int),
+            "once folded, the child has landed in integration"
+        );
+
+        // Fail-closed on empty or unknown bookmarks.
+        assert!(!bookmark_landed_in(&jj, &store, "", int));
+        assert!(!bookmark_landed_in(&jj, &store, child, ""));
+        assert!(!bookmark_landed_in(&jj, &store, "agent/nonexistent", int));
+    }
+
     /// Drive `DIV_SIBLING` into the clean-tip / conflicted-intermediate shape: the
     /// integration tip advances with a conflicting `shared.rs` edit, the sibling's
     /// original sealed commit is rebased onto it (recording a conflict on that
@@ -5629,6 +5912,138 @@ index 1111111111..2222222222 100644
             "the resolving seal leaves the tip clean"
         );
         dest
+    }
+
+    /// A wedged coordinator hub for the CAIRN-2288 merge-time repro, built the way
+    /// the incident arose. The hub (`int`) seals an edit to `shared.rs`; a child
+    /// (`child`) branches from it and seals a DISTINCT file; `main` then advances
+    /// with a CONFLICTING edit to `shared.rs`. The hub auto-rebases onto the
+    /// advanced main (baking the conflict into the shared `hub-edit` intermediate,
+    /// which the child also descends from) and the coordinator resolves at its tip
+    /// and re-seals; the child, dragged onto the same conflicted intermediate,
+    /// resolves at ITS OWN tip and re-seals. Both branches end with a CLEAN tip
+    /// over the conflicted intermediate, and — crucially, mirroring the live
+    /// topology — the child carries its own resolution rather than depending on
+    /// the hub's. `main_tip` is the advanced base (the flatten dest); origin holds
+    /// the hub at its pre-conflict tip so a post-merge push is a real advance.
+    struct WedgedHub {
+        _home: TempDir,
+        _proj: TempDir,
+        _wts: TempDir,
+        _origin: TempDir,
+        origin_path: PathBuf,
+        jj: JjEnv,
+        store: PathBuf,
+        ws_coord: PathBuf,
+        main_tip: String,
+        int: &'static str,
+        child: &'static str,
+    }
+
+    fn setup_wedged_hub(bin: &str) -> WedgedHub {
+        let home = TempDir::new().unwrap();
+        let origin = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+        init_project(proj.path());
+        git(
+            proj.path(),
+            &["remote", "add", "origin", &origin.path().to_string_lossy()],
+        );
+        git(proj.path(), &["push", "-q", "origin", "main"]);
+        let jj = JjEnv::resolve(bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        // Coordinator integration branch on main, published to origin, with its own
+        // edit to shared.rs.
+        let int = "agent/CAIRN-2241-coordinator-0";
+        let ws_coord = wts.path().join("coord");
+        add_workspace(&jj, &store, &ws_coord, int, "main", None).unwrap();
+        ensure_bookmark_on_origin(&jj, &store, int).unwrap();
+        std::fs::write(ws_coord.join("shared.rs"), "hub-edit\n").unwrap();
+        seal(&jj, &ws_coord, "hub edits shared", None).unwrap();
+
+        // A child branches from the hub's tip and seals a DISTINCT file, so it
+        // shares the `hub-edit` commit as an ancestor.
+        let child = "agent/CAIRN-2284-builder-0";
+        let ws_child = wts.path().join("child");
+        add_workspace(&jj, &store, &ws_child, child, int, None).unwrap();
+        std::fs::write(ws_child.join("child.rs"), "child-work\n").unwrap();
+        seal(&jj, &ws_child, "child work", None).unwrap();
+
+        // `main` advances out of band with a CONFLICTING edit to shared.rs.
+        jj.run(&store, &["new", "main"], "new on main").unwrap();
+        std::fs::write(store.join("shared.rs"), "main-advanced\n").unwrap();
+        jj.run(
+            &store,
+            &["describe", "-m", "main advances shared"],
+            "describe main",
+        )
+        .unwrap();
+        let main_tip = jj
+            .run(
+                &store,
+                &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+                "main tip",
+            )
+            .unwrap()
+            .trim()
+            .to_string();
+        jj.run(
+            &store,
+            &[
+                "bookmark",
+                "set",
+                "main",
+                "-r",
+                "@",
+                "--ignore-working-copy",
+            ],
+            "advance main",
+        )
+        .unwrap();
+
+        // The hub auto-rebases onto the advanced main, baking the conflict into the
+        // shared `hub-edit` commit; the child (which descends from it) is dragged
+        // onto the same conflicted commit. Resolve each branch at ITS OWN tip and
+        // re-seal, leaving both with a CLEAN tip over the conflicted INTERMEDIATE.
+        rebase_branch_onto(&jj, &store, int, "main").unwrap();
+        assert!(branch_has_conflict(&jj, &store, int).unwrap());
+        update_stale(&jj, &ws_coord).unwrap();
+        std::fs::write(ws_coord.join("shared.rs"), "hub-resolved\n").unwrap();
+        seal(&jj, &ws_coord, "resolve hub conflict", None).unwrap();
+        assert!(!branch_has_conflict(&jj, &store, int).unwrap());
+
+        // The child was dragged onto the rewritten conflicted `hub-edit`; resolve
+        // it independently (its own resolution commit, not the hub's).
+        assert!(branch_has_conflict(&jj, &store, child).unwrap());
+        update_stale(&jj, &ws_child).unwrap();
+        std::fs::write(ws_child.join("shared.rs"), "hub-resolved\n").unwrap();
+        seal(&jj, &ws_child, "resolve child conflict", None).unwrap();
+        assert!(!branch_has_conflict(&jj, &store, child).unwrap());
+
+        assert_eq!(
+            flatten_state(&jj, &store, &main_tip, int).unwrap(),
+            FlattenState::IntermediateOnly,
+            "hub: clean tip over a conflicted intermediate"
+        );
+
+        let origin_path = origin.path().to_path_buf();
+        WedgedHub {
+            _home: home,
+            _proj: proj,
+            _wts: wts,
+            _origin: origin,
+            origin_path,
+            jj,
+            store,
+            ws_coord,
+            main_tip,
+            int,
+            child,
+        }
     }
 
     /// Count the commits a range revset resolves to over the store.
@@ -5900,6 +6315,242 @@ index 1111111111..2222222222 100644
             )
             .is_ok(),
             "the flattened sibling is pushable"
+        );
+    }
+
+    /// Component C: a sibling bookmark riding a conflicted INTERMEDIATE commit
+    /// (the live `agent/CAIRN-2285-planner-0 @ c6b16933` shape) does NOT block the
+    /// flatten, is re-pointed onto the flattened commit, and is reported in
+    /// `repointed_bookmarks` — so a later reconcile finds it clean on the new tip
+    /// instead of resurrecting the orphaned conflicted lineage.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn flatten_repoints_rider_bookmark_on_conflicted_intermediate() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping flatten_repoints_rider_bookmark_on_conflicted_intermediate: jj not resolvable");
+            return;
+        };
+        let fx = setup_divergence_fixture(&bin);
+        // Advance the integration tip conflictingly and rebase the sibling onto it,
+        // recording a conflict on the sibling's (now INTERMEDIATE) sealed commit.
+        let dest = advance_int_conflicting(&fx.jj, &fx.store, "int-advanced\n");
+        rebase_branch_onto(&fx.jj, &fx.store, DIV_SIBLING, DIV_INT).unwrap();
+        assert!(branch_has_conflict(&fx.jj, &fx.store, DIV_SIBLING).unwrap());
+
+        // A sibling planner bookmark rides the conflicted intermediate.
+        let rider = "agent/CAIRN-2285-planner-0";
+        let conflicted_intermediate = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+        fx.jj
+            .run(
+                &fx.store,
+                &[
+                    "bookmark",
+                    "create",
+                    rider,
+                    "-r",
+                    &conflicted_intermediate,
+                    "--ignore-working-copy",
+                ],
+                "create rider bookmark",
+            )
+            .unwrap();
+
+        // Resolve on top so the sibling's TIP is clean over the conflicted intermediate.
+        update_stale(&fx.jj, &fx.ws_sibling).unwrap();
+        std::fs::write(fx.ws_sibling.join("shared.rs"), "resolved\n").unwrap();
+        seal(&fx.jj, &fx.ws_sibling, "resolve conflict", None).unwrap();
+        assert_eq!(
+            flatten_state(&fx.jj, &fx.store, &dest, DIV_SIBLING).unwrap(),
+            FlattenState::IntermediateOnly
+        );
+
+        let report =
+            flatten_branch_recovery(&fx.jj, &fx.store, DIV_SIBLING, &dest, "flattened").unwrap();
+
+        // The rider did not block the flatten and was re-pointed onto the flattened commit.
+        assert!(
+            report.repointed_bookmarks.contains(&rider.to_string()),
+            "the rider is reported as re-pointed: {:?}",
+            report.repointed_bookmarks
+        );
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, rider).unwrap(),
+            report.flattened_commit,
+            "the rider now points at the flattened commit"
+        );
+        // The re-pointed rider is a clean descendant of the dest — pushable, no
+        // orphaned conflicted lineage for a later reconcile to resurrect.
+        assert!(!branch_has_conflict(&fx.jj, &fx.store, rider).unwrap());
+        assert!(branch_descends_from(&fx.jj, &fx.store, rider, &dest));
+    }
+
+    /// Component B: `operation_id` + `restore_operation` roll a fold back to its
+    /// exact pre-merge state — after a rebase+fold advances the integration
+    /// bookmark, restoring the snapshot returns both bookmarks to their pre-merge
+    /// commits and realigns the backing git refs, and a retry then lands cleanly
+    /// with no divergent-change accumulation.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn operation_id_and_restore_operation_roll_back_a_fold() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping operation_id_and_restore_operation_roll_back_a_fold: jj not resolvable"
+            );
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let int = "agent/CAIRN-2288-coordinator-0";
+        add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+        let child = "agent/CAIRN-1-builder-0";
+        let ws = wts.path().join("child");
+        add_workspace(&jj, &store, &ws, child, int, None).unwrap();
+        std::fs::write(ws.join("child.rs"), "child\n").unwrap();
+        seal(&jj, &ws, "child edits child.rs", None).unwrap();
+
+        let source_pre = bookmark_commit(&jj, &store, child).unwrap();
+        let target_pre = bookmark_commit(&jj, &store, int).unwrap();
+
+        // Snapshot, then fold the child into the integration bookmark.
+        let op = operation_id(&jj, &store).unwrap();
+        rebase_branch_onto(&jj, &store, child, int).unwrap();
+        merge_into_bookmark(&jj, &store, int, child).unwrap();
+        assert_ne!(
+            bookmark_commit(&jj, &store, int).unwrap(),
+            target_pre,
+            "the fold advanced the integration bookmark"
+        );
+
+        // Roll back to the snapshot: both bookmarks return to their pre-merge commits.
+        restore_operation(&jj, &store, &op).unwrap();
+        assert_eq!(
+            bookmark_commit(&jj, &store, child).unwrap(),
+            source_pre,
+            "the source bookmark is restored to its pre-merge commit"
+        );
+        assert_eq!(
+            bookmark_commit(&jj, &store, int).unwrap(),
+            target_pre,
+            "the target bookmark is restored to its pre-merge commit"
+        );
+        // The exported backing git ref realigns with the restored bookmark.
+        assert_eq!(
+            git_stdout(proj.path(), &["rev-parse", int]),
+            target_pre,
+            "the git ref realigned to the restored target"
+        );
+
+        // A retry after the rollback lands cleanly — no empty-commit accumulation,
+        // no divergent twin for the child change.
+        rebase_branch_onto(&jj, &store, child, int).unwrap();
+        merge_into_bookmark(&jj, &store, int, child).unwrap();
+        assert!(
+            bookmark_landed_in(&jj, &store, child, int),
+            "the retried fold carries the child into the integration branch"
+        );
+        assert_eq!(
+            visible_commits_for_change(&jj, &store, &change_id_of(&jj, &store, child)),
+            1,
+            "no divergent twin accumulated for the child change across the rollback+retry"
+        );
+    }
+
+    /// Component A (the load-bearing fix), positive case: a hub with a CLEAN tip
+    /// over a conflicted INTERMEDIATE (a `main` advance baked the conflict into the
+    /// hub's own history; the coordinator resolved at the tip and re-sealed) is
+    /// flattened at merge time, the child rebases + folds onto it, and the
+    /// integration branch pushes to a bare origin — the wedge is cleared.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn target_flatten_unwedges_child_merge_into_conflicted_hub() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping target_flatten_unwedges_child_merge_into_conflicted_hub: jj not resolvable");
+            return;
+        };
+        let hub = setup_wedged_hub(&bin);
+        // The fixture's child: clean tip over its own conflicted intermediate,
+        // carrying its own resolution (as the live child B did).
+        let child = hub.child;
+
+        // === Replicate store_merge_child's integration path ===
+        // 1. Target preflight: flatten the hub onto its base (main_tip).
+        let report =
+            flatten_branch_recovery(&hub.jj, &hub.store, hub.int, &hub.main_tip, "hub flattened")
+                .unwrap();
+        assert!(
+            report.collapsed_conflicted_commits >= 1,
+            "the hub flatten collapsed its conflicted intermediate"
+        );
+        assert!(!branch_has_conflict(&hub.jj, &hub.store, hub.int).unwrap());
+        let flattened_int = bookmark_commit(&hub.jj, &hub.store, hub.int).unwrap();
+        advance_workspace_onto(&hub.jj, &hub.store, &hub.ws_coord, hub.int, &flattened_int)
+            .unwrap();
+
+        // 2. Rebase the source onto the flattened integration tip. The rebase
+        //    re-applies the child's inherited (old) hub lineage, so it now carries a
+        //    conflicted intermediate of its own — the SOURCE flatten clears it.
+        rebase_branch_onto(&hub.jj, &hub.store, child, hub.int).unwrap();
+        if let FlattenState::IntermediateOnly =
+            flatten_state(&hub.jj, &hub.store, hub.int, child).unwrap()
+        {
+            let d = bookmark_commit(&hub.jj, &hub.store, hub.int).unwrap();
+            flatten_branch_recovery(&hub.jj, &hub.store, child, &d, "child flattened").unwrap();
+        }
+        let range = format!("bookmarks(exact:{:?})..bookmarks(exact:{child:?})", hub.int);
+        assert!(
+            conflicted_commits(&hub.jj, &hub.store, &range).is_empty(),
+            "no conflicted commit survives on the child after the flattens"
+        );
+
+        // 3. Fold + push: the integration branch advances on origin (was wedged).
+        merge_into_bookmark(&hub.jj, &hub.store, hub.int, child).unwrap();
+        let origin_before = git_stdout(&hub.origin_path, &["rev-parse", hub.int]);
+        track_bookmark(&hub.jj, &hub.store, child).ok();
+        push_store_bookmark(&hub.jj, &hub.store, child).unwrap();
+        push_store_bookmark(&hub.jj, &hub.store, hub.int).unwrap();
+        let origin_after = git_stdout(&hub.origin_path, &["rev-parse", hub.int]);
+        assert_ne!(
+            origin_before, origin_after,
+            "the integration branch advanced on origin after the merge"
+        );
+        assert!(
+            bookmark_landed_in(&hub.jj, &hub.store, child, hub.int),
+            "the child's tip is an ancestor of the advanced integration branch"
+        );
+    }
+
+    /// Component A, the pinned failure mode: WITHOUT the target flatten, folding a
+    /// child into the conflicted hub leaves the integration branch's ancestry
+    /// carrying a conflicted commit, so the push is REFUSED — exactly the live
+    /// wedge (`Won't push commit ... since it has conflicts`).
+    #[test]
+    #[serial_test::serial(jj)]
+    fn child_merge_push_refused_without_target_flatten() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping child_merge_push_refused_without_target_flatten: jj not resolvable"
+            );
+            return;
+        };
+        let hub = setup_wedged_hub(&bin);
+        let child = hub.child;
+
+        // Skip the target flatten; fold the child straight into the conflicted hub.
+        rebase_branch_onto(&hub.jj, &hub.store, child, hub.int).unwrap();
+        merge_into_bookmark(&hub.jj, &hub.store, hub.int, child).unwrap();
+
+        // The integration branch's ancestry now includes the hub's conflicted
+        // intermediate, so jj refuses to push it.
+        let err = push_store_bookmark(&hub.jj, &hub.store, hub.int).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("conflict"),
+            "the push is refused for the conflicted ancestor: {err}"
         );
     }
 

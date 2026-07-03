@@ -550,7 +550,8 @@ pub struct BrowserNavEvent {
 /// A plain-data command sent over the [`BrowserCommandTx`] channel from
 /// cairn-core dispatch/teardown to the app-side drain task. Carries NO Tauri
 /// types, so it is safe to hold on the Orchestrator (TRAP 1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum BrowserCommand {
     Open {
         id: String,

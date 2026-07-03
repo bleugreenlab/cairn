@@ -22,7 +22,7 @@ use super::{
     ResourceAppliedChange, ResourceMutationResult,
 };
 use crate::mcp::handlers::{
-    bash, bug_report, executions, implementation, issues, messages, planning,
+    bug_report, comments_artifacts, executions, issues, messages, planning, terminal,
 };
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
@@ -336,11 +336,12 @@ async fn subscribe_terminal_wake(
         ));
     }
 
-    let row = crate::mcp::handlers::bash::lookup_terminal_for_wake(&orch.db.local, job_id, &slug)
-        .await
-        .map_err(|error| build_failure(index, item, error.to_string()))?;
+    let row =
+        crate::mcp::handlers::terminal::lookup_terminal_for_wake(&orch.db.local, job_id, &slug)
+            .await
+            .map_err(|error| build_failure(index, item, error.to_string()))?;
     let Some(row) = row else {
-        let slugs = crate::mcp::handlers::bash::list_job_terminal_slugs(&orch.db.local, job_id)
+        let slugs = crate::mcp::handlers::terminal::list_job_terminal_slugs(&orch.db.local, job_id)
             .await
             .unwrap_or_default();
         let listed = if slugs.is_empty() {
@@ -390,50 +391,29 @@ async fn subscribe_terminal_exit_wake(
     dry_run: bool,
     slug: &str,
     uri: &str,
-    row: &crate::mcp::handlers::bash::TerminalWakeRow,
+    row: &crate::mcp::handlers::terminal::TerminalWakeRow,
 ) -> ResourceMutationResult<String> {
     if dry_run {
         return Ok(format!("Would subscribe terminal-exit wake: {slug}"));
     }
 
-    // Store the canonical terminal URI as the source ref, not the bare slug:
-    // slugs are unique only per job, so a slug ref would cross-match other jobs'
-    // same-slug terminals (e.g. every job's promoted `run-1`). The route side
-    // keys on the same canonical URI.
-    let fact_kinds = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
-    crate::orchestrator::wakes::subscribe_one_shot(
-        &orch.db.local,
+    match crate::mcp::handlers::terminal::subscribe_terminal_exit_wake_once(
+        orch,
         job_id,
-        "process",
-        Some(uri),
-        Some(&fact_kinds),
+        slug,
+        uri,
+        Some(row),
         created_by,
     )
     .await
-    .map_err(|error| build_failure(index, item, error))?;
-
-    if row.status == "exited" {
-        // Already exited between read and subscribe: fire immediately. Delivery
-        // is queued, so it lands when the current turn ends; the one-shot
-        // consume removes the subscription we just created.
-        let runtime_secs = row.exited_at.map(|exited| (exited - row.created_at).max(0));
-        crate::orchestrator::wakes::route_terminal_exit_async(
-            orch,
-            slug,
-            uri,
-            row.exit_code,
-            runtime_secs,
-            row.output_tail.as_deref(),
-        )
-        .await
-        .map_err(|error| build_failure(index, item, error))?;
-        Ok(format!(
-            "Terminal '{slug}' already exited; resume queued for turn end ({uri})"
-        ))
-    } else {
-        Ok(format!(
+    .map_err(|error| build_failure(index, item, error))?
+    {
+        crate::mcp::handlers::terminal::TerminalWakeSubscriptionOutcome::ExitAlreadyQueued => Ok(
+            format!("Terminal '{slug}' already exited; resume queued for turn end ({uri})"),
+        ),
+        _ => Ok(format!(
             "Subscribed to terminal '{slug}' exit; end your turn to resume when it finishes ({uri})"
-        ))
+        )),
     }
 }
 
@@ -452,7 +432,7 @@ async fn subscribe_terminal_output_wake(
     dry_run: bool,
     slug: &str,
     uri: &str,
-    row: &crate::mcp::handlers::bash::TerminalWakeRow,
+    row: &crate::mcp::handlers::terminal::TerminalWakeRow,
 ) -> ResourceMutationResult<String> {
     let phrase = filter
         .phrase
@@ -467,79 +447,44 @@ async fn subscribe_terminal_output_wake(
             )
         })?;
 
-    if row.status == "exited" {
-        return Err(build_failure(
-            index,
-            item,
-            format!(
-                "Terminal '{slug}' has already exited; output watching applies only to a running terminal. Read {uri} for its output."
-            ),
-        ));
-    }
-
     if dry_run {
         return Ok(format!(
             "Would subscribe terminal-output wake on '{slug}' for phrase \"{phrase}\""
         ));
     }
 
-    // Persist first: the subscription is a durable, terminal-scoped property,
-    // not bound to whichever PTY session is live right now. A (re)starting
-    // session hydrates it (see spawn_terminal_session), so it survives the
-    // worktree-fence approval respawn and a subscribe made before any session
-    // is live — "wake me if this terminal outputs X", across sessions.
-    let sub = crate::orchestrator::wakes::subscribe_terminal_output_one_shot(
-        &orch.db.local,
+    match crate::mcp::handlers::terminal::subscribe_terminal_output_wake_once(
+        orch,
         job_id,
+        slug,
         uri,
         phrase,
+        Some(row),
+        None,
         created_by,
     )
     .await
-    .map_err(|error| build_failure(index, item, error))?;
-
-    // If a session is live now, also attach an in-memory watcher to it (the
-    // hydrate path only runs at session start) and scan its current buffer so an
-    // already-printed phrase fires immediately. A missing or dead session is no
-    // longer an error: the persisted subscription stands and the next session
-    // picks it up.
-    use crate::mcp::handlers::bash::OutputWatchRegistration;
-    if let Some(session_id) = row.session_id.as_deref() {
-        match crate::mcp::handlers::bash::register_terminal_output_watcher(
-            orch, session_id, &sub.id, job_id, phrase, uri,
-        ) {
-            OutputWatchRegistration::AlreadyPresent { excerpt } => {
-                // The phrase is already in the buffer: fire immediately. The
-                // queued delivery lands at turn end and the one-shot consume
-                // removes the subscription we just created.
-                crate::orchestrator::wakes::route_terminal_output_async(
-                    orch,
-                    job_id,
-                    slug,
-                    uri,
-                    phrase,
-                    excerpt.as_deref(),
-                )
-                .await
-                .map_err(|error| build_failure(index, item, error))?;
-                return Ok(format!(
-                    "Terminal '{slug}' already printed \"{phrase}\"; resume queued for turn end ({uri})"
-                ));
-            }
-            OutputWatchRegistration::Registered => {
-                return Ok(format!(
-                    "Subscribed to terminal '{slug}' output for phrase \"{phrase}\"; end your turn to resume when it appears ({uri})"
-                ));
-            }
-            // No live session backing the row right now; the persisted
-            // subscription still stands and the next session will pick it up.
-            OutputWatchRegistration::NotLive => {}
+    .map_err(|error| build_failure(index, item, error))?
+    {
+        crate::mcp::handlers::terminal::TerminalWakeSubscriptionOutcome::OutputAlreadyQueued => {
+            Ok(format!(
+                "Terminal '{slug}' already printed \"{phrase}\"; resume queued for turn end ({uri})"
+            ))
         }
+        crate::mcp::handlers::terminal::TerminalWakeSubscriptionOutcome::OutputRegistered => {
+            Ok(format!(
+                "Subscribed to terminal '{slug}' output for phrase \"{phrase}\"; end your turn to resume when it appears ({uri})"
+            ))
+        }
+        crate::mcp::handlers::terminal::TerminalWakeSubscriptionOutcome::ExitAlreadyQueued => Ok(
+            format!(
+                "Terminal '{slug}' already exited before \"{phrase}\" appeared; resume queued for turn end ({uri})"
+            ),
+        ),
+        _ => Ok(format!(
+            "Subscribed to terminal '{slug}' output for phrase \"{phrase}\"; end your turn to resume when it next prints, across restarts ({uri})"
+        )),
     }
-
-    Ok(format!(
-        "Subscribed to terminal '{slug}' output for phrase \"{phrase}\"; end your turn to resume when it next prints, across restarts ({uri})"
-    ))
 }
 
 /// Parse the optional `execution` object on an issue-create payload into a
@@ -788,12 +733,53 @@ pub(crate) async fn dispatch_resource_change(
                 })?),
                 None => None,
             };
+            let wake = match payload.get("wake") {
+                Some(value) => {
+                    let raw = value.as_str().ok_or_else(|| {
+                        build_failure(
+                            index,
+                            item,
+                            "payload.wake must be a string: \"exit\" or a literal output phrase",
+                        )
+                    })?;
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        return Err(build_failure(index, item, "payload.wake must not be empty; use \"exit\" or a literal output phrase"));
+                    }
+                    Some(if trimmed == "exit" {
+                        terminal::TerminalWakeSpec::Exit
+                    } else {
+                        terminal::TerminalWakeSpec::Output(trimmed.to_string())
+                    })
+                }
+                None => None,
+            };
+            if wake.is_some()
+                && matches!(resource, CairnResource::ProjectTerminal { .. })
+                && request.run_id.is_none()
+            {
+                return Err(build_failure(
+                    index,
+                    item,
+                    "payload.wake requires an agent caller when creating a project terminal",
+                ));
+            }
             if dry_run {
-                format!("Would start terminal {slug}: {command}")
+                let wake_suffix = wake
+                    .as_ref()
+                    .map_or_else(String::new, terminal::TerminalWakeSpec::dry_run_suffix);
+                format!("Would start terminal {slug}: {command}{wake_suffix}")
             } else {
-                bash::create_terminal_from_resource(orch, &resource, command, description)
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?
+                terminal::create_terminal_from_resource(
+                    orch,
+                    &resource,
+                    command,
+                    description,
+                    wake,
+                    request.run_id.as_deref(),
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?
             }
         }
         (
@@ -813,7 +799,7 @@ pub(crate) async fn dispatch_resource_change(
                     format!("Would send {} raw chars to terminal {slug}", content.len())
                 }
             } else {
-                bash::append_terminal_input(orch, &resource, content, submit)
+                terminal::append_terminal_input(orch, &resource, content, submit)
                     .await
                     .map_err(|error| build_failure(index, item, error))?
             }
@@ -834,7 +820,7 @@ pub(crate) async fn dispatch_resource_change(
             if dry_run {
                 format!("Would stop terminal {slug}")
             } else {
-                bash::delete_terminal_by_resource(orch, &resource)
+                terminal::delete_terminal_by_resource(orch, &resource)
                     .await
                     .map_err(|error| build_failure(index, item, error))?
             }
@@ -1249,14 +1235,13 @@ pub(crate) async fn dispatch_resource_change(
                     }
                 }
             } else {
-                let has_pr = crate::pr_data::actions::try_resolve_mr_context_for_job(
+                let mr_context = crate::pr_data::actions::try_resolve_mr_context_for_job(
                     &orch.db.local,
                     &owner_id,
                 )
                 .await
-                .map_err(|error| build_failure(index, item, error))?
-                .is_some();
-                if !has_pr {
+                .map_err(|error| build_failure(index, item, error))?;
+                let Some(mr_context) = mr_context else {
                     return Err(build_failure(
                         index,
                         item,
@@ -1264,7 +1249,13 @@ pub(crate) async fn dispatch_resource_change(
                             "node {node_id} has no PR yet; merge/close/refresh require a merge_requests row for the node"
                         ),
                     ));
-                }
+                };
+                // Drive merge/close/refresh through the PR's TRUE owner id
+                // (merge_requests.job_id). For a first-class `pr` node that is
+                // the producing action_run, not this node's job — passing the
+                // wrong id misses the owner-keyed action_run and reports "no PR"
+                // (CAIRN-2287). Shadowing keeps the match arms below unchanged.
+                let owner_id = mr_context.job_id;
                 match action {
                     "merge" => {
                         let method =
@@ -1514,7 +1505,7 @@ pub(crate) async fn dispatch_resource_change(
                     content.len()
                 )
             } else {
-                implementation::append_issue_comment(orch, request, project, *number, content)
+                comments_artifacts::append_issue_comment(orch, request, project, *number, content)
                     .await
                     .map_err(|error| build_failure(index, item, error))?
             }
@@ -1951,14 +1942,13 @@ pub(crate) async fn dispatch_resource_change(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                let has_pr = crate::pr_data::actions::try_resolve_mr_context_for_job(
+                let mr_context = crate::pr_data::actions::try_resolve_mr_context_for_job(
                     &orch.db.local,
                     &job_id,
                 )
                 .await
-                .map_err(|error| build_failure(index, item, error))?
-                .is_some();
-                if !has_pr {
+                .map_err(|error| build_failure(index, item, error))?;
+                let Some(mr_context) = mr_context else {
                     return Err(build_failure(
                         index,
                         item,
@@ -1966,7 +1956,14 @@ pub(crate) async fn dispatch_resource_change(
                             "artifact {node_id}/{artifact_label} has no PR yet; merge/close/refresh require a merge_requests row for the producing job"
                         ),
                     ));
-                }
+                };
+                // Merge/close/refresh through the PR's TRUE owner id
+                // (merge_requests.job_id). A build recipe owns the child PR on a
+                // `pr` action_run, so the create-pr artifact's builder job id is
+                // NOT the owner; resolving it here (via the snapshot-walk
+                // fallback) and using mr_context.job_id keeps the owner-keyed
+                // resolution correct (CAIRN-2287). Shadow to keep the arms below.
+                let job_id = mr_context.job_id;
                 match action {
                     "merge" => {
                         let method =
@@ -2054,7 +2051,7 @@ pub(crate) async fn dispatch_resource_change(
                     mode_name(mode)
                 )
             } else {
-                implementation::write_artifact_change(
+                comments_artifacts::write_artifact_change(
                     orch,
                     project,
                     *number,
@@ -2096,7 +2093,7 @@ pub(crate) async fn dispatch_resource_change(
                     name.as_deref().unwrap_or("artifact")
                 )
             } else {
-                implementation::write_artifact_change(
+                comments_artifacts::write_artifact_change(
                     orch,
                     project,
                     *number,

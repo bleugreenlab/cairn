@@ -11,7 +11,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use cairn_core::internal::agent_process::process::{RunHandle, SuspendKind};
-use cairn_core::internal::mcp::handlers::files::handle_change;
+use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use common::orchestrator;
@@ -127,7 +127,7 @@ async fn owned_loop_question_suspends_without_inline_wait() {
     };
 
     // Returns promptly with the suspend marker (no 45s inline wait).
-    let result = handle_change(&orch, &request).await;
+    let result = handle_write(&orch, &request).await;
     assert!(
         result.contains("Prompt suspended"),
         "expected suspend marker, got: {result}"

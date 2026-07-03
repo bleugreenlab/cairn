@@ -727,6 +727,53 @@ pub struct MigrationResult {
     pub warnings: Vec<String>,
 }
 
+const STANDALONE_IMPORT_MESSAGE: &str =
+    "Legacy SQLite import is a standalone migration utility, not an app runtime path";
+
+/// Check whether the interactive runtime data-migration flow has work to do.
+///
+/// Schema migrations are owned by the database initializer and run before the
+/// host exposes an invoke surface. The old first-launch data-migration UI is now
+/// a compatibility surface: runtime databases are already initialized directly,
+/// and legacy SQLite import is no longer an in-app operation.
+pub fn check_data_migration_status(db_path: &Path) -> MigrationStatus {
+    MigrationStatus {
+        needed: false,
+        pending_migrations: Vec::new(),
+        current_db_path: db_path.to_string_lossy().to_string(),
+        error_message: None,
+    }
+}
+
+/// Start the interactive data-migration flow.
+///
+/// The former in-app legacy SQLite import path has been retired to standalone
+/// tooling, so the user-facing confirmation semantics remain explicit: callers
+/// that ask to start a migration receive the same rejection the desktop command
+/// returned before the runner cutover.
+pub fn start_data_migration(_db_path: &Path) -> Result<(MigrationResult, PathBuf), String> {
+    Err(STANDALONE_IMPORT_MESSAGE.to_string())
+}
+
+/// Confirm the interactive data-migration flow.
+///
+/// With no staged in-app data migration, confirm is a no-op retained for desktop
+/// compatibility.
+pub fn confirm_data_migration(_db_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+/// Cancel the interactive data-migration flow by removing the legacy staged
+/// database path if one exists.
+pub fn cancel_data_migration(db_path: &Path) -> Result<(), String> {
+    let temp_path = db_path.with_extension("db.new");
+    if temp_path.exists() {
+        std::fs::remove_file(&temp_path)
+            .map_err(|e| format!("Failed to remove {}: {e}", temp_path.display()))?;
+    }
+    Ok(())
+}
+
 /// Results from startup recovery.
 ///
 /// Contains outbox entries to replay.

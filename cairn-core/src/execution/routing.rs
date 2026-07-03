@@ -170,28 +170,24 @@ pub async fn owning_db_for_parent_tool_use(
     .await
 }
 
-/// The database that owns this session, resolved by the `runs.session_id` link.
-/// Fail-closed (see module docs). This is the SECOND sanctioned link-probe
-/// (alongside [`owning_db_for_parent_tool_use`]): a session id is a
-/// `BareSessionId` by design (claude rejects a non-uuid `--session-id`), so it is
-/// NOT a routable id and cannot be prefix-parsed; it must be resolved by scanning
-/// for a co-located run. Every other resolver routes via [`routing_db_for_id`].
+/// The database that owns this session, resolved by the session row or a
+/// co-located `runs.session_id` link. Fail-closed (see module docs). This is the
+/// SECOND sanctioned link-probe (alongside [`owning_db_for_parent_tool_use`]): a
+/// session id is a `BareSessionId` by design (claude rejects a non-uuid
+/// `--session-id`), so it is NOT a routable id and cannot be prefix-parsed.
 ///
-/// A backend `session_id` is an opaque agent-session token, not a cairn-structured
-/// id, so it cannot be parsed to a project — it must be resolved by a link. A
-/// session's runs and its full streaming transcript (`events`, FK'd to `runs`)
-/// live WHOLLY in one database, so the database that carries a run for this
-/// session is the same database its events live in — exactly the home a
-/// session-keyed read (transcript delta, last-event poll, skyline, context-token)
-/// must hit. A resumed session has several runs, all co-located, so `LIMIT 1`
-/// picks any one and resolves the same database.
+/// During cold job start there is a short, valid window where `sessions` has been
+/// inserted and `jobs.current_session_id` has been backfilled, but the first run
+/// row has not been inserted yet. Session-keyed UI reads in that window must still
+/// route to the database that owns the session instead of returning a fail-closed
+/// 500. Once a run exists, the run link remains the transcript-home proof.
 pub async fn owning_db_for_session(
     dbs: &DbState,
     session_id: &str,
 ) -> Result<Arc<LocalDb>, CairnError> {
     resolve(
         dbs,
-        "SELECT id FROM runs WHERE session_id = ?1 LIMIT 1",
+        "SELECT id FROM sessions WHERE id = ?1 UNION SELECT id FROM runs WHERE session_id = ?1 LIMIT 1",
         "session",
         session_id,
     )
@@ -509,6 +505,53 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(
             &owning_db_for_event(&dbs, event).await.unwrap(),
+            &team
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolves_session_from_session_row_before_first_run_exists() {
+        let (dbs, team) = db_state_with_team().await;
+        team.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('p-session', 'default', 'P', 'P', '/r', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq)
+                     VALUES ('e-session', 'r', 'p-session', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, agent_config_id, project_id, node_name, status, uri_segment, created_at, updated_at)
+                     VALUES ('j-session', 'e-session', 'a1', 'p-session', 'agent', 'running', 'agent', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO sessions (id, job_id, created_at, updated_at)
+                     VALUES ('sess-pending-run', 'j-session', 1, 1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert!(owning_db_for_session(&dbs, "sess-pending-run")
+            .await
+            .is_err());
+        dbs.insert_team_db_for_test("team1", team.clone()).await;
+        assert!(Arc::ptr_eq(
+            &owning_db_for_session(&dbs, "sess-pending-run")
+                .await
+                .unwrap(),
             &team
         ));
     }

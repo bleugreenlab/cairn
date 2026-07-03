@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use cairn_core::internal::mcp::handlers::files::handle_read_file;
+use cairn_core::internal::mcp::handlers::read::handle_read_file;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use common::orchestrator;

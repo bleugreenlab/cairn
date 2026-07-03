@@ -1,5 +1,5 @@
 //! End-to-end proof of the `context-self` living-doc lifecycle, driven through
-//! the real `write` verb dispatcher (`handle_change`). The recipe is loaded from
+//! the real `write` verb dispatcher (`handle_write`). The recipe is loaded from
 //! the authored fixture `fixtures/ctx-self-proof.yaml`, so the test proves an
 //! actual recipe-file (with a `context-self` edge that round-trips through the
 //! recipe format) drives the lifecycle. Its single agent owns BOTH a terminal

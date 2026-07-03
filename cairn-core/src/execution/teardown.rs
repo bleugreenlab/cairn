@@ -31,35 +31,274 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use turso::params;
 
-/// Remove a job's working directory, dispatching on whether it is a jj workspace
-/// (forget it from the shared store, then delete the dir — it is not a git
-/// worktree of the repo) or a plain git worktree. Idempotent and best-effort.
-fn remove_job_worktree(
+/// The managed worktrees base dir, `~/.cairn/worktrees`. Mirrors the hardcoded
+/// creation path in `execution/jobs/lifecycle.rs` and is deliberately NOT
+/// instance-scoped (`.cairn` vs `.cairn-dev`): the worktrees dir is shared across
+/// instances. `None` only when the home dir cannot be resolved.
+pub(crate) fn worktrees_base_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cairn").join("worktrees"))
+}
+
+/// Robustly remove a job's working directory. Shared by teardown, the worktree
+/// GC, and project deletion. Idempotent and best-effort.
+///
+/// Order:
+/// 1. Best-effort `jj workspace forget` whenever a branch is known and the
+///    project jj store exists — idempotent, and correct even when the workspace
+///    dir was already half-deleted (`.jj` gone). The old `is_jj_dir(wt_path)`
+///    dispatch got this wrong: a partial delete that removed `.jj` first fell
+///    through to `git worktree remove` and failed forever with "not a working
+///    tree" (CAIRN-2283).
+/// 2. If the path is a registered git worktree of the repo, remove it with
+///    `git worktree remove` (unregisters + deletes).
+/// 3. Otherwise — every jj workspace, and every half-deleted dir — fall back to a
+///    rename-then-delete under the managed worktrees base dir.
+pub(crate) fn remove_worktree_robust(
     orch: &Orchestrator,
     repo_path: &str,
     wt_path: &Path,
     branch: Option<&str>,
 ) -> Result<(), String> {
-    if crate::jj::is_jj_dir(wt_path) {
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    if let Some(b) = branch {
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
-        if let Some(b) = branch {
+        if crate::jj::is_jj_dir(&store) {
+            let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
             let _ = crate::jj::forget_workspace(&jj, &store, b);
         }
-        if wt_path.exists() {
-            std::fs::remove_dir_all(wt_path)
-                .map_err(|e| format!("failed to remove jj workspace dir: {e}"))?;
-        }
-        Ok(())
-    } else {
-        crate::git::worktree::remove_worktree_with_services(
+    }
+
+    if !wt_path.exists() {
+        return Ok(());
+    }
+
+    if is_registered_git_worktree(orch, repo_path, wt_path) {
+        return crate::git::worktree::remove_worktree_with_services(
             &*orch.services.git,
             &*orch.services.fs,
             Path::new(repo_path),
             wt_path,
             true,
-        )
+        );
+    }
+
+    let base = worktrees_base_dir()
+        .ok_or_else(|| "could not resolve worktrees base dir (no home dir)".to_string())?;
+    remove_dir_tombstoned(wt_path, &base)
+}
+
+/// Whether `wt_path` is a registered git worktree of `repo_path`. A jj workspace
+/// is never registered in the repo's `git worktree list`, so this returns false
+/// for jj (routing it to the rename-then-delete fallback) and true only for a
+/// genuine git worktree.
+fn is_registered_git_worktree(orch: &Orchestrator, repo_path: &str, wt_path: &Path) -> bool {
+    match orch.services.git.worktree_list(Path::new(repo_path)) {
+        Ok(list) => worktree_list_contains(&list, wt_path),
+        Err(_) => false,
+    }
+}
+
+/// True if `wt_path` appears as a `worktree <path>` entry in `git worktree list
+/// --porcelain` output. Compares canonicalized paths so a symlinked base (macOS
+/// `/var` -> `/private/var`) still matches.
+fn worktree_list_contains(porcelain: &str, wt_path: &Path) -> bool {
+    let target = std::fs::canonicalize(wt_path).unwrap_or_else(|_| wt_path.to_path_buf());
+    porcelain
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| {
+            let listed = Path::new(p);
+            std::fs::canonicalize(listed).unwrap_or_else(|_| listed.to_path_buf()) == target
+        })
+}
+
+/// Rename `wt_path` to a unique `*.trash-<millis>` sibling, then delete the
+/// tombstone with a short retry loop (ENOTEMPTY/EBUSY). The rename is atomic and
+/// frees the live name immediately, so a concurrent writer (Finder's
+/// `.DS_Store`, a straggler build writing into `target/`) can no longer land
+/// files at the live path mid-delete — the ENOTEMPTY failure that stranded
+/// hundreds of GB of merged-issue worktrees. If the tombstone delete still fails
+/// after retries, the tombstone is LEFT in place (logged with its surviving
+/// entries so the writer can be diagnosed) for the worktree GC's `*.trash-*`
+/// sweep, and an error returns.
+///
+/// Guarded to the managed worktrees base dir so a misconfigured `worktree_path`
+/// can never delete an arbitrary directory.
+pub(crate) fn remove_dir_tombstoned(wt_path: &Path, base: &Path) -> Result<(), String> {
+    if !wt_path.starts_with(base) {
+        return Err(format!(
+            "refusing to remove worktree path outside managed base {}: {}",
+            base.display(),
+            wt_path.display()
+        ));
+    }
+    if !wt_path.exists() {
+        return Ok(());
+    }
+    let parent = wt_path.parent().unwrap_or(base);
+    let name = wt_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("worktree");
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let tombstone = parent.join(format!("{name}.trash-{millis}"));
+
+    match std::fs::rename(wt_path, &tombstone) {
+        Ok(()) => remove_dir_with_retries(&tombstone).map_err(|e| {
+            log_surviving_entries(&tombstone);
+            format!(
+                "renamed worktree to tombstone {} but delete failed ({e}); left for GC sweep",
+                tombstone.display()
+            )
+        }),
+        Err(rename_err) => {
+            // Rename failed (cross-device, or a racing remover already moved it).
+            // If the path is already gone we are done; otherwise fall back to an
+            // in-place retrying delete.
+            if !wt_path.exists() {
+                return Ok(());
+            }
+            log::warn!(
+                "Teardown: rename-to-tombstone failed for {} ({rename_err}); deleting in place",
+                wt_path.display()
+            );
+            remove_dir_with_retries(wt_path).map_err(|e| {
+                log_surviving_entries(wt_path);
+                format!("failed to remove worktree dir {}: {e}", wt_path.display())
+            })
+        }
+    }
+}
+
+/// `remove_dir_all` with a short bounded retry/backoff for transient ENOTEMPTY /
+/// EBUSY (a writer still touching the tree). A `NotFound` is success.
+fn remove_dir_with_retries(path: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: usize = 3;
+    let mut last = Ok(());
+    for attempt in 0..ATTEMPTS {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last = Err(e);
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ));
+                }
+            }
+        }
+    }
+    last
+}
+
+/// Log up to 20 entries that survived a failed delete — names who is writing into
+/// the tombstone (a build process, Finder metadata) so the leak can be diagnosed.
+fn log_surviving_entries(path: &Path) {
+    if let Ok(entries) = std::fs::read_dir(path) {
+        let names: Vec<String> = entries
+            .flatten()
+            .take(20)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        log::warn!(
+            "Teardown: tombstone {} still has entries after retries: {:?}",
+            path.display(),
+            names
+        );
+    }
+}
+
+/// Archive at-risk events, drop the warm search index, remove the worktree dir
+/// robustly, and reclaim scratch dirs for one target. Shared by
+/// [`teardown_worktrees`] and the worktree GC. Does NOT touch branches —
+/// branch-deletion policy lives solely in teardown.
+pub(crate) async fn execute_target_cleanup(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    target: &TeardownTarget,
+) {
+    // Archive the execution's at-risk events to git coordinates (with a zstd
+    // backstop) before the worktree and branch disappear, the immutability
+    // boundary. Strictly best-effort: any failure logs a warning and rolls back
+    // (rows stay `full`) — archival must never block cleanup. Construct the jj
+    // driver unconditionally; archival's forward-mapping helpers self-gate on
+    // `is_jj_dir`, so a plain-git worktree is a clean no-op while a jj workspace
+    // gets its commits forward-mapped past any auto-rebase.
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    match crate::archival::archive_target(
+        db,
+        &target.worktree_path,
+        &target.repo_path,
+        &target.job_ids,
+        Some(&jj),
+    )
+    .await
+    {
+        Ok(summary) => {
+            log::info!(
+                "Teardown: archived worktree {} ({} gitcoord-read, {} hybrid-read, {} gitcoord-write, {} system-prompt, {} system-init, {} zstd, {} mismatch-fallback, {} -> {} bytes)",
+                target.worktree_path,
+                summary.gitcoord_read,
+                summary.hybrid_read,
+                summary.gitcoord_write,
+                summary.system_prompt,
+                summary.system_init,
+                summary.zstd,
+                summary.mismatch_fallback,
+                summary.bytes_before,
+                summary.bytes_after,
+            );
+            // Drift tripwire: reads resolved their bytes but every one failed the
+            // render-and-compare. The expected signature of a live/archival
+            // read-composition divergence (the CAIRN-1676 regression) — surfaced
+            // here so it never hides behind a green run.
+            if summary.mismatch_fallback > 0
+                && summary.gitcoord_read == 0
+                && summary.hybrid_read == 0
+            {
+                log::warn!(
+                    "Teardown: worktree {} archived {} reads but none to a git coordinate \
+                     (all fell to mismatch-fallback) — the live and archival read composition \
+                     may have diverged",
+                    target.worktree_path,
+                    summary.mismatch_fallback,
+                );
+            }
+        }
+        Err(e) => log::warn!(
+            "Teardown: archival failed for worktree {}: {}",
+            target.worktree_path,
+            e
+        ),
+    }
+
+    let wt_path = PathBuf::from(&target.worktree_path);
+
+    // Drop the warm search index BEFORE removal (CAIRN-2303) so the picker's
+    // background scan/watcher threads release the directory first — else they can
+    // re-touch files mid-delete. Idempotent when the worktree was never indexed.
+    orch.worktree_search.drop_worktree(&wt_path);
+
+    match remove_worktree_robust(orch, &target.repo_path, &wt_path, target.branch.as_deref()) {
+        Ok(()) => log::info!("Teardown: removed worktree {}", target.worktree_path),
+        Err(e) => log::warn!(
+            "Teardown: failed to remove worktree {}: {}",
+            target.worktree_path,
+            e
+        ),
+    }
+
+    // Reclaim each referencing job's scratch dir alongside the worktree.
+    // Worktrees aren't 1:1 with jobs (inheritance fan-out), so a target may carry
+    // several job ids; remove every one's scratch dir. Idempotent and
+    // best-effort (a missing dir is fine).
+    for job_id in &target.job_ids {
+        crate::scratch::remove_job_scratch_dir(job_id);
     }
 }
 
@@ -67,6 +306,23 @@ fn remove_job_worktree(
 pub enum TeardownScope {
     /// All jobs across an issue (PR merge/close, issue close/delete).
     Issue(String),
+}
+
+/// The branch-deletion policy for an issue teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownReason {
+    /// The issue was recorded as merged WITHOUT a guaranteed fold — the status
+    /// resolution path, which flips the row and tears down but never merges. A
+    /// branch is deleted only once its tip has landed in its merge target;
+    /// an unlanded branch is PRESERVED (local + remote delete skipped) so its
+    /// commits are never stranded — the KMCP data-loss invariant (CAIRN-2287).
+    Merged,
+    /// A verified post-merge reconcile, an explicit PR close, or an issue delete.
+    /// The content is already incorporated (a verified fold, or an out-of-band
+    /// squash-merge that legitimately rewrites the source off the target's
+    /// history) or the discard is deliberate, so branches are deleted
+    /// unconditionally — the pre-existing behavior.
+    Discarded,
 }
 
 /// One worktree+branch unit eligible for teardown, carrying every in-scope job
@@ -104,36 +360,47 @@ pub async fn plan_teardown(
          WHERE j.{scope_col} = ?1 AND j.worktree_path IS NOT NULL"
     );
 
-    // worktree_path -> (branch, repo_path, job_ids). BTreeMap keeps output
-    // deterministic (sorted by path) for stable tests.
-    type Grouped = BTreeMap<String, (Option<String>, String, Vec<String>)>;
-    let grouped: Grouped = db
+    let rows: Vec<(String, String, Option<String>, String)> = db
         .read(|conn| {
             let sql = sql.clone();
             let scope_id = scope_id.clone();
             Box::pin(async move {
                 let mut rows = conn.query(sql.as_str(), (scope_id.as_str(),)).await?;
-                let mut grouped: Grouped = BTreeMap::new();
+                let mut out = Vec::new();
                 while let Some(row) = rows.next().await? {
-                    let job_id = row.text(0)?;
-                    let worktree_path = row.text(1)?;
-                    let branch = row.opt_text(2)?;
-                    let repo_path = row.text(3)?;
-                    let entry = grouped
-                        .entry(worktree_path)
-                        .or_insert_with(|| (branch.clone(), repo_path, Vec::new()));
-                    if entry.0.is_none() {
-                        entry.0 = branch;
-                    }
-                    entry.2.push(job_id);
+                    out.push((row.text(0)?, row.text(1)?, row.opt_text(2)?, row.text(3)?));
                 }
-                Ok(grouped)
+                Ok(out)
             })
         })
         .await
         .map_err(|e| format!("Failed to load teardown candidates: {e}"))?;
 
-    let targets = grouped
+    Ok(group_into_targets(rows))
+}
+
+/// Group `(job_id, worktree_path, branch, repo_path)` rows into one
+/// [`TeardownTarget`] per distinct worktree path, folding the inheritance fan-out
+/// (N jobs -> one path) into a single target. A `BTreeMap` keys the grouping so
+/// output is sorted by path — deterministic for tests. The first non-`None`
+/// branch seen for a path wins. Shared by [`plan_teardown`], the worktree GC, and
+/// project-deletion cleanup.
+pub(crate) fn group_into_targets(
+    rows: Vec<(String, String, Option<String>, String)>,
+) -> Vec<TeardownTarget> {
+    // worktree_path -> (branch, repo_path, job_ids).
+    type Grouped = BTreeMap<String, (Option<String>, String, Vec<String>)>;
+    let mut grouped: Grouped = BTreeMap::new();
+    for (job_id, worktree_path, branch, repo_path) in rows {
+        let entry = grouped
+            .entry(worktree_path)
+            .or_insert_with(|| (branch.clone(), repo_path, Vec::new()));
+        if entry.0.is_none() {
+            entry.0 = branch;
+        }
+        entry.2.push(job_id);
+    }
+    grouped
         .into_iter()
         .map(
             |(worktree_path, (branch, repo_path, job_ids))| TeardownTarget {
@@ -143,8 +410,7 @@ pub async fn plan_teardown(
                 job_ids,
             },
         )
-        .collect();
-    Ok(targets)
+        .collect()
 }
 
 /// The single teardown owner: plan the issue's worktree paths, then kill their
@@ -153,7 +419,11 @@ pub async fn plan_teardown(
 /// Reached only at issue/PR-terminal transitions (PR merge/close, issue
 /// close/merge, issue delete). Issue-wide and unconditional — the work is done
 /// by the time any of these fire.
-pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Result<(), String> {
+pub async fn teardown_worktrees(
+    orch: &Orchestrator,
+    scope: TeardownScope,
+    reason: TeardownReason,
+) -> Result<(), String> {
     // Route to the issue's owning database: a team issue's jobs (and their
     // worktree_path rows, terminals, and browsers) live wholly in its synced
     // replica, so planning and cleanup must read/write there or the team's
@@ -174,95 +444,72 @@ pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Re
         .collect();
     kill_terminals_for_jobs(orch, &db, &job_ids).await;
 
-    // Remove worktrees + delete local branches; collect branches per repo.
+    // Remove worktrees (archive at-risk events, drop the warm search index,
+    // delete the dir robustly, reclaim scratch dirs) then delete local branches;
+    // collect branches per repo. The per-target cleanup is shared with the
+    // worktree GC; branch deletion below stays exclusive to teardown.
     let mut branches_by_repo: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for target in &targets {
-        // Archive the execution's at-risk events to git coordinates (with a zstd
-        // backstop) before the worktree and branch disappear at teardown, the
-        // immutability boundary. Strictly best-effort: any failure logs a warning
-        // and rolls back (rows stay `full`) — archival must never block teardown.
-        // Construct the jj driver unconditionally; archival's forward-mapping
-        // helpers self-gate on `is_jj_dir`, so a plain-git worktree is a clean
-        // no-op (identity coordinates, no change-id) while a jj workspace gets
-        // its commits forward-mapped past any auto-rebase.
-        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-        match crate::archival::archive_target(
-            &db,
-            &target.worktree_path,
-            &target.repo_path,
-            &target.job_ids,
-            Some(&jj),
-        )
-        .await
-        {
-            Ok(summary) => {
-                log::info!(
-                    "Teardown: archived worktree {} ({} gitcoord-read, {} hybrid-read, {} gitcoord-write, {} system-prompt, {} system-init, {} zstd, {} mismatch-fallback, {} -> {} bytes)",
-                    target.worktree_path,
-                    summary.gitcoord_read,
-                    summary.hybrid_read,
-                    summary.gitcoord_write,
-                    summary.system_prompt,
-                    summary.system_init,
-                    summary.zstd,
-                    summary.mismatch_fallback,
-                    summary.bytes_before,
-                    summary.bytes_after,
-                );
-                // Drift tripwire: reads resolved their bytes but every one failed
-                // the render-and-compare. The expected signature of a live/archival
-                // read-composition divergence (the CAIRN-1676 regression) on the
-                // day it lands — surfaced here so it never hides behind a green run.
-                if summary.mismatch_fallback > 0
-                    && summary.gitcoord_read == 0
-                    && summary.hybrid_read == 0
-                {
-                    log::warn!(
-                        "Teardown: worktree {} archived {} reads but none to a git coordinate \
-                         (all fell to mismatch-fallback) — the live and archival read composition \
-                         may have diverged",
-                        target.worktree_path,
-                        summary.mismatch_fallback,
-                    );
-                }
-            }
-            Err(e) => log::warn!(
-                "Teardown: archival failed for worktree {}: {}",
-                target.worktree_path,
-                e
-            ),
-        }
-
-        let wt_path = PathBuf::from(&target.worktree_path);
-        match remove_job_worktree(orch, &target.repo_path, &wt_path, target.branch.as_deref()) {
-            Ok(()) => log::info!("Teardown: removed worktree {}", target.worktree_path),
-            Err(e) => log::warn!(
-                "Teardown: failed to remove worktree {}: {}",
-                target.worktree_path,
-                e
-            ),
-        }
-
-        // Reclaim each referencing job's scratch dir alongside the worktree.
-        // Worktrees aren't 1:1 with jobs (inheritance fan-out), so a target may
-        // carry several job ids; remove every one's scratch dir. Idempotent and
-        // best-effort (a missing dir is fine).
-        for job_id in &target.job_ids {
-            crate::scratch::remove_job_scratch_dir(job_id);
-        }
+        execute_target_cleanup(orch, &db, target).await;
 
         if let Some(branch) = &target.branch {
-            if let Err(e) = crate::git::worktree::delete_branch_with_services(
-                &*orch.services.git,
-                Path::new(&target.repo_path),
-                branch,
-            ) {
-                log::warn!("Teardown: failed to delete local branch {}: {}", branch, e);
+            // On a merged resolution recorded WITHOUT a verified fold (the status
+            // path), never delete a branch whose commits have not landed in the
+            // merge target: deleting it strands those commits and auto-closes the
+            // PR unmerged, the KMCP data-loss failure (CAIRN-2287). Preserve it
+            // (skip local + remote delete) and warn loudly. A landed branch — and
+            // any Discarded (close / delete / verified-merge) teardown — deletes
+            // as before. Worktree, scratch, and terminal cleanup already ran, so
+            // only the recoverable branch ref is kept.
+            let delete_branch = match reason {
+                TeardownReason::Discarded => true,
+                TeardownReason::Merged => {
+                    match resolve_merge_target_for_source(&db, issue_id, branch, &target.job_ids)
+                        .await
+                    {
+                        // A branch never lands "into itself" (a Coordinator whose
+                        // own branch IS the target): nothing folds it elsewhere,
+                        // so treat it as landed for teardown.
+                        Some(merge_target) if merge_target == *branch => true,
+                        Some(merge_target) => {
+                            match branch_landed(orch, &target.repo_path, branch, &merge_target) {
+                                Ok(true) => true,
+                                Ok(false) => {
+                                    log::warn!(
+                                        "Teardown: PRESERVING branch `{branch}` — its tip has NOT landed in merge target `{merge_target}` for merged issue {issue_id}; deleting it would strand commits. Keeping the local branch and skipping the remote delete.",
+                                    );
+                                    false
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Teardown: could not verify whether branch `{branch}` landed in `{merge_target}` for merged issue {issue_id} ({e}); PRESERVING it (fail-closed).",
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        None => {
+                            log::warn!(
+                                "Teardown: no merge target resolved for branch `{branch}` on merged issue {issue_id}; PRESERVING it (fail-closed).",
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+            if delete_branch {
+                if let Err(e) = crate::git::worktree::delete_branch_with_services(
+                    &*orch.services.git,
+                    Path::new(&target.repo_path),
+                    branch,
+                ) {
+                    log::warn!("Teardown: failed to delete local branch {}: {}", branch, e);
+                }
+                branches_by_repo
+                    .entry(target.repo_path.clone())
+                    .or_default()
+                    .push(branch.clone());
             }
-            branches_by_repo
-                .entry(target.repo_path.clone())
-                .or_default()
-                .push(branch.clone());
         }
     }
 
@@ -282,6 +529,174 @@ pub async fn teardown_worktrees(orch: &Orchestrator, scope: TeardownScope) -> Re
     );
 
     Ok(())
+}
+
+/// Robustly remove every worktree registered to a project's jobs (jj-aware,
+/// rename-then-delete). Used by project deletion, which otherwise leaks the
+/// project's worktrees entirely. Branches are intentionally preserved — the git
+/// repo is the user's; Cairn only reclaims its working checkouts. Best-effort,
+/// and must run BEFORE the project rows are deleted (it reads job worktree paths
+/// and branches). No archival: the project's events are about to be deleted with
+/// it, so archiving them into the same about-to-vanish database is pointless.
+pub async fn remove_project_worktrees(orch: &Orchestrator, project_id: &str) -> Result<(), String> {
+    let db = orch.db.local.clone();
+    let targets = plan_project_teardown(&db, project_id).await?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+    for target in &targets {
+        let wt_path = PathBuf::from(&target.worktree_path);
+        orch.worktree_search.drop_worktree(&wt_path);
+        if let Err(e) =
+            remove_worktree_robust(orch, &target.repo_path, &wt_path, target.branch.as_deref())
+        {
+            log::warn!(
+                "Project deletion: failed to remove worktree {}: {}",
+                target.worktree_path,
+                e
+            );
+        }
+        for job_id in &target.job_ids {
+            crate::scratch::remove_job_scratch_dir(job_id);
+        }
+    }
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "jobs", "action": "update"}),
+    );
+    Ok(())
+}
+
+/// Plan every distinct worktree target for a project's jobs, grouping the
+/// inheritance fan-out like [`plan_teardown`].
+async fn plan_project_teardown(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<Vec<TeardownTarget>, String> {
+    let project_id = project_id.to_string();
+    let rows: Vec<(String, String, Option<String>, String)> = db
+        .read(|conn| {
+            let project_id = project_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT j.id, j.worktree_path, j.branch, p.repo_path
+                         FROM jobs j
+                         JOIN projects p ON j.project_id = p.id
+                         WHERE j.project_id = ?1 AND j.worktree_path IS NOT NULL",
+                        (project_id.as_str(),),
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push((row.text(0)?, row.text(1)?, row.opt_text(2)?, row.text(3)?));
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to load project worktrees: {e}"))?;
+    Ok(group_into_targets(rows))
+}
+
+/// Whether `source_branch`'s tip has landed in `target_branch`, dispatching on
+/// project kind. A jj project checks the shared store (the source is folded into
+/// the target as a descendant, so an ancestor test is exact); a plain-git project
+/// runs `git merge-base --is-ancestor`. An `Err` means the VCS query itself
+/// failed — the caller treats that as "unknown" and preserves the branch.
+///
+/// jj-ness is decided from the shared store's presence, NOT the (already-removed)
+/// worktree: teardown deletes the worktree before this runs, so `is_jj_dir` on
+/// the workspace path would always be false here.
+fn branch_landed(
+    orch: &Orchestrator,
+    repo_path: &str,
+    source_branch: &str,
+    target_branch: &str,
+) -> Result<bool, String> {
+    let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
+    if crate::jj::is_jj_dir(&store) {
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        Ok(crate::jj::bookmark_landed_in(
+            &jj,
+            &store,
+            source_branch,
+            target_branch,
+        ))
+    } else {
+        orch.services
+            .git
+            .is_ancestor(Path::new(repo_path), source_branch, target_branch)
+    }
+}
+
+/// Resolve the merge target branch a torn-down `source_branch` should have landed
+/// in: the issue's MR `target_branch` first (the real destination), then a
+/// producing job's `base_branch` (its fork point), then the project default
+/// branch. `None` only when the issue's project cannot be resolved at all.
+async fn resolve_merge_target_for_source(
+    db: &LocalDb,
+    issue_id: &str,
+    source_branch: &str,
+    job_ids: &[String],
+) -> Option<String> {
+    let issue_id = issue_id.to_string();
+    let source_branch = source_branch.to_string();
+    let job_ids = job_ids.to_vec();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        let source_branch = source_branch.clone();
+        let job_ids = job_ids.clone();
+        Box::pin(async move {
+            // 1. The MR's recorded target branch (the true merge destination).
+            let mut rows = conn
+                .query(
+                    "SELECT target_branch FROM merge_requests
+                     WHERE issue_id = ?1 AND source_branch = ?2
+                     ORDER BY opened_at DESC LIMIT 1",
+                    params![issue_id.as_str(), source_branch.as_str()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                if let Some(target) = row.opt_text(0)?.filter(|t| !t.is_empty()) {
+                    return Ok(Some(target));
+                }
+            }
+            drop(rows);
+            // 2. A producing job's base_branch (what it forked from).
+            for job_id in &job_ids {
+                let mut rows = conn
+                    .query(
+                        "SELECT base_branch FROM jobs WHERE id = ?1 LIMIT 1",
+                        params![job_id.as_str()],
+                    )
+                    .await?;
+                if let Some(row) = rows.next().await? {
+                    if let Some(base) = row.opt_text(0)?.filter(|b| !b.is_empty()) {
+                        return Ok(Some(base));
+                    }
+                }
+            }
+            // 3. The project default branch.
+            let mut rows = conn
+                .query(
+                    "SELECT p.default_branch FROM projects p
+                     JOIN issues i ON i.project_id = p.id
+                     WHERE i.id = ?1 LIMIT 1",
+                    params![issue_id.as_str()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                if let Some(default) = row.opt_text(0)?.filter(|d| !d.is_empty()) {
+                    return Ok(Some(default));
+                }
+            }
+            Ok(None)
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Tear down worktrees for jobs whose recipe nodes were removed from a live
@@ -319,7 +734,13 @@ pub async fn teardown_removed_node_worktrees(
 
     for target in targets {
         let wt_path = PathBuf::from(&target.worktree_path);
-        match remove_job_worktree(orch, &target.repo_path, &wt_path, target.branch.as_deref()) {
+
+        // Drop the warm search index before removal (CAIRN-2303) so the picker's
+        // background scan/watcher threads release the directory first; idempotent
+        // when never indexed.
+        orch.worktree_search.drop_worktree(&wt_path);
+
+        match remove_worktree_robust(orch, &target.repo_path, &wt_path, target.branch.as_deref()) {
             Ok(()) => log::info!("Snapshot edit: removed worktree {}", target.worktree_path),
             Err(e) => log::warn!(
                 "Snapshot edit: failed to remove worktree {}: {}",
@@ -763,5 +1184,110 @@ mod tests {
             .await
             .unwrap();
         assert!(targets.is_empty());
+    }
+
+    /// The merged-teardown guard resolves a source branch's merge target through
+    /// three tiers: the MR's recorded `target_branch`, then a producing job's
+    /// `base_branch`, then the project default branch.
+    #[tokio::test]
+    async fn resolve_merge_target_prefers_mr_then_base_then_default() {
+        let db = migrated_db().await;
+        seed_project(&db, "p-1", "CAIRN").await;
+        seed_issue(&db, "p-1", "i-1", 1).await;
+
+        // Tier 1: the MR's recorded target branch wins.
+        db.execute(
+            "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES ('mr-1', 'j-mr', 'p-1', 'i-1', 'PR', 'agent/x', 'integration', 'open', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve_merge_target_for_source(&db, "i-1", "agent/x", &["j-mr".to_string()]).await,
+            Some("integration".to_string())
+        );
+
+        // Tier 2: no MR for this source — fall back to the job's base_branch.
+        db.execute(
+            "INSERT INTO jobs (id, status, project_id, issue_id, branch, base_branch, created_at, updated_at)
+             VALUES ('j-base', 'complete', 'p-1', 'i-1', 'agent/y', 'some-base', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve_merge_target_for_source(&db, "i-1", "agent/y", &["j-base".to_string()]).await,
+            Some("some-base".to_string())
+        );
+
+        // Tier 3: no MR and no base_branch — fall back to the project default.
+        assert_eq!(
+            resolve_merge_target_for_source(&db, "i-1", "agent/z", &[]).await,
+            Some("main".to_string())
+        );
+    }
+
+    /// A half-deleted worktree (its `.jj` already gone, so not a jj dir, and not a
+    /// registered git worktree) is removed by the rename-then-delete fallback,
+    /// leaving no tombstone behind on success.
+    #[test]
+    fn remove_dir_tombstoned_removes_and_leaves_no_tombstone() {
+        let base = tempfile::tempdir().unwrap();
+        let wt = base.path().join("CAIRN-1-builder-0");
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target").join("a.o"), b"x").unwrap();
+
+        remove_dir_tombstoned(&wt, base.path()).unwrap();
+
+        assert!(!wt.exists(), "worktree dir removed");
+        let leftover: Vec<_> = std::fs::read_dir(base.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".trash-"))
+            .collect();
+        assert!(leftover.is_empty(), "no tombstone left on success");
+    }
+
+    /// The base-dir guard refuses to delete a path outside the managed worktrees
+    /// base, so a misconfigured `worktree_path` can never wipe an arbitrary dir.
+    #[test]
+    fn remove_dir_tombstoned_rejects_path_outside_base() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("precious");
+        std::fs::create_dir_all(&victim).unwrap();
+
+        let err = remove_dir_tombstoned(&victim, base.path()).unwrap_err();
+        assert!(err.contains("outside managed base"), "got: {err}");
+        assert!(victim.exists(), "path outside base is left untouched");
+    }
+
+    /// A tombstone left by a failed delete is itself removable by a later pass
+    /// (the GC re-invokes the same guarded remover on `*.trash-*` leftovers).
+    #[test]
+    fn remove_dir_tombstoned_removes_a_prior_tombstone() {
+        let base = tempfile::tempdir().unwrap();
+        let tombstone = base.path().join("CAIRN-1-builder-0.trash-123");
+        std::fs::create_dir_all(&tombstone).unwrap();
+
+        remove_dir_tombstoned(&tombstone, base.path()).unwrap();
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn worktree_list_contains_matches_registered_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("feature-x");
+        std::fs::create_dir_all(&wt).unwrap();
+        let porcelain = format!(
+            "worktree {}\nHEAD abc123\nbranch refs/heads/agent/x\n",
+            wt.display()
+        );
+        assert!(worktree_list_contains(&porcelain, &wt));
+        assert!(!worktree_list_contains(
+            &porcelain,
+            &dir.path().join("other")
+        ));
     }
 }

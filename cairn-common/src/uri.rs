@@ -16,7 +16,7 @@ pub const DEFAULT_BROWSER_SLUG: &str = "default";
 /// Reserved trailing segments under a node (or task) that name a specific
 /// resource rather than an artifact type. A trailing segment NOT in this set is
 /// interpreted as a type-named artifact (`.../{node}/plan`). This is the single
-/// source of truth shared by the URI parser and cairn-cli's `cairn:~/<name>`
+/// source of truth shared by the URI parser and cairn-cmd's `cairn:~/<name>`
 /// resolution so e.g. `cairn:~/chat` can never be misread as an artifact write.
 pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "chat",

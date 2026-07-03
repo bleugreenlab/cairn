@@ -602,39 +602,55 @@ const LOGS_TAIL_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// recent N of these via the shared line-window view.
 const LOGS_MAX_ENTRIES: usize = 2_000;
 
-/// Map the `process` selector to the log file prefix written by
-/// `cairn_common::logging` (`ProcessTag::prefix`).
-fn logs_process_prefix(process: &str) -> Option<&'static str> {
+/// Map the `process` selector to the log file prefixes written by
+/// `cairn_common::logging` (`ProcessTag::prefix`). The `mcp` source keeps the
+/// older `cairn-mcp` prefix readable after the binary was renamed to `cairn-cmd`.
+fn logs_process_prefixes(process: &str) -> Option<&'static [&'static str]> {
     match process {
-        "app" => Some("cairn-app"),
-        "mcp" => Some("cairn-mcp"),
-        "server" => Some("cairn-server"),
+        "app" => Some(&["cairn-app"]),
+        "mcp" => Some(&["cairn-cmd", "cairn-mcp"]),
+        "server" => Some(&["cairn-server"]),
         _ => None,
     }
 }
 
-/// Resolve the log file for `prefix`, optionally pinned to `date` (`YYYY-MM-DD`).
-/// Without a date the newest matching file is chosen: filenames embed the date
-/// (`<prefix>.<date>.jsonl`), so a lexical max over the name selects it.
-fn resolve_log_file(dir: &Path, prefix: &str, date: Option<&str>) -> Option<PathBuf> {
-    if let Some(date) = date {
-        let path = dir.join(format!("{prefix}.{date}.jsonl"));
-        return path.exists().then_some(path);
-    }
-    let mut newest: Option<(String, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+fn date_from_log_filename(name: &str) -> Option<&str> {
+    name.strip_suffix(".jsonl")?
+        .rsplit_once('.')
+        .map(|(_, date)| date)
+}
+
+/// Resolve log files for `prefixes`, optionally pinned to `date` (`YYYY-MM-DD`).
+/// Without a date, all files for the newest available date in the selected
+/// source are returned so same-day `cairn-mcp` and `cairn-cmd` logs remain visible
+/// across an upgrade.
+fn resolve_log_files(dir: &Path, prefixes: &[&str], date: Option<&str>) -> Vec<PathBuf> {
+    let mut matches: Vec<(String, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(prefix) && name.ends_with(".jsonl") {
-            let replace = newest
-                .as_ref()
-                .map(|(best, _)| name > *best)
-                .unwrap_or(true);
-            if replace {
-                newest = Some((name, entry.path()));
-            }
+        if !name.ends_with(".jsonl") || !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            continue;
         }
+        let Some(entry_date) = date_from_log_filename(&name) else {
+            continue;
+        };
+        if date.is_some_and(|date| date != entry_date) {
+            continue;
+        }
+        matches.push((entry_date.to_string(), entry.path()));
     }
-    newest.map(|(_, path)| path)
+
+    if date.is_none() {
+        let Some(newest_date) = matches.iter().map(|(date, _)| date.clone()).max() else {
+            return Vec::new();
+        };
+        matches.retain(|(entry_date, _)| entry_date == &newest_date);
+    }
+    matches.sort_by(|(_, a), (_, b)| a.cmp(b));
+    matches.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Read up to [`LOGS_MAX_ENTRIES`] trailing lines from a JSONL log file, bounded
@@ -735,8 +751,8 @@ fn logs_resource_body(dir: &Path, params: &[QueryParam]) -> String {
     }
 
     let process = find_query_value(params, "process").unwrap_or("app");
-    let prefix = match logs_process_prefix(process) {
-        Some(prefix) => prefix,
+    let prefixes = match logs_process_prefixes(process) {
+        Some(prefixes) => prefixes,
         None => {
             return format!(
                 "Unknown process '{process}' for cairn://logs (expected app, mcp, or server)"
@@ -749,28 +765,30 @@ fn logs_resource_body(dir: &Path, params: &[QueryParam]) -> String {
         return format!("No log files found: {} does not exist", dir.display());
     }
 
-    let path = match resolve_log_file(dir, prefix, date) {
-        Some(path) => path,
-        None => {
-            return match date {
-                Some(date) => format!("No {process} log file for {date} in {}", dir.display()),
-                None => format!("No {process} log files in {}", dir.display()),
-            }
-        }
-    };
+    let paths = resolve_log_files(dir, prefixes, date);
+    if paths.is_empty() {
+        return match date {
+            Some(date) => format!("No {process} log file for {date} in {}", dir.display()),
+            None => format!("No {process} log files in {}", dir.display()),
+        };
+    }
 
-    let lines = match read_log_tail_lines(&path) {
-        Ok(lines) => lines,
-        Err(error) => return format!("Failed to read {}: {error}", path.display()),
-    };
-
-    let rendered: Vec<String> = lines
-        .iter()
-        .filter_map(|line| render_log_entry(line))
-        .collect();
+    let mut rendered = Vec::new();
+    for path in &paths {
+        let lines = match read_log_tail_lines(path) {
+            Ok(lines) => lines,
+            Err(error) => return format!("Failed to read {}: {error}", path.display()),
+        };
+        rendered.extend(lines.iter().filter_map(|line| render_log_entry(line)));
+    }
 
     if rendered.is_empty() {
-        format!("(no log entries in {})", path.display())
+        let file_list = paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("(no log entries in {file_list})")
     } else {
         rendered.join("\n")
     }
@@ -2184,15 +2202,21 @@ line2', X'0001020AFF', 2.5),
         );
         write_log_file(
             dir.path(),
-            "cairn-mcp.2026-06-13.jsonl",
+            "cairn-cmd.2026-06-13.jsonl",
             &[log_line("t", "INFO", "x", "mcp-entry")],
+        );
+        write_log_file(
+            dir.path(),
+            "cairn-mcp.2026-06-13.jsonl",
+            &[log_line("t", "INFO", "x", "old-mcp-entry")],
         );
 
         let app = logs_resource_body(dir.path(), &db_params("process=app"));
         assert!(app.contains("app-entry") && !app.contains("mcp-entry"));
 
         let mcp = logs_resource_body(dir.path(), &db_params("process=mcp"));
-        assert!(mcp.contains("mcp-entry") && !mcp.contains("app-entry"));
+        assert!(mcp.contains("mcp-entry") && mcp.contains("old-mcp-entry"));
+        assert!(!mcp.contains("app-entry"));
     }
 
     #[test]

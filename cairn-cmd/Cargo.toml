@@ -1,5 +1,5 @@
 [package]
-name = "cairn-cli"
+name = "cairn-cmd"
 version.workspace = true
 edition = "2021"
 description = "CLI helper for Cairn agent orchestration"
@@ -9,7 +9,7 @@ homepage = "https://cairn.computer"
 keywords = ["agent", "orchestration", "mcp"]
 
 [[bin]]
-name = "cairn-cli"
+name = "cairn-cmd"
 path = "src/main.rs"
 
 [dependencies]

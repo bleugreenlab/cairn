@@ -26,8 +26,10 @@ pub mod scratch;
 pub mod search;
 pub mod sessions;
 pub mod symbols;
+pub mod terminal_host;
 pub mod todos;
 pub mod turns;
+pub mod worktree_search;
 
 // ── Stable public operations ───────────────────────────
 pub use backends::SessionStart;
