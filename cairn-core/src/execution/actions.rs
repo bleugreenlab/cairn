@@ -572,6 +572,17 @@ fn triage_ledger_relative_path(issue_number: i32) -> String {
     format!("{TRIAGE_LEDGER_DIR}/{issue_number}.md")
 }
 
+/// Seal the memory-triage ledger onto the PR branch before the pull request
+/// opens. This runs for EVERY memory-triage batch, independent of the recorded
+/// decisions: a promotion seals its own canon commit, but an all-discard /
+/// all-defer batch seals nothing of its own, so without this the branch would
+/// carry no diff and `gh pr create` would fail with the cryptic
+/// "No commits between <base> and <branch>". The ledger is that guaranteed diff
+/// — the reviewable adjudication record that makes a no-promotion batch a normal
+/// mergeable PR. Do NOT gate this on the presence of a promotion; the whole
+/// point is the batches that promote nothing. A no-op is legitimate only when
+/// the ledger is already committed (an idempotent PR-node retry), which the
+/// `scoped_dirty` guard below detects. See CAIRN-2376.
 async fn commit_triage_ledger_if_needed(
     orch: &Orchestrator,
     action_run: &ActionRun,
@@ -1996,5 +2007,177 @@ mod tests {
     fn close_pr_args_names_pr_when_known() {
         assert_eq!(close_pr_args(Some(7)), vec!["pr", "close", "7"]);
         assert_eq!(close_pr_args(None), vec!["pr", "close"]);
+    }
+
+    /// Regression guard for CAIRN-2376: a triage batch with NO promotions (only
+    /// discards and deferrals) must still produce a committed ledger on the
+    /// branch, so the PR node opens a real diff instead of failing downstream
+    /// with "No commits between main and <branch>". The ledger commit is the
+    /// fallback that makes all-discard / all-defer triage batches mergeable pull
+    /// requests, and it must not depend on the Integrator having sealed any canon
+    /// commit of its own (a no-promotion Integrator seals nothing).
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(jj)]
+    async fn commit_triage_ledger_seals_no_promotion_batch() {
+        use crate::db::DbState;
+        use crate::jj::JjEnv;
+        use crate::memories::db::record_triage_issue_batch;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::path::Path;
+        use std::sync::Arc;
+
+        fn jj_bin() -> Option<String> {
+            let bin = std::env::var("CAIRN_JJ_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "jj".to_string());
+            crate::env::command(&bin)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                .then_some(bin)
+        }
+        fn git(repo: &Path, args: &[&str]) {
+            let ok = crate::env::git()
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        }
+
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping commit_triage_ledger_seals_no_promotion_batch: jj not resolvable");
+            return;
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // A project git repo whose docs/memory-triage already carries a prior
+        // ledger (so the directory is tracked), plus a base commit on `main`.
+        let project_repo = temp.path().join("project");
+        std::fs::create_dir_all(project_repo.join("docs/memory-triage")).unwrap();
+        git(&project_repo, &["init", "-q", "-b", "main"]);
+        git(&project_repo, &["config", "user.email", "a@b.c"]);
+        git(&project_repo, &["config", "user.name", "tester"]);
+        std::fs::write(project_repo.join("README.md"), "base\n").unwrap();
+        std::fs::write(project_repo.join("docs/memory-triage/1.md"), "# prior\n").unwrap();
+        git(&project_repo, &["add", "-A"]);
+        git(&project_repo, &["commit", "-qm", "init"]);
+
+        // Shared jj store + an Integrator agent workspace with an EMPTY `@` — a
+        // no-promotion Integrator commits nothing of its own before the PR node.
+        let jj = JjEnv::resolve(&bin, &config_dir);
+        let store_dir = crate::jj::project_store_dir(&config_dir, &project_repo);
+        crate::jj::ensure_project_store(&jj, &store_dir, &project_repo).unwrap();
+        let ws_path = temp.path().join("wt");
+        crate::jj::add_workspace(
+            &jj,
+            &store_dir,
+            &ws_path,
+            "agent/CAIRN-7-integrator-0",
+            "main",
+            None,
+        )
+        .unwrap();
+
+        // Database: project + triage issue #7 + a two-memory batch with NO
+        // promotions (one discard, one defer-with-rescope) linked as the issue's
+        // triage batch.
+        let db_local = Arc::new(LocalDb::open(temp.path().join("triage.db")).await.unwrap());
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db_local)
+            .await
+            .unwrap();
+        let repo_path = project_repo.to_string_lossy().to_string();
+        db_local
+            .write(|conn| {
+                let repo_path = repo_path.clone();
+                Box::pin(async move {
+                    conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                    conn.execute(
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P',?1,1,1)",
+                        params![repo_path.as_str()],
+                    ).await?;
+                    conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-7','p-1',7,'Memory triage: project=P (2 pending)','active','none',1,1)", ()).await?;
+                    conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','memory-triage','i-7','p-1','running',1,1,'{}')", ()).await?;
+                    conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at) VALUES ('job-x','e-1','i-7','p-1','complete','Integrator','integrator',1,1)", ()).await?;
+                    let rows: [(&str, &str, Option<&str>); 2] =
+                        [("m-1", "discard", None), ("m-2", "defer", Some("workspace"))];
+                    for (seq, (id, decision, deferred)) in rows.iter().enumerate() {
+                        conn.execute(
+                            "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, reason, triage_decision, deferred_scope, deferred_scope_value, provenance_uri, created_at, updated_at)
+                             VALUES (?1, ?1, 'p-1', 'obs', 'claimed', 'project', 'p-1', 'job-x', ?2, 'considered', ?3, ?4, ?4, 'cairn://p/P/1/1/builder/chat/turn/2', 1, 1)",
+                            params![*id, seq as i64, *decision, *deferred],
+                        ).await?;
+                    }
+                    Ok::<_, DbError>(())
+                })
+            })
+            .await
+            .unwrap();
+        record_triage_issue_batch(&db_local, "i-7", &["m-1".to_string(), "m-2".to_string()])
+            .await
+            .unwrap();
+
+        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let db = Arc::new(DbState::new(db_local, search));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let orch = OrchestratorBuilder::new(db, services, config_dir)
+            .jj_binary_path(bin.clone())
+            .build();
+
+        let action_run = ActionRun {
+            id: "ar-pr".to_string(),
+            execution_id: "e-1".to_string(),
+            recipe_node_id: "pr".to_string(),
+            action_config_id: String::new(),
+            issue_id: Some("i-7".to_string()),
+            project_id: "p-1".to_string(),
+            status: ActionRunStatus::Running,
+            inputs: None,
+            output: None,
+            error_message: None,
+            started_at: None,
+            completed_at: None,
+            created_at: 1,
+            parent_job_id: None,
+            uri_segment: Some("pr".to_string()),
+        };
+
+        commit_triage_ledger_if_needed(&orch, &action_run, ws_path.to_str().unwrap(), &repo_path)
+            .await
+            .expect("no-promotion ledger seals cleanly");
+
+        // The branch now carries a ledger commit ahead of `main` — the diff the
+        // PR opens on. Without it the branch is empty and gh pr create fails with
+        // "No commits between main and <branch>". `@-` is the sealed commit; the
+        // ledger file `7.md` lives there (base `main` carries only the prior
+        // `1.md`), and the working copy is left clean.
+        let listed = crate::jj::file_list(&jj, &ws_path, "@-", "docs/memory-triage").unwrap();
+        assert!(
+            listed.iter().any(|f| f.ends_with("7.md")),
+            "the no-promotion ledger file is committed in @-: {listed:?}"
+        );
+        let ledger = String::from_utf8(
+            crate::jj::file_show(&jj, &ws_path, "@-", "docs/memory-triage/7.md").unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ledger.contains("0 promote")
+                && ledger.contains("### Discard")
+                && ledger.contains("### Defer"),
+            "committed ledger records the discard + defer decisions: {ledger}"
+        );
+        assert!(
+            !crate::jj::is_working_copy_dirty(&jj, &ws_path).unwrap(),
+            "the ledger seal leaves the working copy clean"
+        );
     }
 }

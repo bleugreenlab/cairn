@@ -90,6 +90,19 @@ macro_rules! shared_tail_tool_invocation_durations {
     };
 }
 
+/// CAIRN-2368: add a durable per-job listing index and cached/fresh stamp to
+/// check_result_cache. The table is project-scoped shared state, so this append-only
+/// migration lands in both lineages; the cache key remains input-hash based.
+macro_rules! shared_tail_check_result_job_id {
+    () => {
+        Migration::new(
+            "0093",
+            "check_result_cache_job_id",
+            include_str!("../../../../turso_migrations/0093_check_result_cache_job_id.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -99,6 +112,7 @@ macro_rules! team_lineage {
             shared_tail_check_result_cache!(),
             shared_tail_check_result_input_hash!(),
             shared_tail_tool_invocation_durations!(),
+            shared_tail_check_result_job_id!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -164,6 +178,7 @@ macro_rules! private_lineage {
                 ),
             ),
             shared_tail_tool_invocation_durations!(),
+            shared_tail_check_result_job_id!(),
         ]
     };
 }
@@ -1247,7 +1262,9 @@ mod tests {
                 "0088_reopen_analytics_backfill".to_string(),
                 "0089_check_result_cache".to_string(),
                 "0090_check_result_cache_input_hash".to_string(),
-                "0091_drop_projects_server_id_and_servers".to_string()
+                "0091_drop_projects_server_id_and_servers".to_string(),
+                "0092_tool_invocation_durations".to_string(),
+                "0093_check_result_cache_job_id".to_string()
             ]
         );
         Ok(db)
@@ -1346,11 +1363,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Apply every private migration EXCEPT the final 0090 drop (last in array
-        // order), so the seed sees the pre-drop schema with `projects.server_id`
-        // and the `servers` table still present.
-        let head = &TURSO_MIGRATIONS[..TURSO_MIGRATIONS.len() - 1];
-        MigrationRunner::new(head.to_vec()).run(&db).await.unwrap();
+        // Apply every private migration before the 0091 drop, so the seed sees
+        // the pre-drop schema with `projects.server_id` and the `servers` table
+        // still present. Filter by version rather than slicing the tail: shared
+        // migrations can be appended after 0091 in array order.
+        let head = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version < "0091")
+            .cloned()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(head).run(&db).await.unwrap();
 
         // A server, a workspace, a project referencing that server, and a child
         // issue. FK enforcement is ON here, so the server row must exist first.
@@ -2488,7 +2510,9 @@ mod tests {
                 // change, so it lands in the team lineage too.
                 "0087_token_rollup_hourly".to_string(),
                 "0089_check_result_cache".to_string(),
-                "0090_check_result_cache_input_hash".to_string()
+                "0090_check_result_cache_input_hash".to_string(),
+                "0092_tool_invocation_durations".to_string(),
+                "0093_check_result_cache_job_id".to_string()
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

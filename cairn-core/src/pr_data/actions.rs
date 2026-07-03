@@ -61,9 +61,9 @@ pub struct MergeMrContext {
     pub title: String,
     pub is_workspace: bool,
     /// Whether the issue owns a memory-triage batch (rows in
-    /// `memory_triage_issue_memories`). Drives canon merge handling: force the
-    /// `merge` method and resolve/revert the triage batch on merge/close. This is
-    /// the structural truth — it does not depend on a label being applied.
+    /// `memory_triage_issue_memories`). Drives canon resolution: resolve/revert
+    /// the triage batch on merge/close. This is the structural truth — it does
+    /// not depend on a label being applied.
     pub has_triage_batch: bool,
 }
 
@@ -1762,8 +1762,8 @@ pub async fn reconcile_after_merge(
 ///   live tip and rebase the source onto it, then FF. For the default `squash`
 ///   method the rebased chain is first collapsed to a single commit on the live
 ///   tip (`squash_branch_onto`) so the default branch gains exactly one commit
-///   per PR; the `merge` method (workspace / memory-triage PRs) keeps the real
-///   per-commit fold via `rebase_then_fold_into`. Either way the rebase/squash
+///   per PR; the `merge` method (workspace PRs) keeps the real per-commit fold
+///   via `rebase_then_fold_into`. Either way the rebase/squash
 ///   rewrites the source's commit id, so origin's PR head SHA is no longer
 ///   reachable from the new target; push the rewritten source first so its PR
 ///   head matches the commit that lands on the default branch, then advance the
@@ -1905,7 +1905,7 @@ async fn store_merge_child(
                 }
             }
         } else {
-            // Non-squash (workspace / memory-triage): keep the real fold so the
+            // Non-squash (workspace): keep the real fold so the
             // default branch carries every sealed commit. This method exists to
             // PRESERVE every commit, so flattening would contradict its intent —
             // instead it refuses on ANY recorded conflict (tip or intermediate) so
@@ -2544,10 +2544,10 @@ fn reflect_child_merge_on_github(
 
 /// Resolve the effective merge method for a PR. Squash is the default shape for
 /// a normal PR landing on the default branch (one commit per PR), but workspace
-/// PRs and memory-triage-batch PRs deliberately preserve their individual
-/// commits, so they always force `"merge"` regardless of the requested method.
+/// PRs deliberately preserve their individual commits, so they always force
+/// `"merge"` regardless of the requested method.
 fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<String>) -> String {
-    let force_merge = merge_context.is_workspace || merge_context.has_triage_batch;
+    let force_merge = merge_context.is_workspace;
     if force_merge {
         "merge".to_string()
     } else {
@@ -2558,7 +2558,7 @@ fn effective_merge_method(merge_context: &MergeMrContext, merge_method: Option<S
 /// The merge method a DEFAULT-BRANCH landing will actually use, resolved per
 /// route: the GitHub route (`merge_remote_pr_via_github`) passes the caller's
 /// method straight through (defaulting to squash), while the local fold applies
-/// the workspace / memory-triage forcing (`effective_merge_method`). Only
+/// the workspace forcing (`effective_merge_method`). Only
 /// meaningful when the target IS the default branch. The merge gate uses this to
 /// refuse a clean-tip / conflicted-intermediate source under a non-`squash`
 /// (preserve-every-commit) landing on BOTH routes uniformly — a squash landing
@@ -2590,16 +2590,15 @@ fn resolve_project_default_branch(repo_path: &str, stored_default: &str) -> Stri
 /// `resolved_default` is the config-aware default resolved by the caller.
 ///
 /// True only for a real remote PR (`github_pr_number` present, not a local-only
-/// project) that lands on the default branch and is neither a workspace nor a
-/// memory-triage PR. A Coordinator child→integration PR (`target_branch` is the
-/// integration branch, not the default) and a local-only project both stay on the
-/// local fold; workspace / memory-triage PRs that force the keep-every-commit
-/// `merge` method are out of scope and also stay local.
+/// project) that lands on the default branch and is not a workspace PR. A
+/// Coordinator child→integration PR (`target_branch` is the integration branch,
+/// not the default) and a local-only project both stay on the local fold;
+/// workspace PRs that force the keep-every-commit `merge` method are out of
+/// scope and also stay local.
 fn should_route_to_github(ctx: &MergeMrContext, resolved_default: &str) -> bool {
     ctx.mr.github_pr_number.is_some()
         && !ctx.mr.is_local
         && !ctx.is_workspace
-        && !ctx.has_triage_batch
         && ctx.target_branch == resolved_default
 }
 
@@ -2650,8 +2649,8 @@ async fn merge_remote_pr_via_github(
         .ok_or_else(|| "GitHub merge requires a PR number".to_string())?;
 
     // Squash is the default landing shape (one commit per PR on the default
-    // branch). The workspace / memory-triage forcing in `effective_merge_method`
-    // does not apply here — those PRs never take this branch.
+    // branch). The workspace forcing in `effective_merge_method` does not apply
+    // here — workspace PRs never take this branch.
     let method = merge_method.unwrap_or_else(|| "squash".to_string());
 
     let (owner, repo) = get_owner_repo(&repo_path)?;
@@ -2823,8 +2822,8 @@ pub async fn merge_pr_for_job(
     // GitHub's merge API (GitHub squash-merges, closes the PR, and advances the
     // base on origin; Cairn then reconciles locally). The local jj fold below is
     // kept only where there is no GitHub PR to merge through: local-only projects
-    // and Coordinator child→integration PRs, plus workspace / memory-triage PRs
-    // that deliberately preserve every commit. The conflict gate above has
+    // and Coordinator child→integration PRs, plus workspace PRs that deliberately
+    // preserve every commit. The conflict gate above has
     // already run for both paths.
     if should_merge_via_github(&merge_context) {
         return merge_remote_pr_via_github(
@@ -2842,8 +2841,8 @@ pub async fn merge_pr_for_job(
     // origin and marks the child PR Merged out-of-band. A no-remote jj project
     // folds locally and skips the push. The method selects the *shape* that lands
     // on the default branch: `squash` (the default) collapses the source to one
-    // commit before the fold; `merge` (forced for workspace / memory-triage PRs)
-    // keeps every sealed commit.
+    // commit before the fold; `merge` (forced for workspace PRs) keeps every
+    // sealed commit.
     let method = effective_merge_method(&merge_context, merge_method);
     let fold_started = std::time::Instant::now();
     // Serialize the fold behind the per-store mutex so a merge-fold and a
@@ -2952,20 +2951,25 @@ mod tests {
         }
     }
 
-    /// Squash is the default landing shape; workspace and memory-triage-batch PRs
-    /// always force `merge` so their individual commits survive, even when the
-    /// caller asks for another method.
+    /// Squash is the default landing shape; only workspace PRs force `merge` so
+    /// their individual commits survive, even when the caller asks for another
+    /// method.
     #[test]
-    fn effective_merge_method_defaults_squash_and_forces_merge_for_canon() {
+    fn effective_merge_method_defaults_squash_and_only_forces_merge_for_workspace() {
         // Workspace PR forces merge regardless of the requested method.
         assert_eq!(
             effective_merge_method(&merge_context(true, false), Some("squash".to_string())),
             "merge"
         );
-        // Memory-triage-batch PR forces merge regardless of the requested method.
+        // Memory-triage-batch PRs now honor the requested method.
         assert_eq!(
             effective_merge_method(&merge_context(false, true), Some("rebase".to_string())),
-            "merge"
+            "rebase"
+        );
+        // Memory-triage-batch PRs default to squash like normal PRs.
+        assert_eq!(
+            effective_merge_method(&merge_context(false, true), None),
+            "squash"
         );
         // A normal PR with no requested method defaults to squash.
         assert_eq!(
@@ -3010,11 +3014,18 @@ mod tests {
             "merge",
             "a workspace PR forces a preserve landing even when squash is requested"
         );
+
+        let mut local_triage = merge_context(false, true);
+        local_triage.mr.is_local = true;
+        assert_eq!(
+            default_landing_method(&local_triage, "main", None),
+            "squash",
+            "a local memory-triage PR defaults to squash like a normal PR"
+        );
     }
 
     /// A remote PR landing on the default branch routes to GitHub; everything
-    /// else (local-only, child→integration, workspace, memory-triage) stays on
-    /// the local jj fold.
+    /// else (local-only, child→integration, workspace) stays on the local jj fold.
     #[test]
     fn should_route_to_github_only_for_remote_default_branch_pr() {
         // Base case: a real remote PR on the default branch.
@@ -3035,13 +3046,14 @@ mod tests {
         child.target_branch = "agent/CAIRN-1-coordinator-0".to_string();
         assert!(!should_route_to_github(&child, "main"));
 
-        // Workspace and memory-triage PRs stay on the local fold (keep-every-commit).
+        // Workspace PRs stay on the local fold (keep-every-commit); memory-triage
+        // PRs route like normal PRs.
         let mut workspace = ctx.clone();
         workspace.is_workspace = true;
         assert!(!should_route_to_github(&workspace, "main"));
         let mut triage = ctx.clone();
         triage.has_triage_batch = true;
-        assert!(!should_route_to_github(&triage, "main"));
+        assert!(should_route_to_github(&triage, "main"));
 
         // A stale stored default that disagrees with the real base routes off the
         // PR's actual base: target "staging" against resolved "staging" routes,

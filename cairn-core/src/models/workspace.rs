@@ -88,6 +88,8 @@ pub struct Settings {
     /// Always true — setting removed, kept for serialization compat.
     pub auto_start_jobs: bool,
     pub orphan_cleanup_days: i32,
+    /// Days before stale Cargo target artifacts in project repo checkouts are swept. 0 disables it.
+    pub repo_target_sweep_days: i32,
     /// Whether agent bug reports are enabled (default: true)
     pub bug_reports: bool,
     /// Thinking block display mode in chat transcripts
@@ -136,6 +138,8 @@ pub struct UpdateSettings {
     #[allow(dead_code)]
     pub auto_start_jobs: Option<bool>,
     pub orphan_cleanup_days: Option<i32>,
+    /// Days before stale Cargo target artifacts in project repo checkouts are swept. 0 disables it.
+    pub repo_target_sweep_days: Option<i32>,
     /// Whether agent bug reports are enabled
     pub bug_reports: Option<bool>,
     /// Thinking block display mode in chat transcripts

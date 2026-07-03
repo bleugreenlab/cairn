@@ -217,6 +217,7 @@ pub async fn run_write_checks_after_seal(
         orch.db.local.clone(),
         &run_context.project_id,
         &tree_hash,
+        run_context.job_id.as_str(),
         &keyed,
         tool_use_id,
         move |command, stream_id| async move {
@@ -623,6 +624,7 @@ async fn run_planned_checks<F, Fut>(
     db: Arc<LocalDb>,
     project_id: &str,
     tree_hash: &str,
+    job_id: &str,
     plans: &[(CheckPlan, String)],
     tool_use_id: &str,
     execute: F,
@@ -653,6 +655,8 @@ where
                     output_tail: entry.output_tail.clone(),
                     duration_ms: entry.duration_ms,
                     target_results_json: entry.target_results_json.clone(),
+                    job_id: Some(job_id.to_string()),
+                    cached: Some(true),
                 },
             );
             // Rehydrate the structured per-test detail persisted at run time.
@@ -700,6 +704,8 @@ where
                 output_tail: output_tail.clone(),
                 duration_ms,
                 target_results_json,
+                job_id: Some(job_id.to_string()),
+                cached: Some(false),
             },
         );
 
@@ -910,6 +916,8 @@ mod tests {
             duration_ms: 1,
             ran_at: 1,
             target_results_json: None,
+            job_id: None,
+            cached: None,
         }
     }
 
@@ -1449,6 +1457,8 @@ mod tests {
                 output_tail: "cached".to_string(),
                 duration_ms: 1,
                 target_results_json: None,
+                job_id: Some("job-a".to_string()),
+                cached: Some(false),
             },
         )
         .unwrap();
@@ -1463,6 +1473,7 @@ mod tests {
             db.clone(),
             "project-a",
             "tree-a",
+            "job-a",
             &plans,
             "tool",
             move |_command, _stream_id| {
@@ -1496,6 +1507,7 @@ mod tests {
             db.clone(),
             "project-a",
             "tree-b",
+            "job-a",
             &plans,
             "tool",
             move |_command, _stream_id| {
@@ -1541,6 +1553,7 @@ mod tests {
             db.clone(),
             "project-a",
             "tree-structured",
+            "job-a",
             &plans,
             "tool",
             move |_command, _stream_id| {
@@ -1586,6 +1599,7 @@ mod tests {
             db.clone(),
             "project-a",
             "tree-1",
+            "job-a",
             &plans,
             "tool",
             move |_command, _stream_id| {
@@ -1612,6 +1626,7 @@ mod tests {
             db.clone(),
             "project-a",
             "tree-2",
+            "job-a",
             &plans2,
             "tool",
             move |_command, _stream_id| {

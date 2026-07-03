@@ -49,6 +49,9 @@ impl Orchestrator {
         if let Some(days) = input.orphan_cleanup_days {
             current.orphan_cleanup_days = days.clamp(1, 30);
         }
+        if let Some(days) = input.repo_target_sweep_days {
+            current.repo_target_sweep_days = days.max(0);
+        }
         if let Some(mode) = input.thinking_display_mode {
             current.thinking_display_mode = mode;
         }

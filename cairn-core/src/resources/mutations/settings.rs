@@ -24,6 +24,7 @@ const PREF_KEYS: &[&str] = &[
     "mergeType",
     "pullOnMerge",
     "orphanCleanupDays",
+    "repoTargetSweepDays",
     "bugReports",
     "thinkingDisplayMode",
     "logLevel",

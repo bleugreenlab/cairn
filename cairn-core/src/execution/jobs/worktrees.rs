@@ -86,6 +86,12 @@ pub(crate) fn prepare_worktree_for_job(
     if let Err(error) = crate::jj::write_base_marker(worktree_path, base_ref, &base_rev) {
         log::warn!("failed to write base marker for {branch}: {error}");
     }
+    // Record the project's primary checkout so in-worktree dev tooling can
+    // borrow machine-local artifacts (sidecar binaries) from it. Auxiliary
+    // metadata like the markers above: never fails provisioning.
+    if let Err(error) = crate::jj::write_project_root_marker(worktree_path, repo) {
+        log::warn!("failed to write project root marker for {branch}: {error}");
+    }
     setup_progress::emit(
         sink,
         job_id,

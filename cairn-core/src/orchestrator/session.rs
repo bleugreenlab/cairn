@@ -591,7 +591,8 @@ fn build_messaging_context(
                     let peers =
                         find_peer_agents(conn, &project_key, &issue_id, &current_run_id).await?;
                     let issue_key = issue_key(conn, &project_key, &issue_id).await?;
-                    let session_id = session_id_for_run(conn, &current_run_id).await?;
+                    let (session_id, job_id) =
+                        session_and_job_id_for_run(conn, &current_run_id).await?;
                     let cursor = match session_id.as_deref() {
                         Some(sid) => read_channel_cursor(conn, sid).await?,
                         None => None,
@@ -600,9 +601,10 @@ fn build_messaging_context(
                         conn,
                         &project_key,
                         issue_key.as_deref(),
-                        &current_run_id,
+                        job_id.as_deref(),
                         cursor,
                         20,
+                        true,
                     )
                     .await?;
                     Ok((peers, recent, session_id))
@@ -776,15 +778,20 @@ async fn recent_messages_for_run(
     conn: &turso::Connection,
     project_key: &str,
     issue_key: Option<&str>,
-    exclude_run_id: &str,
+    exclude_job_id: Option<&str>,
     cursor: Option<i64>,
     limit: i64,
+    include_system: bool,
 ) -> DbResult<Vec<PromptMessage>> {
+    let include_system = if include_system { 1_i64 } else { 0_i64 };
     let mut rows = if let Some(issue_key) = issue_key {
         conn.query(
             "SELECT rowid, sender_name, content, created_at
              FROM messages
-             WHERE (sender_run_id IS NULL OR sender_run_id != ?1)
+             WHERE (sender_run_id IS NULL
+                    OR ?1 IS NULL
+                    OR sender_run_id NOT IN (SELECT id FROM runs WHERE job_id = ?1))
+               AND (?6 = 1 OR sender_name != 'system')
                AND (
                     (channel_type = 'project' AND channel_id = ?2)
                     OR (channel_type = 'issue' AND channel_id = ?3)
@@ -792,20 +799,30 @@ async fn recent_messages_for_run(
                AND (?5 IS NULL OR rowid > ?5)
              ORDER BY rowid DESC
              LIMIT ?4",
-            params![exclude_run_id, project_key, issue_key, limit, cursor],
+            params![
+                exclude_job_id,
+                project_key,
+                issue_key,
+                limit,
+                cursor,
+                include_system
+            ],
         )
         .await?
     } else {
         conn.query(
             "SELECT rowid, sender_name, content, created_at
              FROM messages
-             WHERE (sender_run_id IS NULL OR sender_run_id != ?1)
+             WHERE (sender_run_id IS NULL
+                    OR ?1 IS NULL
+                    OR sender_run_id NOT IN (SELECT id FROM runs WHERE job_id = ?1))
+               AND (?5 = 1 OR sender_name != 'system')
                AND channel_type = 'project'
                AND channel_id = ?2
                AND (?4 IS NULL OR rowid > ?4)
              ORDER BY rowid DESC
              LIMIT ?3",
-            params![exclude_run_id, project_key, limit, cursor],
+            params![exclude_job_id, project_key, limit, cursor, include_system],
         )
         .await?
     };
@@ -823,10 +840,10 @@ async fn recent_messages_for_run(
     Ok(messages)
 }
 
-/// Non-stamping peek at project/issue channel messages that would be injected
-/// for `job_id` on the next messaging-context build. This shares the same
-/// filtering as `recent_messages_for_run` but deliberately skips the cursor
-/// advance so the UI can show pending chips without delivering them.
+/// Non-stamping peek at project/issue channel messages that should surface as
+/// pending-delivery chips. This intentionally returns the non-system subset of
+/// messages that may be injected on the next messaging-context build, so passive
+/// lifecycle awareness can reach agents without becoming dismissible UI noise.
 pub async fn pending_channel_messages_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -838,8 +855,7 @@ pub async fn pending_channel_messages_for_job(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT p.key, i.id, i.number, j.current_session_id,
-                            (SELECT r.id FROM runs r WHERE r.job_id = j.id ORDER BY r.created_at DESC LIMIT 1)
+                    "SELECT p.key, i.id, i.number, j.current_session_id
                      FROM jobs j
                      JOIN issues i ON i.id = j.issue_id
                      JOIN projects p ON p.id = i.project_id
@@ -854,7 +870,6 @@ pub async fn pending_channel_messages_for_job(
             let project_key = row.text(0)?;
             let issue_number = row.i64(2)?;
             let session_id = row.opt_text(3)?;
-            let exclude_run_id = row.opt_text(4)?.unwrap_or_default();
             let Some(session_id) = session_id else {
                 return Ok(Vec::new());
             };
@@ -864,9 +879,10 @@ pub async fn pending_channel_messages_for_job(
                 conn,
                 &project_key,
                 Some(&issue_key),
-                &exclude_run_id,
+                Some(&job_id),
                 cursor,
                 limit,
+                false,
             )
             .await
         })
@@ -905,15 +921,22 @@ pub async fn dismiss_channel_message_for_job(
     .await
 }
 
-/// Resolve the session id backing a run, used to scope the channel-injection
-/// cursor. Returns `None` for legacy runs with no session.
-async fn session_id_for_run(conn: &turso::Connection, run_id: &str) -> DbResult<Option<String>> {
+/// Resolve the session and job backing a run, used to scope the channel-injection
+/// cursor and to exclude every run from the recipient's own job across resumes.
+/// Returns `(None, None)` for legacy runs missing either relation.
+async fn session_and_job_id_for_run(
+    conn: &turso::Connection,
+    run_id: &str,
+) -> DbResult<(Option<String>, Option<String>)> {
     let mut rows = conn
-        .query("SELECT session_id FROM runs WHERE id = ?1", params![run_id])
+        .query(
+            "SELECT session_id, job_id FROM runs WHERE id = ?1",
+            params![run_id],
+        )
         .await?;
     match rows.next().await? {
-        Some(row) => row.opt_text(0),
-        None => Ok(None),
+        Some(row) => Ok((row.opt_text(0)?, row.opt_text(1)?)),
+        None => Ok((None, None)),
     }
 }
 
@@ -2476,6 +2499,7 @@ mod tests {
             VALUES('j', 'p', 'i', 'running', 1, 1);
             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
             VALUES('sess', 'j', 'claude', 'open', 1, 1, 1);
+            UPDATE jobs SET current_session_id = 'sess' WHERE id = 'j';
             ",
         )
         .await
@@ -2543,17 +2567,25 @@ mod tests {
     async fn fetch_recent(
         db: &LocalDb,
         issue_key: &str,
-        exclude_run_id: &str,
+        exclude_job_id: Option<&str>,
         cursor: Option<i64>,
     ) -> Vec<PromptMessage> {
         let issue_key = issue_key.to_string();
-        let exclude_run_id = exclude_run_id.to_string();
+        let exclude_job_id = exclude_job_id.map(str::to_string);
         db.read(|conn| {
             let issue_key = issue_key.clone();
-            let exclude_run_id = exclude_run_id.clone();
+            let exclude_job_id = exclude_job_id.clone();
             Box::pin(async move {
-                recent_messages_for_run(conn, "PROJ", Some(&issue_key), &exclude_run_id, cursor, 20)
-                    .await
+                recent_messages_for_run(
+                    conn,
+                    "PROJ",
+                    Some(&issue_key),
+                    exclude_job_id.as_deref(),
+                    cursor,
+                    20,
+                    true,
+                )
+                .await
             })
         })
         .await
@@ -2581,7 +2613,7 @@ mod tests {
         // First injection: empty cursor surfaces the message.
         let cursor0 = read_cursor(&db, "sess").await;
         assert!(cursor0.is_none());
-        let first = fetch_recent(&db, "PROJ/1", "run-self", cursor0).await;
+        let first = fetch_recent(&db, "PROJ/1", Some("j"), cursor0).await;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].content, "salvage-frozen finished successfully");
 
@@ -2592,7 +2624,7 @@ mod tests {
         assert_eq!(cursor1, Some(max_rowid));
 
         // Second injection on the same session: the message is deduped.
-        let second = fetch_recent(&db, "PROJ/1", "run-self", cursor1).await;
+        let second = fetch_recent(&db, "PROJ/1", Some("j"), cursor1).await;
         assert!(
             second.is_empty(),
             "already-injected message must not re-surface"
@@ -2610,7 +2642,7 @@ mod tests {
             2000,
         )
         .await;
-        let third = fetch_recent(&db, "PROJ/1", "run-self", cursor1).await;
+        let third = fetch_recent(&db, "PROJ/1", Some("j"), cursor1).await;
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].content, "new notice");
     }
@@ -2635,7 +2667,7 @@ mod tests {
             1000,
         )
         .await;
-        let first = fetch_recent(&db, "PROJ/1", "run-self", None).await;
+        let first = fetch_recent(&db, "PROJ/1", Some("j"), None).await;
         advance(&db, "sess", first.iter().map(|m| m.rowid).max().unwrap()).await;
         let cursor = read_cursor(&db, "sess").await;
 
@@ -2652,56 +2684,91 @@ mod tests {
             1000,
         )
         .await;
-        let next = fetch_recent(&db, "PROJ/1", "run-self", cursor).await;
+        let next = fetch_recent(&db, "PROJ/1", Some("j"), cursor).await;
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].content, "same-second later");
     }
 
-    /// Ported from the removed messages::db tests: a run never sees the system
-    /// messages describing itself, but does see peers'.
     #[tokio::test]
-    async fn recent_excludes_callers_own_system_messages() {
+    async fn pending_channel_messages_exclude_system_lifecycle_noise() {
         let db = migrated_db().await;
-        // System message about run-1 (the caller).
+        seed_session(&db).await;
         insert_msg(
             &db,
-            "a",
+            "lifecycle",
             "issue",
             "PROJ/1",
-            Some("run-1"),
+            Some("run-peer"),
             "system",
-            "builder-1 started working",
+            "builder finished successfully",
             1000,
         )
         .await;
-        // System message about run-2 (a peer).
         insert_msg(
             &db,
-            "b",
+            "agent-message",
             "issue",
             "PROJ/1",
-            Some("run-2"),
-            "system",
-            "builder-2 started working",
+            Some("run-peer"),
+            "builder",
+            "I need the parent to review this output",
             2000,
         )
         .await;
-        // Regular message from run-2.
+
+        let pending = pending_channel_messages_for_job(&db, "j", 20)
+            .await
+            .unwrap();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sender_name, "builder");
+        assert_eq!(
+            pending[0].content,
+            "I need the parent to review this output"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_messages_exclude_every_run_from_recipient_job() {
+        let db = migrated_db().await;
+        seed_session(&db).await;
+        db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+            VALUES('j-other', 'p', 'i', 'running', 1, 1);
+            INSERT INTO runs(id, issue_id, project_id, job_id, status, created_at, updated_at)
+            VALUES('run-self', 'i', 'p', 'j', 'completed', 1, 1),
+                  ('run-other', 'i', 'p', 'j-other', 'completed', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
         insert_msg(
             &db,
-            "c",
+            "self-lifecycle",
             "issue",
             "PROJ/1",
-            Some("run-2"),
-            "builder-2",
-            "taking src/api/",
-            3000,
+            Some("run-self"),
+            "system",
+            "builder finished successfully",
+            1000,
+        )
+        .await;
+        insert_msg(
+            &db,
+            "other-lifecycle",
+            "issue",
+            "PROJ/1",
+            Some("run-other"),
+            "system",
+            "planner finished successfully",
+            2000,
         )
         .await;
 
-        let as_run_1 = fetch_recent(&db, "PROJ/1", "run-1", None).await;
-        assert_eq!(as_run_1.len(), 2);
-        assert_eq!(as_run_1[0].content, "builder-2 started working");
-        assert_eq!(as_run_1[1].content, "taking src/api/");
+        let recent = fetch_recent(&db, "PROJ/1", Some("j"), None).await;
+
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].content, "planner finished successfully");
     }
 }

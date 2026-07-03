@@ -37,6 +37,14 @@ const BRANCH_MARKER: &str = "cairn-branch";
 /// `scripts/lib/check-base.ts` and `docs/check-harness.md`.
 const BASE_MARKER: &str = "cairn-base";
 
+/// Filename of the non-snapshotted project-root marker inside a workspace's
+/// `.jj` dir. Records the project's primary local checkout path so in-worktree
+/// dev tooling can borrow machine-local artifacts from it (sidecar binaries,
+/// warm caches). A jj workspace is `.jj`-only — `git rev-parse` cannot find
+/// the checkout the way it can from a linked git worktree — so without the
+/// marker there is no on-disk route back. See `scripts/main-checkout.ts`.
+const PROJECT_ROOT_MARKER: &str = "cairn-project-root";
+
 /// Fallback identity used when no per-call author is supplied. Per-commit author
 /// is injected via `--config user.{name,email}=…` on each seal.
 const JJ_DEFAULT_USER_NAME: &str = "Cairn Agent";
@@ -526,6 +534,24 @@ pub fn read_base_marker(ws_path: &Path) -> Option<(String, String)> {
     let branch = lines.next().map(str::trim).filter(|s| !s.is_empty())?;
     let rev = lines.next().map(str::trim).unwrap_or("");
     Some((branch.to_string(), rev.to_string()))
+}
+
+/// Record the project's primary checkout path in the workspace's
+/// non-snapshotted marker — like [`write_branch_marker`], invisible to the
+/// working-copy commit.
+pub fn write_project_root_marker(ws_path: &Path, repo_path: &Path) -> Result<(), String> {
+    let p = ws_path.join(".jj").join(PROJECT_ROOT_MARKER);
+    std::fs::write(&p, format!("{}\n", repo_path.display()))
+        .map_err(|e| format!("write project root marker: {e}"))
+}
+
+/// Read the workspace's project-root marker, if present and non-empty.
+pub fn read_project_root_marker(ws_path: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(ws_path.join(".jj").join(PROJECT_ROOT_MARKER))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Whether the working copy (`@`) carries changes versus its parent. Never
@@ -3148,6 +3174,21 @@ mod tests {
             read_base_marker(dir.path()),
             Some(("main".to_string(), String::new()))
         );
+    }
+
+    #[test]
+    fn project_root_marker_round_trips() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
+
+        assert_eq!(read_project_root_marker(dir.path()), None);
+
+        write_project_root_marker(dir.path(), Path::new("/Users/dev/projects/cairn")).unwrap();
+        assert_eq!(
+            read_project_root_marker(dir.path()),
+            Some(PathBuf::from("/Users/dev/projects/cairn"))
+        );
+        assert!(dir.path().join(".jj").join("cairn-project-root").exists());
     }
 
     /// Provision a real non-colocated workspace, record the base marker as

@@ -70,6 +70,8 @@ pub struct SettingsFile {
     auto_start_jobs: Option<bool>,
     #[serde(default)]
     pub orphan_cleanup_days: Option<i32>,
+    #[serde(default)]
+    pub repo_target_sweep_days: Option<i32>,
     /// Whether agent bug reports are enabled (default: true)
     #[serde(default)]
     pub bug_reports: Option<bool>,
@@ -270,6 +272,7 @@ impl SettingsFile {
             pull_on_merge: self.pull_on_merge.unwrap_or(true),
             auto_start_jobs: true, // Always true — setting removed
             orphan_cleanup_days: self.orphan_cleanup_days.unwrap_or(3),
+            repo_target_sweep_days: self.repo_target_sweep_days.unwrap_or(0).max(0),
             bug_reports: self.bug_reports.unwrap_or(true),
             thinking_display_mode: self
                 .thinking_display_mode
@@ -301,6 +304,7 @@ impl SettingsFile {
             pull_on_merge: Some(settings.pull_on_merge),
             auto_start_jobs: None, // No longer serialized
             orphan_cleanup_days: Some(settings.orphan_cleanup_days),
+            repo_target_sweep_days: Some(settings.repo_target_sweep_days.max(0)),
             bug_reports: Some(settings.bug_reports),
             thinking_display_mode: Some(settings.thinking_display_mode.clone()),
             log_level: Some(settings.log_level),
@@ -825,6 +829,8 @@ mod tests {
         assert_eq!(settings.max_thinking_tokens, Some(31999));
         assert_eq!(settings.merge_type, MergeType::Squash);
         assert!(settings.pull_on_merge);
+        assert_eq!(settings.orphan_cleanup_days, 3);
+        assert_eq!(settings.repo_target_sweep_days, 0);
         assert!(settings.auto_start_jobs); // Always true
         assert_eq!(settings.thinking_display_mode, ThinkingDisplayMode::Full);
         assert_eq!(settings.external_replies, ExternalReplyMode::Watchers);
@@ -850,6 +856,7 @@ externalReplies: disabled
             max_thinking_tokens: Some(16000),
             merge_type: MergeType::Rebase,
             pull_on_merge: false,
+            repo_target_sweep_days: 14,
             ..test_settings()
         };
 
@@ -862,6 +869,7 @@ externalReplies: disabled
         assert_eq!(restored.max_thinking_tokens, settings.max_thinking_tokens);
         assert_eq!(restored.merge_type, settings.merge_type);
         assert_eq!(restored.pull_on_merge, settings.pull_on_merge);
+        assert_eq!(restored.repo_target_sweep_days, 14);
         assert!(restored.auto_start_jobs); // Always true
         assert_eq!(
             restored.thinking_display_mode,
@@ -949,6 +957,7 @@ externalReplies: disabled
             merge_type: Some(MergeType::Merge),
             pull_on_merge: Some(true),
             orphan_cleanup_days: Some(3),
+            repo_target_sweep_days: Some(14),
             bug_reports: Some(true),
             ..Default::default()
         };
@@ -959,6 +968,25 @@ externalReplies: disabled
         assert_eq!(parsed.preferred_models, file.preferred_models);
         assert_eq!(parsed.branch_prefix, file.branch_prefix);
         assert_eq!(parsed.max_thinking_tokens, file.max_thinking_tokens);
+        assert_eq!(parsed.repo_target_sweep_days, Some(14));
+    }
+
+    #[test]
+    fn repo_target_sweep_days_roundtrips_and_clamps_to_zero() {
+        let yaml = "repoTargetSweepDays: 14\n";
+        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let settings = file.to_settings();
+        assert_eq!(settings.repo_target_sweep_days, 14);
+
+        let serialized = serde_yaml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
+        assert!(serialized.contains("repoTargetSweepDays: 14"));
+
+        let negative: SettingsFile = serde_yaml::from_str("repoTargetSweepDays: -7\n").unwrap();
+        assert_eq!(negative.to_settings().repo_target_sweep_days, 0);
+        assert_eq!(
+            SettingsFile::default().to_settings().repo_target_sweep_days,
+            0
+        );
     }
 
     #[test]

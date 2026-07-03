@@ -72,6 +72,10 @@ Web pages and local PDFs are read targets too:
 
     read({paths:["https://example.com/spec", "file:docs/design.pdf"]})
 
+Web search is a read target too. `cairn://websearch?q=` runs your query through the active provider. The query rides in `?q=` as literal text — spaces are fine.
+
+    read({paths:["cairn://websearch?q=tokio async runtime overview"]})
+
 Resource projections use the same query grammar:
 
     read({paths:["cairn://p/CAIRN/issues?status=active&limit=20"]})

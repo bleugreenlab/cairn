@@ -396,6 +396,48 @@ pub(super) fn emit_codex_run_turn_completed(
     );
 }
 
+pub(super) fn emit_codex_command_output_delta(
+    emitter: &Arc<dyn crate::services::EventEmitter>,
+    run_id: &str,
+    tool_use_id: &str,
+    delta: &str,
+    output_chars: i32,
+) {
+    if delta.is_empty() || tool_use_id.is_empty() {
+        return;
+    }
+
+    let _ = emitter.emit(
+        "tool-output-delta",
+        serde_json::json!({
+            "runId": run_id,
+            "toolUseId": tool_use_id,
+            "delta": delta,
+            "outputChars": output_chars,
+        }),
+    );
+}
+
+pub(super) fn emit_codex_command_complete(
+    emitter: &Arc<dyn crate::services::EventEmitter>,
+    run_id: &str,
+    tool_use_id: &str,
+    output_chars: Option<i32>,
+) {
+    if tool_use_id.is_empty() {
+        return;
+    }
+
+    let _ = emitter.emit(
+        "tool-output-complete",
+        serde_json::json!({
+            "runId": run_id,
+            "toolUseId": tool_use_id,
+            "outputChars": output_chars,
+        }),
+    );
+}
+
 pub(super) fn terminal_tool_called_for_run(orch: &Orchestrator, run_id: &str) -> bool {
     orch.process_state
         .processes
@@ -805,4 +847,41 @@ pub(super) fn summarize_file_change_result(item: &Value) -> (String, bool) {
     };
     let is_error = matches!(status, "failed" | "declined");
     (text, is_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::testing::CapturingEmitter;
+    use crate::services::EventEmitter;
+    use std::sync::Arc;
+
+    #[test]
+    fn command_output_delta_uses_tool_output_counter_payload() {
+        let capture = Arc::new(CapturingEmitter::new());
+        let emitter: Arc<dyn EventEmitter> = capture.clone();
+
+        emit_codex_command_output_delta(&emitter, "run-1", "tool-1", "hello\n", 6);
+
+        let events = capture.events_named("tool-output-delta");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["runId"], "run-1");
+        assert_eq!(events[0]["toolUseId"], "tool-1");
+        assert_eq!(events[0]["delta"], "hello\n");
+        assert_eq!(events[0]["outputChars"], 6);
+    }
+
+    #[test]
+    fn command_complete_uses_tool_output_complete_payload() {
+        let capture = Arc::new(CapturingEmitter::new());
+        let emitter: Arc<dyn EventEmitter> = capture.clone();
+
+        emit_codex_command_complete(&emitter, "run-1", "tool-1", Some(7));
+
+        let events = capture.events_named("tool-output-complete");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["runId"], "run-1");
+        assert_eq!(events[0]["toolUseId"], "tool-1");
+        assert_eq!(events[0]["outputChars"], 7);
+    }
 }

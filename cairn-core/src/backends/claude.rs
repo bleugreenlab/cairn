@@ -196,19 +196,28 @@ mod tests {
     }
 
     #[test]
-    fn claude_disallows_host_harness_send_message_tool() {
-        let resolved = ClaudeBackend.resolve_tools(&["SendMessage".to_string()], &[]);
+    fn claude_disallows_host_harness_builtin_tools() {
+        let host_harness_tools = ["SendMessage", "ReportFindings"];
+        let resolved = ClaudeBackend.resolve_tools(
+            &host_harness_tools
+                .iter()
+                .map(|tool| tool.to_string())
+                .collect::<Vec<_>>(),
+            &[],
+        );
 
-        assert!(
-            resolved.disallowed.contains(&"SendMessage".to_string()),
-            "SendMessage must be passed through --disallowedTools: {:?}",
-            resolved.disallowed
-        );
-        assert!(
-            !resolved.allowed.contains(&"SendMessage".to_string()),
-            "SendMessage must not remain on the Claude allow-list: {:?}",
-            resolved.allowed
-        );
+        for tool in host_harness_tools {
+            assert!(
+                resolved.disallowed.contains(&tool.to_string()),
+                "{tool} must be passed through --disallowedTools: {:?}",
+                resolved.disallowed
+            );
+            assert!(
+                !resolved.allowed.contains(&tool.to_string()),
+                "{tool} must not remain on the Claude allow-list: {:?}",
+                resolved.allowed
+            );
+        }
     }
 }
 

@@ -1164,7 +1164,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
         kind: ResourceKind::Settings,
         uri_template: "cairn://settings",
         name: "Workspace settings",
-        description: "The workspace-global settings document with every section: app prefs (branchPrefix, maxThinkingTokens, mergeType, pullOnMerge, orphanCleanupDays, bugReports, thinkingDisplayMode, pendingMemoryThreshold, externalReplies), backends (activeBackend/tiers/backends plus a read-only model catalog and usage), git identities, provider accounts, keybinds, build services, and read-only GitHub status. patch routes each present key to its existing store; GitHub is read-only and OAuth account-add stays UI-only.",
+        description: "The workspace-global settings document with every section: app prefs (branchPrefix, maxThinkingTokens, mergeType, pullOnMerge, orphanCleanupDays, repoTargetSweepDays, bugReports, thinkingDisplayMode, pendingMemoryThreshold, externalReplies), backends (activeBackend/tiers/backends plus a read-only model catalog and usage), git identities, provider accounts, keybinds, build services, and read-only GitHub status. patch routes each present key to its existing store; GitHub is read-only and OAuth account-add stays UI-only.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,

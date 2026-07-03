@@ -8,6 +8,23 @@ use crate::storage::{LocalDb, RowExt};
 use std::sync::Arc;
 use turso::params;
 
+fn row_to_check_result(row: &turso::Row) -> Result<CheckResultCacheEntry, crate::storage::DbError> {
+    Ok(CheckResultCacheEntry {
+        project_id: row.text(0)?,
+        tree_hash: row.text(1)?,
+        input_hash: row.text(2)?,
+        check_name: row.text(3)?,
+        exit_code: row.i64(4)? as i32,
+        passed: row.i64(5)? != 0,
+        output_tail: row.text(6)?,
+        duration_ms: row.i64(7)?,
+        ran_at: row.i64(8)?,
+        target_results_json: row.opt_text(9)?,
+        job_id: row.opt_text(10)?,
+        cached: row.opt_i64(11)?.map(|v| v != 0),
+    })
+}
+
 /// Result of querying the checkpoint command cache for a job.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,7 +60,8 @@ pub fn get_check_result(
                     .query(
                         "
                         SELECT project_id, tree_hash, input_hash, check_name, exit_code,
-                               passed, output_tail, duration_ms, ran_at, target_results_json
+                               passed, output_tail, duration_ms, ran_at, target_results_json,
+                               job_id, cached
                         FROM check_result_cache
                         WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
                         ",
@@ -57,20 +75,7 @@ pub fn get_check_result(
 
                 rows.next()
                     .await?
-                    .map(|row| {
-                        Ok::<_, crate::storage::DbError>(CheckResultCacheEntry {
-                            project_id: row.text(0)?,
-                            tree_hash: row.text(1)?,
-                            input_hash: row.text(2)?,
-                            check_name: row.text(3)?,
-                            exit_code: row.i64(4)? as i32,
-                            passed: row.i64(5)? != 0,
-                            output_tail: row.text(6)?,
-                            duration_ms: row.i64(7)?,
-                            ran_at: row.i64(8)?,
-                            target_results_json: row.opt_text(9)?,
-                        })
-                    })
+                    .map(|row| row_to_check_result(&row))
                     .transpose()
             })
         })
@@ -93,9 +98,9 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                     "
                     INSERT INTO check_result_cache (
                         project_id, tree_hash, input_hash, check_name, exit_code, passed,
-                        output_tail, duration_ms, ran_at, target_results_json
+                        output_tail, duration_ms, ran_at, target_results_json, job_id, cached
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                     ON CONFLICT(project_id, check_name, input_hash) DO UPDATE SET
                         tree_hash = excluded.tree_hash,
                         exit_code = excluded.exit_code,
@@ -103,7 +108,9 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         output_tail = excluded.output_tail,
                         duration_ms = excluded.duration_ms,
                         ran_at = excluded.ran_at,
-                        target_results_json = excluded.target_results_json
+                        target_results_json = excluded.target_results_json,
+                        job_id = excluded.job_id,
+                        cached = excluded.cached
                     ",
                     params![
                         result.project_id.as_str(),
@@ -116,6 +123,10 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         result.duration_ms,
                         ran_at,
                         result.target_results_json.as_deref(),
+                        result.job_id.as_deref(),
+                        result
+                            .cached
+                            .map(|cached| if cached { 1_i64 } else { 0_i64 }),
                     ],
                 )
                 .await?;
@@ -146,7 +157,8 @@ pub fn list_check_results(
                     .query(
                         "
                         SELECT project_id, tree_hash, input_hash, check_name, exit_code,
-                               passed, output_tail, duration_ms, ran_at, target_results_json
+                               passed, output_tail, duration_ms, ran_at, target_results_json,
+                               job_id, cached
                         FROM check_result_cache
                         WHERE project_id = ?1 AND tree_hash = ?2
                         ORDER BY check_name ASC
@@ -156,18 +168,7 @@ pub fn list_check_results(
                     .await?;
                 let mut out = Vec::new();
                 while let Some(row) = rows.next().await? {
-                    out.push(CheckResultCacheEntry {
-                        project_id: row.text(0)?,
-                        tree_hash: row.text(1)?,
-                        input_hash: row.text(2)?,
-                        check_name: row.text(3)?,
-                        exit_code: row.i64(4)? as i32,
-                        passed: row.i64(5)? != 0,
-                        output_tail: row.text(6)?,
-                        duration_ms: row.i64(7)?,
-                        ran_at: row.i64(8)?,
-                        target_results_json: row.opt_text(9)?,
-                    });
+                    out.push(row_to_check_result(&row)?);
                 }
                 Ok::<_, crate::storage::DbError>(out)
             })
@@ -200,9 +201,9 @@ pub fn list_latest_check_results_for_project(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT c.project_id, c.tree_hash, c.check_name, c.exit_code,
+                        SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
                                c.passed, c.output_tail, c.duration_ms, c.ran_at,
-                               c.target_results_json, c.input_hash
+                               c.target_results_json, c.job_id, c.cached
                         FROM check_result_cache c
                         WHERE c.project_id = ?1
                           AND NOT EXISTS (
@@ -220,24 +221,61 @@ pub fn list_latest_check_results_for_project(
                     .await?;
                 let mut out = Vec::new();
                 while let Some(row) = rows.next().await? {
-                    out.push(CheckResultCacheEntry {
-                        project_id: row.text(0)?,
-                        tree_hash: row.text(1)?,
-                        check_name: row.text(2)?,
-                        exit_code: row.i64(3)? as i32,
-                        passed: row.i64(4)? != 0,
-                        output_tail: row.text(5)?,
-                        duration_ms: row.i64(6)?,
-                        ran_at: row.i64(7)?,
-                        target_results_json: row.opt_text(8)?,
-                        input_hash: row.text(9)?,
-                    });
+                    out.push(row_to_check_result(&row)?);
                 }
                 Ok::<_, crate::storage::DbError>(out)
             })
         })
         .await
         .map_err(|e| format!("Failed to list latest check result cache rows: {e}"))
+    })
+}
+
+/// List the most recent cached result per check name for one job, independent of
+/// the current worktree/tree pointer. This is the durable fallback for node-level
+/// surfaces after worktree teardown or movement.
+pub fn list_check_results_for_job(
+    db: Arc<LocalDb>,
+    job_id: &str,
+) -> Result<Vec<CheckResultCacheEntry>, String> {
+    let job_id = job_id.to_string();
+    run_checkpoint_cache_db(async move {
+        db.read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "
+                        SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
+                               c.passed, c.output_tail, c.duration_ms, c.ran_at,
+                               c.target_results_json, c.job_id, c.cached
+                        FROM check_result_cache c
+                        WHERE c.job_id = ?1
+                          AND NOT EXISTS (
+                              SELECT 1 FROM check_result_cache newer
+                              WHERE newer.job_id = c.job_id
+                                AND newer.check_name = c.check_name
+                                AND (newer.ran_at > c.ran_at
+                                     OR (newer.ran_at = c.ran_at
+                                         AND newer.tree_hash > c.tree_hash)
+                                     OR (newer.ran_at = c.ran_at
+                                         AND newer.tree_hash = c.tree_hash
+                                         AND newer.input_hash > c.input_hash))
+                          )
+                        ORDER BY c.check_name ASC
+                        ",
+                        params![job_id.as_str()],
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row_to_check_result(&row)?);
+                }
+                Ok::<_, crate::storage::DbError>(out)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to list job check result cache rows: {e}"))
     })
 }
 
@@ -257,6 +295,8 @@ pub struct CheckResultCacheEntry {
     pub duration_ms: i64,
     pub ran_at: i64,
     pub target_results_json: Option<String>,
+    pub job_id: Option<String>,
+    pub cached: Option<bool>,
 }
 
 /// Write payload for a check-result cache row.
@@ -272,6 +312,8 @@ pub struct CheckResultCacheWrite {
     pub output_tail: String,
     pub duration_ms: i64,
     pub target_results_json: Option<String>,
+    pub job_id: Option<String>,
+    pub cached: Option<bool>,
 }
 
 /// Normalize a shell command string for stable cache key comparison.
@@ -419,6 +461,8 @@ mod tests {
             output_tail: "ok".to_string(),
             duration_ms: 123,
             target_results_json: None,
+            job_id: None,
+            cached: None,
         }
     }
 
@@ -456,6 +500,33 @@ mod tests {
         assert!(row.passed);
         assert_eq!(row.output_tail, "ok");
         assert_eq!(row.duration_ms, 123);
+    }
+
+    #[tokio::test]
+    async fn check_result_cache_round_trips_job_id_and_cached_stamp() {
+        let db = cache_db().await;
+        let mut write = test_result("project-a", "input-a", "rust");
+        write.job_id = Some("job-1".to_string());
+        write.cached = Some(false);
+        store_check_result(db.clone(), write).unwrap();
+
+        let row = get_check_result(db.clone(), "project-a", "rust", "input-a")
+            .unwrap()
+            .expect("stored result should be cached");
+        assert_eq!(row.job_id.as_deref(), Some("job-1"));
+        assert_eq!(row.cached, Some(false));
+
+        let mut restamp = test_result("project-a", "tree-2", "rust");
+        restamp.input_hash = "input-a".to_string();
+        restamp.job_id = Some("job-1".to_string());
+        restamp.cached = Some(true);
+        store_check_result(db.clone(), restamp).unwrap();
+
+        let row = get_check_result(db, "project-a", "rust", "input-a")
+            .unwrap()
+            .expect("restamped result should remain cached");
+        assert_eq!(row.tree_hash, "tree-2");
+        assert_eq!(row.cached, Some(true));
     }
 
     #[tokio::test]
@@ -639,6 +710,32 @@ mod tests {
         let rows = list_latest_check_results_for_project(db, "project-a").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tree_hash, "tree-bbb");
+    }
+
+    #[tokio::test]
+    async fn job_listing_picks_latest_per_check_and_isolates_jobs() {
+        let db = cache_db().await;
+        db.execute_script(
+            "
+            INSERT INTO check_result_cache
+               (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                output_tail, duration_ms, ran_at, job_id, cached)
+             VALUES
+               ('project-a', 'tree-old', 'input-old', 'rust', 0, 1, 'old', 10, 100, 'job-1', 0),
+               ('project-a', 'tree-new', 'input-new', 'rust', 0, 1, 'new', 10, 200, 'job-1', 1),
+               ('project-a', 'tree-new', 'frontend-input', 'frontend', 0, 1, 'fe', 10, 150, 'job-1', 0),
+               ('project-a', 'tree-other', 'other-input', 'rust', 0, 1, 'other', 10, 999, 'job-2', 0);
+            ",
+        )
+        .await
+        .unwrap();
+
+        let rows = list_check_results_for_job(db, "job-1").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].check_name, "frontend");
+        assert_eq!(rows[1].check_name, "rust");
+        assert_eq!(rows[1].tree_hash, "tree-new");
+        assert_eq!(rows[1].cached, Some(true));
     }
 
     #[tokio::test]

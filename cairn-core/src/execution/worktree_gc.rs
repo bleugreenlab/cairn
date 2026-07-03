@@ -4,7 +4,7 @@
 //! whose issue reached a terminal state while the app was closed (so no teardown
 //! fired), teardowns that failed mid-delete, and legacy debris whose job/issue
 //! rows are long gone. This GC is the backstop. It runs at startup and on a ~24h
-//! timer (see [`crate::orchestrator::Orchestrator::spawn_worktree_gc`]) in two
+//! timer (see [`crate::orchestrator::Orchestrator::spawn_worktree_gc`]) in three
 //! passes:
 //!
 //! 1. **DB pass** — reclaim worktrees of jobs whose issue is terminal (any status
@@ -27,8 +27,15 @@
 //!    caches inside the worktrees that survive: fenced agent builds keep
 //!    `CARGO_INCREMENTAL` on for iteration speed (see
 //!    [`crate::config::build_services::default_sccache_service`]), and deleting
-//!    `src-tauri/target/*/incremental` dirs idle past
-//!    `INCREMENTAL_MAX_IDLE_SECS` bounds the resulting disk growth.
+//!    `target/*/incremental` dirs idle past `INCREMENTAL_MAX_IDLE_SECS` bounds
+//!    the resulting disk growth. The same pass sweeps stale non-incremental
+//!    Cargo `target/` artifacts in live worktrees after
+//!    `TARGET_SWEEP_MAX_IDLE_SECS`; these are regenerable build products, so the
+//!    worst case is one slower rebuild.
+//! 3. **Repository target sweep** — opt-in cleanup of each project's main
+//!    checkout `target/` dirs, controlled by `repo_target_sweep_days`. This uses
+//!    the same marker-based discovery and freshness policy as the worktree target
+//!    sweep, but defaults off because main checkouts are user-owned.
 //!
 //! The GC never touches branches — branch-deletion policy lives solely in
 //! [`crate::execution::teardown::teardown_worktrees`], which is landed-aware.
@@ -38,17 +45,18 @@ use crate::execution::teardown::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use turso::params;
+
+const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
 
 /// Run one full GC pass: the DB pass, then the (canonical-instance-gated)
 /// filesystem pass. Best-effort throughout; a failed pass logs and is retried on
 /// the next tick.
 pub(crate) async fn run_worktree_gc(orch: &Orchestrator) {
-    let days = crate::config::settings::load_settings(&orch.config_dir)
-        .orphan_cleanup_days
-        .max(0) as i64;
+    let settings = crate::config::settings::load_settings(&orch.config_dir);
+    let days = settings.orphan_cleanup_days.max(0) as i64;
     let cutoff = chrono::Utc::now().timestamp() - days * 24 * 60 * 60;
 
     // DB pass over EVERY open database — the private DB and each open team
@@ -76,6 +84,7 @@ pub(crate) async fn run_worktree_gc(orch: &Orchestrator) {
     }
 
     fs_pass(orch, cutoff).await;
+    repo_target_sweep(orch, settings.repo_target_sweep_days).await;
 }
 
 /// Plan DB-pass targets: distinct worktree paths of jobs whose issue is terminal
@@ -165,9 +174,31 @@ async fn fs_pass(orch: &Orchestrator, cutoff: i64) {
     // the incremental cache is regenerable scratch, and the only cost of a
     // too-eager delete is one slower rebuild.
     let inc_cutoff = chrono::Utc::now().timestamp() - INCREMENTAL_MAX_IDLE_SECS;
-    let reclaimed = reclaim_incremental_caches(&base, inc_cutoff);
+    let inc_base = base.clone();
+    let reclaimed =
+        tokio::task::spawn_blocking(move || reclaim_incremental_caches(&inc_base, inc_cutoff))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("Worktree GC: incremental-cache reclaim task failed: {e}");
+                0
+            });
     if reclaimed > 0 {
         log::info!("Worktree GC: reclaimed {reclaimed} stale incremental cache dir(s)");
+    }
+
+    let target_cutoff = chrono::Utc::now().timestamp() - TARGET_SWEEP_MAX_IDLE_SECS;
+    let sweep_base = base.clone();
+    let (files, bytes) =
+        tokio::task::spawn_blocking(move || sweep_worktree_targets(&sweep_base, target_cutoff))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("Worktree GC: target sweep task failed: {e}");
+                (0, 0)
+            });
+    if files > 0 {
+        log::info!(
+            "Worktree GC: swept stale worktree target artifacts: {files} file(s), {bytes} byte(s) reclaimed"
+        );
     }
 }
 
@@ -179,6 +210,10 @@ async fn fs_pass(orch: &Orchestrator, cutoff: i64) {
 /// shorter than `orphan_cleanup_days` — the cache is regenerable scratch, not
 /// the agent's work.
 const INCREMENTAL_MAX_IDLE_SECS: i64 = 48 * 60 * 60;
+
+/// How long regenerable Cargo artifacts in surviving agent worktrees may sit
+/// unused before the target sweep reclaims them.
+const TARGET_SWEEP_MAX_IDLE_SECS: i64 = 14 * 24 * 60 * 60;
 
 /// Testable core of the incremental-cache reclaim: for every worktree dir under
 /// `base`, delete each `src-tauri/target/<profile>/incremental` directory idle
@@ -192,29 +227,167 @@ fn reclaim_incremental_caches(base: &Path, cutoff: i64) -> u32 {
     };
     let mut removed = 0u32;
     for wt in worktrees.flatten() {
-        let target = wt.path().join("src-tauri").join("target");
-        let profiles = match std::fs::read_dir(&target) {
-            Ok(e) => e,
-            Err(_) => continue, // no Rust target tree in this worktree
-        };
-        for profile in profiles.flatten() {
-            let inc = profile.path().join("incremental");
-            if !inc.is_dir() || !incremental_idle_before(&inc, cutoff) {
-                continue;
-            }
-            match std::fs::remove_dir_all(&inc) {
-                Ok(()) => {
-                    log::info!("Worktree GC: reclaimed incremental cache {}", inc.display());
-                    removed += 1;
+        let wt_path = wt.path();
+        if !wt_path.is_dir() {
+            continue;
+        }
+        for target in find_target_dirs(&wt_path) {
+            let profiles = match std::fs::read_dir(&target) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for profile in profiles.flatten() {
+                let inc = profile.path().join("incremental");
+                if !inc.is_dir() || !incremental_idle_before(&inc, cutoff) {
+                    continue;
                 }
-                Err(e) => log::warn!(
-                    "Worktree GC: failed to reclaim incremental cache {}: {e}",
-                    inc.display()
-                ),
+                match std::fs::remove_dir_all(&inc) {
+                    Ok(()) => {
+                        log::info!("Worktree GC: reclaimed incremental cache {}", inc.display());
+                        removed += 1;
+                    }
+                    Err(e) => log::warn!(
+                        "Worktree GC: failed to reclaim incremental cache {}: {e}",
+                        inc.display()
+                    ),
+                }
             }
         }
     }
     removed
+}
+
+/// Cargo target dirs under `root`, identified by the CACHEDIR.TAG marker cargo
+/// writes at target creation. Bounded breadth-first scan (depth <= 3), skipping
+/// hidden dirs and node_modules; a found target dir is not descended into.
+fn find_target_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
+
+    while let Some((dir, depth)) = queue.pop_front() {
+        if dir.join(CACHEDIR_TAG).is_file() {
+            out.push(dir);
+            continue;
+        }
+        if depth >= 3 {
+            continue;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "node_modules" || name.starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                queue.push_back((path, depth + 1));
+            }
+        }
+    }
+
+    out
+}
+
+fn sweep_worktree_targets(base: &Path, cutoff: i64) -> (u64, u64) {
+    let worktrees = match std::fs::read_dir(base) {
+        Ok(e) => e,
+        Err(_) => return (0, 0),
+    };
+    let mut total_files = 0;
+    let mut total_bytes = 0;
+    for wt in worktrees.flatten() {
+        let wt_path = wt.path();
+        if !wt_path.is_dir() {
+            continue;
+        }
+        for target in find_target_dirs(&wt_path) {
+            let (files, bytes) = sweep_target_dir(&target, cutoff);
+            if files > 0 {
+                log::info!(
+                    "Worktree GC: swept {}: {files} file(s), {bytes} byte(s) reclaimed",
+                    target.display()
+                );
+                total_files += files;
+                total_bytes += bytes;
+            }
+        }
+    }
+    (total_files, total_bytes)
+}
+
+/// Delete every file under `target` whose freshness (max of mtime and atime) is
+/// older than `cutoff`, then prune emptied directories bottom-up (keeping the
+/// target root itself). Never removes CACHEDIR.TAG. Does not follow symlinks; a
+/// stale symlink is removed as a file. Returns (files_removed, bytes_reclaimed).
+fn sweep_target_dir(target: &Path, cutoff: i64) -> (u64, u64) {
+    fn walk(dir: &Path, cutoff: i64, is_root: bool, totals: &mut (u64, u64)) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if metadata.file_type().is_dir() {
+                walk(&path, cutoff, false, totals);
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some(CACHEDIR_TAG) {
+                continue;
+            }
+            let Some(freshness) = freshness_secs(&metadata) else {
+                continue;
+            };
+            if freshness >= cutoff {
+                continue;
+            }
+            let bytes = metadata.len();
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    totals.0 += 1;
+                    totals.1 += bytes;
+                }
+                Err(e) => log::warn!(
+                    "Worktree GC: failed to remove stale target artifact {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+
+        if !is_root {
+            if let Ok(mut entries) = std::fs::read_dir(dir) {
+                if entries.next().is_none() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
+        }
+    }
+
+    let mut totals = (0, 0);
+    walk(target, cutoff, true, &mut totals);
+    totals
+}
+
+fn freshness_secs(metadata: &std::fs::Metadata) -> Option<i64> {
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    let accessed = metadata
+        .accessed()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    Some(accessed.map_or(modified, |a| modified.max(a)))
 }
 
 /// Whether an incremental dir has been idle since before `cutoff`: the newest of
@@ -333,6 +506,82 @@ fn is_canonical_instance(config_dir: &Path) -> bool {
     config_dir.file_name().and_then(|n| n.to_str()) == Some(".cairn")
 }
 
+async fn repo_target_sweep(orch: &Orchestrator, days: i32) {
+    let Some(cutoff) = repo_target_sweep_cutoff(days, chrono::Utc::now().timestamp()) else {
+        return;
+    };
+    if !is_canonical_instance(&orch.config_dir) {
+        log::debug!(
+            "Worktree GC: skipping repository target sweep on non-canonical instance {}",
+            orch.config_dir.display()
+        );
+        return;
+    }
+
+    let repo_roots = load_project_repo_paths(orch).await;
+    let (files, bytes) =
+        tokio::task::spawn_blocking(move || sweep_repo_targets(repo_roots, cutoff))
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("Worktree GC: repository target sweep task failed: {e}");
+                (0, 0)
+            });
+    if files > 0 {
+        log::info!(
+            "Worktree GC: swept stale repository target artifacts: {files} file(s), {bytes} byte(s) reclaimed"
+        );
+    }
+}
+
+fn repo_target_sweep_cutoff(days: i32, now: i64) -> Option<i64> {
+    (days > 0).then(|| now - days as i64 * 24 * 60 * 60)
+}
+
+fn sweep_repo_targets(repo_roots: Vec<PathBuf>, cutoff: i64) -> (u64, u64) {
+    let mut total_files = 0;
+    let mut total_bytes = 0;
+    for root in repo_roots {
+        for target in find_target_dirs(&root) {
+            let (files, bytes) = sweep_target_dir(&target, cutoff);
+            if files > 0 {
+                log::info!(
+                    "Worktree GC: swept repo target {}: {files} file(s), {bytes} byte(s) reclaimed",
+                    target.display()
+                );
+                total_files += files;
+                total_bytes += bytes;
+            }
+        }
+    }
+    (total_files, total_bytes)
+}
+
+async fn load_project_repo_paths(orch: &Orchestrator) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    for db in orch.db.all_dbs().await {
+        let rows: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT DISTINCT repo_path FROM projects WHERE repo_path IS NOT NULL",
+                            (),
+                        )
+                        .await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push(row.text(0)?);
+                    }
+                    Ok(out)
+                })
+            })
+            .await
+            .unwrap_or_default();
+        roots.extend(rows.iter().map(|p| path_key(Path::new(p))));
+    }
+    roots.into_iter().collect()
+}
+
 /// Every worktree path any job row references, canonicalized for symlink-stable
 /// comparison. A directory in this set is owned by a job and off-limits to the
 /// filesystem pass. Unions across the private DB **and every open team replica**
@@ -401,6 +650,9 @@ fn emit_jobs_change(orch: &Orchestrator) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filetime::FileTime;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use turso::params;
 
     async fn migrated_db() -> LocalDb {
@@ -506,6 +758,25 @@ mod tests {
         chrono::Utc::now().timestamp() + 24 * 60 * 60
     }
 
+    fn target_dir(path: &Path) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join(CACHEDIR_TAG),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        path.to_path_buf()
+    }
+
+    fn set_file_times(path: &Path, atime: i64, mtime: i64) {
+        filetime::set_file_times(
+            path,
+            FileTime::from_unix_time(atime, 0),
+            FileTime::from_unix_time(mtime, 0),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn sweep_removes_unreferenced_dir() {
         let base = tempfile::tempdir().unwrap();
@@ -579,6 +850,118 @@ mod tests {
     }
 
     #[test]
+    fn sweep_target_dir_removes_stale_file_and_keeps_fresh_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = target_dir(&temp.path().join("target"));
+        let stale = target.join("debug/deps/libold.rlib");
+        let fresh = target.join("debug/deps/libfresh.rlib");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"old bytes").unwrap();
+        std::fs::write(&fresh, b"fresh").unwrap();
+        set_file_times(&stale, 10, 10);
+
+        let (files, bytes) = sweep_target_dir(&target, 100);
+
+        assert_eq!(files, 1);
+        assert_eq!(bytes, 9);
+        assert!(!stale.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn sweep_target_dir_keeps_cachedir_tag_even_when_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = target_dir(&temp.path().join("target"));
+        let marker = target.join(CACHEDIR_TAG);
+        set_file_times(&marker, 10, 10);
+
+        let (files, bytes) = sweep_target_dir(&target, 100);
+
+        assert_eq!((files, bytes), (0, 0));
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn sweep_target_dir_keeps_stale_mtime_when_atime_is_fresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = target_dir(&temp.path().join("target"));
+        let artifact = target.join("debug/deps/libhot.rlib");
+        std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        std::fs::write(&artifact, b"hot").unwrap();
+        set_file_times(&artifact, 1_000, 10);
+
+        let (files, bytes) = sweep_target_dir(&target, 100);
+
+        assert_eq!((files, bytes), (0, 0));
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn sweep_target_dir_prunes_emptied_dirs_but_keeps_target_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = target_dir(&temp.path().join("target"));
+        let stale = target.join("debug/.fingerprint/old/bin");
+        std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+        std::fs::write(&stale, b"x").unwrap();
+        set_file_times(&stale, 10, 10);
+
+        let (files, _) = sweep_target_dir(&target, future_cutoff());
+
+        assert_eq!(files, 1);
+        assert!(target.exists());
+        assert!(!target.join("debug").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_target_dir_removes_stale_symlink_without_following_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = target_dir(&temp.path().join("target"));
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(&external).unwrap();
+        let external_file = external.join("keep.txt");
+        std::fs::write(&external_file, b"keep").unwrap();
+        let link = target.join("debug/deps/external-link");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&external, &link).unwrap();
+
+        let (files, _) = sweep_target_dir(&target, future_cutoff());
+
+        assert_eq!(files, 1);
+        assert!(!link.exists());
+        assert!(external_file.exists());
+    }
+
+    #[test]
+    fn find_target_dirs_uses_marker_skip_rules_and_depth_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let root_target = target_dir(&root.join("target"));
+        let tauri_target = target_dir(&root.join("src-tauri/target"));
+        std::fs::create_dir_all(root.join("crate/target")).unwrap();
+        target_dir(&root.join("node_modules/pkg/target"));
+        target_dir(&root.join(".hidden/target"));
+        target_dir(&root.join("a/b/c/target"));
+
+        let mut found = find_target_dirs(root);
+        found.sort();
+        let mut expected = vec![root_target, tauri_target];
+        expected.sort();
+
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn repo_target_sweep_cutoff_is_none_when_disabled() {
+        assert_eq!(repo_target_sweep_cutoff(0, 10_000), None);
+        assert_eq!(repo_target_sweep_cutoff(-1, 10_000), None);
+        assert_eq!(
+            repo_target_sweep_cutoff(2, 10_000),
+            Some(10_000 - 2 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
     fn reclaim_removes_idle_incremental_dirs_only() {
         let base = tempfile::tempdir().unwrap();
         let debug = base.path().join("CAIRN-5-builder-0/src-tauri/target/debug");
@@ -588,6 +971,12 @@ mod tests {
         std::fs::create_dir_all(debug.join("incremental")).unwrap();
         std::fs::create_dir_all(debug.join("deps")).unwrap();
         std::fs::create_dir_all(release.join("incremental")).unwrap();
+        std::fs::write(
+            base.path()
+                .join("CAIRN-5-builder-0/src-tauri/target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
 
         let removed = reclaim_incremental_caches(base.path(), future_cutoff());
         assert_eq!(removed, 2, "one per profile dir");
@@ -604,6 +993,12 @@ mod tests {
             .path()
             .join("CAIRN-6-builder-0/src-tauri/target/debug/incremental");
         std::fs::create_dir_all(&inc).unwrap();
+        std::fs::write(
+            base.path()
+                .join("CAIRN-6-builder-0/src-tauri/target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
 
         // cutoff at the epoch: nothing is idle before it, so a fresh cache stays.
         assert_eq!(reclaim_incremental_caches(base.path(), 0), 0);
@@ -621,6 +1016,12 @@ mod tests {
             .join("CAIRN-7-builder-0/src-tauri/target/debug/incremental");
         let crate_dir = inc.join("cairn_core-abc123");
         std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::write(
+            base.path()
+                .join("CAIRN-7-builder-0/src-tauri/target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
         // Age the top dir well past any cutoff; the crate subdir stays fresh.
         filetime::set_file_mtime(&inc, filetime::FileTime::from_unix_time(1, 0)).unwrap();
 

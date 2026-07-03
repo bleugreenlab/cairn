@@ -49,12 +49,8 @@ use std::time::Instant;
 
 use cairn_common::uri::build_node_checks_uri;
 
-use crate::execution::cache::{
-    get_check_result, list_check_results, store_check_result, CheckResultCacheWrite,
-};
-use crate::execution::check_parsers::{
-    format_failure_excerpt, format_failure_names, parse_check_output, ParsedCheckResult,
-};
+use crate::execution::cache::{get_check_result, store_check_result, CheckResultCacheWrite};
+use crate::execution::check_parsers::parse_check_output;
 use crate::execution::checks::{
     applicable_turn_end_checks, input_hash_for, load_live_project_checks,
 };
@@ -196,6 +192,8 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
                         output_tail: entry.output_tail,
                         duration_ms: entry.duration_ms,
                         target_results_json: entry.target_results_json,
+                        job_id: Some(job_id.to_string()),
+                        cached: Some(true),
                     },
                 );
             }
@@ -225,6 +223,10 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
     // so the PR-node / `/checks` render can tail it live while checks run.
     let log_path = turn_end_log_path(orch, job_id);
     prepare_log(&log_path);
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "check_result_cache", "action": "update"}),
+    );
 
     // 9. Run each remaining check UNSANDBOXED, capturing to the cache and log.
     let mut any_failed = false;
@@ -265,6 +267,8 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
                 output_tail: tail(&output, OUTPUT_TAIL_CHARS),
                 duration_ms,
                 target_results_json,
+                job_id: Some(job_id.to_string()),
+                cached: Some(false),
             },
         );
         if !passed {
@@ -359,116 +363,91 @@ fn short_id(job_id: &str) -> &str {
 /// callers omit the section entirely. Shared by the PR-node view and the `/checks`
 /// read projection.
 pub async fn render_turn_end_checks_section(orch: &Orchestrator, job_id: &str) -> Option<String> {
-    let coords = resolve_job_coords(&orch.db.local, job_id)
-        .await
-        .ok()
-        .flatten()?;
-    let worktree_path = coords.worktree_path.clone().filter(|p| !p.is_empty())?;
-    let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-    // The cache is keyed by the sealed tree identity; resolve it from the live
-    // worktree (best-effort — a torn-down worktree yields no section for now).
-    let tree_hash = sealed_tree_hash(&jj, Path::new(&worktree_path)).ok()?;
-    let rows = list_check_results(orch.db.local.clone(), &coords.project_id, &tree_hash).ok()?;
-    let in_flight = orch.turn_end_checks_in_flight(job_id);
-    let tuples: Vec<CheckRow> = rows
-        .into_iter()
-        .map(|r| CheckRow {
-            name: r.check_name,
-            passed: r.passed,
-            duration_ms: r.duration_ms,
-            output_tail: r.output_tail,
-            target_results_json: r.target_results_json,
-        })
-        .collect();
-    let log_tail = if in_flight {
-        read_log_tail(orch, job_id, LOG_TAIL_CHARS)
-    } else {
-        None
-    };
-    format_checks_section(in_flight, log_tail.as_deref(), &tuples)
-}
-
-/// One rendered check row (name + verdict + duration + failure output tail +
-/// the persisted structured per-test detail, when present).
-struct CheckRow {
-    name: String,
-    passed: bool,
-    duration_ms: i64,
-    output_tail: String,
-    target_results_json: Option<String>,
+    let statuses = crate::execution::checks_status::node_check_statuses(orch, job_id).await?;
+    format_checks_section(&statuses)
 }
 
 /// Pure renderer for the `### Systematic checks` section. Returns `None` when the
-/// section would be empty (not running and no cached rows). Split out so the
-/// running vs. cached-verdict states are unit-tested without a DB or worktree.
+/// project has no configured checks. Split out so every status renders without a
+/// DB or worktree.
 fn format_checks_section(
-    in_flight: bool,
-    log_tail: Option<&str>,
-    rows: &[CheckRow],
+    statuses: &[crate::execution::checks_status::NodeCheckStatus],
 ) -> Option<String> {
-    if !in_flight && rows.is_empty() {
+    use crate::execution::checks_status::{
+        format_status_annotation, formatted_failure_names, NodeCheckState,
+    };
+    if statuses.is_empty() {
         return None;
     }
     let mut out = String::from("\n### Systematic checks\n\n");
-    if in_flight {
-        out.push_str("_running\u{2026}_\n");
-        if let Some(tail) = log_tail.filter(|t| !t.trim().is_empty()) {
-            out.push_str("\n```\n");
-            out.push_str(tail.trim_end());
-            out.push_str("\n```\n");
-        }
-    }
-    for row in rows {
-        if row.passed {
-            out.push_str(&format!(
-                "- \u{2713} {} ({}ms)\n",
-                row.name, row.duration_ms
-            ));
-            continue;
-        }
-        // Rehydrate the structured per-test detail (enrichment; the stored
-        // `passed` flag stays the authority for the verdict).
-        let parsed = row
-            .target_results_json
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<ParsedCheckResult>(s).ok());
-        match parsed.as_ref().and_then(format_failure_names) {
-            Some(names) => out.push_str(&format!(
-                "- \u{2717} {} \u{2014} {names} ({}ms)\n",
-                row.name, row.duration_ms
-            )),
-            None => out.push_str(&format!(
-                "- \u{2717} {} ({}ms)\n",
-                row.name, row.duration_ms
-            )),
-        }
-        let detail = format_failure_excerpt(parsed.as_ref(), row.output_tail.trim_end());
-        if !detail.trim().is_empty() {
-            out.push_str("\n```\n");
-            out.push_str(detail.trim_end());
-            out.push_str("\n```\n");
+    for status in statuses {
+        match status.state {
+            NodeCheckState::Passed => {
+                let annotation = format_status_annotation(status)
+                    .map(|a| format!(" ({a})"))
+                    .unwrap_or_default();
+                out.push_str(&format!("- \u{2713} {}{annotation}\n", status.name));
+            }
+            NodeCheckState::Failed => {
+                let annotation = format_status_annotation(status)
+                    .map(|a| format!(" \u{2014} {a}"))
+                    .or_else(|| formatted_failure_names(status).map(|n| format!(" \u{2014} {n}")))
+                    .unwrap_or_default();
+                out.push_str(&format!("- \u{2717} {}{annotation}\n", status.name));
+                if let Some(detail) = status
+                    .output_tail
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    out.push_str("\n```\n");
+                    out.push_str(detail.trim_end());
+                    out.push_str("\n```\n");
+                }
+            }
+            NodeCheckState::Running => {
+                out.push_str(&format!("- {}: _running\u{2026}_\n", status.name));
+                if let Some(tail) = status
+                    .output_tail
+                    .as_deref()
+                    .filter(|t| !t.trim().is_empty())
+                {
+                    out.push_str("\n```\n");
+                    out.push_str(tail.trim_end());
+                    out.push_str("\n```\n");
+                }
+            }
+            NodeCheckState::Pending => out.push_str(&format!("- {}: pending\n", status.name)),
+            NodeCheckState::AwaitingPr => {
+                out.push_str(&format!("- {}: awaiting PR\n", status.name));
+            }
+            NodeCheckState::NotApplicable => {
+                out.push_str(&format!("- {}: not applicable\n", status.name));
+            }
         }
     }
     Some(out)
 }
 
 /// The node's coordinates resolved from a `job_id` in one query.
-struct JobCoords {
-    project_id: String,
-    issue_id: String,
-    worktree_path: Option<String>,
-    base_branch: Option<String>,
-    base_commit: Option<String>,
-    project_key: String,
-    number: i32,
-    exec_seq: i32,
-    node_segment: String,
+pub(crate) struct JobCoords {
+    pub(crate) project_id: String,
+    pub(crate) issue_id: String,
+    pub(crate) worktree_path: Option<String>,
+    pub(crate) base_branch: Option<String>,
+    pub(crate) base_commit: Option<String>,
+    pub(crate) project_key: String,
+    pub(crate) number: i32,
+    pub(crate) exec_seq: i32,
+    pub(crate) node_segment: String,
 }
 
 /// Resolve everything the runner and renderer need from a `job_id`: the project
 /// and issue ids, the worktree path and base VCS anchors, and the
 /// project-key/number/exec-seq/node-segment that build the `/checks` URI.
-async fn resolve_job_coords(db: &LocalDb, job_id: &str) -> Result<Option<JobCoords>, String> {
+pub(crate) async fn resolve_job_coords(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<JobCoords>, String> {
     let job_id = job_id.to_string();
     db.read(|conn| {
         let job_id = job_id.clone();
@@ -524,13 +503,13 @@ fn prepare_log(path: &Path) {
 }
 
 /// Last `max_chars` chars of the job's log file, or `None` when it is missing/empty.
-fn read_log_tail(orch: &Orchestrator, job_id: &str, max_chars: usize) -> Option<String> {
+pub(crate) fn read_turn_end_log_tail(orch: &Orchestrator, job_id: &str) -> Option<String> {
     let content = std::fs::read_to_string(turn_end_log_path(orch, job_id)).ok()?;
     let trimmed = content.trim_end();
     if trimmed.is_empty() {
         return None;
     }
-    Some(tail(trimmed, max_chars))
+    Some(tail(trimmed, LOG_TAIL_CHARS))
 }
 
 /// Last `max_chars` characters of `s`, on a char boundary.
@@ -545,74 +524,73 @@ fn tail(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
 
-    fn row(name: &str, passed: bool, ms: i64, tail: &str) -> CheckRow {
-        CheckRow {
+    fn status(name: &str, state: NodeCheckState) -> NodeCheckStatus {
+        NodeCheckStatus {
             name: name.to_string(),
-            passed,
-            duration_ms: ms,
-            output_tail: tail.to_string(),
-            target_results_json: None,
+            state,
+            policy: "advisory".to_string(),
+            when: "write".to_string(),
+            cached: None,
+            duration_ms: Some(1234),
+            ran_at: Some(1),
+            passed: None,
+            failed: None,
+            skipped: None,
+            failure_names: Vec::new(),
+            output_tail: None,
         }
     }
 
     #[test]
-    fn section_is_none_when_idle_and_no_rows() {
-        assert!(format_checks_section(false, None, &[]).is_none());
+    fn section_is_none_when_no_configured_checks() {
+        assert!(format_checks_section(&[]).is_none());
     }
 
     #[test]
     fn section_renders_running_with_log_tail() {
-        let s = format_checks_section(true, Some("compiling...\nrunning tests"), &[]).unwrap();
+        let mut running = status("rust", NodeCheckState::Running);
+        running.output_tail = Some("compiling...\nrunning tests".to_string());
+        let s = format_checks_section(&[running]).unwrap();
         assert!(s.contains("### Systematic checks"));
-        assert!(s.contains("_running\u{2026}_"));
+        assert!(s.contains("rust: _running\u{2026}_"));
         assert!(s.contains("running tests"));
     }
 
     #[test]
     fn section_renders_running_without_a_log_yet() {
-        // In flight but the log is still empty: show the running state, no fence.
-        let s = format_checks_section(true, None, &[]).unwrap();
+        let s = format_checks_section(&[status("rust", NodeCheckState::Running)]).unwrap();
         assert!(s.contains("_running\u{2026}_"));
         assert!(!s.contains("```"));
     }
 
     #[test]
     fn section_renders_cached_verdicts_and_inlines_failure_output() {
-        let rows = [
-            row("rust", true, 12345, ""),
-            row("frontend", false, 2100, "assertion failed: left == right"),
-        ];
-        let s = format_checks_section(false, None, &rows).unwrap();
-        assert!(s.contains("\u{2713} rust (12345ms)"));
-        assert!(s.contains("\u{2717} frontend (2100ms)"));
-        // A failing check inlines its output tail; a passing one does not.
+        let mut passed = status("rust", NodeCheckState::Passed);
+        passed.passed = Some(12);
+        passed.failed = Some(0);
+        let mut failed = status("frontend", NodeCheckState::Failed);
+        failed.failed = Some(2);
+        failed.passed = Some(38);
+        failed.output_tail = Some("assertion failed: left == right".to_string());
+        let s = format_checks_section(&[passed, failed]).unwrap();
+        assert!(s.contains("\u{2713} rust (12 tests)"));
+        assert!(s.contains("\u{2717} frontend \u{2014} 2 of 40 failed"));
         assert!(s.contains("assertion failed: left == right"));
     }
 
     #[test]
-    fn section_renders_structured_failure_names() {
-        let json = serde_json::to_string(
-            &crate::execution::check_parsers::parse_check_output(
-                "bunx tsc --noEmit",
-                "a.ts(1,7): error TS2322: bad type",
-            )
-            .unwrap(),
-        )
+    fn section_renders_not_run_states() {
+        let s = format_checks_section(&[
+            status("review", NodeCheckState::AwaitingPr),
+            status("docs", NodeCheckState::NotApplicable),
+            status("lint", NodeCheckState::Pending),
+        ])
         .unwrap();
-        let rows = [CheckRow {
-            name: "typecheck".to_string(),
-            passed: false,
-            duration_ms: 900,
-            output_tail: "raw tail".to_string(),
-            target_results_json: Some(json),
-        }];
-        let s = format_checks_section(false, None, &rows).unwrap();
-        // The failing row leads with the structured name list...
-        assert!(s.contains("\u{2717} typecheck \u{2014} 1 failed: a.ts(1,7) (900ms)"));
-        // ...and inlines the composed failure message rather than the raw tail.
-        assert!(s.contains("TS2322: bad type"));
-        assert!(!s.contains("raw tail"));
+        assert!(s.contains("review: awaiting PR"));
+        assert!(s.contains("docs: not applicable"));
+        assert!(s.contains("lint: pending"));
     }
 
     #[test]
@@ -623,7 +601,6 @@ mod tests {
 
     #[test]
     fn green_rides_along_passively_red_wakes() {
-        // A clean run is delivered but never wakes an idle node; a failure rouses it.
         assert_eq!(delivery_wake(false), attention_push::Wake::Passive);
         assert_eq!(delivery_wake(true), attention_push::Wake::Wake);
     }

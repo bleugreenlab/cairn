@@ -1,7 +1,8 @@
 use super::app_server::AppServerClient;
 use super::auth::{refresh_codex_tokens_for_session, CodexAuthState};
 use super::events::{
-    build_codex_compaction_event, codex_rate_limit_snapshot_from_value, emit_streaming_delta,
+    build_codex_compaction_event, codex_rate_limit_snapshot_from_value,
+    emit_codex_command_complete, emit_codex_command_output_delta, emit_streaming_delta,
     extract_app_server_delta, extract_command_execution, extract_mcp_result,
     extract_raw_response_message_text, finalize_agent_message, finalize_streaming,
     handle_agent_message_delta, handle_codex_interrupted_turn, handle_reasoning_delta,
@@ -22,7 +23,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use crate::transcripts::stream_store::append_chunks;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -204,6 +205,7 @@ impl CodexBackend {
         let mut pending_usage: Option<Usage> = None;
         let mut last_direct_assistant_text: Option<String> = None;
         let mut pending_tool_ids: HashSet<String> = HashSet::new();
+        let mut tool_output_chars: HashMap<String, i32> = HashMap::new();
         let mut terminal_tool_suspended = false;
         let progress_watchdog = Arc::new(Mutex::new(CodexTurnProgressWatchdog::new(
             CODEX_TURN_NO_PROGRESS_TIMEOUT,
@@ -724,6 +726,10 @@ impl CodexBackend {
                                 let (result_text, is_error) = summarize_command_result(
                                     msg.pointer("/params/item").unwrap_or(&Value::Null),
                                 );
+                                if let Some(id) = tool_use_id.as_deref() {
+                                    let output_chars = tool_output_chars.remove(id);
+                                    emit_codex_command_complete(emitter, run_id, id, output_chars);
+                                }
                                 let event = codex_tool_result_event(
                                     session_id.clone(),
                                     tool_use_id.clone(),
@@ -1013,7 +1019,7 @@ impl CodexBackend {
                         orch.store_provider_usage_snapshot(snapshot);
                     }
                 }
-                Some("item/commandExecution/outputDelta") | Some("item/fileChange/outputDelta") => {
+                Some("item/commandExecution/outputDelta") => {
                     let delta = msg
                         .pointer("/params/delta")
                         .and_then(|v| v.as_str())
@@ -1022,17 +1028,19 @@ impl CodexBackend {
                         .pointer("/params/itemId")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    if !delta.is_empty() && !item_id.is_empty() {
-                        let _ = emitter.emit(
-                            "tool-output-delta",
-                            serde_json::json!({
-                                "run_id": run_id,
-                                "tool_use_id": item_id,
-                                "delta": delta,
-                            }),
-                        );
+                    let output_chars = if item_id.is_empty() {
+                        0
+                    } else {
+                        let count = tool_output_chars.entry(item_id.to_string()).or_insert(0);
+                        *count += delta.chars().count() as i32;
+                        *count
+                    };
+                    emit_codex_command_output_delta(emitter, run_id, item_id, delta, output_chars);
+                    if let Ok(mut watchdog) = progress_watchdog.lock() {
+                        watchdog.record_forward_progress(Instant::now());
                     }
                 }
+                Some("item/fileChange/outputDelta") => {}
                 Some("serverRequest/resolved")
                 | Some("turn/diff/updated")
                 | Some("item/plan/delta")

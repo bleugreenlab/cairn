@@ -38,6 +38,10 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         "- orphanCleanupDays: {}\n",
         settings.orphan_cleanup_days
     ));
+    out.push_str(&format!(
+        "- repoTargetSweepDays: {}\n",
+        settings.repo_target_sweep_days
+    ));
     out.push_str(&format!("- bugReports: {}\n", yes_no(settings.bug_reports)));
     out.push_str(&format!(
         "- thinkingDisplayMode: {:?}\n",

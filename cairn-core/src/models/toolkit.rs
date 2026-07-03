@@ -47,6 +47,7 @@ pub const ALWAYS_DISALLOWED_TOOLS: &[&str] = &[
     "TaskStop",
     "PushNotification",
     "SendMessage",
+    "ReportFindings",
     "DesignSync",
     "Workflow",
 ];
