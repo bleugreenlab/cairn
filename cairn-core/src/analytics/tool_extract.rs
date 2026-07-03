@@ -1,8 +1,9 @@
 //! Pure event -> tool-invocation extraction and URI-shape classification.
 //!
 //! No DB, no I/O: [`extract_run_invocations`] takes a run's reconstructed events
-//! and returns one [`ToolInvocation`] per tool use, with `is_error` linked from
-//! the matching `tool_result` event (by tool-use id). Shared by the backfill and
+//! and returns one [`ToolInvocation`] per tool use, with `is_error` and
+//! `result_ts` linked from the matching `tool_result` event (by tool-use id).
+//! Shared by the backfill and
 //! unit-tested in isolation.
 //!
 //! "Target shape" is the tuple (verb, scheme, kind) parsed from a tool's target:
@@ -33,6 +34,7 @@ pub struct ToolInvocation {
     pub target_kind: String,
     pub target_path: Option<String>,
     pub is_error: bool,
+    pub result_ts: Option<i64>,
 }
 
 impl ToolInvocation {
@@ -47,16 +49,17 @@ impl ToolInvocation {
 /// Two passes, composed from the per-event primitives so the run-level backfill
 /// and the per-event live maintenance share one extraction/classification path:
 /// first [`tool_result_error`] over every `tool_result` event builds the
-/// tool-use-id -> is_error map, then [`extract_event_invocations`] over every
-/// assistant event yields the rows (is_error linked from the map).
+/// tool-use-id -> (is_error, result timestamp) map, then
+/// [`extract_event_invocations`] over every assistant event yields the rows
+/// (result fields linked from the map).
 pub fn extract_run_invocations(events: &[Event]) -> Vec<ToolInvocation> {
-    let mut errors: HashMap<String, bool> = HashMap::new();
+    let mut results: HashMap<String, (bool, i64)> = HashMap::new();
     for event in events {
         if event.event_type != "tool_result" {
             continue;
         }
         if let Some((id, is_error)) = tool_result_error(&event.data) {
-            errors.insert(id, is_error);
+            results.insert(id, (is_error, event.created_at));
         }
     }
 
@@ -68,7 +71,10 @@ pub fn extract_run_invocations(events: &[Event]) -> Vec<ToolInvocation> {
         for mut row in
             extract_event_invocations(&event.id, &event.run_id, event.created_at, &event.data)
         {
-            row.is_error = errors.get(&row.tool_use_id).copied().unwrap_or(false);
+            if let Some((is_error, result_ts)) = results.get(&row.tool_use_id).copied() {
+                row.is_error = is_error;
+                row.result_ts = Some(result_ts);
+            }
             out.push(row);
         }
     }
@@ -108,6 +114,7 @@ pub fn extract_event_invocations(
             target_kind: kind,
             target_path: path,
             is_error: false,
+            result_ts: None,
         });
     }
     out
@@ -476,9 +483,20 @@ mod tests {
                 "isError": true,
             }),
         );
+        let mut result = result;
+        result.created_at = 140;
         let rows = extract_run_invocations(&[assistant, result]);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].is_error);
+        assert_eq!(rows[0].result_ts, Some(140));
+    }
+
+    #[test]
+    fn unmatched_tool_use_has_no_result_timestamp() {
+        let assistant = assistant_with_tool("u-missing", "read", json!({ "paths": ["file:x.rs"] }));
+        let rows = extract_run_invocations(&[assistant]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].result_ts, None);
     }
 
     #[test]

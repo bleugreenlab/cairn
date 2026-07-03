@@ -16,10 +16,11 @@ use std::collections::HashMap;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
 pub use types::{
-    BackendCostPoint, Bucket, CostPoint, EconomicsRow, EffectiveCostPoint, HeatmapCell,
-    ModelRoleEconomics, ProjectCost, Scope, TargetBreakdown, TargetShapeRow, TimeRange,
-    TokenCompositionPoint, TokensPerLocPoint, TokensPerSessionPoint, ToolBackfillSummary,
-    ToolCallsPerSessionPoint, ToolErrorRatePoint, ToolMixPoint, TopTargetRow,
+    BackendCostPoint, Bucket, CommandDurationRow, CostPoint, EconomicsRow, EffectiveCostPoint,
+    HeatmapCell, ModelRoleEconomics, ProjectCost, Scope, SessionDurationPoint, TargetBreakdown,
+    TargetShapeRow, TimeCompositionPoint, TimeRange, TokenCompositionPoint, TokensPerLocPoint,
+    TokensPerSessionPoint, ToolBackfillSummary, ToolCallsPerSessionPoint, ToolErrorRatePoint,
+    ToolMixPoint, ToolTimeMixPoint, TopTargetRow,
 };
 
 /// Average billable tokens per session, bucketed by the session's first event.
@@ -723,6 +724,90 @@ pub async fn tool_mix(
         .collect())
 }
 
+/// Completed run wall-time composition: tool execution vs model generation plus
+/// orchestration overhead. The remainder deliberately includes permission waits
+/// and other in-run overhead, so callers should label it "model + overhead".
+pub async fn time_composition(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<TimeCompositionPoint>> {
+    let rows = queries::time_composition(db, scope, range, bucket).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TimeCompositionPoint {
+            bucket_start: r.bucket_start,
+            wall_s: r.wall_s,
+            tool_s: r.tool_s,
+            model_overhead_s: r.model_overhead_s,
+            run_count: r.run_count,
+        })
+        .collect())
+}
+
+/// Tool execution seconds by verb over time.
+pub async fn tool_time_mix(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<ToolTimeMixPoint>> {
+    let rows = queries::tool_time_mix(db, scope, range, bucket).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| ToolTimeMixPoint {
+            bucket_start: r.bucket_start,
+            verb: r.verb,
+            seconds: r.seconds,
+            count: r.count,
+        })
+        .collect())
+}
+
+/// Slowest target shapes by total tool-execution time.
+pub async fn command_durations(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    limit: i64,
+) -> DbResult<Vec<CommandDurationRow>> {
+    let rows = queries::command_durations(db, scope, range, limit).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| CommandDurationRow {
+            verb: r.verb,
+            scheme: r.scheme,
+            kind: r.kind,
+            target: r.target,
+            count: r.count,
+            total_s: r.total_s,
+            avg_s: r.avg_s,
+            max_s: r.max_s,
+            error_count: r.error_count,
+        })
+        .collect())
+}
+
+/// Average active work time per session over time. Session duration is the sum
+/// of completed run wall time in the selected range.
+pub async fn session_durations(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<SessionDurationPoint>> {
+    let rows = queries::session_durations(db, scope, range, bucket).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SessionDurationPoint {
+            bucket_start: r.bucket_start,
+            session_count: r.session_count,
+            avg_s: r.avg_s,
+        })
+        .collect())
+}
+
 /// Token/cost accumulator for one grouping key.
 #[derive(Default)]
 struct Acc {
@@ -1062,6 +1147,191 @@ mod tests {
             .top_targets
             .iter()
             .any(|t| t.target == "src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn tool_backfill_populates_result_timestamps() {
+        let db = fixture_db().await;
+        db.execute_script(
+            r#"
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-result-ts', 'proj', 'job-claude', 'exited', 'sess-claude', 1, 1);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+             VALUES ('rt-a', 'run-result-ts', 'sess-claude', 1, 1, 'assistant',
+                '{"eventType":"assistant","isError":false,"toolUses":[{"id":"rtu","name":"read","input":{"paths":["file:src/lib.rs"]}}]}',
+                NULL, 91000);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+             VALUES ('rt-r', 'run-result-ts', 'sess-claude', 2, 2, 'tool_result',
+                '{"eventType":"tool_result","toolUseId":"rtu","toolName":"read","toolResult":"ok","isError":false}',
+                'rtu', 91012);
+            "#,
+        )
+        .await
+        .unwrap();
+
+        backfill_tool_invocations(&db).await.unwrap();
+        let result_ts = db
+            .query_one(
+                "SELECT result_ts FROM tool_invocations WHERE tool_use_id = 'rtu'",
+                (),
+                |row| row.opt_i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result_ts, Some(91012));
+    }
+
+    #[tokio::test]
+    async fn live_tool_maintenance_sets_result_timestamp() {
+        let db = fixture_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                queries::maintain_rollups_on_insert(
+                    conn,
+                    "live-a",
+                    "run-claude",
+                    92000,
+                    "assistant",
+                    r#"{"eventType":"assistant","isError":false,"toolUses":[{"id":"live-tu","name":"run","input":{"commands":[{"command":"cargo test"}]}}]}"#,
+                    None,
+                )
+                .await?;
+                queries::maintain_rollups_on_insert(
+                    conn,
+                    "live-r",
+                    "run-claude",
+                    92009,
+                    "tool_result",
+                    r#"{"eventType":"tool_result","toolUseId":"live-tu","toolName":"run","toolResult":"ok","isError":true}"#,
+                    None,
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let row = db
+            .query_one(
+                "SELECT is_error, result_ts FROM tool_invocations WHERE tool_use_id = 'live-tu'",
+                (),
+                |row| Ok((row.i64(0)?, row.opt_i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row, (1, Some(92009)));
+    }
+
+    #[tokio::test]
+    async fn duration_queries_aggregate_tool_and_session_time() {
+        let db = fixture_db().await;
+        db.execute_script(
+            r#"
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sess-duration-a', 'job-claude', 'claude', 'open', 10, 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sess-duration-b', 'job-claude', 'claude', 'open', 11, 1, 1);
+            INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES ('sess-overrun', 'job-claude', 'claude', 'open', 12, 1, 1);
+
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, started_at, exited_at, updated_at)
+             VALUES ('run-duration-a', 'proj', 'job-claude', 'exited', 'sess-duration-a', 1, 90000, 90100, 90100);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, started_at, exited_at, updated_at)
+             VALUES ('run-duration-b', 'proj', 'job-claude', 'exited', 'sess-duration-b', 1, 90020, 90040, 90040);
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, started_at, exited_at, updated_at)
+             VALUES ('run-overrun', 'proj', 'job-claude', 'exited', 'sess-overrun', 1, 200000, 200010, 200010);
+
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, parent_tool_use_id, created_at)
+             VALUES ('dur-a1', 'run-duration-a', 'sess-duration-a', 1, 1, 'assistant',
+                '{"eventType":"assistant","isError":false,"toolUses":[{"id":"dur-read","name":"read","input":{"paths":["file:src/lib.rs"]}},{"id":"dur-run","name":"run","input":{"commands":[{"command":"cargo test"}]}}]}',
+                NULL, 90010);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, parent_tool_use_id, created_at)
+             VALUES ('dur-r1', 'run-duration-a', 'sess-duration-a', 2, 2, 'tool_result',
+                '{"eventType":"tool_result","toolUseId":"dur-read","toolName":"read","toolResult":"ok","isError":false}',
+                'dur-read', 90040);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, parent_tool_use_id, created_at)
+             VALUES ('dur-r2', 'run-duration-a', 'sess-duration-a', 3, 3, 'tool_result',
+                '{"eventType":"tool_result","toolUseId":"dur-run","toolName":"run","toolResult":"ok","isError":true}',
+                'dur-run', 90050);
+
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, parent_tool_use_id, created_at)
+             VALUES ('over-a1', 'run-overrun', 'sess-overrun', 1, 1, 'assistant',
+                '{"eventType":"assistant","isError":false,"toolUses":[{"id":"over-run","name":"run","input":{"commands":[{"command":"sleep 20"}]}}]}',
+                NULL, 200000);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, parent_tool_use_id, created_at)
+             VALUES ('over-r1', 'run-overrun', 'sess-overrun', 2, 2, 'tool_result',
+                '{"eventType":"tool_result","toolUseId":"over-run","toolName":"run","toolResult":"ok","isError":false}',
+                'over-run', 200020);
+            "#,
+        )
+        .await
+        .unwrap();
+        backfill_tool_invocations(&db).await.unwrap();
+
+        let composition =
+            time_composition(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+                .await
+                .unwrap();
+        let first = composition
+            .iter()
+            .find(|p| p.bucket_start == 86400)
+            .expect("first duration bucket");
+        assert_eq!(first.wall_s, 120);
+        assert_eq!(first.tool_s, 70);
+        assert_eq!(first.model_overhead_s, 50);
+        assert_eq!(first.run_count, 2);
+        let clamped = composition
+            .iter()
+            .find(|p| p.bucket_start == 172800)
+            .expect("overrun bucket");
+        assert_eq!(clamped.wall_s, 10);
+        // Composition caps summed tool-call time to the completed run wall time,
+        // so concurrent or late result spans cannot make the headline chart
+        // exceed 100%. Per-verb and command-duration queries below still report
+        // raw per-call durations.
+        assert_eq!(clamped.tool_s, 10);
+        assert_eq!(clamped.model_overhead_s, 0);
+
+        let mix = tool_time_mix(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+            .await
+            .unwrap();
+        let read = mix
+            .iter()
+            .find(|p| p.bucket_start == 86400 && p.verb == "read")
+            .expect("read time mix");
+        assert_eq!(read.seconds, 30);
+        assert_eq!(read.count, 1);
+        let run = mix
+            .iter()
+            .find(|p| p.bucket_start == 86400 && p.verb == "run")
+            .expect("run time mix");
+        assert_eq!(run.seconds, 40);
+
+        let commands = command_durations(&db, &Scope::default(), &TimeRange::default(), 10)
+            .await
+            .unwrap();
+        let cargo = commands
+            .iter()
+            .find(|row| row.verb == "run" && row.kind == "cargo")
+            .expect("cargo command duration");
+        assert_eq!(cargo.total_s, 40);
+        assert_eq!(cargo.max_s, 40);
+        assert_eq!(cargo.error_count, 1);
+        assert!((cargo.avg_s - 40.0).abs() < 1e-9);
+
+        let sessions =
+            session_durations(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+                .await
+                .unwrap();
+        let first_sessions = sessions
+            .iter()
+            .find(|p| p.bucket_start == 86400)
+            .expect("session duration bucket");
+        assert_eq!(first_sessions.session_count, 2);
+        assert!((first_sessions.avg_s - 60.0).abs() < 1e-9);
     }
 
     #[tokio::test]

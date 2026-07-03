@@ -935,7 +935,6 @@ impl CodexBackend {
                         "interrupted" | "replaced" | "review_ended" => {
                             log::info!("codex turn aborted ({}), handling interrupt", reason);
                             handle_codex_interrupted_turn(orch, &run_db, emitter, run_id);
-                            client.shutdown();
                         }
                         _ => {
                             insert_error_event(

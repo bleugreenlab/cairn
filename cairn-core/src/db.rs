@@ -102,15 +102,16 @@ pub struct DbState {
     /// The host-installed rotating sync-token minter, set once via
     /// `set_team_token_minter` BEFORE any production team opens. When present,
     /// `open_team` builds the replica with a per-request token callback; when
-    /// absent (every test, the headless server, local-only installs), it uses
-    /// the static/unauthenticated `TeamConfig::auth_token` path unchanged.
+    /// absent (focused tests and local-only hosts that intentionally skip
+    /// installation), it uses the static/unauthenticated `TeamConfig::auth_token`
+    /// path unchanged.
     team_token_minter: RwLock<Option<Arc<dyn TeamTokenMinter>>>,
     /// The host-installed content-store factory, set once via
     /// `set_content_store_factory` alongside the token minter. When present,
     /// `open_team` attaches a per-team [`ContentStore`] to the replica so its
-    /// archival offloads/fetches reach the shared store; when absent (tests, the
-    /// headless server, local-only installs) a team replica carries no store and
-    /// behaves exactly as before.
+    /// archival offloads/fetches reach the shared store; when absent (focused
+    /// tests and local-only hosts that intentionally skip installation) a team
+    /// replica carries no store and behaves exactly as before.
     ///
     /// [`ContentStore`]: crate::archival::store::ContentStore
     content_store_factory: RwLock<Option<Arc<dyn ContentStoreFactory>>>,
@@ -145,6 +146,16 @@ impl DbState {
     /// it unset preserves the storeless team-replica path.
     pub async fn set_content_store_factory(&self, factory: Arc<dyn ContentStoreFactory>) {
         *self.content_store_factory.write().await = Some(factory);
+    }
+
+    /// Returns whether the host installed the rotating sync-token minter.
+    pub async fn has_team_token_minter(&self) -> bool {
+        self.team_token_minter.read().await.is_some()
+    }
+
+    /// Returns whether the host installed the per-team content-store factory.
+    pub async fn has_content_store_factory(&self) -> bool {
+        self.content_store_factory.read().await.is_some()
     }
 
     /// Normalizes a project key the same way `lookup_project_by_key` does (upper

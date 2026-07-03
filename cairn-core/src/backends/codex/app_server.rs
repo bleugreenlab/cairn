@@ -122,6 +122,29 @@ impl AppServerClient {
         self.child.clone()
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_scripted(
+        responses: Vec<Result<Value, String>>,
+        requests: Arc<Mutex<Vec<Value>>>,
+    ) -> Self {
+        let (_notif_tx, notif_rx) = unbounded();
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let writer = ScriptedAppServerWriter {
+            pending: pending.clone(),
+            responses: Arc::new(Mutex::new(std::collections::VecDeque::from(responses))),
+            requests,
+            buffer: Vec::new(),
+        };
+
+        Self {
+            child: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(Some(Box::new(writer)))),
+            next_id: Arc::new(Mutex::new(1)),
+            pending,
+            notification_rx: notif_rx,
+        }
+    }
+
     pub fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = {
             let mut guard = self
@@ -184,10 +207,11 @@ impl AppServerClient {
         }))
     }
 
-    /// Force the app-server transport closed. This is intentionally stronger
-    /// than `turn/interrupt`: Codex can acknowledge an interrupt while its
-    /// upstream response stream continues producing deltas, so callers that are
-    /// aborting a turn use this to tear down stdout/stdin and the child process.
+    /// Force the app-server transport closed.
+    ///
+    /// Normal user Stop uses `turn/interrupt`, which hard-aborts the active turn
+    /// while preserving the app-server for a warm follow-up. Reserve shutdown for
+    /// hard teardown paths such as crashes, watchdog expiry, and session eviction.
     pub fn shutdown(&self) {
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.take();
@@ -209,6 +233,64 @@ impl AppServerClient {
             .ok_or_else(|| "Codex stdin unavailable".to_string())?;
         let line = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
         writeln!(writer, "{}", line).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+struct ScriptedAppServerWriter {
+    pending: Arc<Mutex<PendingMap>>,
+    responses: Arc<Mutex<std::collections::VecDeque<Result<Value, String>>>>,
+    requests: Arc<Mutex<Vec<Value>>>,
+    buffer: Vec<u8>,
+}
+
+#[cfg(test)]
+impl ScriptedAppServerWriter {
+    fn process_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        let request: Value = serde_json::from_slice(line).map_err(std::io::Error::other)?;
+        self.requests.lock().unwrap().push(request.clone());
+        let id = request
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| std::io::Error::other("scripted request missing id"))?;
+        let tx = self
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .ok_or_else(|| std::io::Error::other("scripted request had no pending waiter"))?;
+        let response = self
+            .responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err("scripted app-server response missing".to_string()));
+        let _ = tx.send(response);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Write for ScriptedAppServerWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.buffer.drain(..=newline).collect();
+            if line.ends_with(b"\n") {
+                line.pop();
+            }
+            if line.ends_with(b"\r") {
+                line.pop();
+            }
+            if !line.is_empty() {
+                self.process_line(&line)?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

@@ -619,6 +619,13 @@ pub async fn create_job_terminal(
         slug: Some(slug.clone()),
     };
     insert_terminal(orch.db.local.clone(), terminal.clone()).await?;
+    // Surface the new terminal to connected UIs. The desktop's parallel
+    // create path emits its own insert; this covers the runner invoke surface,
+    // which mirrors commands through here.
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table":"job_terminals","action":"insert"}),
+    );
     hydrate_watchers(orch, &job_id, &slug, &started.output_watchers).await;
     let cleanup_orch = orch.clone();
     let sid = started.session_id.clone();
@@ -813,6 +820,11 @@ pub async fn create_project_terminal(
         slug: Some(slug),
     };
     insert_terminal(orch.db.local.clone(), terminal.clone()).await?;
+    // Surface the new terminal to connected UIs (see create_job_terminal).
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table":"job_terminals","action":"insert"}),
+    );
     emit_reader_events(
         orch.services.clone(),
         started.reader,

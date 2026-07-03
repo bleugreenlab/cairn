@@ -1,4 +1,110 @@
 use super::{DbError, DbResult, LocalDb, RowExt};
+use turso::Connection;
+
+/// Outcome of reading every `PRAGMA integrity_check` row.
+#[derive(Debug, PartialEq, Eq)]
+enum IntegrityStatus {
+    Ok,
+    /// Every failure was `wrong # of entries in index <name>` and is recoverable
+    /// by rebuilding the named indexes from their recorded DDL.
+    IndexDrift(Vec<String>),
+    /// At least one failure is something other than benign index-entry drift.
+    Corrupt(Vec<String>),
+}
+
+const INDEX_DRIFT_PREFIX: &str = "wrong # of entries in index ";
+
+/// Classify the raw `integrity_check` rows. `ok` only means a single `ok` row.
+fn classify_integrity(rows: Vec<String>) -> IntegrityStatus {
+    if rows.len() == 1 && rows[0] == "ok" {
+        return IntegrityStatus::Ok;
+    }
+
+    let mut drifted = Vec::new();
+    for msg in &rows {
+        match msg.strip_prefix(INDEX_DRIFT_PREFIX) {
+            Some(name) if !name.is_empty() => drifted.push(name.to_string()),
+            _ => return IntegrityStatus::Corrupt(rows),
+        }
+    }
+
+    IntegrityStatus::IndexDrift(drifted)
+}
+
+async fn read_integrity_check(conn: &Connection) -> DbResult<IntegrityStatus> {
+    let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(row.text(0)?);
+    }
+
+    if out.is_empty() {
+        return Err(DbError::Row("integrity_check returned no rows".to_string()));
+    }
+
+    Ok(classify_integrity(out))
+}
+
+/// Rebuild each named index from its recorded schema DDL.
+///
+/// Auto-created UNIQUE/PRIMARY KEY indexes have no stored `CREATE INDEX` SQL, so
+/// they cannot safely be dropped and recreated this way. Treat them as
+/// unrecoverable instead of silently skipping a named integrity failure.
+async fn rebuild_indexes(conn: &Connection, names: &[String]) -> DbResult<()> {
+    for name in names {
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                (name.as_str(),),
+            )
+            .await?;
+        let ddl = match rows.next().await? {
+            Some(row) => row.opt_text(0)?,
+            None => None,
+        };
+        drop(rows);
+
+        let Some(ddl) = ddl else {
+            return Err(DbError::Migration(format!(
+                "cannot rebuild index {name}: no recorded CREATE INDEX DDL (auto-index or missing)"
+            )));
+        };
+
+        conn.execute(
+            &format!("DROP INDEX IF EXISTS \"{}\"", name.replace('"', "\"\"")),
+            (),
+        )
+        .await?;
+        conn.execute_batch(&ddl).await?;
+    }
+
+    Ok(())
+}
+
+/// Best-effort, one-shot index-drift repair for a freshly imported database.
+///
+/// Returns the names of any rebuilt indexes. Errors only when a genuinely
+/// unrecoverable problem is found or a rebuild fails; import callers can log and
+/// continue so the normal migration path surfaces real corruption.
+pub async fn repair_index_entry_drift(db: &LocalDb) -> DbResult<Vec<String>> {
+    let conn = db.connect().await?;
+    match read_integrity_check(&conn).await? {
+        IntegrityStatus::Ok => Ok(Vec::new()),
+        IntegrityStatus::IndexDrift(names) => {
+            rebuild_indexes(&conn, &names).await?;
+            match read_integrity_check(&conn).await? {
+                IntegrityStatus::Ok => Ok(names),
+                other => Err(DbError::Migration(format!(
+                    "integrity_check still failing after index rebuild: {other:?}"
+                ))),
+            }
+        }
+        IntegrityStatus::Corrupt(msgs) => Err(DbError::Migration(format!(
+            "integrity_check found non-index-drift corruption: {}",
+            msgs.join("; ")
+        ))),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
@@ -140,17 +246,32 @@ impl MigrationRunner {
             conn.execute("BEGIN", ()).await?;
             conn.execute_batch(migration.sql).await?;
 
-            let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
-            let status = rows
-                .next()
-                .await?
-                .ok_or_else(|| DbError::Row("integrity_check returned no rows".to_string()))?
-                .text(0)?;
-            drop(rows);
-            if status != "ok" {
-                return Err(DbError::Migration(format!(
-                    "{label} integrity_check failed: {status}"
-                )));
+            match read_integrity_check(&conn).await? {
+                IntegrityStatus::Ok => {}
+                IntegrityStatus::IndexDrift(names) => {
+                    log::warn!(
+                        "{label}: integrity_check reported index-entry drift on {names:?}; rebuilding those indexes and re-verifying"
+                    );
+                    rebuild_indexes(&conn, &names).await?;
+                    match read_integrity_check(&conn).await? {
+                        IntegrityStatus::Ok => {
+                            log::info!(
+                                "{label}: index rebuild cleared integrity_check ({names:?})"
+                            );
+                        }
+                        other => {
+                            return Err(DbError::Migration(format!(
+                                "{label} integrity_check still failing after index rebuild: {other:?}"
+                            )));
+                        }
+                    }
+                }
+                IntegrityStatus::Corrupt(msgs) => {
+                    return Err(DbError::Migration(format!(
+                        "{label} integrity_check failed: {}",
+                        msgs.join("; ")
+                    )));
+                }
             }
 
             conn.execute(
@@ -202,5 +323,131 @@ impl MigrationRunner {
             })
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::storage::TURSO_MIGRATIONS;
+
+    async fn test_db(name: &str) -> LocalDb {
+        let temp = tempdir().unwrap();
+        let path = temp.keep().join(name);
+        LocalDb::open(path).await.unwrap()
+    }
+
+    async fn index_sql(conn: &Connection, name: &str) -> DbResult<Option<String>> {
+        let mut rows = conn
+            .query(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                (name,),
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => row.opt_text(0),
+            None => Ok(None),
+        }
+    }
+
+    #[test]
+    fn classify_integrity_accepts_single_ok_row() {
+        assert_eq!(
+            classify_integrity(vec!["ok".to_string()]),
+            IntegrityStatus::Ok
+        );
+    }
+
+    #[test]
+    fn classify_integrity_collects_index_drift_rows() {
+        assert_eq!(
+            classify_integrity(vec![
+                "wrong # of entries in index idx_a".to_string(),
+                "wrong # of entries in index idx_b".to_string(),
+            ]),
+            IntegrityStatus::IndexDrift(vec!["idx_a".to_string(), "idx_b".to_string()])
+        );
+    }
+
+    #[test]
+    fn classify_integrity_rejects_mixed_index_and_non_index_failures() {
+        let rows = vec![
+            "wrong # of entries in index idx_a".to_string(),
+            "row 5 missing from index idx_b".to_string(),
+        ];
+        assert_eq!(
+            classify_integrity(rows.clone()),
+            IntegrityStatus::Corrupt(rows)
+        );
+    }
+
+    #[test]
+    fn classify_integrity_rejects_structural_corruption() {
+        let rows = vec!["*** in database main *** Page 42: btree corruption".to_string()];
+        assert_eq!(
+            classify_integrity(rows.clone()),
+            IntegrityStatus::Corrupt(rows)
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_indexes_round_trips_recorded_ddl_inside_transaction() {
+        let db = test_db("rebuild-index-round-trip.db").await;
+        let conn = db.connect().await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, updated_at INTEGER NOT NULL);
+             CREATE INDEX idx_items_updated_at ON items(updated_at);",
+        )
+        .await
+        .unwrap();
+
+        let before = index_sql(&conn, "idx_items_updated_at")
+            .await
+            .unwrap()
+            .unwrap();
+
+        conn.execute("BEGIN", ()).await.unwrap();
+        rebuild_indexes(&conn, &["idx_items_updated_at".to_string()])
+            .await
+            .unwrap();
+        let after = index_sql(&conn, "idx_items_updated_at")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            read_integrity_check(&conn).await.unwrap(),
+            IntegrityStatus::Ok
+        );
+        conn.execute("COMMIT", ()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebuild_indexes_errors_without_recorded_ddl() {
+        let db = test_db("rebuild-index-missing-ddl.db").await;
+        let conn = db.connect().await.unwrap();
+
+        let err = rebuild_indexes(&conn, &["idx_does_not_exist".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            DbError::Migration(message)
+                if message == "cannot rebuild index idx_does_not_exist: no recorded CREATE INDEX DDL (auto-index or missing)"
+        ));
+    }
+
+    #[tokio::test]
+    async fn repair_index_entry_drift_is_noop_on_clean_migrated_db() {
+        let db = test_db("repair-index-clean-migrated.db").await;
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+
+        let rebuilt = repair_index_entry_drift(&db).await.unwrap();
+        assert!(rebuilt.is_empty());
     }
 }

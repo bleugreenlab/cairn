@@ -76,6 +76,20 @@ macro_rules! shared_tail_check_result_input_hash {
     };
 }
 
+/// CAIRN-2348: add result timestamps to the tool-invocation rollup so duration
+/// analytics can derive tool-call wall time from assistant/tool_result event
+/// pairs. `tool_invocations` and its watermark table are project-scoped shared
+/// tables, so this schema change is appended to both lineages.
+macro_rules! shared_tail_tool_invocation_durations {
+    () => {
+        Migration::new(
+            "0092",
+            "tool_invocation_durations",
+            include_str!("../../../../turso_migrations/0092_tool_invocation_durations.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -84,6 +98,7 @@ macro_rules! team_lineage {
             shared_tail_token_rollup_hourly!(),
             shared_tail_check_result_cache!(),
             shared_tail_check_result_input_hash!(),
+            shared_tail_tool_invocation_durations!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -148,6 +163,7 @@ macro_rules! private_lineage {
                     "../../../../turso_migrations/0091_drop_projects_server_id_and_servers.sql"
                 ),
             ),
+            shared_tail_tool_invocation_durations!(),
         ]
     };
 }

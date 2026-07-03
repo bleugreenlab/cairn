@@ -345,8 +345,8 @@ async fn maintain_tool_rollup_event(
             conn.execute(
                 "INSERT OR REPLACE INTO tool_invocations
                     (id, event_id, tool_use_id, run_id, ts, verb, tool_name,
-                     target_scheme, target_kind, target_path, is_error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     target_scheme, target_kind, target_path, is_error, result_ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     row.id(),
                     row.event_id.as_str(),
@@ -358,7 +358,8 @@ async fn maintain_tool_rollup_event(
                     row.target_scheme.as_str(),
                     row.target_kind.as_str(),
                     row.target_path.as_deref(),
-                    row.is_error as i64
+                    row.is_error as i64,
+                    row.result_ts
                 ],
             )
             .await?;
@@ -366,9 +367,9 @@ async fn maintain_tool_rollup_event(
     } else if event_type == "tool_result" {
         if let Some((tool_use_id, is_error)) = tool_extract::tool_result_error(data) {
             conn.execute(
-                "UPDATE tool_invocations SET is_error = ?3
+                "UPDATE tool_invocations SET is_error = ?3, result_ts = ?4
                  WHERE run_id = ?1 AND tool_use_id = ?2",
-                params![run_id, tool_use_id.as_str(), is_error as i64],
+                params![run_id, tool_use_id.as_str(), is_error as i64, created_at],
             )
             .await?;
         }
@@ -1347,8 +1348,8 @@ async fn upsert_run_invocations(
                 conn.execute(
                     "INSERT OR REPLACE INTO tool_invocations
                         (id, event_id, tool_use_id, run_id, ts, verb, tool_name,
-                         target_scheme, target_kind, target_path, is_error)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                         target_scheme, target_kind, target_path, is_error, result_ts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         row.id(),
                         row.event_id.as_str(),
@@ -1360,7 +1361,8 @@ async fn upsert_run_invocations(
                         row.target_scheme.as_str(),
                         row.target_kind.as_str(),
                         row.target_path.as_deref(),
-                        row.is_error as i64
+                        row.is_error as i64,
+                        row.result_ts
                     ],
                 )
                 .await?;
@@ -1515,6 +1517,229 @@ pub(crate) async fn tool_mix(
             bucket_start: row.i64(0)?,
             verb: row.text(1)?,
             count: row.i64(2)?,
+        })
+    })
+    .await
+}
+
+/// Completed run wall time vs tool-execution time for one time bucket. Tool-call
+/// spans are summed per run, then capped to that run's wall time before bucket
+/// aggregation so concurrent or out-of-bound result events cannot make the
+/// headline composition exceed 100%.
+#[derive(Debug, Clone)]
+pub(crate) struct TimeCompositionRow {
+    pub bucket_start: i64,
+    pub wall_s: i64,
+    pub tool_s: i64,
+    pub model_overhead_s: i64,
+    pub run_count: i64,
+}
+
+pub(crate) async fn time_composition(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<TimeCompositionRow>> {
+    let bucket_expr = bucket.bucket_expr("run_ts");
+    let sql = format!(
+        "WITH completed_runs AS (
+            SELECT r.id AS run_id,
+                   r.started_at AS run_ts,
+                   (r.exited_at - r.started_at) AS wall_s
+            FROM runs r
+            LEFT JOIN jobs j ON j.id = r.job_id
+            WHERE r.started_at IS NOT NULL
+              AND r.exited_at IS NOT NULL
+              AND r.exited_at >= r.started_at
+              AND (?1 IS NULL OR COALESCE(r.project_id, j.project_id) = ?1)
+              AND (?2 IS NULL OR r.started_at >= ?2)
+              AND (?3 IS NULL OR r.started_at < ?3)
+        ),
+        raw_tool_by_run AS (
+            SELECT cr.run_id AS run_id,
+                   SUM(CASE
+                       WHEN ti.result_ts IS NOT NULL AND ti.result_ts >= ti.ts
+                           THEN ti.result_ts - ti.ts
+                       ELSE 0
+                   END) AS raw_tool_s
+            FROM completed_runs cr
+            LEFT JOIN tool_invocations ti ON ti.run_id = cr.run_id
+            GROUP BY cr.run_id
+        ),
+        run_parts AS (
+            SELECT cr.run_id,
+                   cr.run_ts,
+                   cr.wall_s,
+                   MIN(cr.wall_s, COALESCE(rtbr.raw_tool_s, 0)) AS tool_s
+            FROM completed_runs cr
+            LEFT JOIN raw_tool_by_run rtbr ON rtbr.run_id = cr.run_id
+        )
+        SELECT {bucket_expr} AS bucket_start,
+               SUM(wall_s) AS wall_s,
+               SUM(tool_s) AS tool_s,
+               SUM(wall_s - tool_s) AS model_overhead_s,
+               COUNT(*) AS run_count
+        FROM run_parts
+        GROUP BY bucket_start
+        ORDER BY bucket_start"
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(TimeCompositionRow {
+            bucket_start: row.i64(0)?,
+            wall_s: row.opt_i64(1)?.unwrap_or(0),
+            tool_s: row.opt_i64(2)?.unwrap_or(0),
+            model_overhead_s: row.opt_i64(3)?.unwrap_or(0),
+            run_count: row.i64(4)?,
+        })
+    })
+    .await
+}
+
+/// Tool-execution seconds by verb over time.
+#[derive(Debug, Clone)]
+pub(crate) struct ToolTimeMixRow {
+    pub bucket_start: i64,
+    pub verb: String,
+    pub seconds: i64,
+    pub count: i64,
+}
+
+pub(crate) async fn tool_time_mix(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<ToolTimeMixRow>> {
+    let bucket_expr = bucket.bucket_expr("ti.ts");
+    let sql = format!(
+        "SELECT {bucket_expr} AS bucket_start,
+                ti.verb,
+                SUM(ti.result_ts - ti.ts) AS seconds,
+                COUNT(*) AS c
+        {join}
+        WHERE {filter}
+          AND ti.result_ts IS NOT NULL
+          AND ti.result_ts >= ti.ts
+        GROUP BY bucket_start, ti.verb
+        ORDER BY bucket_start",
+        join = TOOL_JOIN,
+        filter = TOOL_SCOPE_RANGE,
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(ToolTimeMixRow {
+            bucket_start: row.i64(0)?,
+            verb: row.text(1)?,
+            seconds: row.opt_i64(2)?.unwrap_or(0),
+            count: row.i64(3)?,
+        })
+    })
+    .await
+}
+
+/// Slowest target shapes by total tool-execution time.
+#[derive(Debug, Clone)]
+pub(crate) struct CommandDurationQueryRow {
+    pub verb: String,
+    pub scheme: String,
+    pub kind: String,
+    pub target: Option<String>,
+    pub count: i64,
+    pub total_s: i64,
+    pub avg_s: f64,
+    pub max_s: i64,
+    pub error_count: i64,
+}
+
+pub(crate) async fn command_durations(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    limit: i64,
+) -> DbResult<Vec<CommandDurationQueryRow>> {
+    let sql = format!(
+        "SELECT ti.verb,
+                ti.target_scheme,
+                ti.target_kind,
+                MIN(ti.target_path) AS representative_target,
+                COUNT(*) AS c,
+                SUM(ti.result_ts - ti.ts) AS total_s,
+                CAST(SUM(ti.result_ts - ti.ts) AS REAL) / COUNT(*) AS avg_s,
+                MAX(ti.result_ts - ti.ts) AS max_s,
+                SUM(ti.is_error) AS errors
+        {join}
+        WHERE {filter}
+          AND ti.result_ts IS NOT NULL
+          AND ti.result_ts >= ti.ts
+        GROUP BY ti.verb, ti.target_scheme, ti.target_kind
+        ORDER BY total_s DESC, c DESC
+        LIMIT ?4",
+        join = TOOL_JOIN,
+        filter = TOOL_SCOPE_RANGE,
+    );
+    let mut params = scope_range_params(scope, range);
+    params.push(Value::Integer(limit.max(1)));
+    db.query_all(sql, params, |row| {
+        Ok(CommandDurationQueryRow {
+            verb: row.text(0)?,
+            scheme: row.text(1)?,
+            kind: row.text(2)?,
+            target: row.opt_text(3)?,
+            count: row.i64(4)?,
+            total_s: row.opt_i64(5)?.unwrap_or(0),
+            avg_s: row.opt_f64(6)?.unwrap_or(0.0),
+            max_s: row.opt_i64(7)?.unwrap_or(0),
+            error_count: row.opt_i64(8)?.unwrap_or(0),
+        })
+    })
+    .await
+}
+
+/// Average active work time per session, where session duration is the sum of
+/// completed run wall time in the selected range rather than first-to-last idle
+/// span.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionDurationRow {
+    pub bucket_start: i64,
+    pub session_count: i64,
+    pub avg_s: f64,
+}
+
+pub(crate) async fn session_durations(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<SessionDurationRow>> {
+    let bucket_expr = bucket.bucket_expr("session_ts");
+    let sql = format!(
+        "WITH session_runs AS (
+            SELECT r.session_id AS session_id,
+                   MIN(r.started_at) AS session_ts,
+                   SUM(r.exited_at - r.started_at) AS duration_s
+            FROM runs r
+            LEFT JOIN jobs j ON j.id = r.job_id
+            WHERE r.session_id IS NOT NULL
+              AND r.started_at IS NOT NULL
+              AND r.exited_at IS NOT NULL
+              AND r.exited_at >= r.started_at
+              AND (?1 IS NULL OR COALESCE(r.project_id, j.project_id) = ?1)
+              AND (?2 IS NULL OR r.started_at >= ?2)
+              AND (?3 IS NULL OR r.started_at < ?3)
+            GROUP BY r.session_id
+        )
+        SELECT {bucket_expr} AS bucket_start,
+               COUNT(*) AS session_count,
+               AVG(duration_s) AS avg_s
+        FROM session_runs
+        GROUP BY bucket_start
+        ORDER BY bucket_start"
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(SessionDurationRow {
+            bucket_start: row.i64(0)?,
+            session_count: row.i64(1)?,
+            avg_s: row.opt_f64(2)?.unwrap_or(0.0),
         })
     })
     .await

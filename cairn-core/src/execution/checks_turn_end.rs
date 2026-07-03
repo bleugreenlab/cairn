@@ -91,17 +91,25 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         return Ok(());
     };
     let Some(worktree_path) = coords.worktree_path.clone().filter(|p| !p.is_empty()) else {
+        log::debug!(
+            "turn-end checks for job {}: no worktree; nothing to run",
+            short_id(job_id)
+        );
         return Ok(());
     };
     let repo_root = Path::new(&worktree_path);
 
     // 2. Load the LIVE project checks contract (same source as the write cadence).
-    let Some(checks) = load_live_project_checks(orch, &coords.project_id, repo_root).await else {
-        return Ok(());
+    let checks = match load_live_project_checks(orch, &coords.project_id, repo_root).await {
+        Some(checks) if !checks.is_empty() => checks,
+        _ => {
+            log::debug!(
+                "turn-end checks for job {}: no checks contract; nothing to run",
+                short_id(job_id)
+            );
+            return Ok(());
+        }
     };
-    if checks.is_empty() {
-        return Ok(());
-    }
 
     // 3. Is a PR open? Gates the `when:review` cadence.
     let owning = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
@@ -119,15 +127,28 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         coords.base_branch.as_deref(),
         coords.base_commit.as_deref(),
     ) else {
+        log::debug!(
+            "turn-end checks for job {}: changed-file set unresolvable; nothing to run",
+            short_id(job_id)
+        );
         return Ok(());
     };
     if changed.is_empty() {
+        log::debug!(
+            "turn-end checks for job {}: empty changed-file set; nothing to run",
+            short_id(job_id)
+        );
         return Ok(());
     }
 
     // 5. Select the applicable turn-end checks (cadence + pr_open + impact gate).
     let plans = applicable_turn_end_checks(&checks, &changed, repo_root, pr_open);
     if plans.is_empty() {
+        log::debug!(
+            "turn-end checks for job {}: no applicable idle/review check (pr_open={}); nothing to run",
+            short_id(job_id),
+            pr_open
+        );
         return Ok(());
     }
 
@@ -182,8 +203,23 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         }
     }
     if to_run.is_empty() {
+        log::debug!(
+            "turn-end checks for job {}: every applicable check is already cached for this tree; nothing to run",
+            short_id(job_id)
+        );
         return Ok(());
     }
+    log::info!(
+        "turn-end checks for job {}: launching {} check(s) [{}] over {} changed file(s)",
+        short_id(job_id),
+        to_run.len(),
+        to_run
+            .iter()
+            .map(|(p, _)| p.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        changed.len()
+    );
 
     // 8. Prepare the host-readable, job-scoped log file (truncated for a fresh run)
     // so the PR-node / `/checks` render can tail it live while checks run.
@@ -192,6 +228,7 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
 
     // 9. Run each remaining check UNSANDBOXED, capturing to the cache and log.
     let mut any_failed = false;
+    let mut verdicts: Vec<String> = Vec::with_capacity(to_run.len());
     for (index, (plan, input_hash)) in to_run.iter().enumerate() {
         let stream_id = format!("turn-checks:{job_id}:{index}");
         let started = Instant::now();
@@ -233,6 +270,11 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         if !passed {
             any_failed = true;
         }
+        verdicts.push(format!(
+            "{}={} ({duration_ms}ms)",
+            plan.name,
+            if passed { "pass" } else { "fail" }
+        ));
     }
 
     // Nudge any live PR-node / `/checks` view to re-render with the fresh verdicts.
@@ -241,30 +283,42 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
     );
 
-    // 10. On any failure, resume the idle builder with the failing summary inlined.
-    // On success there is no wake (no wasted turn on green).
+    log::info!(
+        "turn-end checks for job {}: completed \u{2014} [{}] \u{2192} {}",
+        short_id(job_id),
+        verdicts.join(", "),
+        if any_failed { "wake" } else { "passive" }
+    );
+
+    // 10. Deliver the results into the session. A failure ROUSES the idle builder
+    // (Wake + nudge) so it resumes with the failing detail inlined; a clean run
+    // rides along PASSIVELY — never a wasted turn on green, but the green verdict
+    // is still delivered on the session's next resume and recorded on the wake
+    // card. The push key is the same for both, so same-key supersession keeps at
+    // most one checks push pending: a later red supersedes an undelivered green,
+    // and vice versa.
+    let checks_uri = build_node_checks_uri(
+        &coords.project_key,
+        coords.number,
+        coords.exec_seq,
+        &coords.node_segment,
+    );
+    let key = format!("turn-checks:{checks_uri}");
+    if let Err(e) = attention_push::push(
+        &owning,
+        job_id,
+        &checks_uri,
+        delivery_wake(any_failed),
+        attention_push::Boundary::Event,
+        &key,
+    )
+    .await
+    {
+        return Err(format!("failed to queue turn-check results push: {e}"));
+    }
+    // Only a failure wakes an idle builder now; a passive green push waits for the
+    // session's next natural resume.
     if any_failed {
-        let checks_uri = build_node_checks_uri(
-            &coords.project_key,
-            coords.number,
-            coords.exec_seq,
-            &coords.node_segment,
-        );
-        let key = format!("turn-checks:{checks_uri}");
-        if let Err(e) = attention_push::push(
-            &owning,
-            job_id,
-            &checks_uri,
-            attention_push::Wake::Wake,
-            attention_push::Boundary::Event,
-            &key,
-        )
-        .await
-        {
-            return Err(format!("failed to queue turn-check failure push: {e}"));
-        }
-        // Wake the idle builder now so it resumes with the failure rather than
-        // only seeing it ride along with a later unrelated wake.
         if let Err(e) = crate::messages::delivery::nudge_job_for_urgency(
             orch,
             job_id,
@@ -272,12 +326,30 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         ) {
             log::warn!(
                 "turn-check failure wake for job {} failed: {}",
-                &job_id[..job_id.len().min(8)],
+                short_id(job_id),
                 e
             );
         }
     }
     Ok(())
+}
+
+/// The wake level a completed turn-end run is delivered at: a failure ROUSES the
+/// idle builder (`Wake`), a clean run rides along `Passive` so green never costs a
+/// turn but is still delivered and recorded. Pure, so the green-passive /
+/// red-wake decision is unit-tested.
+fn delivery_wake(any_failed: bool) -> attention_push::Wake {
+    if any_failed {
+        attention_push::Wake::Wake
+    } else {
+        attention_push::Wake::Passive
+    }
+}
+
+/// First 8 chars of a job id for log lines (mirrors the ids elsewhere in this
+/// module), clamped so a short id never panics.
+fn short_id(job_id: &str) -> &str {
+    &job_id[..job_id.len().min(8)]
 }
 
 /// Render the `### Systematic checks` section for a node job: the "running" live
@@ -547,5 +619,18 @@ mod tests {
     fn tail_keeps_last_chars_on_boundary() {
         assert_eq!(tail("abcdef", 3), "def");
         assert_eq!(tail("abc", 10), "abc");
+    }
+
+    #[test]
+    fn green_rides_along_passively_red_wakes() {
+        // A clean run is delivered but never wakes an idle node; a failure rouses it.
+        assert_eq!(delivery_wake(false), attention_push::Wake::Passive);
+        assert_eq!(delivery_wake(true), attention_push::Wake::Wake);
+    }
+
+    #[test]
+    fn short_id_never_panics_on_a_short_string() {
+        assert_eq!(short_id("abcd"), "abcd");
+        assert_eq!(short_id("0123456789"), "01234567");
     }
 }

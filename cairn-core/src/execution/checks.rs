@@ -573,6 +573,15 @@ pub struct CheckOutcome {
     /// Retained combined-output tail — the excerpt source when the parse carries
     /// no per-failure messages (nextest) or there is no parse at all.
     pub output_tail: String,
+    /// Whether this verdict was REUSED from the cache rather than run for this
+    /// commit. The summary annotates cache hits so a reused verdict is
+    /// distinguishable from a fresh run at a glance.
+    pub cached: bool,
+    /// Wall-clock duration of the run that produced this verdict, in ms. On a
+    /// cache hit this is the stored duration of the original run. Surfaced for
+    /// non-test-runner checks (typecheck, api, …) where a test count is not
+    /// meaningful.
+    pub duration_ms: i64,
 }
 
 /// The cache key for one check's verdict: the content identity of ONLY the files
@@ -657,6 +666,8 @@ where
                 exit_code: Some(entry.exit_code),
                 parsed,
                 output_tail: entry.output_tail,
+                cached: true,
+                duration_ms: entry.duration_ms,
             });
             continue;
         }
@@ -698,6 +709,8 @@ where
             exit_code,
             parsed,
             output_tail,
+            cached: false,
+            duration_ms,
         });
     }
     results
@@ -712,10 +725,12 @@ where
 pub fn format_check_summary(results: &[CheckOutcome]) -> String {
     let header = results
         .iter()
-        .map(|o| match (o.passed, o.exit_code) {
-            (true, _) => format!("\u{2713} {}", o.name),
-            (false, Some(code)) => format!("\u{2717} {} (exit {code})", o.name),
-            (false, None) => format!("\u{2717} {} (failed to run)", o.name),
+        .map(|o| {
+            let mark = if o.passed { '\u{2713}' } else { '\u{2717}' };
+            match summary_annotation(o) {
+                Some(ann) => format!("{mark} {} ({ann})", o.name),
+                None => format!("{mark} {}", o.name),
+            }
         })
         .collect::<Vec<_>>()
         .join(" \u{b7} ");
@@ -728,6 +743,69 @@ pub fn format_check_summary(results: &[CheckOutcome]) -> String {
         }
     }
     out
+}
+
+/// The parenthetical annotation for one check's status line, or `None` when there
+/// is nothing worth adding beyond the bare `\u{2713}`/`\u{2717} <name>`. This is
+/// the trust-carrying part of the summary: it turns three indistinguishable
+/// greens (a real N-test pass, a zero-selection vacuous pass, and a reused cache
+/// hit) into three visibly different lines.
+///
+/// - Passing TEST-RUNNER check: `12 tests`, or `no tests matched the change`
+///   when the selector executed zero tests (a `related` run that matched nothing).
+/// - Passing non-test check (tsc/api/dead-code): `4.1s` on a fresh run (duration
+///   is the only meaningful signal; a test count would be a lie).
+/// - Failing TEST-RUNNER check: `2 of 40 failed, exit 101`.
+/// - Failing non-test check: `exit 101`, or `failed to run` on a spawn error.
+/// - A cache hit appends `cached` so a reused verdict never masquerades as fresh.
+///
+/// Pure, so it is unit-tested directly.
+fn summary_annotation(o: &CheckOutcome) -> Option<String> {
+    let test_parse = o.parsed.as_ref().filter(|p| p.is_test_runner());
+    let mut parts: Vec<String> = Vec::new();
+    if o.passed {
+        match test_parse {
+            Some(p) if p.tests_run() == 0 => parts.push("no tests matched the change".to_string()),
+            Some(p) => parts.push(format!("{} tests", p.tests_run())),
+            // Non-test check: duration is the only honest signal, and only on a
+            // fresh run (a cache hit's stored duration would be misleading).
+            None if !o.cached && o.duration_ms > 0 => {
+                parts.push(format_check_duration(o.duration_ms))
+            }
+            None => {}
+        }
+    } else {
+        match test_parse {
+            Some(p) => {
+                let exit = o
+                    .exit_code
+                    .map(|c| format!(", exit {c}"))
+                    .unwrap_or_default();
+                parts.push(format!("{} of {} failed{exit}", p.failed, p.tests_run()));
+            }
+            None => match o.exit_code {
+                Some(code) => parts.push(format!("exit {code}")),
+                None => parts.push("failed to run".to_string()),
+            },
+        }
+    }
+    if o.cached {
+        parts.push("cached".to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// Render a check duration compactly: `4.1s` at or above a second, `850ms` below.
+fn format_check_duration(ms: i64) -> String {
+    if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 /// One failing check's detail block: a `\u{2717} <name> \u{2014} N failed: ...`
@@ -1161,6 +1239,25 @@ mod tests {
             exit_code,
             parsed: None,
             output_tail: String::new(),
+            cached: false,
+            duration_ms: 0,
+        }
+    }
+
+    /// A test-runner parse with explicit pass/fail counts, so the summary's
+    /// count-bearing annotations are exercised without a real runner.
+    fn runner_parse(parser: &str, passed: usize, failed: usize) -> ParsedCheckResult {
+        ParsedCheckResult {
+            parser: parser.to_string(),
+            passed,
+            failed,
+            skipped: 0,
+            failures: (0..failed)
+                .map(|i| crate::execution::check_parsers::CheckFailure {
+                    name: format!("t{i}"),
+                    message: None,
+                })
+                .collect(),
         }
     }
 
@@ -1192,6 +1289,8 @@ mod tests {
             exit_code: Some(1),
             parsed,
             output_tail: "raw output tail".to_string(),
+            cached: false,
+            duration_ms: 0,
         }];
         let s = format_check_summary(&results);
         // Header status line first.
@@ -1215,6 +1314,102 @@ mod tests {
         assert!(rendered.contains("f0.ts") && rendered.contains("f4.ts"));
         assert!(rendered.contains("+3 more"));
         assert!(!rendered.contains("f5.ts"));
+    }
+
+    /// Build a passing/failing outcome carrying a runner parse, for the
+    /// count-bearing annotation tests.
+    fn parsed_outcome(
+        name: &str,
+        passed: bool,
+        exit_code: Option<i32>,
+        parsed: ParsedCheckResult,
+        cached: bool,
+    ) -> CheckOutcome {
+        CheckOutcome {
+            name: name.to_string(),
+            passed,
+            exit_code,
+            parsed: Some(parsed),
+            output_tail: String::new(),
+            cached,
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn summary_shows_test_count_on_a_passing_runner_check() {
+        let o = parsed_outcome(
+            "frontend",
+            true,
+            Some(0),
+            runner_parse("vitest", 12, 0),
+            false,
+        );
+        assert_eq!(format_check_summary(&[o]), "\u{2713} frontend (12 tests)");
+    }
+
+    #[test]
+    fn summary_flags_a_zero_selection_pass_honestly() {
+        // A `related` selector that matched nothing exits 0 but validated nothing:
+        // the annotation must say so rather than render a bare green.
+        let o = parsed_outcome(
+            "frontend",
+            true,
+            Some(0),
+            runner_parse("vitest", 0, 0),
+            false,
+        );
+        assert_eq!(
+            format_check_summary(&[o]),
+            "\u{2713} frontend (no tests matched the change)"
+        );
+    }
+
+    #[test]
+    fn summary_shows_pass_of_total_on_a_failing_runner_check() {
+        let o = parsed_outcome(
+            "rust",
+            false,
+            Some(101),
+            runner_parse("nextest", 38, 2),
+            false,
+        );
+        let s = format_check_summary(&[o]);
+        assert!(
+            s.starts_with("\u{2717} rust (2 of 40 failed, exit 101)"),
+            "got: {s}"
+        );
+    }
+
+    #[test]
+    fn summary_shows_duration_on_a_passing_unparsed_check() {
+        // typecheck / api have no test-runner parse; a fresh pass shows duration.
+        let mut o = outcome("typecheck", true, Some(0));
+        o.duration_ms = 4100;
+        assert_eq!(format_check_summary(&[o]), "\u{2713} typecheck (4.1s)");
+    }
+
+    #[test]
+    fn summary_annotates_a_cache_hit() {
+        // A reused verdict is distinguishable from a fresh run. Duration is
+        // suppressed for a cache hit (it belonged to the original run).
+        let mut o = outcome("typecheck", true, Some(0));
+        o.cached = true;
+        o.duration_ms = 4100;
+        assert_eq!(format_check_summary(&[o]), "\u{2713} typecheck (cached)");
+
+        // A cached test-runner pass keeps its count AND flags the reuse.
+        let cached_runner = parsed_outcome(
+            "frontend",
+            true,
+            Some(0),
+            runner_parse("vitest", 7, 0),
+            true,
+        );
+        assert_eq!(
+            format_check_summary(&[cached_runner]),
+            "\u{2713} frontend (7 tests, cached)"
+        );
     }
 
     // --- cache hit / miss at the runner seam ------------------------------

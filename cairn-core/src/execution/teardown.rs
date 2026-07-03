@@ -55,6 +55,13 @@ pub(crate) fn worktrees_base_dir() -> Option<PathBuf> {
 ///    `git worktree remove` (unregisters + deletes).
 /// 3. Otherwise — every jj workspace, and every half-deleted dir — fall back to a
 ///    rename-then-delete under the managed worktrees base dir.
+///
+/// Every path except the git-aware remove (which unregisters itself) finishes
+/// with a best-effort `git worktree prune` of the repo: a dir deleted without
+/// `git worktree remove` — the tombstone fallback, a manual `rm -rf`, a prior
+/// fs-only sweep — leaves its `.git/worktrees/<name>` registration behind, and
+/// those accumulate until they slow down and collide with future
+/// `git worktree add` calls.
 pub(crate) fn remove_worktree_robust(
     orch: &Orchestrator,
     repo_path: &str,
@@ -70,6 +77,9 @@ pub(crate) fn remove_worktree_robust(
     }
 
     if !wt_path.exists() {
+        // The dir is already gone, but a registration may not be: git keeps a
+        // missing worktree registered until pruned.
+        prune_worktree_registrations(orch, Path::new(repo_path));
         return Ok(());
     }
 
@@ -85,7 +95,25 @@ pub(crate) fn remove_worktree_robust(
 
     let base = worktrees_base_dir()
         .ok_or_else(|| "could not resolve worktrees base dir (no home dir)".to_string())?;
-    remove_dir_tombstoned(wt_path, &base)
+    let result = remove_dir_tombstoned(wt_path, &base);
+    // Even a partially failed removal renames the live path away (or leaves it
+    // intact, where pruning is a no-op), so prune unconditionally. This also
+    // deregisters a genuine git worktree that fell through here because
+    // `worktree_list` itself errored.
+    prune_worktree_registrations(orch, Path::new(repo_path));
+    result
+}
+
+/// Best-effort `git worktree prune` on `repo_path`, clearing `.git/worktrees`
+/// registrations whose worktree dirs no longer exist. Harmless when the repo is
+/// a jj project or not a git repo at all (the command just fails; debug-logged).
+fn prune_worktree_registrations(orch: &Orchestrator, repo_path: &Path) {
+    if let Err(e) = orch.services.git.worktree_prune(repo_path) {
+        log::debug!(
+            "Teardown: git worktree prune failed for {}: {e}",
+            repo_path.display()
+        );
+    }
 }
 
 /// Whether `wt_path` is a registered git worktree of `repo_path`. A jj workspace

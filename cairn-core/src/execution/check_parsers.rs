@@ -72,6 +72,24 @@ pub struct ParsedCheckResult {
     pub failures: Vec<CheckFailure>,
 }
 
+impl ParsedCheckResult {
+    /// Whether this parse came from a TEST RUNNER (`nextest`/`vitest`), whose
+    /// pass/fail counts denote real tests, rather than `tsc`, whose `failed` is a
+    /// type-error tally with no "test count" meaning. Verdict surfaces gate the
+    /// `N tests` / `no tests matched` rendering on this so a passing typecheck is
+    /// never labelled with a bogus test count.
+    pub fn is_test_runner(&self) -> bool {
+        self.parser == "nextest" || self.parser == "vitest"
+    }
+
+    /// Tests the runner actually executed: passed + failed. Skipped/ignored tests
+    /// did not run, so they are excluded from the "was anything validated?" tally
+    /// that distinguishes a real green from a zero-selection green.
+    pub fn tests_run(&self) -> usize {
+        self.passed + self.failed
+    }
+}
+
 /// One failing test / error site.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

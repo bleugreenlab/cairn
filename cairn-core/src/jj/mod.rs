@@ -1925,6 +1925,37 @@ pub fn rebase_branch_onto(
     .map(|_| ())
 }
 
+/// Fast-forward a branch bookmark to a concrete destination commit over the shared
+/// store, then export the move to git immediately so jj's bookmark and backing git
+/// ref stay in lockstep. This is the no-work sibling analogue of
+/// [`rebase_branch_onto`]: there is no branch commit to rebase, only an idle
+/// bookmark to move onto the advanced base.
+pub fn fast_forward_bookmark(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest: &str,
+) -> Result<(), String> {
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            dest,
+            "--ignore-working-copy",
+        ],
+        "jj bookmark fast-forward",
+    )?;
+    jj.run(
+        store,
+        &["git", "export", "--ignore-working-copy"],
+        "jj git export (bookmark fast-forward)",
+    )
+    .map(|_| ())
+}
+
 /// Classify a jj error as the STALE-working-copy refusal family.
 ///
 /// jj refuses every working-copy-touching command on a stale workspace (one
@@ -2188,6 +2219,23 @@ pub fn branch_descends_from(jj: &JjEnv, store: &Path, branch: &str, dest_commit:
         &format!("bookmarks(exact:{branch:?})"),
         dest_commit,
     )
+}
+
+/// True when `branch`'s tip is an ancestor of (or equals) `dest_commit`.
+/// A resolve failure falls to `false`, matching [`revset_descends_from`]: callers
+/// should proceed with the normal rebase rather than wrongly classifying a branch
+/// as safely fast-forwardable.
+pub fn branch_is_ancestor_of(jj: &JjEnv, store: &Path, branch: &str, dest_commit: &str) -> bool {
+    let branch_revset = format!("bookmarks(exact:{branch:?})");
+    let revset = format!("({branch_revset})::{dest_commit}");
+    jj.run(
+        store,
+        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        "jj ancestor check",
+    )
+    .ok()
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
 }
 
 /// The change-id of a bookmark's tip over the store, or empty when the bookmark
@@ -2945,6 +2993,34 @@ pub fn reconcile_siblings(
                 &mut report,
             );
             continue;
+        }
+        if let Some(dest) = dest_commit.as_deref() {
+            if branch_is_ancestor_of(jj, store, branch, dest) {
+                if let Err(e) = fast_forward_bookmark(jj, store, branch, dest) {
+                    log::warn!("jj reconcile: fast-forward {branch} to {dest} failed: {e}");
+                    continue;
+                }
+                let conflicted = match advance_workspace_onto(jj, store, ws_path, branch, dest) {
+                    Ok(conflicted) => conflicted,
+                    Err(e) => {
+                        log::warn!(
+                            "jj reconcile: advance workspace {} onto {dest} failed: {e}",
+                            ws_path.display()
+                        );
+                        continue;
+                    }
+                };
+                if conflicted {
+                    report.conflicted.push(branch.clone());
+                } else {
+                    report.rebased_clean.push(branch.clone());
+                }
+                // Deliberately do not push the fast-forwarded bookmark. A no-work
+                // sibling has not sealed a PR head; pushing every idle sibling on
+                // every default-branch advance would spam origin with empty branch
+                // updates. The next seal already exports and pushes the bookmark.
+                continue;
+            }
         }
         if let Err(e) = rebase_branch_onto(jj, store, branch, integration_branch) {
             log::warn!("jj reconcile: rebase {branch} onto {integration_branch} failed: {e}");
@@ -4528,6 +4604,128 @@ index 1111111111..2222222222 100644
         assert_eq!(
             commit_overlap_after_first, commit_overlap_after_second,
             "a second reconcile at the same dest tip leaves the conflicted commit id unchanged (no redundant wake)"
+        );
+    }
+
+    /// A sibling that has not sealed work yet has its bookmark sitting exactly on
+    /// the old base. When the base advances, reconcile must fast-forward that idle
+    /// bookmark and re-parent the workspace `@` onto the new base instead of
+    /// handing it to `jj rebase -b`, whose revset is empty for an ancestor bookmark.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn reconcile_siblings_fast_forwards_no_work_sibling() {
+        let Some(bin) = jj_bin() else {
+            eprintln!(
+                "skipping reconcile_siblings_fast_forwards_no_work_sibling: jj not resolvable"
+            );
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let int = "agent/CAIRN-2345-coordinator-0";
+        add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+        let idle = "agent/CAIRN-2345-builder-0";
+        let ws_idle = wts.path().join("idle");
+        add_workspace(&jj, &store, &ws_idle, idle, int, None).unwrap();
+        let old_idle_commit = bookmark_commit(&jj, &store, idle).unwrap();
+
+        jj.run(&store, &["new", int], "new on int").unwrap();
+        std::fs::write(store.join("base-advance.rs"), "advanced base\n").unwrap();
+        jj.run(
+            &store,
+            &["describe", "-m", "integration advances base"],
+            "describe",
+        )
+        .unwrap();
+        jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
+            .unwrap();
+        let dest_commit = bookmark_commit(&jj, &store, int).unwrap();
+        assert_ne!(
+            old_idle_commit, dest_commit,
+            "the integration bookmark must advance past the idle sibling's old base"
+        );
+
+        let specs = vec![(idle.to_string(), ws_idle.clone())];
+        let report = reconcile_siblings(&jj, &store, int, &specs).unwrap();
+        assert_eq!(report.rebased_clean, vec![idle.to_string()]);
+        assert!(report.conflicted.is_empty());
+        assert_eq!(bookmark_commit(&jj, &store, idle).unwrap(), dest_commit);
+        assert_eq!(
+            std::fs::read_to_string(ws_idle.join("base-advance.rs")).unwrap(),
+            "advanced base\n",
+            "the fast-forwarded workspace materializes the new base file"
+        );
+
+        let commit_after_first = bookmark_commit(&jj, &store, idle).unwrap();
+        let report2 = reconcile_siblings(&jj, &store, int, &specs).unwrap();
+        assert_eq!(report2.rebased_clean, vec![idle.to_string()]);
+        assert!(report2.conflicted.is_empty());
+        assert_eq!(
+            bookmark_commit(&jj, &store, idle).unwrap(),
+            commit_after_first,
+            "a second reconcile is caught by the already-on-dest skip and does not rewrite"
+        );
+    }
+
+    /// The fast-forward path still has to surface an idle sibling's unsealed WIP
+    /// when re-parenting that workspace `@` onto the new base records a conflict.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn reconcile_siblings_no_work_sibling_with_conflicting_wip_classified_conflicted() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping reconcile_siblings_no_work_sibling_with_conflicting_wip_classified_conflicted: jj not resolvable");
+            return;
+        };
+        let home = TempDir::new().unwrap();
+        let proj = TempDir::new().unwrap();
+        let wts = TempDir::new().unwrap();
+        init_project(proj.path());
+        let jj = JjEnv::resolve(&bin, home.path());
+        let store = home.path().join("jj-stores").join("proj");
+        ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+        let int = "agent/CAIRN-2345-coordinator-0";
+        add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+        let idle = "agent/CAIRN-2345-builder-0";
+        let ws_idle = wts.path().join("idle-conflict");
+        add_workspace(&jj, &store, &ws_idle, idle, int, None).unwrap();
+
+        std::fs::write(ws_idle.join("shared.rs"), "idle unsealed change\n").unwrap();
+        jj.run(&ws_idle, &["log", "-r", "@"], "snapshot idle wip")
+            .unwrap();
+
+        jj.run(&store, &["new", int], "new on int").unwrap();
+        std::fs::write(store.join("shared.rs"), "integration advanced shared\n").unwrap();
+        jj.run(
+            &store,
+            &["describe", "-m", "integration advances shared"],
+            "describe",
+        )
+        .unwrap();
+        jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
+            .unwrap();
+        let dest_commit = bookmark_commit(&jj, &store, int).unwrap();
+
+        let specs = vec![(idle.to_string(), ws_idle.clone())];
+        let report = reconcile_siblings(&jj, &store, int, &specs).unwrap();
+        assert_eq!(report.conflicted, vec![idle.to_string()]);
+        assert!(report.rebased_clean.is_empty());
+        assert_eq!(
+            bookmark_commit(&jj, &store, idle).unwrap(),
+            dest_commit,
+            "the idle bookmark still fast-forwards to the new base"
+        );
+
+        let conflicted_file = std::fs::read_to_string(ws_idle.join("shared.rs")).unwrap();
+        assert!(
+            conflicted_file.contains("<<<<<<<") && conflicted_file.contains(">>>>>>>"),
+            "the agent sees materialized conflict markers: {conflicted_file}"
         );
     }
 

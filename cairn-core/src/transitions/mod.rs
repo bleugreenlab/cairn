@@ -33,8 +33,8 @@ pub mod turn;
 pub use run::{set_exit_reason, transition_run};
 pub use session::transition_session;
 pub use status::{
-    recompute_execution_status, recompute_issue_status, resolve_issue, unresolve_issue,
-    ExecutionStatus, Resolution,
+    recompute_execution_status, recompute_issue_status, resolve_issue, transition_job_readiness,
+    unresolve_issue, ExecutionStatus, Resolution,
 };
 pub use turn::{apply_turn_outcome, interrupt_turn, start_turn, yield_turn};
 

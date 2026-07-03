@@ -291,6 +291,55 @@ pub struct ToolMixPoint {
     pub count: i64,
 }
 
+/// Run wall-time composition for one time bucket. `model_overhead_s` is the
+/// completed run wall time that is not accounted for by tool calls; it includes
+/// model generation plus orchestration overhead and any in-run waiting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimeCompositionPoint {
+    pub bucket_start: i64,
+    pub wall_s: i64,
+    pub tool_s: i64,
+    pub model_overhead_s: i64,
+    pub run_count: i64,
+}
+
+/// Tool execution seconds by verb for one time bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolTimeMixPoint {
+    pub bucket_start: i64,
+    pub verb: String,
+    pub seconds: i64,
+    pub count: i64,
+}
+
+/// Aggregated duration for one target shape, ordered by total seconds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandDurationRow {
+    pub verb: String,
+    pub scheme: String,
+    pub kind: String,
+    pub target: Option<String>,
+    pub count: i64,
+    pub total_s: i64,
+    pub avg_s: f64,
+    pub max_s: i64,
+    pub error_count: i64,
+}
+
+/// Average completed run wall time per session for one time bucket. A session's
+/// duration is the sum of its completed runs' wall time rather than
+/// first-to-last idle span.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionDurationPoint {
+    pub bucket_start: i64,
+    pub session_count: i64,
+    pub avg_s: f64,
+}
+
 /// Target-shape breakdown plus the most-targeted resources.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]

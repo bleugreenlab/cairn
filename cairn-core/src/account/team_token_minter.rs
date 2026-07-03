@@ -12,7 +12,7 @@
 //! [`DbState::set_team_token_minter`](crate::db::DbState::set_team_token_minter)
 //! installs the minter before any production team opens; absent a minter,
 //! `open_team` falls back to the static/unauthenticated token path unchanged
-//! (every test and the headless server).
+//! (for focused tests and local-only hosts that intentionally skip installation).
 
 use std::collections::HashMap;
 use std::sync::Arc;

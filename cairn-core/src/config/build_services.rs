@@ -139,12 +139,23 @@ impl BuildServiceConfig {
 /// between the two. Unix only — the wrapper is a shell script. `SCCACHE_CACHE_SIZE`
 /// raises the daemon's max cache above the 10 GiB default (the daemon reads it
 /// from this same env map at launch) so a warm multi-worktree workspace stops
-/// evicting. `CARGO_INCREMENTAL=0` disables incremental compilation for fenced
-/// agent builds: sccache cannot cache incremental units, so leaving it on both
-/// misses the cache and grows an unbounded per-worktree `target/debug/incremental`
-/// tree (tens of GB per worktree). It rides the same unix block as the wrapper —
-/// the only place sccache is actually wired — and reaches only fenced agent
-/// spawns, never the user's own interactive `cargo` in their checkout.
+/// evicting. `SCCACHE_IDLE_TIMEOUT=0` keeps the daemon alive indefinitely: sccache
+/// defaults to exiting after 600 s idle, which killed the Cairn-supervised server
+/// between builds — the client wrapper then silently fell back to uncached direct
+/// compiles until the next runner restart. Like the cache size, the daemon reads
+/// it from this env map at launch; it is inert in client env.
+///
+/// Incremental compilation stays **on** for fenced agent builds — an earlier
+/// revision injected `CARGO_INCREMENTAL=0` here so sccache could cache more, and
+/// live measurement reversed it. sccache categorically cannot cache incremental
+/// compilations or clippy-driver output, and it whiffs on the workspace crates
+/// agents actually edit (cross-worktree paths, changed sources), so disabling
+/// incremental bought almost no cache and made every agent edit-test iteration
+/// recompile the edited crate from scratch — the dominant per-iteration cost.
+/// The hybrid: incremental carries the agent's edit loop, sccache still covers
+/// registry deps and non-incremental CI builds, and the worktree GC bounds the
+/// resulting per-worktree `target/*/incremental` disk growth (see
+/// [`crate::execution::worktree_gc`]).
 pub fn default_sccache_service() -> BuildServiceConfig {
     let mut env = HashMap::new();
     env.insert("SCCACHE_SERVER_PORT".to_string(), "4226".to_string());
@@ -153,14 +164,13 @@ pub fn default_sccache_service() -> BuildServiceConfig {
         "{home}/.cache/sccache".to_string(),
     );
     env.insert("SCCACHE_CACHE_SIZE".to_string(), "50G".to_string());
+    // Never idle out: the default 600 s idle timeout kills the supervised daemon
+    // between builds, and the client wrapper silently degrades to uncached compiles.
+    env.insert("SCCACHE_IDLE_TIMEOUT".to_string(), "0".to_string());
     if cfg!(unix) {
         let wrapper = "{cairnHome}/bin/cache-wrapper.sh".to_string();
         env.insert("RUSTC_WRAPPER".to_string(), wrapper.clone());
         env.insert("CARGO_BUILD_RUSTC_WRAPPER".to_string(), wrapper);
-        // sccache cannot cache incremental compilation (see the doc comment above);
-        // disabling it stops the unbounded per-worktree incremental cache and lifts
-        // the sccache hit rate. Rides the unix block with the wrapper it depends on.
-        env.insert("CARGO_INCREMENTAL".to_string(), "0".to_string());
     }
     BuildServiceConfig {
         enabled: true,
@@ -284,6 +294,19 @@ env:
         );
     }
 
+    #[test]
+    fn default_sccache_service_never_idles_out() {
+        // sccache's default 600 s idle timeout would kill the supervised daemon
+        // between builds, silently degrading every later fenced build to uncached
+        // compiles. The daemon reads SCCACHE_IDLE_TIMEOUT from this env map at
+        // launch; 0 disables the timeout. Present on every platform.
+        let env = default_sccache_service().expanded_env(&templates());
+        assert_eq!(
+            env.get("SCCACHE_IDLE_TIMEOUT").map(String::as_str),
+            Some("0")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn default_sccache_service_injects_wrapper_env() {
@@ -298,13 +321,13 @@ env:
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn default_sccache_service_disables_incremental() {
-        // sccache cannot cache incremental builds, so the service turns incremental
-        // off for fenced agent cargo — stopping the unbounded incremental cache and
-        // raising the cache hit rate. Unix-only, matching the wrapper it rides with.
+    fn default_sccache_service_keeps_incremental_on() {
+        // Incremental compilation stays on for fenced agent builds: sccache cannot
+        // cache incremental units anyway, and the agent edit-test loop depends on
+        // them (see the doc comment on `default_sccache_service`). The worktree GC
+        // bounds the resulting incremental-cache disk growth instead.
         let env = default_sccache_service().expanded_env(&templates());
-        assert_eq!(env.get("CARGO_INCREMENTAL").map(String::as_str), Some("0"));
+        assert_eq!(env.get("CARGO_INCREMENTAL"), None);
     }
 }

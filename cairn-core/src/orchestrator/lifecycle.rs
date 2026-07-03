@@ -1558,11 +1558,10 @@ pub fn suspend_run_for_durable_wait(
     exit_reason: &str,
 ) -> Result<(), String> {
     let _ = exit_reason;
-    // Self-suspend: do NOT reap the run's inline commands. A fence crossing in
-    // one item of a parallel `run()` suspends the run; its sibling commands are
-    // still executing and must survive so the batch can collect their outcomes
-    // and re-run cleanly on resume (CAIRN-2123).
-    stop_session_internal(orch, run_id, false)?;
+    // Self-suspend: do NOT reap the run's inline commands and do NOT hard-kill
+    // on interrupt failure. A durable wait is a warm park, not user Stop; the run
+    // must remain resumable when the awaited dependency resolves.
+    stop_session_internal(orch, run_id, false, InterruptFailurePolicy::WarmAnyway)?;
     Ok(())
 }
 
@@ -2184,11 +2183,11 @@ pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
             child_run_id,
             run_id
         );
-        let _ = stop_session_internal(orch, child_run_id, true);
+        let _ = stop_session_internal(orch, child_run_id, true, InterruptFailurePolicy::HardKill);
     }
 
     // Stop the requested run
-    stop_session_internal(orch, run_id, true)
+    stop_session_internal(orch, run_id, true, InterruptFailurePolicy::HardKill)
 }
 
 /// Marker recorded as the response of an `ask_user` prompt cancelled by a
@@ -2227,7 +2226,7 @@ pub fn stop_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
             child_run_id,
             job_id
         );
-        let _ = stop_session_internal(orch, &child_run_id, true);
+        let _ = stop_session_internal(orch, &child_run_id, true, InterruptFailurePolicy::HardKill);
     }
 
     // Cancel open input and terminalize the job's live turns (drops a pending
@@ -2316,6 +2315,16 @@ fn cancel_open_input_and_live_turns_for_job(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InterruptFailurePolicy {
+    /// External Stop must not leave a still-running backend parked as warm when
+    /// interrupt delivery genuinely failed.
+    HardKill,
+    /// Durable waits are self-suspends; even if the best-effort interrupt fails,
+    /// the process must remain warm for the eventual resume.
+    WarmAnyway,
+}
+
 /// Internal stop without cascading (used by cascading stop)
 ///
 /// Sends an interrupt control request via stdin and transitions the process
@@ -2333,14 +2342,34 @@ fn stop_session_internal(
     orch: &Orchestrator,
     run_id: &str,
     reap_inline: bool,
+    interrupt_failure_policy: InterruptFailurePolicy,
 ) -> Result<(), String> {
     // Interrupt/cancel the current turn. Fall back to the DB current_turn_id so
     // stop repairs stale UI-visible state even when the process map lost the run.
     stop_active_turn_for_run(orch, run_id);
 
-    // Send interrupt via backend-aware stdin handler
+    // Send interrupt via backend-aware stdin handler. A successful Codex
+    // `turn/interrupt` response is deferred until the turn is actually aborted.
     if let Err(e) = crate::backends::stdin::send_interrupt(&orch.process_state, run_id) {
-        log::warn!("Failed to send interrupt to run {}: {}", run_id, e);
+        if e.starts_with("Process not found:") {
+            log::warn!(
+                "Run {} missing from process map during stop; reconciling stale DB state",
+                run_id
+            );
+        } else if interrupt_failure_policy == InterruptFailurePolicy::HardKill {
+            log::warn!(
+                "Failed to send interrupt to run {}; falling back to hard termination: {}",
+                run_id,
+                e
+            );
+            return kill_session_with_reason(orch, run_id, "user_stop");
+        } else {
+            log::warn!(
+                "Failed to send interrupt to run {}; preserving warm durable-wait state: {}",
+                run_id,
+                e
+            );
+        }
     }
 
     // Only kill foreground bash processes — background terminals survive the
@@ -3108,7 +3137,10 @@ mod memory_review_tests {
 /// parents hung forever.
 #[cfg(test)]
 mod warm_completion_tests {
-    use super::{finalize_run, stop_job, transition_to_warm_state};
+    use super::{
+        finalize_run, stop_job, stop_session_internal, suspend_run_for_durable_wait,
+        transition_to_warm_state, InterruptFailurePolicy,
+    };
     use crate::agent_process::process::{wrap_plain_stdin, RunHandle};
     use crate::db::DbState;
     use crate::models::RunStatus;
@@ -3208,6 +3240,18 @@ mod warm_completion_tests {
         processes.register(run_id.to_string(), handle);
     }
 
+    fn register_process_without_stdin(orch: &Orchestrator, run_id: &str, job_id: Option<&str>) {
+        let mut processes = orch.process_state.processes.lock().unwrap();
+        let mut handle = RunHandle::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Some(format!("sess-{run_id}")),
+            job_id.map(str::to_string),
+        );
+        handle.begin_turn("turn-without-stdin");
+        processes.register(run_id.to_string(), handle);
+    }
+
     async fn turn_state(orch: &Orchestrator, id: &str) -> String {
         let id = id.to_string();
         orch.db
@@ -3260,6 +3304,50 @@ mod warm_completion_tests {
             .into_iter()
             .filter(|payload| payload.get("type").and_then(Value::as_str) == Some(attention_type))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn stop_hard_terminates_instead_of_warming_when_interrupt_delivery_fails() {
+        let db = test_db().await;
+        let orch = test_orchestrator(db);
+        register_process_without_stdin(&orch, "run-no-stdin", Some("job-no-stdin"));
+
+        stop_session_internal(
+            &orch,
+            "run-no-stdin",
+            true,
+            InterruptFailurePolicy::HardKill,
+        )
+        .expect("hard-stop fallback should complete");
+
+        assert!(
+            orch.process_state
+                .processes
+                .lock()
+                .unwrap()
+                .get("run-no-stdin")
+                .is_none(),
+            "failed interrupt delivery must not leave the process parked warm"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_wait_preserves_warm_process_when_interrupt_delivery_fails() {
+        let db = test_db().await;
+        let orch = test_orchestrator(db);
+        register_process_without_stdin(&orch, "run-suspend", Some("job-suspend"));
+
+        suspend_run_for_durable_wait(&orch, "run-suspend", "delegated_wait_suspended")
+            .expect("durable wait suspend should tolerate interrupt failure");
+
+        let processes = orch.process_state.processes.lock().unwrap();
+        let handle = processes
+            .get("run-suspend")
+            .expect("durable wait must keep the process registered for resume");
+        assert!(
+            handle.is_warm(),
+            "durable wait must park the process warm instead of hard-killing it"
+        );
     }
 
     #[tokio::test]

@@ -8,8 +8,9 @@
 //! resolve through the same store/respond machinery via
 //! [`resolve_permission_request`].
 
+use crate::backends::{stdin, AgentPermissions};
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{Fence, TurnStartReason, TurnState, TurnYieldReason};
+use crate::models::{ExecutionSnapshot, Fence, TurnStartReason, TurnState, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
@@ -743,6 +744,181 @@ pub struct PermissionResponseResume {
     pub successor_turn_id: Option<String>,
     pub job_id: Option<String>,
     pub duplicate: bool,
+}
+
+/// Persist an "allow all" decision for the agent that owns a permission request.
+///
+/// The normal permission response schema only has per-request allow/deny. The
+/// desktop's Allow all button additionally flips the requesting agent's worktree
+/// fence in the execution snapshot to [`Fence::Allow`] and tells any live process
+/// for that agent to switch permission mode. The database is resolved from the
+/// request id so team executions update their synced replica rather than the
+/// private database.
+pub async fn allow_all_for_request(orch: &Orchestrator, request_id: &str) -> Result<(), String> {
+    // A team execution's executions/jobs rows live in its synced replica, so the
+    // snapshot read+write and the active-job lookup must target the owning
+    // database (CAIRN-2227). Fail-closed (CAIRN-2170 class): an `allowAll` whose
+    // replica is not open errors rather than editing a stale private snapshot.
+    let db = crate::execution::routing::owning_db_for_permission_request(&orch.db, request_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let target = load_permission_snapshot_target(&db, request_id).await?;
+    let Some(mut snapshot) = target.snapshot else {
+        return Err("Execution has no snapshot".to_string());
+    };
+
+    let agent = snapshot.agents.get_mut(&target.agent_id).ok_or_else(|| {
+        format!(
+            "Agent '{}' not found in execution snapshot",
+            target.agent_id
+        )
+    })?;
+    agent.fence = Some(Fence::Allow);
+    let snapshot_json = snapshot.to_json()?;
+
+    update_execution_snapshot(&db, &target.execution_id, &snapshot_json).await?;
+    // Process-state propagation is host-local (live processes are keyed by
+    // session in memory), but the job-session lookup it drives reads the owning
+    // database.
+    propagate_fence_allow_to_processes(orch, &db, &target.execution_id, &target.agent_id).await;
+
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "executions", "action": "update"}),
+    );
+
+    Ok(())
+}
+
+struct PermissionSnapshotTarget {
+    execution_id: String,
+    agent_id: String,
+    snapshot: Option<ExecutionSnapshot>,
+}
+
+async fn load_permission_snapshot_target(
+    db: &LocalDb,
+    request_id: &str,
+) -> Result<PermissionSnapshotTarget, String> {
+    let request_id = request_id.to_string();
+    db.read(|conn| {
+        let request_id = request_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "
+                    SELECT j.execution_id, j.agent_config_id, e.snapshot
+                    FROM permission_requests pr
+                    JOIN runs r ON pr.run_id = r.id
+                    JOIN jobs j ON COALESCE(pr.job_id, r.job_id) = j.id
+                    JOIN executions e ON j.execution_id = e.id
+                    WHERE pr.id = ?1
+                    LIMIT 1
+                    ",
+                    params![request_id.as_str()],
+                )
+                .await?;
+            let row = rows
+                .next()
+                .await?
+                .ok_or_else(|| DbError::Row(format!("job not found for request: {request_id}")))?;
+            let execution_id = row.text(0)?;
+            let agent_id = row
+                .opt_text(1)?
+                .ok_or_else(|| DbError::Row("Job has no agent_config_id".to_string()))?;
+            let snapshot = row
+                .opt_text(2)?
+                .map(|json| ExecutionSnapshot::from_json(&json))
+                .transpose()
+                .map_err(DbError::Row)?;
+            Ok(PermissionSnapshotTarget {
+                execution_id,
+                agent_id,
+                snapshot,
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to load permission snapshot target: {e}"))
+}
+
+async fn update_execution_snapshot(
+    db: &LocalDb,
+    execution_id: &str,
+    snapshot_json: &str,
+) -> Result<(), String> {
+    db.execute(
+        "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
+        params![snapshot_json, execution_id],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("Failed to update execution snapshot: {e}"))
+}
+
+async fn propagate_fence_allow_to_processes(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution_id: &str,
+    agent_id: &str,
+) {
+    let rows = match load_agent_job_sessions(db, execution_id, agent_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("Failed to query jobs for fence allow propagation: {e}");
+            return;
+        }
+    };
+
+    let perms = AgentPermissions::new(Fence::Allow);
+    let mode = perms.to_legacy_str();
+    for (job_id, session_id) in rows {
+        let Some(session_id) = session_id else {
+            continue;
+        };
+        let Some(run_id) = orch.process_state.find_process_by_session(&session_id) else {
+            continue;
+        };
+        if let Err(e) = stdin::send_set_permission_mode(&orch.process_state, &run_id, mode) {
+            log::warn!(
+                "Failed to propagate allow fence to job {}: {}",
+                &job_id[..job_id.len().min(8)],
+                e
+            );
+        }
+    }
+}
+
+async fn load_agent_job_sessions(
+    db: &LocalDb,
+    execution_id: &str,
+    agent_id: &str,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let execution_id = execution_id.to_string();
+    let agent_id = agent_id.to_string();
+    db.read(|conn| {
+        let execution_id = execution_id.clone();
+        let agent_id = agent_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, current_session_id
+                     FROM jobs
+                     WHERE execution_id = ?1
+                       AND agent_config_id = ?2
+                       AND status NOT IN ('complete', 'failed')",
+                    params![execution_id.as_str(), agent_id.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push((row.text(0)?, row.opt_text(1)?));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to load active job sessions: {e}"))
 }
 
 /// Resolve a pending permission request: record the answer, record any session
@@ -1767,6 +1943,87 @@ async fn start_turn_for_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::DbState;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use std::sync::Arc;
+
+    async fn test_orchestrator() -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let db_path = root.join("test.db");
+        let local = LocalDb::open(db_path).await.unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build()
+    }
+
+    async fn seed_allow_all_permission(orch: &Orchestrator) {
+        let snapshot = serde_json::json!({
+            "recipe": {
+                "id": "recipe-1",
+                "name": "Recipe",
+                "description": null,
+                "trigger": "manual",
+                "nodes": [],
+                "edges": []
+            },
+            "agents": {
+                "agent-1": {
+                    "id": "agent-1",
+                    "name": "Agent",
+                    "description": "Agent",
+                    "prompt": "prompt",
+                    "tools": [],
+                    "disallowedTools": null,
+                    "skills": null,
+                    "fence": "ask"
+                }
+            },
+            "skills": {},
+            "triggerContext": {
+                "issueId": "issue-1",
+                "projectId": "project-1",
+                "triggerType": "manual"
+            },
+            "delegatedPackets": [],
+            "createdAt": 1
+        })
+        .to_string()
+        .replace('\'', "''");
+        orch.db
+            .local
+            .execute_script(format!(
+                "
+                INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','Workspace',1,1);
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('project-1','ws','Project','PRJ','/tmp/project',1,1);
+                INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+                 VALUES ('issue-1','project-1',1,'Issue','active','active','none',1,1);
+                INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+                 VALUES ('execution-1','recipe-1','issue-1','project-1','running',1,1,'{snapshot}');
+                INSERT INTO jobs(
+                    id, execution_id, recipe_node_id, issue_id, project_id, status,
+                    agent_config_id, node_name, uri_segment, created_at, updated_at
+                ) VALUES (
+                    'job-1','execution-1','node-1','issue-1','project-1','running',
+                    'agent-1','Agent','agent',1,1
+                );
+                INSERT INTO runs(id, issue_id, project_id, job_id, status, created_at, updated_at)
+                 VALUES ('run-1','issue-1','project-1','job-1','running',1,1);
+                INSERT INTO permission_requests(
+                    id, run_id, tool_use_id, tool_name, tool_input, status, created_at, job_id, uri_segment
+                ) VALUES (
+                    'perm-request-1','run-1','tool-1','read','{{}}','pending',1,'job-1','perm-1'
+                );
+                "
+            ))
+            .await
+            .unwrap();
+    }
 
     fn codex_mcp_request_input() -> String {
         serde_json::json!({
@@ -1781,6 +2038,29 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn allow_all_for_request_sets_requesting_agent_fence_to_allow() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+
+        allow_all_for_request(&orch, "perm-request-1")
+            .await
+            .unwrap();
+
+        let snapshot = orch
+            .db
+            .local
+            .query_text(
+                "SELECT snapshot FROM executions WHERE id = 'execution-1'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let snapshot = ExecutionSnapshot::from_json(&snapshot).unwrap();
+        assert_eq!(snapshot.agents["agent-1"].fence, Some(Fence::Allow));
     }
 
     #[test]

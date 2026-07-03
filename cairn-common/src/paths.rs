@@ -75,6 +75,31 @@ pub fn cairn_home() -> PathBuf {
         .join(suffix)
 }
 
+/// The database filename inside `cairn_home()` that the runner owns.
+pub const RUNNER_DB_FILENAME: &str = "cairn.db";
+
+/// The Tauri desktop bundle identifier — the subdirectory name under the OS
+/// app-data dir where the pre-runner desktop stored its database.
+pub const DESKTOP_BUNDLE_IDENTIFIER: &str = "com.cairn.desktop";
+
+/// Path to the database the pre-runner desktop stored in the OS app-data dir.
+///
+/// Before the runner-daemon cutover, the desktop opened its database from
+/// Tauri's `app_data_dir()` (`dirs::data_dir()/com.cairn.desktop/`), not
+/// `cairn_home()`. The runner now owns `~/.cairn`, so on first boot it carries
+/// this legacy database across (see `cairn-runner`'s legacy migration). Prod
+/// used `cairn.turso.db`; dev used `cairn-dev.turso.db`.
+///
+/// Returns `None` when the OS app-data dir cannot be determined.
+pub fn legacy_appdata_db_path() -> Option<PathBuf> {
+    let name = if is_dev() {
+        "cairn-dev.turso.db"
+    } else {
+        "cairn.turso.db"
+    };
+    dirs::data_dir().map(|dir| dir.join(DESKTOP_BUNDLE_IDENTIFIER).join(name))
+}
+
 /// The Cairn log directory.
 ///
 /// If `CAIRN_LOG_DIR` is set, it is used verbatim (the narrow log-only

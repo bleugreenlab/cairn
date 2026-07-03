@@ -12,7 +12,7 @@ pub use error::{DbError, DbResult};
 pub use local_db::{
     db_set_paths, db_set_size, install_crypto_provider, move_db_set, LocalDb, RetryConfig,
 };
-pub use migration::{Migration, MigrationRunner};
+pub use migration::{repair_index_entry_drift, Migration, MigrationRunner};
 pub use migrations::{
     Lineage, PrivateReason, RekeyTableManifest, ScopeTarget, TableScope, PROJECT_REKEY_MANIFEST,
     TABLE_SCOPES, TEAM_MIGRATIONS, TURSO_MIGRATIONS,

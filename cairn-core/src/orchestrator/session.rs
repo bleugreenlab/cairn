@@ -479,15 +479,12 @@ fn build_orientation_block(
     out
 }
 
-/// Render the `## Available Terminals` affordance: a project's named terminal
-/// shortcuts (`.cairn` `terminalCommands`), each by name + command, plus one
-/// runnable `create` example using the slug the system would generate for the
-/// first shortcut. Returns `None` for an empty list so the section is omitted
-/// entirely, mirroring the Available Agents / Skills empty-gating.
-///
-/// The example carries the command in the payload because terminal `create`
-/// requires it (see the terminal contracts in `cairn-common`) — a slug alone
-/// would be rejected.
+/// Render the `## Project checks` section: the project's configured `checks`
+/// contract (`.cairn/config.yaml`), each check with its command, policy, and
+/// cadence, over framing on WHEN the engine runs each cadence and HOW verdicts
+/// are delivered — so an agent trusts the automated cadence instead of
+/// re-testing by hand. Returns `None` for an empty contract so the section is
+/// omitted, mirroring the Available Agents / Skills empty-gating.
 fn build_project_checks_section(
     checks: &std::collections::HashMap<String, crate::config::project_settings::CheckCommand>,
 ) -> Option<String> {
@@ -500,7 +497,16 @@ fn build_project_checks_section(
 
     let mut out = String::from("## Project checks\n\n");
     out.push_str(
-        "Configured checks from `.cairn/config.yaml`. They are not run automatically by this slice yet; use them as the canonical project test contract.\n\n",
+        "Configured checks from `.cairn/config.yaml`, run automatically on a cadence:\n\n\
+         - `when: write` checks run right after each source-touching commit; their verdicts \
+         (with test counts) are appended to the committing tool result.\n\
+         - `when: idle` checks run in the background at turn-end; `when: review` re-runs the \
+         full suites while a PR is open. A failing turn-end check wakes this session with the \
+         results inlined; passing results ride along passively into your next turn.\n\n\
+         Trust the cadence: a green verdict with a test count covers the diff, so the per-suite \
+         commands exist for iterating on a failure a check surfaced, not for re-verifying a \
+         finished diff. What checks do NOT cover: live UI/feature verification and cross-system \
+         integration still need a browser or a dev instance.\n\n",
     );
     for (name, check) in entries {
         out.push_str(&format!(

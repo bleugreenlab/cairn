@@ -164,6 +164,7 @@ pub fn push_kind_headline(prefix: &str) -> (&str, &str) {
         "direct" => ("message", "Direct message"),
         "resolved" => ("resolved", "Issue resolved"),
         "tasks" => ("tasks", "Tasks need attention"),
+        "turn-checks" => ("checks", "Turn-end check results"),
         other => (other, "Attention update"),
     }
 }

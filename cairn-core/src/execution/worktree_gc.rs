@@ -17,10 +17,18 @@
 //!    teardown would.
 //! 2. **Filesystem pass** — remove directories under the worktrees base that NO
 //!    job row references (legacy debris) plus `*.trash-*` tombstones the robust
-//!    remover left behind, idle since before the cutoff. **Gated to the canonical
-//!    instance** (`config_dir` == `~/.cairn`, not `~/.cairn-dev`): the base dir is
-//!    shared across instances, and a dev DB does not know about production jobs,
-//!    so an ungated dev sweep would delete live production worktrees.
+//!    remover left behind, idle since before the cutoff. Each swept dir's parent
+//!    repo (read from its `.git` file) gets a `git worktree prune` afterwards, so
+//!    the fs-only delete does not strand a `.git/worktrees/<name>` registration.
+//!    **Gated to the canonical instance** (`config_dir` == `~/.cairn`, not
+//!    `~/.cairn-dev`): the base dir is shared across instances, and a dev DB does
+//!    not know about production jobs, so an ungated dev sweep would delete live
+//!    production worktrees. The pass also reclaims stale incremental-compile
+//!    caches inside the worktrees that survive: fenced agent builds keep
+//!    `CARGO_INCREMENTAL` on for iteration speed (see
+//!    [`crate::config::build_services::default_sccache_service`]), and deleting
+//!    `src-tauri/target/*/incremental` dirs idle past
+//!    `INCREMENTAL_MAX_IDLE_SECS` bounds the resulting disk growth.
 //!
 //! The GC never touches branches — branch-deletion policy lives solely in
 //! [`crate::execution::teardown::teardown_worktrees`], which is landed-aware.
@@ -30,7 +38,7 @@ use crate::execution::teardown::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use turso::params;
 
@@ -122,18 +130,125 @@ async fn fs_pass(orch: &Orchestrator, cutoff: i64) {
         None => return,
     };
     let referenced = load_referenced_paths(orch).await;
-    let removed = sweep_base_dir(&base, &referenced, cutoff);
-    if removed > 0 {
-        log::info!("Worktree GC: filesystem pass removed {removed} director(ies)");
+    let outcome = sweep_base_dir(&base, &referenced, cutoff);
+    // The sweep deletes dirs with plain fs ops (it has no job row, so no
+    // git-aware removal path), which leaves each dir's `.git/worktrees/<name>`
+    // registration behind in its parent repo. Prune every repo a swept dir
+    // pointed at so registrations don't accumulate and collide with future
+    // `git worktree add` calls.
+    for repo in &outcome.prune_repos {
+        match orch.services.git.worktree_prune(repo) {
+            Ok(()) => log::info!(
+                "Worktree GC: pruned stale worktree registrations in {}",
+                repo.display()
+            ),
+            Err(e) => log::warn!(
+                "Worktree GC: git worktree prune failed for {}: {e}",
+                repo.display()
+            ),
+        }
+    }
+    if outcome.removed > 0 {
+        log::info!(
+            "Worktree GC: filesystem pass removed {} director(ies)",
+            outcome.removed
+        );
         emit_jobs_change(orch);
     }
+
+    // Incremental-cache reclaim. Fenced agent builds run with incremental
+    // compilation ON (see `config::build_services::default_sccache_service` for
+    // why), so an actively-iterated worktree accretes a large
+    // `target/<profile>/incremental` tree. Job-referenced worktrees survive the
+    // sweep above by design; this bounds their disk instead. Its cutoff is the
+    // fixed `INCREMENTAL_MAX_IDLE_SECS`, not the settings-driven orphan cutoff —
+    // the incremental cache is regenerable scratch, and the only cost of a
+    // too-eager delete is one slower rebuild.
+    let inc_cutoff = chrono::Utc::now().timestamp() - INCREMENTAL_MAX_IDLE_SECS;
+    let reclaimed = reclaim_incremental_caches(&base, inc_cutoff);
+    if reclaimed > 0 {
+        log::info!("Worktree GC: reclaimed {reclaimed} stale incremental cache dir(s)");
+    }
+}
+
+/// How long a worktree's `src-tauri/target/<profile>/incremental` dir may sit
+/// idle before the filesystem pass reclaims it. 48 h: an actively-iterating
+/// agent touches its incremental cache on every build, so a live edit-test loop
+/// always stays fresh and survives, while a parked worktree pays at worst one
+/// cold rebuild of its workspace crates if it ever resumes. Deliberately much
+/// shorter than `orphan_cleanup_days` — the cache is regenerable scratch, not
+/// the agent's work.
+const INCREMENTAL_MAX_IDLE_SECS: i64 = 48 * 60 * 60;
+
+/// Testable core of the incremental-cache reclaim: for every worktree dir under
+/// `base`, delete each `src-tauri/target/<profile>/incremental` directory idle
+/// since before `cutoff` (unix secs). Plain `remove_dir_all` — unlike swept
+/// worktrees, there is no `.git` registration or job row to respect, and the
+/// contents are regenerable. Returns the number of dirs removed.
+fn reclaim_incremental_caches(base: &Path, cutoff: i64) -> u32 {
+    let worktrees = match std::fs::read_dir(base) {
+        Ok(e) => e,
+        Err(_) => return 0, // absent base already logged by the sweep
+    };
+    let mut removed = 0u32;
+    for wt in worktrees.flatten() {
+        let target = wt.path().join("src-tauri").join("target");
+        let profiles = match std::fs::read_dir(&target) {
+            Ok(e) => e,
+            Err(_) => continue, // no Rust target tree in this worktree
+        };
+        for profile in profiles.flatten() {
+            let inc = profile.path().join("incremental");
+            if !inc.is_dir() || !incremental_idle_before(&inc, cutoff) {
+                continue;
+            }
+            match std::fs::remove_dir_all(&inc) {
+                Ok(()) => {
+                    log::info!("Worktree GC: reclaimed incremental cache {}", inc.display());
+                    removed += 1;
+                }
+                Err(e) => log::warn!(
+                    "Worktree GC: failed to reclaim incremental cache {}: {e}",
+                    inc.display()
+                ),
+            }
+        }
+    }
+    removed
+}
+
+/// Whether an incremental dir has been idle since before `cutoff`: the newest of
+/// its own mtime and its immediate children's. rustc writes new session dirs
+/// *inside* the per-crate subdirs on every rebuild, so the top dir's own mtime
+/// can look stale mid-iteration; one level down is where liveness shows.
+/// Conservative like [`dir_idle_before`]: no resolvable mtime keeps the dir.
+fn incremental_idle_before(inc: &Path, cutoff: i64) -> bool {
+    let mut newest = mtime_secs(inc);
+    if let Ok(entries) = std::fs::read_dir(inc) {
+        for child in entries.flatten() {
+            newest = newest.max(mtime_secs(&child.path()));
+        }
+    }
+    matches!(newest, Some(m) if m < cutoff)
+}
+
+/// Result of one filesystem sweep: how many dirs were removed, and the parent
+/// repos whose `.git/worktrees` registrations now need pruning.
+#[derive(Debug, Default)]
+struct SweepOutcome {
+    removed: u32,
+    /// Parent repos of removed dirs that were linked git worktrees (derived from
+    /// each dir's `.git` file before deletion). `BTreeSet` for deterministic
+    /// order in logs and tests.
+    prune_repos: BTreeSet<PathBuf>,
 }
 
 /// Testable core of the filesystem pass: scan `base`, remove each directory that
 /// no job references (or any `*.trash-*` tombstone) once it is idle past
-/// `cutoff`. Returns how many were removed. Removal goes through the same guarded
-/// rename-then-delete the live remover uses.
-fn sweep_base_dir(base: &Path, referenced: &HashSet<PathBuf>, cutoff: i64) -> u32 {
+/// `cutoff`. Removal goes through the same guarded rename-then-delete the live
+/// remover uses. Collects (but does not run) the parent repos to prune — the
+/// caller owns the git side.
+fn sweep_base_dir(base: &Path, referenced: &HashSet<PathBuf>, cutoff: i64) -> SweepOutcome {
     let entries = match std::fs::read_dir(base) {
         Ok(e) => e,
         Err(e) => {
@@ -143,11 +258,11 @@ fn sweep_base_dir(base: &Path, referenced: &HashSet<PathBuf>, cutoff: i64) -> u3
                     base.display()
                 );
             }
-            return 0;
+            return SweepOutcome::default();
         }
     };
 
-    let mut removed = 0u32;
+    let mut outcome = SweepOutcome::default();
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
@@ -165,6 +280,8 @@ fn sweep_base_dir(base: &Path, referenced: &HashSet<PathBuf>, cutoff: i64) -> u3
         if !dir_idle_before(&path, cutoff) {
             continue;
         }
+        // Read the parent repo BEFORE deletion — the `.git` file goes with the dir.
+        let parent_repo = parent_repo_of_git_worktree(&path);
         match teardown::remove_dir_tombstoned(&path, base) {
             Ok(()) => {
                 log::info!(
@@ -176,12 +293,35 @@ fn sweep_base_dir(base: &Path, referenced: &HashSet<PathBuf>, cutoff: i64) -> u3
                         "unreferenced"
                     }
                 );
-                removed += 1;
+                outcome.removed += 1;
+                if let Some(repo) = parent_repo {
+                    outcome.prune_repos.insert(repo);
+                }
             }
             Err(e) => log::warn!("Worktree GC: failed to remove {}: {e}", path.display()),
         }
     }
-    removed
+    outcome
+}
+
+/// The parent repository a linked git worktree belongs to, derived from its
+/// `.git` file (`gitdir: <repo>/.git/worktrees/<name>`). `None` for jj
+/// workspaces (which have no `.git` file), half-deleted dirs, and anything else
+/// without that shape — including a worktree of a bare repo, whose admin dir
+/// does not sit under a `.git` directory we can prune from a checkout path.
+fn parent_repo_of_git_worktree(dir: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let admin = Path::new(contents.strip_prefix("gitdir:")?.trim());
+    // admin = <repo>/.git/worktrees/<name>
+    let worktrees = admin.parent()?;
+    if worktrees.file_name()? != "worktrees" {
+        return None;
+    }
+    let git_dir = worktrees.parent()?;
+    if git_dir.file_name()? != ".git" {
+        return None;
+    }
+    git_dir.parent().map(Path::to_path_buf)
 }
 
 /// The canonical (production) instance keys its config dir at `~/.cairn`; a dev
@@ -372,9 +512,12 @@ mod tests {
         let unref = base.path().join("CAIRN-9-builder-0");
         std::fs::create_dir_all(&unref).unwrap();
 
-        let removed = sweep_base_dir(base.path(), &HashSet::new(), future_cutoff());
-        assert_eq!(removed, 1);
+        let outcome = sweep_base_dir(base.path(), &HashSet::new(), future_cutoff());
+        assert_eq!(outcome.removed, 1);
         assert!(!unref.exists());
+        // A dir with no `.git` file (a jj workspace, plain debris) has no parent
+        // repo to prune.
+        assert!(outcome.prune_repos.is_empty());
     }
 
     #[test]
@@ -384,8 +527,8 @@ mod tests {
         std::fs::create_dir_all(&referenced_dir).unwrap();
         let referenced: HashSet<PathBuf> = [path_key(&referenced_dir)].into_iter().collect();
 
-        let removed = sweep_base_dir(base.path(), &referenced, future_cutoff());
-        assert_eq!(removed, 0);
+        let outcome = sweep_base_dir(base.path(), &referenced, future_cutoff());
+        assert_eq!(outcome.removed, 0);
         assert!(referenced_dir.exists(), "a job-referenced dir is untouched");
     }
 
@@ -396,8 +539,8 @@ mod tests {
         std::fs::create_dir_all(&young).unwrap();
 
         // cutoff at the epoch: nothing is idle before it, so a fresh dir stays.
-        let removed = sweep_base_dir(base.path(), &HashSet::new(), 0);
-        assert_eq!(removed, 0);
+        let outcome = sweep_base_dir(base.path(), &HashSet::new(), 0);
+        assert_eq!(outcome.removed, 0);
         assert!(young.exists());
     }
 
@@ -407,8 +550,108 @@ mod tests {
         let tombstone = base.path().join("CAIRN-3-builder-0.trash-42");
         std::fs::create_dir_all(&tombstone).unwrap();
 
-        let removed = sweep_base_dir(base.path(), &HashSet::new(), future_cutoff());
-        assert_eq!(removed, 1);
+        let outcome = sweep_base_dir(base.path(), &HashSet::new(), future_cutoff());
+        assert_eq!(outcome.removed, 1);
         assert!(!tombstone.exists());
+    }
+
+    /// Sweeping a linked git worktree (its `.git` file names the parent repo's
+    /// admin dir) collects that repo for a post-sweep `git worktree prune`, so
+    /// the fs-only delete does not strand the registration.
+    #[test]
+    fn sweep_collects_parent_repo_of_git_worktree_for_prune() {
+        let base = tempfile::tempdir().unwrap();
+        let wt = base.path().join("CAIRN-4-builder-0");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            "gitdir: /repos/cairn/.git/worktrees/CAIRN-4-builder-0\n",
+        )
+        .unwrap();
+
+        let outcome = sweep_base_dir(base.path(), &HashSet::new(), future_cutoff());
+        assert_eq!(outcome.removed, 1);
+        assert!(!wt.exists());
+        assert_eq!(
+            outcome.prune_repos.iter().collect::<Vec<_>>(),
+            vec![&PathBuf::from("/repos/cairn")]
+        );
+    }
+
+    #[test]
+    fn reclaim_removes_idle_incremental_dirs_only() {
+        let base = tempfile::tempdir().unwrap();
+        let debug = base.path().join("CAIRN-5-builder-0/src-tauri/target/debug");
+        let release = base
+            .path()
+            .join("CAIRN-5-builder-0/src-tauri/target/release");
+        std::fs::create_dir_all(debug.join("incremental")).unwrap();
+        std::fs::create_dir_all(debug.join("deps")).unwrap();
+        std::fs::create_dir_all(release.join("incremental")).unwrap();
+
+        let removed = reclaim_incremental_caches(base.path(), future_cutoff());
+        assert_eq!(removed, 2, "one per profile dir");
+        assert!(!debug.join("incremental").exists());
+        assert!(!release.join("incremental").exists());
+        // Only the incremental caches go; the rest of target/ and the worktree stay.
+        assert!(debug.join("deps").exists());
+    }
+
+    #[test]
+    fn reclaim_keeps_fresh_incremental_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let inc = base
+            .path()
+            .join("CAIRN-6-builder-0/src-tauri/target/debug/incremental");
+        std::fs::create_dir_all(&inc).unwrap();
+
+        // cutoff at the epoch: nothing is idle before it, so a fresh cache stays.
+        assert_eq!(reclaim_incremental_caches(base.path(), 0), 0);
+        assert!(inc.exists());
+    }
+
+    /// A rebuild touches the per-crate subdirs inside `incremental/`, not the top
+    /// dir itself — a stale top-dir mtime with a fresh child is an actively
+    /// iterating agent, and its cache must survive.
+    #[test]
+    fn reclaim_keeps_incremental_dir_with_fresh_child() {
+        let base = tempfile::tempdir().unwrap();
+        let inc = base
+            .path()
+            .join("CAIRN-7-builder-0/src-tauri/target/debug/incremental");
+        let crate_dir = inc.join("cairn_core-abc123");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        // Age the top dir well past any cutoff; the crate subdir stays fresh.
+        filetime::set_file_mtime(&inc, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        assert!(!incremental_idle_before(&inc, now - 60));
+        assert_eq!(reclaim_incremental_caches(base.path(), now - 60), 0);
+        assert!(inc.exists());
+    }
+
+    #[test]
+    fn parent_repo_parses_gitdir_file_and_rejects_other_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        // No `.git` file at all (a jj workspace).
+        assert_eq!(parent_repo_of_git_worktree(&wt), None);
+
+        // The canonical linked-worktree shape resolves to the checkout root.
+        std::fs::write(wt.join(".git"), "gitdir: /r/x/.git/worktrees/wt\n").unwrap();
+        assert_eq!(
+            parent_repo_of_git_worktree(&wt),
+            Some(PathBuf::from("/r/x"))
+        );
+
+        // A gitdir that is not a `.git/worktrees/<name>` admin path is rejected.
+        std::fs::write(wt.join(".git"), "gitdir: /somewhere/else\n").unwrap();
+        assert_eq!(parent_repo_of_git_worktree(&wt), None);
+
+        // A submodule-style gitdir (`.git/modules/<name>`) is rejected too.
+        std::fs::write(wt.join(".git"), "gitdir: /r/x/.git/modules/wt\n").unwrap();
+        assert_eq!(parent_repo_of_git_worktree(&wt), None);
     }
 }

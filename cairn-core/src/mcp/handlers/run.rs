@@ -1569,6 +1569,307 @@ fn compose_run_output(outcomes: &[ItemOutcome]) -> String {
     text
 }
 
+/// A recognized trailing `tail` pipeline stage whose only effect is to keep the
+/// last N lines of stdout. A trailing `tail` buffers all upstream output until
+/// EOF, so the live preview stays blank for the whole run; stripping it lets the
+/// full output stream, and re-applying [`OutputTail::apply`] to the captured
+/// stdout keeps the recorded result exactly what the agent asked for.
+struct OutputTail {
+    /// Number of trailing lines to keep. GNU/BSD `tail` defaults to 10.
+    lines: usize,
+}
+
+impl OutputTail {
+    /// Keep the last `lines` lines of `stdout`, mirroring `tail -n <lines>`.
+    /// Captured stdout is lines joined by `\n` (the reader strips the newlines),
+    /// so this counts `\n` separators.
+    fn apply(&self, stdout: &str) -> String {
+        if self.lines == 0 {
+            return String::new();
+        }
+        let total_lines = stdout.bytes().filter(|&b| b == b'\n').count() + 1;
+        if total_lines <= self.lines {
+            return stdout.to_string();
+        }
+        // The last N lines begin just after the `drop`-th newline.
+        let drop = total_lines - self.lines;
+        let mut seen = 0usize;
+        let mut start = 0usize;
+        for (idx, byte) in stdout.bytes().enumerate() {
+            if byte == b'\n' {
+                seen += 1;
+                if seen == drop {
+                    start = idx + 1;
+                    break;
+                }
+            }
+        }
+        stdout[start..].to_string()
+    }
+}
+
+/// GNU/BSD `tail` keeps the last 10 lines when no count is given.
+const DEFAULT_TAIL_LINES: usize = 10;
+
+/// If `command` is a single pure pipeline ending in a `tail` stage whose sole
+/// effect is "keep the last N lines of stdout", return the command with that
+/// stage removed plus the [`OutputTail`] to re-apply to captured stdout. Returns
+/// `None` — leave the command exactly as written — for anything not provably
+/// equivalent to that.
+///
+/// The transformation is exact only because the command is a single pipeline:
+/// every stage's stdout flows through to the final `tail`, and a fresh `bash -c`
+/// runs without `pipefail`, so the pipeline exits with tail's success (0). Both
+/// facts let the caller re-apply the line limit to the whole captured stdout and
+/// mask the exit code to 0 with byte-for-byte fidelity. A top-level `&&`, `;`,
+/// `||`, background `&`, or newline breaks that equivalence (the tail would apply
+/// only to the final statement, or the exit code would be conditional), and
+/// `tail -f`/`-c`/`-n +N`, a file argument, or `|&` are not last-N-line stdin
+/// tails — all of these bail. See [`head_is_pure_pipeline`] and
+/// [`parse_tail_stage`].
+fn strip_streamable_tail(command: &str) -> Option<(String, OutputTail)> {
+    let (head, tail_segment) = split_last_top_level_pipe(command)?;
+    let tail = parse_tail_stage(tail_segment)?;
+    let head = head.trim_end();
+    if head.is_empty() || !head_is_pure_pipeline(head) {
+        return None;
+    }
+    Some((head.to_string(), tail))
+}
+
+/// Split `command` at its last top-level plain `|` (a real pipe: not `||`, not
+/// `|&`, not `>|`, and not inside single/double quotes, backticks, or
+/// `$(...)`/`(...)` nesting). Returns `(before, after)` with the pipe removed, or
+/// `None` when there is no such pipe.
+fn split_last_top_level_pipe(command: &str) -> Option<(&str, &str)> {
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut depth: usize = 0;
+    let mut last_pipe: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            match c {
+                b'\\' => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_double = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            if c == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'`' => in_backtick = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'|' if depth == 0 => {
+                let next = bytes.get(i + 1).copied();
+                let prev = i.checked_sub(1).map(|p| bytes[p]);
+                // `||` (logical OR): consume both bytes so neither registers.
+                if next == Some(b'|') {
+                    i += 2;
+                    continue;
+                }
+                // `|&` (pipe stdout+stderr) combines streams — tail would see a
+                // different byte stream than our stdout-only re-application. `>|`
+                // is a force-clobber redirect, not a pipe.
+                if next != Some(b'&') && prev != Some(b'>') {
+                    last_pipe = Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let idx = last_pipe?;
+    Some((&command[..idx], &command[idx + 1..]))
+}
+
+/// A "pure pipeline" head: its only top-level control operators are single `|`
+/// pipes, so every stage's stdout flows through to the final `tail`. A top-level
+/// `;`, `&&`, `||`, background `&`, or newline breaks the equivalence that makes
+/// stripping exact, so those return `false`. Redirection ampersands (`2>&1`,
+/// `>&2`, `&>file`) are allowed — they are adjacent to `>`/`<`, never doubled.
+fn head_is_pure_pipeline(head: &str) -> bool {
+    let bytes = head.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut depth: usize = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_double {
+            match c {
+                b'\\' => {
+                    i += 2;
+                    continue;
+                }
+                b'"' => in_double = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            if c == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            b'\'' => in_single = true,
+            b'"' => in_double = true,
+            b'`' => in_backtick = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' | b'\n' if depth == 0 => return false,
+            b'|' if depth == 0 => {
+                // `||` (logical OR) is not a pipe.
+                if bytes.get(i + 1).copied() == Some(b'|') {
+                    return false;
+                }
+            }
+            b'&' if depth == 0 => {
+                // Allow redirection ampersands (`2>&1`, `>&2`, `&>file`); reject
+                // background `&` and `&&`.
+                let prev = i.checked_sub(1).map(|p| bytes[p]);
+                let next = bytes.get(i + 1).copied();
+                let is_redirection = prev == Some(b'>') || prev == Some(b'<') || next == Some(b'>');
+                if !is_redirection {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Parse a pipeline segment that must be exactly a `tail` invocation equivalent
+/// to "keep the last N lines". Any shell metacharacter (a trailing operator,
+/// redirection, subshell, substitution, quote, or glob riding along) or an
+/// unrecognized flag yields `None`.
+fn parse_tail_stage(segment: &str) -> Option<OutputTail> {
+    let segment = segment.trim();
+    if segment.bytes().any(|b| {
+        matches!(
+            b,
+            b'|' | b'&'
+                | b';'
+                | b'<'
+                | b'>'
+                | b'('
+                | b')'
+                | b'`'
+                | b'$'
+                | b'\''
+                | b'"'
+                | b'*'
+                | b'?'
+                | b'['
+                | b'\\'
+        )
+    }) {
+        return None;
+    }
+    let mut toks = segment.split_whitespace();
+    if toks.next()? != "tail" {
+        return None;
+    }
+    let args: Vec<&str> = toks.collect();
+    parse_tail_args(&args)
+}
+
+/// Parse `tail`'s arguments into a last-N-lines transform, or `None` for any form
+/// that is not a plain stdin line tail (`-f`, `-c`, `-n +N`, a file argument, an
+/// unrecognized flag).
+fn parse_tail_args(args: &[&str]) -> Option<OutputTail> {
+    if args.is_empty() {
+        return Some(OutputTail {
+            lines: DEFAULT_TAIL_LINES,
+        });
+    }
+    let mut lines: Option<usize> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "-n" || a == "--lines" {
+            lines = Some(parse_line_count(args.get(i + 1)?)?);
+            i += 2;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--lines=") {
+            lines = Some(parse_line_count(v)?);
+            i += 1;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("-n") {
+            lines = Some(parse_line_count(v)?);
+            i += 1;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix('-') {
+            // Obsolescent `-N` count form. `-f`/`-c`/`-q`/... fail here because
+            // they are not all-digits.
+            lines = Some(parse_line_count(v)?);
+            i += 1;
+            continue;
+        }
+        // A bare positional is a file argument — tail would read the file, not the
+        // pipe — so this is not a stdin tail.
+        return None;
+    }
+    lines.map(|lines| OutputTail { lines })
+}
+
+/// Parse a `tail` line-count value: plain ASCII digits only. Rejects `+N` (from
+/// line N), an empty value, and any non-numeric flag letter.
+fn parse_line_count(value: &str) -> Option<usize> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<usize>().ok()
+}
+
 /// Run a single resolved item: execute it, format its body, and (for shell
 /// items only) cache checkpoint results and auto-push on `git commit`.
 #[allow(clippy::too_many_arguments)]
@@ -1594,18 +1895,37 @@ async fn run_one(
         ("bash", "-c")
     };
 
+    // A trailing `| tail -N` on a shell item buffers all upstream output until
+    // EOF, so the live preview stays blank for the whole run. When there is a run
+    // context (a live preview worth restoring), strip that tail for execution and
+    // re-apply the line limit to the captured stdout after the process exits (see
+    // below). `shell_command` stays the ORIGINAL string — grant key, checkpoint
+    // cache, and the displayed header all key on exactly what the agent wrote.
+    let mut tail_transform: Option<OutputTail> = None;
+
     let (program, args, timeout, shell_command): (
         String,
         Vec<String>,
         Option<u32>,
         Option<String>,
     ) = match spec {
-        RunSpec::Shell { command, timeout } => (
-            shell.to_string(),
-            vec![flag.to_string(), command.clone()],
-            timeout,
-            Some(command),
-        ),
+        RunSpec::Shell { command, timeout } => {
+            // Only strip when a live preview exists to protect (a run context);
+            // headless/CLI invocations keep exact pipeline semantics.
+            let exec_command = match run_context.and_then(|_| strip_streamable_tail(&command)) {
+                Some((stripped, tail)) => {
+                    tail_transform = Some(tail);
+                    stripped
+                }
+                None => command.clone(),
+            };
+            (
+                shell.to_string(),
+                vec![flag.to_string(), exec_command],
+                timeout,
+                Some(command),
+            )
+        }
         RunSpec::Script {
             program,
             args,
@@ -1713,6 +2033,20 @@ async fn run_one(
                     }
                 }
             }
+        }
+    }
+
+    // The stripped `| tail -N` re-applied (see resolve above): the command ran
+    // bare so its full stdout streamed to the live preview; trim the captured
+    // stdout back to the last N lines and mask the exit code to tail's success
+    // (0), so the recorded result is what `cmd | tail -N` produces — only the live
+    // preview changed. Skipped on timeout: the command never reached EOF (tail
+    // would still be buffering), and the promoted-terminal path owns that
+    // partial-output case.
+    if let Some(tail) = &tail_transform {
+        if !exec.timed_out {
+            exec.stdout = tail.apply(&exec.stdout);
+            exec.exit_code = Some(0);
         }
     }
 
@@ -3761,6 +4095,74 @@ mod tests {
             payload.commands[1].payload.as_ref().unwrap().args,
             vec!["--fast".to_string()]
         );
+    }
+
+    #[test]
+    fn strip_streamable_tail_recognizes_last_n_line_forms() {
+        let cases = [
+            ("cargo build | tail -50", "cargo build", 50),
+            ("cargo build | tail -n 50", "cargo build", 50),
+            ("cargo build | tail -n50", "cargo build", 50),
+            ("cargo build | tail --lines=50", "cargo build", 50),
+            ("cargo build | tail --lines 50", "cargo build", 50),
+            ("cargo build | tail", "cargo build", DEFAULT_TAIL_LINES),
+            // A merged stderr redirect stays on the head side and streams live.
+            ("cargo build 2>&1 | tail -20", "cargo build 2>&1", 20),
+            // Multi-stage pipelines are fine: every stage still feeds tail.
+            ("cat log | grep err | tail -5", "cat log | grep err", 5),
+        ];
+        for (command, head, lines) in cases {
+            let (stripped, tail) = strip_streamable_tail(command)
+                .unwrap_or_else(|| panic!("should strip trailing tail: {command}"));
+            assert_eq!(stripped, head, "head mismatch for {command}");
+            assert_eq!(tail.lines, lines, "line count mismatch for {command}");
+        }
+    }
+
+    #[test]
+    fn strip_streamable_tail_leaves_unrecognized_or_unsafe_forms_untouched() {
+        let untouched = [
+            "cargo build",                            // no pipe at all
+            "cargo build | tail -f",                  // follow never reaches EOF
+            "cargo build | tail -c 100",              // byte tail, not line tail
+            "cargo build | tail -n +50",              // from line N, not last N
+            "cargo build | tail -50 log.txt",         // reads a file, not the pipe
+            "cargo build | tail -5 | grep x",         // tail is not the final stage
+            "cargo build | tail -q",                  // unrecognized flag
+            "cargo build | head -50",                 // head already streams
+            "cargo build |& tail -5",                 // pipe-both combines stderr
+            "cargo build || tail -5",                 // logical OR, not a pipe
+            "(cargo build | tail -5)",                // pipe nested in a subshell
+            "echo 'a | tail -5'",                     // pipe is inside quotes
+            "cd foo && make | tail -20",              // && makes the exit conditional
+            "echo start ; make | tail -5",            // ; — tail sees only the last stmt
+            "set -o pipefail; cargo build | tail -5", // pipefail changes exit semantics
+            "make | tail -5 & echo done",             // trailing background operator
+        ];
+        for command in untouched {
+            assert!(
+                strip_streamable_tail(command).is_none(),
+                "should leave untouched: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_tail_keeps_last_n_lines() {
+        let tail = OutputTail { lines: 2 };
+        assert_eq!(tail.apply("a\nb\nc\nd"), "c\nd");
+        // Fewer lines than the limit — unchanged.
+        assert_eq!(tail.apply("only\none"), "only\none");
+        assert_eq!(tail.apply("single"), "single");
+        // Exactly the limit — unchanged.
+        assert_eq!(tail.apply("x\ny"), "x\ny");
+        // Empty stdout stays empty.
+        assert_eq!(tail.apply(""), "");
+    }
+
+    #[test]
+    fn output_tail_zero_lines_is_empty() {
+        assert_eq!(OutputTail { lines: 0 }.apply("a\nb\nc"), "");
     }
 }
 
