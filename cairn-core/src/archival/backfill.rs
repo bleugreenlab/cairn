@@ -85,8 +85,6 @@
 
 use std::path::Path;
 
-use super::compress;
-use super::encoding::ArchivedShape;
 use super::rewrite::{
     build_system_init_shape, build_system_prompt_shape, build_tool_map, event_tool_use_id,
     normalize_tool_name, push_blobbed_or_zstd, zstd_stub, SegmentBlob, SystemBlobKind,
@@ -94,6 +92,8 @@ use super::rewrite::{
 };
 use crate::models::Event;
 use crate::runs::queries::{event_from_row, EVENT_COLUMNS};
+use crate::storage::compress;
+use crate::storage::events::encoding::ArchivedShape;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
 /// Rows compressed per transaction. One batch is one transaction.
@@ -455,11 +455,11 @@ async fn mark_backfill_complete(db: &LocalDb) -> DbResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archival::event_fixture::{
+    use crate::archival::rewrite::{classify_system_blob_columns_for_test, SystemBlobKind};
+    use crate::storage::event_fixture::{
         assistant_read, assistant_text, system_init_claude, system_prompt, tool_result, user_text,
     };
-    use crate::archival::reconstruct_events;
-    use crate::archival::rewrite::{classify_system_blob_columns_for_test, SystemBlobKind};
+    use crate::storage::reconstruct_events;
     use crate::storage::{migrated_test_db, SearchIndex};
     use turso::params;
 

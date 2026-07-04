@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-use ast_grep_language::SupportLang;
+use crate::symbols::SupportLang;
 use serde_yaml::{Mapping, Value};
 
 use crate::symbols::engine::{self, SymbolNode};

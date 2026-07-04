@@ -7,6 +7,7 @@ use crate::models::{SearchContentType, SearchFilters};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::query::QueryParam;
+use cairn_symbols::search_util::{build_glob_matcher, format_grep_line};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -315,20 +316,6 @@ pub(crate) struct GlobMatches {
     pub pattern: String,
     pub paths: Vec<PathBuf>,
     pub timed_out: bool,
-}
-
-/// Resolve a glob to its matched files. Shared by the glob tool's list output
-/// and the read-projection's `output_mode=content`/`count` modes, so both walk
-/// the tree identically (gitignore-aware, path-scoped, timeout-bounded).
-pub(crate) fn build_glob_matcher(pattern: &str) -> Result<globset::GlobSet, String> {
-    let glob = globset::GlobBuilder::new(pattern)
-        .literal_separator(false)
-        .build()
-        .map_err(|e| format!("Invalid glob pattern '{}': {}", pattern, e))?;
-    globset::GlobSetBuilder::new()
-        .add(glob)
-        .build()
-        .map_err(|e| format!("Failed to build glob matcher: {}", e))
 }
 
 pub(crate) async fn glob_matched_paths(
@@ -774,26 +761,6 @@ fn build_grep_searcher(payload: &GrepPayload) -> grep_searcher::Searcher {
     }
 
     builder.build()
-}
-
-/// Format one grep content line. With a non-empty `relative` label this is the
-/// directory/single-file form `path:N:text` (match) / `path:N-text` (context);
-/// with an empty label (a materialized in-memory body — a rendered resource,
-/// web markdown, artifact, or transcript) the path prefix is dropped entirely,
-/// yielding `N:text` / `N-text`. `sep` is `':'` for a match line and `'-'` for a
-/// context line; both forms collapse to bare `text` when line numbers are off.
-pub(crate) fn format_grep_line(
-    relative: &str,
-    line_number: Option<u64>,
-    sep: char,
-    text: &str,
-) -> String {
-    match (relative.is_empty(), line_number) {
-        (true, Some(n)) => format!("{}{}{}", n, sep, text),
-        (true, None) => text.to_string(),
-        (false, Some(n)) => format!("{}:{}{}{}", relative, n, sep, text),
-        (false, None) => format!("{}{}{}", relative, sep, text),
-    }
 }
 
 /// Collect grep output lines for one source under the requested output mode,

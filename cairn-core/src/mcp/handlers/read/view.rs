@@ -552,7 +552,7 @@ pub(crate) fn estimate_len(segment: &ReadSegment) -> usize {
 /// truncation can never cut them.
 ///
 /// Shared by the live `read_batch` dispatch ([`super::batch`]) and archival
-/// reconstruction ([`crate::archival::reconstruct`]): both feed a `Vec<ReadSegment>`
+/// reconstruction ([`crate::storage::events::reconstruct`]): both feed a `Vec<ReadSegment>`
 /// through this one composer so a reconstructed read reproduces the live envelope
 /// byte-for-byte.
 pub(crate) fn assemble(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {

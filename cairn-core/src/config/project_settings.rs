@@ -24,8 +24,9 @@ pub struct WorktreeSettings {
 
 /// Configuration for how gitignored paths are populated into new worktrees.
 ///
-/// Paths matching `copy` patterns are copied (isolated per worktree).
-/// Paths matching `symlink` patterns are symlinked (shared with main repo).
+/// Paths matching `copy` patterns are copied from the main repo (isolated per worktree).
+/// Paths matching `symlink` patterns are symlinked to the main repo.
+/// `seed` entries copy-on-write clone external directories into worktree-relative destinations.
 /// Unmatched paths are skipped — new worktrees start clean by default.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -36,11 +37,23 @@ pub struct PopulateConfig {
     /// Patterns whose matching paths are symlinked to the main repo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symlink: Vec<String>,
+    /// External directories to copy-on-write seed into worktree-relative destinations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed: Vec<SeedEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedEntry {
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
 }
 
 impl PopulateConfig {
     pub fn is_empty(&self) -> bool {
-        self.copy.is_empty() && self.symlink.is_empty()
+        self.copy.is_empty() && self.symlink.is_empty() && self.seed.is_empty()
     }
 }
 
@@ -449,8 +462,9 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 # It can be committed to version control to share settings with your team.
 #
 # Worktree population: control which gitignored content is pre-populated.
-# Paths matching 'copy' patterns are copied (isolated per worktree).
-# Paths matching 'symlink' patterns are symlinked (shared with main repo).
+# Paths matching 'copy' patterns are copied from the main repo (isolated per worktree).
+# Paths matching 'symlink' patterns are symlinked to the main repo.
+# 'seed' entries copy-on-write clone external warm caches into the worktree.
 # Unmatched paths are skipped — setup commands handle the rest.
 #
 # worktree:
@@ -461,6 +475,10 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 #     symlink:
 #       - "target/"
 #       - ".cache/"
+#     seed:
+#       - from: "~/.my-project-cache/target"
+#         to: "target"
+#         exclude: ["*/incremental"]
 
 # Commands to run when setting up a new worktree
 # setupCommands:
@@ -913,6 +931,11 @@ copyFiles:
                 populate: PopulateConfig {
                     copy: vec![".env".to_string(), ".env.*".to_string()],
                     symlink: vec!["target/".to_string()],
+                    seed: vec![SeedEntry {
+                        from: "~/.cache/project-target".to_string(),
+                        to: "target".to_string(),
+                        exclude: vec!["*/incremental".to_string()],
+                    }],
                 },
             }),
             ..Default::default()
@@ -924,6 +947,10 @@ copyFiles:
         let config = loaded.populate_config();
         assert_eq!(config.copy, vec![".env", ".env.*"]);
         assert_eq!(config.symlink, vec!["target/"]);
+        assert_eq!(config.seed.len(), 1);
+        assert_eq!(config.seed[0].from, "~/.cache/project-target");
+        assert_eq!(config.seed[0].to, "target");
+        assert_eq!(config.seed[0].exclude, vec!["*/incremental"]);
 
         // Verify the serialized YAML contains expected structure
         let config_path = get_project_config_path(project_path);
@@ -931,8 +958,45 @@ copyFiles:
         assert!(raw.contains("populate"));
         assert!(raw.contains(".env"));
         assert!(raw.contains("target/"));
+        assert!(raw.contains("seed"));
+        assert!(raw.contains("~/.cache/project-target"));
+        assert!(raw.contains("*/incremental"));
         // seedIgnored should never appear in new files
         assert!(!raw.contains("seedIgnored"));
+    }
+
+    #[test]
+    fn test_seed_only_populate_config_is_not_empty() {
+        let config = PopulateConfig {
+            copy: vec![],
+            symlink: vec![],
+            seed: vec![SeedEntry {
+                from: "~/warm/target".to_string(),
+                to: "target".to_string(),
+                exclude: vec![],
+            }],
+        };
+
+        assert!(!config.is_empty());
+    }
+
+    #[test]
+    fn test_populate_config_deserializes_seed() {
+        let raw = r#"
+worktree:
+  populate:
+    seed:
+      - from: "~/.warm/target"
+        to: "src-tauri/target"
+        exclude: ["*/incremental"]
+"#;
+
+        let settings: ProjectSettingsFile = serde_yaml::from_str(raw).unwrap();
+        let config = settings.populate_config();
+        assert_eq!(config.seed.len(), 1);
+        assert_eq!(config.seed[0].from, "~/.warm/target");
+        assert_eq!(config.seed[0].to, "src-tauri/target");
+        assert_eq!(config.seed[0].exclude, vec!["*/incremental"]);
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub use lifecycle::{
 pub use naming::{
     branch_exists_with_git, get_worktree_for_branch_with_git, parse_worktree_list_for_branch,
 };
-pub use populate::{populate_worktree, PopulateResult};
+pub use populate::{populate_worktree, seed_worktree, PopulateResult, SeedResult};
 pub use setup::{
     run_setup_commands_with_process, run_setup_commands_with_process_streaming, SetupError,
 };

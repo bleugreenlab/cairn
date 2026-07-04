@@ -148,7 +148,7 @@ fn env_port(name: &str) -> Option<u16> {
 //
 // `bun run dev:instance` (scripts/dev-instance.ts) launches a branch-keyed dev
 // build whose home is `~/.cairn-dev-<key>` (key = slugified branch), with its
-// database at `<home>/cairn-dev.turso.db` and MCP callback port `3860 + slot`
+// database at `<home>/cairn.db` and MCP callback port `3860 + slot`
 // where the slot is persisted per branch in `~/.cairn-dev-instances.json`. These
 // helpers mirror that launcher's path/slug/port contract so the host app can
 // resolve a running dev instance and query it (see docs/dev-instances.md). They
@@ -158,11 +158,11 @@ fn env_port(name: &str) -> Option<u16> {
 // ============================================================================
 
 /// Base runner transport port for `dev:instance` slots: slot `s` binds `BASE + s`.
-/// Mirrors `RUNNER_PORT_BASE` in scripts/dev-instance.ts.
+/// Mirrors `RUNNER_PORT_BASE` in scripts/dev-instance-slots.ts.
 pub const DEV_INSTANCE_RUNNER_PORT_BASE: u16 = DEFAULT_RUNNER_PORT;
 
 /// Base MCP callback port for `dev:instance` slots: slot `s` binds `BASE + s`.
-/// Mirrors `CALLBACK_PORT_BASE` in scripts/dev-instance.ts.
+/// Mirrors `CALLBACK_PORT_BASE` in scripts/dev-instance-slots.ts.
 pub const DEV_INSTANCE_CALLBACK_PORT_BASE: u16 = 3860;
 
 /// Prefix marking a `dev:instance` home directory. The trailing hyphen keeps
@@ -171,7 +171,7 @@ pub const DEV_INSTANCE_CALLBACK_PORT_BASE: u16 = 3860;
 pub const DEV_INSTANCE_HOME_PREFIX: &str = ".cairn-dev-";
 
 /// Database filename inside every `dev:instance` home.
-pub const DEV_INSTANCE_DB_FILENAME: &str = "cairn-dev.turso.db";
+pub const DEV_INSTANCE_DB_FILENAME: &str = RUNNER_DB_FILENAME;
 
 /// Filename of the `dev:instance` branch->slot registry under the OS home.
 pub const DEV_INSTANCE_REGISTRY_FILENAME: &str = ".cairn-dev-instances.json";
@@ -403,6 +403,12 @@ mod tests {
         assert_eq!(callback_port(), 3857);
 
         clear_env();
+    }
+
+    #[test]
+    fn dev_instance_database_uses_runner_filename() {
+        assert_eq!(DEV_INSTANCE_DB_FILENAME, RUNNER_DB_FILENAME);
+        assert_eq!(DEV_INSTANCE_DB_FILENAME, "cairn.db");
     }
 
     #[test]

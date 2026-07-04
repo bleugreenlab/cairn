@@ -7,8 +7,8 @@ use tokio::sync::Notify;
 use tokio::time::sleep;
 use turso::{params::IntoParams, Builder, Connection, Row};
 
+use super::content_store::{ContentStore, TeamReplicaContext};
 use super::{DbError, DbResult, RowExt};
-use crate::archival::store::{ContentStore, TeamReplicaContext};
 use crate::db::TeamId;
 
 /// Install a process-wide rustls [`CryptoProvider`](rustls::crypto::CryptoProvider)

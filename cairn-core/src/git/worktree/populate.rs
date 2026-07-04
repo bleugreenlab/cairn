@@ -9,7 +9,142 @@ pub struct PopulateResult {
     pub failed: usize,
 }
 
-use crate::config::project_settings::PopulateConfig;
+#[derive(Debug, Default)]
+pub struct SeedResult {
+    pub cloned: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+fn expand_seed_from(from: &str) -> PathBuf {
+    if from == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = from.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(from)
+}
+
+fn slash_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn seed_entry(
+    fs: &dyn FileSystem,
+    from: &Path,
+    to: &Path,
+    exclude_set: &globset::GlobSet,
+    result: &mut SeedResult,
+) {
+    let mut stack = vec![from.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        let rel = match path.strip_prefix(from) {
+            Ok(rel) => rel,
+            Err(e) => {
+                log::warn!(
+                    "Seed path {} was not under source {}: {}",
+                    path.display(),
+                    from.display(),
+                    e
+                );
+                result.failed += 1;
+                continue;
+            }
+        };
+
+        if !rel.as_os_str().is_empty() && exclude_set.is_match(slash_path(rel)) {
+            result.skipped += 1;
+            continue;
+        }
+
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                log::warn!("Failed to inspect seed path {}: {}", path.display(), e);
+                result.failed += 1;
+                continue;
+            }
+        };
+
+        if metadata.is_dir() {
+            let entries = match std::fs::read_dir(&path) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    log::warn!("Failed to read seed directory {}: {}", path.display(), e);
+                    result.failed += 1;
+                    continue;
+                }
+            };
+            for entry in entries {
+                match entry {
+                    Ok(entry) => stack.push(entry.path()),
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to read seed directory entry under {}: {}",
+                            path.display(),
+                            e
+                        );
+                        result.failed += 1;
+                    }
+                }
+            }
+        } else if metadata.is_file() {
+            let dst = if rel.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(rel)
+            };
+            match fs.reflink_file(&path, &dst) {
+                Ok(()) => result.cloned += 1,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to seed {} to {}: {}",
+                        path.display(),
+                        dst.display(),
+                        e
+                    );
+                    result.failed += 1;
+                }
+            }
+        } else {
+            result.skipped += 1;
+        }
+    }
+}
+
+pub fn seed_worktree(
+    fs: &dyn FileSystem,
+    worktree_path: &Path,
+    seeds: &[SeedEntry],
+) -> Result<SeedResult, String> {
+    let mut result = SeedResult::default();
+
+    for seed in seeds {
+        let from = expand_seed_from(&seed.from);
+        if !fs.exists(&from) {
+            log::info!("Seed source {} is absent; skipping", from.display());
+            result.skipped += 1;
+            continue;
+        }
+
+        let exclude_set = build_glob_set(&seed.exclude)?;
+        let to = worktree_path.join(seed.to.trim_matches('/'));
+        seed_entry(fs, &from, &to, &exclude_set, &mut result);
+    }
+
+    Ok(result)
+}
+
+use crate::config::project_settings::{PopulateConfig, SeedEntry};
+use std::path::{Path, PathBuf};
 
 /// Determine the population strategy for a given path.
 ///
@@ -265,6 +400,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -282,6 +418,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![],
             symlink: vec![".cairn/".to_string()],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -299,6 +436,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec!["target/".to_string()],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -338,6 +476,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -363,6 +502,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env*".to_string()],
             symlink: vec![".env*".to_string()],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -386,6 +526,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -402,6 +543,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -427,6 +569,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec!["node_modules/".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -457,6 +600,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec!["[invalid".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         let result = populate_with(&git, &fs, &config);
@@ -471,6 +615,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run().returning(|_, _| {
@@ -493,6 +638,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env*".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -526,6 +672,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![],
             symlink: vec!["node_modules/".to_string()],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -556,6 +703,7 @@ mod tests {
         let config = PopulateConfig {
             copy: vec!["build/".to_string()],
             symlink: vec![],
+            seed: vec![],
         };
 
         git.expect_run()
@@ -571,5 +719,149 @@ mod tests {
         let r = populate_ok(&git, &fs, &config);
         assert_eq!(r.copied, 0);
         assert_eq!(r.failed, 1);
+    }
+    #[test]
+    fn test_seed_worktree_clones_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("debug")).unwrap();
+        std::fs::write(source.join("debug").join("dep.rlib"), "dep").unwrap();
+
+        let mut fs = MockFileSystem::new();
+        let source_for_exists = source.clone();
+        fs.expect_exists()
+            .withf(move |p| p == source_for_exists.as_path())
+            .returning(|_| true);
+        fs.expect_reflink_file()
+            .withf(|from, to| {
+                from.ends_with("debug/dep.rlib")
+                    && to == Path::new("/worktree/target/debug/dep.rlib")
+            })
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let result = seed_worktree(
+            &fs,
+            Path::new("/worktree"),
+            &[SeedEntry {
+                from: source.display().to_string(),
+                to: "target".to_string(),
+                exclude: vec![],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(result.cloned, 1);
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.failed, 0);
+    }
+
+    #[test]
+    fn test_seed_worktree_prunes_excluded_subtree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("debug").join("incremental")).unwrap();
+        std::fs::write(source.join("debug").join("dep.rlib"), "dep").unwrap();
+        std::fs::write(
+            source.join("debug").join("incremental").join("session.o"),
+            "incremental",
+        )
+        .unwrap();
+
+        let mut fs = MockFileSystem::new();
+        let source_for_exists = source.clone();
+        fs.expect_exists()
+            .withf(move |p| p == source_for_exists.as_path())
+            .returning(|_| true);
+        fs.expect_reflink_file()
+            .withf(|from, to| {
+                from.ends_with("debug/dep.rlib")
+                    && to == Path::new("/worktree/target/debug/dep.rlib")
+            })
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let result = seed_worktree(
+            &fs,
+            Path::new("/worktree"),
+            &[SeedEntry {
+                from: source.display().to_string(),
+                to: "target".to_string(),
+                exclude: vec!["*/incremental".to_string()],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(result.cloned, 1);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.failed, 0);
+    }
+
+    #[test]
+    fn test_seed_worktree_skips_missing_source() {
+        let mut fs = MockFileSystem::new();
+        fs.expect_exists().returning(|_| false);
+
+        let result = seed_worktree(
+            &fs,
+            Path::new("/worktree"),
+            &[SeedEntry {
+                from: "/missing/source".to_string(),
+                to: "target".to_string(),
+                exclude: vec![],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(result.cloned, 0);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.failed, 0);
+    }
+
+    #[test]
+    fn test_seed_worktree_continues_after_file_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.rlib"), "a").unwrap();
+        std::fs::write(source.join("b.rlib"), "b").unwrap();
+
+        let mut fs = MockFileSystem::new();
+        let source_for_exists = source.clone();
+        fs.expect_exists()
+            .withf(move |p| p == source_for_exists.as_path())
+            .returning(|_| true);
+        let mut calls = 0;
+        fs.expect_reflink_file().times(2).returning(move |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Err("disk full".to_string())
+            } else {
+                Ok(())
+            }
+        });
+
+        let result = seed_worktree(
+            &fs,
+            Path::new("/worktree"),
+            &[SeedEntry {
+                from: source.display().to_string(),
+                to: "target".to_string(),
+                exclude: vec![],
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(result.cloned, 1);
+        assert_eq!(result.failed, 1);
+    }
+
+    #[test]
+    fn test_seed_tilde_expansion_resolves_home() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+
+        assert_eq!(expand_seed_from("~/warm/target"), home.join("warm/target"));
     }
 }

@@ -335,32 +335,12 @@ pub fn path_escapes_worktree(worktree_path: &Path, full_path: &Path) -> bool {
     }
 }
 
-/// Whether `full_path` resolves into any of `dirs` (i.e. equals or is nested
-/// under one). Mirrors [`path_escapes_worktree`]'s resolution (canonicalize, or
-/// fall back to the nearest existing ancestor) so a not-yet-existing path is
-/// judged by where it would live. Used both for the read denylist (gate reads of
-/// credential stores/keys) and the write writable-extra set (temp/toolchain
-/// writes are in-sandbox).
-pub fn path_within_any(full_path: &Path, dirs: &[PathBuf]) -> bool {
-    if dirs.is_empty() {
-        return false;
-    }
-    let resolved = if full_path.exists() {
-        full_path.canonicalize().ok()
-    } else {
-        full_path
-            .ancestors()
-            .find(|ancestor| ancestor.exists())
-            .and_then(|ancestor| ancestor.canonicalize().ok())
-    };
-    let Some(resolved) = resolved else {
-        return false;
-    };
-    dirs.iter().any(|dir| {
-        let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        resolved.starts_with(&dir_canon)
-    })
-}
+/// Whether a path resolves into any of a set of directories. The canonical
+/// implementation now lives in [`cairn_symbols::search_util`] so the fff
+/// worktree index and this crate's read/write fence checks share one copy;
+/// re-exported here so existing `crate::mcp::file_targets::path_within_any`
+/// call sites keep resolving.
+pub use cairn_symbols::search_util::path_within_any;
 
 /// Resolve a `file:` read target to an absolute path **without** requiring it to
 /// exist. Lets the read denylist gate run before existence validation, so a
@@ -463,26 +443,6 @@ mod tests {
             &temp.path().join("outside.txt")
         ));
         assert!(path_escapes_worktree(&worktree, Path::new("/etc")));
-    }
-
-    #[test]
-    fn path_within_any_matches_only_listed_subtrees() {
-        let temp = tempdir().unwrap();
-        let secrets = temp.path().join("secrets");
-        std::fs::create_dir_all(&secrets).unwrap();
-        std::fs::write(secrets.join("creds"), "x").unwrap();
-        let public = temp.path().join("public.txt");
-        std::fs::write(&public, "y").unwrap();
-
-        let dirs = vec![secrets.clone()];
-        // A file inside a listed subtree matches.
-        assert!(path_within_any(&secrets.join("creds"), &dirs));
-        // A file outside any listed subtree does not.
-        assert!(!path_within_any(&public, &dirs));
-        // A not-yet-existing file under a listed dir still matches (via ancestor).
-        assert!(path_within_any(&secrets.join("new/deep"), &dirs));
-        // An empty list never matches.
-        assert!(!path_within_any(&public, &[]));
     }
 
     #[test]

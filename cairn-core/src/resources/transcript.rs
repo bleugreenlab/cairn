@@ -42,7 +42,7 @@ impl EventRow {
 pub(super) async fn load_job_events_ordered(
     conn: &turso::Connection,
     job_id: &str,
-    store: Option<&dyn crate::archival::store::ContentStore>,
+    store: Option<&dyn crate::storage::ContentStore>,
     private_route_db: Option<&crate::storage::LocalDb>,
 ) -> Vec<EventRow> {
     // 1. Load run_ids ordered by creation time
@@ -88,7 +88,7 @@ pub(super) async fn load_job_events_ordered(
         }
     }
 
-    crate::archival::reconstruct::reconstruct_events_with_conn_and_routes(
+    crate::storage::events::reconstruct::reconstruct_events_with_conn_and_routes(
         conn,
         events,
         store,
@@ -110,7 +110,7 @@ pub(super) async fn load_job_events_ordered(
 pub(super) async fn load_turn_events(
     conn: &turso::Connection,
     turn_id: &str,
-    store: Option<&dyn crate::archival::store::ContentStore>,
+    store: Option<&dyn crate::storage::ContentStore>,
     private_route_db: Option<&crate::storage::LocalDb>,
 ) -> Vec<(String, i32, String, String)> {
     let columns = crate::runs::queries::EVENT_COLUMNS;
@@ -123,7 +123,7 @@ pub(super) async fn load_turn_events(
             }
         }
     }
-    crate::archival::reconstruct::reconstruct_events_with_conn_and_routes(
+    crate::storage::events::reconstruct::reconstruct_events_with_conn_and_routes(
         conn,
         events,
         store,
@@ -167,7 +167,7 @@ pub(super) async fn get_single_event(
     conn: &turso::Connection,
     run_id: &str,
     event_seq: i32,
-    store: Option<&dyn crate::archival::store::ContentStore>,
+    store: Option<&dyn crate::storage::ContentStore>,
     private_route_db: Option<&crate::storage::LocalDb>,
 ) -> String {
     let columns = crate::runs::queries::EVENT_COLUMNS;
@@ -197,7 +197,7 @@ pub(super) async fn get_single_event(
         return format!("Event with sequence {} not found", event_seq);
     };
 
-    let mut events = crate::archival::reconstruct::reconstruct_events_with_conn_and_routes(
+    let mut events = crate::storage::events::reconstruct::reconstruct_events_with_conn_and_routes(
         conn,
         vec![event],
         store,
@@ -1494,7 +1494,7 @@ mod tests {
             .unwrap();
 
         let original = "{\"eventType\":\"user\",\"content\":\"archived turn content\"}";
-        let blob = crate::archival::compress(original.as_bytes()).unwrap();
+        let blob = crate::storage::compress(original.as_bytes()).unwrap();
         db.write(move |conn| {
             let blob = blob.clone();
             Box::pin(async move {

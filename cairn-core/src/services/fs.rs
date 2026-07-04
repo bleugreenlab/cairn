@@ -41,6 +41,11 @@ pub trait FileSystem: Send + Sync {
     /// Creates parent directories of the destination if they don't exist.
     fn copy_file(&self, from: &Path, to: &Path) -> Result<(), String>;
 
+    /// Copy-on-write clone a file when the filesystem supports it, falling back
+    /// to a regular byte copy otherwise. Creates parent directories of the
+    /// destination if they don't exist.
+    fn reflink_file(&self, from: &Path, to: &Path) -> Result<(), String>;
+
     /// Create a symbolic link at `link` pointing to `target`.
     /// On Windows, uses a directory junction for directories.
     fn symlink(&self, target: &Path, link: &Path) -> Result<(), String>;
@@ -99,6 +104,36 @@ impl FileSystem for RealFileSystem {
         Ok(())
     }
 
+    fn reflink_file(&self, from: &Path, to: &Path) -> Result<(), String> {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+        }
+        if to.exists() || self.is_symlink(to) {
+            std::fs::remove_file(to)
+                .map_err(|e| format!("Failed to replace existing destination {:?}: {}", to, e))?;
+        }
+        match reflink_copy::reflink_or_copy(from, to) {
+            Ok(None) => {
+                log::debug!("Reflinked file from {} to {}", from.display(), to.display());
+                Ok(())
+            }
+            Ok(Some(bytes)) => {
+                log::debug!(
+                    "Reflink unavailable; copied {} bytes from {} to {}",
+                    bytes,
+                    from.display(),
+                    to.display()
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "Failed to reflink or copy {:?} to {:?}: {}",
+                from, to, e
+            )),
+        }
+    }
+
     fn symlink(&self, target: &Path, link: &Path) -> Result<(), String> {
         #[cfg(unix)]
         {
@@ -155,9 +190,7 @@ impl FileSystem for RealFileSystem {
             if src_path.is_dir() {
                 self.copy_dir_recursive(&src_path, &dst_path)?;
             } else {
-                std::fs::copy(&src_path, &dst_path).map_err(|e| {
-                    format!("Failed to copy {:?} to {:?}: {}", src_path, dst_path, e)
-                })?;
+                self.reflink_file(&src_path, &dst_path)?;
             }
         }
         Ok(())
@@ -278,6 +311,34 @@ mod tests {
         assert!(fs.exists(&dst));
         let contents = fs.read_to_string(&dst).unwrap();
         assert_eq!(contents, "content");
+    }
+
+    #[test]
+    fn real_fs_reflink_file() {
+        let (temp, fs) = real_fs_fixture();
+
+        let src = temp.path().join("source.txt");
+        fs.write_str(&src, "hello reflink").unwrap();
+
+        let dst = temp.path().join("nested").join("dest.txt");
+        fs.reflink_file(&src, &dst).unwrap();
+
+        assert!(fs.exists(&dst));
+        assert_eq!(fs.read_to_string(&dst).unwrap(), "hello reflink");
+    }
+
+    #[test]
+    fn real_fs_reflink_file_overwrites_existing() {
+        let (temp, fs) = real_fs_fixture();
+
+        let src = temp.path().join("source.txt");
+        fs.write_str(&src, "new content").unwrap();
+
+        let dst = temp.path().join("dest.txt");
+        fs.write_str(&dst, "old content").unwrap();
+        fs.reflink_file(&src, &dst).unwrap();
+
+        assert_eq!(fs.read_to_string(&dst).unwrap(), "new content");
     }
 
     #[test]

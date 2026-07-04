@@ -181,7 +181,7 @@ pub fn list_events(db: Arc<LocalDb>, run_id: &str) -> Result<Vec<Event>, CairnEr
     let query_run_id = run_id.clone();
     let mut events = run_query_db(async move {
         let events = load_events_for_run(&query_db, query_run_id).await?;
-        let mut events = crate::archival::reconstruct_events(&query_db, events).await;
+        let mut events = crate::storage::reconstruct_events(&query_db, events).await;
         apply_lean_read_projection(&query_db, &mut events).await?;
         Ok(events)
     })?;
@@ -202,7 +202,7 @@ pub fn list_events_limited(
     let run_id = run_id.to_string();
     run_query_db(async move {
         let events = load_events_limited(&db, run_id, limit, offset).await?;
-        Ok(crate::archival::reconstruct_events(&db, events).await)
+        Ok(crate::storage::reconstruct_events(&db, events).await)
     })
 }
 
@@ -215,7 +215,7 @@ pub fn list_events_for_session(
     let query_session_id = session_id.clone();
     let (mut events, run_position) = run_query_db(async move {
         let (events, run_position) = load_events_for_session(&query_db, query_session_id).await?;
-        let events = crate::archival::reconstruct_events(&query_db, events).await;
+        let events = crate::storage::reconstruct_events(&query_db, events).await;
         Ok((events, run_position))
     })?;
 
@@ -243,7 +243,7 @@ pub fn list_events_for_session_after_count(
     let offset = i64::from(cached_event_count.max(0));
     run_query_db(async move {
         let mut events = load_events_for_session_after_count(&db, session_id, offset).await?;
-        events = crate::archival::reconstruct_events(&db, events).await;
+        events = crate::storage::reconstruct_events(&db, events).await;
         Ok(events)
     })
 }
@@ -254,7 +254,7 @@ pub fn list_events_for_turn(db: Arc<LocalDb>, turn_id: &str) -> Result<Vec<Event
     let query_turn_id = turn_id.clone();
     let mut events = run_query_db(async move {
         let events = load_events_for_turn(&query_db, query_turn_id).await?;
-        Ok(crate::archival::reconstruct_events(&query_db, events).await)
+        Ok(crate::storage::reconstruct_events(&query_db, events).await)
     })?;
     if let Some(active) = message_streams_for_turn(db, &turn_id)? {
         insert_active_stream_by_created_at(&mut events, active);
@@ -277,7 +277,7 @@ pub fn list_events_for_session_delta(
     let (events, last_rowid) = run_query_db(async move {
         let (events, last_rowid) =
             load_session_events_delta(&query_db, query_session_id, after_rowid).await?;
-        let mut events = crate::archival::reconstruct_events(&query_db, events).await;
+        let mut events = crate::storage::reconstruct_events(&query_db, events).await;
         apply_lean_read_projection(&query_db, &mut events).await?;
         Ok((events, last_rowid))
     })?;
@@ -636,7 +636,7 @@ pub fn load_event_by_id(db: Arc<LocalDb>, event_id: &str) -> Result<Option<Event
             .map_err(CairnError::from)?;
         match event {
             Some(event) => {
-                let mut events = crate::archival::reconstruct_events(&query_db, vec![event]).await;
+                let mut events = crate::storage::reconstruct_events(&query_db, vec![event]).await;
                 Ok(events.pop())
             }
             None => Ok(None),
@@ -1330,7 +1330,7 @@ mod tests {
     /// Rewrite an event to the zstd archival shape the teardown writer produces:
     /// a valid-but-empty stub in `data`, the compressed original in `data_blob`.
     async fn archive_event_zstd(db: &LocalDb, id: &str, original: &str) {
-        let blob = crate::archival::compress(original.as_bytes()).unwrap();
+        let blob = crate::storage::compress(original.as_bytes()).unwrap();
         let id = id.to_string();
         db.write(move |conn| {
             let id = id.clone();
@@ -1376,7 +1376,7 @@ mod tests {
         let (events, _) = load_session_events_delta(&db, "sess-1".to_string(), None)
             .await
             .unwrap();
-        let events = crate::archival::reconstruct_events(&db, events).await;
+        let events = crate::storage::reconstruct_events(&db, events).await;
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].data, original,

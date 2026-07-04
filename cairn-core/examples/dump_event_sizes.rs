@@ -6,6 +6,7 @@
 //!
 //! Usage: cargo run -p cairn-core --example dump_event_sizes -- /path/to/db
 
+use cairn_codec::codec::{decompress, CODEC_ZSTD_V1};
 use turso::{Builder, Value};
 
 fn text(v: &Value) -> String {
@@ -51,7 +52,7 @@ async fn main() {
         let stub_len = int(&row.get_value(3).unwrap());
         let blob_len = int(&row.get_value(4).unwrap());
         let (orig, head) = match row.get_value(6).unwrap() {
-            Value::Blob(b) => match zstd::stream::decode_all(&b[..]) {
+            Value::Blob(b) => match decompress(CODEC_ZSTD_V1, &b[..]) {
                 Ok(d) => {
                     let h: String = String::from_utf8_lossy(&d).chars().take(110).collect();
                     (d.len() as i64, h)
@@ -78,7 +79,7 @@ async fn main() {
             let body = if head == "<decompress failed>" || orig == 0 {
                 text(&row.get_value(5).unwrap())
             } else if let Value::Blob(b) = row.get_value(6).unwrap() {
-                String::from_utf8_lossy(&zstd::stream::decode_all(&b[..]).unwrap()).into_owned()
+                String::from_utf8_lossy(&decompress(CODEC_ZSTD_V1, &b[..]).unwrap()).into_owned()
             } else {
                 text(&row.get_value(5).unwrap())
             };

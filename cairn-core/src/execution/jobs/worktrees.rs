@@ -164,6 +164,37 @@ pub(crate) fn prepare_worktree_for_job(
                 );
             }
         }
+        match crate::git::worktree::seed_worktree(fs, worktree_path, &populate_config.seed) {
+            Ok(result) => {
+                let line = format!(
+                    "[info] Seeding external worktree content ({} cloned, {} skipped, {} failed)",
+                    result.cloned, result.skipped, result.failed
+                );
+                log::info!("{line}");
+                setup_progress::emit(
+                    sink,
+                    job_id,
+                    issue_id.clone(),
+                    "status",
+                    Some("populate"),
+                    None,
+                    Some(line),
+                );
+            }
+            Err(e) => {
+                let line = format!("[info] Worktree seeding failed (continuing): {e}");
+                log::warn!("{line}");
+                setup_progress::emit(
+                    sink,
+                    job_id,
+                    issue_id.clone(),
+                    "status",
+                    Some("populate"),
+                    None,
+                    Some(line),
+                );
+            }
+        }
         // Security backstop: explicitly-populated gitignored content must stay
         // UNCOMMITTED so a later run/write seal can never commit secrets or
         // build artifacts. At this point only populate has run (no setup

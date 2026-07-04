@@ -438,17 +438,18 @@ pub struct RecipeNode {
 }
 
 /// Schedule period - predefined intervals
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SchedulePeriod {
     Month,
     Week,
+    Weekday,
     Day,
     Hour,
 }
 
 /// Schedule interval - custom duration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleInterval {
     pub days: u32,
@@ -457,7 +458,7 @@ pub struct ScheduleInterval {
 }
 
 /// Schedule every - period or custom interval
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", untagged)]
 pub enum ScheduleEvery {
     Period(SchedulePeriod),
@@ -465,10 +466,10 @@ pub enum ScheduleEvery {
 }
 
 /// Schedule at - specific time within a period
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleAt {
-    /// Day: 1-31 for month, 0-6 for week (Sunday=0)
+    /// Day: 1-31 for month, 0-6 for week (Sunday=0). Ignored for weekday schedules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub day: Option<u32>,
     pub hour: u32,
@@ -476,7 +477,7 @@ pub struct ScheduleAt {
 }
 
 /// Schedule configuration for scheduled recipes
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ScheduleConfig {
     pub every: ScheduleEvery,
@@ -1072,6 +1073,28 @@ mod tests {
         // Deserializing "issue" from JSON/YAML should produce Manual
         let trigger: RecipeTrigger = serde_json::from_str("\"issue\"").unwrap();
         assert_eq!(trigger, RecipeTrigger::Manual);
+    }
+
+    #[test]
+    fn schedule_period_serde_includes_weekday() {
+        let config: ScheduleConfig = serde_json::from_value(serde_json::json!({
+            "every": "weekday",
+            "at": { "hour": 9, "minute": 30 },
+            "allowCatchup": false,
+            "catchupWindowHours": 24
+        }))
+        .unwrap();
+
+        assert_eq!(config.every, ScheduleEvery::Period(SchedulePeriod::Weekday));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({
+                "every": "weekday",
+                "at": { "hour": 9, "minute": 30 },
+                "allowCatchup": false,
+                "catchupWindowHours": 24
+            })
+        );
     }
 
     // =========================================================================

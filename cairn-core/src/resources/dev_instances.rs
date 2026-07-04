@@ -3,8 +3,8 @@
 //!
 //! `bun run dev:instance` (scripts/dev-instance.ts) launches a branch-keyed dev
 //! build whose home is `~/.cairn-dev-<key>` (key = slugified branch), database at
-//! `<home>/cairn-dev.turso.db`, and MCP callback port `3860 + slot` where the
-//! slot is persisted per branch in `~/.cairn-dev-instances.json`. That running
+//! `<home>/cairn.db`, and MCP callback port `3860 + slot` where the slot is
+//! persisted per branch in `~/.cairn-dev-instances.json`. That running
 //! build holds a process lock on its own database file, so this module never
 //! opens the file directly: it asks the instance's own MCP callback server to run
 //! the read-only `cairn://db` projection and relays the rows. The instance

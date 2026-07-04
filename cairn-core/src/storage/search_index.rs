@@ -742,7 +742,7 @@ async fn load_event_documents(db: &LocalDb) -> DbResult<Vec<SearchDocument>> {
         .into_iter()
         .map(|(event, project_id, issue_id, job_id)| (event, (project_id, issue_id, job_id)))
         .unzip();
-    let events = crate::archival::reconstruct_events(db, events).await;
+    let events = super::reconstruct_events(db, events).await;
 
     let mut documents = Vec::new();
     for (event, (project_id, issue_id, job_id)) in events.into_iter().zip(meta) {
@@ -822,10 +822,7 @@ async fn load_archived_event_document(
     let Some((event, project_id, issue_id, job_id)) = row else {
         return Ok(None);
     };
-    let Some(event) = crate::archival::reconstruct_events(db, vec![event])
-        .await
-        .pop()
-    else {
+    let Some(event) = super::reconstruct_events(db, vec![event]).await.pop() else {
         return Ok(None);
     };
     Ok(event_search_document(event, project_id, issue_id, job_id))
@@ -1237,7 +1234,7 @@ mod tests {
     /// `data_blob`.
     async fn seed_archived_zstd_event(db: &LocalDb, content: &str) {
         let blob =
-            crate::archival::compress(format!("{{\"content\":\"{content}\"}}").as_bytes()).unwrap();
+            crate::storage::compress(format!("{{\"content\":\"{content}\"}}").as_bytes()).unwrap();
         db.write(move |conn| {
             let blob = blob.clone();
             Box::pin(async move {

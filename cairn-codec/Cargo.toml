@@ -1,0 +1,30 @@
+[package]
+name = "cairn-codec"
+version.workspace = true
+edition = "2021"
+description = "Tagged event-payload compression codec and the in-process git object/packfile/diff substrate it archives to, quarantined from cairn-core"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "mcp"]
+
+[dependencies]
+zstd = "0.13"
+# Session archival object access (CAIRN-1538). Focused gix crates only — not the
+# umbrella `gix` — to read range packs and the repo ODB in-process. gix-features
+# is pulled directly for its `zlib::Inflate`, required by gix-pack's entry decoder.
+gix-pack = { version = "0.71", features = ["sha1"] }
+gix-object = { version = "0.61", features = ["sha1"] }
+gix-hash = { version = "0.25", features = ["sha1"] }
+gix-odb = { version = "0.81.0", features = ["sha1"] }
+gix-features = { version = "0.48", features = ["zlib"] }
+# Used by `packfile::build_execution_pack` for a scratch dir at teardown, and by
+# the in-crate tests. A normal dep (not dev-only) because production code needs it.
+tempfile = "3"
+
+[features]
+# Exposes the disposable-git-repo test helpers (`testutil`) and pack-index
+# introspection (`packfile::pack_index_oids`) so cairn-core's archival tests can
+# build the same real-anatomy fixtures the in-crate tests use — mirrors
+# cairn-core's own `test-utils` gate.
+test-utils = []

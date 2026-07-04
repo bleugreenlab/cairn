@@ -7,6 +7,9 @@ mod row;
 mod search_index;
 mod team_sync;
 
+pub(crate) mod content_store;
+pub(crate) mod events;
+
 pub(crate) use blocking::run_db_blocking;
 pub use error::{DbError, DbResult};
 pub use local_db::{
@@ -23,6 +26,20 @@ pub use row::{
 };
 pub use search_index::{SearchIndex, SearchIndexHit};
 pub use team_sync::{run_pull_task, run_push_task, RouteReconcile, SyncCadence};
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use content_store::InMemoryContentStore;
+pub use content_store::{
+    BrokeredContentStore, BrokeredContentStoreFactory, ContentStore, ContentStoreFactory,
+    TeamReplicaContext,
+};
+#[cfg(any(test, feature = "test-utils"))]
+pub use events::event_fixture;
+pub use events::{
+    build_execution_pack, compress, count_commits_ahead, decompress, reconstruct_events,
+    render_range_diff, render_range_file_diffs, NodeDiffFile, ObjectStore, ResolvePathError,
+    CODEC_NONE, CODEC_ZSTD_V1,
+};
 
 #[cfg(test)]
 pub(crate) async fn migrated_test_db(name: &str) -> LocalDb {

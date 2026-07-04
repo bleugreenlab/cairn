@@ -14,12 +14,12 @@ use tokio::task::JoinHandle;
 use cairn_common::ids::{self, RoutableId, RouteScope};
 
 use crate::account::team_token_minter::TeamTokenMinter;
-use crate::archival::store::{ContentStoreFactory, TeamReplicaContext};
 use crate::services::EventEmitter;
 use crate::storage::{
     run_pull_task, run_push_task, DbError, DbResult, LocalDb, MigrationRunner, RouteReconcile,
     RowExt, SearchIndex, SyncCadence, TEAM_MIGRATIONS,
 };
+use crate::storage::{ContentStoreFactory, TeamReplicaContext};
 
 pub type TeamId = String;
 
@@ -113,7 +113,7 @@ pub struct DbState {
     /// tests and local-only hosts that intentionally skip installation) a team
     /// replica carries no store and behaves exactly as before.
     ///
-    /// [`ContentStore`]: crate::archival::store::ContentStore
+    /// [`ContentStore`]: crate::storage::ContentStore
     content_store_factory: RwLock<Option<Arc<dyn ContentStoreFactory>>>,
 }
 

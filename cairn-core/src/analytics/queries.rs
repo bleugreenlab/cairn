@@ -1357,7 +1357,7 @@ async fn load_run_events(db: &LocalDb, run_id: &str) -> DbResult<Vec<Event>> {
             crate::runs::queries::event_from_row,
         )
         .await?;
-    Ok(crate::archival::reconstruct_events(db, events).await)
+    Ok(crate::storage::reconstruct_events(db, events).await)
 }
 
 async fn upsert_run_invocations(

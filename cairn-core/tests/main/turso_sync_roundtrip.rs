@@ -391,15 +391,15 @@ fn create_project_input(id: &str, key: &str, repo: &Path, team_id: Option<&str>)
     }
 }
 
-/// A [`ContentStoreFactory`](cairn_core::archival::ContentStoreFactory) that hands
+/// A [`ContentStoreFactory`](cairn_core::internal::storage::ContentStoreFactory) that hands
 /// every team the SAME shared store, so what host A offloads, host B fetches.
-struct SharedStoreFactory(std::sync::Arc<dyn cairn_core::archival::ContentStore>);
+struct SharedStoreFactory(std::sync::Arc<dyn cairn_core::internal::storage::ContentStore>);
 
-impl cairn_core::archival::ContentStoreFactory for SharedStoreFactory {
+impl cairn_core::internal::storage::ContentStoreFactory for SharedStoreFactory {
     fn store_for(
         &self,
         _team_id: &cairn_core::internal::db::TeamId,
-    ) -> std::sync::Arc<dyn cairn_core::archival::ContentStore> {
+    ) -> std::sync::Arc<dyn cairn_core::internal::storage::ContentStore> {
         self.0.clone()
     }
 }
@@ -427,8 +427,8 @@ async fn team_run_archival_offloads_to_store_and_reconstructs_on_a_second_replic
     // One shared content store stands in for the brokered S3-backed store, wired
     // into BOTH hosts' factories. `store` (typed) is kept for assertions; `shared`
     // is the same instance behind the trait object the factories hand out.
-    let store = cairn_core::archival::InMemoryContentStore::new();
-    let shared: std::sync::Arc<dyn cairn_core::archival::ContentStore> =
+    let store = cairn_core::internal::storage::InMemoryContentStore::new();
+    let shared: std::sync::Arc<dyn cairn_core::internal::storage::ContentStore> =
         std::sync::Arc::new(store.clone());
 
     // ---- Host A: routed team project + a system:prompt event, then archive. ----
@@ -497,7 +497,7 @@ async fn team_run_archival_offloads_to_store_and_reconstructs_on_a_second_replic
     let cairn = format!("\n\n{}", "CAIRN-PROMPT ".repeat(700));
     let workspace = "\n\n## Workspace Instructions\n\nworkspace doctrine".to_string();
     let agent = "\n\n<agent_role>\nbuilder role body".to_string();
-    let (data, _content) = cairn_core::archival::event_fixture::system_prompt(&[
+    let (data, _content) = cairn_core::internal::storage::event_fixture::system_prompt(&[
         ("backend_base", &backend_base),
         ("cairn", &cairn),
         ("workspace", &workspace),

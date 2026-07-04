@@ -32,10 +32,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gix_hash::{oid, ObjectId};
 use serde::Serialize;
 
-use crate::archival::{render_range_file_diffs, NodeDiffFile, ObjectStore};
+use crate::storage::{count_commits_ahead, render_range_file_diffs, NodeDiffFile, ObjectStore};
 use crate::storage::{DbResult, LocalDb, RowExt};
 
 /// Aggregate change counts for a node's worktree change-group. `files_changed`
@@ -380,15 +379,10 @@ pub async fn node_base_tip_diff(
         (store, base, tip)
     };
 
-    let base_oid =
-        ObjectId::from_hex(base_hex.as_bytes()).map_err(|e| format!("invalid base sha: {e}"))?;
-    let tip_oid =
-        ObjectId::from_hex(tip_hex.as_bytes()).map_err(|e| format!("invalid tip sha: {e}"))?;
-
-    let files = render_range_file_diffs(&store, &base_oid, &tip_oid)?;
+    let files = render_range_file_diffs(&store, &base_hex, &tip_hex)?;
     let total_additions = files.iter().map(|f| f.additions as i32).sum();
     let total_deletions = files.iter().map(|f| f.deletions as i32).sum();
-    let commits_ahead = count_commits_ahead(&store, &base_oid, &tip_oid);
+    let commits_ahead = count_commits_ahead(&store, &base_hex, &tip_hex);
 
     Ok(Some(NodeDiff {
         files,
@@ -396,34 +390,6 @@ pub async fn node_base_tip_diff(
         total_additions,
         total_deletions,
     }))
-}
-
-/// Count commits on the first-parent chain from `tip` back to (but not
-/// including) `base`. Bounded so a missing base or a cycle can't spin.
-fn count_commits_ahead(store: &ObjectStore, base: &oid, tip: &oid) -> i32 {
-    use gix_object::{CommitRefIter, Kind as ObjectKind};
-    const HASH_KIND: gix_hash::Kind = gix_hash::Kind::Sha1;
-    const CAP: i32 = 100_000;
-
-    let mut count = 0;
-    let mut current = tip.to_owned();
-    while current.as_ref() != base && count < CAP {
-        let Some((kind, bytes)) = store.resolve_object(&current) else {
-            break;
-        };
-        if kind != ObjectKind::Commit {
-            break;
-        }
-        let Some(parent) = CommitRefIter::from_bytes(&bytes, HASH_KIND)
-            .parent_ids()
-            .next()
-        else {
-            break;
-        };
-        count += 1;
-        current = parent;
-    }
-    count
 }
 
 fn git_head(worktree_path: &str) -> Option<String> {
@@ -499,7 +465,7 @@ mod tests {
 
     mod db {
         use super::super::*;
-        use crate::archival::testutil::{commit_all, git, init_repo, write_file};
+        use crate::storage::events::testutil::{commit_all, git, init_repo, write_file};
         use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
 
         async fn migrated_db() -> LocalDb {

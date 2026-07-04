@@ -25,11 +25,11 @@ pub mod runs;
 pub mod scratch;
 pub mod search;
 pub mod sessions;
-pub mod symbols;
+pub use cairn_symbols::symbols;
 pub mod terminal_host;
 pub mod todos;
 pub mod turns;
-pub mod worktree_search;
+pub use cairn_symbols::worktree_search;
 
 // ── Stable public operations ───────────────────────────
 pub use backends::SessionStart;
@@ -77,6 +77,12 @@ mod resources;
 mod services;
 mod storage;
 mod workspace;
+
+// Cross-engine parity tests comparing the fff worktree index (cairn-symbols)
+// against this crate's canonical ripgrep walk. Only cairn-core sees both
+// engines, so the comparison is anchored here rather than in cairn-symbols.
+#[cfg(test)]
+mod worktree_search_parity;
 
 /// Unstable app-facing API used by Cairn host crates.
 ///

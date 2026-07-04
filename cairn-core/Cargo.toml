@@ -39,6 +39,7 @@ async-trait = "0.1"
 cairn-common = { path = "../cairn-common" }
 ignore = "0.4"
 globset = "0.4"
+reflink-copy = "0.1.30"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 tempfile = "3"
@@ -55,38 +56,24 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 tantivy = "0.26.1"
 jsonschema = { version = "0.26", default-features = false }
 tiktoken-rs = "0.6"
-# In-process structural code intelligence (tree-sitter via ast-grep). Replaces
-# the external Language Server adapter: parses on demand, ships ~25 grammars
-# compiled in (no install, no per-worktree server/index). `ast-grep-language`
-# default `builtin-parser` feature compiles every bundled grammar.
-ast-grep-core = "0.43"
-ast-grep-language = "0.43"
-ast-grep-config = "0.43"
-ast-grep-outline = { path = "../ast-grep-outline" }
+# Structural code intelligence (ast-grep) and the warm fff worktree-search index
+# are quarantined behind cairn-symbols so cairn-core no longer compiles the ~25
+# tree-sitter grammars or fff-search directly — its two heaviest dependency
+# edges. cairn-symbols re-exports what core still needs (`SupportLang`, the
+# glob/path/format search helpers); the load-bearing dependency rationale for
+# ast-grep and fff-search now lives in that crate's manifest.
+cairn-symbols = { path = "../cairn-symbols" }
 
-# In-process warm file-search index (CAIRN-2303). Wraps fff-search's resident
-# FilePicker so repeated ?grep=/?glob= reads and translated run() rg/grep in a
-# worktree hit a warm, watcher-maintained index instead of re-walking the tree
-# from scratch. Pinned exact: 0.9.x has no API-stability guarantee and the
-# worktree_search wrapper module is the sole consumer of its surface. No
-# features: `zlob` needs Zig at build time (the pure-Rust globset fallback is
-# fine), frecency/history LMDB stores are disabled at runtime (None paths), and
-# the process-wide SIGSEGV handler only installs via fff::log::init_tracing,
-# which cairn-core never calls.
-fff-search = { version = "=0.9.6", default-features = false }
+# The gix + zstd event-codec/object substrate (tagged payload compression, the
+# in-memory layered git ObjectStore, range packfile construction, and committed
+# diff rendering) is quarantined behind cairn-codec so cairn-core no longer
+# compiles gix or zstd directly. Its hex-sha-keyed API keeps gix types out of
+# cairn-core entirely; the load-bearing gix rationale now lives in that manifest.
+cairn-codec = { path = "../cairn-codec" }
 
 # Optional: test utilities (mocking)
 mockall = { version = "0.13", optional = true }
 jsonwebtoken = "9.3.1"
-zstd = "0.13"
-# Session archival object access (CAIRN-1538). Focused gix crates only — not the
-# umbrella `gix` — to read range packs and the repo ODB in-process. gix-features
-# is pulled directly for its `zlib::Inflate`, required by gix-pack's entry decoder.
-gix-pack = { version = "0.71", features = ["sha1"] }
-gix-object = { version = "0.61", features = ["sha1"] }
-gix-hash = { version = "0.25", features = ["sha1"] }
-gix-odb = { version = "0.81.0", features = ["sha1"] }
-gix-features = { version = "0.48", features = ["zlib"] }
 lsp-types = "0.97"
 # HTML→markdown for the built-in "regular" web-fetch provider. A turndown.js
 # inspired pure-Rust converter; only `text/html` responses are converted, JSON
@@ -118,6 +105,7 @@ serde_json = "1.0"
 serial_test = "3"
 tempfile = "3"
 cairn-core = { path = ".", features = ["test-utils"] }
+cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
 
 [features]
 internal-api = []
