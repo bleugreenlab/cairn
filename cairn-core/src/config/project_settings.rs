@@ -344,7 +344,32 @@ pub fn load_checks(project_path: &Path) -> Option<HashMap<String, CheckCommand>>
         .and_then(|(file, _)| file.checks)
 }
 
-/// Save project settings to file
+/// Managed top-level config keys: the current schema fields plus the legacy keys
+/// the migration removes. A top-level key on disk that is NOT in this set is a
+/// user-authored key the comment-preserving merge leaves untouched.
+const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
+    "setupCommands",
+    "terminalCommands",
+    "checks",
+    "defaultBranch",
+    "references",
+    "worktree",
+    "activeBackend",
+    "backends",
+    "mcpServers",
+    // Legacy keys the load-path migration strips.
+    "ciCommands",
+    "copyFiles",
+];
+
+/// Save project settings to file.
+///
+/// When `config.yaml` already exists and parses cleanly, the write is a
+/// diff-scoped merge that rewrites only the subtrees whose value changed,
+/// preserving every comment and unknown key (see [`super::yaml_edit`]). A fresh
+/// file, or a document the merge declines, falls back to a full serialization
+/// with the header comment. The commit is pushed best-effort: a project's config
+/// lives on its shared branch, and a diverged local main breaks issue PR merges.
 pub fn save_project_settings(
     project_path: &Path,
     settings: &ProjectSettingsFile,
@@ -357,19 +382,50 @@ pub fn save_project_settings(
             .map_err(|e| format!("Failed to create .cairn directory: {}", e))?;
     }
 
-    // Add header comment
-    let yaml = serde_yaml::to_string(settings)
-        .map_err(|e| format!("Failed to serialize project settings: {}", e))?;
-    let content = format!("# Cairn Project Configuration\n{}", yaml);
+    let content = render_settings_yaml(&path, settings)?;
 
     std::fs::write(&path, content)
         .map_err(|e| format!("Failed to write project config file: {}", e))?;
     super::commit_and_maybe_push(
         std::slice::from_ref(&path),
         "cairn: update project config",
-        None,
+        Some(project_path),
     );
     Ok(())
+}
+
+/// The YAML text to write for `settings`.
+///
+/// Prefers a comment-preserving merge into the existing file; falls back to a
+/// full serialization (with the header comment) for a fresh or unmergeable file.
+/// A semantically no-op save returns the on-disk bytes verbatim, so git stages
+/// nothing and no commit is produced.
+fn render_settings_yaml(path: &Path, settings: &ProjectSettingsFile) -> Result<String, String> {
+    let target_value = serde_yaml::to_value(settings)
+        .map_err(|e| format!("Failed to serialize project settings: {}", e))?;
+    let target_mapping = match &target_value {
+        serde_yaml::Value::Mapping(m) => m,
+        _ => return Err("project settings did not serialize to a mapping".to_string()),
+    };
+
+    if let Ok(original) = std::fs::read_to_string(path) {
+        if !original.trim().is_empty() {
+            match super::yaml_edit::merge_into_yaml(
+                &original,
+                target_mapping,
+                MANAGED_TOP_LEVEL_KEYS,
+            ) {
+                Ok(merged) => return Ok(merged),
+                Err(e) => {
+                    log::debug!("Comment-preserving YAML merge fell back to full rewrite: {e}")
+                }
+            }
+        }
+    }
+
+    let yaml = serde_yaml::to_string(settings)
+        .map_err(|e| format!("Failed to serialize project settings: {}", e))?;
+    Ok(format!("# Cairn Project Configuration\n{}", yaml))
 }
 
 /// Create a default project config file with commented template
@@ -802,7 +858,7 @@ copyFiles:
     }
 
     #[test]
-    fn save_project_settings_commits_scoped_and_does_not_push() {
+    fn save_project_settings_commits_scoped_and_pushes() {
         let temp = TempDir::new().unwrap();
         let origin = temp.path().join("origin.git");
         std::fs::create_dir_all(&origin).unwrap();
@@ -831,8 +887,19 @@ copyFiles:
             !status.contains("config.yaml"),
             "config.yaml committed: {status:?}"
         );
-        // Project scope is commit-only: nothing pushed to origin.
-        assert!(!origin_has_branch(&origin, &git_branch(&proj)));
+        // The commit is pushed to origin best-effort on a detached thread, so a
+        // diverged local main can never break issue PR merges. Poll until the
+        // background push lands the branch.
+        let branch = git_branch(&proj);
+        let mut pushed = false;
+        for _ in 0..40 {
+            if origin_has_branch(&origin, &branch) {
+                pushed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(pushed, "settings save should push its commit to origin");
     }
 
     #[test]

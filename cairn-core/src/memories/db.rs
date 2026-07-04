@@ -286,6 +286,27 @@ pub async fn confirm_draft_memories_for_job(db: &LocalDb, job_id: &str) -> DbRes
     db.write(|conn| {
         let job_id = job_id.clone();
         Box::pin(async move {
+            // A job's drafts become `pending` only once the work that produced
+            // them lands: the job's issue must be merged, or the job must have
+            // no owning issue (chat / ad-hoc runs, where "merged" is undefined).
+            // Until then survivors stay `draft` and never enter the triage pool.
+            let mut eligibility_rows = conn
+                .query(
+                    "SELECT 1 FROM jobs j
+                     WHERE j.id = ?1
+                       AND (j.issue_id IS NULL
+                         OR EXISTS (
+                           SELECT 1 FROM issues i
+                           WHERE i.id = j.issue_id AND i.merged_at IS NOT NULL
+                         ))
+                     LIMIT 1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            if eligibility_rows.next().await?.is_none() {
+                return Ok(Vec::new());
+            }
+
             let sql = format!(
                 "SELECT {MEMORY_COLUMNS} FROM memories \
                  WHERE job_id = ?1 AND status = 'draft' \
@@ -512,6 +533,96 @@ pub async fn resolve_triage_batch_on_merge(db: &LocalDb, issue_id: &str) -> DbRe
                         .await?;
                     }
                 }
+            }
+            Ok(ids)
+        })
+    })
+    .await
+}
+
+pub async fn draft_memory_job_ids_for_issue(db: &LocalDb, issue_id: &str) -> DbResult<Vec<String>> {
+    let issue_id = issue_id.to_string();
+    db.query_all(
+        "SELECT DISTINCT m.job_id
+         FROM memories m
+         JOIN jobs j ON j.id = m.job_id
+         WHERE m.status = 'draft' AND j.issue_id = ?1
+         ORDER BY m.job_id ASC",
+        params![issue_id.as_str()],
+        |row| row.text(0),
+    )
+    .await
+}
+
+pub async fn discard_draft_memories_for_closed_issue(
+    db: &LocalDb,
+    issue_id: &str,
+) -> DbResult<Vec<String>> {
+    let issue_id = issue_id.to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.write(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT m.id
+                     FROM memories m
+                     JOIN jobs j ON j.id = m.job_id
+                     WHERE m.status = 'draft' AND j.issue_id = ?1
+                     ORDER BY m.created_at ASC, m.id ASC",
+                    params![issue_id.as_str()],
+                )
+                .await?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next().await? {
+                ids.push(row.text(0)?);
+            }
+            for id in &ids {
+                conn.execute(
+                    "UPDATE memories
+                     SET status = 'discarded',
+                         reason = COALESCE(reason, 'owning issue closed without merge'),
+                         updated_at = ?1
+                     WHERE id = ?2 AND status = 'draft'",
+                    params![now, id.as_str()],
+                )
+                .await?;
+            }
+            Ok(ids)
+        })
+    })
+    .await
+}
+
+pub async fn discard_draft_memories_for_closed_issues(db: &LocalDb) -> DbResult<Vec<String>> {
+    let now = chrono::Utc::now().timestamp();
+    db.write(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT m.id
+                     FROM memories m
+                     JOIN jobs j ON j.id = m.job_id
+                     JOIN issues i ON i.id = j.issue_id
+                     WHERE m.status = 'draft' AND i.closed_at IS NOT NULL
+                     ORDER BY m.created_at ASC, m.id ASC",
+                    (),
+                )
+                .await?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next().await? {
+                ids.push(row.text(0)?);
+            }
+            for id in &ids {
+                conn.execute(
+                    "UPDATE memories
+                     SET status = 'discarded',
+                         reason = COALESCE(reason, 'owning issue closed without merge'),
+                         updated_at = ?1
+                     WHERE id = ?2 AND status = 'draft'",
+                    params![now, id.as_str()],
+                )
+                .await?;
             }
             Ok(ids)
         })
@@ -1051,17 +1162,31 @@ mod tests {
     }
 
     async fn insert_memory(db: &LocalDb, id: &str, project_id: Option<&str>, created_at: i64) {
+        insert_memory_with_status_and_job(db, id, project_id, "pending", "job-main", created_at)
+            .await;
+    }
+
+    async fn insert_memory_with_status_and_job(
+        db: &LocalDb,
+        id: &str,
+        project_id: Option<&str>,
+        status: &str,
+        job_id: &str,
+        created_at: i64,
+    ) {
         db.write(|conn| {
             let id = id.to_string();
             let project_id = project_id.map(str::to_string);
+            let status = status.to_string();
+            let job_id = job_id.to_string();
             let (scope, scope_value) = match project_id.as_deref() {
                 Some("workspace") | None => ("workspace".to_string(), "workspace".to_string()),
                 Some(project_id) => ("project".to_string(), project_id.to_string()),
             };
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, created_at, updated_at) VALUES (?1, ?1, ?2, ?3, 'pending', ?4, ?5, 'job-main', ?6, ?6, ?6)",
-                    params![id.as_str(), project_id.as_deref(), id.as_str(), scope.as_str(), scope_value.as_str(), created_at],
+                    "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, created_at, updated_at) VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?8)",
+                    params![id.as_str(), project_id.as_deref(), id.as_str(), status.as_str(), scope.as_str(), scope_value.as_str(), job_id.as_str(), created_at],
                 )
                 .await?;
                 Ok(())
@@ -1095,6 +1220,189 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(ids.contains("workspace-memory"));
         assert!(ids.contains("project-memory"));
+    }
+
+    #[tokio::test]
+    async fn unmerged_issue_job_keeps_drafts_out_of_pending_pool() {
+        let db = test_db().await;
+        insert_memory_with_status_and_job(
+            &db,
+            "draft-open",
+            Some("project-1"),
+            "draft",
+            "job-main",
+            1,
+        )
+        .await;
+
+        let confirmed = confirm_draft_memories_for_job(&db, "job-main")
+            .await
+            .unwrap();
+
+        assert!(confirmed.is_empty());
+        assert_eq!(memory_status(&db, "draft-open").await, "draft");
+    }
+
+    #[tokio::test]
+    async fn no_issue_job_confirms_drafts_immediately() {
+        let db = test_db().await;
+        db.execute(
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-chat', 'recipe', NULL, 'project-1', 'complete', 2, 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+             VALUES ('job-chat', 'exec-chat', NULL, 'project-1', 'complete', 'chat', 'chat', 2, 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        insert_memory_with_status_and_job(
+            &db,
+            "draft-chat",
+            Some("project-1"),
+            "draft",
+            "job-chat",
+            2,
+        )
+        .await;
+
+        let confirmed = confirm_draft_memories_for_job(&db, "job-chat")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            confirmed
+                .iter()
+                .map(|memory| memory.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["draft-chat"]
+        );
+        assert_eq!(memory_status(&db, "draft-chat").await, "pending");
+    }
+
+    #[tokio::test]
+    async fn merged_issue_job_confirms_drafts() {
+        let db = test_db().await;
+        insert_memory_with_status_and_job(
+            &db,
+            "draft-merged",
+            Some("project-1"),
+            "draft",
+            "job-main",
+            1,
+        )
+        .await;
+        db.execute(
+            "UPDATE issues SET merged_at = 10 WHERE id = 'issue-main'",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let confirmed = confirm_draft_memories_for_job(&db, "job-main")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            confirmed
+                .iter()
+                .map(|memory| memory.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["draft-merged"]
+        );
+        assert_eq!(memory_status(&db, "draft-merged").await, "pending");
+    }
+
+    #[tokio::test]
+    async fn draft_job_lookup_and_close_discard_are_issue_scoped() {
+        let db = test_db().await;
+        db.execute(
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-other', 'project-1', 43, 'Other', 'active', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-other', 'recipe', 'issue-other', 'project-1', 'complete', 2, 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+             VALUES ('job-other', 'exec-other', 'issue-other', 'project-1', 'complete', 'builder', 'builder', 2, 2)",
+            (),
+        )
+        .await
+        .unwrap();
+        insert_memory_with_status_and_job(
+            &db,
+            "draft-main",
+            Some("project-1"),
+            "draft",
+            "job-main",
+            1,
+        )
+        .await;
+        insert_memory_with_status_and_job(
+            &db,
+            "draft-other",
+            Some("project-1"),
+            "draft",
+            "job-other",
+            2,
+        )
+        .await;
+
+        assert_eq!(
+            draft_memory_job_ids_for_issue(&db, "issue-main")
+                .await
+                .unwrap(),
+            vec!["job-main"]
+        );
+
+        let discarded = discard_draft_memories_for_closed_issue(&db, "issue-main")
+            .await
+            .unwrap();
+        assert_eq!(discarded, vec!["draft-main"]);
+        let memory = load_memory(&db, "draft-main").await.unwrap();
+        assert_eq!(memory.status, MemoryStatus::Discarded);
+        assert_eq!(
+            memory.reason.as_deref(),
+            Some("owning issue closed without merge")
+        );
+        assert_eq!(memory_status(&db, "draft-other").await, "draft");
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_discard_finds_closed_owning_issues() {
+        let db = test_db().await;
+        insert_memory_with_status_and_job(
+            &db,
+            "draft-closed",
+            Some("project-1"),
+            "draft",
+            "job-main",
+            1,
+        )
+        .await;
+        db.execute(
+            "UPDATE issues SET closed_at = 10 WHERE id = 'issue-main'",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let discarded = discard_draft_memories_for_closed_issues(&db).await.unwrap();
+
+        assert_eq!(discarded, vec!["draft-closed"]);
+        assert_eq!(memory_status(&db, "draft-closed").await, "discarded");
     }
 
     #[tokio::test]

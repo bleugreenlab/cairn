@@ -348,3 +348,61 @@ pub struct TargetBreakdown {
     pub top_targets: Vec<TopTargetRow>,
     pub total: i64,
 }
+
+// --- Delivery economics: normalized per merged PR shipped ---
+
+/// Economics for one grouping key (a model alias or a normalized role),
+/// normalized per merged PR that key's jobs shipped. Unlike [`EconomicsRow`]
+/// (which scales with raw usage), the per-PR ratios expose the marginal cost of
+/// shipping a unit of work, so a cheap-but-chatty model and an expensive-but-
+/// terse one become directly comparable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrEconomicsRow {
+    pub key: String,
+    /// Merged PRs attributed to this key's jobs.
+    pub pr_count: i64,
+    /// Total delivery cost (real metered where reported, else priced estimate).
+    pub cost_usd: f64,
+    pub billable_tokens: i64,
+    pub lines_changed: i64,
+    /// `cost_usd / pr_count`; 0 when no PRs.
+    pub cost_per_pr: f64,
+    /// `billable_tokens / pr_count`; 0 when no PRs.
+    pub tokens_per_pr: f64,
+    /// `billable_tokens / lines_changed`; 0 when no lines.
+    pub tokens_per_line: f64,
+}
+
+/// Per-model and per-role delivery economics normalized per merged PR, plus the
+/// price-table source date.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedPrEconomics {
+    pub by_model: Vec<PrEconomicsRow>,
+    pub by_role: Vec<PrEconomicsRow>,
+    pub price_source_date: String,
+}
+
+/// One time-bucket point of delivery efficiency: the cost and tokens the
+/// workspace spent on the merged PRs that landed in the bucket. Bucketed on the
+/// PR's `merged_at`, so the trend answers "is shipping getting cheaper?".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCostTrendPoint {
+    pub bucket_start: i64,
+    pub pr_count: i64,
+    pub cost_usd: f64,
+    pub billable_tokens: i64,
+    pub lines_changed: i64,
+}
+
+/// One merged issue's lead time: the seconds from issue creation to its first
+/// merged PR. The distribution of these values is the cycle-time histogram.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueLeadTimePoint {
+    pub lead_seconds: i64,
+    /// `merged_at` of the first merged PR, so the client can slice by time.
+    pub merged_at: i64,
+}

@@ -71,6 +71,24 @@ pub fn confirm_drafts_for_completed_job(
     confirm_drafts_for_completed_job_in_db(orch, db, job_id)
 }
 
+pub async fn confirm_and_spawn_drafts_for_merged_issue(
+    orch: crate::orchestrator::Orchestrator,
+    issue_id: &str,
+) -> Result<Vec<String>, String> {
+    let issue_id = issue_id.to_string();
+    let db = orch.db.local.clone();
+    let job_ids = crate::memories::db::draft_memory_job_ids_for_issue(&db, &issue_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut confirmed_memories = Vec::new();
+    for job_id in job_ids {
+        confirmed_memories.extend(confirm_drafts_for_completed_job(&orch, &job_id)?);
+    }
+    let confirmed_scopes =
+        crate::memories::triage::distinct_scopes_from_memories(&confirmed_memories);
+    crate::memories::triage::maybe_spawn_triage(orch, confirmed_scopes).await
+}
+
 fn confirm_drafts_for_completed_job_in_db(
     orch: &crate::orchestrator::Orchestrator,
     db: Arc<LocalDb>,
@@ -868,7 +886,7 @@ mod tests {
         .await
         .unwrap();
         db.execute(
-            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES (?1, ?2, 7, 'Team Issue', 'active', 1, 1)",
+            "INSERT INTO issues (id, project_id, number, title, status, merged_at, created_at, updated_at) VALUES (?1, ?2, 7, 'Team Issue', 'merged', 2, 1, 2)",
             params![issue_id.as_str(), project_id.as_str()],
         )
         .await

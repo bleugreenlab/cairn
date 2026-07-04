@@ -17,8 +17,9 @@ use crate::storage::{DbResult, LocalDb, RowExt};
 
 pub use types::{
     BackendCostPoint, Bucket, CommandDurationRow, CostPoint, EconomicsRow, EffectiveCostPoint,
-    HeatmapCell, ModelRoleEconomics, ProjectCost, Scope, SessionDurationPoint, TargetBreakdown,
-    TargetShapeRow, TimeCompositionPoint, TimeRange, TokenCompositionPoint, TokensPerLocPoint,
+    HeatmapCell, IssueLeadTimePoint, MergedPrEconomics, ModelRoleEconomics, PrCostTrendPoint,
+    PrEconomicsRow, ProjectCost, Scope, SessionDurationPoint, TargetBreakdown, TargetShapeRow,
+    TimeCompositionPoint, TimeRange, TokenCompositionPoint, TokensPerLocPoint,
     TokensPerSessionPoint, ToolBackfillSummary, ToolCallsPerSessionPoint, ToolErrorRatePoint,
     ToolMixPoint, ToolTimeMixPoint, TopTargetRow,
 };
@@ -609,31 +610,153 @@ pub async fn model_role_economics(
     })
 }
 
+/// Delivery economics normalized per merged PR, by model and by agent role.
+///
+/// The comparative counterpart to [`model_role_economics`]: instead of totals
+/// that scale with raw usage, this divides each key's cost and tokens by the
+/// number of merged PRs its jobs shipped, so a terse model and a chatty one
+/// become directly comparable on "what does it cost to ship a PR". Costs use the
+/// same [`exact_or_priced`] rule as every other $-valued analytic, and role
+/// groups on the job's agent identity (`agent_config_id`), matching
+/// `model_role_economics` rather than the free-form `node_name`.
+pub async fn merged_pr_economics(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<MergedPrEconomics> {
+    let rows = queries::merged_pr_economics_rows(db, scope, range).await?;
+    let mut by_model: HashMap<String, PrAcc> = HashMap::new();
+    let mut by_role: HashMap<String, PrAcc> = HashMap::new();
+    for row in &rows {
+        let cost = exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            row.input,
+            row.cache_read,
+            row.cache_create,
+            row.output,
+            row.exact_cost,
+            row.exact_cost_count,
+        );
+        let model_key = row
+            .model
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        by_model.entry(model_key).or_default().add(row, cost);
+        by_role
+            .entry(normalize_role(row.agent_config_id.as_deref()))
+            .or_default()
+            .add(row, cost);
+    }
+    Ok(MergedPrEconomics {
+        by_model: finalize_pr(by_model),
+        by_role: finalize_pr(by_role),
+        price_source_date: pricing::PRICE_SOURCE_DATE.to_string(),
+    })
+}
+
+/// Delivery cost efficiency over time: cost, tokens, and lines per merged PR
+/// bucketed on each PR's `merged_at`. Each (model, backend) group is priced via
+/// [`exact_or_priced`] before summing per bucket, so the trend answers "is
+/// shipping getting cheaper?" rather than echoing raw spend.
+pub async fn merged_pr_cost_trend(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<PrCostTrendPoint>> {
+    let rows = queries::merged_pr_cost_trend_rows(db, scope, range, bucket).await?;
+    // (pr_count, cost, billable, lines) accumulated per bucket.
+    let mut buckets: HashMap<i64, (i64, f64, i64, i64)> = HashMap::new();
+    for row in &rows {
+        let cost = exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            row.input,
+            row.cache_read,
+            row.cache_create,
+            row.output,
+            row.exact_cost,
+            row.exact_cost_count,
+        );
+        let e = buckets.entry(row.bucket_start).or_insert((0, 0.0, 0, 0));
+        e.0 += row.pr_count;
+        e.1 += cost;
+        e.2 += row.billable;
+        e.3 += row.lines;
+    }
+    let mut points: Vec<PrCostTrendPoint> = buckets
+        .into_iter()
+        .map(
+            |(bucket_start, (pr_count, cost_usd, billable_tokens, lines_changed))| {
+                PrCostTrendPoint {
+                    bucket_start,
+                    pr_count,
+                    cost_usd,
+                    billable_tokens,
+                    lines_changed,
+                }
+            },
+        )
+        .collect();
+    points.sort_by_key(|p| p.bucket_start);
+    Ok(points)
+}
+
+/// Lead time (issue creation -> first merged PR) for every merged issue in the
+/// range. The raw per-issue seconds are the cycle-time distribution the
+/// dashboard renders as a histogram with median / p90 markers.
+pub async fn issue_lead_times(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<Vec<IssueLeadTimePoint>> {
+    let rows = queries::issue_lead_times(db, scope, range).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| IssueLeadTimePoint {
+            lead_seconds: r.lead_seconds,
+            merged_at: r.merged_at,
+        })
+        .collect())
+}
+
 /// Run the incremental tool-invocation backfill (Tier B). Off the hot path;
 /// safe to invoke on demand from the dashboard.
 pub async fn backfill_tool_invocations(db: &LocalDb) -> DbResult<ToolBackfillSummary> {
     queries::backfill_tool_invocations(db).await
 }
 
-/// Run the one-time historical rollup backfill, gated so it runs once per
-/// install. Spawn it on a background task at startup.
+/// Run startup analytics rollup repair passes. Spawn it on a background task at
+/// startup.
 ///
 /// Live event inserts now maintain both rollups incrementally
 /// (`queries::maintain_rollups_on_insert`, hooked into the insert transaction),
-/// but events that predate that seam were never folded. This populates both
-/// tiers for those historical events — the Tier A token/cost fold and the
-/// Tier B reconstruct-based tool-invocation backfill — then records completion
-/// so it never re-scans the whole events table on later startups. Both passes
-/// are themselves idempotent safety nets (the fold re-derives a run wholesale,
-/// the tool backfill upserts by id), so a concurrent per-event increment can
-/// never double-count: the marker only avoids the redundant full scan.
+/// but events that predate that seam were never folded. The original historical
+/// pass populates both tiers — the Tier A token/cost fold and the Tier B
+/// reconstruct-based tool-invocation backfill — then records completion so it
+/// never re-scans the whole events table on later startups. A second marker
+/// versions the narrower result-timestamp repair added after `result_ts`
+/// existed: installs that already completed the original pass only revisit runs
+/// that have NULL-result tool_invocations rows.
 pub async fn run_historical_backfill(db: &LocalDb) -> DbResult<()> {
-    if historical_backfill_complete(db).await? {
-        return Ok(());
+    let ran_full_backfill = if historical_backfill_complete(db).await? {
+        false
+    } else {
+        queries::fold_token_rollup(db).await?;
+        queries::backfill_tool_invocations(db).await?;
+        mark_historical_backfill_complete(db).await?;
+        true
+    };
+
+    if !tool_result_backfill_complete(db).await? {
+        if !ran_full_backfill {
+            queries::reconcile_tool_invocation_results(db).await?;
+        }
+        mark_tool_result_backfill_complete(db).await?;
     }
-    queries::fold_token_rollup(db).await?;
-    queries::backfill_tool_invocations(db).await?;
-    mark_historical_backfill_complete(db).await?;
+
     Ok(())
 }
 
@@ -650,6 +773,25 @@ async fn mark_historical_backfill_complete(db: &LocalDb) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp();
     db.execute(
         "UPDATE analytics_rollup_backfill_state SET backfilled_at = ?1 WHERE id = 1",
+        (now,),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn tool_result_backfill_complete(db: &LocalDb) -> DbResult<bool> {
+    db.query_one(
+        "SELECT tool_results_backfilled_at FROM analytics_rollup_backfill_state WHERE id = 1",
+        (),
+        |row| Ok(row.opt_i64(0)?.is_some()),
+    )
+    .await
+}
+
+async fn mark_tool_result_backfill_complete(db: &LocalDb) -> DbResult<()> {
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "UPDATE analytics_rollup_backfill_state SET tool_results_backfilled_at = ?1 WHERE id = 1",
         (now,),
     )
     .await
@@ -868,6 +1010,66 @@ fn finalize(map: HashMap<String, Acc>) -> Vec<EconomicsRow> {
     rows
 }
 
+/// Per-key accumulator for [`merged_pr_economics`]: sums delivery cost, tokens,
+/// lines, and the PR count they were spent on.
+#[derive(Default)]
+struct PrAcc {
+    pr_count: i64,
+    cost: f64,
+    billable: i64,
+    lines: i64,
+}
+
+impl PrAcc {
+    fn add(&mut self, row: &queries::MergedPrEconRow, cost: f64) {
+        self.pr_count += row.pr_count;
+        self.cost += cost;
+        self.billable += row.billable;
+        self.lines += row.lines;
+    }
+}
+
+/// Resolve accumulated delivery economics into per-PR ratios, sorted by total
+/// cost descending (the most expensive-to-ship key first).
+fn finalize_pr(map: HashMap<String, PrAcc>) -> Vec<PrEconomicsRow> {
+    let mut rows: Vec<PrEconomicsRow> = map
+        .into_iter()
+        .map(|(key, a)| {
+            let cost_per_pr = if a.pr_count > 0 {
+                a.cost / a.pr_count as f64
+            } else {
+                0.0
+            };
+            let tokens_per_pr = if a.pr_count > 0 {
+                a.billable as f64 / a.pr_count as f64
+            } else {
+                0.0
+            };
+            let tokens_per_line = if a.lines > 0 {
+                a.billable as f64 / a.lines as f64
+            } else {
+                0.0
+            };
+            PrEconomicsRow {
+                key,
+                pr_count: a.pr_count,
+                cost_usd: a.cost,
+                billable_tokens: a.billable,
+                lines_changed: a.lines,
+                cost_per_pr,
+                tokens_per_pr,
+                tokens_per_line,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows
+}
+
 /// Normalize a raw `jobs.node_name` into a display role: strip a trailing
 /// `-<digits>` instance suffix, replace separators with spaces, title-case
 /// each word. Empty / missing names become `Other`.
@@ -978,9 +1180,9 @@ mod tests {
                 NULL, 90002, 88888, 0, 0, 88888, 0);
 
             INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
-                target_branch, status, opened_at, updated_at, additions, deletions)
+                target_branch, status, opened_at, updated_at, merged_at, additions, deletions)
              VALUES ('mr1', 'job-claude', 'proj', NULL, 'PR', 'agent/x', 'main', 'merged',
-                90100, 90100, 100, 55);
+                90100, 90100, 90100, 100, 55);
             ",
         )
         .await
@@ -1065,6 +1267,82 @@ mod tests {
         assert_eq!(r.lines_changed, 155);
         assert!((r.tokens_per_line - 1.0).abs() < 1e-9);
         assert_eq!(r.role, "Builder");
+    }
+
+    #[tokio::test]
+    async fn merged_pr_economics_normalizes_per_pr() {
+        let db = fixture_db().await;
+        let out = merged_pr_economics(&db, &Scope::default(), &TimeRange::default())
+            .await
+            .unwrap();
+        // Only job-claude shipped a merged PR (mr1); job-codex produced none.
+        let m = out
+            .by_model
+            .iter()
+            .find(|r| r.key == "sonnet")
+            .expect("sonnet model row");
+        assert_eq!(m.pr_count, 1);
+        assert_eq!(m.billable_tokens, 155);
+        assert_eq!(m.lines_changed, 155);
+        assert!((m.tokens_per_pr - 155.0).abs() < 1e-9);
+        assert!((m.tokens_per_line - 1.0).abs() < 1e-9);
+        assert!(m.cost_usd > 0.0);
+        // One PR, so cost_per_pr equals the total cost.
+        assert!((m.cost_per_pr - m.cost_usd).abs() < 1e-9);
+        // Codex model never shipped a PR in the fixture.
+        assert!(!out.by_model.iter().any(|r| r.key == "gpt-5"));
+        // Role groups on agent_config_id ("builder" -> "Builder").
+        let r = out
+            .by_role
+            .iter()
+            .find(|r| r.key == "Builder")
+            .expect("Builder role row");
+        assert_eq!(r.pr_count, 1);
+        assert_eq!(r.billable_tokens, 155);
+        assert_eq!(out.price_source_date, pricing::PRICE_SOURCE_DATE);
+    }
+
+    #[tokio::test]
+    async fn merged_pr_cost_trend_buckets_by_merge_day() {
+        let db = fixture_db().await;
+        let pts = merged_pr_cost_trend(&db, &Scope::default(), &TimeRange::default(), Bucket::Day)
+            .await
+            .unwrap();
+        assert_eq!(pts.len(), 1);
+        // mr1 merged_at 90100 falls in the day bucket starting at 86400.
+        assert_eq!(pts[0].bucket_start, 86400);
+        assert_eq!(pts[0].pr_count, 1);
+        assert_eq!(pts[0].billable_tokens, 155);
+        assert_eq!(pts[0].lines_changed, 155);
+        assert!(pts[0].cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn issue_lead_times_measures_open_to_first_merge() {
+        let db = fixture_db().await;
+        // Seed an issue whose PR merges 3600s after it opened. Its own job is
+        // needed because merge_requests.job_id is UNIQUE (one PR per job), and
+        // the fixture's mr1 has a NULL issue_id so it yields no lead-time point.
+        db.execute_script(
+            "
+            INSERT INTO jobs(id, project_id, status, model, node_name, agent_config_id, created_at, updated_at)
+             VALUES ('job-lead', 'proj', 'merged', 'sonnet', 'builder', 'builder', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('iss1', 'proj', 1, 'Feature', 'merged', 1000, 1000);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                target_branch, status, opened_at, updated_at, merged_at, additions, deletions)
+             VALUES ('mr-lead', 'job-lead', 'proj', 'iss1', 'PR', 'agent/y', 'main', 'merged',
+                2000, 4600, 4600, 10, 5);
+            ",
+        )
+        .await
+        .unwrap();
+        let pts = issue_lead_times(&db, &Scope::default(), &TimeRange::default())
+            .await
+            .unwrap();
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].lead_seconds, 3600); // 4600 - 1000
+        assert_eq!(pts[0].merged_at, 4600);
     }
 
     #[tokio::test]
@@ -1223,6 +1501,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row, (1, Some(92009)));
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_legacy_null_result_rows_after_historical_marker() {
+        let db = fixture_db().await;
+        db.execute_script(
+            r#"
+            INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-legacy-result-ts', 'proj', 'job-claude', 'exited', 'sess-claude', 1, 1);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+             VALUES ('legacy-a', 'run-legacy-result-ts', 'sess-claude', 1, 1, 'assistant',
+                '{"eventType":"assistant","isError":false,"toolUses":[{"id":"legacy-tu","name":"read","input":{"paths":["file:src/lib.rs"]}}]}',
+                NULL, 93000);
+            INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data,
+                parent_tool_use_id, created_at)
+             VALUES ('legacy-r', 'run-legacy-result-ts', 'sess-claude', 2, 2, 'tool_result',
+                '{"eventType":"tool_result","toolUseId":"legacy-tu","toolName":"read","toolResult":"boom","isError":true}',
+                'legacy-tu', 93012);
+
+            INSERT INTO tool_invocations(id, event_id, tool_use_id, run_id, ts, verb, tool_name,
+                target_scheme, target_kind, target_path, is_error, result_ts)
+             VALUES ('legacy-a:legacy-tu', 'legacy-a', 'legacy-tu', 'run-legacy-result-ts', 93000,
+                'read', 'read', 'file', 'rs', 'src/lib.rs', 0, NULL);
+            INSERT INTO tool_invocation_runs(run_id, processed_through, updated_at)
+             VALUES ('run-legacy-result-ts', 93012, 93012);
+            UPDATE analytics_rollup_backfill_state
+             SET backfilled_at = 1, tool_results_backfilled_at = NULL
+             WHERE id = 1;
+            "#,
+        )
+        .await
+        .unwrap();
+
+        queries::backfill_tool_invocations(&db).await.unwrap();
+        let before_reconcile = db
+            .query_one(
+                "SELECT result_ts FROM tool_invocations WHERE tool_use_id = 'legacy-tu'",
+                (),
+                |row| row.opt_i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_reconcile, None);
+
+        run_historical_backfill(&db).await.unwrap();
+
+        let row = db
+            .query_one(
+                "SELECT is_error, result_ts FROM tool_invocations WHERE tool_use_id = 'legacy-tu'",
+                (),
+                |row| Ok((row.i64(0)?, row.opt_i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row, (1, Some(93012)));
+
+        let marker = db
+            .query_one(
+                "SELECT tool_results_backfilled_at FROM analytics_rollup_backfill_state WHERE id = 1",
+                (),
+                |row| row.opt_i64(0),
+            )
+            .await
+            .unwrap();
+        assert!(marker.is_some());
     }
 
     #[tokio::test]

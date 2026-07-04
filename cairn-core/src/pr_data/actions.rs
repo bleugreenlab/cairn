@@ -71,8 +71,8 @@ fn db_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
 }
 
-/// Query the `merge_requests` row linked to a job (joined with its project for
-/// the repo path). `None` when the job has no PR yet.
+/// Query the `merge_requests` row linked to a producing job (joined with its
+/// project for the repo path). `None` when the job has no PR yet.
 pub async fn query_mr_context_for_job(
     conn: &turso::Connection,
     job_id: &str,
@@ -172,11 +172,12 @@ async fn query_pr_node_mr_context_for_artifact_job(
             .query(
                 "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local
                  FROM action_runs ar
-                 JOIN merge_requests mr ON mr.job_id = ar.id
+                 JOIN merge_requests mr ON mr.job_id = ar.parent_job_id OR mr.job_id = ar.id
                  JOIN projects p ON mr.project_id = p.id
                  WHERE ar.execution_id = ?1
                    AND ar.recipe_node_id = ?2
-                 ORDER BY ar.created_at DESC
+                 ORDER BY CASE WHEN mr.job_id = ar.parent_job_id THEN 0 ELSE 1 END,
+                          ar.created_at DESC
                  LIMIT 1",
                 params![execution_id.as_str(), target_node_id.as_str()],
             )
@@ -566,8 +567,8 @@ pub async fn resolve_pr_node(
         }
     };
 
-    if merge_context.has_triage_batch {
-        if let Some(issue_id) = merge_context.issue_id.as_deref() {
+    if let Some(issue_id) = merge_context.issue_id.as_deref() {
+        if merge_context.has_triage_batch {
             let result = match resolution {
                 PrNodeResolution::Merge => {
                     crate::memories::db::resolve_triage_batch_on_merge(&orch.db.local, issue_id)
@@ -594,6 +595,27 @@ pub async fn resolve_pr_node(
                 ),
             }
         }
+
+        if matches!(resolution, PrNodeResolution::Close) {
+            match crate::memories::db::discard_draft_memories_for_closed_issue(
+                &orch.db.local,
+                issue_id,
+            )
+            .await
+            {
+                Ok(ids) if !ids.is_empty() => log::info!(
+                    "Discarded {} draft memory row(s) for closed issue {}",
+                    ids.len(),
+                    issue_id
+                ),
+                Ok(_) => {}
+                Err(error) => log::warn!(
+                    "Failed to discard draft memories for closed issue {}: {}",
+                    issue_id,
+                    error
+                ),
+            }
+        }
     }
 
     if let Some(issue_id) = merge_context.issue_id.as_deref() {
@@ -606,10 +628,10 @@ pub async fn resolve_pr_node(
     };
     crate::pr_data::ports::fire_pr_node_port_for_owner(&orch.db.local, owner_id, port).await?;
     // A first-class `pr` action_run was `Blocked` while the PR was open;
-    // resolution completes it so the execution can finish. Recompute the whole
-    // execution to clear the `NeedsApproval` attention and settle status. Legacy
-    // `create_pr` PRs own a job (no action_run to flip); a single-job recompute
-    // covers that path. See CAIRN-1220.
+    // resolution completes it so the execution can finish. The durable MR owner
+    // is the producing job, so the action_run is found by parent_job_id. Legacy
+    // `create_pr` PRs have no action_run to flip; a single-job recompute covers
+    // that path. See CAIRN-1220.
     match complete_pr_action_run_if_owner(&orch.db.local, owner_id, now).await? {
         Some(execution_id) => {
             crate::execution::advancement::recompute_execution_jobs(orch, &execution_id)?
@@ -624,6 +646,36 @@ pub async fn resolve_pr_node(
     }
 
     if matches!(resolution, PrNodeResolution::Merge) {
+        if let Some(issue_id) = merge_context.issue_id.clone() {
+            let orch_for_memories = orch.clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                match crate::memories::commands::confirm_and_spawn_drafts_for_merged_issue(
+                    orch_for_memories,
+                    &issue_id,
+                )
+                .await
+                {
+                    Ok(spawned) if !spawned.is_empty() => log::info!(
+                        "Confirmed draft memories for merged issue {} and spawned {} triage issue(s) in {:?}",
+                        issue_id,
+                        spawned.len(),
+                        started.elapsed()
+                    ),
+                    Ok(_) => log::info!(
+                        "Confirmed draft memories for merged issue {} with no triage issue spawned in {:?}",
+                        issue_id,
+                        started.elapsed()
+                    ),
+                    Err(error) => log::warn!(
+                        "Failed to confirm draft memories for merged issue {}: {}",
+                        issue_id,
+                        error
+                    ),
+                }
+            });
+        }
+
         // Downstream sibling/coordinator reconciliation advances *other* in-flight
         // branches (siblings auto-rebase onto the advanced tip; a Coordinator on
         // the integration branch has its `@` re-parented). It has no bearing on
@@ -665,9 +717,10 @@ pub async fn resolve_pr_node(
     Ok(closed_sessions)
 }
 
-/// If `owner_id` is a `pr` action_run, mark it `complete` and return its
-/// execution_id. Returns `None` when the owner is a job (legacy `create_pr`),
-/// leaving its resolution to the job projection.
+/// If `owner_id` is a producing job with a blocked `pr` action_run child, mark
+/// that action_run `complete` and return its execution_id. Also accepts an
+/// action_run id for unrepaired historical rows. Returns `None` for legacy
+/// `create_pr` jobs with no first-class PR action.
 async fn complete_pr_action_run_if_owner(
     db: &LocalDb,
     owner_id: &str,
@@ -679,18 +732,30 @@ async fn complete_pr_action_run_if_owner(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT execution_id FROM action_runs WHERE id = ?1 LIMIT 1",
+                    "SELECT id, execution_id
+                     FROM (
+                         SELECT id, execution_id, 0 AS priority
+                         FROM action_runs
+                         WHERE parent_job_id = ?1
+                         UNION ALL
+                         SELECT id, execution_id, 1 AS priority
+                         FROM action_runs
+                         WHERE id = ?1
+                     )
+                     ORDER BY priority
+                     LIMIT 1",
                     params![owner_id.as_str()],
                 )
                 .await?;
             let Some(row) = rows.next().await? else {
                 return Ok(None);
             };
-            let execution_id = row.text(0)?;
+            let action_run_id = row.text(0)?;
+            let execution_id = row.text(1)?;
             drop(rows);
             conn.execute(
                 "UPDATE action_runs SET status = 'complete', completed_at = ?1 WHERE id = ?2",
-                params![now, owner_id.as_str()],
+                params![now, action_run_id.as_str()],
             )
             .await?;
             Ok(Some(execution_id))
@@ -1306,14 +1371,12 @@ pub async fn close_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<Strin
 ///
 /// Owner-aware: the direct `merge_requests.job_id = ?` lookup runs first, then a
 /// fallback that walks the execution snapshot from this job's node to the `pr`
-/// node that owns the row (`query_mr_context_for_create_pr_artifact_job`). A
-/// build recipe opens the child PR via a first-class `pr` action node, so the
-/// row's `job_id` is that action_run's id, not the builder job's — without the
-/// fallback a builder job id resolves nothing and merge/close/refresh (and the
-/// live PR section) report "no PR" for every child PR (CAIRN-2287). The returned
-/// `MrContext.job_id` is the PR's TRUE owner id, which callers pass back into
-/// `merge_pr_for_job` / `close_pr_for_job` / `refresh_pr_for_job` so their
-/// owner-keyed resolution and port firing stay correct.
+/// node that opened the row (`query_mr_context_for_create_pr_artifact_job`). A
+/// build recipe opens the child PR via a first-class `pr` action node, but the
+/// durable row is keyed by the producing builder job so analytics and file-change
+/// joins have a real `jobs.id`. The fallback preserves resolution from the
+/// builder artifact and from legacy action-run-keyed rows that could not be
+/// repaired.
 pub async fn try_resolve_mr_context_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -3504,14 +3567,14 @@ mod tests {
                 )
                 .await?;
                 conn.execute(
-                    "INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, created_at)
-                     VALUES ('pr-action-run', 'exec-pr-node', 'pr', 'builtin:pr', 'issue-pr-node', 'proj-pr-node', 'blocked', 2)",
+                    "INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, created_at, parent_job_id)
+                     VALUES ('pr-action-run', 'exec-pr-node', 'pr', 'builtin:pr', 'issue-pr-node', 'proj-pr-node', 'blocked', 2, 'builder-job')",
                     (),
                 )
                 .await?;
                 conn.execute(
                     "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, body, source_branch, target_branch, status, opened_at, updated_at)
-                     VALUES ('mr-pr-node', 'pr-action-run', 'proj-pr-node', 'issue-pr-node', 'Old title', 'Old body', 'agent/PROJ-3-builder', 'main', 'open', 1, 1)",
+                     VALUES ('mr-pr-node', 'builder-job', 'proj-pr-node', 'issue-pr-node', 'Old title', 'Old body', 'agent/PROJ-3-builder', 'main', 'open', 1, 1)",
                     (),
                 )
                 .await?;
@@ -3597,10 +3660,9 @@ mod tests {
     }
 
     /// The owner-aware resolution the PR actions and the live PR section depend on:
-    /// a build recipe's child PR is owned by the `pr` action_run, so a direct
-    /// `job_id` lookup on the builder job misses it. `try_resolve_mr_context_for_job`
-    /// must fall through the snapshot walk and return the row — with the action_run
-    /// as the TRUE owner id — so merge/close/refresh key on the owner (CAIRN-2287).
+    /// a build recipe's child PR is opened by the `pr` action_run but durably owned
+    /// by the producing builder job, so direct lookup succeeds and the snapshot
+    /// fallback remains available for legacy action-run-keyed rows.
     #[tokio::test(flavor = "current_thread")]
     async fn try_resolve_mr_context_follows_pr_node_owner() {
         let db = migrated_db().await;
@@ -3612,9 +3674,31 @@ mod tests {
             .expect("the pr-node-owned MR resolves from the builder job id");
         assert_eq!(ctx.mr_id, "mr-pr-node");
         assert_eq!(
-            ctx.job_id, "pr-action-run",
-            "the resolved owner is the pr action_run, not the builder job"
+            ctx.job_id, "builder-job",
+            "the resolved owner is the persisted builder job"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pr_resolution_completes_pr_action_run_for_producing_job_owner() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+
+        let execution_id = complete_pr_action_run_if_owner(&db, "builder-job", 42)
+            .await
+            .unwrap()
+            .expect("builder job resolves its pr action_run child");
+
+        assert_eq!(execution_id, "exec-pr-node");
+        let status = db
+            .query_text(
+                "SELECT status FROM action_runs WHERE id = 'pr-action-run'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, "complete");
     }
 
     #[tokio::test(flavor = "current_thread")]

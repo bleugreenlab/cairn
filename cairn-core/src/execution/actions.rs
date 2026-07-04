@@ -245,10 +245,10 @@ async fn execute_builtin_action(
 }
 
 /// Handle a first-class PR node: open the PR with the same mechanics the legacy
-/// `create_pr` action used, link the `merge_requests` row to the PR action_run's
-/// own id, and fire the fixed `open` port. The action_run is left `Running`; the
-/// shared `complete_action_run` flips it to `Blocked` (holding the DAG open while
-/// the PR awaits merge/close). See CAIRN-1220.
+/// `create_pr` action used, link the `merge_requests` row to the producing
+/// builder job, and fire the fixed `open` port. The action_run is left `Running`;
+/// the shared `complete_action_run` flips it to `Blocked` (holding the DAG open
+/// while the PR awaits merge/close). See CAIRN-1220.
 pub async fn handle_pr_node(
     orch: &Orchestrator,
     action_run: &ActionRun,
@@ -266,6 +266,10 @@ pub async fn handle_pr_node(
     let has_remote = vcs.has_remote();
 
     commit_triage_ledger_if_needed(orch, action_run, &worktree_path, &repo_path).await?;
+    let producing_job_id = action_run
+        .parent_job_id
+        .as_deref()
+        .ok_or("PR action run has no parent_job_id for merge_request ownership")?;
 
     // Seed the merge_requests row with the create-pr title/body before the slow
     // push + GitHub open below. The PR facet appears as soon as this action run
@@ -277,7 +281,7 @@ pub async fn handle_pr_node(
     // the backend refresh fills in live mergeability/checks.
     upsert_merge_request_for_pr(
         &db,
-        &action_run.id,
+        producing_job_id,
         &action_run.project_id,
         action_run.issue_id.as_deref(),
         &title,
@@ -317,7 +321,7 @@ pub async fn handle_pr_node(
     let now = chrono::Utc::now().timestamp() as i32;
     upsert_merge_request_for_pr(
         &db,
-        &action_run.id,
+        producing_job_id,
         &action_run.project_id,
         action_run.issue_id.as_deref(),
         &title,
@@ -341,7 +345,7 @@ pub async fn handle_pr_node(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
-    let _ = crate::pr_data::actions::refresh_pr_for_job(orch, &action_run.id).await;
+    let _ = crate::pr_data::actions::refresh_pr_for_job(orch, producing_job_id).await;
 
     Ok(github
         .map(|(url, _)| url)
@@ -1653,7 +1657,7 @@ async fn latest_complete_implementation_job(
 #[allow(clippy::too_many_arguments)]
 async fn upsert_merge_request_for_pr(
     db: &LocalDb,
-    parent_job_id: &str,
+    producing_job_id: &str,
     project_id: &str,
     issue_id: Option<&str>,
     title: &str,
@@ -1664,7 +1668,7 @@ async fn upsert_merge_request_for_pr(
     is_local: bool,
     now: i32,
 ) -> Result<(), String> {
-    let parent_job_id = parent_job_id.to_string();
+    let producing_job_id = producing_job_id.to_string();
     let project_id = project_id.to_string();
     let issue_id = issue_id.map(ToOwned::to_owned);
     let title = title.to_string();
@@ -1674,7 +1678,7 @@ async fn upsert_merge_request_for_pr(
     let github = github.map(|(url, number)| (url.to_string(), number));
 
     db.write(|conn| {
-        let parent_job_id = parent_job_id.clone();
+        let producing_job_id = producing_job_id.clone();
         let project_id = project_id.clone();
         let issue_id = issue_id.clone();
         let title = title.clone();
@@ -1683,17 +1687,31 @@ async fn upsert_merge_request_for_pr(
         let base_branch = base_branch.clone();
         let github = github.clone();
         Box::pin(async move {
+            validate_merge_request_job(conn, &producing_job_id, &project_id, &source_branch)
+                .await?;
             let mut existing = conn
                 .query(
-                    "SELECT id, target_branch FROM merge_requests WHERE job_id = ?1 LIMIT 1",
-                    (parent_job_id.as_str(),),
+                    "SELECT id, target_branch
+                     FROM merge_requests
+                     WHERE job_id = ?1
+                        OR job_id IN (
+                            SELECT ar.id
+                            FROM action_runs ar
+                            WHERE ar.parent_job_id = ?1
+                        )
+                     ORDER BY CASE WHEN job_id = ?1 THEN 0 ELSE 1 END, updated_at DESC
+                     LIMIT 1",
+                    params![producing_job_id.as_str()],
                 )
                 .await?;
             if let Some(row) = existing.next().await? {
                 let existing_id = row.text(0)?;
                 let existing_target = row.text(1).unwrap_or_else(|_| "main".to_string());
                 let target_branch = base_branch.as_deref().unwrap_or(&existing_target);
-                log::info!("Updating existing merge_request for job {}", parent_job_id);
+                log::info!(
+                    "Updating existing merge_request for job {}",
+                    producing_job_id
+                );
                 let (github_pr_url, github_pr_number, github_state): (
                     Option<String>,
                     Option<i32>,
@@ -1706,18 +1724,20 @@ async fn upsert_merge_request_for_pr(
                     .unwrap_or((None, None, None));
                 conn.execute(
                     "UPDATE merge_requests
-                     SET title = ?1,
-                         body = ?2,
-                         source_branch = ?3,
-                         target_branch = ?4,
+                     SET job_id = ?1,
+                         title = ?2,
+                         body = ?3,
+                         source_branch = ?4,
+                         target_branch = ?5,
                          status = 'open',
-                         github_pr_number = ?5,
-                         github_pr_url = ?6,
-                         github_state = ?7,
-                         is_local = ?8,
-                         updated_at = ?9
-                     WHERE id = ?10",
+                         github_pr_number = ?6,
+                         github_pr_url = ?7,
+                         github_state = ?8,
+                         is_local = ?9,
+                         updated_at = ?10
+                     WHERE id = ?11",
                     params![
+                        producing_job_id.as_str(),
                         title.as_str(),
                         body.as_deref(),
                         source_branch.as_str(),
@@ -1734,7 +1754,7 @@ async fn upsert_merge_request_for_pr(
                 return Ok(());
             }
 
-            log::info!("Creating new merge_request for job {}", parent_job_id);
+            log::info!("Creating new merge_request for job {}", producing_job_id);
             let mut default_branch_rows = conn
                 .query(
                     "SELECT default_branch FROM projects WHERE id = ?1",
@@ -1767,7 +1787,7 @@ async fn upsert_merge_request_for_pr(
                          'squash', ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     mr_id.as_str(),
-                    parent_job_id.as_str(),
+                    producing_job_id.as_str(),
                     project_id.as_str(),
                     issue_id.as_deref(),
                     title.as_str(),
@@ -1788,6 +1808,33 @@ async fn upsert_merge_request_for_pr(
     })
     .await
     .map_err(|e| format!("Failed to upsert merge_request: {}", e))
+}
+
+async fn validate_merge_request_job(
+    conn: &turso::Connection,
+    job_id: &str,
+    project_id: &str,
+    source_branch: &str,
+) -> Result<(), DbError> {
+    let mut rows = conn
+        .query(
+            "SELECT branch FROM jobs WHERE id = ?1 AND project_id = ?2 LIMIT 1",
+            params![job_id, project_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Err(DbError::internal(format!(
+            "merge_request job_id {job_id} does not reference a persisted job"
+        )));
+    };
+    let branch = row.opt_text(0)?;
+    if branch.as_deref() != Some(source_branch) {
+        return Err(DbError::internal(format!(
+            "merge_request job_id {job_id} has branch {:?}, expected source_branch {source_branch}",
+            branch
+        )));
+    }
+    Ok(())
 }
 
 /// Record the PR head commit SHA on the open merge_request for `job_id`
@@ -2001,6 +2048,135 @@ mod tests {
             plan.data.get("content").and_then(|v| v.as_str()),
             Some("living doc")
         );
+    }
+
+    #[tokio::test]
+    async fn upsert_merge_request_stores_persisted_job_id() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-mr','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-mr','p-mr',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-mr','recipe','i-mr','p-mr','running',1,1,'{}')", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-mr','e-mr','builder','i-mr','p-mr','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+
+        upsert_merge_request_for_pr(
+            &db,
+            "job-mr",
+            "p-mr",
+            Some("i-mr"),
+            "Title",
+            Some("Body"),
+            "agent/P-1-builder",
+            Some("main"),
+            None,
+            true,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .query_text(
+                "SELECT mr.job_id FROM merge_requests mr JOIN jobs j ON j.id = mr.job_id WHERE mr.id = mr.id LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap()
+            .expect("merge_request joins to jobs");
+        assert_eq!(stored, "job-mr");
+    }
+
+    #[tokio::test]
+    async fn upsert_merge_request_rejects_dangling_job_id() {
+        let db = test_db().await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-missing','default','P','P','/tmp/p','main',1,1);",
+        )
+        .await
+        .unwrap();
+
+        let err = upsert_merge_request_for_pr(
+            &db,
+            "not-a-job",
+            "p-missing",
+            None,
+            "Title",
+            None,
+            "agent/P-1-builder",
+            Some("main"),
+            None,
+            true,
+            10,
+        )
+        .await
+        .expect_err("dangling merge_request job_id must fail closed");
+        assert!(
+            err.contains("does not reference a persisted job"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_merge_request_relinks_existing_dangling_open_row() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-relink','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-relink','p-relink',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-relink','recipe','i-relink','p-relink','running',1,1,'{}')", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-relink','e-relink','builder','i-relink','p-relink','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, parent_job_id, created_at) VALUES ('pr-action-run','e-relink','pr','builtin:pr','i-relink','p-relink','blocked','job-relink',1)", ()).await?;
+                conn.execute("INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at) VALUES ('mr-relink','pr-action-run','p-relink','i-relink','Old','agent/P-1-builder','main','open',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+
+        upsert_merge_request_for_pr(
+            &db,
+            "job-relink",
+            "p-relink",
+            Some("i-relink"),
+            "New",
+            None,
+            "agent/P-1-builder",
+            Some("main"),
+            None,
+            true,
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.query_text(
+                "SELECT job_id FROM merge_requests WHERE id = 'mr-relink'",
+                ()
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            "job-relink"
+        );
+        assert_eq!(
+            db.query_text(
+                "SELECT title FROM merge_requests WHERE id = 'mr-relink'",
+                ()
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            "New"
+        );
+        let count = db
+            .query_opt("SELECT COUNT(*) FROM merge_requests", (), |row| row.i64(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

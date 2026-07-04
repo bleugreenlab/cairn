@@ -1250,11 +1250,11 @@ pub(crate) async fn dispatch_resource_change(
                         ),
                     ));
                 };
-                // Drive merge/close/refresh through the PR's TRUE owner id
-                // (merge_requests.job_id). For a first-class `pr` node that is
-                // the producing action_run, not this node's job — passing the
-                // wrong id misses the owner-keyed action_run and reports "no PR"
-                // (CAIRN-2287). Shadowing keeps the match arms below unchanged.
+                // Drive merge/close/refresh through the PR's durable producing
+                // job id (`merge_requests.job_id`). For first-class `pr` nodes,
+                // action-run completion and port firing resolve back through
+                // action_runs.parent_job_id. Shadowing keeps the match arms below
+                // unchanged.
                 let owner_id = mr_context.job_id;
                 match action {
                     "merge" => {
@@ -1957,12 +1957,11 @@ pub(crate) async fn dispatch_resource_change(
                         ),
                     ));
                 };
-                // Merge/close/refresh through the PR's TRUE owner id
-                // (merge_requests.job_id). A build recipe owns the child PR on a
-                // `pr` action_run, so the create-pr artifact's builder job id is
-                // NOT the owner; resolving it here (via the snapshot-walk
-                // fallback) and using mr_context.job_id keeps the owner-keyed
-                // resolution correct (CAIRN-2287). Shadow to keep the arms below.
+                // Merge/close/refresh through the PR's durable producing job id
+                // (`merge_requests.job_id`). A build recipe opens the child PR via
+                // a `pr` action_run, but the persisted owner is the builder job;
+                // PR action-run completion resolves through parent_job_id. Shadow
+                // to keep the arms below.
                 let job_id = mr_context.job_id;
                 match action {
                     "merge" => {

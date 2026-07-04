@@ -41,14 +41,11 @@ pub async fn fire_pr_node_port(
     .map_err(|error| format!("Failed to fire PR node port: {error}"))
 }
 
-/// Fire a `pr` node port for the PR's owner id — the `merge_requests.job_id`
-/// value, which is either the producing action_run (a first-class `pr` node, the
-/// CAIRN-1220 path) or a producing job (the legacy `create_pr` path). Resolves
-/// the owner's execution + recipe node from whichever table it lives in.
-///
-/// No-op when the owner has no DAG execution + recipe node: firing a port on a
-/// non-`pr` producing node (legacy `create_pr`) is harmless, and a detached /
-/// manually-attached PR (owner job with no execution) simply has no port to fire.
+/// Fire a `pr` node port for the PR's producing job id (`merge_requests.job_id`).
+/// A first-class `pr` node is represented by an `action_runs` row whose
+/// `parent_job_id` is that producing job; legacy `create_pr` rows have no PR node
+/// port and no-op here. The action-run-id lookup remains as a compatibility
+/// fallback for unrepaired historical rows.
 pub async fn fire_pr_node_port_for_owner(
     db: &LocalDb,
     owner_id: &str,
@@ -62,9 +59,17 @@ pub async fn fire_pr_node_port_for_owner(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT execution_id, recipe_node_id FROM jobs WHERE id = ?1
-                     UNION ALL
-                     SELECT execution_id, recipe_node_id FROM action_runs WHERE id = ?1
+                    "SELECT execution_id, recipe_node_id
+                     FROM (
+                         SELECT execution_id, recipe_node_id, 0 AS priority
+                         FROM action_runs
+                         WHERE parent_job_id = ?1
+                         UNION ALL
+                         SELECT execution_id, recipe_node_id, 1 AS priority
+                         FROM action_runs
+                         WHERE id = ?1
+                     )
+                     ORDER BY priority
                      LIMIT 1",
                     params![owner_id.as_str()],
                 )

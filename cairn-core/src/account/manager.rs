@@ -15,7 +15,11 @@ use crate::storage::{DbError, RowExt};
 use super::connection::{AccountConnection, DbAccount, OrgMembership};
 
 const CHECK_INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
-const REFRESH_THRESHOLD_SECS: i64 = 15 * 60; // 15 minutes before expiry
+                                          // Must exceed CHECK_INTERVAL_SECS: with a 1-hour token, the T+30 tick then sees
+                                          // ~30 min of validity left (below this threshold) and refreshes while the token
+                                          // is still good, instead of the T+60 tick refreshing an already-expired token
+                                          // and leaning on the API's short post-expiry grace window.
+const REFRESH_THRESHOLD_SECS: i64 = 45 * 60; // 45 minutes before expiry
 
 /// Manages the desktop's connection to cairn.computer.
 pub struct AccountManager {
@@ -272,6 +276,11 @@ async fn refresh_loop(
     api_config: crate::api::ApiConfig,
 ) {
     let mut consecutive_failures: u32 = 0;
+    // Tracked separately from generic failures: a 401 is auth-definitive (the
+    // stored token will never be accepted again), so it drives a hard clear of
+    // local account state rather than the soft log-and-retry that transient
+    // network/parse failures get.
+    let mut consecutive_401s: u32 = 0;
     let client = reqwest::Client::new();
     const MAX_FAILURES: u32 = 3;
 
@@ -333,6 +342,7 @@ async fn refresh_loop(
                 time_until_expiry / 60
             );
             consecutive_failures = 0;
+            consecutive_401s = 0;
             continue;
         }
 
@@ -366,6 +376,7 @@ async fn refresh_loop(
                                     } else {
                                         log::info!("Account JWT refreshed successfully");
                                         consecutive_failures = 0;
+                                        consecutive_401s = 0;
                                     }
                                 }
                                 Err(e) => {
@@ -376,12 +387,46 @@ async fn refresh_loop(
                                     consecutive_failures += 1;
                                 }
                             }
+                        } else {
+                            // A 200 with no token/expires_at is a malformed
+                            // success: we can't advance the stored token, so count
+                            // it as a failure rather than silently no-op'ing and
+                            // letting the token drift to expiry unnoticed.
+                            log::warn!("Account refresh: 200 response missing token/expires_at");
+                            consecutive_failures += 1;
                         }
                     }
                     Err(e) => {
                         log::warn!("Account refresh: failed to parse response: {}", e);
                         consecutive_failures += 1;
                     }
+                }
+            }
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                let body = resp.text().await.unwrap_or_default();
+                log::warn!("Account JWT refresh rejected (401): {}", body);
+                consecutive_401s += 1;
+                if consecutive_401s >= MAX_FAILURES {
+                    // Auth-definitive dead token: it will never be accepted
+                    // again, so stop the zombie 401-loop by clearing local
+                    // account state (mirrors the local clear in `disconnect`; the
+                    // server-side device deactivation is skipped — it can't
+                    // succeed with a dead token). DB and UI now agree the user is
+                    // signed out, and the refresh task ends until a reconnect
+                    // starts a fresh one.
+                    log::error!(
+                        "Account refresh: {} consecutive 401s, clearing account and disconnecting",
+                        consecutive_401s
+                    );
+                    if let Err(e) = delete_account(&db).await {
+                        log::error!("Account refresh: failed to clear account row: {}", e);
+                    }
+                    let _ = emitter.emit(
+                        "db-change",
+                        serde_json::json!({"table": "account", "action": "delete"}),
+                    );
+                    let _ = emitter.emit("account-disconnected", serde_json::json!({}));
+                    return;
                 }
             }
             Ok(resp) => {
@@ -742,6 +787,17 @@ mod tests {
             .encode(serde_json::to_vec(payload).unwrap());
         let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("fake-sig");
         format!("{}.{}.{}", header, payload_b64, signature)
+    }
+
+    #[test]
+    fn refresh_threshold_exceeds_check_interval() {
+        // Invariant: the near-expiry threshold must sit ABOVE the tick interval so
+        // a 1-hour token is refreshed on the T+30 tick while still valid, rather
+        // than on the T+60 tick after it has already expired (relying on the API's
+        // short post-expiry grace window). If the threshold ever drops below the
+        // interval, every refresh lands post-expiry and a sleep/wake across the
+        // boundary can strand the token.
+        assert!(REFRESH_THRESHOLD_SECS > CHECK_INTERVAL_SECS as i64);
     }
 
     #[test]

@@ -95,14 +95,15 @@ pub async fn get_summaries_for_action_runs(
 
     let mut summaries = Vec::new();
     for action_run_id in action_run_ids {
-        // A first-class `pr` node links its `merge_requests` row to the
-        // action_run's own id (CAIRN-1220); the legacy `create_pr` action
-        // links it to the producing builder job (`parent_job_id`). Resolve
-        // the owner that actually owns the MR: own id first, then parent.
-        let mut owner_ids = vec![action_run_id.clone()];
+        // A first-class `pr` node now links its `merge_requests` row to the
+        // producing builder job (`parent_job_id`) so the durable key is a real
+        // `jobs.id`. Keep the action_run id as a fallback for legacy rows that
+        // could not be repaired.
+        let mut owner_ids = Vec::new();
         if let Some(parent_job_id) = parent_job_id_for_action_run(db, action_run_id).await? {
             owner_ids.push(parent_job_id);
         }
+        owner_ids.push(action_run_id.clone());
 
         for owner_id in owner_ids {
             if let Some(summary) = pr_summary_for_job(db, &owner_id, action_run_id).await? {
@@ -118,15 +119,13 @@ pub async fn get_by_action_run_id(
     db: &LocalDb,
     action_run_id: &str,
 ) -> Result<Option<PrCache>, String> {
-    if let Some(pr) = pr_cache_for_job(db, action_run_id).await? {
-        return Ok(Some(pr));
+    if let Some(job_id) = parent_job_id_for_action_run(db, action_run_id).await? {
+        if let Some(pr) = pr_cache_for_job(db, &job_id).await? {
+            return Ok(Some(pr));
+        }
     }
 
-    let Some(job_id) = parent_job_id_for_action_run(db, action_run_id).await? else {
-        return Ok(None);
-    };
-
-    pr_cache_for_job(db, &job_id).await
+    pr_cache_for_job(db, action_run_id).await
 }
 
 async fn pr_cache_for_job(db: &LocalDb, job_id: &str) -> Result<Option<PrCache>, String> {

@@ -6,7 +6,6 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::PathBuf;
 
 use crate::mcp::handlers::issues::{create_issue_in_project, CreateExecutionSpec};
 use crate::memories::canon::{resolve_role_canon_home, RoleCanonHome};
@@ -78,56 +77,6 @@ async fn scope_target(
     })
 }
 
-fn read_optional(path: PathBuf) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-fn skill_list_markdown(orch: &Orchestrator, target: &ScopeTarget) -> String {
-    let skills = match target.scope.as_str() {
-        "project" => orch.list_skills_for_context(&target.project_id),
-        _ => orch.list_skill_configs(Some("default"), None),
-    };
-    match skills {
-        Ok(skills) if !skills.is_empty() => skills
-            .into_iter()
-            .map(|skill| format!("- `{}` — {}", skill.name, skill.description))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Ok(_) => "_No workspace/repo skills found._".to_string(),
-        Err(error) => format!("_Unable to load skills: {error}_"),
-    }
-}
-
-fn current_canon_markdown(orch: &Orchestrator, target: &ScopeTarget) -> String {
-    match target.scope.as_str() {
-        "role" => match orch.get_agent_config(
-            &target.scope_value,
-            (target.project_id != "workspace").then_some(target.project_id.as_str()),
-        ) {
-            Ok(Some(agent)) => format!(
-                "Role prompt for `{}`:\n\n```markdown\n{}\n```",
-                target.scope_value, agent.prompt
-            ),
-            Ok(None) => format!("_No live role prompt found for `{}`._", target.scope_value),
-            Err(error) => format!(
-                "_Unable to load role prompt `{}`: {error}_",
-                target.scope_value
-            ),
-        },
-        "project" => match orch.project_path(&target.project_id) {
-            Ok(path) => read_optional(path.join("AGENTS.md"))
-                .map(|content| format!("Project `AGENTS.md`:\n\n```markdown\n{}\n```", content))
-                .unwrap_or_else(|| "_No project AGENTS.md found._".to_string()),
-            Err(error) => format!("_Unable to resolve project path: {error}_"),
-        },
-        _ => read_optional(orch.config_dir.join("AGENTS.md"))
-            .map(|content| format!("Workspace `AGENTS.md`:\n\n```markdown\n{}\n```", content))
-            .unwrap_or_else(|| "_No workspace AGENTS.md found._".to_string()),
-    }
-}
-
 fn format_neighbor(neighbor: &crate::memories::db::MemoryTriageNeighbor) -> String {
     let reason = neighbor
         .memory
@@ -155,19 +104,43 @@ fn markdown_link_text(content: &str) -> String {
         .replace(']', "\\]")
 }
 
+fn role_prompt_under_triage(orch: &Orchestrator, target: &ScopeTarget) -> Option<String> {
+    if target.scope != "role" {
+        return None;
+    }
+
+    let project_id = (target.project_id != "workspace").then_some(target.project_id.as_str());
+    Some(
+        match orch.get_agent_config(&target.scope_value, project_id) {
+            Ok(Some(agent)) => format!(
+                "## Role prompt under triage\n\nRole `{}`:\n\n```markdown\n{}\n```\n\n",
+                target.scope_value, agent.prompt
+            ),
+            Ok(None) => format!(
+                "## Role prompt under triage\n\n_No live role prompt found for `{}`._\n\n",
+                target.scope_value
+            ),
+            Err(error) => format!(
+                "## Role prompt under triage\n\n_Unable to load role prompt `{}`: {error}_\n\n",
+                target.scope_value
+            ),
+        },
+    )
+}
+
 async fn seed_description(
     orch: &Orchestrator,
     target: &ScopeTarget,
     memories: &[Memory],
 ) -> String {
     let mut out = format!(
-        "# Memory triage\n\nScope: `{}={}`\nTarget project: `{}`\n\n## Current canon context\n\n{}\n\n## Workspace/repo skills\n\n{}\n\n## Seeded memories\n\n",
-        target.scope,
-        target.scope_value,
-        target.project_id,
-        current_canon_markdown(orch, target),
-        skill_list_markdown(orch, target),
+        "# Memory triage\n\nScope: `{}={}`\nTarget project: `{}`\n\n",
+        target.scope, target.scope_value, target.project_id,
     );
+    if let Some(role_prompt) = role_prompt_under_triage(orch, target) {
+        out.push_str(&role_prompt);
+    }
+    out.push_str("## Seeded memories\n\n");
     let batch_ids: Vec<String> = memories.iter().map(|memory| memory.id.clone()).collect();
     for memory in memories {
         let uri = crate::memories::db::build_node_memory_uri_for_memory(&orch.db.local, memory)
@@ -343,17 +316,28 @@ pub async fn reconcile_pending_triage(orch: &Orchestrator) -> Result<Vec<String>
 
 /// State-driven reconciliation sweep guaranteeing every qualifying memory pool
 /// has a triage issue. Idempotent and safe to run repeatedly. Runs in order:
-/// confirm drafts stranded on terminal jobs (recovers stuck `draft`); re-home
-/// claimed memories whose triage issue was never created (recovers stuck
-/// `claimed`); recover batches stranded on a *failed* triage execution back to
-/// `pending`; finalize batches whose triage issue already merged but never had
-/// its decisions applied (catch-up and safety net for the canon merge gate);
-/// then spawn a triage issue for every at-threshold pending pool (recovers stuck
-/// `pending`). Entry point for the startup + periodic loop.
+/// confirm drafts stranded on terminal jobs once their owning issue has merged
+/// (recovers stuck `draft`); discard drafts whose owning issue closed without
+/// merging; re-home claimed memories whose triage issue was never created
+/// (recovers stuck `claimed`); recover batches stranded on a *failed* triage
+/// execution back to `pending`; finalize batches whose triage issue already
+/// merged but never had its decisions applied (catch-up and safety net for the
+/// canon merge gate); then spawn a triage issue for every at-threshold pending
+/// pool (recovers stuck `pending`). Entry point for the startup + periodic loop.
 pub async fn reconcile_memory_triage(orch: Orchestrator) -> Result<(), String> {
     let confirmed = crate::memories::commands::confirm_orphaned_drafts(&orch)?;
     if confirmed > 0 {
         log::info!("memory triage reconcile: confirmed {confirmed} orphaned draft memories");
+    }
+
+    let discarded = crate::memories::db::discard_draft_memories_for_closed_issues(&orch.db.local)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !discarded.is_empty() {
+        log::info!(
+            "memory triage reconcile: discarded {} draft memories for closed issues",
+            discarded.len()
+        );
     }
 
     let reverted = crate::memories::db::revert_orphaned_claimed_memories(&orch.db.local)
@@ -410,8 +394,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        current_canon_markdown, distinct_scopes_from_memories, format_neighbor,
-        role_home_project_id, ScopeTarget,
+        distinct_scopes_from_memories, format_neighbor, role_home_project_id, ScopeTarget,
     };
     use crate::db::DbState;
     use crate::memories::db::MemoryTriageNeighbor;
@@ -505,7 +488,11 @@ mod tests {
         }
     }
 
-    fn agent_markdown(name: &str, prompt: &str) -> String {
+    fn agent_markdown(name: &str) -> String {
+        agent_markdown_with_prompt(name, "")
+    }
+
+    fn agent_markdown_with_prompt(name: &str, prompt: &str) -> String {
         format!("---\nname: {name}\ndescription: test agent\ntools:\n  - Read\n---\n\n{prompt}")
     }
 
@@ -517,13 +504,34 @@ mod tests {
         scope_value: &str,
         created_at: i64,
     ) {
+        insert_scoped_memory_with_status(
+            test,
+            id,
+            project_id,
+            scope,
+            scope_value,
+            "pending",
+            created_at,
+        )
+        .await;
+    }
+
+    async fn insert_scoped_memory_with_status(
+        test: &TestOrch,
+        id: &str,
+        project_id: &str,
+        scope: &str,
+        scope_value: &str,
+        status: &str,
+        created_at: i64,
+    ) {
         test.orch
             .db
             .local
             .execute(
                 "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
-                 VALUES (?1, ?1, ?2, ?1, 'pending', ?3, ?4, 'job-main', ?5, 'cairn://p/CAIRN/42/1/builder/chat/turn/2', ?5, ?5)",
-                params![id, project_id, scope, scope_value, created_at],
+                 VALUES (?1, ?1, ?2, ?1, ?3, ?4, ?5, 'job-main', ?6, 'cairn://p/CAIRN/42/1/builder/chat/turn/2', ?6, ?6)",
+                params![id, project_id, status, scope, scope_value, created_at],
             )
             .await
             .unwrap();
@@ -613,6 +621,46 @@ mod tests {
                 ("role".to_string(), "builder".to_string()),
                 ("project".to_string(), "project-1".to_string()),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_issue_draft_confirmation_spawns_triage_issue_for_full_pool() {
+        let test = test_orch().await;
+        for idx in 0..5 {
+            insert_scoped_memory_with_status(
+                &test,
+                &format!("merged-draft-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                "draft",
+                idx + 1,
+            )
+            .await;
+        }
+        test.orch
+            .db
+            .local
+            .execute(
+                "UPDATE issues SET merged_at = 10 WHERE id = 'issue-main'",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let spawned = crate::memories::commands::confirm_and_spawn_drafts_for_merged_issue(
+            test.orch.clone(),
+            "issue-main",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(issue_count(&test, "project-1").await, 2);
+        assert_eq!(
+            memory_status_count(&test, "claimed", "project", "project-1").await,
+            5
         );
     }
 
@@ -808,49 +856,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_defined_role_targets_project_and_loads_project_prompt() {
+    async fn project_defined_role_targets_project() {
         let test = test_orch().await;
         std::fs::write(
             test.project_dir.join(".cairn/agents/builder.md"),
-            agent_markdown("Project Builder", "Project role prompt."),
+            agent_markdown("Project Builder"),
         )
         .unwrap();
 
         let project_id = role_home_project_id(&test.orch, "builder").unwrap();
         assert_eq!(project_id, "project-1");
-
-        let target = ScopeTarget {
-            scope: "role".to_string(),
-            scope_value: "builder".to_string(),
-            project_id,
-            project_key: "PRJ".to_string(),
-            project_name: "Project".to_string(),
-        };
-        let markdown = current_canon_markdown(&test.orch, &target);
-        assert!(markdown.contains("Project role prompt."));
     }
 
     #[tokio::test]
-    async fn workspace_defined_role_targets_workspace_and_loads_workspace_prompt() {
+    async fn workspace_defined_role_targets_workspace() {
         let test = test_orch().await;
         std::fs::write(
             test.orch.config_dir.join("agents/builder.md"),
-            agent_markdown("Workspace Builder", "Workspace role prompt."),
+            agent_markdown("Workspace Builder"),
         )
         .unwrap();
 
         let project_id = role_home_project_id(&test.orch, "builder").unwrap();
         assert_eq!(project_id, "workspace");
-
-        let target = ScopeTarget {
-            scope: "role".to_string(),
-            scope_value: "builder".to_string(),
-            project_id,
-            project_key: "WKS".to_string(),
-            project_name: "Workspace".to_string(),
-        };
-        let markdown = current_canon_markdown(&test.orch, &target);
-        assert!(markdown.contains("Workspace role prompt."));
     }
 
     #[test]
@@ -875,6 +903,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seed_description_includes_triaged_role_prompt_for_role_scope() {
+        let test = test_orch().await;
+        std::fs::write(
+            test.project_dir.join(".cairn/agents/builder.md"),
+            agent_markdown_with_prompt("Builder", "Builder-specific canon."),
+        )
+        .unwrap();
+        let memory = memory("role-memory", "project-1", "role memory");
+        let target = ScopeTarget {
+            scope: "role".to_string(),
+            scope_value: "builder".to_string(),
+            project_id: "project-1".to_string(),
+            project_key: "PRJ".to_string(),
+            project_name: "Project".to_string(),
+        };
+
+        let description = super::seed_description(&test.orch, &target, &[memory]).await;
+
+        assert!(description.contains("## Role prompt under triage"));
+        assert!(description.contains("Role `builder`:"));
+        assert!(description.contains("Builder-specific canon."));
+        assert!(description.contains("## Seeded memories"));
+    }
+
+    #[tokio::test]
     async fn seed_description_uses_memory_uris_without_uuid_or_provenance_cruft() {
         let test = test_orch().await;
         let uuid = "cbd10c2e-765b-4235-9b65-ccaf62f4572d";
@@ -891,6 +944,13 @@ mod tests {
         let memory = crate::memories::db::load_memory(&test.orch.db.local, uuid)
             .await
             .unwrap();
+        std::fs::write(test.project_dir.join("AGENTS.md"), "Project instructions.").unwrap();
+        std::fs::create_dir_all(test.project_dir.join(".cairn/skills/example")).unwrap();
+        std::fs::write(
+            test.project_dir.join(".cairn/skills/example/SKILL.md"),
+            "---\nname: example\ndescription: Example skill.\n---\n\n# Example\n",
+        )
+        .unwrap();
         let target = ScopeTarget {
             scope: "project".to_string(),
             scope_value: "project-1".to_string(),
@@ -914,6 +974,12 @@ mod tests {
             !description.contains("The Integrator should judge each seeded memory independently")
         );
         assert!(!description.contains("Threshold note:"));
+        assert!(!description.contains("Current canon context"));
+        assert!(!description.contains("Role prompt under triage"));
+        assert!(!description.contains("Workspace/repo skills"));
+        assert!(!description.contains("AGENTS.md"));
+        assert!(!description.contains("Project instructions."));
+        assert!(!description.contains("Example skill."));
     }
 
     // Test seed helper mirrors the memories table's full column set; the long
@@ -1234,6 +1300,15 @@ mod tests {
         }
         // job-sent's review turn is still running: its drafts must stay draft.
         insert_memory_review_turn(&test, "job-sent", "running").await;
+        test.orch
+            .db
+            .local
+            .execute(
+                "UPDATE issues SET merged_at = 10 WHERE id = 'issue-main'",
+                (),
+            )
+            .await
+            .unwrap();
 
         super::reconcile_memory_triage(test.orch.clone())
             .await

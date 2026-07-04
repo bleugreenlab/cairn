@@ -103,6 +103,19 @@ macro_rules! shared_tail_check_result_job_id {
     };
 }
 
+/// CAIRN-2386: relink first-class PR-node merge request rows from action-run or
+/// otherwise dangling ids back to the producing builder job, when that job is an
+/// unambiguous match for the PR source branch.
+macro_rules! shared_tail_relink_merge_request_jobs {
+    () => {
+        Migration::new(
+            "0095",
+            "relink_merge_request_jobs",
+            include_str!("../../../../turso_migrations/0095_relink_merge_request_jobs.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -113,6 +126,7 @@ macro_rules! team_lineage {
             shared_tail_check_result_input_hash!(),
             shared_tail_tool_invocation_durations!(),
             shared_tail_check_result_job_id!(),
+            shared_tail_relink_merge_request_jobs!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -179,6 +193,17 @@ macro_rules! private_lineage {
             ),
             shared_tail_tool_invocation_durations!(),
             shared_tail_check_result_job_id!(),
+            // CAIRN-2385: one-time repair marker for historical
+            // tool_invocations.result_ts rows. Private-only because the marker
+            // table is runner-transient state, not team-replicated data.
+            Migration::new(
+                "0094",
+                "tool_invocation_result_backfill_state",
+                include_str!(
+                    "../../../../turso_migrations/0094_tool_invocation_result_backfill_state.sql"
+                ),
+            ),
+            shared_tail_relink_merge_request_jobs!(),
         ]
     };
 }
@@ -1264,7 +1289,9 @@ mod tests {
                 "0090_check_result_cache_input_hash".to_string(),
                 "0091_drop_projects_server_id_and_servers".to_string(),
                 "0092_tool_invocation_durations".to_string(),
-                "0093_check_result_cache_job_id".to_string()
+                "0093_check_result_cache_job_id".to_string(),
+                "0094_tool_invocation_result_backfill_state".to_string(),
+                "0095_relink_merge_request_jobs".to_string(),
             ]
         );
         Ok(db)
@@ -1352,10 +1379,74 @@ mod tests {
         .await
     }
 
-    /// CAIRN-2277: the FK-off rebuild that drops `projects.server_id` and the
-    /// local `servers` table must preserve every existing project and its FK
-    /// children (an orphaned child would mean the rebuild broke referential
-    /// carry-over). Seeds the pre-drop schema, then runs the full lineage.
+    #[tokio::test]
+    async fn migration_0095_relinks_action_run_owned_merge_request_jobs() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("mr-relink.turso.db"))
+            .await
+            .unwrap();
+        let before_0095: Vec<_> = TURSO_MIGRATIONS
+            .iter()
+            .filter(|m| m.version != "0095")
+            .copied()
+            .collect();
+        MigrationRunner::new(before_0095).run(&db).await.unwrap();
+
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-mr', 'default', 'Project', 'PMR', '/tmp/pmr', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-mr', 'proj-mr', 1, 'Issue', 'active', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-mr', 'recipe', 'issue-mr', 'proj-mr', 'running', 1, 1);
+
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, branch, status, created_at, updated_at)
+             VALUES ('job-good', 'exec-mr', 'issue-mr', 'proj-mr', 'agent/PMR-1-builder', 'complete', 100, 110);
+            INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, parent_job_id, created_at)
+             VALUES ('pr-action-run', 'exec-mr', 'pr', 'builtin:pr', 'issue-mr', 'proj-mr', 'blocked', 'job-good', 115);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES ('mr-good', 'pr-action-run', 'proj-mr', 'issue-mr', 'PR', 'agent/PMR-1-builder', 'main', 'open', 120, 120);
+
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, branch, status, created_at, updated_at)
+             VALUES ('job-other', 'exec-mr', 'issue-mr', 'proj-mr', 'agent/PMR-1-other', 'complete', 90, 90);
+            INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES ('mr-untouched', 'dangling-not-action-run', 'proj-mr', 'issue-mr', 'Unmatched PR', 'agent/PMR-1-other', 'main', 'open', 100, 100);
+            ",
+        )
+        .await
+        .unwrap();
+
+        let relink = TURSO_MIGRATIONS
+            .iter()
+            .filter(|m| m.version == "0095")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MigrationRunner::new(relink).run(&db).await.unwrap(),
+            vec!["0095_relink_merge_request_jobs".to_string()]
+        );
+
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT job_id FROM merge_requests WHERE id = 'mr-good'"
+            )
+            .await
+            .unwrap(),
+            "job-good"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT job_id FROM merge_requests WHERE id = 'mr-untouched'"
+            )
+            .await
+            .unwrap(),
+            "dangling-not-action-run"
+        );
+    }
+
     #[tokio::test]
     async fn drop_server_id_preserves_project_data() {
         let temp = tempdir().unwrap();
@@ -2512,7 +2603,8 @@ mod tests {
                 "0089_check_result_cache".to_string(),
                 "0090_check_result_cache_input_hash".to_string(),
                 "0092_tool_invocation_durations".to_string(),
-                "0093_check_result_cache_job_id".to_string()
+                "0093_check_result_cache_job_id".to_string(),
+                "0095_relink_merge_request_jobs".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

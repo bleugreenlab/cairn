@@ -884,11 +884,10 @@ fn create_review_push_on_turn_end(
 /// so a mergeability-only settle (unchanged diffstat) does not re-wake.
 ///
 /// `issue_id` and `source_branch` come from the merge_request the webhook just
-/// updated. The producing builder is resolved by `source_branch`, NOT by
-/// `merge_requests.job_id`: the PR is opened by a separate pr-action node, which
-/// is blocked while the PR is open and so always reads as non-quiescent — gating
-/// on it would never fire (the live CAIRN-1891 bug). Builder and pr-node share the
-/// branch, so the builder is the work-producing job on `source_branch`. Shares
+/// updated. The producing builder is resolved by `source_branch` so webhook
+/// handling works even for old rows whose `merge_requests.job_id` was not a jobs
+/// id. That builder is the work-producing job to quiescence-gate; the separate
+/// pr-action node is blocked while the PR is open. Shares
 /// [`create_review_push_rows`] and [`wake_review_recipients`] with the node-idle
 /// edge — one implementation of the fingerprint/dedup/push/wake logic, two
 /// trigger edges.
@@ -981,16 +980,12 @@ pub async fn create_review_push_for_pr_open(
     }
 }
 
-/// The work-producing builder job for a PR, resolved by the shared branch rather
-/// than `merge_requests.job_id` (CAIRN-1891). The PR is opened by a separate
-/// pr-action node (`merge_requests.job_id`), which is blocked-while-open with a
-/// pending turn and so never reads as quiescent; gating on it silently loses the
-/// wake. The builder and the pr-node share the branch, so among jobs on
-/// `source_branch` the builder is selected as the node that **produced the
-/// reviewable artifact** (a create-pr or plan). The pr-action node consumes that
-/// artifact and opens the PR but writes none itself, so this deterministically
-/// picks the builder even when the pr-node also carries the branch, a worktree,
-/// and a (blocked) turn. `None` when no job on the branch exists.
+/// The work-producing builder job for a PR, resolved by the shared branch
+/// (CAIRN-1891). The PR may be opened by a separate pr-action node, which is
+/// blocked-while-open with a pending turn and so never reads as quiescent; gating
+/// on it silently loses the wake. Among jobs on `source_branch`, select the node
+/// that **produced the reviewable artifact** (a create-pr or plan). `None` when no
+/// job on the branch exists.
 async fn find_producing_builder_job(
     db: &crate::storage::LocalDb,
     issue_id: &str,

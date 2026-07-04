@@ -19,11 +19,14 @@
 //! disallowed lists.
 
 pub mod claude;
+pub mod claude_usage;
 pub mod codex;
 pub mod context_window;
 pub mod openrouter;
 mod run_state;
 pub mod stdin;
+
+pub use claude_usage::collect_claude_usage_snapshot;
 
 use crate::agent_process::process::BackendStdin;
 use crate::models::{Fence, Model};

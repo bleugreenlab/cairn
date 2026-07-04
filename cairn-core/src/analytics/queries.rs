@@ -1279,7 +1279,25 @@ const TOOL_SCOPE_RANGE: &str = "(?1 IS NULL OR COALESCE(r.project_id, j.project_
 /// upserts them. A per-run watermark skips runs with no new events, so repeat
 /// passes only touch active runs.
 pub(crate) async fn backfill_tool_invocations(db: &LocalDb) -> DbResult<ToolBackfillSummary> {
-    let runs = runs_needing_backfill(db).await?;
+    backfill_tool_invocation_runs(db, runs_needing_backfill(db).await?).await
+}
+
+/// Reconcile legacy tool invocation rows that were indexed before the result
+/// timestamp linker existed or before startup was reopened to run it. This is a
+/// one-time startup repair behind `analytics_rollup_backfill_state`: it targets
+/// only runs already represented by NULL-result rows, then reuses the same
+/// run-level extractor as the normal backfill so parseability and error
+/// classification stay canonical.
+pub(crate) async fn reconcile_tool_invocation_results(
+    db: &LocalDb,
+) -> DbResult<ToolBackfillSummary> {
+    backfill_tool_invocation_runs(db, runs_needing_result_reconcile(db).await?).await
+}
+
+async fn backfill_tool_invocation_runs(
+    db: &LocalDb,
+    runs: Vec<String>,
+) -> DbResult<ToolBackfillSummary> {
     let mut runs_processed = 0i64;
     let mut rows_written = 0i64;
     for run_id in runs {
@@ -1310,6 +1328,17 @@ async fn runs_needing_backfill(db: &LocalDb) -> DbResult<Vec<String>> {
          WHERE e.event_type IN ('assistant', 'tool_result')
          GROUP BY e.run_id
          HAVING MAX(e.created_at) > COALESCE(MAX(w.processed_through), -1)",
+        (),
+        |row| row.text(0),
+    )
+    .await
+}
+
+async fn runs_needing_result_reconcile(db: &LocalDb) -> DbResult<Vec<String>> {
+    db.query_all(
+        "SELECT DISTINCT run_id
+         FROM tool_invocations
+         WHERE result_ts IS NULL AND tool_use_id IS NOT NULL",
         (),
         |row| row.text(0),
     )
@@ -2006,6 +2035,216 @@ pub(crate) async fn usage_heatmap(
             day_of_week: row.i64(0)?,
             hour: row.i64(1)?,
             tokens: row.i64(2)?,
+        })
+    })
+    .await
+}
+
+// --- Delivery economics: normalized per merged PR shipped ---
+//
+// All three delivery queries hang off the same rollup-first skeleton: fold each
+// job's `token_rollup` rows into one per-job row, join to its MERGED merge
+// request, and prefer GitHub-synced PR line counts with a `file_changes`
+// fallback. This mirrors `tokens_per_loc`'s per-PR shape, but aggregates by
+// dimension (model/role) or by time so the output is normalized per PR rather
+// than a raw per-PR list. The `mr.job_id = jobs.id` linkage is the REPAIRED
+// column (migration 0095); no `action_runs` indirection lives in production SQL.
+
+/// Per-job token/cost fold plus per-job line counts, shared by the merged-PR
+/// economics and cost-trend queries. Bound param `?1` scopes the project (NULL
+/// disables). `output` is an alias, not a keyword, matching `tokens_per_loc`.
+const MERGED_PR_CTES: &str = "job_tokens AS (
+        SELECT tr.job_id AS job_id,
+               MAX(tr.model) AS model,
+               MAX(tr.agent_config_id) AS agent_config_id,
+               MAX(tr.backend) AS backend,
+               SUM(tr.input_tokens) AS input,
+               SUM(tr.cache_read_tokens) AS cache_read,
+               SUM(tr.cache_create_tokens) AS cache_create,
+               SUM(tr.output_tokens) AS output,
+               SUM(tr.billable_tokens) AS billable,
+               SUM(tr.exact_cost) AS exact_cost,
+               SUM(tr.exact_cost_count) AS exact_cost_count
+        FROM token_rollup tr
+        WHERE tr.job_id IS NOT NULL AND tr.token_event_count > 0
+          AND (?1 IS NULL OR tr.project_id = ?1)
+        GROUP BY tr.job_id
+    ),
+    job_lines AS (
+        SELECT job_id, SUM(COALESCE(additions, 0) + COALESCE(deletions, 0)) AS lines
+        FROM file_changes GROUP BY job_id
+    )";
+
+/// Lines shipped for a merged PR: GitHub-synced `additions + deletions` when
+/// present, else the local `file_changes` rollup (`jl.lines`). Mirrors
+/// `tokens_per_loc` so both delivery metrics agree on PR size.
+const MERGED_PR_LINES_EXPR: &str = "CASE
+        WHEN (COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)) > 0
+            THEN COALESCE(mr.additions, 0) + COALESCE(mr.deletions, 0)
+        ELSE COALESCE(jl.lines, 0)
+    END";
+
+/// One (model, agent_config_id, backend) group's merged-PR delivery aggregate.
+#[derive(Debug, Clone)]
+pub(crate) struct MergedPrEconRow {
+    pub model: Option<String>,
+    pub agent_config_id: Option<String>,
+    pub backend: String,
+    pub pr_count: i64,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub output: i64,
+    pub billable: i64,
+    pub exact_cost: f64,
+    pub exact_cost_count: i64,
+    pub lines: i64,
+}
+
+/// Merged-PR delivery economics grouped by (model, agent, backend). The parent
+/// module re-aggregates into the by-model and by-role views and prices each
+/// group. Range filters `mr.merged_at` (a PR's whole billable total is
+/// attributed to it), so it counts PRs that MERGED in the window.
+pub(crate) async fn merged_pr_economics_rows(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<Vec<MergedPrEconRow>> {
+    let sql = format!(
+        "WITH {ctes}
+        SELECT jt.model, jt.agent_config_id, jt.backend,
+               COUNT(*) AS pr_count,
+               SUM(jt.input), SUM(jt.cache_read), SUM(jt.cache_create),
+               SUM(jt.output), SUM(jt.billable),
+               SUM(jt.exact_cost), SUM(jt.exact_cost_count),
+               SUM({lines})
+        FROM job_tokens jt
+        JOIN merge_requests mr ON mr.job_id = jt.job_id
+            AND mr.status = 'merged' AND mr.merged_at IS NOT NULL
+        LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
+        WHERE (?2 IS NULL OR mr.merged_at >= ?2)
+          AND (?3 IS NULL OR mr.merged_at < ?3)
+        GROUP BY jt.model, jt.agent_config_id, jt.backend",
+        ctes = MERGED_PR_CTES,
+        lines = MERGED_PR_LINES_EXPR,
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(MergedPrEconRow {
+            model: row.opt_text(0)?,
+            agent_config_id: row.opt_text(1)?,
+            backend: row.text(2)?,
+            pr_count: row.i64(3)?,
+            input: row.i64(4)?,
+            cache_read: row.i64(5)?,
+            cache_create: row.i64(6)?,
+            output: row.i64(7)?,
+            billable: row.i64(8)?,
+            exact_cost: row.opt_f64(9)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(10)?,
+            lines: row.opt_i64(11)?.unwrap_or(0),
+        })
+    })
+    .await
+}
+
+/// One (time bucket, model, backend) group's merged-PR delivery aggregate; the
+/// parent module prices each and sums per bucket.
+#[derive(Debug, Clone)]
+pub(crate) struct PrCostTrendRow {
+    pub bucket_start: i64,
+    pub model: Option<String>,
+    pub backend: String,
+    pub pr_count: i64,
+    pub input: i64,
+    pub cache_read: i64,
+    pub cache_create: i64,
+    pub output: i64,
+    pub billable: i64,
+    pub exact_cost: f64,
+    pub exact_cost_count: i64,
+    pub lines: i64,
+}
+
+/// Merged-PR delivery aggregates bucketed on `mr.merged_at`, split per (model,
+/// backend) so the parent can price each group before summing per bucket.
+pub(crate) async fn merged_pr_cost_trend_rows(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+    bucket: Bucket,
+) -> DbResult<Vec<PrCostTrendRow>> {
+    let bucket_expr = bucket.bucket_expr("mr.merged_at");
+    let sql = format!(
+        "WITH {ctes}
+        SELECT {bucket_expr} AS bucket_start, jt.model, jt.backend,
+               COUNT(*) AS pr_count,
+               SUM(jt.input), SUM(jt.cache_read), SUM(jt.cache_create),
+               SUM(jt.output), SUM(jt.billable),
+               SUM(jt.exact_cost), SUM(jt.exact_cost_count),
+               SUM({lines})
+        FROM job_tokens jt
+        JOIN merge_requests mr ON mr.job_id = jt.job_id
+            AND mr.status = 'merged' AND mr.merged_at IS NOT NULL
+        LEFT JOIN job_lines jl ON jl.job_id = jt.job_id
+        WHERE (?2 IS NULL OR mr.merged_at >= ?2)
+          AND (?3 IS NULL OR mr.merged_at < ?3)
+        GROUP BY bucket_start, jt.model, jt.backend
+        ORDER BY bucket_start",
+        ctes = MERGED_PR_CTES,
+        lines = MERGED_PR_LINES_EXPR,
+    );
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(PrCostTrendRow {
+            bucket_start: row.i64(0)?,
+            model: row.opt_text(1)?,
+            backend: row.text(2)?,
+            pr_count: row.i64(3)?,
+            input: row.i64(4)?,
+            cache_read: row.i64(5)?,
+            cache_create: row.i64(6)?,
+            output: row.i64(7)?,
+            billable: row.i64(8)?,
+            exact_cost: row.opt_f64(9)?.unwrap_or(0.0),
+            exact_cost_count: row.i64(10)?,
+            lines: row.opt_i64(11)?.unwrap_or(0),
+        })
+    })
+    .await
+}
+
+/// One merged issue's lead time and its first-merge timestamp.
+#[derive(Debug, Clone)]
+pub(crate) struct LeadTimeRow {
+    pub lead_seconds: i64,
+    pub merged_at: i64,
+}
+
+/// Lead time (issue creation -> FIRST merged PR) for every merged issue in the
+/// window. One row per issue (`MIN(merged_at)` collapses issues with several
+/// merged PRs to their first merge). Range filters that first merge, so an issue
+/// counts in the bucket where its work first shipped. Not a rollup table, but a
+/// bounded issue-count scan (thousands of rows), never the events firehose.
+pub(crate) async fn issue_lead_times(
+    db: &LocalDb,
+    scope: &Scope,
+    range: &TimeRange,
+) -> DbResult<Vec<LeadTimeRow>> {
+    let sql = "SELECT (MIN(mr.merged_at) - i.created_at) AS lead_seconds,
+                      MIN(mr.merged_at) AS merged_at
+        FROM issues i
+        JOIN merge_requests mr ON mr.issue_id = i.id
+            AND mr.status = 'merged' AND mr.merged_at IS NOT NULL
+        WHERE i.created_at IS NOT NULL
+          AND (?1 IS NULL OR i.project_id = ?1)
+        GROUP BY i.id
+        HAVING (MIN(mr.merged_at) - i.created_at) > 0
+           AND (?2 IS NULL OR MIN(mr.merged_at) >= ?2)
+           AND (?3 IS NULL OR MIN(mr.merged_at) < ?3)
+        ORDER BY merged_at";
+    db.query_all(sql, scope_range_params(scope, range), |row| {
+        Ok(LeadTimeRow {
+            lead_seconds: row.i64(0)?,
+            merged_at: row.i64(1)?,
         })
     })
     .await

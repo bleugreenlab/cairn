@@ -52,6 +52,7 @@ pub mod skill_fetch;
 pub mod skills;
 pub mod web_fetch;
 pub mod web_search;
+pub mod yaml_edit;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -266,14 +267,15 @@ pub(crate) fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<(PathBuf,
 ///
 /// This is the single funnel every settings/config writer uses, so no write path
 /// can drift back to leaving `settings.yaml` / `config.yaml` dirty. Callers offer
-/// the workspace repo as `push_root` whenever a commit might land there, and the
-/// committed-repo check above decides whether it actually pushes: the fixed-scope
-/// `settings.yaml` writers pass `Some(config_dir)`, and the scope-flexible
-/// config-resource path passes it unconditionally so a workspace->project move
-/// still pushes the workspace-side deletion while a project-only change is a
-/// no-op (the workspace repo never committed). A purely project-scoped writer may
-/// pass `None`: a project's `origin` is the user's shared code remote, never
-/// auto-pushed on a settings toggle.
+/// the repo whose commit should be pushed as `push_root`, and the committed-repo
+/// check above decides whether it actually pushes: the fixed-scope `settings.yaml`
+/// writers pass `Some(config_dir)`, the scope-flexible config-resource path passes
+/// the workspace repo unconditionally so a workspace->project move still pushes
+/// the workspace-side deletion, and the project `config.yaml` writer passes
+/// `Some(project_path)` so its commit reaches `origin`. Pushing project config is
+/// deliberate: `.cairn/config.yaml` is versioned on the project's shared branch,
+/// and a diverged local main (committed-but-unpushed config) breaks issue PR
+/// merges until a manual push. A caller with nothing to push may pass `None`.
 ///
 /// The push is fire-and-forget on a detached thread so a slow network round-trip
 /// never blocks the UI save, and is skipped entirely when nothing committed.

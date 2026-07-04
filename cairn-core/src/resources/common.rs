@@ -50,8 +50,8 @@ impl ResourceArtifact {
 
 /// An action_run resolved by node segment — the action-node analogue of
 /// `ResourceJob`. A `pr` action node has no job; it is addressed by its stored
-/// `uri_segment` and its id is the owner key (`merge_requests.job_id`) the
-/// owner-generic PR machinery already uses (CAIRN-1220).
+/// `uri_segment`, while persisted PR ownership lives on the producing job and is
+/// reached from the action run through `parent_job_id` (CAIRN-1220).
 #[derive(Debug, Clone)]
 pub(super) struct ResourceActionRun {
     pub(super) id: String,
@@ -840,8 +840,9 @@ pub(super) async fn find_action_run_by_node_name(
 
 /// Resolve a node segment to its owner id: a job id when an agent node matches,
 /// else an action_run id when an action node matches, else a "node not found"
-/// error. The returned id is the owner key threaded into the owner-generic PR
-/// machinery (`merge_requests.job_id`) and the todos/artifact paths.
+/// error. For PR actions this id is a lookup handle; the durable PR owner is the
+/// producing job stored in `merge_requests.job_id`, resolved through
+/// `action_runs.parent_job_id`.
 pub(crate) async fn resolve_node_owner_id(
     db: &LocalDb,
     project_key: &str,
