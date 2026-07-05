@@ -504,6 +504,11 @@ pub(crate) const SETTINGS_BACKENDS: KeySpec =
 pub(crate) const SETTINGS_BRANCH_PREFIX: KeySpec = KeySpec::new("branchPrefix", KeyType::Str, "");
 pub(crate) const SETTINGS_MERGE_TYPE: KeySpec =
     KeySpec::new("mergeType", KeyType::Str, "squash|merge|rebase");
+pub(crate) const SETTINGS_MEMORY_REVIEW_ENABLED: KeySpec = KeySpec::new(
+    "memoryReviewEnabled",
+    KeyType::Bool,
+    "enable memory review prompts and automatic triage",
+);
 pub(crate) const SETTINGS_GIT_IDENTITIES: KeySpec = KeySpec::new(
     "gitIdentities",
     KeyType::Object,

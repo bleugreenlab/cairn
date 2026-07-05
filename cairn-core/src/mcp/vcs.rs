@@ -505,12 +505,8 @@ pub fn worktree_shell_vcs_env(
     #[cfg(unix)]
     match crate::jj::ensure_jj_shim_dir(&orch.config_dir) {
         Ok(shim_dir) => {
-            let current_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = if current_path.is_empty() {
-                shim_dir.to_string_lossy().into_owned()
-            } else {
-                format!("{}:{}", shim_dir.display(), current_path)
-            };
+            let current_path = crate::env::get_user_path();
+            let new_path = format!("{}:{}", shim_dir.display(), current_path);
             env.push(("PATH".into(), new_path));
             env.push(("CAIRN_JJ_BIN".into(), jj.binary_path().to_string()));
         }
@@ -1047,6 +1043,17 @@ mod tests {
             "JJ_CONFIG points at the managed config under the orchestrator config dir: {jj_config}"
         );
         assert_eq!(env.get("JJ_EDITOR").map(String::as_str), Some("true"));
+
+        let path = env.get("PATH").expect("jj shim PATH injected");
+        let shim_prefix = format!("{}:", config_dir.join("shims").display());
+        assert!(
+            path.starts_with(&shim_prefix),
+            "the managed jj shim directory stays first on PATH: {path}"
+        );
+        assert!(
+            path.contains("/.bun/bin"),
+            "the shim is prepended onto env::get_user_path(), not the host process PATH: {path}"
+        );
     }
 
     // ---- resolve_store_lock: the agent seal/discard serialization seam ----

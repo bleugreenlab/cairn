@@ -55,6 +55,9 @@ impl Orchestrator {
         if let Some(mode) = input.thinking_display_mode {
             current.thinking_display_mode = mode;
         }
+        if let Some(enabled) = input.memory_review_enabled {
+            current.memory_review_enabled = enabled;
+        }
         if let Some(threshold) = input.pending_memory_threshold {
             current.pending_memory_threshold = threshold.max(1);
         }

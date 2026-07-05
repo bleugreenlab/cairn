@@ -28,6 +28,7 @@ const PREF_KEYS: &[&str] = &[
     "bugReports",
     "thinkingDisplayMode",
     "logLevel",
+    "memoryReviewEnabled",
     "pendingMemoryThreshold",
     "externalReplies",
     "subscriptionFees",

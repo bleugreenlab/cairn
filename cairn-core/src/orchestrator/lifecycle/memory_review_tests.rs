@@ -279,6 +279,27 @@ async fn null_with_drafts_sends_review_without_confirming() {
 }
 
 #[tokio::test]
+async fn disabled_memory_review_does_not_send_review_turn() {
+    let db = test_db().await;
+    seed_job(&db, None).await;
+    insert_artifact(&db).await;
+    let orch = test_orchestrator(db);
+    std::fs::write(
+        orch.config_dir.join("settings.yaml"),
+        "memoryReviewEnabled: false\n",
+    )
+    .unwrap();
+
+    finish_memory_review_if_due(&orch, "j-review", "run-review");
+    crate::messages::delivery::flush_pending_directs_on_idle(&orch, "run-review");
+
+    assert_eq!(review_state(&orch).await, None);
+    assert_eq!(memory_status(&orch).await, "draft");
+    assert_eq!(direct_push_count(&orch, "%Draft memories:%").await, 0);
+    assert_eq!(memory_review_turn_count(&orch).await, 0);
+}
+
+#[tokio::test]
 async fn null_with_drafts_but_no_artifact_does_not_send_review() {
     let db = test_db().await;
     seed_job(&db, None).await;

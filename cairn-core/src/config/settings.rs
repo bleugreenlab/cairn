@@ -82,6 +82,9 @@ pub struct SettingsFile {
     /// is the opt-in full-debug + profiler level (today's behavior).
     #[serde(default)]
     pub log_level: Option<LogLevel>,
+    /// Whether memory review prompts and automatic memory-triage issue creation are enabled.
+    #[serde(default)]
+    pub memory_review_enabled: Option<bool>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     #[serde(default)]
     pub pending_memory_threshold: Option<i32>,
@@ -278,6 +281,7 @@ impl SettingsFile {
                 .thinking_display_mode
                 .clone()
                 .unwrap_or(ThinkingDisplayMode::Full),
+            memory_review_enabled: self.memory_review_enabled.unwrap_or(true),
             pending_memory_threshold: self.pending_memory_threshold.unwrap_or(5).max(1),
             external_replies: self
                 .external_replies
@@ -308,6 +312,7 @@ impl SettingsFile {
             bug_reports: Some(settings.bug_reports),
             thinking_display_mode: Some(settings.thinking_display_mode.clone()),
             log_level: Some(settings.log_level),
+            memory_review_enabled: Some(settings.memory_review_enabled),
             pending_memory_threshold: Some(settings.pending_memory_threshold.max(1)),
             external_replies: Some(settings.external_replies.clone()),
             subscription_fees: if settings.subscription_fees.is_empty() {

@@ -48,6 +48,10 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         settings.thinking_display_mode
     ));
     out.push_str(&format!(
+        "- memoryReviewEnabled: {}\n",
+        yes_no(settings.memory_review_enabled)
+    ));
+    out.push_str(&format!(
         "- pendingMemoryThreshold: {}\n",
         settings.pending_memory_threshold
     ));

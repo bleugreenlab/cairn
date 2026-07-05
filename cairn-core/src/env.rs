@@ -9,6 +9,11 @@
 use std::process::Command;
 use std::sync::OnceLock;
 
+#[cfg(not(windows))]
+use std::process::{Output, Stdio};
+#[cfg(not(windows))]
+use std::time::{Duration, Instant};
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -87,14 +92,8 @@ pub fn get_user_path() -> &'static str {
             // Start with the process's actual PATH (includes Docker ENV, etc.)
             let env_path = std::env::var("PATH").unwrap_or_default();
 
-            // Try to get PATH from login shell (picks up .bashrc/.zshrc additions)
-            if let Ok(output) = Command::new("sh").args(["-lc", "echo $PATH"]).output() {
-                if output.status.success() {
-                    let shell_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if !shell_path.is_empty() {
-                        return format!("{}:{}:{}", common_paths, shell_path, env_path);
-                    }
-                }
+            if let Some(shell_path) = resolve_user_shell_path() {
+                return format!("{}:{}:{}", common_paths, shell_path, env_path);
             }
 
             if env_path.is_empty() {
@@ -104,6 +103,60 @@ pub fn get_user_path() -> &'static str {
             }
         }
     })
+}
+
+#[cfg(not(windows))]
+fn resolve_user_shell_path() -> Option<String> {
+    let user_shell = crate::services::get_default_shell();
+    let mut user_shell_command = Command::new(&user_shell);
+    user_shell_command.args(["-ilc", "command env"]);
+    shell_path_from_command(&mut user_shell_command).or_else(|| {
+        let mut fallback_command = Command::new("sh");
+        fallback_command.args(["-lc", "command env"]);
+        shell_path_from_command(&mut fallback_command)
+    })
+}
+
+#[cfg(not(windows))]
+fn shell_path_from_command(command: &mut Command) -> Option<String> {
+    let output = command_output_with_timeout(command, Duration::from_secs(3)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_path_from_env_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(windows))]
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            return child.wait_with_output();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn parse_path_from_env_output(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("PATH=").filter(|path| !path.is_empty()))
+        .map(ToOwned::to_owned)
 }
 
 /// Find a binary by name using the user's PATH.
@@ -176,4 +229,39 @@ pub fn git() -> Command {
 /// Create a Command for gh (GitHub CLI) with the user's PATH set.
 pub fn gh() -> Command {
     command("gh")
+}
+
+#[cfg(test)]
+#[cfg(not(windows))]
+mod tests {
+    use super::parse_path_from_env_output;
+
+    #[test]
+    fn parse_path_from_env_output_picks_path_line() {
+        let output = "SHELL=/bin/zsh\nPATH=/usr/local/bin:/usr/bin\nHOME=/Users/example\n";
+        assert_eq!(
+            parse_path_from_env_output(output).as_deref(),
+            Some("/usr/local/bin:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn parse_path_from_env_output_ignores_non_path_lines() {
+        let output = "SHELL=/bin/zsh\nCAIRN_PATH_HINT=/tmp/bin\nHOME=/Users/example\n";
+        assert_eq!(parse_path_from_env_output(output), None);
+    }
+
+    #[test]
+    fn parse_path_from_env_output_uses_last_path_line() {
+        let output = "PATH=/minimal\nnoise from shell rc\nPATH=/shell/configured:/usr/bin\n";
+        assert_eq!(
+            parse_path_from_env_output(output).as_deref(),
+            Some("/shell/configured:/usr/bin")
+        );
+    }
+
+    #[test]
+    fn parse_path_from_env_output_rejects_empty_path() {
+        assert_eq!(parse_path_from_env_output("PATH=\n"), None);
+    }
 }

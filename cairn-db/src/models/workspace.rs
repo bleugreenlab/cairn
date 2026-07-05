@@ -94,6 +94,8 @@ pub struct Settings {
     pub bug_reports: bool,
     /// Thinking block display mode in chat transcripts
     pub thinking_display_mode: ThinkingDisplayMode,
+    /// Whether memory review prompts and automatic memory-triage issue creation are enabled.
+    pub memory_review_enabled: bool,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: i32,
     /// Behavior for replies to the documented `to: "external"` target.
@@ -144,6 +146,8 @@ pub struct UpdateSettings {
     pub bug_reports: Option<bool>,
     /// Thinking block display mode in chat transcripts
     pub thinking_display_mode: Option<ThinkingDisplayMode>,
+    /// Whether memory review prompts and automatic memory-triage issue creation are enabled.
+    pub memory_review_enabled: Option<bool>,
     /// Number of exact-scope pending memories that triggers a memory-triage issue.
     pub pending_memory_threshold: Option<i32>,
     /// Behavior for replies to the documented `to: "external"` target.

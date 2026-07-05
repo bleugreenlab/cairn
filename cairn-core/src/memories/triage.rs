@@ -290,7 +290,11 @@ pub async fn maybe_spawn_triage(
     orch: Orchestrator,
     confirmed_scopes: Vec<(String, String)>,
 ) -> Result<Vec<String>, String> {
-    let threshold = orch.get_settings().pending_memory_threshold.max(1) as i64;
+    let settings = orch.get_settings();
+    if !settings.memory_review_enabled {
+        return Ok(Vec::new());
+    }
+    let threshold = settings.pending_memory_threshold.max(1) as i64;
     let mut spawned = Vec::new();
     for (scope, scope_value) in confirmed_scopes {
         spawned.extend(spawn_triage_for_scope(&orch, &scope, &scope_value, threshold).await?);
@@ -303,7 +307,11 @@ pub async fn maybe_spawn_triage(
 /// already-claimed batches are no longer pending, so a re-run only spawns for
 /// backlog that has accumulated since.
 pub async fn reconcile_pending_triage(orch: &Orchestrator) -> Result<Vec<String>, String> {
-    let threshold = orch.get_settings().pending_memory_threshold.max(1) as i64;
+    let settings = orch.get_settings();
+    if !settings.memory_review_enabled {
+        return Ok(Vec::new());
+    }
+    let threshold = settings.pending_memory_threshold.max(1) as i64;
     let scopes = crate::memories::db::distinct_pending_scopes(&orch.db.local)
         .await
         .map_err(|error| error.to_string())?;
@@ -1113,6 +1121,44 @@ mod tests {
         assert_eq!(triage_issue_count(&test).await, 1);
         assert_eq!(
             memory_status_count(&test, "claimed", "project", "project-1").await,
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_memory_review_does_not_spawn_triage_issue() {
+        let test = test_orch().await;
+        std::fs::write(
+            test.orch.config_dir.join("settings.yaml"),
+            "memoryReviewEnabled: false\n",
+        )
+        .unwrap();
+        for idx in 0..5 {
+            insert_pending_memory(
+                &test,
+                &format!("p-{idx}"),
+                "project-1",
+                "project",
+                "project-1",
+                idx + 1,
+            )
+            .await;
+        }
+
+        let fast_path = super::maybe_spawn_triage(
+            test.orch.clone(),
+            vec![("project".to_string(), "project-1".to_string())],
+        )
+        .await
+        .unwrap();
+        super::reconcile_memory_triage(test.orch.clone())
+            .await
+            .unwrap();
+
+        assert!(fast_path.is_empty());
+        assert_eq!(triage_issue_count(&test).await, 0);
+        assert_eq!(
+            memory_status_count(&test, "pending", "project", "project-1").await,
             5
         );
     }

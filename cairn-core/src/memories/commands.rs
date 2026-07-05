@@ -157,6 +157,9 @@ pub fn send_memory_review_on_idle(
     job_id: &str,
     run_id: &str,
 ) -> Result<bool, String> {
+    if !orch.get_settings().memory_review_enabled {
+        return Ok(false);
+    }
     let db = orch.db.local.clone();
     let job_id = job_id.to_string();
     let run_id = run_id.to_string();
@@ -289,6 +292,9 @@ fn latest_memory_review_direct_message_id(
 pub fn reconcile_stranded_memory_reviews(
     orch: crate::orchestrator::Orchestrator,
 ) -> Result<usize, String> {
+    if !orch.get_settings().memory_review_enabled {
+        return Ok(0);
+    }
     let db = orch.db.local.clone();
     let eligible_jobs = crate::execution::advancement::run_advancement_db(async move {
         db.query_all(
