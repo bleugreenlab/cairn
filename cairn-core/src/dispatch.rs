@@ -446,7 +446,7 @@ async fn terminal_wake_active(
                            AND source_kind = 'process'
                            AND source_ref LIKE ?2 ESCAPE '\\'
                          LIMIT 1",
-                        turso::params![job_id.as_str(), pattern.as_str()],
+                        cairn_db::turso::params![job_id.as_str(), pattern.as_str()],
                     )
                     .await?;
                 Ok(rows.next().await?.is_some())

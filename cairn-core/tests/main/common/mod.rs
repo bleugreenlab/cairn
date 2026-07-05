@@ -18,9 +18,9 @@ use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::storage::{
     DbError, DbResult, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
 };
+use cairn_db::turso::params;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
-use turso::params;
 
 pub async fn migrated_db() -> (TempDir, LocalDb) {
     let temp = tempdir().unwrap();

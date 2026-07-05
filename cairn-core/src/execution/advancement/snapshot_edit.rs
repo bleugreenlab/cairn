@@ -61,7 +61,7 @@ struct ExecutionJobRow {
 /// each is flipped to `cancelled` with its transcript preserved, and any
 /// worktree it exclusively owned is returned for filesystem teardown.
 pub(crate) async fn reconcile_removed_nodes_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     removed_node_ids: &HashSet<String>,
 ) -> DbResult<RemovedNodesReconcile> {
@@ -181,7 +181,10 @@ pub fn reconcile_removed_nodes(
     })
 }
 
-async fn project_repo_path_conn(conn: &turso::Connection, project_id: &str) -> DbResult<String> {
+async fn project_repo_path_conn(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+) -> DbResult<String> {
     let mut rows = conn
         .query(
             "SELECT repo_path FROM projects WHERE id = ?1",
@@ -200,7 +203,11 @@ async fn project_repo_path_conn(conn: &turso::Connection, project_id: &str) -> D
 /// it (see `recompute`), so this single write is durable. Closing the open
 /// session (without deleting it) keeps the resume/warm-process machinery from
 /// treating an archived job as live work while preserving its record.
-async fn cancel_job_conn(conn: &turso::Connection, job_id: &str, now: i64) -> DbResult<()> {
+async fn cancel_job_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    now: i64,
+) -> DbResult<()> {
     conn.execute(
         "UPDATE jobs SET status = 'cancelled', completed_at = ?1, updated_at = ?1 WHERE id = ?2",
         params![now, job_id],
@@ -279,7 +286,10 @@ mod tests {
         )
     }
 
-    async fn seed_project_issue_execution(conn: &turso::Connection, snapshot: &ExecutionSnapshot) {
+    async fn seed_project_issue_execution(
+        conn: &cairn_db::turso::Connection,
+        snapshot: &ExecutionSnapshot,
+    ) {
         conn.execute(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)",
             (),
@@ -312,7 +322,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     async fn seed_job(
-        conn: &turso::Connection,
+        conn: &cairn_db::turso::Connection,
         id: &str,
         node_id: &str,
         status: &str,
@@ -338,7 +348,7 @@ mod tests {
         }
     }
 
-    async fn job_exists(conn: &turso::Connection, id: &str) -> bool {
+    async fn job_exists(conn: &cairn_db::turso::Connection, id: &str) -> bool {
         let mut rows = conn
             .query("SELECT 1 FROM jobs WHERE id = ?1", params![id])
             .await
@@ -346,7 +356,7 @@ mod tests {
         rows.next().await.unwrap().is_some()
     }
 
-    async fn session_exists(conn: &turso::Connection, job_id: &str) -> bool {
+    async fn session_exists(conn: &cairn_db::turso::Connection, job_id: &str) -> bool {
         let mut rows = conn
             .query("SELECT 1 FROM sessions WHERE job_id = ?1", params![job_id])
             .await
@@ -354,7 +364,7 @@ mod tests {
         rows.next().await.unwrap().is_some()
     }
 
-    async fn job_status(conn: &turso::Connection, id: &str) -> Option<String> {
+    async fn job_status(conn: &cairn_db::turso::Connection, id: &str) -> Option<String> {
         let mut rows = conn
             .query("SELECT status FROM jobs WHERE id = ?1", params![id])
             .await
@@ -362,7 +372,7 @@ mod tests {
         rows.next().await.unwrap().map(|row| row.text(0).unwrap())
     }
 
-    async fn run_exists(conn: &turso::Connection, run_id: &str) -> bool {
+    async fn run_exists(conn: &cairn_db::turso::Connection, run_id: &str) -> bool {
         let mut rows = conn
             .query("SELECT 1 FROM runs WHERE id = ?1", params![run_id])
             .await

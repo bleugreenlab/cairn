@@ -1,4 +1,4 @@
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::messages::{db as msg_db, queued::DeliveryUrgency};
 use crate::models::ChannelType;
@@ -100,7 +100,10 @@ pub(crate) fn load_parent_job(
 /// Return `job_id` if it is a resumable wake target (exists, not failed, has a
 /// session to resume); otherwise `None`, so the caller falls back to
 /// issue-level resolution.
-async fn resumable_job(conn: &turso::Connection, job_id: &str) -> DbResult<Option<String>> {
+async fn resumable_job(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<Option<String>> {
     let mut rows = conn
         .query(
             "SELECT id FROM jobs

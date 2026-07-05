@@ -26,7 +26,7 @@ pub struct ContextTokenState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ContextTokenEventSnapshot {
+pub struct ContextTokenEventSnapshot {
     pub run_id: String,
     pub session_id: String,
     pub backend: String,
@@ -40,7 +40,7 @@ pub(crate) struct ContextTokenEventSnapshot {
 }
 
 impl ContextTokenEventSnapshot {
-    pub(crate) fn into_state(self, context_window: Option<i64>) -> ContextTokenState {
+    pub fn into_state(self, context_window: Option<i64>) -> ContextTokenState {
         let input_tokens = self.input_tokens.unwrap_or(0);
         let output_tokens = self.output_tokens.unwrap_or(0);
         // Codex and OpenRouter report OpenAI-style usage where prompt/input already
@@ -72,7 +72,7 @@ impl ContextTokenEventSnapshot {
     }
 }
 
-pub(crate) async fn get_latest_context_token_event(
+pub async fn get_latest_context_token_event(
     db: Arc<LocalDb>,
     session_id: &str,
 ) -> DbResult<Option<ContextTokenEventSnapshot>> {

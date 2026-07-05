@@ -169,7 +169,7 @@ async fn lookup_search_project_context_by_cwd(
     .await
 }
 
-fn search_project_context_from_row(row: &turso::Row) -> DbResult<SearchProjectContext> {
+fn search_project_context_from_row(row: &cairn_db::turso::Row) -> DbResult<SearchProjectContext> {
     Ok(SearchProjectContext {
         project_id: row.text(0)?,
         project_key: row.text(1)?,

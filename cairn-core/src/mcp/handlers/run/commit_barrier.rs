@@ -69,6 +69,13 @@ pub(super) fn run_commit_barrier(
                             "\u{2713} Committed changes ({}){}",
                             commit_result.sha, pr_suffix
                         ));
+                        // Surface an amend that was converted to a child commit
+                        // because the target commit is shared with a sibling
+                        // bookmark, so the agent's `^` intent visibly landed as a
+                        // new commit rather than a rewrite of shared history.
+                        if let Some(note) = &commit_result.amend_note {
+                            message.push_str(&format!(" — {note}"));
+                        }
                     }
                     Err(e) if e.contains("nothing to commit") => {
                         // Tree was (or became) clean; already equals HEAD.

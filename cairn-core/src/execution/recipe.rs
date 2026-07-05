@@ -20,14 +20,14 @@ use crate::config::{agents as config_agents, skills as config_skills, ConfigResu
 use crate::execution::Initiator;
 use crate::models::{
     Execution, ExecutionSnapshot, ExecutionStatus, Fence, Job, Model, ModelSelection, RecipeNode,
-    RecipeNodeType, RecipeSnapshot, RecipeTrigger, RuntimeExtras, SkillSnapshot, SnapshotOverrides,
+    RecipeNodeType, RecipeSnapshot, RuntimeExtras, SkillSnapshot, SnapshotOverrides,
     TriggerContext, TriggerType,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde::Serialize;
 use std::collections::HashMap;
-use turso::params;
 
 // Re-export execution queries with _impl aliases for backward compatibility.
 #[allow(unused_imports)]
@@ -57,6 +57,7 @@ pub fn create_jobs_for_execution(
 /// handler so both go through the same path. Advancement is enqueued on the
 /// orchestrator effect queue; hosts without an effect queue (`effect_tx == None`)
 /// get the execution + jobs created and must advance the DAG themselves.
+#[allow(clippy::too_many_arguments)]
 pub fn start_recipe_execution_and_advance(
     orch: &Orchestrator,
     issue_id: &str,
@@ -64,6 +65,7 @@ pub fn start_recipe_execution_and_advance(
     project_id: &str,
     backend: Option<&str>,
     initiated_via: Option<&str>,
+    trigger_type: TriggerType,
 ) -> Result<Execution, String> {
     let execution = start_recipe_execution_impl(
         orch,
@@ -74,6 +76,7 @@ pub fn start_recipe_execution_and_advance(
         backend,
         None,
         initiated_via,
+        trigger_type,
     )?;
     let _jobs = create_jobs_for_execution(orch, &execution.id)?;
     orch.notifier.emit_change("executions");
@@ -108,6 +111,7 @@ pub fn start_recipe_execution_impl(
     backend: Option<&str>,
     initiator: Option<Initiator>,
     initiated_via: Option<&str>,
+    trigger_type: TriggerType,
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
 
@@ -136,7 +140,7 @@ pub fn start_recipe_execution_impl(
         &recipe.id,
         Some(issue_id),
         project_id,
-        TriggerType::Manual,
+        trigger_type.clone(),
         None,
         override_sel.as_ref(),
     )?;
@@ -233,7 +237,7 @@ pub fn start_recipe_execution_impl(
             snapshot: Some(snapshot_json),
             seq: Some(next_seq),
             initiator: initiator.clone(),
-            triggered_by: "manual".to_string(),
+            triggered_by: trigger_type.to_string(),
         },
     )?;
 
@@ -247,7 +251,7 @@ pub fn start_recipe_execution_impl(
         completed_at: None,
         seq: Some(next_seq),
         initiator: initiator.clone(),
-        triggered_by: TriggerType::Manual,
+        triggered_by: trigger_type,
     })
 }
 
@@ -314,81 +318,6 @@ pub fn start_manual_execution_impl(
         seq: None,
         initiator: initiator.clone(),
         triggered_by: TriggerType::Manual,
-    })
-}
-
-/// Start a scheduled recipe execution for a project.
-///
-/// Creates the execution record and snapshot only. The caller creates jobs from
-/// the snapshot and advances the DAG.
-pub fn start_scheduled_execution_impl(
-    orch: &Orchestrator,
-    recipe_id: &str,
-    project_id: Option<&str>,
-) -> Result<Execution, String> {
-    let now = chrono::Utc::now().timestamp() as i32;
-    let project_path = project_id
-        .map(|id| {
-            let db = resolve_owning_db_for_project(orch, id)?;
-            project_path_for_recipe(db, id.to_string())
-        })
-        .transpose()?;
-
-    let recipe = get_recipe_from_files(&orch.config_dir, project_path.as_deref(), recipe_id)?;
-    if recipe.trigger != RecipeTrigger::Schedule {
-        return Err(format!(
-            "Recipe {} trigger changed to {:?}, skipping scheduled execution",
-            recipe_id, recipe.trigger
-        ));
-    }
-
-    let final_project_id = project_id
-        .map(str::to_string)
-        .or(recipe.project_id.clone())
-        .ok_or_else(|| "Scheduled recipe must have a project_id".to_string())?;
-
-    let snapshot = build_execution_snapshot_from_files(
-        &orch.config_dir,
-        project_path.as_deref(),
-        &recipe.id,
-        None,
-        &final_project_id,
-        TriggerType::Schedule,
-        None,
-        None,
-    )?;
-    let snapshot_json = snapshot.to_json()?;
-
-    let db = resolve_owning_db_for_project(orch, &final_project_id)?;
-    let exec_id = ids::mint_child(&final_project_id);
-    insert_execution(
-        db,
-        NewExecution {
-            id: exec_id.clone(),
-            recipe_id: recipe.id.clone(),
-            issue_id: None,
-            project_id: Some(final_project_id.clone()),
-            status: "running".to_string(),
-            started_at: now,
-            completed_at: None,
-            snapshot: Some(snapshot_json),
-            seq: None,
-            initiator: None,
-            triggered_by: TriggerType::Schedule.to_string(),
-        },
-    )?;
-
-    Ok(Execution {
-        id: exec_id,
-        recipe_id: recipe.id,
-        issue_id: None,
-        project_id: Some(final_project_id),
-        status: ExecutionStatus::Running,
-        started_at: now as i64,
-        completed_at: None,
-        seq: None,
-        initiator: None,
-        triggered_by: TriggerType::Schedule,
     })
 }
 

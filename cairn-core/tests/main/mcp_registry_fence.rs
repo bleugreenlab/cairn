@@ -21,9 +21,9 @@ use cairn_core::models::{
     AgentSnapshot, ExecutionSnapshot, Fence, LegacyOnEscape, LegacySandbox, RecipeSnapshot,
     RecipeTrigger, TriggerContext, TriggerType,
 };
+use cairn_db::turso::params;
 use serde_json::json;
 use tempfile::TempDir;
-use turso::params;
 
 fn settings_path(temp: &TempDir) -> std::path::PathBuf {
     temp.path().join("config").join("settings.yaml")

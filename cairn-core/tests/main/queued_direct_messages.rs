@@ -19,7 +19,7 @@ use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_core::messages::db as msg_db;
 use cairn_core::models::ChannelType;
-use turso::params;
+use cairn_db::turso::params;
 
 fn insert_pending_direct(orch: &Orchestrator, recipient: &str, content: &str) -> String {
     let msg = msg_db::insert_message(

@@ -1,11 +1,10 @@
 use cairn_common::ids::rekey_to_team;
+use cairn_db::turso::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use turso::Value;
 use uuid::Uuid;
 
 use crate::db::DbState;
-use crate::models::ExecutionSnapshot;
 use crate::projects::crud::{get_db, insert_project_route};
 use crate::services::Clock;
 use crate::storage::{DbError, LocalDb, RowExt, PROJECT_REKEY_MANIFEST};
@@ -373,9 +372,12 @@ async fn insert_rows(
                         // execution snapshot. Other JSON/text payloads are display or
                         // audit content for this slice and intentionally stay untouched.
                         if let Value::Text(json) = &values[idx] {
-                            let mut snapshot = ExecutionSnapshot::from_json(json).map_err(|e| {
-                                DbError::Internal(format!("deserializing execution snapshot: {e}"))
-                            })?;
+                            let mut snapshot = crate::config::snapshot_migrate::load(json)
+                                .map_err(|e| {
+                                    DbError::Internal(format!(
+                                        "deserializing execution snapshot: {e}"
+                                    ))
+                                })?;
                             snapshot.rekey_to_team(&team_id).map_err(|e| {
                                 DbError::Internal(format!("re-keying execution snapshot: {e}"))
                             })?;

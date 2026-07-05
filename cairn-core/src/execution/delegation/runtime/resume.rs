@@ -136,7 +136,7 @@ async fn prepare_parent_for_delegated_wait_db(
     .map_err(|e| e.to_string())
 }
 
-async fn next_turn_sequence(conn: &turso::Connection, session_id: &str) -> DbResult<i64> {
+async fn next_turn_sequence(conn: &cairn_db::turso::Connection, session_id: &str) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "SELECT MAX(sequence) FROM turns WHERE session_id = ?1",
@@ -151,7 +151,7 @@ async fn next_turn_sequence(conn: &turso::Connection, session_id: &str) -> DbRes
 }
 
 async fn query_successor_turn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     predecessor_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use turso::params;
+use cairn_db::turso::params;
 
 use super::common::{
     connect_and_find_node_job, connect_and_find_task_job, connect_for_read,
@@ -118,7 +118,10 @@ fn activity_preview(text: &str) -> String {
 /// rows. Archived assistant events store their body at git coordinates, not in
 /// `data`, so they are excluded rather than reconstructed — a summary read must
 /// stay cheap, and a completed/archived node has its artifact to read instead.
-async fn latest_assistant_preview(conn: &turso::Connection, job_id: &str) -> Option<String> {
+async fn latest_assistant_preview(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Option<String> {
     let mut rows = conn
         .query(
             "
@@ -155,7 +158,7 @@ async fn latest_assistant_preview(conn: &turso::Connection, job_id: &str) -> Opt
 /// the node has no events yet (nothing to summarize beyond the header), so a
 /// just-started node stays terse. Counts and timing come from one cheap
 /// aggregate that needs no event-body reconstruction.
-async fn render_node_activity(conn: &turso::Connection, job_id: &str) -> Option<String> {
+async fn render_node_activity(conn: &cairn_db::turso::Connection, job_id: &str) -> Option<String> {
     let mut rows = conn
         .query(
             "
@@ -463,7 +466,10 @@ struct NodeQuestionRow {
     answered: bool,
 }
 
-async fn load_node_questions(conn: &turso::Connection, job_id: &str) -> Vec<NodeQuestionRow> {
+async fn load_node_questions(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Vec<NodeQuestionRow> {
     let mut questions = Vec::new();
     if let Ok(mut rows) = conn
         .query(
@@ -612,7 +618,10 @@ struct NodePermissionRow {
     response: Option<String>,
 }
 
-async fn load_node_permissions(conn: &turso::Connection, job_id: &str) -> Vec<NodePermissionRow> {
+async fn load_node_permissions(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Vec<NodePermissionRow> {
     let mut requests = Vec::new();
     if let Ok(mut rows) = conn
         .query(
@@ -1167,7 +1176,7 @@ async fn render_action_node(
 /// are intentionally absent and render with appearance-order numbering and no
 /// drill-down link.
 async fn load_primary_session_turn_sequences(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> HashMap<String, i32> {
     let mut map = HashMap::new();
@@ -1485,6 +1494,23 @@ pub(super) async fn artifact_affordance_block(
     super::common::artifact_affordance_with_schema(kind, artifact_name, &schema_value)
 }
 
+fn render_gated_artifact_actions(
+    body: &str,
+    artifact_uri: &str,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+) -> String {
+    let messages_uri = format!(
+        "cairn://p/{}/{}/{}/{}/messages",
+        project_key, number, exec_seq, node_name
+    );
+    format!(
+        "{body}\n\n## actions\n- [confirm]({artifact_uri}): patch with confirmed:true to approve this gated artifact and advance the DAG. e.g. write({{changes:[{{target:\"{artifact_uri}\",mode:\"patch\",payload:{{confirmed:true}}}}]}})\n- [continue]({messages_uri}): append a message to the producing node; it resumes with your feedback and revises (re-blocking on a new version). e.g. write({{changes:[{{target:\"{messages_uri}\",mode:\"append\",payload:{{content:\"...\"}}}}]}})"
+    )
+}
+
 pub(super) async fn read_node_artifact(
     orch: &crate::orchestrator::Orchestrator,
     project_key: &str,
@@ -1534,12 +1560,13 @@ pub(super) async fn read_node_artifact(
     // how to resolve it via `write`. This block is stateful, so it lives here
     // rather than in the contract-derived `affordance_for_kind`.
     let mut output = if job.status == "blocked" {
-        let node_uri = format!(
-            "cairn://p/{}/{}/{}/{}",
-            project_key, number, exec_seq, node_name
-        );
-        format!(
-            "{body}\n\n## actions\n- [confirm]({artifact_uri}): patch with confirmed:true to approve this gated artifact and advance the DAG. e.g. write({{changes:[{{target:\"{artifact_uri}\",mode:\"patch\",payload:{{confirmed:true}}}}]}})\n- [continue]({node_uri}): append a message to the producing node; it resumes with your feedback and revises (re-blocking on a new version). e.g. write({{changes:[{{target:\"{node_uri}\",mode:\"append\",payload:{{content:\"...\"}}}}]}})"
+        render_gated_artifact_actions(
+            &body,
+            &artifact_uri,
+            project_key,
+            number,
+            exec_seq,
+            node_name,
         )
     } else {
         body
@@ -2044,4 +2071,25 @@ pub(super) async fn read_task_chat_event(
         db.private_route_db().map(|db| db.as_ref()),
     )
     .await
+}
+
+#[cfg(test)]
+mod gated_artifact_tests {
+    use super::render_gated_artifact_actions;
+
+    #[test]
+    fn gated_artifact_continue_targets_node_messages_collection() {
+        let output = render_gated_artifact_actions(
+            "body",
+            "cairn://p/CAIRN/2160/1/planner/plan",
+            "CAIRN",
+            2160,
+            1,
+            "planner",
+        );
+
+        assert!(output.contains("[continue](cairn://p/CAIRN/2160/1/planner/messages)"));
+        assert!(output.contains("target:\"cairn://p/CAIRN/2160/1/planner/messages\""));
+        assert!(!output.contains("target:\"cairn://p/CAIRN/2160/1/planner\""));
+    }
 }

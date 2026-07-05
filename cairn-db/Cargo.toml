@@ -1,0 +1,50 @@
+[package]
+name = "cairn-db"
+version.workspace = true
+edition = "2021"
+description = "Cairn's database layer — domain models, table records, and the Turso + tantivy storage engine — quarantined from cairn-core"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "mcp"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+regex = "1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+sha2 = "0.10"
+async-trait = "0.1"
+thiserror = "2"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+# Full-text search index. Descends here from cairn-core so its ~22s compile edge
+# moves out of the core hot path (the whole point of the extraction).
+tantivy = "0.26.1"
+# Embedded Turso — the local DB engine. Copied verbatim from cairn-core's pin;
+# core keeps its own turso dep until step 5 re-points its remaining callers here.
+turso = { git = "https://github.com/tursodatabase/turso", rev = "496c24ed85d2a7cf4963f12537e3c539144765a7", default-features = false, features = ["sync"] }
+# Direct rustls handle so `LocalDb::ensure_crypto_provider` can install a
+# process-wide default `CryptoProvider` before turso's sync TLS client is built.
+# See the doc comment on `ensure_crypto_provider` in storage/local_db.rs.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+# Scratch dirs for `migrated_test_db` and the content store. A NORMAL dep (not
+# dev-only) because the `test-utils`-gated `migrated_test_db` helper is compiled
+# into cross-crate test-utils builds where dev-deps are absent (mirrors cairn-codec).
+tempfile = "3"
+cairn-common = { path = "../cairn-common" }
+# The gix + zstd event-codec/object substrate; storage/events re-exports it.
+cairn-codec = { path = "../cairn-codec" }
+
+[dev-dependencies]
+cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
+
+[features]
+# Exposes InMemoryContentStore, event_fixture, events::testutil, reconstruct_fixture,
+# and migrated_test_db for cross-crate test-utils consumers (cairn-core's tests);
+# mirrors cairn-core's / cairn-codec's test-utils gate.
+test-utils = ["cairn-codec/test-utils"]

@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::labels::crud::{label_from_row, list_labels_conn, DEFAULT_WORKSPACE_ID};
 use crate::models::Label;
 use crate::storage::{DbResult, RowExt};
 
 pub async fn resolve_label_ref(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     workspace_id: &str,
     label_ref: &str,
 ) -> Result<Label, String> {
@@ -48,7 +48,7 @@ pub async fn resolve_label_ref(
 }
 
 pub async fn list_labels_for_issue(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Vec<Label>> {
     let mut rows = conn
@@ -69,7 +69,7 @@ pub async fn list_labels_for_issue(
 }
 
 pub async fn replace_issue_labels(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     refs: &[String],
     now: i64,
@@ -101,7 +101,7 @@ pub async fn replace_issue_labels(
 }
 
 pub async fn list_issue_ids_for_label(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     label_ref: &str,
 ) -> Result<Vec<String>, String> {
     let label = resolve_label_ref(conn, DEFAULT_WORKSPACE_ID, label_ref).await?;
@@ -120,7 +120,7 @@ pub async fn list_issue_ids_for_label(
 }
 
 pub async fn hydrate_labels(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue: &mut crate::models::Issue,
 ) -> DbResult<()> {
     issue.labels = list_labels_for_issue(conn, &issue.id).await?;
@@ -147,7 +147,7 @@ mod tests {
         db
     }
 
-    async fn seed_issue(conn: &turso::Connection, issue_id: &str, number: i32) {
+    async fn seed_issue(conn: &cairn_db::turso::Connection, issue_id: &str, number: i32) {
         conn.execute(
             "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-labels', 'default', 'Labels', 'LBL', '/tmp/lbl', 1, 1)",
             (),
@@ -162,7 +162,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_label(conn: &turso::Connection, name: &str) -> String {
+    async fn seed_label(conn: &cairn_db::turso::Connection, name: &str) -> String {
         create_label_conn(
             conn,
             DEFAULT_WORKSPACE_ID,

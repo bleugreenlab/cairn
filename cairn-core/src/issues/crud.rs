@@ -8,8 +8,8 @@ use crate::services::Clock;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::transitions::Resolution;
 use cairn_common::ids;
+use cairn_db::turso::params;
 use std::sync::Arc;
-use turso::params;
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, progress,
     attention, priority, completed_at, dismissed_at, created_at, updated_at, model,
@@ -82,7 +82,7 @@ pub async fn list_children(db: &LocalDb, parent_issue_id: &str) -> Result<Vec<Is
     .map_err(CairnError::from)
 }
 
-fn issue_from_row(row: &turso::Row) -> DbResult<Issue> {
+fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
     Ok(Issue {
         id: row.text(0)?,
         project_id: row.text(1)?,
@@ -108,7 +108,10 @@ fn issue_from_row(row: &turso::Row) -> DbResult<Issue> {
     })
 }
 
-async fn hydrate_dependencies(conn: &turso::Connection, issue: &mut Issue) -> DbResult<()> {
+async fn hydrate_dependencies(
+    conn: &cairn_db::turso::Connection,
+    issue: &mut Issue,
+) -> DbResult<()> {
     issue.depends_on = relations::list_dependency_uris(conn, &issue.id).await?;
     issue.unmet_depends_on = relations::filter_unmet_dependencies(conn, &issue.depends_on).await?;
     issue.unmet_dependency_count = issue.unmet_depends_on.len() as i64;
@@ -116,7 +119,10 @@ async fn hydrate_dependencies(conn: &turso::Connection, issue: &mut Issue) -> Db
     Ok(())
 }
 
-async fn load_optional_conn(conn: &turso::Connection, id: &str) -> DbResult<Option<Issue>> {
+async fn load_optional_conn(
+    conn: &cairn_db::turso::Connection,
+    id: &str,
+) -> DbResult<Option<Issue>> {
     let sql = format!("SELECT {ISSUE_COLUMNS} FROM issues WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
     let mut issue = rows
@@ -130,7 +136,7 @@ async fn load_optional_conn(conn: &turso::Connection, id: &str) -> DbResult<Opti
     Ok(issue)
 }
 
-async fn load_conn(conn: &turso::Connection, id: &str) -> DbResult<Issue> {
+async fn load_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Issue> {
     load_optional_conn(conn, id)
         .await?
         .ok_or_else(|| db_internal(format!("issue not found: {id}")))
@@ -439,7 +445,7 @@ pub async fn unresolve(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), 
 }
 
 async fn close_sessions_for_issue_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     reason: &str,
     now: i64,

@@ -50,7 +50,12 @@ pub mod diff;
 pub mod docs;
 pub mod github;
 pub mod identity;
-pub mod models;
+// `models` and `db_records` descend into cairn-db (with the storage engine);
+// re-exported here at their original crate paths so `crate::models` and
+// `crate::db_records` consumers compile unchanged. `storage` keeps a thin core
+// facade (src/storage/mod.rs) that globs cairn-db's storage and hosts the
+// core-only team-sync loop.
+pub use cairn_db::models;
 pub mod output_schemas;
 pub mod references;
 pub mod skills;
@@ -61,7 +66,7 @@ pub mod transcripts;
 mod agent_process;
 mod backends;
 mod db;
-mod db_records;
+pub use cairn_db::db_records;
 mod effects;
 mod embeddings;
 mod env;

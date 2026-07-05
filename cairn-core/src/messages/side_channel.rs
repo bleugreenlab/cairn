@@ -1,7 +1,7 @@
 //! Durable, non-waking notices from user messages to child issue agents.
 
+use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
-use turso::params;
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, LocalDb, RowExt};

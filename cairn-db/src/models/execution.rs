@@ -2,13 +2,59 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::execution::Initiator;
 use crate::models::{ActionRun, Job};
 
-/// Execution status (recomputed from job states, stored for query efficiency).
+/// Execution lifecycle status (recomputed from job states, stored for query
+/// efficiency).
 ///
 /// The canonical derivation logic is in `transitions::recompute_execution_status`.
-pub use crate::transitions::ExecutionStatus;
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionStatus {
+    #[default]
+    Running,
+    Complete,
+    Failed,
+}
+
+impl std::fmt::Display for ExecutionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecutionStatus::Running => write!(f, "running"),
+            ExecutionStatus::Complete => write!(f, "complete"),
+            ExecutionStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl std::str::FromStr for ExecutionStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "running" => Ok(ExecutionStatus::Running),
+            "complete" => Ok(ExecutionStatus::Complete),
+            "failed" => Ok(ExecutionStatus::Failed),
+            "paused" => Ok(ExecutionStatus::Running),
+            other => Err(format!("unknown execution status: {}", other)),
+        }
+    }
+}
+
+/// Resolver key stored on the execution record. Captures enough information
+/// to re-resolve credentials for auto-started DAG jobs and cold resumes.
+///
+/// Not identity persistence — just a key that maps to cached credentials
+/// (BYOT) or a vault lookup (shared mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Initiator {
+    /// JWT `sub` claim — the user who initiated this execution.
+    pub sub: String,
+    /// Credential mode: "byot" or "shared".
+    pub auth_mode: String,
+    /// Organization ID (empty string for personal accounts).
+    pub org_id: String,
+}
 
 /// An execution - an instance of a recipe running for an issue or project.
 ///
@@ -296,6 +342,33 @@ mod tests {
             .initiator
             .expect("empty org_id should still produce Some");
         assert_eq!(initiator.org_id, "");
+    }
+
+    #[test]
+    fn initiator_serde_roundtrip() {
+        let initiator = super::Initiator {
+            sub: "user-123".to_string(),
+            auth_mode: "byot".to_string(),
+            org_id: "org-456".to_string(),
+        };
+        let json = serde_json::to_string(&initiator).unwrap();
+        let parsed: super::Initiator = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.sub, "user-123");
+        assert_eq!(parsed.auth_mode, "byot");
+        assert_eq!(parsed.org_id, "org-456");
+    }
+
+    #[test]
+    fn initiator_serde_shared_mode() {
+        let initiator = super::Initiator {
+            sub: "user-789".to_string(),
+            auth_mode: "shared".to_string(),
+            org_id: "".to_string(),
+        };
+        let json = serde_json::to_string(&initiator).unwrap();
+        let parsed: super::Initiator = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.auth_mode, "shared");
+        assert_eq!(parsed.org_id, "");
     }
 
     // =========================================================================

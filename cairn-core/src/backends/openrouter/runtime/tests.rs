@@ -486,8 +486,8 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
     use std::sync::Arc;
-    use turso::params;
 
     let db_dir = tempfile::tempdir().unwrap();
     let db = LocalDb::open(db_dir.path().join("or-transcript-test.db"))

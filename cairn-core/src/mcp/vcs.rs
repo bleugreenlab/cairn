@@ -65,6 +65,15 @@ pub trait WorktreeVcs: Send + Sync {
     /// `discard` leans on it internally; the write-path recovery calls it
     /// explicitly to re-base the worktree before re-applying a batch.
     fn update_stale(&self, worktree: &Path) -> Result<(), String>;
+    /// Pre-flight reconcile of a workspace before a batch runs, so an agent's
+    /// tool call never starts against a stale or behind-its-branch-tip working
+    /// copy. Called at batch start under the per-store lock. No-op by default
+    /// (the non-worktree checkout has no shared store to reconcile). See the
+    /// [`JjBackend`] implementation for the two moves it makes.
+    fn reconcile_workspace(&self, worktree: &Path) -> Result<(), String> {
+        let _ = worktree;
+        Ok(())
+    }
     /// Capture the working copy's current edits as a unified patch, for the
     /// write-path stale-recovery to persist to scratch before a give-up discard
     /// (so "recoverable" is true from the agent's seat, not just the jj operation
@@ -234,6 +243,43 @@ impl WorktreeVcs for JjBackend {
 
     fn update_stale(&self, worktree: &Path) -> Result<(), String> {
         crate::jj::update_stale(&self.jj, worktree)
+    }
+
+    fn reconcile_workspace(&self, worktree: &Path) -> Result<(), String> {
+        // 1. Heal an on-disk STALE working copy. `jj workspace update-stale` is the
+        //    one op staleness does not block; on a fresh (non-stale) workspace it
+        //    is a fast no-op (exits 0, "not stale"). This is exactly the heal the
+        //    incident's agent hand-ran — but here it is serialized on the per-store
+        //    lock the caller holds, so it can never race a concurrent rebase.
+        crate::jj::update_stale(&self.jj, worktree)?;
+
+        let Some(branch) = crate::jj::read_branch_marker(worktree) else {
+            return Ok(());
+        };
+
+        // 2. Convert the clean "behind its branch tip" seal refusal into automatic
+        //    recovery: when the working copy is CLEAN, the bookmark has advanced
+        //    PAST `@` (seal would not fast-forward), and the branch tip carries no
+        //    conflict, re-parent `@` onto the workspace's own bookmark tip. A dirty
+        //    tree or a conflicted tip is left untouched — seal-time handling and the
+        //    conflicted-branch preservation path already own those, and re-parenting
+        //    a dirty tree would mint a divergent recovery commit.
+        match crate::jj::is_working_copy_dirty(&self.jj, worktree) {
+            Ok(false) => {}
+            // Dirty (or unprobeable) — leave it to seal-time handling.
+            _ => return Ok(()),
+        }
+        if crate::jj::seal_is_fast_forward(&self.jj, worktree, &branch)? {
+            return Ok(()); // Bookmark not ahead of `@`; nothing to re-parent.
+        }
+        if crate::jj::branch_has_conflict(&self.jj, worktree, &branch).unwrap_or(true) {
+            return Ok(()); // Conflicted tip — the preservation path owns it.
+        }
+        let Some(tip) = crate::jj::bookmark_commit(&self.jj, worktree, &branch) else {
+            return Ok(());
+        };
+        crate::jj::advance_workspace_onto(&self.jj, worktree, worktree, &branch, &tip)?;
+        Ok(())
     }
 
     fn capture_patch(&self, worktree: &Path) -> Option<String> {
@@ -449,6 +495,27 @@ pub fn worktree_shell_vcs_env(
         "GIT_CEILING_DIRECTORIES".into(),
         ceiling.to_string_lossy().into_owned(),
     ));
+    // Intercept `jj workspace update-stale` from bare `jj` in agent shells: jj's
+    // own stale hint names exactly the command that destroyed a workspace in the
+    // incident (racing the shared store). Prepend a shim dir to PATH and point its
+    // `CAIRN_JJ_BIN` at the real binary managed jj runs, so every other jj command
+    // execs the real jj untouched. With `reconcile_workspace` in place the shim
+    // should never trigger in practice; it exists so the one command jj advertises
+    // can never again race the store from an agent's hands. Unix-only.
+    #[cfg(unix)]
+    match crate::jj::ensure_jj_shim_dir(&orch.config_dir) {
+        Ok(shim_dir) => {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let new_path = if current_path.is_empty() {
+                shim_dir.to_string_lossy().into_owned()
+            } else {
+                format!("{}:{}", shim_dir.display(), current_path)
+            };
+            env.push(("PATH".into(), new_path));
+            env.push(("CAIRN_JJ_BIN".into(), jj.binary_path().to_string()));
+        }
+        Err(e) => log::warn!("jj shim setup failed (bare `jj update-stale` not intercepted): {e}"),
+    }
     env
 }
 
@@ -479,6 +546,7 @@ impl FakeVcs {
             seal: Ok(CommitResult {
                 sha: "abc123".to_string(),
                 pr_number: None,
+                amend_note: None,
             }),
             discard_result: Ok(()),
             can_revert: true,

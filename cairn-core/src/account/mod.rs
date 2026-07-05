@@ -6,6 +6,7 @@
 
 pub mod anon_device;
 pub mod connection;
+pub mod content_store;
 pub mod jwt;
 pub mod manager;
 pub mod org_tokens;
@@ -15,6 +16,7 @@ pub mod team_token_minter;
 
 pub use anon_device::AnonDeviceManager;
 pub use connection::{AccountConnection, DbAccount, OrgMembership};
+pub use content_store::{BrokeredContentStore, BrokeredContentStoreFactory};
 pub use manager::AccountManager;
 pub use org_tokens::OrgTokenCache;
 pub use team_sync::{

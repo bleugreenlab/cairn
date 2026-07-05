@@ -5,10 +5,12 @@
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use std::sync::Arc;
-use turso::params;
 
-fn row_to_check_result(row: &turso::Row) -> Result<CheckResultCacheEntry, crate::storage::DbError> {
+fn row_to_check_result(
+    row: &cairn_db::turso::Row,
+) -> Result<CheckResultCacheEntry, crate::storage::DbError> {
     Ok(CheckResultCacheEntry {
         project_id: row.text(0)?,
         tree_hash: row.text(1)?,

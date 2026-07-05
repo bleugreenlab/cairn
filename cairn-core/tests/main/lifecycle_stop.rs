@@ -2,7 +2,7 @@ use crate::common;
 
 use cairn_core::internal::orchestrator::lifecycle;
 use cairn_core::internal::storage::LocalDb;
-use turso::params;
+use cairn_db::turso::params;
 
 async fn insert_project_job_run_turn(db: &LocalDb, turn_state: &str) {
     let project_id = common::create_project(db, "STOP").await;

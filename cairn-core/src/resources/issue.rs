@@ -1,6 +1,6 @@
 //! Issue detail resource reader.
 
-use turso::params;
+use cairn_db::turso::params;
 
 use super::common::{
     connect_for_read, get_todo_progress, has_artifact_for_job, has_terminal_for_job,
@@ -13,7 +13,7 @@ use crate::models::{ExecutionSnapshot, RecipeNodeType};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
 
-async fn render_dependencies_block(conn: &turso::Connection, issue_id: &str) -> String {
+async fn render_dependencies_block(conn: &cairn_db::turso::Connection, issue_id: &str) -> String {
     let dependencies = match relations::list_dependency_uris(conn, issue_id).await {
         Ok(dependencies) => dependencies,
         Err(_) => return String::new(),
@@ -44,7 +44,7 @@ async fn render_dependencies_block(conn: &turso::Connection, issue_id: &str) -> 
 }
 
 async fn render_family_block(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     parent_issue_id: Option<&str>,
 ) -> String {
@@ -96,7 +96,10 @@ async fn render_family_block(
     }
 }
 
-async fn render_possibly_related_block(conn: &turso::Connection, issue_id: &str) -> String {
+async fn render_possibly_related_block(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> String {
     let mut rows = match conn
         .query(
             "
@@ -716,7 +719,7 @@ pub(super) async fn read_issue_execution(
         Err(e) => return storage_error("Failed to load execution", e.into()),
     };
 
-    let snapshot = match ExecutionSnapshot::from_json(&snapshot_json) {
+    let snapshot = match crate::config::snapshot_migrate::load(&snapshot_json) {
         Ok(snapshot) => snapshot,
         Err(e) => return format!("Failed to parse snapshot: {e}"),
     };
@@ -813,8 +816,8 @@ mod execution_snapshot_read_tests {
         TriggerContext, TriggerType,
     };
     use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
     use std::collections::HashMap;
-    use turso::params;
 
     async fn exec(db: &LocalDb, sql: &'static str) {
         db.write(|conn| {

@@ -1,6 +1,5 @@
 //! Project types.
 
-use crate::config::project_settings::CheckCommand;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -49,7 +48,8 @@ pub struct ProjectRemoteStatus {
 /// (e.g. a dev launcher writing a per-instance state dir) without parking on a
 /// worktree-fence prompt. Because this lives in repo-committed `.cairn/config.yaml`,
 /// the scopes are bounded: they may never intersect the secret-store read
-/// denylist. See `crate::config::dev_commands` and `docs/worktree-fence.md`.
+/// denylist. The dev-command denylist lives in cairn-core's config layer; see
+/// `docs/worktree-fence.md`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalCommand {
@@ -91,7 +91,7 @@ pub struct UpdateProject {
     /// Background-testing checks keyed by name. An empty map clears all checks
     /// from `.cairn/config.yaml`; `None` leaves the existing checks untouched.
     pub checks: Option<HashMap<String, CheckCommand>>,
-    pub worktree_populate: Option<crate::config::project_settings::PopulateConfig>,
+    pub worktree_populate: Option<PopulateConfig>,
     pub default_branch: Option<String>,
 }
 
@@ -100,4 +100,113 @@ pub struct UpdateProject {
 pub struct MoveProject {
     pub project_id: String,
     pub team_id: String,
+}
+
+/// Configuration for how gitignored paths are populated into new worktrees.
+///
+/// Paths matching `copy` patterns are copied from the main repo (isolated per worktree).
+/// Paths matching `symlink` patterns are symlinked to the main repo.
+/// `seed` entries copy-on-write clone external directories into worktree-relative destinations.
+/// Unmatched paths are skipped — new worktrees start clean by default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PopulateConfig {
+    /// Patterns whose matching paths are copied into the worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub copy: Vec<String>,
+    /// Patterns whose matching paths are symlinked to the main repo.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub symlink: Vec<String>,
+    /// External directories to copy-on-write seed into worktree-relative destinations.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed: Vec<SeedEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SeedEntry {
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+impl PopulateConfig {
+    pub fn is_empty(&self) -> bool {
+        self.copy.is_empty() && self.symlink.is_empty() && self.seed.is_empty()
+    }
+}
+
+/// One project check: a single command run at one cadence. Selectivity is
+/// expressed by a `{changedFiles}` or `{targets}` placeholder inside the
+/// command — the placeholder *is* the selector, and a placeholder-less command
+/// runs as-is (a full run).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckCommand {
+    /// The command to run. A `{changedFiles}` or `{targets}` placeholder makes
+    /// it selective; a placeholder-less command runs as-is.
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub impact: Option<Vec<String>>,
+    #[serde(
+        default = "default_check_policy",
+        skip_serializing_if = "is_default_check_policy"
+    )]
+    pub policy: CheckPolicy,
+    #[serde(
+        default = "default_check_when",
+        skip_serializing_if = "is_default_check_when"
+    )]
+    pub when: CheckWhen,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckPolicy {
+    Advisory,
+    Gate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckWhen {
+    Write,
+    Idle,
+    Review,
+}
+
+fn default_check_policy() -> CheckPolicy {
+    CheckPolicy::Advisory
+}
+
+fn is_default_check_policy(policy: &CheckPolicy) -> bool {
+    *policy == default_check_policy()
+}
+
+fn default_check_when() -> CheckWhen {
+    CheckWhen::Write
+}
+
+fn is_default_check_when(when: &CheckWhen) -> bool {
+    *when == default_check_when()
+}
+
+impl CheckPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckPolicy::Advisory => "advisory",
+            CheckPolicy::Gate => "gate",
+        }
+    }
+}
+
+impl CheckWhen {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CheckWhen::Write => "write",
+            CheckWhen::Idle => "idle",
+            CheckWhen::Review => "review",
+        }
+    }
 }

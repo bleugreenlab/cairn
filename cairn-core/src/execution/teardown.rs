@@ -29,9 +29,9 @@
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use turso::params;
 
 /// The managed worktrees base dir, `~/.cairn/worktrees`. Mirrors the hardcoded
 /// creation path in `execution/jobs/lifecycle.rs` and is deliberately NOT
@@ -968,7 +968,7 @@ async fn delete_remote_branches_for_repo(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turso::params;
+    use cairn_db::turso::params;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("teardown-test.db").await

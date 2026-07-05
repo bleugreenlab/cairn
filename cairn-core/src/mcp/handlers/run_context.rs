@@ -233,7 +233,7 @@ async fn lookup_run_by_cwd(db: &LocalDb, cwd: &str) -> Result<RunContext, String
     .map_err(|e| e.to_string())
 }
 
-fn run_context_from_row(row: &turso::Row) -> DbResult<RunContext> {
+fn run_context_from_row(row: &cairn_db::turso::Row) -> DbResult<RunContext> {
     let issue_number = row.opt_i64(5)?.map(|value| value as i32);
     let exec_seq = row.opt_i64(9)?.map(|value| value as i32);
     let job_name = row.opt_text(8)?;

@@ -21,9 +21,9 @@ use cairn_core::models::{
     AgentSnapshot, ExecutionSnapshot, Fence, RecipeSnapshot, RecipeTrigger, TriggerContext,
     TriggerType,
 };
+use cairn_db::turso::params;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use turso::params;
 
 fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
     let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());

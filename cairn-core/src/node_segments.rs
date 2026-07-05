@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::config::slugify_resource_segment;
 use crate::storage::{DbResult, RowExt};
@@ -55,7 +55,7 @@ pub(crate) fn task_segment_base(
 }
 
 async fn existing_segments(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     sql: &str,
     bind: &str,
 ) -> DbResult<HashSet<String>> {
@@ -76,7 +76,7 @@ async fn existing_segments(
 /// both claim `pr` — the second gets `pr-2`. Used by both job creation and
 /// action_run creation so the namespace stays single-owner.
 pub async fn allocate_top_level_segment(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     execution_id: &str,
     base_segment: &str,
@@ -121,7 +121,7 @@ pub async fn allocate_top_level_segment(
 }
 
 pub async fn allocate_child_task_segment(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     parent_job_id: &str,
     base_segment: &str,
 ) -> DbResult<String> {
@@ -138,7 +138,7 @@ pub async fn allocate_child_task_segment(
 }
 
 pub async fn allocate_project_job_segment(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     base_segment: &str,
 ) -> DbResult<String> {

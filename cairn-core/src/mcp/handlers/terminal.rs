@@ -14,6 +14,7 @@ use crate::services::{
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::ids;
 use cairn_common::uri::CairnResource;
+use cairn_db::turso::params;
 use portable_pty::{CommandBuilder, PtySize};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -24,7 +25,6 @@ use std::sync::{
 };
 use std::thread;
 use std::time::SystemTime;
-use turso::params;
 use uuid::Uuid;
 
 use crate::mcp::types::McpCallbackRequest;
@@ -337,7 +337,7 @@ async fn update_terminal_resource_session(
 }
 
 async fn find_terminal_target_job_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,
@@ -402,7 +402,7 @@ async fn find_terminal_target_job_id(
 }
 
 async fn find_task_terminal_target_job_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,
@@ -440,7 +440,7 @@ async fn find_task_terminal_target_job_id(
 }
 
 async fn terminal_slug_exists_for_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     slug: &str,
 ) -> DbResult<bool> {
@@ -458,7 +458,7 @@ async fn terminal_slug_exists_for_job(
 }
 
 async fn terminal_slug_exists_for_project(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     slug: &str,
 ) -> DbResult<bool> {
@@ -482,7 +482,7 @@ async fn terminal_slug_exists_for_project(
 /// Whether a *running* terminal with this slug exists in the job scope. Used by
 /// create-availability so a lingering exited row does not block re-use.
 async fn terminal_slug_running_for_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     slug: &str,
 ) -> DbResult<bool> {
@@ -501,7 +501,7 @@ async fn terminal_slug_running_for_job(
 }
 
 async fn terminal_slug_running_for_project(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     slug: &str,
 ) -> DbResult<bool> {
@@ -578,7 +578,9 @@ async fn lookup_terminal_for_wake_by_session_id(
     .await
 }
 
-async fn terminal_wake_row_from_rows(rows: &mut turso::Rows) -> DbResult<Option<TerminalWakeRow>> {
+async fn terminal_wake_row_from_rows(
+    rows: &mut cairn_db::turso::Rows,
+) -> DbResult<Option<TerminalWakeRow>> {
     let Some(row) = rows.next().await? else {
         return Ok(None);
     };

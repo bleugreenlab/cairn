@@ -1,7 +1,7 @@
 //! Artifact query operations.
 
+use cairn_db::turso::params;
 use serde_json::Value;
-use turso::params;
 
 use crate::models::Artifact;
 use crate::storage::{DbError, LocalDb, RowExt};
@@ -14,7 +14,7 @@ fn db_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
 }
 
-pub(crate) fn artifact_from_row(row: &turso::Row) -> Result<Artifact, DbError> {
+pub(crate) fn artifact_from_row(row: &cairn_db::turso::Row) -> Result<Artifact, DbError> {
     let data: Value = serde_json::from_str(&row.text(4)?)
         .map_err(|e| DbError::internal(format!("Invalid artifact data JSON: {e}")))?;
 

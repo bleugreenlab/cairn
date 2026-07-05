@@ -8,8 +8,8 @@ use cairn_core::runs::queries;
 use cairn_core::transcripts::stream_store::{
     abort_stream, append_chunks, open_stream, StreamChunkInput,
 };
+use cairn_db::turso::params;
 use serde_json::Value;
-use turso::params;
 
 struct NoopEmitter;
 

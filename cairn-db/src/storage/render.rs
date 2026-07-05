@@ -1,6 +1,10 @@
-//! Shared view layer for batch reads.
+//! Shared view/render layer for batch reads, plus the archived-file render seam.
 //!
-//! Single source of truth for turning a produced [`ReadSegment`] into its final
+//! Moved down from the mcp read handler into `storage` so `storage` carries no
+//! upward edge into the mcp layer (it will later descend into `cairn-db`); the mcp read
+//! layer re-exports it under the original `view` name so its consumers compile
+//! unchanged. This module is the single source of truth for turning a produced
+//! [`ReadSegment`] into its final
 //! text block: budget truncation on line boundaries, the single-huge-line
 //! character-fallback continuation (the dead-end fix), the always-valid continue
 //! footer, and the enriched `=== uri [suffix] ===` header. The per-source line
@@ -9,9 +13,55 @@
 //! cairn-cmd composer lives here.
 
 use cairn_common::query::{encode_query_params, split_target_query, QueryParam};
+use std::sync::OnceLock;
+
 use cairn_common::read::{
     Affordance, ImageBlock, NaturalUnit, ReadBatchEnvelope, ReadSegment, SegmentKind, SegmentMeta,
 };
+
+/// Build an `Error`-kind segment carrying an inline failure message for one
+/// target. A producer error never aborts a batch — it shows in place. Lives here
+/// beside the view layer (moved down from the mcp read handler) so `storage`
+/// reconstruction can build the same labeled-coordinate stub segments the live
+/// read builds, without an upward edge into the mcp layer.
+pub fn error_segment(uri: impl Into<String>, message: impl Into<String>) -> ReadSegment {
+    ReadSegment::text(
+        message.into(),
+        SegmentMeta::new(uri, SegmentKind::Error, NaturalUnit::Line),
+    )
+}
+
+/// The render seam for an archived read's file bytes.
+///
+/// Archival reconstruction lives in `storage` (it will descend into `cairn-db`),
+/// but reproducing a read's rendered [`ReadSegment`] requires the mcp read
+/// layer's byte renderers and in-process ast-grep/outline machinery, which sit
+/// above `storage`. The mcp layer registers an implementation at `Orchestrator`
+/// construction; reconstruction calls it through this registry. All boundary
+/// types already live in [`cairn_common::read`], so the seam is clean both ways.
+pub trait ArchivedFileRenderer: Send + Sync {
+    fn produce_archived_file_segment(
+        &self,
+        target: &str,
+        bytes: &[u8],
+    ) -> Result<ReadSegment, String>;
+}
+
+static ARCHIVED_FILE_RENDERER: OnceLock<&'static dyn ArchivedFileRenderer> = OnceLock::new();
+
+/// Register the archived-file renderer. Idempotent (first writer wins); the mcp
+/// read layer calls this at every `Orchestrator` construction. A binary that
+/// reconstructs archived reads WITHOUT registering a renderer degrades every
+/// archived read to a labeled coordinate stub — never a panic.
+pub fn set_archived_file_renderer(renderer: &'static dyn ArchivedFileRenderer) {
+    let _ = ARCHIVED_FILE_RENDERER.set(renderer);
+}
+
+/// The registered archived-file renderer, or `None` when none has been
+/// registered (reconstruction then degrades archived reads to stubs).
+pub fn archived_file_renderer() -> Option<&'static dyn ArchivedFileRenderer> {
+    ARCHIVED_FILE_RENDERER.get().copied()
+}
 
 /// Single backend budget for one whole `read` batch, applied once at the
 /// assembler. Kept at ~45_000 characters: it approximates the agent-CLI
@@ -555,7 +605,7 @@ pub(crate) fn estimate_len(segment: &ReadSegment) -> usize {
 /// reconstruction ([`crate::storage::events::reconstruct`]): both feed a `Vec<ReadSegment>`
 /// through this one composer so a reconstructed read reproduces the live envelope
 /// byte-for-byte.
-pub(crate) fn assemble(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {
+pub fn assemble(segments: Vec<ReadSegment>) -> ReadBatchEnvelope {
     let lengths: Vec<usize> = segments.iter().map(estimate_len).collect();
     let separator_budget = segments.len().saturating_sub(1);
     let total_budget = READ_BATCH_CHAR_BUDGET.saturating_sub(separator_budget);

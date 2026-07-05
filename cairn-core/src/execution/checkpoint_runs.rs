@@ -20,7 +20,7 @@ use crate::execution::advancement::run_advancement_db;
 use crate::execution::conditions::CheckpointRunOutput;
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
-use turso::params;
+use cairn_db::turso::params;
 
 /// Hard cap on automatic checkpoint re-run iterations per job. A flapping
 /// backstop: once this many command runs have been recorded for a checkpoint

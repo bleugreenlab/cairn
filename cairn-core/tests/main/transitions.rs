@@ -8,9 +8,9 @@ use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::{CapturingEmitter, TestServicesBuilder};
 use cairn_core::internal::services::EventEmitter;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_db::turso::params;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
-use turso::params;
 
 #[derive(Clone)]
 struct SharedEmitter(Arc<CapturingEmitter>);

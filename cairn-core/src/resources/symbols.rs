@@ -89,7 +89,7 @@ pub(crate) async fn read_project_symbols(
 }
 
 async fn project_repo_path(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
 ) -> Result<Option<String>, String> {
     let key = project_key.to_uppercase();

@@ -281,7 +281,7 @@ pub(super) fn fact_kinds_json(fact_kinds: Option<&[String]>) -> Option<String> {
     })
 }
 
-pub(super) fn subscription_from_row(row: &turso::Row) -> DbResult<WakeSubscription> {
+pub(super) fn subscription_from_row(row: &cairn_db::turso::Row) -> DbResult<WakeSubscription> {
     let fact_kinds_json = row.opt_text(4)?;
     let fact_kinds = fact_kinds_json
         .as_deref()
@@ -303,7 +303,7 @@ pub(super) fn subscription_from_row(row: &turso::Row) -> DbResult<WakeSubscripti
     })
 }
 
-pub(super) fn suppressed_from_row(row: &turso::Row) -> DbResult<SuppressedWake> {
+pub(super) fn suppressed_from_row(row: &cairn_db::turso::Row) -> DbResult<SuppressedWake> {
     Ok(SuppressedWake {
         id: row.text(0)?,
         subscription_id: row.opt_text(1)?,

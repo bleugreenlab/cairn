@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) async fn load_execution_snapshot_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<ExecutionSnapshot> {
     let mut rows = conn
@@ -18,7 +18,7 @@ pub(super) async fn load_execution_snapshot_conn(
         .flatten()
         .ok_or_else(|| db_internal(format!("Execution has no snapshot: {execution_id}")))?;
 
-    ExecutionSnapshot::from_json(&snapshot_json)
+    crate::config::snapshot_migrate::load(&snapshot_json)
         .map_err(|e| DbError::Row(format!("Failed to parse execution snapshot: {e}")))
 }
 

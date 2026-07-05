@@ -402,8 +402,8 @@ mod tests {
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
     use tempfile::TempDir;
-    use turso::params;
 
     struct TestOrch {
         _temp: TempDir,

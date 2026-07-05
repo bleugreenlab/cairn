@@ -4,8 +4,8 @@ use crate::mcp::types::{ChangeItem, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
 use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_db::turso::params;
 use sha2::{Digest, Sha256};
-use turso::params;
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))

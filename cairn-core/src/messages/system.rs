@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::models::ChannelType;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 /// Emit a system message for a job lifecycle event.
 ///

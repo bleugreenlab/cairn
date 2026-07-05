@@ -12,7 +12,7 @@ use cairn_core::models::{
     RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger, TriggerContext,
     TriggerType, WorktreeMode,
 };
-use turso::params;
+use cairn_db::turso::params;
 
 fn node(id: &str, node_type: RecipeNodeType, agent_config_id: Option<&str>) -> RecipeNode {
     RecipeNode {

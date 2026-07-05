@@ -27,7 +27,7 @@
 #![allow(dead_code)]
 
 use cairn_common::uri::parse_uri;
-use turso::params;
+use cairn_db::turso::params;
 use uuid::Uuid;
 
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -117,7 +117,7 @@ fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn push_from_row(row: &turso::Row) -> DbResult<Push> {
+fn push_from_row(row: &cairn_db::turso::Row) -> DbResult<Push> {
     let wake = row.text(3)?;
     let boundary = row.text(4)?;
     Ok(Push {
@@ -524,6 +524,20 @@ pub async fn has_pending_waking_live(db: &LocalDb, recipient: &str) -> DbResult<
     Ok(false)
 }
 
+/// The keys of a recipient's undelivered *rousing* (`wake`/`interrupt`) pushes,
+/// ignoring liveness. Diagnostic only — [`has_pending_waking_live`] is the resume
+/// gate; this names the pushes that were present so a decline (they all
+/// lazy-resolve dead, or the recipient is self-suspended) can be logged instead
+/// of failing silently (CAIRN-2410, the lost coordinator review wake).
+pub async fn pending_waking_keys(db: &LocalDb, recipient: &str) -> DbResult<Vec<String>> {
+    let pending = list_pending(db, recipient).await?;
+    Ok(pending
+        .into_iter()
+        .filter(|push| push.wake != Wake::Passive)
+        .map(|push| push.key)
+        .collect())
+}
+
 /// Delete an undelivered push by id. Dismissal only applies while the push is
 /// still pending; a concurrent delivery that stamps `delivered_event_id` first
 /// makes this a no-op.
@@ -570,7 +584,7 @@ pub async fn stamp_delivered(db: &LocalDb, push_ids: &[String], event_id: &str) 
 /// guard makes a duplicate stamp a no-op. Returns the number of rows newly
 /// stamped.
 pub async fn stamp_delivered_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     push_ids: &[String],
     event_id: &str,
 ) -> DbResult<usize> {
@@ -622,7 +636,7 @@ pub async fn read_cursor(db: &LocalDb, recipient: &str, source: &str) -> DbResul
 /// events for that one job's runs). Runs on a caller-supplied connection so the
 /// catch-up cursor advance can compute the delivery-time tail inside the stamp
 /// transaction.
-async fn count_job_chat_turns(conn: &turso::Connection, job_id: &str) -> DbResult<i64> {
+async fn count_job_chat_turns(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "SELECT COUNT(DISTINCT e.turn_id) FROM events e
@@ -655,7 +669,7 @@ async fn count_job_chat_turns(conn: &turso::Connection, job_id: &str) -> DbResul
 /// carrying event rolls back the advance too, and catch-up redelivers against the
 /// old cursor.
 pub async fn advance_read_cursors_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     push_ids: &[String],
 ) -> DbResult<()> {
     let now = now_ts();
@@ -740,10 +754,27 @@ pub async fn lazy_resolve_live(db: &LocalDb, push: &Push) -> DbResult<bool> {
                 return Ok(true); // issue not found -> don't drop
             };
             let live = match referent.as_str() {
-                // Live while there is reviewable output: an open unmerged PR OR
-                // an unconfirmed create-pr/plan artifact for the issue. The
-                // second arm is load-bearing for a plan-review push, which never
-                // has a PR row.
+                // Live while there is reviewable output. This drain/wake liveness
+                // predicate MIRRORS the push-creation predicate
+                // (`reviewable_ref_and_fingerprint` at the idle edge +
+                // `create_review_push_for_pr_open`, lifecycle/review_push.rs):
+                //   arm 1 — an open, unmerged PR for the issue;
+                //   arm 2 — an unconfirmed `plan` artifact (a plan-review push
+                //           never has a PR row, so it is confirmed-gated);
+                //   arm 3 — a `create-pr` artifact of ANY confirmed state, but ONLY
+                //           while no `merge_requests` row exists for the issue at all.
+                // Arm 3 is the pre-open window the creation predicate is explicitly
+                // designed to cover: a builder's `create-pr` artifact auto-confirms
+                // on write (CAIRN-1219) and the PR opens a few ms later, so between
+                // the artifact write and the `merge_requests` row landing neither arm
+                // 1 nor arm 2 matches — yet the review push IS live (CAIRN-2410, the
+                // lost coordinator wake). The no-MR-row guard keeps arm 1
+                // authoritative once any row exists (open → live, merged/closed →
+                // dead), so a confirmed create-pr artifact left over from a merged PR
+                // never resurrects a retired review. A re-run window (an OLD merged
+                // row plus a fresh create-pr) is covered by the PR-open edge
+                // (`fire_pr_open_review` re-fires with a `pr:` fingerprint once the
+                // new row opens), not by arm 3.
                 "review" => {
                     exists(
                         conn,
@@ -756,11 +787,25 @@ pub async fn lazy_resolve_live(db: &LocalDb, push: &Push) -> DbResult<bool> {
                             conn,
                             "SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
                              WHERE j.issue_id=?1
-                               AND a.artifact_type IN ('create-pr','plan')
+                               AND a.artifact_type='plan'
                                AND a.confirmed=0 LIMIT 1",
                             &issue_id,
                         )
                         .await?
+                        || (exists(
+                            conn,
+                            "SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
+                             WHERE j.issue_id=?1
+                               AND a.artifact_type='create-pr' LIMIT 1",
+                            &issue_id,
+                        )
+                        .await?
+                            && !exists(
+                                conn,
+                                "SELECT 1 FROM merge_requests WHERE issue_id=?1 LIMIT 1",
+                                &issue_id,
+                            )
+                            .await?)
                 }
                 // Live only while the referent is still pending AND the subject
                 // issue is not terminal: a blocker on a closed/merged/failed
@@ -817,7 +862,7 @@ pub async fn has_open_pr_for_issue(db: &LocalDb, issue_id: &str) -> DbResult<boo
 }
 
 async fn lookup_issue_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     number: i32,
 ) -> DbResult<Option<String>> {
@@ -834,7 +879,7 @@ async fn lookup_issue_id(
     }
 }
 
-async fn exists(conn: &turso::Connection, sql: &str, issue_id: &str) -> DbResult<bool> {
+async fn exists(conn: &cairn_db::turso::Connection, sql: &str, issue_id: &str) -> DbResult<bool> {
     let mut rows = conn.query(sql, params![issue_id]).await?;
     Ok(rows.next().await?.is_some())
 }
@@ -842,7 +887,7 @@ async fn exists(conn: &turso::Connection, sql: &str, issue_id: &str) -> DbResult
 /// Whether the issue is terminal (`merged`/`closed`/`failed`), mirroring
 /// [`crate::models::IssueStatus::is_terminal`]. A `question:`/`permission:` push
 /// for a terminalized issue is dead — the blocker no longer needs a watcher.
-async fn issue_is_terminal(conn: &turso::Connection, issue_id: &str) -> DbResult<bool> {
+async fn issue_is_terminal(conn: &cairn_db::turso::Connection, issue_id: &str) -> DbResult<bool> {
     let mut rows = conn
         .query("SELECT status FROM issues WHERE id=?1", params![issue_id])
         .await?;
@@ -1373,6 +1418,59 @@ mod tests {
             .await
             .unwrap();
         // Confirmed + no PR -> dead.
+        assert!(!lazy_resolve_live(&db, &p).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn lazy_resolve_review_lives_with_confirmed_create_pr_no_mr() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        // The incident (CAIRN-2410): a builder wrote a `create-pr` artifact that
+        // AUTO-confirmed on write (CAIRN-1219), and the PR has not opened yet
+        // (no merge_requests row). Before the fix this window read DEAD, silently
+        // dropping the idle coordinator's review wake. It must read LIVE.
+        let p = sample_push("review:cairn://p/PROJ/2", "cairn://p/PROJ/2/1/builder");
+        // No artifact and no PR -> dead.
+        assert!(!lazy_resolve_live(&db, &p).await.unwrap());
+
+        db.execute_script(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-pr','child-job','create-pr',1,'{}',1,'create-pr',1,1,1);",
+        )
+        .await
+        .unwrap();
+        // Confirmed create-pr artifact, no MR row yet -> LIVE (arm 3, the fix).
+        assert!(lazy_resolve_live(&db, &p).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn lazy_resolve_review_dead_when_mr_merged_despite_confirmed_create_pr() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        // Guards against over-widening arm 3: once a merge_requests row exists,
+        // arm 1 is authoritative. A merged PR is a dead review even though the
+        // confirmed create-pr artifact that opened it still exists.
+        let p = sample_push("review:cairn://p/PROJ/2", "cairn://p/PROJ/2/1/builder");
+        db.execute_script(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-pr','child-job','create-pr',1,'{}',1,'create-pr',1,1,1);",
+        )
+        .await
+        .unwrap();
+        // Pre-open window: confirmed create-pr, no MR row -> live via arm 3.
+        assert!(lazy_resolve_live(&db, &p).await.unwrap());
+
+        // The PR opened and then merged. Arm 1's no-MR-row guard hands control to
+        // the row: a merged row makes the review dead, arm 3 no longer applies.
+        db.execute_script(
+            "INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr','child-job','p','issue-1','t','b','main','merged',1,1);",
+        )
+        .await
+        .unwrap();
         assert!(!lazy_resolve_live(&db, &p).await.unwrap());
     }
 

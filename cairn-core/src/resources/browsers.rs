@@ -131,7 +131,7 @@ pub(crate) async fn resolve_browser_target(
 }
 
 async fn find_node_job_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,
@@ -160,7 +160,7 @@ async fn find_node_job_id(
 }
 
 async fn find_task_job_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,

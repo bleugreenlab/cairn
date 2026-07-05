@@ -1,5 +1,5 @@
 use super::*;
-use turso::params;
+use cairn_db::turso::params;
 
 pub(crate) use crate::storage::event_fixture::{
     assistant_read, assistant_run, assistant_text, assistant_thinking, assistant_tool,
@@ -62,6 +62,10 @@ pub(crate) async fn seed_chain(
     pack_anchor: Option<&str>,
     with_task: bool,
 ) {
+    // Every archival roundtrip test seeds this chain, so it is the shared setup
+    // point that registers the archived-file renderer the reconstruction path (and
+    // `render_targets`/`mixed_render_targets`) now sources through the registry.
+    crate::mcp::handlers::read::register_archived_file_renderer();
     let repo_path = repo_path.to_string();
     let worktree_path = worktree_path.to_string();
     let base_commit = base_commit.map(str::to_string);

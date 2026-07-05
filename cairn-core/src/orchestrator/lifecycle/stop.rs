@@ -106,7 +106,7 @@ fn run_issue_id(orch: &Orchestrator, run_id: &str) -> Result<Option<String>, Str
     run_db_blocking(move || async move {
         db.query_opt_text(
             "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
-            turso::params![run_id.as_str()],
+            cairn_db::turso::params![run_id.as_str()],
         )
         .await
         .map_err(|e| format!("Failed to load issue id for run db-change: {e}"))
@@ -301,7 +301,10 @@ fn child_run_ids_for_run(orch: &Orchestrator, run_id: &str) -> Vec<String> {
     .unwrap_or_default()
 }
 
-async fn find_descendant_job_ids(conn: &turso::Connection, job_id: &str) -> DbResult<Vec<String>> {
+async fn find_descendant_job_ids(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<Vec<String>> {
     let mut all_descendants = Vec::new();
     let mut current_parents = vec![job_id.to_string()];
 
@@ -333,7 +336,7 @@ async fn find_descendant_job_ids(conn: &turso::Connection, job_id: &str) -> DbRe
 }
 
 async fn get_running_runs_for_jobs(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_ids: &[String],
 ) -> DbResult<Vec<String>> {
     let mut run_ids = Vec::new();

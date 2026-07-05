@@ -257,7 +257,7 @@ pub fn create_action_run(
 }
 
 async fn find_parent_job_id_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     recipe_node_id: &str,
 ) -> DbResult<Option<String>> {

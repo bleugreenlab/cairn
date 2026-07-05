@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::embeddings::vector;
 use crate::models::{Memory, MemoryScope, MemoryStatus, MemoryTriageDecision};
@@ -15,15 +15,15 @@ const MEMORY_COLUMNS: &str = "id, name, project_id, content, status, \
 
 pub(crate) const MEMORY_COLUMNS_FOR_COMMANDS: &str = MEMORY_COLUMNS;
 
-fn memory_from_row(row: &turso::Row) -> DbResult<Memory> {
+fn memory_from_row(row: &cairn_db::turso::Row) -> DbResult<Memory> {
     memory_from_row_inner(row)
 }
 
-pub(crate) fn memory_from_row_for_commands(row: &turso::Row) -> DbResult<Memory> {
+pub(crate) fn memory_from_row_for_commands(row: &cairn_db::turso::Row) -> DbResult<Memory> {
     memory_from_row_inner(row)
 }
 
-fn memory_from_row_inner(row: &turso::Row) -> DbResult<Memory> {
+fn memory_from_row_inner(row: &cairn_db::turso::Row) -> DbResult<Memory> {
     Ok(Memory {
         id: row.text(0)?,
         name: row.opt_text(1)?,
@@ -49,7 +49,7 @@ fn memory_from_row_inner(row: &turso::Row) -> DbResult<Memory> {
     })
 }
 
-async fn load_memory_conn(conn: &turso::Connection, memory_id: &str) -> DbResult<Memory> {
+async fn load_memory_conn(conn: &cairn_db::turso::Connection, memory_id: &str) -> DbResult<Memory> {
     let sql = format!("SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1 LIMIT 1");
     let mut rows = conn.query(&sql, params![memory_id]).await?;
 

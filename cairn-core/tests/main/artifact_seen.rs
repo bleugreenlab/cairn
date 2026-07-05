@@ -4,7 +4,7 @@ use crate::common;
 
 use cairn_core::artifacts::queries;
 use cairn_core::internal::storage::{LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 async fn insert_artifact(db: &LocalDb, id: &str, job_id: &str, version: i64) {
     let id = id.to_string();

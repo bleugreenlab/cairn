@@ -5448,3 +5448,476 @@ fn resolve_base_rev_uses_root_for_unborn_repo() {
         "the branch bookmark is created at root"
     );
 }
+
+// ---------------------------------------------------------------------------
+// CAIRN-2422: pre-flight staleness reconcile, amend-conversion, the jj shim,
+// and the create-pr empty-delta discriminator.
+// ---------------------------------------------------------------------------
+
+/// The load-bearing pre-flight assumption: `update_stale` on a NON-stale
+/// (fresh) workspace exits 0 — jj prints "not stale" — so
+/// `reconcile_workspace` can run it unconditionally at every tool-call boundary
+/// without failing the happy path. Idempotent across repeated runs.
+#[test]
+#[serial_test::serial(jj)]
+fn update_stale_on_fresh_workspace_is_a_clean_noop() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping update_stale_on_fresh_workspace_is_a_clean_noop: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+
+    update_stale(&jj, &ws).expect("update-stale on a fresh workspace is a clean no-op");
+    assert_eq!(is_working_copy_dirty(&jj, &ws), Ok(false));
+    // Idempotent: running it again is still a no-op.
+    update_stale(&jj, &ws).expect("update-stale is idempotent on a fresh workspace");
+}
+
+/// Pin the stale+CLEAN sidecar behavior: a workspace whose `@` was rebased out
+/// from under it in the store (clean, no loose edits) is genuinely jj-stale — a
+/// snapshot is refused — and `update_stale` advances it onto the rewritten
+/// commit, leaving a clean working copy with the merged file materialized. This
+/// is the shape `reconcile_workspace` relies on for its step-1 heal.
+#[test]
+#[serial_test::serial(jj)]
+fn induced_stale_clean_workspace_heals_via_update_stale() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping induced_stale_clean_workspace_heals_via_update_stale: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let (int_tip, ws_coord, int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
+
+    // Induce GENUINE jj-staleness: rebase the coordinator's working-copy commit
+    // in the store WITHOUT refreshing it on disk (the store-side half of
+    // `advance_workspace_onto`, minus its `update_stale`).
+    let name = workspace_name_for_branch(&int);
+    jj.run(
+        &store,
+        &[
+            "rebase",
+            "-s",
+            &format!("{name}@"),
+            "-o",
+            &int_tip,
+            "--ignore-working-copy",
+        ],
+        "induce genuine staleness",
+    )
+    .unwrap();
+
+    // Clean+stale: a snapshot (diff) is now refused with the stale message.
+    let probe = is_working_copy_dirty(&jj, &ws_coord);
+    assert!(
+        probe.is_err() && is_stale_error(&probe.unwrap_err()),
+        "precondition: a rebased-out workspace is genuinely stale"
+    );
+
+    // update_stale heals it: clean working copy on the advanced commit.
+    update_stale(&jj, &ws_coord).unwrap();
+    assert_eq!(
+        is_working_copy_dirty(&jj, &ws_coord),
+        Ok(false),
+        "clean+stale heals to a clean advanced @"
+    );
+    assert!(
+        ws_coord.join("child.rs").exists(),
+        "the merged sibling file is materialized after the heal"
+    );
+}
+
+/// The core WS1 fix at the backend level: a workspace sitting BEHIND its
+/// advanced branch tip (the coordinator-fold shape) is reconciled by
+/// `reconcile_workspace` — `@` re-parented onto the tip, merged sibling work
+/// materialized, working copy clean — and a subsequent seal succeeds with no
+/// agent-visible error.
+#[test]
+#[serial_test::serial(jj)]
+fn reconcile_workspace_heals_behind_tip_and_reseals() {
+    use crate::mcp::vcs::WorktreeVcs;
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping reconcile_workspace_heals_behind_tip_and_reseals: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let (int_tip, ws_coord, int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
+
+    // Precondition: a seal is refused — `@` is behind the advanced branch tip.
+    let premature = seal(&jj, &ws_coord, "premature", None);
+    assert!(
+        premature
+            .as_ref()
+            .err()
+            .map(|e| is_stale_error(e))
+            .unwrap_or(false),
+        "precondition: sealing a behind-tip workspace is refused: {premature:?}"
+    );
+
+    // Reconcile via the production backend.
+    let backend = crate::mcp::vcs::JjBackend::new(JjEnv::resolve(&bin, home.path()));
+    backend.reconcile_workspace(&ws_coord).unwrap();
+
+    // `@` now sits on the branch tip; the merged sibling file is materialized.
+    let coord_parent = jj
+        .run(
+            &ws_coord,
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+            "coord @- after reconcile",
+        )
+        .unwrap();
+    assert_eq!(
+        coord_parent, int_tip,
+        "reconcile re-parents @ onto the branch tip"
+    );
+    assert!(
+        ws_coord.join("child.rs").exists(),
+        "the merged sibling work is materialized"
+    );
+    assert_eq!(
+        is_working_copy_dirty(&jj, &ws_coord),
+        Ok(false),
+        "the worktree is clean after reconcile"
+    );
+
+    // A subsequent seal succeeds and advances the branch forward.
+    std::fs::write(ws_coord.join("feature.rs"), "coord feature\n").unwrap();
+    let sealed = seal(&jj, &ws_coord, "coord feature", None).unwrap();
+    assert!(
+        !sealed.sha.is_empty(),
+        "the post-reconcile seal lands a commit"
+    );
+    let int_after = bookmark_commit(&jj, &store, &int).unwrap();
+    assert_ne!(
+        int_after, int_tip,
+        "the branch advanced forward past the folded tip"
+    );
+}
+
+/// `reconcile_workspace` leaves a DIRTY working copy untouched — it does not
+/// advance `@` and does not disturb the agent's loose edits — so the seal-time
+/// stale-recovery path retains ownership of the dirty case (running an
+/// unconditional advance on a dirty tree would mint a divergent recovery
+/// commit, jj's own tangle).
+#[test]
+#[serial_test::serial(jj)]
+fn reconcile_workspace_leaves_dirty_workspace_untouched() {
+    use crate::mcp::vcs::WorktreeVcs;
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping reconcile_workspace_leaves_dirty_workspace_untouched: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let (_int_tip, ws_coord, _int) = fold_child_leaving_coordinator_stale(&jj, &store, wts.path());
+
+    // The agent left uncommitted work in `@` (behind-tip AND dirty).
+    std::fs::write(ws_coord.join("wip.rs"), "work in progress\n").unwrap();
+
+    let backend = crate::mcp::vcs::JjBackend::new(JjEnv::resolve(&bin, home.path()));
+    backend.reconcile_workspace(&ws_coord).unwrap();
+
+    // The dirty edit is preserved and `@` was NOT advanced onto the tip.
+    assert_eq!(
+        std::fs::read_to_string(ws_coord.join("wip.rs")).unwrap(),
+        "work in progress\n",
+        "the dirty edit is preserved for seal-time handling"
+    );
+    assert!(
+        !ws_coord.join("child.rs").exists(),
+        "a dirty tree is left to seal-time, not advanced onto the tip"
+    );
+}
+
+/// WS3: a `^` amend whose target commit `@-` is SHARED with a sibling bookmark
+/// is converted into a regular child commit — the shared commit is never
+/// rewritten, only the workspace's own bookmark advances, and the foreign
+/// bookmark stays put. The conversion is surfaced on `CommitResult.amend_note`.
+#[test]
+#[serial_test::serial(jj)]
+fn seal_amend_converts_to_child_when_target_commit_is_shared() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping seal_amend_converts_to_child_when_target_commit_is_shared: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-1-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+
+    // Seal a real commit; `@-` is the sealed tip carrying the own branch.
+    std::fs::write(ws.join("a.rs"), "one\n").unwrap();
+    seal(&jj, &ws, "shared work", None).unwrap();
+    let shared_before = jj
+        .run(
+            &ws,
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+            "shared @-",
+        )
+        .unwrap();
+
+    // Park a FOREIGN bookmark on `@-` (a sibling/integration bookmark).
+    jj.run(
+        &ws,
+        &[
+            "bookmark",
+            "set",
+            "integration",
+            "-r",
+            "@-",
+            "--ignore-working-copy",
+        ],
+        "park foreign bookmark",
+    )
+    .unwrap();
+
+    // New edit + `^` amend: because `@-` is shared, convert to a CHILD commit.
+    std::fs::write(ws.join("b.rs"), "two\n").unwrap();
+    let result = seal(&jj, &ws, "^", None).unwrap();
+    assert!(
+        result
+            .amend_note
+            .as_deref()
+            .map(|n| n.contains("integration"))
+            .unwrap_or(false),
+        "the conversion names the shared bookmark: {:?}",
+        result.amend_note
+    );
+
+    // `@-` is a NEW child commit; the shared commit id is unchanged.
+    let child = jj
+        .run(
+            &ws,
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+            "child @-",
+        )
+        .unwrap();
+    assert_ne!(
+        child, shared_before,
+        "a child commit was sealed, not a rewrite"
+    );
+    let child_parent = jj
+        .run(
+            &ws,
+            &["log", "-r", "@--", "--no-graph", "-T", "commit_id"],
+            "child parent",
+        )
+        .unwrap();
+    assert_eq!(
+        child_parent, shared_before,
+        "the child descends from the shared commit"
+    );
+
+    // The own branch advanced to the child; the foreign bookmark stayed put.
+    assert_eq!(
+        bookmark_commit(&jj, &ws, branch).unwrap(),
+        child,
+        "the workspace's own bookmark advanced onto the child"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &ws, "integration").unwrap(),
+        shared_before,
+        "the foreign bookmark still points at the untouched shared commit"
+    );
+    // The child carries the amend's new edit.
+    let names = jj
+        .run(&ws, &["diff", "-r", "@-", "--name-only"], "child contents")
+        .unwrap();
+    assert!(
+        names.contains("b.rs"),
+        "the child commits the amend's edit: {names}"
+    );
+}
+
+/// WS3 boundary: a plain `^` amend whose target commit is NOT shared still
+/// squashes into the prior commit (keeping its change id) and sets no
+/// amend-conversion note.
+#[test]
+#[serial_test::serial(jj)]
+fn seal_amend_squashes_when_target_commit_is_not_shared() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping seal_amend_squashes_when_target_commit_is_not_shared: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let branch = "agent/CAIRN-1-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+
+    std::fs::write(ws.join("a.rs"), "one\n").unwrap();
+    seal(&jj, &ws, "orig", None).unwrap();
+    let change_before = jj
+        .run(
+            &ws,
+            &["log", "-r", "@-", "--no-graph", "-T", "change_id"],
+            "change before amend",
+        )
+        .unwrap();
+
+    std::fs::write(ws.join("b.rs"), "two\n").unwrap();
+    let result = seal(&jj, &ws, "^", None).unwrap();
+    assert!(
+        result.amend_note.is_none(),
+        "no conversion without a foreign bookmark: {:?}",
+        result.amend_note
+    );
+    let change_after = jj
+        .run(
+            &ws,
+            &["log", "-r", "@-", "--no-graph", "-T", "change_id"],
+            "change after amend",
+        )
+        .unwrap();
+    assert_eq!(
+        change_before, change_after,
+        "a squash amend keeps the change id (folded, not a new child)"
+    );
+    let names = jj
+        .run(
+            &ws,
+            &["diff", "-r", "@-", "--name-only"],
+            "amended contents",
+        )
+        .unwrap();
+    assert!(
+        names.contains("a.rs") && names.contains("b.rs"),
+        "both edits are folded into one commit: {names}"
+    );
+}
+
+/// WS2: the generated jj shim intercepts `jj workspace update-stale` (exit 0 +
+/// explanation, real jj never invoked) and execs the real binary for every
+/// other command (`--version` output matches the real jj byte-for-byte).
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(jj)]
+fn jj_shim_intercepts_update_stale_and_passes_through() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping jj_shim_intercepts_update_stale_and_passes_through: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let shim_dir = ensure_jj_shim_dir(home.path()).unwrap();
+    let shim = shim_dir.join("jj");
+    assert!(shim.exists(), "the shim script is generated");
+
+    // `workspace update-stale` is intercepted: exit 0, explanatory stderr, and
+    // the real jj (pointed at a bogus path) is NEVER invoked.
+    let intercepted = std::process::Command::new(&shim)
+        .args(["workspace", "update-stale"])
+        .env("CAIRN_JJ_BIN", "/definitely/not/a/real/jj")
+        .output()
+        .unwrap();
+    assert!(
+        intercepted.status.success(),
+        "the intercepted update-stale exits 0"
+    );
+    let stderr = String::from_utf8_lossy(&intercepted.stderr);
+    assert!(
+        stderr.contains("Cairn reconciles jj workspace staleness"),
+        "the interception explains itself: {stderr}"
+    );
+
+    // Every other command execs the real jj: `--version` matches byte-for-byte.
+    let via_shim = std::process::Command::new(&shim)
+        .arg("--version")
+        .env("CAIRN_JJ_BIN", &bin)
+        .output()
+        .unwrap();
+    let direct = crate::env::command(&bin).arg("--version").output().unwrap();
+    assert!(via_shim.status.success(), "pass-through --version succeeds");
+    assert_eq!(
+        via_shim.stdout, direct.stdout,
+        "the shim execs the real jj untouched for non-intercepted commands"
+    );
+}
+
+/// WS4 discriminator: the create-pr gate refuses a branch whose delta versus
+/// base is empty. `node_changed_files` reports an empty set over a zero-delta
+/// branch (the +0/-0 PR the gate catches) and a non-empty set once work is
+/// sealed — the exact boolean the sweep-and-gate turns into a refusal.
+#[test]
+#[serial_test::serial(jj)]
+fn node_changed_files_empty_over_zero_delta_branch() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping node_changed_files_empty_over_zero_delta_branch: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+
+    // No seals yet: the branch delta vs main is empty (the empty-PR shape).
+    let empty = node_changed_files(&jj, &ws, Some("main"), None)
+        .expect("base resolves so the delta is measurable");
+    assert!(
+        empty.is_empty(),
+        "a branch with no commits over base has an empty delta: {empty:?}"
+    );
+
+    // After a seal, the delta is non-empty and the gate would pass.
+    std::fs::write(ws.join("feature.rs"), "real work\n").unwrap();
+    seal(&jj, &ws, "real work", None).unwrap();
+    let nonempty = node_changed_files(&jj, &ws, Some("main"), None).unwrap();
+    assert!(
+        nonempty.iter().any(|c| c.path == "feature.rs"),
+        "a sealed branch carries a real delta: {nonempty:?}"
+    );
+}

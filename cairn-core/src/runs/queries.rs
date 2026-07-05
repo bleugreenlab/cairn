@@ -8,11 +8,11 @@ use crate::transcripts::stream_store::ActiveMessageStream;
 use crate::transcripts::stream_store::{
     find_active_stream_for_run, find_active_stream_for_session, read_active_stream,
 };
+use cairn_db::turso::{params, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::Arc;
-use turso::{params, Row};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,17 +116,14 @@ pub(crate) const RUN_COLUMNS: &str =
     "id, issue_id, project_id, job_id, status, session_id, error_message,
     started_at, exited_at, created_at, updated_at, chat_id, exit_reason, start_mode";
 
-pub(crate) const EVENT_COLUMNS: &str =
-    "id, run_id, session_id, sequence, timestamp, event_type, data,
-    parent_tool_use_id, created_at, input_tokens, cache_read_tokens, cache_create_tokens,
-    output_tokens, turn_id, thinking_tokens, storage_mode, content_commit, content_render_sha,
-    data_blob, codec, content_change_id, cost_usd";
-
-/// Number of columns `EVENT_COLUMNS` projects, and therefore the zero-based
-/// index of any extra column appended after it (e.g. `SELECT {EVENT_COLUMNS},
-/// rowid` puts `rowid` here). Keep in lockstep with `EVENT_COLUMNS`: adding a
-/// column there without bumping this read a trailing column at the wrong index.
-pub(crate) const EVENT_COLUMN_COUNT: usize = 22;
+// The event-column contract lives in `storage` so the read path (the storage
+// search index) can reach it without an upward edge. Re-exported here so this
+// module's own SQL and every existing `crate::runs::queries::EVENT_COLUMNS` /
+// `event_from_row` consumer (analytics, archival, transcript) keeps compiling
+// unchanged.
+pub(crate) use crate::storage::events::columns::{
+    event_from_row, EVENT_COLUMNS, EVENT_COLUMN_COUNT,
+};
 
 const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id";
 
@@ -1046,34 +1043,6 @@ pub(crate) fn run_from_row(row: &Row) -> DbResult<Run> {
         created_at: row.i64(9)?,
         updated_at: row.i64(10)?,
         start_mode: row.opt_text(13)?.and_then(|mode| mode.parse().ok()),
-    })
-}
-
-pub(crate) fn event_from_row(row: &Row) -> DbResult<Event> {
-    Ok(Event {
-        id: row.text(0)?,
-        run_id: row.text(1)?,
-        session_id: row.opt_text(2)?,
-        sequence: row.i64(3)? as i32,
-        timestamp: row.i64(4)?,
-        event_type: row.text(5)?,
-        data: row.text(6)?,
-        parent_tool_use_id: row.opt_text(7)?,
-        created_at: row.i64(8)?,
-        input_tokens: row.opt_i64(9)?.map(|value| value as i32),
-        cache_read_tokens: row.opt_i64(10)?.map(|value| value as i32),
-        cache_create_tokens: row.opt_i64(11)?.map(|value| value as i32),
-        output_tokens: row.opt_i64(12)?.map(|value| value as i32),
-        turn_id: row.opt_text(13)?,
-        thinking_tokens: row.opt_i64(14)?.map(|value| value as i32),
-        storage_mode: row.opt_text(15)?,
-        content_commit: row.opt_text(16)?,
-        content_render_sha: row.opt_text(17)?,
-        data_blob: row.opt_blob(18)?,
-        codec: row.opt_text(19)?,
-        content_change_id: row.opt_text(20)?,
-        cost_usd: row.opt_f64(21)?,
-        read_segments: None,
     })
 }
 

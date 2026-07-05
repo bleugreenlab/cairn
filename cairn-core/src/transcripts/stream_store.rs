@@ -7,8 +7,8 @@ use crate::db_records::{DbMessageStream, DbMessageStreamChunk};
 use crate::effects::outbox::{self, OutboxEntry};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{query_opt_text_conn, DbError, DbResult, LocalDb, RowExt};
+use cairn_db::turso::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
-use turso::{params, Connection, Row};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

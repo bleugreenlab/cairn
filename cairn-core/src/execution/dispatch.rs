@@ -15,9 +15,9 @@ use crate::models::{
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::ids;
+use cairn_db::turso::params;
 use std::future::Future;
 use std::sync::Arc;
-use turso::params;
 
 /// Process a single trigger event: enrich, guard, match, dispatch.
 ///
@@ -447,7 +447,7 @@ fn load_execution_dispatch_context(
 }
 
 async fn load_execution_dispatch_context_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<ExecutionDispatchContext> {
     let mut rows = conn
@@ -492,7 +492,7 @@ async fn load_execution_dispatch_context_conn(
 }
 
 async fn load_job_event_context_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<(Option<String>, Option<String>)>> {
     let mut rows = conn
@@ -510,7 +510,7 @@ async fn load_job_event_context_conn(
 }
 
 async fn query_one_text(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     sql: &'static str,
     id: &str,
 ) -> DbResult<Option<String>> {
@@ -522,7 +522,7 @@ async fn query_one_text(
 }
 
 async fn query_one_i64(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     sql: &'static str,
     id: &str,
 ) -> DbResult<Option<i64>> {

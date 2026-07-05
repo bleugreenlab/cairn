@@ -152,7 +152,7 @@ impl IssueStatus {
     /// A terminal status is a stable end-state: no further automated progress
     /// will happen without an external action. `watch` returns on these so an
     /// external driver stops waiting instead of long-polling forever on a done
-    /// issue. Distinct from [`crate::issues::relations::is_complete_status`]
+    /// issue. Distinct from cairn-core's issue-relations completeness check
     /// (dependency satisfaction = Merged | Closed only): `Failed` is terminal
     /// for a watcher's purposes too. `Complete` is intentionally *not* terminal
     /// — it is a transient successful state that typically advances to a PR /

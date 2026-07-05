@@ -7,8 +7,8 @@ use crate::db_records::{db_job_from_row, DbJob, JOB_COLUMNS};
 use crate::error::CairnError;
 use crate::models::{ExecutionSnapshot, Job, RecipeNode};
 use crate::storage::{DbError, LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde::Serialize;
-use turso::params;
 
 #[derive(Debug, Clone)]
 pub struct ImplementationInfo {

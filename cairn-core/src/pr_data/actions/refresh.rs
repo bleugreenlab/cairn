@@ -11,8 +11,8 @@ use crate::pr_data::helpers::{
     local_pr_files, ParsedPrDetails,
 };
 use crate::storage::{DbError, LocalDb, RowExt};
+use cairn_db::turso::params;
 use std::path::Path;
-use turso::params;
 
 use super::conflict::{conflict_recovery_hint, format_conflicted_commits, source_conflict_report};
 use super::context::{

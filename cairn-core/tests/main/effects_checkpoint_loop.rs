@@ -27,9 +27,9 @@ use cairn_core::internal::jj::{self, JjEnv};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_db::turso::params;
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
-use turso::params;
 
 const EXEC_ID: &str = "exec-1";
 const BUILDER_JOB: &str = "builder";

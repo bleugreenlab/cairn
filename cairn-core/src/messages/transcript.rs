@@ -15,7 +15,7 @@ use crate::models::Message;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 /// Insert a `system:message` event per delivered message. Best-effort:
 /// individual insert failures are logged but don't stop the loop, matching the
@@ -429,7 +429,7 @@ async fn insert_system_event(
     .await
 }
 
-async fn next_event_sequence(conn: &turso::Connection, run_id: &str) -> DbResult<i32> {
+async fn next_event_sequence(conn: &cairn_db::turso::Connection, run_id: &str) -> DbResult<i32> {
     let mut rows = conn
         .query(
             "SELECT MAX(sequence) FROM events WHERE run_id = ?1",

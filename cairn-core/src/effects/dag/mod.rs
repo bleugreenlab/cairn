@@ -32,7 +32,7 @@ use crate::models::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 use uuid::Uuid;
 
 use super::types::{ConditionSpec, EffectContext, EffectSource, WorkflowEffect};

@@ -4,7 +4,7 @@
 
 use crate::orchestrator::Orchestrator;
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 use super::{parse_issue_identifier, ProjectContext};
 use crate::issues::relations;
@@ -341,7 +341,10 @@ async fn lookup_project_context(
 /// this root as a child issue's spawner means a delegated sub-task that spawns
 /// the child still points the wake at the owning coordinator, not its own
 /// (possibly completed) job. Returns `None` when the run has no job.
-async fn root_job_for_run(conn: &turso::Connection, run_id: &str) -> DbResult<Option<String>> {
+async fn root_job_for_run(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+) -> DbResult<Option<String>> {
     let mut rows = conn
         .query(
             "SELECT job_id FROM runs WHERE id = ?1 LIMIT 1",
@@ -819,7 +822,7 @@ pub async fn handle_update_issue(orch: &Orchestrator, request: &McpCallbackReque
     }
 }
 
-async fn load_issue_by_id(conn: &turso::Connection, issue_id: &str) -> DbResult<Issue> {
+async fn load_issue_by_id(conn: &cairn_db::turso::Connection, issue_id: &str) -> DbResult<Issue> {
     let mut rows = conn
         .query(
             "

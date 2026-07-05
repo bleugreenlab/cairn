@@ -15,8 +15,8 @@ use cairn_core::internal::services::{
     testing::TestServicesBuilder, RealPtyFactory, TerminalOutputWatcher,
 };
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_db::turso::params;
 use serde_json::{json, Value};
-use turso::params;
 
 async fn real_pty_orchestrator_fixture() -> (tempfile::TempDir, Arc<LocalDb>, Orchestrator) {
     let temp = tempfile::tempdir().unwrap();

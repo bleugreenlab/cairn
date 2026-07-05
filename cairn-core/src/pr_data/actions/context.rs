@@ -3,7 +3,7 @@
 
 use crate::models::{ExecutionSnapshot, RecipeNodeType};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrNodeResolution {
@@ -53,7 +53,7 @@ pub(super) fn db_error(context: &str, error: DbError) -> String {
 /// Query the `merge_requests` row linked to a producing job (joined with its
 /// project for the repo path). `None` when the job has no PR yet.
 pub async fn query_mr_context_for_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<MrContext>> {
     let mut rows = conn
@@ -83,7 +83,7 @@ pub async fn query_mr_context_for_job(
 }
 
 async fn query_pr_node_mr_context_for_artifact_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<MrContext>> {
     let mut job_rows = conn
@@ -177,7 +177,7 @@ async fn query_pr_node_mr_context_for_artifact_job(
 }
 
 pub(super) async fn query_mr_context_for_create_pr_artifact_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<MrContext>> {
     if let Some(context) = query_mr_context_for_job(conn, job_id).await? {

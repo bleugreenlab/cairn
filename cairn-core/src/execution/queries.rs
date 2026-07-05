@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::db_records::{db_job_from_row, DbActionRun, DbExecution, DbJob, JOB_COLUMNS};
 use crate::models::{
@@ -58,7 +58,7 @@ pub fn get_execution_node_statuses(
 /// ordering oldest→newest means the newest live attempt wins the per-node
 /// collapse (a `HashMap` keeps the last value inserted for a key).
 pub(crate) async fn node_statuses_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<HashMap<String, String>> {
     let mut rows = conn
@@ -218,7 +218,7 @@ async fn get_execution_snapshot_async(
         .map_err(|e| format!("Failed to load execution: {e}"))?;
 
     snapshot_json
-        .map(|json| ExecutionSnapshot::from_json(&json))
+        .map(|json| crate::config::snapshot_migrate::load(&json))
         .transpose()
 }
 
@@ -822,7 +822,7 @@ fn prefixed_execution_columns(prefix: &str) -> String {
         .join(", ")
 }
 
-fn db_execution_from_row(row: &turso::Row) -> DbResult<DbExecution> {
+fn db_execution_from_row(row: &cairn_db::turso::Row) -> DbResult<DbExecution> {
     Ok(DbExecution {
         id: row.text(0)?,
         recipe_id: row.text(1)?,
@@ -840,7 +840,7 @@ fn db_execution_from_row(row: &turso::Row) -> DbResult<DbExecution> {
     })
 }
 
-fn db_action_run_from_row(row: &turso::Row) -> Result<DbActionRun, DbError> {
+fn db_action_run_from_row(row: &cairn_db::turso::Row) -> Result<DbActionRun, DbError> {
     Ok(DbActionRun {
         id: row.text(0)?,
         execution_id: row.text(1)?,

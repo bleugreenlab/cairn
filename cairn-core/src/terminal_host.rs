@@ -8,13 +8,13 @@ use crate::services::{
     PortableTerminalChild, PtySession, PtyState, Services, TerminalOutputWatcher, MAX_BUFFER_SIZE,
 };
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use cairn_db::turso::params;
 use portable_pty::{CommandBuilder, PtySize};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use turso::params;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
@@ -82,7 +82,7 @@ pub struct ActiveTerminal {
     pub project_key: String,
 }
 
-fn terminal_from_row(row: &turso::Row) -> DbResult<JobTerminal> {
+fn terminal_from_row(row: &cairn_db::turso::Row) -> DbResult<JobTerminal> {
     Ok(JobTerminal {
         id: row.text(0)?,
         job_id: row.opt_text(1)?,
@@ -535,7 +535,7 @@ async fn project_repo_path(db: Arc<LocalDb>, project_id: String) -> Result<Strin
 }
 
 async fn slug_exists(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: Option<&str>,
     project_id: Option<&str>,
     slug: &str,

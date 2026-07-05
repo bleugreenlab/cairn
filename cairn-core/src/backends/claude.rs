@@ -33,11 +33,11 @@ use crate::transcripts::stream_store::{
     ActiveMessageStream, EmitDelta, EventInsert, StreamAccumulator, StreamingToolWrite,
 };
 use cairn_common::ids;
+use cairn_db::turso::params;
 use std::io::{BufRead, Write};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use turso::params;
 use uuid::Uuid;
 
 use super::{AgentBackend, DiscoveredModel, ResolvedTools, SessionConfig};
@@ -2324,8 +2324,8 @@ mod flush_pending_tests {
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
     use crate::transcripts::stream_store::open_stream;
+    use cairn_db::turso::params;
     use std::sync::Arc;
-    use turso::params;
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();

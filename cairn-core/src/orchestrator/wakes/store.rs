@@ -1,4 +1,4 @@
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::storage::{DbResult, LocalDb, RowExt};
 
@@ -93,7 +93,7 @@ pub async fn peek_pending_suppressed_for_job(
 }
 
 async fn select_pending_suppressed(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Vec<SuppressedWake>> {
     let mut rows = conn

@@ -2,7 +2,7 @@ use crate::issues::crud;
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
 use crate::transitions::Resolution;
-use turso::params;
+use cairn_db::turso::params;
 
 /// Who is driving a status resolution. Gates the fail-closed checks: a person
 /// acting through the UI is a deliberate override (the menu confirms first), so

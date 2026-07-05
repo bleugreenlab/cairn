@@ -40,8 +40,8 @@ use crate::orchestrator::Orchestrator;
 use cairn_common::query::{split_target_query, QueryParam};
 use cairn_common::read::{Affordance, ImageBlock, NaturalUnit, SegmentKind};
 use cairn_common::uri::{parse_uri, CairnResource};
+use cairn_db::turso::Value;
 use std::path::{Path, PathBuf};
-use turso::Value;
 
 // ============================================================================
 // Router

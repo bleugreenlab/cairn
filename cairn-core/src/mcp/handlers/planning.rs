@@ -9,9 +9,9 @@ use crate::models::{TurnStartReason, TurnState, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, RowExt};
 use cairn_common::ids;
+use cairn_db::turso::params;
 use serde::Deserialize;
 use serde_json::Value;
-use turso::params;
 
 use super::permission::{
     emit_successor_turn_events, ensure_and_start_successor_turn, get_issue_title, issue_id_for_run,
@@ -873,7 +873,7 @@ async fn lookup_prompt_for_node_question(
 }
 
 async fn record_prompt_response_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     prompt_id: &str,
     response: &str,
     answered_at: i64,
@@ -950,7 +950,7 @@ async fn record_prompt_response_conn(
 }
 
 async fn ensure_prompt_successor_turn_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
     job_id: &str,
     predecessor_id: &str,
@@ -1027,7 +1027,7 @@ async fn ensure_prompt_successor_turn_conn(
 }
 
 async fn get_successor_turn_id_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     predecessor_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn

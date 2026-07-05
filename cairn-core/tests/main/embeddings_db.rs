@@ -5,7 +5,7 @@ use crate::common;
 
 use cairn_core::internal::embeddings::{queries, vector, EmbedJob};
 use cairn_core::internal::storage::LocalDb;
-use turso::params;
+use cairn_db::turso::params;
 
 async fn create_test_run(db: &LocalDb) -> String {
     let id = uuid::Uuid::new_v4().to_string();

@@ -92,7 +92,10 @@ fn gate_for(
 /// agent is active. Confirmation is decoupled from run state — it keys off the
 /// unconfirmed artifact, not the job status — so a live review no longer hides
 /// the confirm affordance. CAIRN-1576.
-async fn latest_turn_state(conn: &turso::Connection, job_id: &str) -> DbResult<Option<TurnState>> {
+async fn latest_turn_state(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<Option<TurnState>> {
     let mut rows = conn
         .query(
             "SELECT state FROM turns
@@ -113,7 +116,7 @@ async fn latest_turn_state(conn: &turso::Connection, job_id: &str) -> DbResult<O
 /// *including* a memory-review turn. Liveness includes the review so the job
 /// stays Running while the post-completion review agent is active; the terminal
 /// outcome still derives from the work turn via [`latest_turn_state`].
-async fn latest_turn_is_live(conn: &turso::Connection, job_id: &str) -> DbResult<bool> {
+async fn latest_turn_is_live(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT state FROM turns WHERE job_id = ?1 ORDER BY created_at DESC, sequence DESC LIMIT 1",
@@ -132,7 +135,10 @@ async fn latest_turn_is_live(conn: &turso::Connection, job_id: &str) -> DbResult
     ))
 }
 
-async fn latest_artifact_confirmed(conn: &turso::Connection, job_id: &str) -> DbResult<bool> {
+async fn latest_artifact_confirmed(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
@@ -154,7 +160,7 @@ async fn latest_artifact_confirmed(conn: &turso::Connection, job_id: &str) -> Db
 /// only. Falls back to the job-scoped latest when the contract is unnamed (a
 /// command checkpoint, whose seeded artifact has a NULL `output_name`).
 async fn latest_artifact_confirmed_for(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     required_name: Option<&str>,
 ) -> DbResult<bool> {
@@ -181,7 +187,10 @@ async fn latest_artifact_confirmed_for(
 /// Whether any artifact row exists for the job — i.e. the node produced its
 /// declared output. Distinct from `latest_artifact_confirmed`, which conflates
 /// "no artifact" with "artifact awaiting confirmation."
-async fn latest_artifact_present(conn: &turso::Connection, job_id: &str) -> DbResult<bool> {
+async fn latest_artifact_present(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT 1 FROM artifacts WHERE job_id = ?1 LIMIT 1",
@@ -199,7 +208,7 @@ async fn latest_artifact_present(conn: &turso::Connection, job_id: &str) -> DbRe
 /// `artifact_name`. Falls back to any-artifact presence only when the contract
 /// is unnamed (no resolvable `artifact_name`).
 async fn artifact_present_for(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     required_name: Option<&str>,
 ) -> DbResult<bool> {
@@ -225,7 +234,7 @@ async fn artifact_present_for(
 /// reads `turn_failed`. Used by `mark_job_failed` and the no-recovery checkpoint
 /// rejection path — cases where the job has no recovery edge and must go terminal.
 pub(crate) async fn force_fail_job_turn_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<()> {
     let now = chrono::Utc::now().timestamp();
@@ -299,7 +308,7 @@ pub(crate) async fn force_fail_job_turn_conn(
 }
 
 async fn execution_issue_id_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -311,7 +320,10 @@ async fn execution_issue_id_conn(
     crate::storage::next_opt_text(&mut rows, 0).await
 }
 
-async fn load_sweep_jobs(conn: &turso::Connection, execution_id: &str) -> DbResult<Vec<SweepJob>> {
+async fn load_sweep_jobs(
+    conn: &cairn_db::turso::Connection,
+    execution_id: &str,
+) -> DbResult<Vec<SweepJob>> {
     let mut rows = conn
         .query(
             "SELECT id, recipe_node_id, parent_job_id, status, issue_id, project_id,
@@ -340,7 +352,7 @@ async fn load_sweep_jobs(conn: &turso::Connection, execution_id: &str) -> DbResu
 }
 
 async fn write_job_status(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     from: &JobStatus,
     to: &JobStatus,
@@ -430,7 +442,7 @@ fn topo_order(node_ids: &[&str], control: &[(String, String)]) -> Vec<String> {
 /// Recompute one job's status from its facts without writing. Used by tests and
 /// the manager path; the execution sweep computes the same facts in bulk.
 pub async fn recompute_job_status_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<JobStatus> {
     let jobs_one = {
@@ -573,7 +585,7 @@ pub async fn recompute_job_status_conn(
 }
 
 async fn upstream_failed_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     node_id: &str,
     snapshot: &crate::models::ExecutionSnapshot,
@@ -604,7 +616,7 @@ async fn upstream_failed_conn(
 /// Sweep every job in an execution in topological order, writing changed caches
 /// and recomputing execution + issue status. Returns the diffs for effect emission.
 pub async fn recompute_execution_jobs_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<Vec<JobStatusChange>> {
     let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;

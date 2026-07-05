@@ -1,6 +1,6 @@
 use crate::models::{ActionRun, ActionRunStatus, ConditionEvaluation};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 const ACTION_RUN_COLUMNS: &str = "
     id, execution_id, recipe_node_id, action_config_id, issue_id, project_id,
@@ -8,7 +8,7 @@ const ACTION_RUN_COLUMNS: &str = "
     parent_job_id, uri_segment
 ";
 
-pub(crate) fn action_run_from_row(row: &turso::Row) -> DbResult<ActionRun> {
+pub(crate) fn action_run_from_row(row: &cairn_db::turso::Row) -> DbResult<ActionRun> {
     let status = row
         .text(6)?
         .parse::<ActionRunStatus>()
@@ -33,7 +33,7 @@ pub(crate) fn action_run_from_row(row: &turso::Row) -> DbResult<ActionRun> {
     })
 }
 
-fn condition_evaluation_from_row(row: &turso::Row) -> DbResult<ConditionEvaluation> {
+fn condition_evaluation_from_row(row: &cairn_db::turso::Row) -> DbResult<ConditionEvaluation> {
     Ok(ConditionEvaluation {
         id: row.text(0)?,
         execution_id: row.text(1)?,

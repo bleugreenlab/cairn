@@ -16,11 +16,11 @@ use crate::models::{
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_common::ids;
+use cairn_db::turso::params;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
-use turso::params;
 
 fn parse_json_option(
     value: Option<String>,
@@ -333,6 +333,22 @@ pub async fn handle_pr_node(
         now,
     )
     .await?;
+    // CAIRN-2410: fire the same in-process PR-open review edge the legacy
+    // create_pr action fires, or an idle coordinator loses the review wake for a
+    // child PR (the create-pr artifact auto-confirms into a window where the
+    // drain/wake liveness predicate reads the review as dead before the
+    // merge_requests row settles). This also records head_sha on the PR-node
+    // path, keeping the review fingerprint on its precise head-SHA form.
+    fire_pr_open_review(
+        orch,
+        &db,
+        &vcs,
+        &worktree_path,
+        producing_job_id,
+        action_run.issue_id.as_deref(),
+        &branch_name,
+    )
+    .await;
     crate::pr_data::ports::fire_pr_node_port(
         &db,
         &action_run.execution_id,
@@ -684,6 +700,50 @@ async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<Stri
     .map_err(|e| format!("Failed to load project repo_path: {e}"))
 }
 
+/// Record the branch HEAD as the merge_request's `head_sha` and fire the
+/// in-process PR-open review edge. The single shared tail of both in-process
+/// PR-opening paths — the legacy `create_pr` action ([`handle_create_pr`]) and
+/// the first-class PR node ([`handle_pr_node`]) — so the two cannot diverge.
+///
+/// CAIRN-1891: the PR is open in-process right now. The webhook PR-open edge can
+/// be missed (the relay WebSocket can be disconnected when GitHub delivers the
+/// `opened` event, and reconnect fetches 0 missed events), so this is the
+/// reliable, in-process edge. Recording `head_sha` FIRST makes this edge and the
+/// (later) webhook edge compute the SAME review fingerprint — the webhook's
+/// `pull_request.head.sha` is this same commit — and the shared creator's
+/// fingerprint-dedup collapses them to exactly one wake. It also keeps
+/// `merge_requests.head_sha` non-NULL on the PR-node path, so the review
+/// fingerprint uses the precise head-SHA form rather than degrading to the
+/// diffstat. Fires for local PRs too (no webhook ever comes).
+///
+/// CAIRN-2410: `handle_pr_node` (the modern first-class PR node) must call this
+/// too. Without it, a builder's `create-pr` artifact auto-confirms and the PR
+/// opens in a window where the drain/wake liveness predicate reads the review as
+/// dead, so an idle coordinator loses the child-PR review wake entirely.
+async fn fire_pr_open_review(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    vcs: &PrVcs,
+    worktree_path: &str,
+    job_id: &str,
+    issue_id: Option<&str>,
+    branch_name: &str,
+) {
+    if let Ok(head_sha) = vcs.head_sha(worktree_path) {
+        if let Err(e) = set_mr_head_sha(db, job_id, &head_sha).await {
+            log::warn!(
+                "Failed to record merge_request head_sha for job {}: {}",
+                job_id,
+                e
+            );
+        }
+    }
+    if let Some(issue_id) = issue_id {
+        crate::orchestrator::lifecycle::create_review_push_for_pr_open(orch, issue_id, branch_name)
+            .await;
+    }
+}
+
 /// Handle the create_pr action using `gh` CLI.
 async fn handle_create_pr(
     orch: &Orchestrator,
@@ -747,31 +807,18 @@ async fn handle_create_pr(
         serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
 
-    // CAIRN-1891: the PR is open in-process right now. The webhook PR-open edge
-    // can be missed (the relay WebSocket can be disconnected when GitHub delivers
-    // the `opened` event, and reconnect fetches 0 missed events), so fire the
-    // review here too — the reliable, in-process edge. Record the branch HEAD as
-    // the merge_request's head_sha FIRST so this edge and the (later) webhook edge
-    // compute the SAME review fingerprint — the webhook's `pull_request.head.sha`
-    // is this same commit — and the shared creator's fingerprint-dedup collapses
-    // them to exactly one wake. Fires for local PRs too (no webhook ever comes).
-    if let Ok(head_sha) = vcs.head_sha(&worktree_path) {
-        if let Err(e) = set_mr_head_sha(&db, parent_job_id, &head_sha).await {
-            log::warn!(
-                "Failed to record merge_request head_sha for job {}: {}",
-                parent_job_id,
-                e
-            );
-        }
-    }
-    if let Some(issue_id) = action_run.issue_id.as_deref() {
-        crate::orchestrator::lifecycle::create_review_push_for_pr_open(
-            orch,
-            issue_id,
-            &branch_name,
-        )
-        .await;
-    }
+    // CAIRN-1891: the PR is open in-process right now — record head_sha and fire
+    // the reliable in-process PR-open review edge. See `fire_pr_open_review`.
+    fire_pr_open_review(
+        orch,
+        &db,
+        &vcs,
+        &worktree_path,
+        parent_job_id,
+        action_run.issue_id.as_deref(),
+        &branch_name,
+    )
+    .await;
 
     // Refresh the GitHub PR cache so mergeability / review / check state is
     // known promptly. Without this the cache stays unknown until a webhook or
@@ -1811,7 +1858,7 @@ async fn upsert_merge_request_for_pr(
 }
 
 async fn validate_merge_request_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     project_id: &str,
     source_branch: &str,
@@ -1932,7 +1979,7 @@ async fn update_merge_request_status(
     Ok(())
 }
 
-fn action_config_from_row(row: &turso::Row) -> Result<ActionConfig, DbError> {
+fn action_config_from_row(row: &cairn_db::turso::Row) -> Result<ActionConfig, DbError> {
     let input_schema = parse_json_option(row.opt_text(4)?, "input_schema")?;
     let output_schema = parse_json_option(row.opt_text(5)?, "output_schema")?;
 
@@ -1953,7 +2000,7 @@ fn action_config_from_row(row: &turso::Row) -> Result<ActionConfig, DbError> {
     })
 }
 
-fn artifact_from_row(row: &turso::Row) -> Result<Artifact, DbError> {
+fn artifact_from_row(row: &cairn_db::turso::Row) -> Result<Artifact, DbError> {
     let data = serde_json::from_str(&row.text(4)?)
         .map_err(|error| DbError::Row(format!("invalid artifact data JSON: {error}")))?;
 

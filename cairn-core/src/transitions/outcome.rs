@@ -9,10 +9,10 @@
 
 use crate::models::{IssueAttention, IssueProgress};
 use crate::storage::{DbError, DbResult, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 pub async fn recompute_execution_status_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<()> {
     let non_terminal_jobs = count(
@@ -85,7 +85,10 @@ pub async fn recompute_execution_status_conn(
     Ok(())
 }
 
-pub async fn recompute_issue_status_conn(conn: &turso::Connection, issue_id: &str) -> DbResult<()> {
+pub async fn recompute_issue_status_conn(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<()> {
     let Some((progress, attention)) = issue_progress_attention(conn, issue_id).await? else {
         return Ok(());
     };
@@ -141,7 +144,7 @@ pub async fn recompute_issue_status_conn(conn: &turso::Connection, issue_id: &st
 }
 
 async fn issue_progress_attention(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Option<(IssueProgress, IssueAttention)>> {
     let mut issue_rows = conn
@@ -231,7 +234,10 @@ async fn issue_progress_attention(
     Ok(Some((progress, attention)))
 }
 
-async fn issue_completed_at(conn: &turso::Connection, issue_id: &str) -> DbResult<Option<i64>> {
+async fn issue_completed_at(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<Option<i64>> {
     crate::storage::query_opt_i64_conn(
         conn,
         "SELECT completed_at FROM issues WHERE id = ?1",
@@ -240,7 +246,7 @@ async fn issue_completed_at(conn: &turso::Connection, issue_id: &str) -> DbResul
     .await
 }
 
-async fn count(conn: &turso::Connection, sql: &'static str, id: &str) -> DbResult<i64> {
+async fn count(conn: &cairn_db::turso::Connection, sql: &'static str, id: &str) -> DbResult<i64> {
     let mut rows = conn.query(sql, (id,)).await?;
     let row = rows
         .next()
@@ -249,7 +255,11 @@ async fn count(conn: &turso::Connection, sql: &'static str, id: &str) -> DbResul
     row.i64(0)
 }
 
-async fn issue_count(conn: &turso::Connection, issue_id: &str, sql: &'static str) -> DbResult<i64> {
+async fn issue_count(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+    sql: &'static str,
+) -> DbResult<i64> {
     count(conn, sql, issue_id).await
 }
 

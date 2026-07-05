@@ -122,9 +122,57 @@ pub fn seal_paths(
     author: Option<&GitAuthor>,
     paths: &[&str],
 ) -> Result<CommitResult, String> {
+    // Read the workspace's own branch up front: it drives both the amend-share
+    // guard here and the fast-forward guard / bookmark advance further down.
+    let branch = read_branch_marker(ws);
+
     let mut args: Vec<String> = JjEnv::author_args(author);
+    // Set when a `^` amend is CONVERTED to a child commit because `@-` is shared.
+    let mut amend_note: Option<String> = None;
     if msg == "^" {
-        args.extend(["squash".into(), "--use-destination-message".into()]);
+        // A `^` amend rewrites `@-` in place. If `@-` carries a bookmark OTHER than
+        // this workspace's own branch, that commit is SHARED — a sibling or
+        // integration bookmark is parked on it — and squash-rewriting it would
+        // break the sibling (the incident: an amend rewrote a shared integration
+        // commit while the builder's bookmark sat on the tip). Convert to a regular
+        // child commit reusing `@-`'s description; the post-seal `bookmark set
+        // <own-branch> -r @-` then advances only THIS branch and the shared commit
+        // is never rewritten.
+        let foreign: Vec<String> = local_bookmarks_at(jj, ws, "@-")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| branch.as_deref() != Some(b.as_str()))
+            .collect();
+        if foreign.is_empty() {
+            args.extend(["squash".into(), "--use-destination-message".into()]);
+        } else {
+            let desc = jj
+                .run(
+                    ws,
+                    &[
+                        "log",
+                        "-r",
+                        "@-",
+                        "--no-graph",
+                        "-T",
+                        "description",
+                        "--ignore-working-copy",
+                    ],
+                    "jj amend-convert description",
+                )
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            let desc = if desc.is_empty() {
+                "amend".to_string()
+            } else {
+                desc
+            };
+            args.extend(["commit".into(), "-m".into(), desc]);
+            amend_note = Some(format!(
+                "amend converted to a new commit: the previous commit is shared with {}",
+                foreign.join(", ")
+            ));
+        }
     } else {
         args.extend(["commit".into(), "-m".into(), msg.into()]);
     }
@@ -148,7 +196,6 @@ pub fn seal_paths(
     // a follow-up advance can fix it. The healthy case (bookmark == `@-`) and an
     // amend (the bookmark follows the rewrite) both fast-forward. With the
     // post-fold workspace advance in place this is unreachable on the happy path.
-    let branch = read_branch_marker(ws);
     if let Some(branch) = branch.as_deref() {
         if !seal_is_fast_forward(jj, ws, branch)? {
             // The fast-forward guard refused: `@` does not descend from the branch
@@ -231,6 +278,7 @@ pub fn seal_paths(
     Ok(CommitResult {
         sha,
         pr_number: None,
+        amend_note,
     })
 }
 
@@ -254,7 +302,7 @@ pub fn seal_paths(
 /// edit commits into `@` and the bookmark advances), so it must not be refused.
 /// A genuinely-ahead bookmark on a divergent line (the Coordinator-fold case) is
 /// still rejected, because it is not an ancestor of `@`.
-fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, String> {
+pub fn seal_is_fast_forward(jj: &JjEnv, ws: &Path, branch: &str) -> Result<bool, String> {
     let Some(bookmark) = bookmark_commit(jj, ws, branch) else {
         return Ok(true);
     };

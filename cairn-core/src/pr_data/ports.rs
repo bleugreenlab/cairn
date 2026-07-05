@@ -1,8 +1,8 @@
 use crate::storage::{DbResult, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 pub async fn fire_pr_node_port_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     recipe_node_id: &str,
     port: &str,
@@ -90,7 +90,7 @@ pub async fn fire_pr_node_port_for_owner(
 }
 
 pub async fn pr_node_port_fired_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     recipe_node_id: &str,
     port: &str,

@@ -2,7 +2,7 @@ use crate::common;
 
 use cairn_core::internal::execution::jobs::reconcile_stale_active_turn_for_continue_for_test;
 use cairn_core::internal::storage::LocalDb;
-use turso::params;
+use cairn_db::turso::params;
 
 async fn insert_job_session_run_turn(db: &LocalDb, turn_state: &str, run_id: Option<&str>) {
     let project_id = common::create_project(db, "CONT").await;

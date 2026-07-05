@@ -26,7 +26,7 @@ use cairn_core::internal::orchestrator::lifecycle::{stop_session, suspend_run_fo
 use cairn_core::internal::services::testing::MockChildProcess;
 use cairn_core::internal::services::ChildProcess;
 use cairn_core::internal::storage::{LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 /// Options for the suspend/resume fixture.
 struct Fixture {

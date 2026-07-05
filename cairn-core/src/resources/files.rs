@@ -108,7 +108,7 @@ type IssueFileChangeRow = (
     Option<String>,
     String,
 );
-async fn issue_has_jobs(conn: &turso::Connection, issue_id: &str) -> bool {
+async fn issue_has_jobs(conn: &cairn_db::turso::Connection, issue_id: &str) -> bool {
     match conn
         .query(
             "SELECT id FROM jobs WHERE issue_id = ?1 LIMIT 1",
@@ -122,7 +122,7 @@ async fn issue_has_jobs(conn: &turso::Connection, issue_id: &str) -> bool {
 }
 
 async fn load_issue_file_changes_with_agents(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> Vec<IssueFileChangeRow> {
     let mut results = Vec::new();
@@ -172,7 +172,10 @@ async fn load_issue_file_changes_with_agents(
     results
 }
 
-async fn load_issue_file_changes(conn: &turso::Connection, issue_id: &str) -> Vec<FileChangeRow> {
+async fn load_issue_file_changes(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> Vec<FileChangeRow> {
     let mut results = Vec::new();
     if let Ok(mut rows) = conn
         .query(
@@ -209,7 +212,10 @@ async fn load_issue_file_changes(conn: &turso::Connection, issue_id: &str) -> Ve
     results
 }
 
-async fn load_job_file_changes(conn: &turso::Connection, job_id: &str) -> Vec<FileChangeRow> {
+async fn load_job_file_changes(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Vec<FileChangeRow> {
     let mut results = Vec::new();
     if let Ok(mut rows) = conn
         .query(
@@ -251,7 +257,7 @@ async fn load_job_file_changes(conn: &turso::Connection, job_id: &str) -> Vec<Fi
 /// worktree, or have no recorded base — each case falls the projection back to
 /// the recorded `file_changes` cache.
 async fn load_job_vcs_anchors(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let Ok(mut rows) = conn
@@ -291,7 +297,7 @@ async fn load_job_vcs_anchors(
 /// longer exist, and the live-review lag this fixes bites at the node level.
 async fn load_node_changed_rows(
     orch: &Orchestrator,
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> Vec<FileChangeRow> {
     let (worktree_path, base_branch, base_commit) = load_job_vcs_anchors(conn, job_id).await;

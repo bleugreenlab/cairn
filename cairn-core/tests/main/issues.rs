@@ -7,7 +7,7 @@ use cairn_core::models::{
     CommentSource, CreateComment, CreateIssue, Issue, IssueProgress, IssueStatus, UpdateIssue,
 };
 use cairn_core::transitions::Resolution;
-use turso::params;
+use cairn_db::turso::params;
 
 struct FixedClock(i64);
 

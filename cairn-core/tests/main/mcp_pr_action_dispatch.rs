@@ -12,8 +12,8 @@ use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::LocalDb;
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 async fn insert_node(db: &LocalDb, project_id: &str, issue_id: &str) {
     let project_id = project_id.to_string();

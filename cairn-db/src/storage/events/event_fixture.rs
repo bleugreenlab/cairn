@@ -286,15 +286,23 @@ pub fn read_stub(id: &str, paths: &[&str]) -> String {
 /// `handle_read_batch` is asserted separately (see the rewrite tests'
 /// `live_read_batch_round_trips_through_archival`); this builder is the
 /// convenience the per-shape tests assert against.
+///
+/// Routes through the registered [`ArchivedFileRenderer`] rather than naming the
+/// mcp read layer, so `storage` carries no upward edge into it. The caller
+/// must register the renderer first (`register_archived_file_renderer()`); every
+/// archival test does so through its shared `seed_chain` setup.
 pub fn render_targets(targets: &[(&str, &[u8])]) -> String {
+    let renderer =
+        crate::storage::render::archived_file_renderer().expect("archived renderer registered");
     let segments: Vec<cairn_common::read::ReadSegment> = targets
         .iter()
         .map(|(target, bytes)| {
-            crate::mcp::handlers::read::produce_archived_file_segment(target, bytes)
+            renderer
+                .produce_archived_file_segment(target, bytes)
                 .expect("produce archived file segment")
         })
         .collect();
-    crate::mcp::handlers::read::view::assemble(segments).text
+    crate::storage::render::assemble(segments).text
 }
 
 /// One section of a mixed read batch for the hybrid-archival fixtures: a `file:`
@@ -311,20 +319,21 @@ pub enum MixedSection<'a> {
 /// hybrid path, where only the `file:` sections are git-addressed.
 pub fn mixed_render_targets(sections: &[MixedSection]) -> String {
     use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
+    let renderer =
+        crate::storage::render::archived_file_renderer().expect("archived renderer registered");
     let segments: Vec<ReadSegment> = sections
         .iter()
         .map(|section| match section {
-            MixedSection::File(target, bytes) => {
-                crate::mcp::handlers::read::produce_archived_file_segment(target, bytes)
-                    .expect("produce archived file segment")
-            }
+            MixedSection::File(target, bytes) => renderer
+                .produce_archived_file_segment(target, bytes)
+                .expect("produce archived file segment"),
             MixedSection::Resource(uri, body) => ReadSegment::text(
                 *body,
                 SegmentMeta::new(*uri, SegmentKind::Resource, NaturalUnit::Line),
             ),
         })
         .collect();
-    crate::mcp::handlers::read::view::assemble(segments).text
+    crate::storage::render::assemble(segments).text
 }
 
 /// The archived hybrid-read stub stored in `data`: the heavy `toolResult` is

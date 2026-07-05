@@ -51,7 +51,7 @@ pub struct DbAccount {
 }
 
 impl DbAccount {
-    pub(crate) fn from_row(row: &turso::Row) -> Result<Self, DbError> {
+    pub(crate) fn from_row(row: &cairn_db::turso::Row) -> Result<Self, DbError> {
         Ok(Self {
             user_id: row.text(0)?,
             email: row.text(1)?,

@@ -7,7 +7,7 @@
 use crate::models::TodoItem;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 /// Compact one-line-per-todo rendering (`[id] content - status`) returned in
 /// `write` results so the post-mutation state — including freshly assigned
@@ -230,7 +230,10 @@ pub async fn get_todos_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<TodoIte
         .map_err(|e| format!("Failed to load todos: {e}"))
 }
 
-async fn get_todos_for_job_conn(conn: &turso::Connection, job_id: &str) -> DbResult<Vec<TodoItem>> {
+async fn get_todos_for_job_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<Vec<TodoItem>> {
     let mut rows = conn
         .query(
             "

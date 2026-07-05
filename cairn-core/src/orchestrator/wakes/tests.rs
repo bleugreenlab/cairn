@@ -5,7 +5,7 @@ use super::types::FACT_KIND_MESSAGE;
 use crate::messages::queued::DeliveryUrgency;
 use crate::orchestrator::attention_push::Wake;
 use crate::orchestrator::Orchestrator;
-use turso::params;
+use cairn_db::turso::params;
 
 use super::*;
 use std::sync::Arc;

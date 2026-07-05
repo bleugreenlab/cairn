@@ -14,7 +14,7 @@ use std::future::Future;
 /// `block_in_place` panics on a current-thread runtime, so it is gated to the
 /// multi-thread flavor; plain sync callers (desktop Tauri commands, tests) take
 /// the direct path unchanged.
-pub(crate) fn run_db_blocking<T, F, Fut>(make_future: F) -> Result<T, String>
+pub fn run_db_blocking<T, F, Fut>(make_future: F) -> Result<T, String>
 where
     T: Send,
     F: FnOnce() -> Fut + Send,

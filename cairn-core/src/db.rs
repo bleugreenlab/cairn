@@ -21,7 +21,9 @@ use crate::storage::{
 };
 use crate::storage::{ContentStoreFactory, TeamReplicaContext};
 
-pub type TeamId = String;
+// `TeamId` is defined in cairn-db's storage layer and re-exported through the
+// core storage facade; re-export it here so `crate::db::TeamId` is unchanged.
+pub use crate::storage::TeamId;
 
 /// Normalized project key -> routing target. `None` = the private database;
 /// `Some(team)` routes to that team's replica. Shared (`Arc`) so the per-team
@@ -260,7 +262,12 @@ impl DbState {
                         let team_id = team_id.clone();
                         // Turso invokes this before every sync HTTP request; the
                         // minter's cache caps how often it actually hits the api.
-                        async move { minter.mint(&team_id).await.map_err(turso::Error::Error) }
+                        async move {
+                            minter
+                                .mint(&team_id)
+                                .await
+                                .map_err(cairn_db::turso::Error::Error)
+                        }
                     },
                 )
                 .await?

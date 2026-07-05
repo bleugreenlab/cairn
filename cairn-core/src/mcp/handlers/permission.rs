@@ -14,7 +14,7 @@ use crate::models::{ExecutionSnapshot, Fence, TurnStartReason, TurnState, TurnYi
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 use super::{emit_attention, AttentionEvent};
 
@@ -634,7 +634,7 @@ pub(crate) async fn resolve_fence_policy(
         .ok()
         .flatten()?;
 
-    let snapshot = crate::models::ExecutionSnapshot::from_json(&snapshot_json).ok()?;
+    let snapshot = crate::config::snapshot_migrate::load(&snapshot_json).ok()?;
     let agent = snapshot.agents.get(&agent_config_id)?;
     Some(agent.fence.unwrap_or_default())
 }
@@ -683,7 +683,7 @@ pub struct PermissionRequestRecord {
 }
 
 impl PermissionRequestRecord {
-    fn from_row(row: &turso::Row) -> DbResult<Self> {
+    fn from_row(row: &cairn_db::turso::Row) -> DbResult<Self> {
         Ok(Self {
             id: row.text(0)?,
             run_id: row.text(1)?,
@@ -828,7 +828,7 @@ async fn load_permission_snapshot_target(
                 .ok_or_else(|| DbError::Row("Job has no agent_config_id".to_string()))?;
             let snapshot = row
                 .opt_text(2)?
-                .map(|json| ExecutionSnapshot::from_json(&json))
+                .map(|json| crate::config::snapshot_migrate::load(&json))
                 .transpose()
                 .map_err(DbError::Row)?;
             Ok(PermissionSnapshotTarget {
@@ -1659,7 +1659,10 @@ pub(super) async fn issue_id_for_run(db: &LocalDb, run_id: &str) -> DbResult<Opt
         .await
 }
 
-async fn issue_id_for_run_conn(conn: &turso::Connection, run_id: &str) -> DbResult<Option<String>> {
+async fn issue_id_for_run_conn(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+) -> DbResult<Option<String>> {
     let mut rows = conn
         .query(
             "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
@@ -1685,7 +1688,7 @@ pub async fn recompute_issue_status_for_issue(db: &LocalDb, issue_id: &str) -> D
 }
 
 pub(super) async fn yield_turn_for_host(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     turn_id: &str,
     reason: TurnYieldReason,
 ) -> DbResult<bool> {
@@ -1755,7 +1758,7 @@ pub async fn ensure_and_start_successor_turn(
 }
 
 async fn run_turn_context(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     run_id: &str,
 ) -> DbResult<Option<(String, String)>> {
     let mut rows = conn
@@ -1776,7 +1779,7 @@ async fn run_turn_context(
 }
 
 async fn ensure_successor_turn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
     job_id: &str,
     predecessor_turn_id: &str,
@@ -1857,7 +1860,10 @@ async fn ensure_successor_turn(
     })
 }
 
-async fn select_turn_state(conn: &turso::Connection, turn_id: &str) -> DbResult<TurnState> {
+async fn select_turn_state(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+) -> DbResult<TurnState> {
     let mut rows = conn
         .query(
             "SELECT state FROM turns WHERE id = ?1 LIMIT 1",
@@ -1872,7 +1878,7 @@ async fn select_turn_state(conn: &turso::Connection, turn_id: &str) -> DbResult<
     state.parse().map_err(DbError::Row)
 }
 
-async fn count_active_job_turns(conn: &turso::Connection, job_id: &str) -> DbResult<i64> {
+async fn count_active_job_turns(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "
@@ -1891,7 +1897,7 @@ async fn count_active_job_turns(conn: &turso::Connection, job_id: &str) -> DbRes
     row.i64(0)
 }
 
-async fn next_turn_sequence(conn: &turso::Connection, session_id: &str) -> DbResult<i64> {
+async fn next_turn_sequence(conn: &cairn_db::turso::Connection, session_id: &str) -> DbResult<i64> {
     let mut rows = conn
         .query(
             "SELECT MAX(sequence) FROM turns WHERE session_id = ?1",
@@ -1906,7 +1912,7 @@ async fn next_turn_sequence(conn: &turso::Connection, session_id: &str) -> DbRes
 }
 
 async fn start_turn_for_run(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     turn_id: &str,
     run_id: &str,
 ) -> DbResult<bool> {
@@ -2059,7 +2065,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let snapshot = ExecutionSnapshot::from_json(&snapshot).unwrap();
+        let snapshot = crate::config::snapshot_migrate::load(&snapshot).unwrap();
         assert_eq!(snapshot.agents["agent-1"].fence, Some(Fence::Allow));
     }
 

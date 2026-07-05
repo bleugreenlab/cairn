@@ -4,7 +4,7 @@ use crate::common;
 
 use cairn_core::internal::storage::{DbResult, LocalDb};
 use cairn_core::merge_requests::queries;
-use turso::params;
+use cairn_db::turso::params;
 
 async fn create_execution(db: &LocalDb, project_id: &str) -> String {
     let id = uuid::Uuid::new_v4().to_string();

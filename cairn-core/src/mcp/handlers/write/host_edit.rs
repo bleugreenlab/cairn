@@ -14,7 +14,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use turso::params;
+use cairn_db::turso::params;
 
 use super::file_mutations::{changed_line_counts, emit_worktree_changed, record_file_change_async};
 use crate::mcp::git::GitAuthor;
@@ -813,6 +813,7 @@ mod tests {
             Ok(CommitResult {
                 sha: "recovered".to_string(),
                 pr_number: None,
+                amend_note: None,
             }),
         ]);
         let sha = finish_commit(&vcs, dir.path(), &file, "a.rs", "x\n", "msg", None).unwrap();
@@ -848,6 +849,7 @@ mod tests {
             Ok(CommitResult {
                 sha: "recovered".to_string(),
                 pr_number: None,
+                amend_note: None,
             }),
         ]);
         let sha = finish_commit(&vcs, dir.path(), &file, "a.rs", "x\n", "msg", None).unwrap();

@@ -4,12 +4,12 @@ use crate::backends::run_state::run_backend_db;
 use crate::backends::AgentBackend;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use turso::params;
 
 pub(super) fn codex_mcp_elicitation_accept_payload() -> Value {
     serde_json::json!({

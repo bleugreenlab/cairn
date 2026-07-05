@@ -14,8 +14,8 @@ use crate::common::{
     read_resource as read, resource_orchestrator_fixture,
 };
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 const RECIPE_YAML: &str = "cairnVersion: 1\nname: Deploy Flow\ndescription: A deploy recipe\ntrigger: issue\ncontext: issue\n\nnodes:\n  - id: trigger-1\n    type: trigger\n    name: Trigger\n    position: 0@0\n\nedges: []\n";
 

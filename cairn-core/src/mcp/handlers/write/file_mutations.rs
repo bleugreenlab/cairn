@@ -11,9 +11,9 @@ use crate::mcp::git::GitAuthor;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
 use crate::storage::RowExt;
+use cairn_db::turso::params;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use turso::params;
 
 /// Rejection returned when a file-target change is attempted in a non-worktree
 /// cwd (the project's live checkout). Changes can only happen in a worktree, so
@@ -1353,7 +1353,9 @@ pub(super) async fn finalize_file_commit(
                 .to_string(),
                 sha: Some(result.sha),
                 pr_number: result.pr_number,
-                message: None,
+                // Surface an amend that was converted to a child commit because
+                // the target commit is shared with a sibling bookmark.
+                message: result.amend_note,
             })))
         }
         Err(e) if crate::jj::is_conflicted_branch_seal_error(&e) => {

@@ -28,7 +28,7 @@ pub(super) fn db_internal(message: impl Into<String>) -> DbError {
 }
 
 pub(super) async fn load_job_by_id_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<DbJob>> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1 LIMIT 1");

@@ -51,6 +51,12 @@ fn git_stdout(
 pub struct CommitResult {
     pub sha: String,
     pub pr_number: Option<i32>,
+    /// Set when a `^` amend was CONVERTED into a regular child commit because the
+    /// commit it would have rewritten is shared with a sibling bookmark. Carries a
+    /// human-readable note the barrier/commit report surfaces so the agent's `^`
+    /// intent visibly landed as a child commit instead of silently rewriting
+    /// shared history. `None` for every ordinary seal/amend.
+    pub amend_note: Option<String>,
 }
 
 pub fn current_commit(worktree_path: &Path) -> Result<String, String> {

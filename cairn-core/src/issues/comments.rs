@@ -5,12 +5,12 @@ use crate::models::{Comment, CommentSource, CreateComment};
 use crate::services::Clock;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
+use cairn_db::turso::params;
 use std::sync::Arc;
-use turso::params;
 
 const COMMENT_COLUMNS: &str = "id, issue_id, content, source, created_at, seq";
 
-fn comment_from_row(row: &turso::Row) -> DbResult<Comment> {
+fn comment_from_row(row: &cairn_db::turso::Row) -> DbResult<Comment> {
     Ok(Comment {
         id: row.text(0)?,
         issue_id: row.text(1)?,
@@ -24,7 +24,7 @@ fn comment_from_row(row: &turso::Row) -> DbResult<Comment> {
 /// Next 1-based per-issue comment sequence. Computed inside the caller's write
 /// transaction so the local single-writer DB assigns gap-free, stable seqs.
 pub(crate) async fn next_issue_comment_seq(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<i64> {
     let mut rows = conn
@@ -82,7 +82,7 @@ pub async fn owning_db_for_comment(
     crate::execution::routing::routing_db_for_id(dbs, comment_id).await
 }
 
-async fn load_conn(conn: &turso::Connection, id: &str) -> DbResult<Comment> {
+async fn load_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Comment> {
     let sql = format!("SELECT {COMMENT_COLUMNS} FROM comments WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
     rows.next()

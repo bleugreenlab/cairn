@@ -10,8 +10,8 @@ use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_core::models::Fence;
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 /// A fence-crossing `tool_input`, as `raise_fence` stores it. `descriptor` is the
 /// session-grant key; `request` is the originating verb, embedded for resume.

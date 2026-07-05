@@ -341,15 +341,15 @@ async fn apply(
                 conn.execute(
                     "INSERT OR IGNORE INTO archival_blobs(hash, content, created_at)
                      VALUES (?1, ?2, unixepoch())",
-                    (hash.as_str(), turso::Value::Blob(content.clone())),
+                    (hash.as_str(), cairn_db::turso::Value::Blob(content.clone())),
                 )
                 .await?;
             }
             for (id, shape) in &updates {
                 let cols = shape.encode();
                 let blob_value = match &cols.data_blob {
-                    Some(blob) => turso::Value::Blob(blob.clone()),
-                    None => turso::Value::Null,
+                    Some(blob) => cairn_db::turso::Value::Blob(blob.clone()),
+                    None => cairn_db::turso::Value::Null,
                 };
                 conn.execute(
                     "UPDATE events SET storage_mode = ?1, content_commit = ?2,
@@ -461,7 +461,7 @@ mod tests {
     };
     use crate::storage::reconstruct_events;
     use crate::storage::{migrated_test_db, SearchIndex};
-    use turso::params;
+    use cairn_db::turso::params;
 
     /// Seed a project/execution/job/run chain. `worktree_path` is the job's
     /// recorded path: `None` (never had a worktree) and a nonexistent path are

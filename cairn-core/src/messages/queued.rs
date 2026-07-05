@@ -17,56 +17,15 @@
 //! stranded — the resume claim sweeps it up.
 
 use cairn_common::ids;
+use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
-use turso::params;
 
 use crate::storage::{run_db_blocking, DbResult, LocalDb, RowExt};
 
-/// Canonical delivery urgency for inbound job-bound content.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum DeliveryUrgency {
-    /// Do not wake; ride along with the next agent-bound payload.
-    Passive,
-    /// Wake idle recipients; active recipients receive this at turn boundary.
-    Queue,
-    /// Wake idle recipients; active recipients receive this at tool or turn boundary.
-    Steer,
-    /// Wake idle recipients; active recipients are interrupted then resumed.
-    Interrupt,
-}
-
-impl DeliveryUrgency {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DeliveryUrgency::Passive => "passive",
-            DeliveryUrgency::Queue => "queue",
-            DeliveryUrgency::Steer => "steer",
-            DeliveryUrgency::Interrupt => "interrupt",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "passive" => Ok(DeliveryUrgency::Passive),
-            "queue" => Ok(DeliveryUrgency::Queue),
-            "steer" => Ok(DeliveryUrgency::Steer),
-            "interrupt" => Ok(DeliveryUrgency::Interrupt),
-            other => Err(format!("invalid delivery urgency: {other}")),
-        }
-    }
-
-    pub fn wakes_idle(self) -> bool {
-        self >= DeliveryUrgency::Queue
-    }
-
-    pub fn delivered_at_tool_boundary(self) -> bool {
-        matches!(
-            self,
-            DeliveryUrgency::Passive | DeliveryUrgency::Steer | DeliveryUrgency::Interrupt
-        )
-    }
-}
+/// Canonical delivery urgency for inbound job-bound content. Defined in
+/// `models::message`; re-exported here (and aliased as [`Delivery`]) so the
+/// queued-message CRUD/claim logic keeps resolving the local name.
+pub use crate::models::DeliveryUrgency;
 
 pub type Delivery = DeliveryUrgency;
 
@@ -81,7 +40,7 @@ pub struct QueuedMessage {
     pub delivered_at: Option<i64>,
 }
 
-fn message_from_row(row: &turso::Row) -> DbResult<QueuedMessage> {
+fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<QueuedMessage> {
     let delivery = Delivery::parse(&row.text(3)?).map_err(crate::storage::DbError::Row)?;
     Ok(QueuedMessage {
         id: row.text(0)?,

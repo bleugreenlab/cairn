@@ -861,7 +861,7 @@ async fn patch_execution_agent_snapshot_updates_stored_snapshot() {
         .await
         .unwrap()
         .unwrap();
-    let snap = crate::models::ExecutionSnapshot::from_json(&json).unwrap();
+    let snap = crate::config::snapshot_migrate::load(&json).unwrap();
     assert_eq!(snap.agents["builder"].prompt, "new");
 }
 

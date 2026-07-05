@@ -5,8 +5,8 @@
 //! threshold is reached. Events are grouped by a configurable field
 //! (`group_by`) and scoped by project, issue, or global.
 
+use cairn_db::turso::params;
 use serde_json::Value;
-use turso::params;
 use uuid::Uuid;
 
 use crate::models::{AccumulationScope, Recipe, RecipeNodeType};
@@ -241,7 +241,7 @@ pub async fn try_accumulate(
 }
 
 async fn load_accumulator_state(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     recipe_id: &str,
     group_key: &str,
     scope_key: &str,

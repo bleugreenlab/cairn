@@ -2,7 +2,9 @@ use super::{
     create_review_push_for_pr_open, create_review_push_on_turn_end, issue_for_attention_by_job,
 };
 use crate::db::DbState;
-use crate::orchestrator::attention_push::{list_pending, stamp_delivered, Boundary, Push, Wake};
+use crate::orchestrator::attention_push::{
+    latest_push_fingerprint, list_pending, stamp_delivered, Boundary, Push, Wake,
+};
 use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
 use crate::services::testing::TestServicesBuilder;
 use crate::storage::{LocalDb, SearchIndex};
@@ -521,6 +523,71 @@ async fn pr_open_and_node_idle_share_one_creator() {
     assert_eq!(
         after_idle[0].id, row_id,
         "both edges share one push row keyed review:{{issue}}"
+    );
+}
+
+#[tokio::test]
+async fn pr_open_after_idle_artifact_push_supersedes_to_pr_fingerprint() {
+    // The CAIRN-2410 incident, reconstructed. A builder's `create-pr` artifact
+    // auto-confirms on write (CAIRN-1219); the coordinator's node-idle edge
+    // pushes a review with an `artifact:` fingerprint while no merge_requests
+    // row exists yet. The PR opens ~42ms later. Before the fix the PR-open edge
+    // never ran on the first-class PR-node path, so this second edge never
+    // re-fired and the wake was lost. Now the idle-edge artifact push, then the
+    // PR opening, then the PR-open edge supersedes the SAME review:{issue} row to
+    // a `pr:` fingerprint on a rousing push that wakes the idle watcher.
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    // The reviewable artifact is a CONFIRMED create-pr (the auto-confirm the
+    // incident hinges on), and there is no merge_requests row yet.
+    insert_artifact(&db, "create-pr", 1).await;
+    let orch = test_orchestrator(db);
+
+    // Idle edge fires first: one review push fingerprinted on the artifact.
+    run_review_push(&orch);
+    let after_idle = pending(&orch, "j-watch").await;
+    assert_eq!(after_idle.len(), 1);
+    let idle_row = after_idle[0].id.clone();
+    let idle_fp = latest_push_fingerprint(&orch.db.local, "j-watch", REVIEW_KEY)
+        .await
+        .unwrap()
+        .flatten()
+        .unwrap();
+    assert!(
+        idle_fp.starts_with("artifact:"),
+        "idle edge fingerprints on the artifact, got {idle_fp}"
+    );
+
+    // The PR opens: the merge_requests row lands (the 42ms-late seed).
+    insert_open_pr(&orch.db.local).await;
+
+    // The PR-open edge re-evaluates the same review key. The reviewable ref is
+    // now the open PR, so the fingerprint changes to `pr:` and the row is
+    // superseded in place — still exactly one undelivered review.
+    run_pr_open(&orch).await;
+    let after_open = pending(&orch, "j-watch").await;
+    assert_eq!(
+        after_open.len(),
+        1,
+        "supersede-by-key collapses the idle and PR-open pushes to one undelivered row"
+    );
+    assert_eq!(
+        after_open[0].id, idle_row,
+        "the PR-open push supersedes the idle push in place (same review:{{issue}} key)"
+    );
+    assert_eq!(
+        after_open[0].wake,
+        Wake::Wake,
+        "the superseding review is rousing, so an idle watcher is woken"
+    );
+    let open_fp = latest_push_fingerprint(&orch.db.local, "j-watch", REVIEW_KEY)
+        .await
+        .unwrap()
+        .flatten()
+        .unwrap();
+    assert!(
+        open_fp.starts_with("pr:"),
+        "the PR-open edge fingerprints on the open PR, got {open_fp}"
     );
 }
 

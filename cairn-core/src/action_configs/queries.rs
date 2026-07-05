@@ -1,6 +1,6 @@
 //! Action configuration database queries.
 
-use turso::params;
+use cairn_db::turso::params;
 use uuid::Uuid;
 
 use crate::models::{
@@ -21,7 +21,7 @@ fn parse_json_option(value: Option<String>, label: &str) -> DbResult<Option<serd
         .map_err(|error| DbError::Row(format!("invalid {label} JSON: {error}")))
 }
 
-fn action_config_from_row(row: &turso::Row) -> DbResult<ActionConfig> {
+fn action_config_from_row(row: &cairn_db::turso::Row) -> DbResult<ActionConfig> {
     let input_schema = parse_json_option(row.opt_text(4)?, "input_schema")?;
     let output_schema = parse_json_option(row.opt_text(5)?, "output_schema")?;
 
@@ -43,7 +43,7 @@ fn action_config_from_row(row: &turso::Row) -> DbResult<ActionConfig> {
 }
 
 async fn load_action_config_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     id: &str,
 ) -> DbResult<Option<ActionConfig>> {
     let mut rows = conn

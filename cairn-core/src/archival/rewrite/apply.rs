@@ -22,7 +22,7 @@ pub(super) async fn apply(
                 conn.execute(
                     "INSERT OR IGNORE INTO archival_blobs(hash, content, created_at)
                      VALUES (?1, ?2, unixepoch())",
-                    (hash.as_str(), turso::Value::Blob(content.clone())),
+                    (hash.as_str(), cairn_db::turso::Value::Blob(content.clone())),
                 )
                 .await?;
             }
@@ -71,7 +71,10 @@ pub(super) async fn apply(
 /// ([`crate::storage::events::encoding::ArchivedShape::encode`]), shared by the inline ([`apply`])
 /// and offloaded ([`apply_offloaded`]) paths so the two can never diverge on how
 /// a row is rewritten. `content_change_id` rides along as orthogonal provenance.
-async fn write_event_updates(conn: &turso::Connection, updates: &[EventUpdate]) -> DbResult<()> {
+async fn write_event_updates(
+    conn: &cairn_db::turso::Connection,
+    updates: &[EventUpdate],
+) -> DbResult<()> {
     for EventUpdate {
         id,
         shape,
@@ -83,8 +86,8 @@ async fn write_event_updates(conn: &turso::Connection, updates: &[EventUpdate]) 
         // `decode` would reject.
         let cols = shape.encode();
         let blob_value = match &cols.data_blob {
-            Some(blob) => turso::Value::Blob(blob.clone()),
-            None => turso::Value::Null,
+            Some(blob) => cairn_db::turso::Value::Blob(blob.clone()),
+            None => cairn_db::turso::Value::Null,
         };
         conn.execute(
             "UPDATE events SET storage_mode = ?1, content_commit = ?2,

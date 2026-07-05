@@ -5,8 +5,8 @@ use crate::db::DbState;
 use crate::orchestrator::Orchestrator;
 use crate::services::testing::{MockGitClient, TestServicesBuilder};
 use crate::storage::{LocalDb, SearchIndex};
+use cairn_db::turso::params;
 use std::sync::Arc;
-use turso::params;
 
 pub(super) async fn migrated_db() -> LocalDb {
     crate::storage::migrated_test_db("reconcile-test.db").await

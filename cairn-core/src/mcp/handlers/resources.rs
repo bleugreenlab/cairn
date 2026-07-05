@@ -12,7 +12,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::query::split_target_query;
 use cairn_common::uri::{parse_uri, CairnResource};
-use turso::params;
+use cairn_db::turso::params;
 
 /// Type alias for read cursor state: session_id -> bytes_read
 /// Uses per-terminal cursor so reads "consume" output regardless of which run is reading.
@@ -54,7 +54,7 @@ pub struct ReadResourcePayload {
 }
 
 async fn find_terminal_target_job_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,
@@ -118,7 +118,7 @@ async fn find_terminal_target_job_id(
 }
 
 async fn find_task_terminal_target_job_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
     exec_seq: i32,

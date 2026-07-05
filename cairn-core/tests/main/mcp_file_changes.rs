@@ -10,8 +10,8 @@ use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use cairn_core::memories::db as memory_db;
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 // The change/write path seals and discards through the jj VCS seam, so a
 // file-target test cwd must be a real `.jj` workspace over a shared store. These

@@ -8,9 +8,11 @@
 //! `write`) is the authorization — there is no separate user-only guard.
 
 use cairn_common::protocol::CallbackRequest;
-use turso::params;
+use cairn_db::turso::params;
 
-use crate::models::{AgentSnapshot, ExecutionSnapshot};
+use crate::models::AgentSnapshot;
+#[cfg(test)]
+use crate::models::ExecutionSnapshot;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
 
@@ -64,6 +66,7 @@ pub async fn start_execution_from_collection(
         &project_id,
         backend,
         Some("external"),
+        crate::models::TriggerType::Manual,
     )?;
 
     // Wake any in-flight `watch` so the driving loop re-derives state promptly.
@@ -128,7 +131,7 @@ pub async fn edit_execution_agent(
 
 /// Shallow-merge a partial agent-snapshot patch over the stored snapshot for one
 /// agent, then validate the result as a full `AgentSnapshot`. The stored base is
-/// taken through `ExecutionSnapshot::from_json` (migrate-on-read), so the patch
+/// taken through `config::snapshot_migrate::load` (migrate-on-read), so the patch
 /// merges onto the current-form representation. When the agent does not yet exist
 /// in the snapshot, the patch must itself be a complete snapshot.
 async fn merge_agent_snapshot(
@@ -174,7 +177,7 @@ async fn load_agent_snapshot_value(
     let Some(json) = json else {
         return Ok(None);
     };
-    let snapshot = ExecutionSnapshot::from_json(&json)?;
+    let snapshot = crate::config::snapshot_migrate::load(&json)?;
     match snapshot.agents.get(agent_id) {
         Some(agent) => Ok(Some(
             serde_json::to_value(agent).map_err(|e| e.to_string())?,
@@ -322,7 +325,7 @@ async fn load_stored_agent_fence(
     let Some(json) = json else {
         return Ok(None);
     };
-    let snapshot = ExecutionSnapshot::from_json(&json)?;
+    let snapshot = crate::config::snapshot_migrate::load(&json)?;
     Ok(snapshot.agents.get(agent_id).and_then(|a| a.fence))
 }
 
@@ -541,7 +544,7 @@ mod snapshot_edit_guard_tests {
             .await
             .unwrap()
             .unwrap();
-        ExecutionSnapshot::from_json(&json).unwrap()
+        crate::config::snapshot_migrate::load(&json).unwrap()
     }
 
     async fn needs_fresh_session(db: &LocalDb, job_id: &str) -> bool {

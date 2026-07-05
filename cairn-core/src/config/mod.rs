@@ -50,6 +50,7 @@ pub mod secrets;
 pub mod settings;
 pub mod skill_fetch;
 pub mod skills;
+pub mod snapshot_migrate;
 pub mod web_fetch;
 pub mod web_search;
 pub mod yaml_edit;

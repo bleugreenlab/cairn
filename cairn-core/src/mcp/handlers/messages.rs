@@ -13,7 +13,7 @@ use crate::orchestrator::attention::{AttentionEvent, AttentionFact, ExternalMess
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_common::uri::{build_job_base_uri, build_node_uri, parse_uri, CairnResource};
-use turso::params;
+use cairn_db::turso::params;
 
 async fn sender_name_for_run(db: &LocalDb, run_ctx: &super::RunContext) -> Result<String, String> {
     let node_name = run_ctx.job_name.as_deref().unwrap_or("unknown");

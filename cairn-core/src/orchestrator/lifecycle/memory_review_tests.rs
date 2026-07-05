@@ -310,6 +310,14 @@ async fn sent_idle_confirms_surviving_drafts_and_spawns_triage() {
     }
     // The review turn has ended (Complete): completion is allowed to fire.
     insert_review_turn(&db, "complete").await;
+    // The draft-confirmation eligibility gate in `confirm_draft_memories_for_job`
+    // only advances a job's drafts out of `draft` once the work that produced
+    // them has landed — i.e. the owning issue is merged. Mark `i-review` merged
+    // so the review-completion hook actually confirms its survivors (matching the
+    // production path where a review completes on an already-merged issue).
+    db.execute("UPDATE issues SET merged_at = 1 WHERE id = 'i-review'", ())
+        .await
+        .unwrap();
     let orch = test_orchestrator(db);
 
     finish_memory_review_if_due(&orch, "j-review", "run-review");

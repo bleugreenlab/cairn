@@ -3,7 +3,7 @@
 use crate::models::RunStatus;
 use crate::services::EventEmitter;
 use crate::storage::{DbError, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 use super::TransitionError;
 

@@ -10,7 +10,7 @@ use crate::orchestrator::Orchestrator;
 use crate::resources::mutations::{dispatch_resource_change, hash_resource_target};
 use crate::storage::RowExt;
 use cairn_common::uri::{parse_uri, CairnResource};
-use turso::params;
+use cairn_db::turso::params;
 
 #[derive(Debug, Clone)]
 pub(super) struct ChangePreviewEvent {

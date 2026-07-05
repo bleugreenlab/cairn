@@ -7,7 +7,7 @@
 //! Usage: cargo run -p cairn-core --example dump_event_sizes -- /path/to/db
 
 use cairn_codec::codec::{decompress, CODEC_ZSTD_V1};
-use turso::{Builder, Value};
+use cairn_db::turso::{Builder, Value};
 
 fn text(v: &Value) -> String {
     match v {

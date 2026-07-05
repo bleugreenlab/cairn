@@ -1,7 +1,7 @@
 use super::*;
 
 async fn condition_edge_satisfied_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     edge: &DbRecipeEdge,
 ) -> DbResult<bool> {
@@ -22,7 +22,7 @@ async fn condition_edge_satisfied_conn(
 }
 
 pub(super) async fn is_action_node_ready_with_snapshot_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     node_id: &str,
     all_edges: &[DbRecipeEdge],
@@ -109,7 +109,10 @@ pub(super) async fn is_action_node_ready_with_snapshot_conn(
     Ok(true)
 }
 
-pub(super) async fn is_job_ready_conn(conn: &turso::Connection, job: &DbJob) -> DbResult<bool> {
+pub(super) async fn is_job_ready_conn(
+    conn: &cairn_db::turso::Connection,
+    job: &DbJob,
+) -> DbResult<bool> {
     let Some(node_id) = job.recipe_node_id.as_deref() else {
         return Ok(true);
     };
@@ -145,7 +148,7 @@ fn node_map(nodes: &[DbRecipeNode]) -> HashMap<&str, &DbRecipeNode> {
 }
 
 async fn find_ready_nodes_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     node_types: &[&str],
     completed_table: &str,
@@ -369,7 +372,7 @@ mod tests {
         }
     }
 
-    async fn seed(conn: &turso::Connection, dep_status: &str) {
+    async fn seed(conn: &cairn_db::turso::Connection, dep_status: &str) {
         conn.execute(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)",
             (),

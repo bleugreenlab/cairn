@@ -5,8 +5,8 @@ use crate::common::{change_resource as change, read_resource};
 use cairn_common::uri::{build_issue_uri, build_project_issues_uri, build_project_uri};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 struct IssueProjectFixture {
     _temp: tempfile::TempDir,
@@ -899,8 +899,8 @@ async fn blocked_artifact_read_surfaces_resolution_actions() {
     assert!(blocked.contains("confirmed:true"));
     assert!(blocked.contains("cairn://p/MCP/1/1/planner/plan"));
     assert!(blocked.contains("continue"));
-    // The continue action targets the producing node, not the artifact.
-    assert!(blocked.contains("target:\"cairn://p/MCP/1/1/planner\""));
+    // The continue action targets the producing node's messages collection, not the artifact.
+    assert!(blocked.contains("target:\"cairn://p/MCP/1/1/planner/messages\""));
 
     // Non-blocked producing job: no resolution affordance, raw artifact only.
     let done = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder/pr".to_string()).await;

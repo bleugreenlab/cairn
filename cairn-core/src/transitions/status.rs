@@ -5,42 +5,14 @@ use crate::models::JobStatus;
 use crate::services::EventEmitter;
 use crate::services::RealClock;
 use crate::storage::{DbError, LocalDb, RowExt};
-use serde::{Deserialize, Serialize};
-use turso::params;
+use cairn_db::turso::params;
 
 /// Execution lifecycle status.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecutionStatus {
-    #[default]
-    Running,
-    Complete,
-    Failed,
-}
-
-impl std::fmt::Display for ExecutionStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExecutionStatus::Running => write!(f, "running"),
-            ExecutionStatus::Complete => write!(f, "complete"),
-            ExecutionStatus::Failed => write!(f, "failed"),
-        }
-    }
-}
-
-impl std::str::FromStr for ExecutionStatus {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "running" => Ok(ExecutionStatus::Running),
-            "complete" => Ok(ExecutionStatus::Complete),
-            "failed" => Ok(ExecutionStatus::Failed),
-            "paused" => Ok(ExecutionStatus::Running),
-            other => Err(format!("unknown execution status: {}", other)),
-        }
-    }
-}
+///
+/// The canonical derivation logic is `recompute_execution_status` below; the
+/// enum itself now lives in `models::execution`, re-exported here so existing
+/// `transitions::ExecutionStatus` callers keep resolving.
+pub use crate::models::ExecutionStatus;
 
 /// Resolution type for issue merge/close.
 #[derive(Debug, Clone, Copy)]
@@ -228,7 +200,7 @@ pub async fn transition_job_readiness(
 }
 
 async fn issue_id_for_execution_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> crate::storage::DbResult<Option<String>> {
     let mut rows = conn
@@ -260,7 +232,7 @@ mod tests {
     use crate::models::JobStatus;
     use crate::services::testing::CapturingEmitter;
     use crate::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
-    use turso::params;
+    use cairn_db::turso::params;
 
     async fn migrated_db() -> LocalDb {
         let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("resolve.db"))

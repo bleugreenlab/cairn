@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use cairn_common::uri::{build_issue_uri, parse_uri, CairnResource};
+use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
-use turso::params;
 
 use crate::models::IssueStatus;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -47,7 +47,7 @@ pub fn is_complete_status(status: &IssueStatus) -> bool {
 }
 
 pub async fn list_dependency_uris(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
     let mut rows = conn
@@ -64,7 +64,7 @@ pub async fn list_dependency_uris(
 }
 
 pub async fn list_dependent_issue_ids(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     depends_on_uri: &str,
 ) -> DbResult<Vec<String>> {
     let canonical = canonicalize_issue_uri(depends_on_uri).map_err(DbError::Row)?;
@@ -82,7 +82,7 @@ pub async fn list_dependent_issue_ids(
 }
 
 pub async fn list_issue_dependencies(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Vec<DependencyRef>> {
     let mut dependencies = Vec::new();
@@ -114,7 +114,10 @@ pub async fn list_issue_dependencies(
     Ok(dependencies)
 }
 
-pub async fn resolve_issue_uri(conn: &turso::Connection, uri: &str) -> DbResult<Option<IssueRef>> {
+pub async fn resolve_issue_uri(
+    conn: &cairn_db::turso::Connection,
+    uri: &str,
+) -> DbResult<Option<IssueRef>> {
     let canonical = canonicalize_issue_uri(uri).map_err(DbError::Row)?;
     let Some(CairnResource::Issue { project, number }) = parse_uri(&canonical) else {
         return Ok(None);
@@ -148,7 +151,10 @@ pub async fn resolve_issue_uri(conn: &turso::Connection, uri: &str) -> DbResult<
         .transpose()
 }
 
-pub async fn issue_uri_for_id(conn: &turso::Connection, issue_id: &str) -> DbResult<String> {
+pub async fn issue_uri_for_id(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<String> {
     let mut rows = conn
         .query(
             "
@@ -213,7 +219,7 @@ pub async fn issue_key_for_messages(db: &LocalDb, issue_id: &str) -> DbResult<St
 }
 
 pub async fn resolve_parent_branch(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     child_issue_id: &str,
 ) -> DbResult<Option<String>> {
     let mut parent_rows = conn
@@ -252,7 +258,7 @@ pub async fn resolve_parent_branch(
 }
 
 pub async fn validate_no_cycle(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     current_uri: &str,
     proposed_dependencies: &[String],
 ) -> Result<(), String> {
@@ -299,7 +305,7 @@ pub async fn validate_no_cycle(
 /// is a bounded linear walk up from the proposed parent; a self-parent is caught
 /// on the first iteration.
 pub async fn validate_no_parent_cycle(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     child_issue_id: &str,
     proposed_parent_id: &str,
 ) -> Result<(), String> {
@@ -329,7 +335,7 @@ pub async fn validate_no_parent_cycle(
 }
 
 pub async fn replace_dependencies(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     dependencies: &[String],
     now: i64,
@@ -374,7 +380,7 @@ pub async fn replace_dependencies(
 /// reached a complete status (Merged/Closed), preserving order. Unresolvable
 /// URIs count as unmet and are returned in canonical form for display.
 pub async fn filter_unmet_dependencies(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     uris: &[String],
 ) -> DbResult<Vec<String>> {
     let mut unmet = Vec::new();
@@ -389,7 +395,7 @@ pub async fn filter_unmet_dependencies(
 }
 #[cfg(test)]
 mod parent_tests {
-    use turso::params;
+    use cairn_db::turso::params;
 
     use super::*;
     use crate::issues::crud;
@@ -495,18 +501,24 @@ mod parent_tests {
 /// Canonical issue URIs of this issue's dependencies that have not yet reached
 /// Merged or Closed. These are what the issue is currently "blocked on".
 pub async fn unmet_dependency_uris(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Vec<String>> {
     let uris = list_dependency_uris(conn, issue_id).await?;
     filter_unmet_dependencies(conn, &uris).await
 }
 
-pub async fn unmet_dependency_count(conn: &turso::Connection, issue_id: &str) -> DbResult<i64> {
+pub async fn unmet_dependency_count(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<i64> {
     Ok(unmet_dependency_uris(conn, issue_id).await?.len() as i64)
 }
 
-pub async fn dependencies_ready(conn: &turso::Connection, issue_id: &str) -> DbResult<bool> {
+pub async fn dependencies_ready(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<bool> {
     Ok(unmet_dependency_count(conn, issue_id).await? == 0)
 }
 
@@ -529,7 +541,7 @@ mod tests {
     }
 
     async fn seed_issue(
-        conn: &turso::Connection,
+        conn: &cairn_db::turso::Connection,
         project_id: &str,
         id: &str,
         number: i32,
@@ -544,7 +556,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn seed_project(conn: &turso::Connection, id: &str, key: &str) {
+    async fn seed_project(conn: &cairn_db::turso::Connection, id: &str, key: &str) {
         conn.execute(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
             params![format!("w-{id}"), format!("Workspace {key}")],

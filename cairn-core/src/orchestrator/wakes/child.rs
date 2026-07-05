@@ -1,4 +1,4 @@
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::storage::{LocalDb, RowExt};
 

@@ -1,12 +1,12 @@
 use crate::models::{Check, MergeableState, PrCache, PrDataSummary, PrState, WebhookEvent};
 use crate::storage::{DbResult, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 const PR_COLUMNS: &str = "id, job_id, github_pr_number, github_pr_url, title, body, github_state,
     status, github_review, github_mergeable, additions, deletions, checks_status, checks_json,
     github_fetched_at, updated_at, source_branch, target_branch, is_local";
 
-fn pr_cache_from_row(row: &turso::Row) -> DbResult<PrCache> {
+fn pr_cache_from_row(row: &cairn_db::turso::Row) -> DbResult<PrCache> {
     let checks: Vec<Check> = row
         .opt_text(13)?
         .and_then(|json| serde_json::from_str(&json).ok())
@@ -218,7 +218,7 @@ pub async fn get_webhook_events_for_job(
         .map_err(|e| format!("Failed to load webhook events for job: {e}"))
 }
 
-fn webhook_event_from_row(row: &turso::Row) -> DbResult<WebhookEvent> {
+fn webhook_event_from_row(row: &cairn_db::turso::Row) -> DbResult<WebhookEvent> {
     Ok(WebhookEvent {
         id: row.text(0)?,
         event_type: row.text(1)?,

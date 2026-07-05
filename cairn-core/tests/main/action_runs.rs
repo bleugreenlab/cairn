@@ -3,7 +3,7 @@ use crate::common;
 use cairn_core::action_runs::queries;
 use cairn_core::internal::storage::LocalDb;
 use cairn_core::models::ActionRunStatus;
-use turso::params;
+use cairn_db::turso::params;
 
 async fn insert_issue(db: &LocalDb, project_id: &str, issue_id: &str, number: i64) {
     let project_id = project_id.to_string();

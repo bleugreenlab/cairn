@@ -42,10 +42,11 @@ use super::encoding::{
 use super::{decompress, diff, ObjectStore, CODEC_NONE, CODEC_ZSTD_V1};
 use crate::models::Event;
 use crate::storage::content_store::{content_hash, unframe_pack, ContentStore};
+use crate::storage::render::ArchivedFileRenderer;
 use crate::storage::{DbResult, LocalDb, RowExt};
 
 /// Prefix of the stub substituted for an unresolvable coordinate.
-pub(crate) const STUB_PREFIX: &str = "content no longer resolvable";
+pub const STUB_PREFIX: &str = "content no longer resolvable";
 
 /// Reconstruct any archived events in `events` back to their full rendered form.
 ///
@@ -547,10 +548,7 @@ fn reconstruct_system_init(event: &mut Event, blobs: &HashMap<String, String>) {
 /// problem or a missing skeleton blob (the caller degrades). A missing tool-set
 /// blob substitutes a labeled stub array so the rest still reconstructs. Shared
 /// with the writer's verify-then-discard so the two can never drift.
-pub(crate) fn reassemble_system_init(
-    stub_data: &str,
-    blobs: &HashMap<String, String>,
-) -> Option<String> {
+pub fn reassemble_system_init(stub_data: &str, blobs: &HashMap<String, String>) -> Option<String> {
     let value: Value = serde_json::from_str(stub_data).ok()?;
     let obj = value.as_object()?;
     let skeleton_hash = obj.get("skeleton")?.as_str()?;
@@ -916,16 +914,13 @@ fn split_diff_by_path(diff: &str) -> HashMap<String, String> {
 /// that cannot be resolved or rendered degrades to an `Error` segment (bare
 /// `=== uri ===` header + a `STUB_PREFIX` body), so reconstruction never errors
 /// out of the batch and `crate::archival::rewrite::try_read`'s stub contract still holds.
-pub(crate) fn reconstruct_read(
-    commit_hex: &str,
-    paths: &[String],
-    store: Option<&ObjectStore>,
-) -> String {
+pub fn reconstruct_read(commit_hex: &str, paths: &[String], store: Option<&ObjectStore>) -> String {
+    let renderer = crate::storage::render::archived_file_renderer();
     let segments: Vec<ReadSegment> = paths
         .iter()
-        .map(|target| build_archived_segment(commit_hex, target, store))
+        .map(|target| build_archived_segment(commit_hex, target, store, renderer))
         .collect();
-    crate::mcp::handlers::read::view::assemble(segments).text
+    crate::storage::render::assemble(segments).text
 }
 
 /// Render one archived file target's standalone section text — the exact bytes it
@@ -933,20 +928,21 @@ pub(crate) fn reconstruct_read(
 /// and running the shared single-section renderer. An unresolvable target renders
 /// an `Error` segment carrying a `STUB_PREFIX` body. Shared by the hybrid-read
 /// write (its verbatim needle) and reconstruction (its skeleton fill).
-pub(crate) fn render_archived_file_section(
+pub fn render_archived_file_section(
     commit_hex: &str,
     target: &str,
     store: Option<&ObjectStore>,
 ) -> String {
-    let seg = build_archived_segment(commit_hex, target, store);
-    crate::mcp::handlers::read::view::render_section_text(seg)
+    let renderer = crate::storage::render::archived_file_renderer();
+    let seg = build_archived_segment(commit_hex, target, store, renderer);
+    crate::storage::render::render_section_text(seg)
 }
 
 /// The NUL-delimited placeholder a hybrid-read skeleton carries in place of an
 /// excised file section. A raw NUL byte can never appear in rendered UTF-8/JSON
 /// text, so a placeholder can never collide with content (the same invariant the
 /// system-init skeleton relies on).
-pub(crate) fn section_placeholder(index: usize) -> String {
+pub fn section_placeholder(index: usize) -> String {
     format!("\0{index}\0")
 }
 
@@ -955,7 +951,7 @@ pub(crate) fn section_placeholder(index: usize) -> String {
 /// write's verify-then-discard and reconstruction so the two cannot drift. A
 /// rendered section can never contain a placeholder (NUL-free), so substitutions
 /// never cascade and order is irrelevant.
-pub(crate) fn splice_hybrid_skeleton(
+pub fn splice_hybrid_skeleton(
     skeleton: &str,
     commit_hex: &str,
     paths: &[String],
@@ -975,16 +971,18 @@ pub(crate) fn splice_hybrid_skeleton(
 
 /// Build the [`ReadSegment`] for one archived read target from its blob, or an
 /// `Error` segment carrying a labeled coordinate stub when the blob cannot be
-/// resolved or rendered. The shared producer
-/// ([`crate::mcp::handlers::read::produce_archived_file_segment`]) guarantees the
-/// segment is identical to the one the live read built from the same bytes.
+/// resolved or rendered. The registered [`ArchivedFileRenderer`] (the mcp read
+/// layer's byte renderers) guarantees the segment is identical to the one the
+/// live read built from the same bytes; when no renderer is registered the
+/// target degrades to the same coordinate stub as an unresolvable one.
 fn build_archived_segment(
     commit_hex: &str,
     target: &str,
     store: Option<&ObjectStore>,
+    renderer: Option<&dyn ArchivedFileRenderer>,
 ) -> ReadSegment {
     let stub_segment =
-        |label: &str| crate::mcp::handlers::read::error_segment(target, stub(commit_hex, label));
+        |label: &str| crate::storage::render::error_segment(target, stub(commit_hex, label));
     let Some(store) = store else {
         return stub_segment(target);
     };
@@ -992,15 +990,7 @@ fn build_archived_segment(
         return stub_segment(target);
     };
     match store.resolve_path_at_commit(commit_hex, &path) {
-        Ok(bytes) => {
-            match crate::mcp::handlers::read::produce_archived_file_segment(target, &bytes) {
-                Ok(segment) => segment,
-                Err(error) => {
-                    log::warn!("archived read render failed for {target}: {error}");
-                    stub_segment(&path)
-                }
-            }
-        }
+        Ok(bytes) => render_archived_bytes(renderer, target, &bytes, || stub_segment(&path)),
         Err(error) => {
             warn_unresolvable_once(commit_hex, &path, &error);
             stub_segment(&path)
@@ -1008,7 +998,30 @@ fn build_archived_segment(
     }
 }
 
-pub(crate) fn repo_relative_path(target: &str) -> Option<String> {
+/// Render archived file bytes through the registered renderer, degrading to
+/// `stub` when no renderer is registered or the render fails. Pure: the renderer
+/// and stub are both injected, so neither the global registry nor a DB is needed
+/// to exercise both branches. A missing renderer yields the same labeled
+/// coordinate stub as an unresolvable coordinate.
+fn render_archived_bytes(
+    renderer: Option<&dyn ArchivedFileRenderer>,
+    target: &str,
+    bytes: &[u8],
+    stub: impl Fn() -> ReadSegment,
+) -> ReadSegment {
+    match renderer {
+        Some(renderer) => match renderer.produce_archived_file_segment(target, bytes) {
+            Ok(segment) => segment,
+            Err(error) => {
+                log::warn!("archived read render failed for {target}: {error}");
+                stub()
+            }
+        },
+        None => stub(),
+    }
+}
+
+pub fn repo_relative_path(target: &str) -> Option<String> {
     let split = cairn_common::query::split_target_query(target).ok()?;
     let rel = split.identity.strip_prefix("file:")?;
     Some(rel.trim_start_matches('/').to_string())
@@ -1044,254 +1057,12 @@ fn warn_unresolvable_once(commit_hex: &str, path: &str, error: &impl std::fmt::D
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::event_fixture::{
-        assistant_write_remainder, read_stub, render_targets as expected_read,
+    use crate::storage::event_fixture::assistant_write_remainder;
+    use crate::storage::events::reconstruct_fixture::{
+        build_fixture, make_event, migrated_db, read_event, seed_chain, tool_result,
     };
-    use crate::storage::events::testutil::{commit_all, git, init_repo, write_file};
-    use crate::storage::{build_execution_pack, compress, CODEC_ZSTD_V1};
-    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use turso::params;
-
-    async fn migrated_db() -> LocalDb {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.keep().join("cairn-archival-reconstruct.db");
-        let db = LocalDb::open(path).await.unwrap();
-        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
-            .run(&db)
-            .await
-            .unwrap();
-        db
-    }
-
-    /// Seed the runs → jobs → projects chain plus an `execution_history` row so
-    /// `reconstruct_events` can resolve coordinates for run `run` / execution
-    /// `exec`. `pack` is the range pack bytes, or `None` for an empty range.
-    async fn seed_chain(db: &LocalDb, repo_path: &str, pack: Option<(Vec<u8>, Vec<u8>)>) {
-        let repo_path = repo_path.to_string();
-        db.write(move |conn| {
-            let repo_path = repo_path.clone();
-            let pack = pack.clone();
-            Box::pin(async move {
-                conn.execute(
-                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('proj','ws','p','P',?1,1,1)",
-                    (repo_path.as_str(),),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO executions(id, recipe_id, status, started_at) VALUES ('exec','r','running',1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO jobs(id, execution_id, project_id, status, created_at, updated_at)
-                     VALUES ('job','exec','proj','complete',1,1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO runs(id, job_id, status, created_at, updated_at)
-                     VALUES ('run','job','exited',1,1)",
-                    (),
-                )
-                .await?;
-                match pack {
-                    Some((pack, idx)) => {
-                        conn.execute(
-                            "INSERT INTO execution_history(execution_id, base_sha, tip_sha, pack, pack_idx)
-                             VALUES ('exec','base','tip',?1,?2)",
-                            params![pack, idx],
-                        )
-                        .await?;
-                    }
-                    None => {
-                        conn.execute(
-                            "INSERT INTO execution_history(execution_id, base_sha, tip_sha, pack, pack_idx)
-                             VALUES ('exec','base','tip',NULL,NULL)",
-                            (),
-                        )
-                        .await?;
-                    }
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    async fn seed_team_chain(
-        db: &LocalDb,
-        synced_repo_path: &str,
-        pack: Option<(Vec<u8>, Vec<u8>)>,
-    ) {
-        let synced_repo_path = synced_repo_path.to_string();
-        db.write(move |conn| {
-            let synced_repo_path = synced_repo_path.clone();
-            let pack = pack.clone();
-            Box::pin(async move {
-                conn.execute(
-                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('teamABC123~00000000-0000-4000-8000-000000000001','ws','p','P',?1,1,1)",
-                    (synced_repo_path.as_str(),),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO executions(id, recipe_id, status, started_at) VALUES ('exec','r','running',1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO jobs(id, execution_id, project_id, status, created_at, updated_at)
-                     VALUES ('job','exec','teamABC123~00000000-0000-4000-8000-000000000001','complete',1,1)",
-                    (),
-                )
-                .await?;
-                conn.execute(
-                    "INSERT INTO runs(id, job_id, status, created_at, updated_at)
-                     VALUES ('run','job','exited',1,1)",
-                    (),
-                )
-                .await?;
-                if let Some((pack, idx)) = pack {
-                    conn.execute(
-                        "INSERT INTO execution_history(execution_id, base_sha, tip_sha, pack, pack_idx)
-                         VALUES ('exec','base','tip',?1,?2)",
-                        params![pack, idx],
-                    )
-                    .await?;
-                }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    fn make_event(
-        id: &str,
-        event_type: &str,
-        data: &str,
-        storage_mode: Option<&str>,
-        content_commit: Option<&str>,
-        data_blob: Option<Vec<u8>>,
-        codec: Option<&str>,
-    ) -> Event {
-        Event {
-            id: id.to_string(),
-            run_id: "run".to_string(),
-            session_id: None,
-            sequence: 1,
-            timestamp: 1,
-            event_type: event_type.to_string(),
-            data: data.to_string(),
-            parent_tool_use_id: None,
-            created_at: 1,
-            input_tokens: None,
-            cache_read_tokens: None,
-            cache_create_tokens: None,
-            output_tokens: None,
-            turn_id: None,
-            thinking_tokens: None,
-            cost_usd: None,
-            storage_mode: storage_mode.map(str::to_string),
-            content_commit: content_commit.map(str::to_string),
-            content_change_id: None,
-            content_render_sha: None,
-            data_blob,
-            codec: codec.map(str::to_string),
-            read_segments: None,
-        }
-    }
-
-    struct Fixture {
-        _origin_dir: tempfile::TempDir,
-        _clone_dir: tempfile::TempDir,
-        origin: PathBuf,
-        clone: PathBuf,
-        anchor: String,
-        tip: String,
-        pack: Vec<u8>,
-        idx: Vec<u8>,
-    }
-
-    /// origin holds `main` at the anchor; a clone makes a branch commit (tip)
-    /// whose new objects live only in the range pack — so a tip read mixes
-    /// pack-layer (commit/tree/modified blob) and repo-layer (unchanged blob)
-    /// resolution.
-    fn build_fixture() -> Fixture {
-        let origin_dir = tempfile::tempdir().unwrap();
-        let origin = origin_dir.path().to_path_buf();
-        init_repo(&origin);
-        write_file(&origin, "a.txt", b"alpha\nbeta\ngamma\ndelta\n");
-        write_file(&origin, "dir/b.txt", b"unchanged-keep\n");
-        let anchor = commit_all(&origin, "base");
-
-        let clone_dir = tempfile::tempdir().unwrap();
-        let clone = clone_dir.path().to_path_buf();
-        git(
-            &origin,
-            &[
-                "clone",
-                "-q",
-                origin.to_str().unwrap(),
-                clone.to_str().unwrap(),
-            ],
-        );
-        git(&clone, &["checkout", "-q", "-b", "work"]);
-        write_file(&clone, "a.txt", b"ALPHA\nbeta\ngamma\ndelta\nepsilon\n");
-        write_file(&clone, "c.txt", b"new file\n");
-        let tip = commit_all(&clone, "work");
-
-        let (pack, idx) = build_execution_pack(&clone, &tip, &anchor, "main")
-            .unwrap()
-            .unwrap();
-
-        Fixture {
-            _origin_dir: origin_dir,
-            _clone_dir: clone_dir,
-            origin,
-            clone,
-            anchor,
-            tip,
-            pack,
-            idx,
-        }
-    }
-
-    // The expected rendered batch body (`expected_read`) and the archived
-    // gitcoord-read stub (`read_stub`) come from the shared real-anatomy fixture
-    // imported above; a wrong-shape assumption fails in exactly one place.
-
-    fn read_event(content_commit: &str, paths: &[&str]) -> Event {
-        let data = read_stub("t1", paths);
-        make_event(
-            "read-ev",
-            "tool_result",
-            &data,
-            Some("gitcoord"),
-            Some(content_commit),
-            None,
-            None,
-        )
-    }
-
-    fn tool_result(event: &Event) -> String {
-        let value: serde_json::Value = serde_json::from_str(&event.data).unwrap();
-        value["toolResult"].as_str().unwrap().to_string()
-    }
+    use crate::storage::events::testutil::git;
+    use crate::storage::{compress, CODEC_ZSTD_V1};
 
     #[tokio::test]
     async fn identity_when_all_full() {
@@ -1337,145 +1108,6 @@ mod tests {
         );
         let out = reconstruct_events(&db, vec![event]).await;
         assert_eq!(out[0].data, original);
-    }
-
-    #[tokio::test]
-    async fn gitcoord_reads_are_byte_identical() {
-        let fx = build_fixture();
-        let db = migrated_db().await;
-        seed_chain(
-            &db,
-            fx.origin.to_str().unwrap(),
-            Some((fx.pack.clone(), fx.idx.clone())),
-        )
-        .await;
-
-        // Tip read: full file, line window, tail, single-file grep (all pack-layer
-        // a.txt) plus an unchanged file (pack-layer tree, repo-layer blob).
-        let tip_a = b"ALPHA\nbeta\ngamma\ndelta\nepsilon\n";
-        let b_txt = b"unchanged-keep\n";
-        let targets: Vec<(&str, &[u8])> = vec![
-            ("file:a.txt", tip_a),
-            ("file:a.txt?offset=2&limit=2", tip_a),
-            ("file:a.txt?offset=-1", tip_a),
-            ("file:a.txt?grep=beta", tip_a),
-            ("file:dir/b.txt", b_txt),
-        ];
-        let paths: Vec<&str> = targets.iter().map(|(t, _)| *t).collect();
-        let event = read_event(&fx.tip, &paths);
-        let out = reconstruct_events(&db, vec![event]).await;
-        assert_eq!(tool_result(&out[0]), expected_read(&targets));
-
-        // Anchor read resolves entirely from the repo layer (anchor is not in the
-        // range pack).
-        let anchor_a = b"alpha\nbeta\ngamma\ndelta\n";
-        let anchor_targets: Vec<(&str, &[u8])> = vec![("file:a.txt", anchor_a)];
-        let anchor_event = read_event(&fx.anchor, &["file:a.txt"]);
-        let anchor_out = reconstruct_events(&db, vec![anchor_event]).await;
-        assert_eq!(tool_result(&anchor_out[0]), expected_read(&anchor_targets));
-    }
-
-    #[tokio::test]
-    async fn team_gitcoord_read_stubs_until_private_local_repo_path_is_set() {
-        let fx = build_fixture();
-        let team_db = migrated_db().await;
-        seed_team_chain(
-            &team_db,
-            "/creator/path/not/on/this/machine",
-            Some((fx.pack.clone(), fx.idx.clone())),
-        )
-        .await;
-        let private_db = Arc::new(migrated_db().await);
-        private_db
-            .execute(
-                "INSERT INTO teams(id, name, sync_url, replica_path, created_at) VALUES ('teamABC123', 'Team', 'http://sync', '/tmp/team.db', 1)",
-                (),
-            )
-            .await
-            .unwrap();
-        private_db
-            .execute(
-                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('P', 'teamABC123', 1)",
-                (),
-            )
-            .await
-            .unwrap();
-
-        let event = read_event(&fx.tip, &["file:a.txt"]);
-        let without_clone = team_db
-            .read(|conn| {
-                let event = event.clone();
-                let private_db = private_db.clone();
-                Box::pin(async move {
-                    DbResult::Ok(
-                        reconstruct_events_with_conn_and_routes(
-                            conn,
-                            vec![event],
-                            None,
-                            Some(private_db.as_ref()),
-                        )
-                        .await,
-                    )
-                })
-            })
-            .await
-            .unwrap();
-        assert!(tool_result(&without_clone[0]).contains(STUB_PREFIX));
-
-        private_db
-            .execute(
-                "UPDATE project_routes SET local_repo_path = ?1 WHERE project_key = 'P'",
-                (fx.origin.to_str().unwrap(),),
-            )
-            .await
-            .unwrap();
-        let event = read_event(&fx.tip, &["file:a.txt"]);
-        let with_clone = team_db
-            .read(|conn| {
-                let event = event.clone();
-                let private_db = private_db.clone();
-                Box::pin(async move {
-                    DbResult::Ok(
-                        reconstruct_events_with_conn_and_routes(
-                            conn,
-                            vec![event],
-                            None,
-                            Some(private_db.as_ref()),
-                        )
-                        .await,
-                    )
-                })
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            tool_result(&with_clone[0]),
-            expected_read(&[(
-                "file:a.txt",
-                b"ALPHA
-beta
-gamma
-delta
-epsilon
-" as &[u8],
-            )])
-        );
-    }
-
-    #[tokio::test]
-    async fn null_pack_reconstructs_via_repo_layer() {
-        let fx = build_fixture();
-        let db = migrated_db().await;
-        // No range pack: an anchor read still resolves from the project repo ODB.
-        seed_chain(&db, fx.origin.to_str().unwrap(), None).await;
-
-        let anchor_a = b"alpha\nbeta\ngamma\ndelta\n";
-        let event = read_event(&fx.anchor, &["file:a.txt"]);
-        let out = reconstruct_events(&db, vec![event]).await;
-        assert_eq!(
-            tool_result(&out[0]),
-            expected_read(&[("file:a.txt", anchor_a)])
-        );
     }
 
     #[tokio::test]
@@ -1542,5 +1174,15 @@ epsilon
         let expected = git(&fx.clone, &["show", "--format=", "--no-color", &fx.tip]);
         let expected = expected.trim_start_matches('\n');
         assert_eq!(combined, expected);
+    }
+
+    /// The trait-fallback branch: with no renderer registered, archived file bytes
+    /// degrade to the injected stub. Pure — no DB, no global, no mcp dependency.
+    #[test]
+    fn render_archived_bytes_without_renderer_degrades_to_stub() {
+        let stub =
+            || crate::storage::render::error_segment("file:a.txt", stub("deadbeef", "file:a.txt"));
+        let segment = render_archived_bytes(None, "file:a.txt", b"ignored", stub);
+        assert!(segment.body.contains(STUB_PREFIX));
     }
 }

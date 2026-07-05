@@ -7,13 +7,22 @@
 
 pub mod batch;
 pub mod file;
-pub mod view;
 
-use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
+use cairn_common::read::ReadSegment;
 
 pub use batch::handle_read_batch;
 pub use file::handle_read_file;
-pub(crate) use file::{produce_archived_file_segment, produce_file_segment};
+pub(crate) use file::produce_file_segment;
+
+// The shared view/render layer moved down into `storage::render` so `storage`
+// carries no upward `crate::mcp` edge. Re-export it under the original `view`
+// name, and re-export `error_segment`, so every existing `super::view::…` /
+// `super::error_segment` consumer in `batch`/`file` compiles unchanged.
+pub(crate) use crate::storage::render as view;
+pub(crate) use crate::storage::render::error_segment;
+
+#[cfg(test)]
+mod archived_reconstruct_tests;
 
 /// A producer outcome: a finished segment, or a fence suspension that must abort
 /// the whole batch so the permission flow can re-dispatch it once approved.
@@ -27,13 +36,31 @@ pub enum Produced {
     Suspended(String),
 }
 
-/// Build an `Error`-kind segment carrying an inline failure message for one
-/// target. A producer error never aborts the batch — it shows in place.
-pub fn error_segment(uri: impl Into<String>, message: impl Into<String>) -> ReadSegment {
-    ReadSegment::text(
-        message.into(),
-        SegmentMeta::new(uri, SegmentKind::Error, NaturalUnit::Line),
-    )
+/// The mcp read layer's implementation of the archived-file render seam. Only
+/// this layer can reproduce a read's rendered [`ReadSegment`] from raw bytes (it
+/// re-runs the byte renderers and the in-process ast-grep/outline machinery), so
+/// it registers the implementation with `storage::render` at `Orchestrator`
+/// construction and archival reconstruction — which lives below this layer — calls
+/// back through the registry.
+struct McpArchivedFileRenderer;
+
+impl crate::storage::render::ArchivedFileRenderer for McpArchivedFileRenderer {
+    fn produce_archived_file_segment(
+        &self,
+        target: &str,
+        bytes: &[u8],
+    ) -> Result<ReadSegment, String> {
+        file::produce_archived_file_segment(target, bytes)
+    }
+}
+
+/// Register the mcp archived-file renderer with `storage::render`. Idempotent
+/// (the registry is a `OnceLock`), so calling it at each `Orchestrator`
+/// construction is harmless. Must run before any archived-read reconstruction;
+/// without it, archived reads degrade to labeled coordinate stubs.
+pub fn register_archived_file_renderer() {
+    static R: McpArchivedFileRenderer = McpArchivedFileRenderer;
+    crate::storage::render::set_archived_file_renderer(&R);
 }
 
 /// Derive match/file counts from a rendered grep body.

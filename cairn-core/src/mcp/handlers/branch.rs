@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use cairn_common::uri::{parse_uri, CairnResource};
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
@@ -323,7 +323,7 @@ async fn job_by_node_uri(
         .map_err(|e| e.to_string())
 }
 
-fn job_context_from_row(row: &turso::Row) -> crate::storage::DbResult<JobBranchContext> {
+fn job_context_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<JobBranchContext> {
     Ok(JobBranchContext {
         branch: row.opt_text(0)?,
         worktree_path: row.opt_text(1)?.map(PathBuf::from),

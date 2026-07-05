@@ -2,9 +2,9 @@ use super::CODEX_BACKEND_NAME;
 use crate::backends::run_state::run_backend_db;
 use crate::models::{Fence, Model};
 use crate::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde_json::Value;
 use std::sync::Arc;
-use turso::params;
 
 const RESUME_FALLBACK_TRANSCRIPT_CHARS: usize = 24_000;
 

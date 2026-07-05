@@ -9,7 +9,7 @@ use turso::{params::IntoParams, Builder, Connection, Row};
 
 use super::content_store::{ContentStore, TeamReplicaContext};
 use super::{DbError, DbResult, RowExt};
-use crate::db::TeamId;
+use crate::storage::TeamId;
 
 /// Install a process-wide rustls [`CryptoProvider`](rustls::crypto::CryptoProvider)
 /// exactly once, before any Turso Sync TLS client is built.
@@ -177,7 +177,7 @@ impl LocalDb {
     /// Open a Turso Sync replica whose auth token is produced on demand by
     /// `token_fn`, which the sync client invokes before every HTTP request. This
     /// is the ROTATING-token path: the closure can return a freshly minted token
-    /// each call (e.g. via a [`crate::account::team_token_minter::TeamTokenMinter`]),
+    /// each call (e.g. via a rotating team-sync token minter),
     /// so a short-lived token is refreshed transparently without reopening the
     /// replica. A closure error fails the in-flight sync op (the caller's backoff
     /// retries it). The static-token / unauthenticated path is [`Self::open_synced`].
@@ -256,7 +256,7 @@ impl LocalDb {
     /// (MVCC) database uses `BEGIN CONCURRENT` for optimistic concurrency; the
     /// synced engine captures changes via CDC, which is incompatible with MVCC,
     /// so it uses a plain `BEGIN` (writers serialize and retry on Busy instead).
-    pub(crate) fn concurrent_begin(&self) -> &'static str {
+    pub fn concurrent_begin(&self) -> &'static str {
         match self.database {
             DbHandle::Local(_) => "BEGIN CONCURRENT",
             DbHandle::Synced(_) => "BEGIN",

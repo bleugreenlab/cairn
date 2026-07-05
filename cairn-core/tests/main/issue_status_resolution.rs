@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use cairn_core::internal::storage::LocalDb;
 use cairn_core::issues::status::{update_status, ResolutionActor};
-use turso::params;
+use cairn_db::turso::params;
 
 async fn insert_issue(db: &LocalDb, project_id: &str, issue_id: &str) {
     let project_id = project_id.to_string();

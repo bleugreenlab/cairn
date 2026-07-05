@@ -14,7 +14,7 @@
 //!    acts without a round-trip read. Terminal `resolved:` pushes are rendered as
 //!    concise confirmations instead of dumping the resolved issue body.
 
-use turso::params;
+use cairn_db::turso::params;
 
 use super::attention_push::{Boundary, Wake};
 use super::Orchestrator;

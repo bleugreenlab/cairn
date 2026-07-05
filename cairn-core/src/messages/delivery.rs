@@ -13,7 +13,7 @@ use crate::messages::queued::DeliveryUrgency;
 use crate::models::{ChannelType, Message};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, DbError, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 /// Look up the most recent run id for a job. Used by callers that have a job
 /// id (PR conflict resolution, manager wake, etc.) and need to address the
@@ -190,7 +190,7 @@ fn direct_wake_for_urgency(urgency: DeliveryUrgency) -> crate::orchestrator::att
 }
 
 async fn node_uri_for_job_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> Result<Option<String>, DbError> {
     let mut rows = conn
@@ -219,7 +219,7 @@ async fn node_uri_for_job_conn(
 /// delivery: the message row stores the frozen body, and the push row is what the
 /// idle/event drain sees and stamps.
 pub(crate) async fn insert_system_direct_push_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     recipient_job_id: &str,
     recipient_run_id: &str,
     content: &str,
@@ -553,6 +553,33 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
     };
 
     if notice_count == 0 && queued_count == 0 && !waking_push {
+        // CAIRN-2410: a decline is silent by default, which is exactly what turned
+        // a lost review wake into a multi-hour mystery. If the recipient DID carry
+        // undelivered rousing pushes but they all lazy-resolved dead (or it is
+        // self-suspended on its own work), name the job, the reason, and the push
+        // keys so the next incident of this class is a one-grep diagnosis.
+        let job_for_log = job_id.clone();
+        let keys = run_db_blocking(move || async move {
+            Ok(
+                crate::orchestrator::attention_push::pending_waking_keys(db, &job_for_log)
+                    .await
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+        if !keys.is_empty() {
+            log::debug!(
+                "flush-on-idle: job {} declined resume ({}): {} pending rousing push(es) not delivered: {}",
+                &job_id[..job_id.len().min(8)],
+                if self_suspended {
+                    "self-suspended on own work"
+                } else {
+                    "all pushes lazy-resolve dead"
+                },
+                keys.len(),
+                keys.join(", "),
+            );
+        }
         return None;
     }
 
@@ -664,7 +691,7 @@ pub fn nudge_job_for_urgency(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turso::params;
+    use cairn_db::turso::params;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("delivery-flush.db").await
@@ -866,6 +893,43 @@ mod tests {
 
         let pending = collect_pending_for_flush(&db, "run-1")
             .expect("an idle agent with a pending wake push must resume");
+        assert_eq!(pending.job_id, "job-1");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn collect_pending_resumes_idle_agent_with_review_backed_by_confirmed_create_pr() {
+        // CAIRN-2410: the coordinator's pending review push is backed ONLY by a
+        // confirmed create-pr artifact with no merge_requests row (the pre-open
+        // window). That is precisely the state the drain/wake liveness predicate
+        // used to read as dead, silently declining the resume. It must now
+        // resume, since `has_pending_waking_live` -> `lazy_resolve_live` treats the
+        // confirmed create-pr/no-MR-row window as live.
+        let db = migrated_db().await;
+        seed_run(&db, "run-1", "job-1").await;
+        set_head_turn(&db, "job-1", "complete", None).await;
+        // A confirmed create-pr artifact for the issue, and NO merge_requests row.
+        db.execute_script(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-pr','job-1','create-pr',1,'{}',1,'create-pr',1,1,1);",
+        )
+        .await
+        .unwrap();
+        // A pending rousing review push whose referent is that issue.
+        crate::orchestrator::attention_push::push(
+            &db,
+            "job-1",
+            "cairn://p/PROJ/42",
+            crate::orchestrator::attention_push::Wake::Wake,
+            crate::orchestrator::attention_push::Boundary::Event,
+            "review:cairn://p/PROJ/42",
+        )
+        .await
+        .unwrap();
+
+        let pending = collect_pending_for_flush(&db, "run-1").expect(
+            "an idle coordinator whose review is backed by a confirmed create-pr must resume",
+        );
         assert_eq!(pending.job_id, "job-1");
     }
 

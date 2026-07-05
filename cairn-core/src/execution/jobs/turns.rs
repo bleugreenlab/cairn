@@ -7,7 +7,7 @@ pub(super) struct TurnHead {
 }
 
 pub(super) async fn next_turn_sequence_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
 ) -> DbResult<i32> {
     let mut rows = conn
@@ -26,7 +26,7 @@ pub(super) async fn next_turn_sequence_conn(
 }
 
 pub(super) async fn get_head_turn_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<TurnHead>> {
     let mut rows = conn
@@ -48,7 +48,7 @@ pub(super) async fn get_head_turn_conn(
 }
 
 pub(super) async fn create_turn_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     turn_id: &str,
     session_id: &str,
     job_id: &str,
@@ -202,7 +202,7 @@ pub(super) fn create_initial_turn(
 /// projection treat the review as post-completion housekeeping rather than the
 /// job's latest work.
 async fn followup_start_reason_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     user_initiated: bool,
 ) -> DbResult<TurnStartReason> {
@@ -239,7 +239,7 @@ async fn followup_start_reason_conn(
 }
 
 pub(super) async fn create_successor_turn_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     turn_id: &str,
     session_id: &str,
     job_id: &str,

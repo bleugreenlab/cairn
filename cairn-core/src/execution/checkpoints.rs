@@ -12,7 +12,7 @@ use crate::db_records::{db_job_from_row, DbJob, JOB_COLUMNS};
 use crate::models::{Artifact, Job};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 /// Approve a blocked checkpoint job.
 /// Marks the job as complete, then advances the DAG.
@@ -102,7 +102,10 @@ async fn validate_confirmable(db: &LocalDb, job_id: &str) -> Result<DbJob, Strin
     .map_err(|e| e.to_string())
 }
 
-async fn load_job_by_id_conn(conn: &turso::Connection, job_id: &str) -> DbResult<Option<DbJob>> {
+async fn load_job_by_id_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<Option<DbJob>> {
     let mut rows = conn
         .query(
             &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1"),
@@ -128,7 +131,7 @@ async fn load_job_by_id_conn(conn: &turso::Connection, job_id: &str) -> DbResult
 /// name (task jobs, standalone checkpoint nodes, legacy/unnamed contracts) falls
 /// back to the latest artifact overall.
 pub(crate) async fn confirm_latest_artifact_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Artifact> {
     let now = chrono::Utc::now().timestamp() as i32;
@@ -204,7 +207,7 @@ pub(crate) async fn confirm_latest_artifact_conn(
 /// `None` for jobs with no recipe node (task jobs), no `context-out` contract,
 /// or an unnamed/legacy contract.
 async fn resolve_terminal_artifact_name_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     let (node_id, execution_id) = {
@@ -232,7 +235,7 @@ async fn resolve_terminal_artifact_name_conn(
 /// `confirmed` flag is the gate the projection reads. Used when a standalone
 /// checkpoint node arms, so approve has a row to flip.
 pub(crate) async fn ensure_checkpoint_artifact_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<()> {
     let exists = {

@@ -1,4 +1,4 @@
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::models::{CreateLabel, Label, UpdateLabel};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -9,7 +9,7 @@ pub const PALETTE: &[&str] = &[
     "#15803D", "#B45309", "#0369A1", "#BE123C",
 ];
 
-pub(crate) fn label_from_row(row: &turso::Row) -> DbResult<Label> {
+pub(crate) fn label_from_row(row: &cairn_db::turso::Row) -> DbResult<Label> {
     Ok(Label {
         id: row.text(0)?,
         workspace_id: row.text(1)?,
@@ -65,14 +65,14 @@ pub fn validate_color(color: &str) -> Result<String, String> {
     }
 }
 
-async fn label_id_exists_conn(conn: &turso::Connection, id: &str) -> DbResult<bool> {
+async fn label_id_exists_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<bool> {
     let mut rows = conn
         .query("SELECT 1 FROM labels WHERE id = ?1 LIMIT 1", params![id])
         .await?;
     Ok(rows.next().await?.is_some())
 }
 
-async fn unique_label_id_conn(conn: &turso::Connection, base: &str) -> DbResult<String> {
+async fn unique_label_id_conn(conn: &cairn_db::turso::Connection, base: &str) -> DbResult<String> {
     let mut candidate = base.to_string();
     let mut n = 2;
     while label_id_exists_conn(conn, &candidate).await? {
@@ -82,7 +82,7 @@ async fn unique_label_id_conn(conn: &turso::Connection, base: &str) -> DbResult<
     Ok(candidate)
 }
 
-pub async fn get_label_conn(conn: &turso::Connection, label_id: &str) -> DbResult<Label> {
+pub async fn get_label_conn(conn: &cairn_db::turso::Connection, label_id: &str) -> DbResult<Label> {
     let mut rows = conn
         .query(
             "SELECT id, workspace_id, name, color, created_at, updated_at FROM labels WHERE id = ?1 LIMIT 1",
@@ -97,7 +97,7 @@ pub async fn get_label_conn(conn: &turso::Connection, label_id: &str) -> DbResul
 }
 
 pub async fn list_labels_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     workspace_id: &str,
 ) -> DbResult<Vec<Label>> {
     let mut rows = conn
@@ -114,7 +114,7 @@ pub async fn list_labels_conn(
 }
 
 pub async fn create_label_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     workspace_id: &str,
     input: CreateLabel,
     now: i64,
@@ -148,7 +148,7 @@ pub async fn create_label_conn(
 }
 
 pub async fn update_label_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     label_id: &str,
     input: UpdateLabel,
     now: i64,
@@ -184,7 +184,7 @@ pub async fn update_label_conn(
         .map_err(|error| error.to_string())
 }
 
-pub async fn delete_label_conn(conn: &turso::Connection, label_id: &str) -> DbResult<()> {
+pub async fn delete_label_conn(conn: &cairn_db::turso::Connection, label_id: &str) -> DbResult<()> {
     conn.execute("DELETE FROM labels WHERE id = ?1", params![label_id])
         .await?;
     Ok(())
@@ -258,7 +258,7 @@ mod tests {
         db
     }
 
-    async fn seed_issue(conn: &turso::Connection, issue_id: &str) {
+    async fn seed_issue(conn: &cairn_db::turso::Connection, issue_id: &str) {
         conn.execute(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-labels', 'default', 'Labels', 'LBL', '/tmp/lbl', 1, 1)",
             (),

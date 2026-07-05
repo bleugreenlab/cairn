@@ -29,7 +29,7 @@ fn doc_roots_from_config(config_json: Option<String>) -> Vec<String> {
     DEFAULT_DOC_ROOTS.iter().map(|s| s.to_string()).collect()
 }
 
-fn doc_reference_from_row(row: &turso::Row) -> DbResult<DocReference> {
+fn doc_reference_from_row(row: &cairn_db::turso::Row) -> DbResult<DocReference> {
     Ok(DocReference {
         id: row.text(0)?,
         issue_id: row.text(1)?,

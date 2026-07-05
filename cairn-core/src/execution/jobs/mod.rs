@@ -32,13 +32,13 @@ use crate::transcripts::stream_store::{
     get_next_sequence, insert_event, insert_event_stamping_pushes, EventInsert,
 };
 use cairn_common::ids;
+use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use turso::params;
 
 mod child_tasks;
 mod config_loading;

@@ -219,7 +219,7 @@ async fn lookup_run_context_by_cwd(db: &LocalDb, cwd: &str) -> Result<ParentRunC
 }
 
 async fn lookup_run_context_by_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     run_id: &str,
 ) -> DbResult<Option<ParentRunContext>> {
     let mut rows = conn
@@ -245,7 +245,7 @@ async fn lookup_run_context_by_id(
 }
 
 async fn lookup_run_context_by_cwd_worktree(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     cwd: &str,
 ) -> DbResult<Option<ParentRunContext>> {
     let mut rows = conn
@@ -273,7 +273,7 @@ async fn lookup_run_context_by_cwd_worktree(
 }
 
 async fn lookup_run_context_by_cwd_project(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     cwd: &str,
 ) -> DbResult<Option<ParentRunContext>> {
     let mut rows = conn
@@ -300,7 +300,7 @@ async fn lookup_run_context_by_cwd_project(
         .transpose()
 }
 
-fn run_context_from_row(row: &turso::Row, _job_type: &str) -> DbResult<ParentRunContext> {
+fn run_context_from_row(row: &cairn_db::turso::Row, _job_type: &str) -> DbResult<ParentRunContext> {
     Ok(ParentRunContext {
         run_id: row.text(0)?,
         job_id: row.text(1)?,
@@ -404,7 +404,7 @@ pub(super) async fn persist_task_packet(
     .await
     .map_err(|e| format!("Failed to load execution: {}", e))?;
     let snapshot_json = snapshot_json.ok_or("Execution has no snapshot")?;
-    let mut snapshot = ExecutionSnapshot::from_json(&snapshot_json)
+    let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
         .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
 
     let parent_turn_id = match select_optional_text(
@@ -611,7 +611,7 @@ pub(super) async fn refresh_packet_state(
     .await
     .map_err(|e| format!("Failed to load execution: {}", e))?;
     let snapshot_json = snapshot_json.ok_or("Execution has no snapshot")?;
-    let mut snapshot = ExecutionSnapshot::from_json(&snapshot_json)
+    let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
         .map_err(|e| format!("Failed to parse snapshot: {}", e))?;
 
     let mut changed = false;

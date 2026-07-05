@@ -2,7 +2,7 @@
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
-use turso::params;
+use cairn_db::turso::params;
 
 use super::context::{db_error, query_mr_context_for_create_pr_artifact_job};
 

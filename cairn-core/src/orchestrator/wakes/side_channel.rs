@@ -1,4 +1,4 @@
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::storage::{DbResult, LocalDb};
 
@@ -88,7 +88,7 @@ pub async fn claim_pending_live_side_channel_for_job_async(
 }
 
 async fn select_pending_live_side_channel(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Vec<SuppressedWake>> {
     let mut rows = conn

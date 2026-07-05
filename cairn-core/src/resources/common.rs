@@ -1,6 +1,6 @@
 //! Shared support for URI resource readers.
 
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -95,7 +95,7 @@ pub(super) async fn resolve_home_relative_resource_uri(
     }
 }
 
-pub(super) async fn connect_for_read(db: &LocalDb) -> Result<turso::Connection, String> {
+pub(super) async fn connect_for_read(db: &LocalDb) -> Result<cairn_db::turso::Connection, String> {
     let conn = db
         .connect()
         .await
@@ -109,7 +109,7 @@ pub(super) async fn connect_for_read(db: &LocalDb) -> Result<turso::Connection, 
     Ok(conn)
 }
 
-pub(super) fn resource_job_from_row(row: &turso::Row) -> DbResult<ResourceJob> {
+pub(super) fn resource_job_from_row(row: &cairn_db::turso::Row) -> DbResult<ResourceJob> {
     Ok(ResourceJob {
         id: row.text(0)?,
         parent_job_id: row.opt_text(1)?,
@@ -120,7 +120,7 @@ pub(super) fn resource_job_from_row(row: &turso::Row) -> DbResult<ResourceJob> {
     })
 }
 
-fn resource_artifact_from_row(row: &turso::Row) -> DbResult<ResourceArtifact> {
+fn resource_artifact_from_row(row: &cairn_db::turso::Row) -> DbResult<ResourceArtifact> {
     Ok(ResourceArtifact {
         data: row.text(0)?,
         output_name: row.opt_text(1)?,
@@ -129,7 +129,7 @@ fn resource_artifact_from_row(row: &turso::Row) -> DbResult<ResourceArtifact> {
 }
 
 pub(super) async fn lookup_project_by_key(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
 ) -> Result<ProjectContext, String> {
     let key = project_key.to_uppercase();
@@ -156,7 +156,7 @@ pub(super) async fn lookup_project_by_key(
 }
 
 async fn issue_id_for_number(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     number: i32,
 ) -> Option<String> {
@@ -172,7 +172,7 @@ async fn issue_id_for_number(
 }
 
 pub(super) async fn resolve_issue_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     number: i32,
 ) -> Result<(ProjectContext, String), String> {
@@ -184,7 +184,7 @@ pub(super) async fn resolve_issue_id(
 }
 
 pub(super) async fn visible_job_node_segment(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job: &ResourceJob,
 ) -> String {
     if let Some(segment) = job
@@ -481,7 +481,10 @@ fn schema_example_payload(
 }
 
 /// Get todo progress string like "3/5 todos"
-pub(super) async fn get_todo_progress(conn: &turso::Connection, job_id: &str) -> Option<String> {
+pub(super) async fn get_todo_progress(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Option<String> {
     let mut rows = conn
         .query("SELECT status FROM todos WHERE job_id = ?1", (job_id,))
         .await
@@ -506,7 +509,7 @@ pub(super) async fn connect_and_find_node_job(
     number: i32,
     exec_seq: i32,
     node_name: &str,
-) -> Result<(turso::Connection, ResourceJob), String> {
+) -> Result<(cairn_db::turso::Connection, ResourceJob), String> {
     let conn = connect_for_read(db).await?;
     let (_, issue_id) = resolve_issue_id(&conn, project_key, number).await?;
     let job = find_job_by_node_name(&conn, &issue_id, node_name, exec_seq)
@@ -527,7 +530,7 @@ pub(super) async fn connect_and_find_task_job(
     exec_seq: i32,
     node_name: &str,
     task_name: &str,
-) -> Result<(turso::Connection, ResourceJob, ResourceJob), String> {
+) -> Result<(cairn_db::turso::Connection, ResourceJob, ResourceJob), String> {
     let (conn, parent_job) =
         connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await?;
     let task_job = find_task_by_name(&conn, &parent_job.id, task_name).await?;
@@ -535,7 +538,7 @@ pub(super) async fn connect_and_find_task_job(
 }
 
 /// Check if a job or any of its child jobs have an artifact
-pub(super) async fn has_artifact_for_job(conn: &turso::Connection, job_id: &str) -> bool {
+pub(super) async fn has_artifact_for_job(conn: &cairn_db::turso::Connection, job_id: &str) -> bool {
     // Check the job itself
     let direct = match conn
         .query(
@@ -570,7 +573,7 @@ pub(super) async fn has_artifact_for_job(conn: &turso::Connection, job_id: &str)
 }
 
 /// Check if a job has any terminals
-pub(super) async fn has_terminal_for_job(conn: &turso::Connection, job_id: &str) -> bool {
+pub(super) async fn has_terminal_for_job(conn: &cairn_db::turso::Connection, job_id: &str) -> bool {
     match conn
         .query(
             "SELECT id FROM job_terminals WHERE job_id = ?1 LIMIT 1",
@@ -584,7 +587,7 @@ pub(super) async fn has_terminal_for_job(conn: &turso::Connection, job_id: &str)
 }
 
 pub(super) async fn get_direct_artifact_for_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> Option<ResourceArtifact> {
     // Most recently written name wins. `version` is per-name, so ordering by it
@@ -609,7 +612,7 @@ pub(super) async fn get_direct_artifact_for_job(
 
 /// Get artifact for a job (checking job itself and child jobs)
 pub(super) async fn get_artifact_for_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> Option<ResourceArtifact> {
     if let Some(artifact) = get_direct_artifact_for_job(conn, job_id).await {
@@ -639,7 +642,7 @@ pub(super) async fn get_artifact_for_job(
 /// name's own version chain rather than whatever name carries the highest
 /// version across the job.
 pub(super) async fn get_named_artifact_for_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     output_name: &str,
 ) -> Option<ResourceArtifact> {
@@ -686,7 +689,7 @@ pub(super) async fn get_named_artifact_for_job(
 /// highest version). A single-artifact node yields exactly one entry — the same
 /// artifact [`get_artifact_for_job`] would surface.
 pub(super) async fn list_named_artifacts_for_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> Vec<ResourceArtifact> {
     let sql = format!(
@@ -717,7 +720,7 @@ pub(super) async fn list_named_artifacts_for_job(
 }
 
 pub(super) async fn find_task_by_name(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     parent_job_id: &str,
     task_name: &str,
 ) -> Result<ResourceJob, String> {
@@ -749,7 +752,7 @@ pub(super) async fn find_task_by_name(
 
 /// Get the execution_id for a given exec_seq (1-based index stored in seq column)
 async fn get_execution_id_for_seq(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     exec_seq: i32,
 ) -> Option<String> {
@@ -770,7 +773,7 @@ async fn get_execution_id_for_seq(
 }
 
 pub(super) async fn find_job_by_node_name(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     node_name: &str,
     exec_seq: i32,
@@ -808,7 +811,7 @@ pub(super) async fn find_job_by_node_name(
 /// `get_execution_id_for_seq`, so action nodes resolve through the exact key the
 /// node-tree emits and `blocked_node_artifact_uri` uses (CAIRN-1222).
 pub(super) async fn find_action_run_by_node_name(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
     node_name: &str,
     exec_seq: i32,

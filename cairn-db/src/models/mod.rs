@@ -48,11 +48,12 @@ pub use workspace::{
 
 // Project types
 pub use project::{
-    CreateProject, MoveProject, Project, ProjectRemoteStatus, TerminalCommand, UpdateProject,
+    CheckCommand, CheckPolicy, CheckWhen, CreateProject, MoveProject, PopulateConfig, Project,
+    ProjectRemoteStatus, SeedEntry, TerminalCommand, UpdateProject,
 };
 
 // Context token snapshot types
-pub(crate) use context_tokens::get_latest_context_token_event;
+pub use context_tokens::get_latest_context_token_event;
 pub use context_tokens::ContextTokenState;
 
 // Provider usage snapshot types
@@ -74,13 +75,13 @@ pub use job::{Job, JobStatus};
 // Execution types (recipe instances)
 pub use execution::{
     ConditionEvaluation, Execution, ExecutionDetail, ExecutionFilters, ExecutionListItem,
-    ExecutionListResult, ExecutionStatus, TriggerType, TriggeredExecution,
+    ExecutionListResult, ExecutionStatus, Initiator, TriggerType, TriggeredExecution,
 };
 
 // Run types
 pub use run::{
-    Event, PermissionRequest, PermissionStatus, Prompt, Run, RunStartMode, RunStatus, RunTodos,
-    TodoItem,
+    Event, PermissionRequest, PermissionStatus, Prompt, ReadSegmentTokens, Run, RunStartMode,
+    RunStatus, RunTodos, TodoItem,
 };
 
 // Session types (durable conversation identity)
@@ -148,7 +149,7 @@ pub use snapshot::{
 pub use files::{detect_language, BranchInfo, FileContent};
 
 // Message types
-pub use message::{ChannelType, Message};
+pub use message::{ChannelType, DeliveryUrgency, Message};
 
 // Embedding types
 pub use embedding::EventEmbedding;

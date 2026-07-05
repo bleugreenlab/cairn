@@ -250,6 +250,17 @@ pub(crate) fn create_review_push_on_turn_end(
 /// [`create_review_push_rows`] and [`wake_review_recipients`] with the node-idle
 /// edge — one implementation of the fingerprint/dedup/push/wake logic, two
 /// trigger edges.
+///
+/// Live callers are the two IN-PROCESS PR-opening paths, both via
+/// `execution::actions::fire_pr_open_review`: `handle_create_pr` (the legacy
+/// `builtin:create_pr` action) and `handle_pr_node` (the modern first-class PR
+/// node, wired in under CAIRN-2410 — before that this edge never fired on the
+/// PR-node path and idle coordinators lost the child-PR review wake). The
+/// desktop GitHub webhook handler (`src-tauri/src/github/`) that once also called
+/// this is dead code after the runner split (the `github` module is not declared
+/// in `src-tauri/src/lib.rs`); its removal is tracked under CAIRN-2408. There is
+/// therefore no live webhook-driven caller today — the in-process edges are the
+/// only ones that fire.
 pub async fn create_review_push_for_pr_open(
     orch: &Orchestrator,
     issue_id: &str,

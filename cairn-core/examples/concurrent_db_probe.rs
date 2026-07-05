@@ -5,7 +5,7 @@
 //!
 //! This is the real cross-process test the within-process unit test in
 //! `local_db.rs` cannot give us: Turso/SQLite coordination across separate
-//! `turso::Database` handles inside one process could plausibly share in-memory
+//! `cairn_db::turso::Database` handles inside one process could plausibly share in-memory
 //! state, masking a cross-process failure. Re-spawning ourselves as worker
 //! processes exercises genuine OS-level file locking + WAL/MVCC coordination.
 //!

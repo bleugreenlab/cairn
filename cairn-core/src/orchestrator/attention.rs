@@ -12,8 +12,8 @@
 //! + detail-uri, so distinct facts always pass through (artifact-then-idle,
 //!   for example, is two emits).
 
+use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
-use turso::params;
 
 use crate::mcp::types::Question;
 use crate::messages::queued::DeliveryUrgency;

@@ -8,7 +8,7 @@ use crate::common;
 
 use cairn_core::internal::storage::{DbError, LocalDb, RowExt};
 use cairn_core::transitions::outcome::recompute_issue_status_conn;
-use turso::params;
+use cairn_db::turso::params;
 
 /// Seed `(project, issue, running execution, complete builder job, open PR)`.
 /// The PR's GitHub state fields are caller-supplied so each test can model a

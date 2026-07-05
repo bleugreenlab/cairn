@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) async fn load_execution_snapshot_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<Option<ExecutionSnapshot>> {
     let mut rows = conn
@@ -18,14 +18,14 @@ pub(super) async fn load_execution_snapshot_conn(
         .flatten();
     snapshot_json
         .map(|json| {
-            ExecutionSnapshot::from_json(&json)
+            crate::config::snapshot_migrate::load(&json)
                 .map_err(|e| DbError::Row(format!("Failed to parse execution snapshot: {e}")))
         })
         .transpose()
 }
 
 pub(super) async fn require_execution_snapshot_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<ExecutionSnapshot> {
     load_execution_snapshot_conn(conn, execution_id)
@@ -105,7 +105,7 @@ pub(super) async fn find_job_downstream_artifact_schema(
 }
 
 pub(super) async fn resolve_job_inputs_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job: &DbJob,
 ) -> DbResult<Vec<ResolvedInput>> {
     let Some(node_id) = job.recipe_node_id.as_deref() else {
@@ -251,7 +251,7 @@ pub(super) async fn resolve_job_inputs_conn(
 /// `output_name`). When the ArtifactNode has no producer but carries inline
 /// literal `content`, it is a static input document (the collapsed Context node).
 pub(super) async fn load_artifact_node_input_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     rnode_map: &HashMap<&str, &RecipeNode>,
     all_edges: &[DbRecipeEdge],
@@ -313,7 +313,7 @@ pub(super) async fn load_artifact_node_input_conn(
 }
 
 pub(super) async fn build_trigger_context_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     snapshot: &ExecutionSnapshot,
     job: &DbJob,
 ) -> DbResult<ResolvedInput> {
@@ -383,7 +383,7 @@ pub(super) async fn build_trigger_context_conn(
 }
 
 pub(super) async fn load_issue_by_project_key_number_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_number: i32,
 ) -> DbResult<Option<(String, String, Option<String>)>> {
@@ -403,7 +403,7 @@ pub(super) async fn load_issue_by_project_key_number_conn(
 }
 
 pub(super) async fn load_issue_title_description_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     issue_id: &str,
 ) -> DbResult<Option<(String, Option<String>)>> {
     let mut rows = conn
@@ -460,7 +460,7 @@ fn ctx_self_names_from_edges(
 /// consumer's terminal input in place of the real terminal artifact (e.g.
 /// `create-pr`).
 pub(super) async fn load_artifact_for_edge_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     output_name: &str,
     exclude_from_fallback: &[String],
@@ -500,7 +500,7 @@ pub(super) async fn load_artifact_for_edge_conn(
 }
 
 pub(super) async fn load_last_assistant_message_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -522,7 +522,7 @@ pub(super) async fn load_last_assistant_message_conn(
 }
 
 pub(crate) async fn find_downstream_artifact_schema_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     node_id: &str,
     execution_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
@@ -547,7 +547,7 @@ pub(crate) async fn find_downstream_artifact_schema_conn(
 /// another agent), the node's own inline `outputSchema` is the contract. Splitting
 /// the snapshot load out lets the recompute sweep reuse its loaded snapshot.
 pub(crate) async fn find_downstream_artifact_schema_with_snapshot_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     snapshot: &ExecutionSnapshot,
     node_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
@@ -584,7 +584,7 @@ pub(crate) async fn find_downstream_artifact_schema_with_snapshot_conn(
 /// with no `schema` (a pure literal-content input document) is not a terminal
 /// contract.
 async fn resolve_ctx_out_target_schema(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     node_map: &HashMap<&str, &RecipeNode>,
     target_node_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
@@ -664,7 +664,7 @@ fn legacy_own_output_schema(
 /// to validate ctx-self writes; they are NOT the terminal contract and never gate
 /// the job. ArtifactNodes with no schema are skipped (nothing to validate).
 pub(crate) async fn resolve_ctx_self_schemas_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     node_id: &str,
     execution_id: &str,
 ) -> DbResult<Vec<OutputSchemaInfo>> {
@@ -708,7 +708,7 @@ pub(crate) fn resolve_ctx_self_schemas_with_snapshot(
 }
 
 pub(super) async fn load_action_config_schema_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     action_config_id: &str,
 ) -> DbResult<Option<OutputSchemaInfo>> {
     let mut rows = conn

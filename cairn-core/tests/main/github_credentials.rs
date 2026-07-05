@@ -1,7 +1,7 @@
 use crate::common;
 
 use cairn_core::github::credentials;
-use turso::params;
+use cairn_db::turso::params;
 
 /// Read a single raw text column from the `default` github_app row.
 async fn raw_column(

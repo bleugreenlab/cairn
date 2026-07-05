@@ -150,6 +150,35 @@ pub fn bookmark_landed_in(jj: &JjEnv, store: &Path, src: &str, dst: &str) -> boo
     revset_commit(jj, store, &revset).is_some()
 }
 
+/// Local bookmarks pointing exactly at `rev` in this workspace's view of the
+/// store. The single-commit analogue of [`local_bookmarks_in_range`]: the amend
+/// guard in [`seal_paths`] uses it to detect whether `@-` (the commit a `^` amend
+/// would rewrite) is SHARED with a sibling bookmark, in which case the amend is
+/// converted to a child commit rather than rewriting shared history.
+/// `--ignore-working-copy` keeps the read from snapshotting `@` before the seal
+/// deliberately does so.
+pub fn local_bookmarks_at(jj: &JjEnv, ws: &Path, rev: &str) -> Result<Vec<String>, String> {
+    let out = jj.run(
+        ws,
+        &[
+            "log",
+            "-r",
+            rev,
+            "--no-graph",
+            "-T",
+            "local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+            "--ignore-working-copy",
+        ],
+        "jj log (local bookmarks at rev)",
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 /// Resolve a single revset to a commit id over the shared store, or `None` when
 /// it does not resolve. Used for both exact local bookmarks and remote-tracking
 /// bookmarks such as `main@origin`.

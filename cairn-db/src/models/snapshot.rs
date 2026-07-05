@@ -271,18 +271,6 @@ impl ExecutionSnapshot {
         serde_json::to_string(self).map_err(|e| format!("Failed to serialize snapshot: {}", e))
     }
 
-    /// Deserialize from JSON string, applying resolve-early migration on read.
-    ///
-    /// **All** snapshot deserialization must go through this so pre-resolve-early
-    /// snapshots (flat `model`/`resolvedBackend` + frozen `presets`) gain a
-    /// concrete atomic `selection` and recovered `extras` exactly once.
-    pub fn from_json(json: &str) -> Result<Self, String> {
-        let mut snapshot: Self = serde_json::from_str(json)
-            .map_err(|e| format!("Failed to deserialize snapshot: {}", e))?;
-        snapshot.migrate_on_read();
-        Ok(snapshot)
-    }
-
     /// Re-key every routable id embedded in the snapshot for a private-to-team
     /// project move. Provider ids and backend session ids are intentionally not
     /// present in this pass.
@@ -311,70 +299,6 @@ impl ExecutionSnapshot {
             }
         }
         Ok(())
-    }
-
-    /// Fold legacy per-agent flat `model`/`resolved_backend` (and frozen
-    /// `presets`) into the atomic `selection` + `extras` representation, once.
-    ///
-    /// Recovers exactly what the runtime used to recompute: the backend prefers
-    /// the stored `resolved_backend`, else derives from the model, else the
-    /// frozen active backend; extras are recovered from the frozen preset matrix
-    /// when present. Clears the legacy fields and the frozen presets afterward so
-    /// the atomic field is the single representation going forward.
-    pub fn migrate_on_read(&mut self) {
-        let frozen = self
-            .presets
-            .as_ref()
-            .map(crate::config::presets::PresetsConfig::from);
-        for packet in &mut self.delegated_packets {
-            if packet.ownership.fence.is_none()
-                && (packet.ownership.sandbox.is_some() || packet.ownership.on_escape.is_some())
-            {
-                packet.ownership.fence = Some(Fence::from_legacy(
-                    packet.ownership.sandbox,
-                    packet.ownership.on_escape,
-                ));
-            }
-            packet.ownership.sandbox = None;
-            packet.ownership.on_escape = None;
-        }
-
-        for agent in self.agents.values_mut() {
-            if agent.fence.is_none() && (agent.sandbox.is_some() || agent.on_escape.is_some()) {
-                agent.fence = Some(Fence::from_legacy(agent.sandbox, agent.on_escape));
-            }
-            agent.sandbox = None;
-            agent.on_escape = None;
-
-            if agent.selection.is_none() {
-                if let Some(model) = agent.model.clone() {
-                    let backend = agent
-                        .resolved_backend
-                        .clone()
-                        .or_else(|| {
-                            crate::backends::backend_for_model(model.as_str()).map(str::to_string)
-                        })
-                        .or_else(|| frozen.as_ref().map(|p| p.active_backend.clone()))
-                        .unwrap_or_else(|| "claude".to_string());
-                    agent.selection = Some(ModelSelection { backend, model });
-                }
-            }
-            if agent.extras.is_none() {
-                if let Some(presets) = frozen.as_ref() {
-                    if let Ok(resolved) = crate::config::presets::resolve_selection_with_provenance(
-                        agent.tier.as_ref().map(Model::as_str),
-                        agent.backend_preference.as_deref(),
-                        None,
-                        presets,
-                    ) {
-                        agent.extras = Some(resolved.extras);
-                    }
-                }
-            }
-            agent.model = None;
-            agent.resolved_backend = None;
-        }
-        self.presets = None;
     }
 }
 
@@ -467,7 +391,7 @@ mod tests {
         };
 
         let json = snapshot.to_json().unwrap();
-        let restored = ExecutionSnapshot::from_json(&json).unwrap();
+        let restored: ExecutionSnapshot = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.recipe.id, "recipe-1");
         assert_eq!(restored.agents.len(), 1);
@@ -645,93 +569,6 @@ mod tests {
 
         let packet: DelegatedWorkPacket = serde_json::from_str(json).unwrap();
         assert!(!packet.background);
-    }
-
-    /// Pre-resolve-early snapshot (flat model/resolvedBackend + frozen presets,
-    /// no `selection`) migrates on read into a concrete atomic selection,
-    /// recovers `extras` from the frozen presets, and re-serializes with a
-    /// nested `selection` and no `presets`.
-    #[test]
-    fn migrate_on_read_builds_selection_from_legacy_fields() {
-        let json = r#"{
-            "recipe": {
-                "id": "r-1", "name": "R", "description": null,
-                "trigger": "manual", "nodes": [], "edges": []
-            },
-            "agents": {
-                "build": {
-                    "id": "build", "name": "Build", "description": "",
-                    "prompt": "p", "tools": [],
-                    "tier": "md",
-                    "model": "sonnet",
-                    "resolvedBackend": "claude"
-                }
-            },
-            "skills": {},
-            "triggerContext": {"issueId": null, "projectId": "p-1", "triggerType": "manual"},
-            "presets": {
-                "activeBackend": "claude",
-                "tiers": ["sm", "md", "lg"],
-                "backends": {
-                    "claude": {
-                        "md": {"model": "sonnet", "options": {"reasoningEffort": "high"}}
-                    }
-                }
-            },
-            "createdAt": 1
-        }"#;
-
-        let snapshot = ExecutionSnapshot::from_json(json).unwrap();
-        let agent = snapshot.agents.get("build").unwrap();
-        let selection = agent.selection.as_ref().expect("selection migrated");
-        assert_eq!(selection.backend, "claude");
-        assert_eq!(selection.model.as_str(), "sonnet");
-        assert_eq!(
-            agent.extras.as_ref().unwrap().reasoning_effort.as_deref(),
-            Some("high")
-        );
-        assert!(snapshot.presets.is_none());
-        assert!(agent.model.is_none());
-        assert!(agent.resolved_backend.is_none());
-
-        // Re-serialize: nested selection present, no presets, no flat model.
-        let reserialized = snapshot.to_json().unwrap();
-        assert!(reserialized.contains("\"selection\""));
-        assert!(!reserialized.contains("\"presets\""));
-        assert!(!reserialized.contains("resolvedBackend"));
-    }
-
-    /// An ancient snapshot with `presets: null` still loads; backend is derived
-    /// from the model when no frozen active backend is available.
-    #[test]
-    fn migrate_on_read_without_presets_derives_backend_from_model() {
-        let json = r#"{
-            "recipe": {
-                "id": "r-1", "name": "R", "description": null,
-                "trigger": "manual", "nodes": [], "edges": []
-            },
-            "agents": {
-                "build": {
-                    "id": "build", "name": "Build", "description": "",
-                    "prompt": "p", "tools": [],
-                    "model": "gpt-5.3-codex"
-                }
-            },
-            "skills": {},
-            "triggerContext": {"issueId": null, "projectId": "p-1", "triggerType": "manual"},
-            "createdAt": 1
-        }"#;
-
-        let snapshot = ExecutionSnapshot::from_json(json).unwrap();
-        let selection = snapshot
-            .agents
-            .get("build")
-            .unwrap()
-            .selection
-            .as_ref()
-            .unwrap();
-        assert_eq!(selection.backend, "codex");
-        assert_eq!(selection.model.as_str(), "gpt-5.3-codex");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::{ChannelType, Message};
 use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 use uuid::Uuid;
 
 fn db_error(context: &str, error: DbError) -> String {
@@ -19,7 +19,7 @@ const MESSAGE_COLUMNS: &str = "id, channel_type, channel_id, sender_run_id, send
         recipient_run_id, content, created_at, urgency";
 
 /// Convert a database row to a domain Message.
-fn message_from_row(row: &turso::Row) -> DbResult<Message> {
+fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<Message> {
     let channel_type = row.text(1)?;
     Ok(Message {
         id: row.text(0)?,
@@ -60,7 +60,7 @@ pub async fn get_message_by_id_async(db: &LocalDb, id: &str) -> DbResult<Option<
     .await
 }
 
-async fn load_message_by_id(conn: &turso::Connection, id: &str) -> DbResult<Message> {
+async fn load_message_by_id(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Message> {
     let sql = format!("SELECT {} FROM messages WHERE id = ?1", MESSAGE_COLUMNS);
     let mut rows = conn.query(&sql, params![id]).await?;
 
@@ -71,7 +71,7 @@ async fn load_message_by_id(conn: &turso::Connection, id: &str) -> DbResult<Mess
         .ok_or_else(|| DbError::Row(format!("inserted message not found: {}", id)))
 }
 
-async fn cursor_created_at(conn: &turso::Connection, id: &str) -> DbResult<Option<i64>> {
+async fn cursor_created_at(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Option<i64>> {
     let mut rows = conn
         .query("SELECT created_at FROM messages WHERE id = ?1", params![id])
         .await?;
@@ -79,7 +79,7 @@ async fn cursor_created_at(conn: &turso::Connection, id: &str) -> DbResult<Optio
     crate::storage::next_i64(&mut rows, 0).await
 }
 
-async fn collect_messages(mut rows: turso::Rows) -> DbResult<Vec<Message>> {
+async fn collect_messages(mut rows: cairn_db::turso::Rows) -> DbResult<Vec<Message>> {
     let mut messages = Vec::new();
     while let Some(row) = rows.next().await? {
         messages.push(message_from_row(&row)?);
@@ -531,7 +531,7 @@ pub(super) async fn query_directs_for_job_async(
 mod tests {
     use super::*;
     use crate::storage::LocalDb;
-    use turso::params;
+    use cairn_db::turso::params;
 
     /// Insert a message with a specific timestamp for deterministic ordering in tests.
     async fn migrated_db() -> LocalDb {

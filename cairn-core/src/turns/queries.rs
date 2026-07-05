@@ -4,7 +4,7 @@ use crate::models::{Turn, TurnStartReason, TurnState, TurnYieldReason};
 use crate::services::EventEmitter;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 #[derive(Debug, Clone)]
 pub struct NewTurn<'a> {
@@ -555,7 +555,10 @@ async fn list_by_column(db: &LocalDb, column: &str, value: &str) -> Result<Vec<T
         .map_err(|e| e.to_string())
 }
 
-async fn create_turn_conn(conn: &turso::Connection, new_turn: &NewTurnData) -> DbResult<Turn> {
+async fn create_turn_conn(
+    conn: &cairn_db::turso::Connection,
+    new_turn: &NewTurnData,
+) -> DbResult<Turn> {
     if let Some(job_id) = new_turn.job_id.as_deref() {
         let active_count = count_conn(
             conn,
@@ -625,7 +628,7 @@ async fn create_turn_conn(conn: &turso::Connection, new_turn: &NewTurnData) -> D
 }
 
 async fn create_successor_turn_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     turn_id: &str,
     session_id: &str,
     job_id: &str,
@@ -666,7 +669,7 @@ async fn create_successor_turn_conn(
 }
 
 async fn ensure_resume_successor_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     predecessor_id: Option<&str>,
     job_id: Option<&str>,
     session_id: Option<&str>,
@@ -694,7 +697,10 @@ async fn ensure_resume_successor_conn(
     Ok(Some(successor.id))
 }
 
-async fn load_turn_conn(conn: &turso::Connection, turn_id: &str) -> DbResult<Option<Turn>> {
+async fn load_turn_conn(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+) -> DbResult<Option<Turn>> {
     let mut rows = conn
         .query(
             "SELECT id, session_id, run_id, job_id, sequence,
@@ -712,7 +718,7 @@ async fn load_turn_conn(conn: &turso::Connection, turn_id: &str) -> DbResult<Opt
 }
 
 async fn load_successor_turn_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     predecessor_id: &str,
 ) -> DbResult<Option<Turn>> {
     let mut rows = conn
@@ -733,7 +739,7 @@ async fn load_successor_turn_conn(
         .transpose()
 }
 
-async fn next_sequence_conn(conn: &turso::Connection, session_id: &str) -> DbResult<i32> {
+async fn next_sequence_conn(conn: &cairn_db::turso::Connection, session_id: &str) -> DbResult<i32> {
     let mut rows = conn
         .query(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM turns WHERE session_id = ?1",
@@ -747,7 +753,7 @@ async fn next_sequence_conn(conn: &turso::Connection, session_id: &str) -> DbRes
         .ok_or_else(|| DbError::internal("failed to compute next turn sequence"))
 }
 
-async fn count_conn(conn: &turso::Connection, sql: &str, value: &str) -> DbResult<i64> {
+async fn count_conn(conn: &cairn_db::turso::Connection, sql: &str, value: &str) -> DbResult<i64> {
     let mut rows = conn.query(sql, params![value]).await?;
     rows.next()
         .await?
@@ -756,7 +762,7 @@ async fn count_conn(conn: &turso::Connection, sql: &str, value: &str) -> DbResul
         .ok_or_else(|| DbError::internal("count query returned no rows"))
 }
 
-fn turn_from_row(row: &turso::Row) -> DbResult<Turn> {
+fn turn_from_row(row: &cairn_db::turso::Row) -> DbResult<Turn> {
     let state = row.text(6)?.parse::<TurnState>().map_err(DbError::Row)?;
     let yield_reason = row
         .opt_text(7)?

@@ -13,9 +13,9 @@ use cairn_core::internal::mcp::handlers::watch::handle_watch;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::{AttentionEvent, Orchestrator};
 use cairn_core::internal::storage::{DbError, LocalDb};
+use cairn_db::turso::params;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use turso::params;
 
 const WATCH_URI: &str = "cairn://p/WATCH/1";
 

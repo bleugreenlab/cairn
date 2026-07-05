@@ -662,6 +662,32 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         }
     }
 
+    // Pre-flight staleness reconcile for a file-touching write: heal a stale /
+    // behind-its-branch-tip working copy BEFORE applying edits (which land on disk,
+    // then seal), serialized on the per-store jj lock the base-advance reconcile
+    // and merge-fold hold, so the batch applies and seals against a fresh base and
+    // can never race a concurrent rebase. Best-effort; finalize_file_commit's
+    // seal-time stale-recovery remains the mid-batch fallback. Resource-only writes
+    // never reach here (no file target); a non-worktree cwd was rejected above.
+    if crate::jj::is_jj_dir(std::path::Path::new(&request.cwd))
+        && payload
+            .changes
+            .iter()
+            .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)))
+    {
+        let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&request.cwd));
+        let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+        let _guard = match store_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&request.cwd)) {
+            log::warn!(
+                "pre-flight workspace reconcile (write) failed (continuing; seal-time stale arm remains the fallback): {e}"
+            );
+        }
+    }
+
     // Blocking appends (task/question collections) are deferred to the end of the
     // call and run as a single group; everything else applies first in order.
     let blocking_indices: Vec<usize> = payload

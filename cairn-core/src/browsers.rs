@@ -8,9 +8,9 @@
 
 use std::time::Duration;
 
+use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
-use turso::params;
 
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
@@ -87,7 +87,7 @@ const BROWSER_SELECT: &str = "
            created_at, closed_at, last_active_at
     FROM job_browsers";
 
-fn browser_from_row(row: &turso::Row) -> DbResult<JobBrowser> {
+fn browser_from_row(row: &cairn_db::turso::Row) -> DbResult<JobBrowser> {
     Ok(JobBrowser {
         id: row.text(0)?,
         job_id: row.opt_text(1)?,
@@ -479,9 +479,9 @@ pub async fn list_running_browsers_for_jobs(
             let sql = format!(
                 "{BROWSER_SELECT} WHERE job_id IN ({placeholders}) AND status = '{STATUS_OPEN}' ORDER BY created_at ASC"
             );
-            let params: Vec<turso::Value> = job_ids
+            let params: Vec<cairn_db::turso::Value> = job_ids
                 .iter()
-                .map(|id| turso::Value::Text(id.clone()))
+                .map(|id| cairn_db::turso::Value::Text(id.clone()))
                 .collect();
             let mut rows = conn.query(&sql, params).await?;
             let mut browsers = Vec::new();
@@ -512,9 +512,9 @@ pub async fn delete_all_browser_rows_for_jobs(
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!("DELETE FROM job_browsers WHERE job_id IN ({placeholders})");
-            let params: Vec<turso::Value> = job_ids
+            let params: Vec<cairn_db::turso::Value> = job_ids
                 .iter()
-                .map(|id| turso::Value::Text(id.clone()))
+                .map(|id| cairn_db::turso::Value::Text(id.clone()))
                 .collect();
             conn.execute(&sql, params).await?;
             Ok(())

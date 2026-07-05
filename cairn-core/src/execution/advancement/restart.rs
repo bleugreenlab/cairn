@@ -39,7 +39,7 @@ pub struct RestartNodeOutcome {
 /// Connection-level restart: validate, archive the prior attempt, create a fresh
 /// job — all in one transaction so a partial restart is never observable.
 pub(crate) async fn restart_node_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     recipe_node_id: &str,
 ) -> DbResult<RestartNodeOutcome> {
@@ -151,7 +151,10 @@ mod tests {
         )
     }
 
-    async fn seed_project_issue_execution(conn: &turso::Connection, snap: &ExecutionSnapshot) {
+    async fn seed_project_issue_execution(
+        conn: &cairn_db::turso::Connection,
+        snap: &ExecutionSnapshot,
+    ) {
         conn.execute(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)",
             (),
@@ -184,7 +187,7 @@ mod tests {
 
     #[allow(clippy::too_many_arguments)]
     async fn seed_job(
-        conn: &turso::Connection,
+        conn: &cairn_db::turso::Connection,
         id: &str,
         node_id: &str,
         status: &str,
@@ -217,7 +220,7 @@ mod tests {
         }
     }
 
-    async fn job_status(conn: &turso::Connection, id: &str) -> Option<String> {
+    async fn job_status(conn: &cairn_db::turso::Connection, id: &str) -> Option<String> {
         let mut rows = conn
             .query("SELECT status FROM jobs WHERE id = ?1", params![id])
             .await
@@ -225,7 +228,10 @@ mod tests {
         rows.next().await.unwrap().map(|row| row.text(0).unwrap())
     }
 
-    async fn jobs_for_node(conn: &turso::Connection, node_id: &str) -> Vec<(String, String)> {
+    async fn jobs_for_node(
+        conn: &cairn_db::turso::Connection,
+        node_id: &str,
+    ) -> Vec<(String, String)> {
         let mut rows = conn
             .query(
                 "SELECT id, status FROM jobs WHERE execution_id = 'exec-1' AND recipe_node_id = ?1

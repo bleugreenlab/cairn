@@ -4,7 +4,7 @@ pub(super) fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
 }
 
-pub(super) fn session_from_row(row: &turso::Row) -> DbResult<Session> {
+pub(super) fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> {
     Ok(Session {
         id: row.text(0)?,
         job_id: row.opt_text(1)?,
@@ -23,7 +23,7 @@ pub(super) fn session_from_row(row: &turso::Row) -> DbResult<Session> {
 }
 
 pub(super) async fn load_job_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<DbJob>> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1");
@@ -289,7 +289,7 @@ pub(super) fn worktree_head_commit(orch: &Orchestrator, worktree_path: &Path) ->
 /// chases the chain to the durable root, so the rule is depth-proof for nested
 /// coordinators. Unresolvable bases stay NULL (never guessed).
 pub(super) async fn resolve_pack_anchor_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job: &DbJob,
     base_commit: Option<&str>,
 ) -> DbResult<Option<String>> {
@@ -311,7 +311,7 @@ pub(super) async fn resolve_pack_anchor_conn(
 /// The inherited anchor for an explicit parent job: its `pack_anchor`, else its
 /// `base_commit`.
 async fn parent_pack_anchor_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     parent_job_id: &str,
 ) -> DbResult<Option<String>> {
     let mut rows = conn
@@ -330,7 +330,7 @@ async fn parent_pack_anchor_conn(
 /// The inherited anchor for a child-issue execution, found by the parent's
 /// integration branch.
 async fn parent_pack_anchor_by_branch_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     branch: &str,
 ) -> DbResult<Option<String>> {
@@ -389,7 +389,7 @@ pub(super) async fn update_job_worktree(
 }
 
 pub(super) async fn load_session_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
 ) -> DbResult<Option<Session>> {
     let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1");
@@ -450,7 +450,7 @@ pub(super) async fn load_session_optional(
 }
 
 pub(super) async fn insert_session_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
     job_id: Option<&str>,
     chat_id: Option<&str>,
@@ -470,7 +470,7 @@ pub(super) async fn insert_session_conn(
 }
 
 pub(super) async fn resolve_prepare_session_start_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job: &DbJob,
     session: &Session,
     job_backend: &str,

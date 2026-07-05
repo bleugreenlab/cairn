@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 /// Create an execution with an empty snapshot in the database.
 async fn create_execution_with_snapshot(db: &LocalDb, execution_id: &str, project_id: &str) {

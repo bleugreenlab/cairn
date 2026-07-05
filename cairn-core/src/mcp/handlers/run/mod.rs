@@ -157,6 +157,24 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // NonWorktreeVcs for the project's live checkout) and capture the pre-batch
     // snapshot through it.
     let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&cwd));
+    // Pre-flight staleness reconcile: heal a stale / behind-its-branch-tip working
+    // copy BEFORE the batch runs, serialized on the same per-store jj lock the
+    // base-advance reconcile and merge-fold hold, so it can never race a concurrent
+    // rebase (the hazard a hand-run `jj workspace update-stale` hit). Resolved once
+    // here and reused by the post-batch commit barrier below. Best-effort: a
+    // failure leaves the seal-time stale arm as the mid-batch fallback.
+    let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+    {
+        let _guard = match store_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&cwd)) {
+            log::warn!(
+                "pre-flight workspace reconcile failed (continuing; seal-time stale arm remains the fallback): {e}"
+            );
+        }
+    }
     // Capture the pre-batch snapshot whenever a no-`commit_msg` run could leave
     // dirt the barrier must reconcile. For a worktree this is gated on the
     // hygiene fence (Ask/Deny). For the project's LIVE checkout we capture
@@ -346,7 +364,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // The guard scopes ONLY the barrier's store mutation — the pre-batch snapshot
     // and per-item command execution above stay outside it (per-workspace reads /
     // FS work, not shared-store rebase/import). `None` for a non-worktree cwd.
-    let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+    // `store_lock` is the same handle resolved for the pre-flight reconcile above.
     let barrier = {
         let _store_guard = match store_lock.as_ref() {
             Some(lock) => Some(lock.lock().await),

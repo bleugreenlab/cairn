@@ -24,7 +24,7 @@ use crate::messages::queued::DeliveryUrgency;
 use crate::models::ExecutionSnapshot;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 #[derive(Debug)]
 struct MergedJob {
@@ -1028,7 +1028,7 @@ async fn load_job_by_id(db: &LocalDb, job_id: &str) -> Result<Option<MergedJob>,
 }
 
 async fn load_job_by_id_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<MergedJob>> {
     let mut rows = conn
@@ -1171,7 +1171,7 @@ async fn latest_complete_implementation_job(
 }
 
 async fn load_execution_snapshot_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<ExecutionSnapshot> {
     let mut rows = conn
@@ -1186,7 +1186,8 @@ async fn load_execution_snapshot_conn(
     let Some(snapshot_json) = row.opt_text(0)? else {
         return Err(DbError::Row("execution has no snapshot".to_string()));
     };
-    ExecutionSnapshot::from_json(&snapshot_json).map_err(|error| DbError::Row(error.to_string()))
+    crate::config::snapshot_migrate::load(&snapshot_json)
+        .map_err(|error| DbError::Row(error.to_string()))
 }
 
 /// In-flight siblings on the same base that may need rebasing after a merge.

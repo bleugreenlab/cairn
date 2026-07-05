@@ -9,8 +9,8 @@ use crate::storage::RowExt;
 use cairn_common::query::{split_target_query, QueryParam};
 use cairn_common::read::{ImageBlock, NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
 use cairn_common::uri::{build_issue_uri, parse_uri, CairnResource};
+use cairn_db::turso::params;
 use serde::Serialize;
-use turso::params;
 
 /// Size threshold for eliding glob content previews (250KB)
 const LARGE_FILE_THRESHOLD: u64 = 250_000;

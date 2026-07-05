@@ -15,8 +15,8 @@ use cairn_core::internal::agent_process::process::{RunHandle, SuspendKind};
 use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 async fn seed(db: &LocalDb) {
     let project_id = common::create_project(db, "TOR").await;

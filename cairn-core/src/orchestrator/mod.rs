@@ -261,11 +261,20 @@ impl OrchestratorBuilder {
         // chokepoint every sync-capable host passes through before it can open a
         // team replica. Turso's sync IO builds its hyper-rustls client the
         // instant the `turso-sync-io` thread spawns (inside
-        // `turso::sync::Builder::build()`), so the provider must already be
+        // turso's `sync::Builder::build()`), so the provider must already be
         // installed by then — doing it lazily per-open races that thread spawn
         // (CAIRN-2196). Idempotent and `Once`-guarded; see
         // `storage::install_crypto_provider`.
         crate::storage::install_crypto_provider();
+
+        // Register the archived-file renderer so archival reconstruction (in
+        // `storage`, below the mcp read layer) can reproduce archived reads
+        // byte-for-byte. One of two idempotent registration sites: this covers
+        // orchestrator-owning construction (including tests that build an
+        // orchestrator directly), while `cairn_transport::state::init_database`
+        // registers earlier to cover the startup search-index refresh, which
+        // reconstructs archived events before the orchestrator is built.
+        crate::mcp::handlers::read::register_archived_file_renderer();
 
         let anon_device_manager = Arc::new(AnonDeviceManager::new(
             self.db.clone(),
@@ -829,6 +838,23 @@ impl Orchestrator {
                 log::warn!("analytics rollup backfill failed: {e}");
             }
         });
+    }
+
+    /// Spawn the live recipe scheduler: a detached loop that fires
+    /// schedule-triggered recipes. Each fire creates a fresh issue and starts the
+    /// recipe as that issue's execution, stamped `triggered_by = schedule`, so a
+    /// scheduled run gets the normal issue/execution/attention surface.
+    ///
+    /// The loop uses a bounded sleep (`min(soonest_fire - now, 60s)`): a capped
+    /// wake just recomputes next-fire times, so recipe create/edit/delete lands
+    /// within a minute without a poke channel back into core. Firing is
+    /// restart-safe and double-fire-safe via the executions-table dedupe
+    /// (`MAX(started_at) WHERE triggered_by = 'schedule'`) — no marker table.
+    ///
+    /// Owned by the always-on hosts (runner and non-inert server); the thin
+    /// desktop app must never call this. Must run within a tokio runtime.
+    pub fn spawn_recipe_scheduler(&self) {
+        crate::execution::scheduler::spawn_recipe_scheduler(self.clone());
     }
 
     /// Spawn the memory-triage reconciliation sweep: once immediately at

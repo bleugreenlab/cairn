@@ -14,7 +14,8 @@
 //! `crate::storage::events::*` / `crate::storage::*` consumer compiling
 //! unchanged.
 
-pub(crate) mod encoding;
+pub mod columns;
+pub mod encoding;
 pub mod reconstruct;
 
 // Exposed under `test-utils` (not just `cfg(test)`) so the unfenced integration
@@ -22,6 +23,13 @@ pub mod reconstruct;
 // fixtures the in-crate tests use.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod event_fixture;
+
+// DB/git-fixture scaffolding shared by the reconstruction tests split across two
+// layers: the renderer-agnostic tests that stay here in `reconstruct`, and the
+// byte-exact archived-read tests that must name the real renderer and so live in
+// the mcp read layer (above the seam). One copy so the two can never drift.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod reconstruct_fixture;
 
 // The gix + zstd codec/object substrate, quarantined into cairn-codec. Its API is
 // keyed by hex sha strings, so gix types never re-enter cairn-core through it.
@@ -37,7 +45,7 @@ pub use cairn_codec::packfile::build_execution_pack;
 
 // Test-only, mirroring the original `#[cfg(test)] pub(crate) mod testutil`, so
 // core test modules keep resolving `crate::storage::events::testutil::*`.
-#[cfg(test)]
-pub(crate) use cairn_codec::testutil;
+#[cfg(any(test, feature = "test-utils"))]
+pub use cairn_codec::testutil;
 
 pub use reconstruct::reconstruct_events;

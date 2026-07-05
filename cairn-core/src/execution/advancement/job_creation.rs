@@ -48,7 +48,7 @@ pub(crate) fn create_jobs_for_execution(
 }
 
 pub(crate) async fn create_jobs_for_new_nodes_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     new_node_ids: &HashSet<String>,
     snapshot: &ExecutionSnapshot,
@@ -174,7 +174,7 @@ fn find_parent_agent_job_id(
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_job_for_node_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
     issue_id: &str,
     project_id: &str,
@@ -361,7 +361,7 @@ async fn insert_job_for_node_conn(
 }
 
 async fn base_branch_for_issue_job(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     issue_id: &str,
 ) -> DbResult<Option<String>> {
@@ -376,7 +376,7 @@ async fn base_branch_for_issue_job(
 }
 
 async fn default_branch_for_project(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
 ) -> DbResult<String> {
     let mut rows = conn
@@ -415,7 +415,7 @@ fn backend_for_job_session(snapshot: &ExecutionSnapshot, agent_config_id: Option
 }
 
 async fn load_session_backend_sequence_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
 ) -> DbResult<(String, i32)> {
     let mut rows = conn
@@ -432,7 +432,7 @@ async fn load_session_backend_sequence_conn(
 }
 
 async fn insert_session_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
     job_id: Option<&str>,
     backend: &str,

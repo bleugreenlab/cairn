@@ -12,10 +12,10 @@ use crate::models::Model;
 
 use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
+use cairn_db::turso::params;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
-use turso::params;
 
 use super::Orchestrator;
 
@@ -685,7 +685,7 @@ fn compose_user_message(prompt: &str, messaging: &str) -> String {
 }
 
 async fn issue_key(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_id: &str,
 ) -> DbResult<Option<String>> {
@@ -704,7 +704,7 @@ async fn issue_key(
 }
 
 async fn find_peer_agents(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_id: &str,
     current_run_id: &str,
@@ -775,7 +775,7 @@ async fn find_peer_agents(
 }
 
 async fn recent_messages_for_run(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_key: &str,
     issue_key: Option<&str>,
     exclude_job_id: Option<&str>,
@@ -925,7 +925,7 @@ pub async fn dismiss_channel_message_for_job(
 /// cursor and to exclude every run from the recipient's own job across resumes.
 /// Returns `(None, None)` for legacy runs missing either relation.
 async fn session_and_job_id_for_run(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     run_id: &str,
 ) -> DbResult<(Option<String>, Option<String>)> {
     let mut rows = conn
@@ -940,7 +940,10 @@ async fn session_and_job_id_for_run(
     }
 }
 
-async fn read_channel_cursor(conn: &turso::Connection, session_id: &str) -> DbResult<Option<i64>> {
+async fn read_channel_cursor(
+    conn: &cairn_db::turso::Connection,
+    session_id: &str,
+) -> DbResult<Option<i64>> {
     let mut rows = conn
         .query(
             "SELECT channel_cursor_rowid FROM sessions WHERE id = ?1",
@@ -957,7 +960,7 @@ async fn read_channel_cursor(conn: &turso::Connection, session_id: &str) -> DbRe
 /// keeps the cursor monotonic so a stale/concurrent build can never rewind it
 /// and re-surface already-injected messages.
 async fn advance_channel_cursor(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
     rowid: i64,
 ) -> DbResult<()> {

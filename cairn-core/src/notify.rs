@@ -107,7 +107,7 @@ fn event_issue_id_for_run(db: Arc<LocalDb>, run_id: &str) -> Result<Option<Strin
     run_db_blocking(move || async move {
         db.query_opt_text(
             "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
-            turso::params![run_id.as_str()],
+            cairn_db::turso::params![run_id.as_str()],
         )
         .await
         .map_err(|e| format!("Failed to load issue id for event db-change: {e}"))

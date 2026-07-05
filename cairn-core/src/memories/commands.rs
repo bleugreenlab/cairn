@@ -6,7 +6,7 @@ use crate::execution::routing::owning_db_for_job;
 use crate::models::{CreateMemory, Memory, UpdateMemory};
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 pub async fn create(db: &LocalDb, input: CreateMemory) -> Result<Memory, String> {
     let id = ids::mint_child(
@@ -396,7 +396,7 @@ const REFLECTION_ACTIVITY_THRESHOLD: i64 = 50;
 /// Counting across all of the job's runs (rather than one run's session) keeps
 /// the measure from being deflated by session rotation over a long job.
 async fn job_activity_exceeds_threshold(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     threshold: i64,
 ) -> Result<bool, DbError> {
@@ -451,7 +451,7 @@ pub fn memory_review_idle_state_for_job(
 }
 
 async fn memory_review_idle_state_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> Result<Option<MemoryReviewIdleState>, DbError> {
     let mut rows = conn
@@ -491,7 +491,7 @@ async fn memory_review_idle_state_conn(
 }
 
 async fn terminal_output_artifact_name_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     parent_job_id: Option<&str>,
     recipe_node_id: Option<&str>,
     execution_id: Option<&str>,
@@ -522,7 +522,7 @@ async fn terminal_output_artifact_name_conn(
 }
 
 async fn output_artifact_present_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     terminal_name: Option<&str>,
 ) -> Result<bool, DbError> {
@@ -657,9 +657,9 @@ mod tests {
     use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use turso::params;
 
     struct TestOrch {
         _temp: TempDir,

@@ -3,7 +3,7 @@
 use crate::models::{Session, SessionStatus};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 pub async fn create_for_job(db: &LocalDb, job_id: &str, backend: &str) -> Result<Session, String> {
     let id = ids::mint_session_id().into_string();
@@ -315,7 +315,7 @@ async fn get_for_parent(
 }
 
 async fn create_with_id_and_lineage_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     id: &str,
     job_id: Option<&str>,
     chat_id: Option<&str>,
@@ -350,7 +350,7 @@ async fn create_with_id_and_lineage_conn(
 }
 
 async fn load_session_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     session_id: &str,
 ) -> DbResult<Option<Session>> {
     let mut rows = conn
@@ -369,7 +369,7 @@ async fn load_session_conn(
         .transpose()
 }
 
-fn session_from_row(row: &turso::Row) -> DbResult<Session> {
+fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> {
     let status = row.text(4)?.parse().map_err(|e: String| DbError::Row(e))?;
 
     Ok(Session {

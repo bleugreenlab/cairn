@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::config::slugify_resource_segment;
 use crate::storage::{DbResult, LocalDb, RowExt};
-use turso::{params, Connection, Row, Value};
+use cairn_db::turso::{params, Connection, Row, Value};
 
 #[derive(Debug, Clone)]
 pub struct ResourceEmbeddingRecord {

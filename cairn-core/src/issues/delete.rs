@@ -4,7 +4,7 @@
 use crate::issues::{crud, relations};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 /// Collect the run ids belonging to an issue so their live sessions can be
 /// killed before the issue and its worktrees are torn down.

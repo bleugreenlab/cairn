@@ -4,7 +4,7 @@ use cairn_core::internal::services::Clock;
 use cairn_core::models::CreateProject;
 use cairn_core::projects::crud;
 use cairn_core::CairnError;
-use turso::params;
+use cairn_db::turso::params;
 
 struct FixedClock(i64);
 

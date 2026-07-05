@@ -23,8 +23,8 @@
 //! calls is caught by the next call's check rather than missed, so the harness
 //! never needs a timed poll to stay correct.
 
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::{IssueAttention, IssueStatus};

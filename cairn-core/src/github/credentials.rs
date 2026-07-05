@@ -10,7 +10,7 @@
 
 use super::crypto;
 use crate::storage::{LocalDb, RowExt};
-use turso::params;
+use cairn_db::turso::params;
 
 /// GitHub App credentials needed for API auth.
 #[derive(Debug, Clone)]

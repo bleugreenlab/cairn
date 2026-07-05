@@ -14,22 +14,13 @@
 //! assembler composes targets in input order.
 
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use tiktoken_rs::{o200k_base, CoreBPE};
 
-/// Per-target token count for one section of a composed read result. Serialized
-/// onto `Event.read_segments` (camelCase `readSegments`) and consumed by the
-/// read formatter, which maps segments to rows by input order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReadSegmentTokens {
-    /// Suffix-stripped header URI for this section, or the single input path for
-    /// a no-header read. Empty when neither is known.
-    pub target: String,
-    /// Approximate token count of this section's body.
-    pub tokens: i64,
-}
+/// Per-target token count for one section of a composed read result. The type
+/// lives in `models::run` (serialized onto `Event.read_segments`); this module
+/// owns the token-counting logic that produces it.
+pub use crate::models::ReadSegmentTokens;
 
 fn bpe() -> &'static CoreBPE {
     static BPE: OnceLock<CoreBPE> = OnceLock::new();

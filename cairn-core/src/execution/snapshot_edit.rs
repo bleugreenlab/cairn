@@ -11,11 +11,11 @@
 
 use std::path::PathBuf;
 
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::config::agents::FileAgent;
 use crate::config::presets::{load_effective_presets, resolve_agent_snapshot};
-use crate::models::{AgentSnapshot, ExecutionSnapshot};
+use crate::models::AgentSnapshot;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 
@@ -35,7 +35,7 @@ pub async fn update_execution_agent(
         .await?
         .ok_or("Execution has no snapshot")?;
 
-    let mut snapshot = ExecutionSnapshot::from_json(&snapshot_json)
+    let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
         .map_err(|e| format!("Failed to parse snapshot: {e}"))?;
     let project_path = project_repo_path(db, &snapshot.trigger_context.project_id).await?;
 

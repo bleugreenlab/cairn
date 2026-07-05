@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use cairn_core::memories::{commands, db};
 use cairn_core::models::{CreateMemory, MemoryScope, MemoryStatus};
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 async fn seed_node(
     local_db: &cairn_core::internal::storage::LocalDb,
@@ -315,6 +315,18 @@ async fn node_memory_sequence_confirms_and_resolves_uri() {
         .await
         .unwrap();
     assert_eq!(drafts.len(), 2);
+
+    // Since #2141, `confirm_draft_memories_for_job` advances a job's drafts out
+    // of `draft` only once the owning issue is merged (drafts stay inert until
+    // the work lands). Mark the seeded issue merged so this test exercises the
+    // confirm path it asserts.
+    local_db
+        .execute(
+            "UPDATE issues SET merged_at = 1 WHERE id = 'issue-SEQ-7'",
+            (),
+        )
+        .await
+        .unwrap();
 
     let confirmed = db::confirm_draft_memories_for_job(&local_db, &job_id)
         .await

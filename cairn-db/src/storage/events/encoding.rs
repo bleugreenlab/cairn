@@ -50,31 +50,31 @@ use super::{CODEC_NONE, CODEC_ZSTD_V1};
 /// `data.archived` markers that select a `blobbed` row's reassembly contract on
 /// the read path. Both consumers store their constant parts in `archival_blobs`
 /// and inline their per-run remainder; only the reassembly differs.
-pub(crate) const ARCHIVED_SYSTEM_PROMPT: &str = "system_prompt";
-pub(crate) const ARCHIVED_SYSTEM_INIT: &str = "system_init";
+pub const ARCHIVED_SYSTEM_PROMPT: &str = "system_prompt";
+pub const ARCHIVED_SYSTEM_INIT: &str = "system_init";
 
 /// The skeleton placeholder tag for a `system:init` row's deduped tool-set array.
 /// Scalar varying fields tag themselves by their JSON path; the tool set is the
 /// one structured field, so its tag is named explicitly and shared by the writer
 /// and reader.
-pub(crate) const INIT_TOOLS_TAG: &str = "raw.tools";
+pub const INIT_TOOLS_TAG: &str = "raw.tools";
 
 /// Wrap a tag in the NUL-delimited placeholder a `system:init` skeleton carries
 /// in place of a varying value. A raw NUL byte can never appear in serialized
 /// JSON, so a placeholder can never collide with skeleton content.
-pub(crate) fn init_placeholder(tag: &str) -> String {
+pub fn init_placeholder(tag: &str) -> String {
     format!("\0{tag}\0")
 }
 
 /// `storage_mode` column markers.
-pub(crate) const MODE_FULL: &str = "full";
-pub(crate) const MODE_ZSTD: &str = "zstd";
-pub(crate) const MODE_GITCOORD: &str = "gitcoord";
+pub const MODE_FULL: &str = "full";
+pub const MODE_ZSTD: &str = "zstd";
+pub const MODE_GITCOORD: &str = "gitcoord";
 
 /// One archived event's logical form: the shapes the storage contract admits.
 /// Each carries exactly the fields its columns encode.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ArchivedShape {
+pub enum ArchivedShape {
     /// Unarchived: `data` holds the original rendered bytes verbatim.
     Full { data: String },
     /// Compressed backstop: `data` is a label stub, the original lives zstd in
@@ -125,7 +125,7 @@ pub(crate) enum ArchivedShape {
 ///
 /// [`Event`]: crate::models::Event
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct EventColumns {
+pub struct EventColumns {
     pub storage_mode: Option<String>,
     pub content_commit: Option<String>,
     pub content_render_sha: Option<String>,
@@ -137,7 +137,7 @@ pub(crate) struct EventColumns {
 impl ArchivedShape {
     /// Project a shape onto its column values. Total and infallible: every shape
     /// maps to exactly one valid column combination.
-    pub(crate) fn encode(&self) -> EventColumns {
+    pub fn encode(&self) -> EventColumns {
         match self {
             ArchivedShape::Full { data } => EventColumns {
                 storage_mode: Some(MODE_FULL.to_string()),
@@ -202,7 +202,7 @@ impl ArchivedShape {
 
 /// A column combination that matches no archived shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DecodeError(pub String);
+pub struct DecodeError(pub String);
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -213,7 +213,7 @@ impl std::fmt::Display for DecodeError {
 /// Classify a row's columns into its [`ArchivedShape`], rejecting combinations no
 /// shape produces (a `gitcoord` row with no commit, a compressed row whose codec
 /// disagrees with its blob, a `full` row carrying a blob, an unknown mode).
-pub(crate) fn decode(cols: &EventColumns) -> Result<ArchivedShape, DecodeError> {
+pub fn decode(cols: &EventColumns) -> Result<ArchivedShape, DecodeError> {
     // Global blob/codec invariant: a blob is always zstd_v1, its absence is always
     // uncompressed. This holds across every mode, so check it once up front.
     match (cols.data_blob.is_some(), cols.codec.as_deref()) {

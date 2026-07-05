@@ -2,6 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Per-target token count for one section of a composed read result. Serialized
+/// onto `Event.read_segments` (camelCase `readSegments`) and consumed by the
+/// read formatter, which maps segments to rows by input order. The token-counting
+/// logic that produces these lives in `runs::read_tokens`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadSegmentTokens {
+    /// Suffix-stripped header URI for this section, or the single input path for
+    /// a no-header read. Empty when neither is known.
+    pub target: String,
+    /// Approximate token count of this section's body.
+    pub tokens: i64,
+}
+
 /// A run — one process attachment lifetime.
 ///
 /// Created when a process spawns, finalized when it exits.
@@ -166,7 +180,7 @@ pub struct Event {
     /// stripped from `data` and replaced by these counts. `None` everywhere
     /// else (skyline path, plain row loads).
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub read_segments: Option<Vec<crate::runs::read_tokens::ReadSegmentTokens>>,
+    pub read_segments: Option<Vec<ReadSegmentTokens>>,
 }
 
 /// A prompt awaiting user response

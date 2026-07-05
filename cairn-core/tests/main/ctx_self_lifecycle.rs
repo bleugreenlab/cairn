@@ -23,8 +23,8 @@ use cairn_core::internal::storage::{DbError, LocalDb, RowExt};
 use cairn_core::models::{
     ExecutionSnapshot, RecipeFile, RecipeNodeType, RecipeSnapshot, TriggerContext, TriggerType,
 };
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 /// Load the authored proof recipe, validate it, and build the execution snapshot
 /// the run advances against. Returns the snapshot JSON plus the worker agent's

@@ -8,7 +8,7 @@ use crate::models::ConfirmPolicy;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, RowExt};
 use cairn_common::ids;
-use turso::params;
+use cairn_db::turso::params;
 
 // ============================================================================
 // Handlers
@@ -357,6 +357,24 @@ pub(crate) async fn write_artifact_change(
     //    request-changes revision stays Blocked until the human confirms).
     let confirmed = resolve_confirmed(is_patch, prior_confirmed, policy);
 
+    // Before storing a create-pr artifact version: sweep any unsealed work onto the
+    // branch and refuse an empty-delta (+0/-0) PR. Keyed on the written artifact's
+    // own name/type, the same signal `create_pr_artifact_details` syncs on, so a
+    // ctx-self write under a create-pr terminal never triggers it. The reserved
+    // `action:` merge/close/refresh paths return earlier and never reach here.
+    let is_create_pr_write = artifact_name == Some("create-pr")
+        || output_name.as_str() == "create-pr"
+        || artifact_type.as_str() == "create-pr";
+    if is_create_pr_write {
+        if let Ok(job) = crate::jobs::queries::get_job(&db, &job_id).await {
+            if let (Some(wt), Some(branch)) = (job.worktree_path.as_deref(), job.branch.as_deref())
+            {
+                sweep_and_gate_create_pr_branch(orch, wt, branch, job.base_branch.as_deref())
+                    .await?;
+            }
+        }
+    }
+
     let data_json = serde_json::to_string(&effective_payload)
         .map_err(|e| format!("Failed to serialize artifact: {e}"))?;
     let stored = store_artifact(
@@ -626,6 +644,87 @@ fn should_arm_output_artifact_interrupt(
     has_output_contract: bool,
 ) -> bool {
     has_output_contract && !is_patch && output_artifact_name_matches(artifact_name, required_name)
+}
+
+/// Sweep any unsealed work onto the PR branch and refuse an empty-delta PR before
+/// a create-pr artifact write is stored. Runs only for a content create/patch of a
+/// create-pr artifact (the `action:` merge/close/refresh paths return earlier).
+///
+/// Two moves, serialized on the per-store jj lock like every other Cairn jj store
+/// writer:
+/// 1. **Sweep.** If the working copy carries unsealed work, seal it via the normal
+///    [`crate::mcp::vcs::JjBackend::seal_all`] path (advancing the bookmark,
+///    exporting, and pushing exactly like an agent seal). This is the
+///    missing-seal-on-disk recovery the incident needed: a final seal that
+///    half-applied without failing the artifact write left the branch short of the
+///    agent's work.
+/// 2. **Gate.** Compute the branch's delta versus its base over the store. If it is
+///    STILL empty after the sweep, refuse the artifact write with a diagnostic
+///    naming the branch and base — the one legitimate refusal, catching the +0/-0
+///    PR at its source instead of at coordinator review.
+///
+/// Skips entirely when the worktree no longer exists on disk (post-merge title
+/// edits and the like): there is nothing to sweep or gate.
+async fn sweep_and_gate_create_pr_branch(
+    orch: &Orchestrator,
+    worktree_path: &str,
+    branch: &str,
+    base_branch: Option<&str>,
+) -> Result<(), String> {
+    let worktree = std::path::Path::new(worktree_path);
+    if !crate::jj::is_jj_dir(worktree) {
+        return Ok(());
+    }
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let backend = crate::mcp::vcs::JjBackend::new(crate::jj::JjEnv::resolve(
+        &orch.jj_binary_path,
+        &orch.config_dir,
+    ));
+
+    // Serialize on the per-store lock, keyed off the workspace's own project-root
+    // marker (the same store `resolve_store_lock` targets). Best-effort resolution:
+    // a worktree missing its marker seals without the guard, matching the
+    // resolve_store_lock None fallback.
+    let store_lock = crate::jj::read_project_root_marker(worktree)
+        .map(|root| orch.jj_store_lock(&crate::jj::project_store_dir(&orch.config_dir, &root)));
+    let _guard = match store_lock.as_ref() {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+
+    // 1. Sweep unsealed work onto the bookmark.
+    if crate::jj::is_working_copy_dirty(&jj, worktree).unwrap_or(false) {
+        crate::mcp::vcs::WorktreeVcs::seal_all(
+            &backend,
+            worktree,
+            "seal pending work for PR",
+            None,
+        )
+        .map_err(|e| {
+            format!("create-pr: failed to seal pending work before opening the PR: {e}")
+        })?;
+    }
+
+    // 2. Gate on a non-empty delta vs base. `node_changed_files` measures the
+    //    node's own commits (`base..@`) over the live graph. `None` means the base
+    //    could not be resolved — do NOT refuse on an unprovable delta; only a
+    //    positively-empty delta is the refusal.
+    let base_rev = crate::jj::read_base_marker(worktree)
+        .map(|(_, rev)| rev)
+        .filter(|rev| !rev.is_empty());
+    if let Some(changes) =
+        crate::jj::node_changed_files(&jj, worktree, base_branch, base_rev.as_deref())
+    {
+        if changes.is_empty() {
+            let base_name = base_branch.unwrap_or("the base branch");
+            return Err(format!(
+                "create-pr refused: branch `{branch}` has an empty delta versus its base \
+                 `{base_name}` — there is nothing to open a PR from. Seal your work first, then \
+                 retry; inspect the delta with `jj diff --from {base_name} --to @`."
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn create_pr_artifact_details(
@@ -962,7 +1061,7 @@ async fn store_artifact(
 /// A node that only ever writes one name increments exactly as a per-job chain
 /// did.
 async fn insert_next_artifact_version(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     artifact_type: &str,
     output_name: &str,

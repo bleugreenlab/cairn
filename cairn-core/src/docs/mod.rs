@@ -1,9 +1,9 @@
 //! Documentation operations — filesystem scanning and DB reference queries.
 
 use cairn_common::ids;
+use cairn_db::turso::params;
 use std::fs;
 use std::path::Path;
-use turso::params;
 
 use crate::models::{DocContent, DocFile, DocReference};
 use crate::storage::{DbError, LocalDb, RowExt};

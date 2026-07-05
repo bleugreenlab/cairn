@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) async fn load_execution_issue_id_conn(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<Option<String>> {
     crate::storage::query_opt_text_conn(

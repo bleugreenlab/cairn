@@ -45,9 +45,9 @@ use crate::execution::teardown::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use turso::params;
 
 const CACHEDIR_TAG: &str = "CACHEDIR.TAG";
 
@@ -650,10 +650,10 @@ fn emit_jobs_change(orch: &Orchestrator) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_db::turso::params;
     use filetime::FileTime;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    use turso::params;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("worktree-gc-test.db").await

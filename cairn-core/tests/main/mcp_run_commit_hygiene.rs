@@ -18,9 +18,9 @@ use cairn_core::models::{
     AgentSnapshot, ExecutionSnapshot, Fence, LegacyOnEscape, LegacySandbox, RecipeSnapshot,
     RecipeTrigger, TriggerContext, TriggerType,
 };
+use cairn_db::turso::params;
 use serde_json::json;
 use tempfile::TempDir;
-use turso::params;
 
 // These tests drive the real commit barrier end-to-end. jj is the only VCS
 // substrate now, so the agent worktree is a real `.jj` workspace over a shared

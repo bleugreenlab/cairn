@@ -11,7 +11,7 @@
 //! normalization happen in the parent module so the price table stays in one
 //! place.
 
-use turso::{params, Connection, Value};
+use cairn_db::turso::{params, Connection, Value};
 
 use super::tool_extract::{self, ToolInvocation};
 use super::types::{Bucket, Scope, TimeRange, ToolBackfillSummary, TopTargetRow};

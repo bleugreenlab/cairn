@@ -4,7 +4,7 @@
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use crate::transitions::Resolution;
-use turso::params;
+use cairn_db::turso::params;
 
 use super::context::{db_error, resolve_merge_mr_context_for_job, PrNodeResolution};
 

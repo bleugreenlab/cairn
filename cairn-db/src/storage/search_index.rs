@@ -707,7 +707,7 @@ async fn load_event_documents(db: &LocalDb) -> DbResult<Vec<SearchDocument>> {
     // Project EVENT_COLUMNS in a subquery so `e.*` stays unambiguous against the
     // joined `runs` row (both tables have an `id`), while preserving the exact
     // column order `event_from_row` expects.
-    let columns = crate::runs::queries::EVENT_COLUMNS;
+    let columns = crate::storage::events::columns::EVENT_COLUMNS;
     let sql = format!(
         "SELECT e.*, r.project_id, r.issue_id, r.job_id
          FROM (SELECT {columns} FROM events WHERE event_type IN ('text', 'tool_result', 'user')) e
@@ -721,13 +721,16 @@ async fn load_event_documents(db: &LocalDb) -> DbResult<Vec<SearchDocument>> {
                 let mut out: Vec<EventRow> = Vec::new();
                 let mut rows = conn.query(&sql, ()).await?;
                 while let Some(row) = rows.next().await? {
-                    let event = crate::runs::queries::event_from_row(&row)?;
+                    let event = crate::storage::events::columns::event_from_row(&row)?;
                     // r.project_id/issue_id/job_id ride just past EVENT_COLUMNS;
                     // key off EVENT_COLUMN_COUNT so adding an event column shifts
                     // them in lockstep instead of silently reading the wrong slot.
-                    let project_id = row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT)?;
-                    let issue_id = row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 1)?;
-                    let job_id = row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 2)?;
+                    let project_id =
+                        row.opt_text(crate::storage::events::columns::EVENT_COLUMN_COUNT)?;
+                    let issue_id =
+                        row.opt_text(crate::storage::events::columns::EVENT_COLUMN_COUNT + 1)?;
+                    let job_id =
+                        row.opt_text(crate::storage::events::columns::EVENT_COLUMN_COUNT + 2)?;
                     out.push((event, project_id, issue_id, job_id));
                 }
                 Ok(out)
@@ -791,7 +794,7 @@ async fn load_archived_event_document(
 ) -> DbResult<Option<SearchDocument>> {
     use crate::models::Event;
 
-    let columns = crate::runs::queries::EVENT_COLUMNS;
+    let columns = crate::storage::events::columns::EVENT_COLUMNS;
     let sql = format!(
         "SELECT e.*, r.project_id, r.issue_id, r.job_id
          FROM (SELECT {columns} FROM events
@@ -808,12 +811,12 @@ async fn load_archived_event_document(
                 let Some(row) = rows.next().await? else {
                     return Ok(None);
                 };
-                let event = crate::runs::queries::event_from_row(&row)?;
+                let event = crate::storage::events::columns::event_from_row(&row)?;
                 Ok(Some((
                     event,
-                    row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT)?,
-                    row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 1)?,
-                    row.opt_text(crate::runs::queries::EVENT_COLUMN_COUNT + 2)?,
+                    row.opt_text(crate::storage::events::columns::EVENT_COLUMN_COUNT)?,
+                    row.opt_text(crate::storage::events::columns::EVENT_COLUMN_COUNT + 1)?,
+                    row.opt_text(crate::storage::events::columns::EVENT_COLUMN_COUNT + 2)?,
                 )))
             })
         })
@@ -1266,6 +1269,32 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn read_tool_results_are_not_content_indexed() {
+        // A reconstructed gitcoord/hybrid read carries its rendered bytes under
+        // `toolResult`, never `content`; the event search body is extracted from
+        // `$.content` only (`event_search_document` / `rebuild_source_queries`),
+        // so a read is never indexed by search. This is the invariant that keeps
+        // the startup search refresh non-corrupting even though it reconstructs
+        // archived reads before the mcp render seam is registered: whether the
+        // read reconstructs to real bytes or a coordinate stub, its `toolResult`
+        // never reaches the index and `apply_pending` skips it identically. If
+        // read tool_results ever become searchable, the renderer-registration
+        // ordering (`init_database` / `OrchestratorBuilder::build`) becomes
+        // load-bearing and this test should change deliberately.
+        let data = r#"{"eventType":"tool_result","toolUseId":"t1","toolName":"read","toolInput":{"paths":["file:a.txt"]},"toolResult":"=== file:a.txt ===\nALPHA\nbeta"}"#;
+        let event = crate::storage::events::reconstruct_fixture::make_event(
+            "read-ev",
+            "tool_result",
+            data,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(event_search_document(event, Some("proj".to_string()), None, None).is_none());
     }
 
     #[tokio::test]

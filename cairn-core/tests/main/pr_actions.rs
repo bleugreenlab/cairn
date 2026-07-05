@@ -21,9 +21,9 @@ use cairn_core::internal::services::testing::{MockGitClient, MockHttpClient, Tes
 use cairn_core::internal::services::HttpResponse;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
 use cairn_core::pr_data::actions;
+use cairn_db::turso::params;
 use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedReceiver;
-use turso::params;
 
 const TEST_KEY: &str = include_str!("../fixtures/test_rsa_key.pem");
 

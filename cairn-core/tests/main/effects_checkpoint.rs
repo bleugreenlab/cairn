@@ -9,8 +9,8 @@ use cairn_core::internal::effects::checkpoint::approve_job_pure;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::TestServicesBuilder;
 use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_db::turso::params;
 use tempfile::{tempdir, TempDir};
-use turso::params;
 
 struct TestContext {
     orch: Orchestrator,

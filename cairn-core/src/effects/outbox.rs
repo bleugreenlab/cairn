@@ -7,7 +7,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::storage::{DbResult, LocalDb, RowExt};
-use turso::{params, Connection};
+use cairn_db::turso::{params, Connection};
 
 /// A pending outbox entry ready for processing.
 #[derive(Debug, Clone)]

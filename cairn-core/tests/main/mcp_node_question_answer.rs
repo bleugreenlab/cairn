@@ -7,8 +7,8 @@ use cairn_core::internal::mcp::handlers::read::handle_read_file;
 use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
+use cairn_db::turso::params;
 use serde_json::json;
-use turso::params;
 
 async fn insert_question_fixture(db: &LocalDb) {
     let project_id = common::create_project(db, "TQA").await;

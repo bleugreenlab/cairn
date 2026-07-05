@@ -1,6 +1,6 @@
 //! Project, project-issues, project-chat, and project-search resource readers.
 
-use turso::params;
+use cairn_db::turso::params;
 
 use super::common::{
     connect_for_read, find_query_value, lookup_project_by_key, parse_optional_bool_param,
@@ -24,7 +24,10 @@ struct ProjectIssueStats {
     closed: usize,
 }
 
-async fn load_project_issue_stats(conn: &turso::Connection, project_id: &str) -> ProjectIssueStats {
+async fn load_project_issue_stats(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+) -> ProjectIssueStats {
     let mut rows = match conn
         .query(
             "SELECT status FROM issues WHERE project_id = ?1",
@@ -55,7 +58,7 @@ async fn load_project_issue_stats(conn: &turso::Connection, project_id: &str) ->
 }
 
 async fn load_recent_project_issue_summaries(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     limit: i64,
 ) -> Vec<(i32, String, String, Option<String>, i32)> {
@@ -335,7 +338,7 @@ fn issue_filter_clause(query: &ProjectIssuesQuery) -> String {
 /// same filter clause. `limit`/`offset` push down to SQL so the producer can
 /// report a truthful `[N of M issues]` header and a paging continue URI.
 async fn load_project_issue_summaries(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     project_id: &str,
     query: &ProjectIssuesQuery,
 ) -> Result<(Vec<ProjectIssueSummary>, usize), String> {
@@ -1203,7 +1206,7 @@ mod project_issues_query_tests {
         db
     }
 
-    async fn seed_project(conn: &turso::Connection) {
+    async fn seed_project(conn: &cairn_db::turso::Connection) {
         conn.execute(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-labels', 'default', 'Labels', 'LBL', '/tmp/lbl', 1, 1)",
             (),
@@ -1212,7 +1215,12 @@ mod project_issues_query_tests {
         .unwrap();
     }
 
-    async fn seed_issue(conn: &turso::Connection, issue_id: &str, number: i32, title: &str) {
+    async fn seed_issue(
+        conn: &cairn_db::turso::Connection,
+        issue_id: &str,
+        number: i32,
+        title: &str,
+    ) {
         conn.execute(
             "INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at) VALUES (?1, 'p-labels', ?2, ?3, '', 'backlog', 'backlog', 'none', 0, ?2, ?2)",
             params![issue_id, number, title],
@@ -1221,7 +1229,7 @@ mod project_issues_query_tests {
         .unwrap();
     }
 
-    async fn seed_label(conn: &turso::Connection, name: &str) {
+    async fn seed_label(conn: &cairn_db::turso::Connection, name: &str) {
         create_label_conn(
             conn,
             DEFAULT_WORKSPACE_ID,

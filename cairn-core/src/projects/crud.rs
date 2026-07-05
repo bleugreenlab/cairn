@@ -798,7 +798,7 @@ pub async fn worktree_paths(db: &LocalDb, project_id: &str) -> Result<Vec<String
     .map_err(CairnError::from)
 }
 
-fn db_project_from_row(row: &turso::Row) -> Result<DbProject, DbError> {
+fn db_project_from_row(row: &cairn_db::turso::Row) -> Result<DbProject, DbError> {
     Ok(DbProject {
         id: row.text(0)?,
         workspace_id: row.text(1)?,

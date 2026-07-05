@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use turso::params;
+use cairn_db::turso::params;
 
 use crate::storage::RowExt;
 
@@ -40,7 +40,7 @@ impl EventRow {
 /// - `rowid` (via insertion-order index) is the stable intra-second tiebreaker,
 ///   because `sequence` is unreliable on cold resume
 pub(super) async fn load_job_events_ordered(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     store: Option<&dyn crate::storage::ContentStore>,
     private_route_db: Option<&crate::storage::LocalDb>,
@@ -108,7 +108,7 @@ pub(super) async fn load_job_events_ordered(
 }
 
 pub(super) async fn load_turn_events(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     turn_id: &str,
     store: Option<&dyn crate::storage::ContentStore>,
     private_route_db: Option<&crate::storage::LocalDb>,
@@ -137,7 +137,7 @@ pub(super) async fn load_turn_events(
 
 /// Get the Nth run for a job (1-indexed)
 pub(super) async fn get_nth_run_id(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     job_id: &str,
     run_seq: i32,
 ) -> Option<String> {
@@ -164,7 +164,7 @@ pub(super) async fn get_nth_run_id(
 
 /// Get a single event by run_id and sequence, returning full formatted content
 pub(super) async fn get_single_event(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     run_id: &str,
     event_seq: i32,
     store: Option<&dyn crate::storage::ContentStore>,
@@ -217,7 +217,7 @@ pub(super) async fn get_single_event(
 }
 
 async fn resolve_single_event_tool_name(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     run_id: &str,
     event_type: &str,
     data: &str,
@@ -249,7 +249,7 @@ fn tool_use_id_from_event(event_data: &serde_json::Value) -> Option<&str> {
 }
 
 async fn resolve_tool_name(
-    conn: &turso::Connection,
+    conn: &cairn_db::turso::Connection,
     run_id: &str,
     tool_use_id: &str,
 ) -> Option<String> {
