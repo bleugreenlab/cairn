@@ -4,6 +4,68 @@ use super::*;
 // Private helpers
 // ============================================================================
 
+fn spawn_seed_worktree_task(
+    orch: &Orchestrator,
+    worktree_path: PathBuf,
+    populate_config: crate::config::project_settings::PopulateConfig,
+    job_id: String,
+    issue_id: Option<String>,
+    sink: setup_progress::SetupSink,
+    cancel: Arc<AtomicBool>,
+) {
+    let fs = orch.services.fs.clone();
+
+    std::thread::spawn(move || {
+        if cancel.load(Ordering::SeqCst) {
+            log::info!(
+                "Skipping background seed for job {job_id}: setup was cancelled before seed start"
+            );
+            return;
+        }
+
+        let result =
+            crate::git::worktree::seed_worktree(&*fs, &worktree_path, &populate_config.seed);
+        if cancel.load(Ordering::SeqCst) {
+            log::info!(
+                "Background seed for job {job_id} finished after setup cancellation; suppressing progress emit"
+            );
+            return;
+        }
+
+        match result {
+            Ok(result) => {
+                let line = format!(
+                    "[info] Background seed complete ({} cloned, {} skipped, {} failed)",
+                    result.cloned, result.skipped, result.failed
+                );
+                log::info!("{line}");
+                setup_progress::emit(
+                    &sink,
+                    &job_id,
+                    issue_id.clone(),
+                    "status",
+                    Some("populate"),
+                    None,
+                    Some(line),
+                );
+            }
+            Err(e) => {
+                let line = format!("[info] Background seed failed (continuing): {e}");
+                log::warn!("{line}");
+                setup_progress::emit(
+                    &sink,
+                    &job_id,
+                    issue_id.clone(),
+                    "status",
+                    Some("populate"),
+                    None,
+                    Some(line),
+                );
+            }
+        }
+    });
+}
+
 /// Create a worktree for a job using the orchestrator's service traits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_worktree_for_job(
@@ -164,37 +226,6 @@ pub(crate) fn prepare_worktree_for_job(
                 );
             }
         }
-        match crate::git::worktree::seed_worktree(fs, worktree_path, &populate_config.seed) {
-            Ok(result) => {
-                let line = format!(
-                    "[info] Seeding external worktree content ({} cloned, {} skipped, {} failed)",
-                    result.cloned, result.skipped, result.failed
-                );
-                log::info!("{line}");
-                setup_progress::emit(
-                    sink,
-                    job_id,
-                    issue_id.clone(),
-                    "status",
-                    Some("populate"),
-                    None,
-                    Some(line),
-                );
-            }
-            Err(e) => {
-                let line = format!("[info] Worktree seeding failed (continuing): {e}");
-                log::warn!("{line}");
-                setup_progress::emit(
-                    sink,
-                    job_id,
-                    issue_id.clone(),
-                    "status",
-                    Some("populate"),
-                    None,
-                    Some(line),
-                );
-            }
-        }
         // Security backstop: explicitly-populated gitignored content must stay
         // UNCOMMITTED so a later run/write seal can never commit secrets or
         // build artifacts. At this point only populate has run (no setup
@@ -260,6 +291,42 @@ pub(crate) fn prepare_worktree_for_job(
             cleanup();
             return Err(e);
         }
+    }
+
+    // 4. Warm-cache seed entries are deliberately off the startup-critical path.
+    // The jj auto-track exclude was installed before population began, so these
+    // build artifacts stay out of snapshots even if the agent seals while the
+    // background clone is still running. The hard leak gate above is reserved for
+    // synchronous copy/symlink population, where secrets such as .env can live.
+    if !populate_config.seed.is_empty() {
+        let line = format!(
+            "[info] Seeding external worktree content in the background ({} entr{})",
+            populate_config.seed.len(),
+            if populate_config.seed.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        log::info!("{line}");
+        setup_progress::emit(
+            sink,
+            job_id,
+            issue_id.clone(),
+            "status",
+            Some("populate"),
+            None,
+            Some(line),
+        );
+        spawn_seed_worktree_task(
+            orch,
+            worktree_path.to_path_buf(),
+            populate_config.clone(),
+            job_id.to_string(),
+            issue_id.clone(),
+            sink.clone(),
+            cancel.clone(),
+        );
     }
 
     Ok(())

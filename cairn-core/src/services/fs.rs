@@ -46,6 +46,11 @@ pub trait FileSystem: Send + Sync {
     /// destination if they don't exist.
     fn reflink_file(&self, from: &Path, to: &Path) -> Result<(), String>;
 
+    /// Copy-on-write clone a directory tree when the filesystem supports it,
+    /// falling back to recursive file reflinks/copies otherwise. The destination
+    /// must not already exist.
+    fn reflink_dir(&self, from: &Path, to: &Path) -> Result<(), String>;
+
     /// Create a symbolic link at `link` pointing to `target`.
     /// On Windows, uses a directory junction for directories.
     fn symlink(&self, target: &Path, link: &Path) -> Result<(), String>;
@@ -60,6 +65,33 @@ pub trait FileSystem: Send + Sync {
 
 /// Production filesystem implementation using std::fs.
 pub struct RealFileSystem;
+
+#[cfg(target_os = "macos")]
+fn clonefile_dir(from: &Path, to: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn clonefile(
+            src: *const std::os::raw::c_char,
+            dst: *const std::os::raw::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let src = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| format!("Source path contains an interior NUL byte: {:?}", from))?;
+    let dst = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| format!("Destination path contains an interior NUL byte: {:?}", to))?;
+
+    let result = unsafe { clonefile(src.as_ptr(), dst.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
 
 impl FileSystem for RealFileSystem {
     fn exists(&self, path: &Path) -> bool {
@@ -114,24 +146,45 @@ impl FileSystem for RealFileSystem {
                 .map_err(|e| format!("Failed to replace existing destination {:?}: {}", to, e))?;
         }
         match reflink_copy::reflink_or_copy(from, to) {
-            Ok(None) => {
-                log::debug!("Reflinked file from {} to {}", from.display(), to.display());
-                Ok(())
-            }
-            Ok(Some(bytes)) => {
-                log::debug!(
-                    "Reflink unavailable; copied {} bytes from {} to {}",
-                    bytes,
-                    from.display(),
-                    to.display()
-                );
-                Ok(())
-            }
+            Ok(None) => Ok(()),
+            Ok(Some(_bytes)) => Ok(()),
             Err(e) => Err(format!(
                 "Failed to reflink or copy {:?} to {:?}: {}",
                 from, to, e
             )),
         }
+    }
+
+    fn reflink_dir(&self, from: &Path, to: &Path) -> Result<(), String> {
+        if to.exists() || self.is_symlink(to) {
+            return Err(format!(
+                "Destination already exists and cannot be directory-cloned: {:?}",
+                to
+            ));
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if from.is_dir() {
+                match clonefile_dir(from, to) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        log::debug!(
+                            "clonefile failed for {} to {}; falling back to recursive reflink/copy: {}",
+                            from.display(),
+                            to.display(),
+                            error
+                        );
+                    }
+                }
+            }
+        }
+
+        self.copy_dir_recursive(from, to)
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> Result<(), String> {

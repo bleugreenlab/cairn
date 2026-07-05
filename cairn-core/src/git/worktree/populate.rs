@@ -36,50 +36,73 @@ fn slash_path(path: &Path) -> String {
         .join("/")
 }
 
-fn seed_entry(
+fn prune_seed_excludes(
     fs: &dyn FileSystem,
-    from: &Path,
-    to: &Path,
+    root: &Path,
     exclude_set: &globset::GlobSet,
-    result: &mut SeedResult,
-) {
-    let mut stack = vec![from.to_path_buf()];
+) -> (usize, usize) {
+    let mut removed = 0;
+    let mut failed = 0;
+    let mut stack = vec![root.to_path_buf()];
 
     while let Some(path) = stack.pop() {
-        let rel = match path.strip_prefix(from) {
+        let rel = match path.strip_prefix(root) {
             Ok(rel) => rel,
             Err(e) => {
                 log::warn!(
-                    "Seed path {} was not under source {}: {}",
+                    "Seed path {} was not under destination {}: {}",
                     path.display(),
-                    from.display(),
+                    root.display(),
                     e
                 );
-                result.failed += 1;
+                failed += 1;
+                continue;
+            }
+        };
+
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                log::warn!(
+                    "Failed to inspect cloned seed path {}: {}",
+                    path.display(),
+                    e
+                );
+                failed += 1;
                 continue;
             }
         };
 
         if !rel.as_os_str().is_empty() && exclude_set.is_match(slash_path(rel)) {
-            result.skipped += 1;
+            let removed_path = if metadata.is_dir() {
+                fs.remove_dir_all(&path)
+            } else {
+                fs.remove_file(&path)
+            };
+            match removed_path {
+                Ok(()) => removed += 1,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to prune excluded seed path {}: {}",
+                        path.display(),
+                        e
+                    );
+                    failed += 1;
+                }
+            }
             continue;
         }
-
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(e) => {
-                log::warn!("Failed to inspect seed path {}: {}", path.display(), e);
-                result.failed += 1;
-                continue;
-            }
-        };
 
         if metadata.is_dir() {
             let entries = match std::fs::read_dir(&path) {
                 Ok(entries) => entries,
                 Err(e) => {
-                    log::warn!("Failed to read seed directory {}: {}", path.display(), e);
-                    result.failed += 1;
+                    log::warn!(
+                        "Failed to read cloned seed directory {}: {}",
+                        path.display(),
+                        e
+                    );
+                    failed += 1;
                     continue;
                 }
             };
@@ -88,36 +111,18 @@ fn seed_entry(
                     Ok(entry) => stack.push(entry.path()),
                     Err(e) => {
                         log::warn!(
-                            "Failed to read seed directory entry under {}: {}",
+                            "Failed to read cloned seed directory entry under {}: {}",
                             path.display(),
                             e
                         );
-                        result.failed += 1;
+                        failed += 1;
                     }
                 }
             }
-        } else if metadata.is_file() {
-            let dst = if rel.as_os_str().is_empty() {
-                to.to_path_buf()
-            } else {
-                to.join(rel)
-            };
-            match fs.reflink_file(&path, &dst) {
-                Ok(()) => result.cloned += 1,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to seed {} to {}: {}",
-                        path.display(),
-                        dst.display(),
-                        e
-                    );
-                    result.failed += 1;
-                }
-            }
-        } else {
-            result.skipped += 1;
         }
     }
+
+    (removed, failed)
 }
 
 pub fn seed_worktree(
@@ -126,6 +131,8 @@ pub fn seed_worktree(
     seeds: &[SeedEntry],
 ) -> Result<SeedResult, String> {
     let mut result = SeedResult::default();
+
+    let started = std::time::Instant::now();
 
     for seed in seeds {
         let from = expand_seed_from(&seed.from);
@@ -137,8 +144,42 @@ pub fn seed_worktree(
 
         let exclude_set = build_glob_set(&seed.exclude)?;
         let to = worktree_path.join(seed.to.trim_matches('/'));
-        seed_entry(fs, &from, &to, &exclude_set, &mut result);
+        if fs.exists(&to) || fs.is_symlink(&to) {
+            log::info!(
+                "Seed destination {} already exists; skipping {}",
+                to.display(),
+                from.display()
+            );
+            result.skipped += 1;
+            continue;
+        }
+
+        match fs.reflink_dir(&from, &to) {
+            Ok(()) => {
+                result.cloned += 1;
+                let (skipped, failed) = prune_seed_excludes(fs, &to, &exclude_set);
+                result.skipped += skipped;
+                result.failed += failed;
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to seed {} to {}: {}",
+                    from.display(),
+                    to.display(),
+                    e
+                );
+                result.failed += 1;
+            }
+        }
     }
+
+    log::info!(
+        "Seeded external worktree content ({} cloned, {} skipped, {} failed) in {:?}",
+        result.cloned,
+        result.skipped,
+        result.failed,
+        started.elapsed()
+    );
 
     Ok(result)
 }
@@ -335,6 +376,7 @@ mod tests {
     use super::*;
     use crate::services::testing::{MockFileSystem, MockGitClient};
     use crate::services::GitOutput;
+    use crate::services::RealFileSystem;
     // Tests for populate_worktree
 
     fn git_ls_files_output(entries: &[&str]) -> GitOutput {
@@ -721,28 +763,17 @@ mod tests {
         assert_eq!(r.failed, 1);
     }
     #[test]
-    fn test_seed_worktree_clones_files() {
+    fn test_seed_worktree_clones_directory_tree() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
+        let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(source.join("debug")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(source.join("debug").join("dep.rlib"), "dep").unwrap();
 
-        let mut fs = MockFileSystem::new();
-        let source_for_exists = source.clone();
-        fs.expect_exists()
-            .withf(move |p| p == source_for_exists.as_path())
-            .returning(|_| true);
-        fs.expect_reflink_file()
-            .withf(|from, to| {
-                from.ends_with("debug/dep.rlib")
-                    && to == Path::new("/worktree/target/debug/dep.rlib")
-            })
-            .times(1)
-            .returning(|_, _| Ok(()));
-
         let result = seed_worktree(
-            &fs,
-            Path::new("/worktree"),
+            &RealFileSystem,
+            &worktree,
             &[SeedEntry {
                 from: source.display().to_string(),
                 to: "target".to_string(),
@@ -754,13 +785,19 @@ mod tests {
         assert_eq!(result.cloned, 1);
         assert_eq!(result.skipped, 0);
         assert_eq!(result.failed, 0);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("target/debug/dep.rlib")).unwrap(),
+            "dep"
+        );
     }
 
     #[test]
     fn test_seed_worktree_prunes_excluded_subtree() {
         let temp = tempfile::TempDir::new().unwrap();
         let source = temp.path().join("source");
+        let worktree = temp.path().join("worktree");
         std::fs::create_dir_all(source.join("debug").join("incremental")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(source.join("debug").join("dep.rlib"), "dep").unwrap();
         std::fs::write(
             source.join("debug").join("incremental").join("session.o"),
@@ -768,22 +805,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut fs = MockFileSystem::new();
-        let source_for_exists = source.clone();
-        fs.expect_exists()
-            .withf(move |p| p == source_for_exists.as_path())
-            .returning(|_| true);
-        fs.expect_reflink_file()
-            .withf(|from, to| {
-                from.ends_with("debug/dep.rlib")
-                    && to == Path::new("/worktree/target/debug/dep.rlib")
-            })
-            .times(1)
-            .returning(|_, _| Ok(()));
-
         let result = seed_worktree(
-            &fs,
-            Path::new("/worktree"),
+            &RealFileSystem,
+            &worktree,
             &[SeedEntry {
                 from: source.display().to_string(),
                 to: "target".to_string(),
@@ -795,6 +819,8 @@ mod tests {
         assert_eq!(result.cloned, 1);
         assert_eq!(result.skipped, 1);
         assert_eq!(result.failed, 0);
+        assert!(worktree.join("target/debug/dep.rlib").exists());
+        assert!(!worktree.join("target/debug/incremental").exists());
     }
 
     #[test]
@@ -819,41 +845,42 @@ mod tests {
     }
 
     #[test]
-    fn test_seed_worktree_continues_after_file_failure() {
+    fn test_seed_worktree_continues_after_directory_failure() {
         let temp = tempfile::TempDir::new().unwrap();
-        let source = temp.path().join("source");
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(source.join("a.rlib"), "a").unwrap();
-        std::fs::write(source.join("b.rlib"), "b").unwrap();
-
-        let mut fs = MockFileSystem::new();
-        let source_for_exists = source.clone();
-        fs.expect_exists()
-            .withf(move |p| p == source_for_exists.as_path())
-            .returning(|_| true);
-        let mut calls = 0;
-        fs.expect_reflink_file().times(2).returning(move |_, _| {
-            calls += 1;
-            if calls == 1 {
-                Err("disk full".to_string())
-            } else {
-                Ok(())
-            }
-        });
+        let source_a = temp.path().join("source-a");
+        let source_b = temp.path().join("source-b");
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&source_a).unwrap();
+        std::fs::create_dir_all(&source_b).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(source_a.join("a.rlib"), "a").unwrap();
+        std::fs::write(source_b.join("b.rlib"), "b").unwrap();
+        std::fs::write(worktree.join("blocked"), "not a directory").unwrap();
 
         let result = seed_worktree(
-            &fs,
-            Path::new("/worktree"),
-            &[SeedEntry {
-                from: source.display().to_string(),
-                to: "target".to_string(),
-                exclude: vec![],
-            }],
+            &RealFileSystem,
+            &worktree,
+            &[
+                SeedEntry {
+                    from: source_a.display().to_string(),
+                    to: "blocked/target-a".to_string(),
+                    exclude: vec![],
+                },
+                SeedEntry {
+                    from: source_b.display().to_string(),
+                    to: "target-b".to_string(),
+                    exclude: vec![],
+                },
+            ],
         )
         .unwrap();
 
         assert_eq!(result.cloned, 1);
         assert_eq!(result.failed, 1);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("target-b/b.rlib")).unwrap(),
+            "b"
+        );
     }
 
     #[test]
