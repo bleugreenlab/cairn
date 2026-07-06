@@ -119,10 +119,16 @@ async fn execute_tool(
             crate::mcp::handlers::read::handle_read_batch(orch, request, read_cursors).await
         }
 
-        // Host process introspection: the answering server's own OS process id.
-        // `cairn://dev/pid` relays this to a dev instance over its callback
-        // channel to learn the instance's pid authoritatively (no `lsof`).
-        "process_info" => std::process::id().to_string(),
+        // Host process introspection for `cairn://dev/pid`, which relays this to
+        // a dev instance so an external tool (e.g. Axon accessibility) can target
+        // the instance's window. Since the runner-daemon split the callback is
+        // served by the windowless `cairn-runner`, so return the desktop UI pid
+        // it registered over `/ws` when a window is attached, and fall back to
+        // this server's own pid otherwise (headless, or no desktop connected).
+        "process_info" => orch
+            .attached_ui_pid()
+            .unwrap_or_else(std::process::id)
+            .to_string(),
 
         // Run tool
         "run" => crate::mcp::handlers::run::handle_run(orch, request).await,

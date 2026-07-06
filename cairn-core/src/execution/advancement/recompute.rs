@@ -116,7 +116,10 @@ async fn latest_turn_state(
 /// *including* a memory-review turn. Liveness includes the review so the job
 /// stays Running while the post-completion review agent is active; the terminal
 /// outcome still derives from the work turn via [`latest_turn_state`].
-async fn latest_turn_is_live(conn: &cairn_db::turso::Connection, job_id: &str) -> DbResult<bool> {
+pub(super) async fn latest_turn_is_live(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<bool> {
     let mut rows = conn
         .query(
             "SELECT state FROM turns WHERE job_id = ?1 ORDER BY created_at DESC, sequence DESC LIMIT 1",
@@ -971,6 +974,38 @@ pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Resu
                 project_id: change.project_id.clone(),
             });
         }
+    }
+
+    // CAIRN-2483 review-readiness hook: when a job of an issue flips to a terminal
+    // or Idle status, the whole child issue may have just gone quiescent. Evaluate
+    // review readiness for each such issue — this is the edge that usually fires
+    // LAST for a planbuild child (the review agent completing), and it generalizes
+    // to any recipe shape (e.g. a build-only child settling after its builder
+    // terminalizes and the pr action completes). The evaluator is fully gated and
+    // deduped, so re-evaluation is a cheap idempotent no-op when nothing settled.
+    let review_issue_ids: std::collections::HashSet<String> = changes
+        .iter()
+        .filter(|change| {
+            matches!(
+                change.to,
+                JobStatus::Complete | JobStatus::Failed | JobStatus::Idle
+            )
+        })
+        .filter_map(|change| change.issue_id.clone())
+        .collect();
+    for issue_id in review_issue_ids {
+        let orch_for_review = orch.clone();
+        crate::orchestrator::lifecycle::detach_onto_runtime(
+            async move {
+                crate::orchestrator::lifecycle::evaluate_review_readiness(
+                    &orch_for_review,
+                    &issue_id,
+                    false,
+                )
+                .await;
+            },
+            || {},
+        );
     }
 
     // Any terminal job in the sweep can unblock downstream DAG work; fire one

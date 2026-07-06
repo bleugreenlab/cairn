@@ -41,6 +41,18 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
         // through `finalize_run`; with the interrupt gone, the clean warm
         // transition is the turn-complete signal and must drive the recompute.
         if let Some(job_id) = job_id_for_run(orch, run_id) {
+            // Turn-end project checks (when:review), detached so the suite never
+            // blocks the turn from ending. This MUST precede `recompute_job`: the
+            // recompute review-readiness hook (fired when this job flips
+            // terminal/idle) detaches an `evaluate_review_readiness` that reads
+            // the turn-end-check single-flight markers. Claiming this job's slot
+            // synchronously first guarantees that hook sees checks in-flight and
+            // defers, instead of racing the launch and pushing a premature parent
+            // review before this job's own review-cadence suite has even started
+            // (CAIRN-2483). If the suite is skipped (memory-review turn, no
+            // worktree, no applicable checks) no slot is held and the hook fires
+            // correctly — there is genuinely nothing to wait for.
+            spawn_turn_end_checks(orch, &job_id);
             if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
                 log::error!(
                     "Failed to recompute job {} after warm transition: {}",
@@ -54,9 +66,6 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
             // without depending on the recompute sweep poke that this work
             // is replacing.
             let needs_attention = emit_for_turn_end(orch, &job_id);
-            // Turn-end project checks (when:review), detached so the suite never
-            // blocks the turn from ending.
-            spawn_turn_end_checks(orch, &job_id);
             maybe_reclaim_ephemeral_task_worktree(orch, &job_id);
             // Raise the desktop "completed" toast only when that idle left
             // something for the driver/user to act on — a plan awaiting
@@ -486,6 +495,13 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
         // approval checkpoint), or Failed — and cascades + advances the DAG.
         // This is purely mechanical now; finalize_run no longer decides outcomes.
         if let Some(job_id) = job_id.clone() {
+            // Turn-end project checks (when:idle/when:review), detached so the
+            // suite never blocks the turn from ending. Claimed BEFORE
+            // `recompute_job` so the recompute review-readiness hook sees this
+            // job's checks in-flight and defers rather than racing the launch and
+            // pushing a premature parent review (CAIRN-2483). Mirrors the
+            // warm-transition turn-end caller above.
+            spawn_turn_end_checks(orch, &job_id);
             if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
                 log::error!(
                     "Failed to recompute job {} after run finalize: {}",
@@ -501,10 +517,6 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
             // hears about it through this fact rather than the recompute-sweep
             // poke this work removes.
             emit_for_turn_end(orch, &job_id);
-            // Turn-end project checks (when:idle/when:review), detached so the
-            // suite never blocks the turn from ending. Mirrors the warm-transition
-            // turn-end caller above.
-            spawn_turn_end_checks(orch, &job_id);
             maybe_reclaim_ephemeral_task_worktree(orch, &job_id);
             // Run-terminal idle: flush any directs/side-channel notices still
             // pending for this run so a queued child-attention update is not
@@ -668,4 +680,38 @@ fn emit_agent_terminal_attention_once(
             tool_name: None,
         },
     );
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    //! CAIRN-2483: the turn-end-check single-flight slot must be claimed
+    //! (`spawn_turn_end_checks`) BEFORE `recompute_job` in both turn-end callers,
+    //! so the recompute review-readiness hook observes this job's checks as
+    //! in-flight and defers instead of racing the launch and pushing a premature
+    //! parent review. Guarded structurally because the ordering is load-bearing
+    //! and a silent reorder would reintroduce the race.
+    const SOURCE: &str = include_str!("finalize.rs");
+
+    fn assert_spawn_before_recompute(func_signature: &str) {
+        let start = SOURCE
+            .find(func_signature)
+            .unwrap_or_else(|| panic!("caller {func_signature} present in source"));
+        let body = &SOURCE[start..];
+        let spawn = body
+            .find("spawn_turn_end_checks(orch")
+            .expect("spawn_turn_end_checks call present");
+        let recompute = body
+            .find("recompute_job(orch")
+            .expect("recompute_job call present");
+        assert!(
+            spawn < recompute,
+            "{func_signature}: spawn_turn_end_checks must precede recompute_job (CAIRN-2483)"
+        );
+    }
+
+    #[test]
+    fn turn_end_callers_claim_checks_slot_before_recompute() {
+        assert_spawn_before_recompute("pub fn transition_to_warm_state");
+        assert_spawn_before_recompute("pub fn finalize_run");
+    }
 }

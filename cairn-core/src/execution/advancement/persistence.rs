@@ -39,6 +39,22 @@ pub(super) async fn load_job_by_id_conn(
         .transpose()
 }
 
+/// Load every job of an issue (across all its executions) in one query. Used by
+/// the review-readiness quiescence predicate, which needs each job's status and
+/// DAG-readiness coordinates.
+pub(crate) async fn load_jobs_for_issue_conn(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<Vec<DbJob>> {
+    let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE issue_id = ?1");
+    let mut rows = conn.query(&sql, (issue_id,)).await?;
+    let mut jobs = Vec::new();
+    while let Some(row) = rows.next().await? {
+        jobs.push(db_job_from_row(&row)?);
+    }
+    Ok(jobs)
+}
+
 pub(crate) fn load_job(db: Arc<LocalDb>, job_id: &str) -> Result<Option<DbJob>, String> {
     let job_id = job_id.to_string();
     run_advancement_db(async move {

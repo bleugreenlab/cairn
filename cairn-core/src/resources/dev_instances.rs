@@ -329,11 +329,12 @@ pub(crate) async fn query_db(
     Ok(extract_db_body(&envelope.text))
 }
 
-/// Ask a running dev instance for its own OS process id over its MCP callback
-/// server. The instance answers the `process_info` tool with its
-/// `std::process::id()` — authoritative and portable, no `lsof`, and it proves
-/// liveness in the same round trip the db relay uses. Errors are short fragments
-/// composed into a `pid_line`.
+/// Ask a running dev instance for its window's OS process id over its MCP
+/// callback server. The instance answers the `process_info` tool with the pid
+/// its desktop app registered over `/ws` (the window's `std::process::id()`),
+/// falling back to the serving runner's own pid when no window is attached — no
+/// `lsof`, and it proves liveness in the same round trip the db relay uses.
+/// Errors are short fragments composed into a `pid_line`.
 pub(crate) async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
     let token = cairn_common::auth::load_mcp_token_from(&instance.home).ok_or_else(|| {
         format!(

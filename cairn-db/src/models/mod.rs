@@ -58,7 +58,8 @@ pub use context_tokens::ContextTokenState;
 
 // Provider usage snapshot types
 pub use provider_usage::{
-    ProviderCreditsSnapshot, ProviderModelUsageRow, ProviderUsageScope, ProviderUsageSnapshot,
+    ProviderCreditsSnapshot, ProviderModelUsageRow, ProviderUsageResetCredit,
+    ProviderUsageResetCredits, ProviderUsageResetResult, ProviderUsageScope, ProviderUsageSnapshot,
     ProviderUsageWindow,
 };
 

@@ -448,6 +448,7 @@ fn claude_rate_limit_snapshot(info: &RateLimitInfo) -> ProviderUsageSnapshot {
         captured_at: chrono::Utc::now().timestamp(),
         windows: vec![window],
         credits: None,
+        reset_credits: None,
         error: None,
         unsupported_reason: None,
         raw: serde_json::to_value(info).ok(),

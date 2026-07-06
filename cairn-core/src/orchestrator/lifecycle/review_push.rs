@@ -57,12 +57,14 @@ pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
         return false;
     };
     let issue_uri = ctx.issue_uri();
-    // CAIRN-1882: the single creator of a review push. At this work-turn idle
-    // edge, push a review to the issue's watchers when there is reviewable
-    // output. Independent of the idle fact computed below (which still drives the
-    // desktop "completed" toast and `cairn watch`): only the review-to-watcher
-    // wake moved to the push queue.
-    create_review_push_on_turn_end(orch, job_id, &issue_id, &ctx);
+    // CAIRN-2483: this edge no longer creates the review push. Review firing is
+    // now gated on the whole issue being quiescent AND its checks settled, owned
+    // end-to-end by the checks pipeline (`evaluate_review_readiness`, invoked from
+    // the turn-end checks completion, the job-terminal recompute hook, and the
+    // PR-open edge). This function keeps only its idle-fact / `AttentionEvent`
+    // half, which still drives the desktop "completed" toast and `cairn watch`;
+    // `needs_attention` semantics are untouched.
+    //
     // Resolve the fact (and any detail URI) synchronously via the shared helper.
     let dbs = orch.db.clone();
     let issue_id_for_fact = issue_id.clone();
@@ -174,222 +176,171 @@ pub(crate) fn detach_onto_runtime(
     });
 }
 
-/// Create the review push at this work-turn idle edge (CAIRN-1882).
+/// The shared review-readiness evaluator (CAIRN-2483). A review fires when
+/// **(reviewable output exists) AND (producing node not in memory-review) AND
+/// (issue quiescent) AND (checks settled)**, at the moment the last of those
+/// becomes true. Multiple trigger edges (turn-end checks completion, the
+/// job-terminal recompute hook, and the PR-open edge) may evaluate at different
+/// moments; the per-watcher fingerprint dedupe inside [`create_review_push_rows`]
+/// guarantees at most one wake per reviewed state.
 ///
-/// The node-idle edge of the review push (the second edge — when a PR opens
-/// after the node already idled — is [`create_review_push_for_pr_open`]): when a
-/// producing node's turn ends and it is idle, push a `review:{issue}` to each
-/// watcher of the node's issue if
-///
-/// 1. the just-ended turn was a *work* turn (`start_reason != 'memory_review'`),
-///    and
-/// 2. the issue has reviewable output — either an open, unmerged `merge_requests`
-///    row, or a create-pr/unconfirmed-plan artifact for the producing job.
-///
-/// `content_ref` is the producing node's `/pr` URI when a PR exists, else its
-/// artifact URI — the resolvable thing the watcher reviews. Supersede-by-key
-/// collapses repeats; the delivery layer (CAIRN-1881) drains, lazy-resolves, and
-/// stamps the push. The producing node is never a recipient of its own review.
-pub(crate) fn create_review_push_on_turn_end(
-    orch: &Orchestrator,
-    job_id: &str,
-    issue_id: &str,
-    ctx: &crate::orchestrator::attention::IssueAttentionContext,
-) {
-    // Gate: only a WORK-turn idle creates a review push. A trailing memory-review
-    // turn end (start_reason = 'memory_review') must not.
-    if latest_turn_is_memory_review(orch, job_id) {
+/// `fresh_red` is supplied by the invoking edge: `true` when the launch that just
+/// completed produced a *non-cached* failing verdict. A fresh red defers — that
+/// red is simultaneously waking the owning agent and the fix loop is live, and the
+/// next settle re-evaluates. A cached/stale red counts as settled-with-warning
+/// (the agent was already woken and idled anyway) so a perma-red advisory suite
+/// never silences parent wakes forever. Non-checks edges pass `false`.
+pub async fn evaluate_review_readiness(orch: &Orchestrator, issue_id: &str, fresh_red: bool) {
+    let db = match crate::issues::crud::owning_db_for_issue(&orch.db, issue_id).await {
+        Ok(db) => db,
+        Err(e) => {
+            log::warn!("review readiness: issue db resolve failed: {e}");
+            return;
+        }
+    };
+    // 1. Reviewable output exists — resolve the producing job that owns it.
+    let producing_job_id = match resolve_producing_job_for_issue(&db, issue_id).await {
+        Ok(Some(job_id)) => job_id,
+        Ok(None) => return,
+        Err(e) => {
+            log::warn!("review readiness: producing-job lookup failed: {e}");
+            return;
+        }
+    };
+    // 2. The whole issue must be quiescent (no imminent agent/action work). This
+    //    liveness check *includes* a trailing memory-review turn, so a review is
+    //    never fired mid-reflection; once the reflection turn terminalizes the
+    //    issue settles and the review fires normally (there is deliberately no
+    //    separate "latest turn is memory_review" gate: a builder's latest turn is
+    //    permanently its memory-review turn, so gating on it would block the
+    //    review forever — CAIRN-2483).
+    match crate::execution::advancement::issue_settled(&db, issue_id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            log::warn!("review readiness: issue_settled failed: {e}");
+            return;
+        }
+    }
+    // 3. Checks must be settled (with the fresh-red / stale-red rule).
+    if !checks_settled(orch, &db, issue_id, fresh_red).await {
         return;
     }
-    let dbs = orch.db.clone();
-    let issue_id_owned = issue_id.to_string();
-    let job_id_owned = job_id.to_string();
-    let ctx_owned = ctx.clone();
-    let result = run_db_blocking(move || async move {
-        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id_owned)
-            .await
-            .map_err(|e| e.to_string())?;
-        create_review_push_rows(&db, &job_id_owned, &issue_id_owned, &ctx_owned).await
-    });
-    match result {
+    // 4. Resolve the issue context and create the deduped review push rows.
+    let ctx = match crate::orchestrator::attention::read_issue_for_attention(&db, issue_id).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            log::warn!("review readiness: issue context failed: {e}");
+            return;
+        }
+    };
+    match create_review_push_rows(&db, &producing_job_id, issue_id, &ctx).await {
         Ok(recipients) => {
             orch.notifier.emit_change("attention_pushes");
             wake_review_recipients(orch, &recipients);
         }
         Err(e) => log::warn!(
             "review push creation for job {} failed: {}",
-            &job_id[..job_id.len().min(8)],
+            &producing_job_id[..producing_job_id.len().min(8)],
             e
         ),
     }
 }
 
-/// The PR-open edge of the review push (CAIRN-1891) — the second of the two edges
-/// at which a review fires. The model: a review fires when (producing node
-/// quiescent) AND (reviewable work exists), at the moment the *later* of the two
-/// becomes true. [`create_review_push_on_turn_end`] is the edge where idle is the
-/// later event; this is the edge where the PR opening is.
-///
-/// A builder that writes a `create-pr` artifact and idles cannot fire the review
-/// at its idle edge: the PR is not open yet (branch push + webhook lag), and the
-/// create-pr artifact auto-confirms on write (the PR lifecycle is the gate,
-/// CAIRN-1219), so neither reviewable arm matches at that instant. Slice B
-/// (CAIRN-1882) demoted the PR webhook to state-only, so without this edge the
-/// review wake is lost entirely. The webhook is the moment that observes the PR
-/// opening, so it fires the review here — gated on the producing node being
-/// quiescent (not running a *work* turn — a trailing memory-review turn still
-/// counts as quiescent — and not self-suspended on its own work) so a mid-work
-/// `synchronize` does not fire, and fingerprint-deduped by the shared row creator
-/// so a mergeability-only settle (unchanged diffstat) does not re-wake.
-///
-/// `issue_id` and `source_branch` come from the merge_request the webhook just
-/// updated. The producing builder is resolved by `source_branch` so webhook
-/// handling works even for old rows whose `merge_requests.job_id` was not a jobs
-/// id. That builder is the work-producing job to quiescence-gate; the separate
-/// pr-action node is blocked while the PR is open. Shares
-/// [`create_review_push_rows`] and [`wake_review_recipients`] with the node-idle
-/// edge — one implementation of the fingerprint/dedup/push/wake logic, two
-/// trigger edges.
-///
-/// Live callers are the two IN-PROCESS PR-opening paths, both via
-/// `execution::actions::fire_pr_open_review`: `handle_create_pr` (the legacy
-/// `builtin:create_pr` action) and `handle_pr_node` (the modern first-class PR
-/// node, wired in under CAIRN-2410 — before that this edge never fired on the
-/// PR-node path and idle coordinators lost the child-PR review wake). The
-/// desktop GitHub webhook handler (`src-tauri/src/github/`) that once also called
-/// this is dead code after the runner split (the `github` module is not declared
-/// in `src-tauri/src/lib.rs`); its removal is tracked under CAIRN-2408. There is
-/// therefore no live webhook-driven caller today — the in-process edges are the
-/// only ones that fire.
-pub async fn create_review_push_for_pr_open(
+/// Checks are settled for an issue iff no job of the issue holds an in-flight
+/// turn-end run (the review agent inherits the builder's worktree, so its own
+/// turn-end suite counts too), subject to the fresh-red rule. A `fresh_red` from
+/// the invoking edge always defers. Fail-closed (a lookup error reads as
+/// not-settled) so a transient read never fires a premature wake — another edge
+/// re-evaluates. Check policy (`gate`/`advisory`) is deliberately ignored: every
+/// review-cadence check holds the wake equally, since the coordinator wants
+/// information, not enforcement.
+async fn checks_settled(
     orch: &Orchestrator,
-    issue_id: &str,
-    source_branch: &str,
-) {
-    let owning = match crate::issues::crud::owning_db_for_issue(&orch.db, issue_id).await {
-        Ok(db) => db,
-        Err(e) => {
-            log::warn!("PR-open review push: issue db resolve failed: {e}");
-            return;
-        }
-    };
-    let db = &owning;
-    // Resolve the producing BUILDER by the shared branch — not the pr-action node
-    // that owns the merge_request. Without a builder there is nothing to gate on,
-    // so skip rather than fire blind.
-    let builder_job_id = match find_producing_builder_job(db, issue_id, source_branch).await {
-        Ok(Some(job_id)) => job_id,
-        Ok(None) => {
-            log::warn!(
-                "PR-open review push: no producing builder on branch {} for issue {}",
-                source_branch,
-                &issue_id[..issue_id.len().min(8)]
-            );
-            return;
-        }
-        Err(e) => {
-            log::warn!("PR-open review push: builder lookup failed: {e}");
-            return;
-        }
-    };
-    // Quiescence gate on the BUILDER. A builder running a *work* turn is still
-    // committing work (the diffstat is in flux), so the review is premature. But a
-    // running *memory-review* turn is quiescent-for-review: the work turn already
-    // ended and the PR is the reviewable output, and the node-idle edge gates out
-    // memory-review turn ends — so on the common build path (create-pr → trailing
-    // memory-review turn → `opened` webhook lands while it runs) this edge is the
-    // ONLY one that can wake the watcher. Treating a running memory-review turn as
-    // busy would lose that wake permanently. A builder self-suspended on its own
-    // sub-work is not done either. Fail closed (a lookup error reads as
-    // non-quiescent) so a transient read error never fires a spurious wake.
-    let active = crate::messages::delivery::head_turn_active(db, &builder_job_id)
-        .await
-        .unwrap_or(true);
-    let memory_review = latest_turn_is_memory_review(orch, &builder_job_id);
-    let self_suspended = crate::messages::delivery::head_turn_self_suspended(db, &builder_job_id)
-        .await
-        .unwrap_or(true);
-    log::debug!(
-        "PR-open review: issue={} branch={} builder={} active={} memory_review={} self_suspended={}",
-        &issue_id[..issue_id.len().min(8)],
-        source_branch,
-        &builder_job_id[..builder_job_id.len().min(8)],
-        active,
-        memory_review,
-        self_suspended,
-    );
-    if (active && !memory_review) || self_suspended {
-        return;
-    }
-    let ctx = match crate::orchestrator::attention::read_issue_for_attention(db, issue_id).await {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            log::warn!(
-                "PR-open review push: issue context for {} failed: {}",
-                &issue_id[..issue_id.len().min(8)],
-                e
-            );
-            return;
-        }
-    };
-    match create_review_push_rows(db, &builder_job_id, issue_id, &ctx).await {
-        Ok(recipients) => {
-            log::debug!(
-                "PR-open review: pushed to {} watcher(s) for issue {}",
-                recipients.len(),
-                &issue_id[..issue_id.len().min(8)]
-            );
-            orch.notifier.emit_change("attention_pushes");
-            wake_review_recipients(orch, &recipients);
-        }
-        Err(e) => log::warn!(
-            "PR-open review push creation for job {} failed: {}",
-            &builder_job_id[..builder_job_id.len().min(8)],
-            e
-        ),
-    }
-}
-
-/// The work-producing builder job for a PR, resolved by the shared branch
-/// (CAIRN-1891). The PR may be opened by a separate pr-action node, which is
-/// blocked-while-open with a pending turn and so never reads as quiescent; gating
-/// on it silently loses the wake. Among jobs on `source_branch`, select the node
-/// that **produced the reviewable artifact** (a create-pr or plan). `None` when no
-/// job on the branch exists.
-async fn find_producing_builder_job(
     db: &crate::storage::LocalDb,
     issue_id: &str,
-    source_branch: &str,
-) -> Result<Option<String>, String> {
+    fresh_red: bool,
+) -> bool {
+    if fresh_red {
+        return false;
+    }
+    match job_ids_for_issue(db, issue_id).await {
+        Ok(job_ids) => !job_ids.iter().any(|j| orch.turn_end_checks_in_flight(j)),
+        Err(e) => {
+            log::warn!("review readiness: job ids for checks-settled failed: {e}");
+            false
+        }
+    }
+}
+
+/// The job ids of an issue's executions (used by the checks-settled gate).
+async fn job_ids_for_issue(
+    db: &crate::storage::LocalDb,
+    issue_id: &str,
+) -> Result<Vec<String>, String> {
     let issue_id = issue_id.to_string();
-    let source_branch = source_branch.to_string();
     db.read(|conn| {
         let issue_id = issue_id.clone();
-        let source_branch = source_branch.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM jobs WHERE issue_id = ?1",
+                    (issue_id.as_str(),),
+                )
+                .await?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next().await? {
+                ids.push(row.text(0)?);
+            }
+            Ok::<_, DbError>(ids)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Resolve the job that owns an issue's reviewable output — a create-pr /
+/// unconfirmed-plan artifact, or an open PR on the job's own branch. Mirrors the
+/// producing-builder resolution ordering of [`find_producing_builder_job`] but is
+/// issue-scoped (no branch given): the pr-action node writes no reviewable
+/// artifact, so the artifact/worktree ordering excludes it. `None` when the issue
+/// has no reviewable output at all.
+async fn resolve_producing_job_for_issue(
+    db: &crate::storage::LocalDb,
+    issue_id: &str,
+) -> Result<Option<String>, String> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
                     "SELECT j.id FROM jobs j
                      WHERE j.issue_id = ?1
-                       AND j.branch = ?2
+                       AND (
+                         EXISTS (
+                           SELECT 1 FROM artifacts a
+                           WHERE a.job_id = j.id
+                             AND (a.artifact_type = 'create-pr'
+                                  OR (a.artifact_type = 'plan' AND a.confirmed = 0))
+                         )
+                         OR EXISTS (
+                           SELECT 1 FROM merge_requests mr
+                           WHERE mr.issue_id = ?1
+                             AND mr.source_branch = j.branch
+                             AND mr.status = 'open'
+                         )
+                       )
                      ORDER BY
-                       -- The builder is the node that produced the reviewable
-                       -- artifact (create-pr/plan); the pr-action node writes
-                       -- none, so this excludes it even when it shares the branch
-                       -- and carries a blocked turn.
                        CASE WHEN EXISTS (
                          SELECT 1 FROM artifacts a
                          WHERE a.job_id = j.id
                            AND a.artifact_type IN ('create-pr', 'plan')
                        ) THEN 0 ELSE 1 END,
-                       -- Then a node with a worktree that ran agent work turns,
-                       -- as a secondary guard against pure action nodes.
                        CASE WHEN j.worktree_path IS NOT NULL THEN 0 ELSE 1 END,
-                       CASE WHEN EXISTS (SELECT 1 FROM turns t WHERE t.job_id = j.id)
-                            THEN 0 ELSE 1 END,
                        j.created_at DESC
                      LIMIT 1",
-                    (issue_id.as_str(), source_branch.as_str()),
+                    (issue_id.as_str(),),
                 )
                 .await?;
             match rows.next().await? {
@@ -400,6 +351,99 @@ async fn find_producing_builder_job(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Startup re-arm (CAIRN-2483). The turn-end-check single-flight marker is
+/// in-memory, so a restart mid-suite loses the completion edge and would strand
+/// the parent's review wake. For each job at status `idle`/terminal on a
+/// non-terminal issue that still has reviewable output, re-spawn the turn-end
+/// checks: the input-hash cache makes this cheap (unchanged inputs → all-cached
+/// exit → evaluator → push restored). Called once at startup after outbox replay.
+pub async fn rearm_review_checks_on_startup(orch: &Orchestrator) {
+    let candidates = match rearm_candidate_jobs(&orch.db.local).await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            log::warn!("review-checks startup re-arm: candidate lookup failed: {e}");
+            return;
+        }
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    log::info!(
+        "review-checks startup re-arm: re-spawning turn-end checks for {} settled job(s)",
+        candidates.len()
+    );
+    for job_id in candidates {
+        spawn_turn_end_checks(orch, &job_id);
+    }
+}
+
+/// Jobs eligible for the startup review-checks re-arm: settled (`idle`/terminal)
+/// jobs on a non-terminal issue that still own reviewable output.
+async fn rearm_candidate_jobs(db: &crate::storage::LocalDb) -> Result<Vec<String>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT DISTINCT j.id FROM jobs j
+                     JOIN issues i ON i.id = j.issue_id
+                     WHERE i.status NOT IN ('merged', 'closed')
+                       AND j.status IN ('idle', 'complete', 'failed')
+                       AND (
+                         EXISTS (
+                           SELECT 1 FROM artifacts a
+                           WHERE a.job_id = j.id
+                             AND (a.artifact_type = 'create-pr'
+                                  OR (a.artifact_type = 'plan' AND a.confirmed = 0))
+                         )
+                         OR EXISTS (
+                           SELECT 1 FROM merge_requests mr
+                           WHERE mr.issue_id = j.issue_id
+                             AND mr.source_branch = j.branch
+                             AND mr.status = 'open'
+                         )
+                       )",
+                    (),
+                )
+                .await?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next().await? {
+                ids.push(row.text(0)?);
+            }
+            Ok::<_, DbError>(ids)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The PR-open edge of the review push (CAIRN-2483). A builder that writes a
+/// `create-pr` artifact and idles cannot fire the review at its idle edge: the
+/// PR is not open yet (branch push + open lag), and the create-pr artifact
+/// auto-confirms on write (CAIRN-1219), so neither reviewable arm matches at that
+/// instant. The in-process PR-opening path
+/// (`execution::actions::fire_pr_open_review`, from `handle_create_pr` and
+/// `handle_pr_node`) observes the PR opening and routes here.
+///
+/// This edge now defers to [`evaluate_review_readiness`], which carries the full
+/// issue-quiescence and checks-settled gates. `source_branch` is retained for the
+/// caller's signature and logging; the evaluator resolves the producing job from
+/// the issue itself. At PR-open time the review agent or the checks suite is
+/// usually still live, so this edge typically defers and a later settled edge
+/// (checks completion or the job-terminal recompute hook) fires the wake; it
+/// covers the case where the MR row lands only after everything else has settled.
+pub async fn create_review_push_for_pr_open(
+    orch: &Orchestrator,
+    issue_id: &str,
+    source_branch: &str,
+) {
+    log::debug!(
+        "PR-open review: evaluating readiness for issue {} (branch {})",
+        &issue_id[..issue_id.len().min(8)],
+        source_branch,
+    );
+    evaluate_review_readiness(orch, issue_id, false).await;
 }
 
 /// Create the review push rows for an issue's watchers — the single shared
@@ -599,7 +643,7 @@ async fn job_branch(db: &crate::storage::LocalDb, job_id: &str) -> Result<Option
 /// the builder's node coordinates don't resolve, the content_ref falls back to
 /// the issue URI, which still resolves for the drain/render path.
 ///
-/// The fingerprint prefers the PR head commit SHA (`pr:{mr}:sha:{sha}`), which a
+/// The fingerprint prefers the reviewed head commit SHA (`sha:{sha}`), which a
 /// real new commit always changes and a mergeability-only settle never does; it
 /// falls back to the diffstat (`pr:{mr}:{additions}:{deletions}`) when no head
 /// SHA has been recorded yet. `None` when no open PR exists on that branch.
@@ -686,8 +730,12 @@ async fn open_pr_review_arm(
                 },
                 _ => format!("cairn://p/{project_key}/{number}"),
             };
+            // CAIRN-2483: unify on the reviewed head commit (`sha:{sha}`) so the
+            // open-PR arm and the create-pr-artifact arm can never re-fire twice
+            // for the same reviewed state across edges. Falls back to the diffstat
+            // form only when no head SHA has been recorded yet.
             let fingerprint = match head_sha {
-                Some(sha) => format!("pr:{mr_id}:sha:{sha}"),
+                Some(sha) => format!("sha:{sha}"),
                 None => {
                     let fmt =
                         |n: Option<i64>| n.map(|v| v.to_string()).unwrap_or_else(|| "-".into());

@@ -1,6 +1,4 @@
-use super::{
-    create_review_push_for_pr_open, create_review_push_on_turn_end, issue_for_attention_by_job,
-};
+use super::{create_review_push_for_pr_open, evaluate_review_readiness};
 use crate::db::DbState;
 use crate::orchestrator::attention_push::{
     latest_push_fingerprint, list_pending, stamp_delivered, Boundary, Push, Wake,
@@ -85,16 +83,15 @@ async fn pending(orch: &Orchestrator, recipient: &str) -> Vec<Push> {
     list_pending(&orch.db.local, recipient).await.unwrap()
 }
 
-fn run_review_push(orch: &Orchestrator) {
-    let (issue_id, ctx) =
-        issue_for_attention_by_job(orch, "j-prod").expect("issue context for producing job");
-    create_review_push_on_turn_end(orch, "j-prod", &issue_id, &ctx);
+async fn run_review_push(orch: &Orchestrator) {
+    // Both trigger edges now run through the single readiness evaluator; this
+    // helper models the turn-end / checks-completion edge (fresh_red = false).
+    evaluate_review_readiness(orch, "i-rev", false).await;
 }
 
 async fn run_pr_open(orch: &Orchestrator) {
-    // The webhook passes (issue_id, source_branch); the builder is resolved
-    // from the branch inside the creator. `insert_open_pr` uses branch 'b',
-    // matching the seeded builder j-prod's branch.
+    // The PR-open edge now defers to the same readiness evaluator; the source
+    // branch is retained only for the caller's signature/logging.
     create_review_push_for_pr_open(orch, "i-rev", "b").await;
 }
 
@@ -107,7 +104,7 @@ async fn work_idle_with_unconfirmed_create_pr_artifact_pushes_review() {
     insert_artifact(&db, "create-pr", 0).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
 
     let watcher = pending(&orch, "j-watch").await;
     assert_eq!(watcher.len(), 1);
@@ -124,7 +121,7 @@ async fn work_idle_with_open_pr_pushes_review() {
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
 
     let watcher = pending(&orch, "j-watch").await;
     assert_eq!(watcher.len(), 1);
@@ -136,17 +133,22 @@ async fn work_idle_with_open_pr_pushes_review() {
 }
 
 #[tokio::test]
-async fn memory_review_turn_end_creates_no_review_push() {
-    // The gate: a trailing memory-review turn is not a work turn, so even an
-    // open PR yields no review push.
+async fn settled_after_memory_review_completes_fires_review() {
+    // The common build path: the builder's WORK turn produced the PR, then a
+    // trailing memory-review turn ran and completed. Once that reflection turn
+    // terminalizes the issue is settled, so the review fires normally — there is
+    // deliberately no separate memory-review gate that would block it forever
+    // (a builder's latest turn is permanently its memory-review turn; CAIRN-2483).
     let db = test_db().await;
-    seed(&db, "memory_review").await;
+    seed(&db, "memory_review").await; // t-prod: memory_review turn, state complete
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
 
-    assert!(pending(&orch, "j-watch").await.is_empty());
+    let watcher = pending(&orch, "j-watch").await;
+    assert_eq!(watcher.len(), 1);
+    assert_eq!(watcher[0].key, REVIEW_KEY);
 }
 
 #[tokio::test]
@@ -159,7 +161,7 @@ async fn work_idle_with_confirmed_create_pr_artifact_pushes_review() {
     insert_artifact(&db, "create-pr", 1).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
 
     let watcher = pending(&orch, "j-watch").await;
     assert_eq!(watcher.len(), 1);
@@ -177,7 +179,7 @@ async fn work_idle_without_reviewable_output_no_push() {
     insert_artifact(&db, "plan", 1).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
 
     assert!(pending(&orch, "j-watch").await.is_empty());
 }
@@ -193,8 +195,8 @@ async fn successive_work_idles_collapse_to_one_undelivered() {
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
-    run_review_push(&orch);
+    run_review_push(&orch).await;
+    run_review_push(&orch).await;
 
     assert_eq!(pending(&orch, "j-watch").await.len(), 1);
 }
@@ -208,7 +210,7 @@ async fn unchanged_fingerprint_skips_review_even_after_delivery() {
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     let first = pending(&orch, "j-watch").await;
     assert_eq!(first.len(), 1);
 
@@ -220,7 +222,7 @@ async fn unchanged_fingerprint_skips_review_even_after_delivery() {
     assert!(pending(&orch, "j-watch").await.is_empty());
 
     // Same diffstat -> skipped, no re-wake.
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     assert!(
         pending(&orch, "j-watch").await.is_empty(),
         "an unchanged reviewable state must not re-create a review push"
@@ -236,7 +238,7 @@ async fn changed_diffstat_creates_new_review_after_delivery() {
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     let first = pending(&orch, "j-watch").await;
     assert_eq!(first.len(), 1);
     stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
@@ -248,7 +250,7 @@ async fn changed_diffstat_creates_new_review_after_delivery() {
         .execute_script("UPDATE merge_requests SET additions=10, deletions=2 WHERE id='mr-rev';")
         .await
         .unwrap();
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     let second = pending(&orch, "j-watch").await;
     assert_eq!(second.len(), 1, "a changed diffstat re-creates the review");
     assert_ne!(second[0].id, first[0].id);
@@ -263,7 +265,7 @@ async fn mergeability_only_change_does_not_refire_review() {
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     let first = pending(&orch, "j-watch").await;
     assert_eq!(first.len(), 1);
     stamp_delivered(&orch.db.local, &[first[0].id.clone()], "ev-1")
@@ -277,7 +279,7 @@ async fn mergeability_only_change_does_not_refire_review() {
             )
             .await
             .unwrap();
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     assert!(
         pending(&orch, "j-watch").await.is_empty(),
         "a mergeability-only settle must not re-create a review push"
@@ -413,13 +415,11 @@ async fn pr_open_changed_head_sha_refires_even_with_same_diffstat() {
 }
 
 #[tokio::test]
-async fn pr_open_during_memory_review_turn_fires_review() {
-    // The common build path: create-pr (work turn ends) -> a trailing
-    // memory-review turn runs -> the `opened` webhook lands while it runs. A
-    // running memory-review turn is quiescent-for-review (the PR is the
-    // reviewable output, and the node-idle edge gates out memory-review turn
-    // ends), so the PR-open edge MUST fire here — otherwise the wake is lost
-    // permanently when no further commit produces a later webhook.
+async fn running_memory_review_turn_defers_then_fires_on_settle() {
+    // A running memory-review turn keeps the issue unsettled (issue_settled's
+    // liveness check includes memory-review turns), so no review fires
+    // mid-reflection. Once that reflection turn completes the issue settles and
+    // the review fires — exactly once (CAIRN-2483).
     let db = test_db().await;
     seed(&db, "memory_review").await;
     insert_open_pr(&db).await;
@@ -429,19 +429,24 @@ async fn pr_open_during_memory_review_turn_fires_review() {
     let orch = test_orchestrator(db);
 
     run_pr_open(&orch).await;
+    assert!(
+        pending(&orch, "j-watch").await.is_empty(),
+        "a running memory-review turn must defer the review"
+    );
 
+    orch.db
+        .local
+        .execute_script("UPDATE turns SET state='complete' WHERE id='t-prod';")
+        .await
+        .unwrap();
+    run_pr_open(&orch).await;
     let watcher = pending(&orch, "j-watch").await;
     assert_eq!(
         watcher.len(),
         1,
-        "a running memory-review turn must not block the PR-open review"
+        "the review fires once the reflection turn settles"
     );
     assert_eq!(watcher[0].key, REVIEW_KEY);
-
-    // The node-idle edge for that same memory-review turn end is gated out, so
-    // it adds nothing — still exactly one undelivered review (no double).
-    run_review_push(&orch);
-    assert_eq!(pending(&orch, "j-watch").await.len(), 1);
 }
 
 #[tokio::test]
@@ -517,7 +522,7 @@ async fn pr_open_and_node_idle_share_one_creator() {
     assert_eq!(after_pr_open.len(), 1);
     let row_id = after_pr_open[0].id.clone();
 
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     let after_idle = pending(&orch, "j-watch").await;
     assert_eq!(after_idle.len(), 1);
     assert_eq!(
@@ -544,7 +549,7 @@ async fn pr_open_after_idle_artifact_push_supersedes_to_pr_fingerprint() {
     let orch = test_orchestrator(db);
 
     // Idle edge fires first: one review push fingerprinted on the artifact.
-    run_review_push(&orch);
+    run_review_push(&orch).await;
     let after_idle = pending(&orch, "j-watch").await;
     assert_eq!(after_idle.len(), 1);
     let idle_row = after_idle[0].id.clone();
@@ -589,6 +594,86 @@ async fn pr_open_after_idle_artifact_push_supersedes_to_pr_fingerprint() {
         open_fp.starts_with("pr:"),
         "the PR-open edge fingerprints on the open PR, got {open_fp}"
     );
+}
+
+// --- CAIRN-2483: the issue-quiescence and checks-settled gates -----------
+
+#[tokio::test]
+async fn fresh_red_defers_the_review() {
+    // A fresh (non-cached) failing check at the completion edge defers the parent
+    // review: that red is simultaneously waking the owning builder and the fix
+    // loop is live. A later settle (fresh_red = false, the stale-red case) fires.
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_open_pr(&db).await;
+    let orch = test_orchestrator(db);
+
+    evaluate_review_readiness(&orch, "i-rev", true).await;
+    assert!(
+        pending(&orch, "j-watch").await.is_empty(),
+        "a fresh red must defer the parent review"
+    );
+
+    evaluate_review_readiness(&orch, "i-rev", false).await;
+    assert_eq!(
+        pending(&orch, "j-watch").await.len(),
+        1,
+        "a stale red (fresh_red=false) settles-with-warning and the review fires"
+    );
+}
+
+#[tokio::test]
+async fn in_flight_turn_end_checks_defer_the_review() {
+    // While any job of the issue holds an in-flight turn-end run, checks are not
+    // settled, so the review defers until the suite completes.
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_open_pr(&db).await;
+    let orch = test_orchestrator(db);
+
+    assert!(orch.try_begin_turn_end_checks("j-prod"));
+    run_review_push(&orch).await;
+    assert!(
+        pending(&orch, "j-watch").await.is_empty(),
+        "an in-flight turn-end suite must hold the review"
+    );
+
+    orch.end_turn_end_checks("j-prod");
+    run_review_push(&orch).await;
+    assert_eq!(pending(&orch, "j-watch").await.len(), 1);
+}
+
+#[tokio::test]
+async fn transient_action_run_defers_then_blocked_fires() {
+    // The pr action opening the PR (a pending/running action_run) keeps the issue
+    // unsettled until it terminalizes or blocks (the open-PR human gate).
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_open_pr(&db).await;
+    let orch = test_orchestrator(db);
+
+    orch.db
+        .local
+        .execute_script(
+            "INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, created_at)
+             VALUES('ar-pr','e-rev','pr','builtin:pr','i-rev','p-rev','running',1);",
+        )
+        .await
+        .unwrap();
+    run_review_push(&orch).await;
+    assert!(
+        pending(&orch, "j-watch").await.is_empty(),
+        "a transient pr action_run must hold the review"
+    );
+
+    // The action blocks (PR open, human gate) -> settled -> the review fires.
+    orch.db
+        .local
+        .execute_script("UPDATE action_runs SET status='blocked' WHERE id='ar-pr';")
+        .await
+        .unwrap();
+    run_review_push(&orch).await;
+    assert_eq!(pending(&orch, "j-watch").await.len(), 1);
 }
 
 #[tokio::test]

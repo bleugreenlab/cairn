@@ -80,6 +80,7 @@ pub async fn collect_openrouter_usage_snapshot(orch: &Orchestrator) -> ProviderU
         captured_at: chrono::Utc::now().timestamp(),
         windows: Vec::new(),
         credits,
+        reset_credits: None,
         error: None,
         unsupported_reason: None,
         raw,

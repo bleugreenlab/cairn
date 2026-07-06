@@ -155,6 +155,9 @@ impl ConfigResource for RecipeResource {
         if let Some(trigger) = input.trigger {
             recipe.trigger = trigger;
         }
+        if let Some(is_system) = input.is_system {
+            recipe.is_system = is_system;
+        }
         if let Some(nodes) = input.nodes {
             recipe.nodes = nodes;
         }
@@ -497,5 +500,77 @@ impl Orchestrator {
             }
         };
         Ok(file.validate())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RecipeResource;
+    use crate::models::{Recipe, RecipeTrigger, UpdateRecipe};
+    use crate::orchestrator::config_resource::ConfigResource;
+    use std::path::PathBuf;
+
+    fn existing_recipe(is_system: bool) -> crate::config::recipes::FileRecipe {
+        crate::config::recipes::FileRecipe {
+            recipe: Recipe {
+                id: "recipe".to_string(),
+                name: "Recipe".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                workspace_id: Some("default".to_string()),
+                project_id: None,
+                is_system,
+                version: 1,
+                parent_recipe_id: None,
+                child_recipe_id: None,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                created_at: 1,
+                updated_at: 1,
+            },
+            is_project_scoped: false,
+            file_path: PathBuf::from("recipe.yaml"),
+        }
+    }
+
+    fn update_input(is_system: Option<bool>) -> UpdateRecipe {
+        UpdateRecipe {
+            name: None,
+            description: None,
+            trigger: None,
+            workspace_id: None,
+            project_id: None,
+            is_system,
+            nodes: None,
+            edges: None,
+        }
+    }
+
+    #[test]
+    fn recipe_update_can_clear_system_flag() {
+        let updated = RecipeResource::build_update_file(
+            &existing_recipe(true),
+            update_input(Some(false)),
+            "recipe",
+            false,
+            false,
+            2,
+        );
+
+        assert!(!updated.recipe.is_system);
+    }
+
+    #[test]
+    fn recipe_update_preserves_system_flag_when_unspecified() {
+        let updated = RecipeResource::build_update_file(
+            &existing_recipe(true),
+            update_input(None),
+            "recipe",
+            false,
+            false,
+            2,
+        );
+
+        assert!(updated.recipe.is_system);
     }
 }

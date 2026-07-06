@@ -26,7 +26,10 @@ mod stop;
 pub(crate) use common::set_exit_reason;
 pub(crate) use finalize::memory_review_turn_ended;
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state};
-pub use review_push::create_review_push_for_pr_open;
+pub(crate) use review_push::detach_onto_runtime;
+pub use review_push::{
+    create_review_push_for_pr_open, evaluate_review_readiness, rearm_review_checks_on_startup,
+};
 pub use stop::{
     kill_session, kill_session_with_reason, live_run_id_for_job, stop_active_turn_for_run,
     stop_job, stop_session, suspend_run_for_durable_wait,
@@ -35,10 +38,7 @@ pub use stop::{
 #[cfg(test)]
 pub(crate) use finalize::finish_memory_review_if_due;
 #[cfg(test)]
-pub(crate) use review_push::{
-    create_review_push_on_turn_end, detach_onto_runtime, issue_for_attention_by_job,
-    review_artifact_ref,
-};
+pub(crate) use review_push::review_artifact_ref;
 #[cfg(test)]
 pub(crate) use stop::{stop_session_internal, InterruptFailurePolicy};
 

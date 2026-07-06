@@ -109,7 +109,7 @@ pub(super) async fn is_action_node_ready_with_snapshot_conn(
     Ok(true)
 }
 
-pub(super) async fn is_job_ready_conn(
+pub(crate) async fn is_job_ready_conn(
     conn: &cairn_db::turso::Connection,
     job: &DbJob,
 ) -> DbResult<bool> {
@@ -140,6 +140,93 @@ pub(super) async fn is_job_ready_conn(
         }
     }
 
+    Ok(true)
+}
+
+/// Whether an issue's executions have gone fully quiescent for review-wake
+/// purposes. This is the structural "nothing is imminently happening" predicate
+/// the review evaluator gates on (CAIRN-2483): a review is pushed to watchers
+/// only once the reviewed child issue has actually settled, never mid-work.
+///
+/// Settled iff, across every job of the issue's executions:
+/// - no job has a live latest turn (Running/Pending/Yielded, *including* a
+///   trailing memory-review turn and a self-suspended own-work wait — a yielded
+///   turn reads live), and
+/// - no job is Pending **and** DAG-ready — a claimable job is imminent work; this
+///   is what covers the builder-end → review-start gap once the pr node fires its
+///   open port and the review job becomes ready. A Pending job whose control-deps
+///   are unmet counts as settled (it may never run), and
+/// - no `action_run` is in a transient state (`pending`/`running`) — this covers
+///   the pr action itself over its seed → GitHub-open → open-port window.
+///
+/// Idle and Blocked jobs, and Blocked (open-PR gate) / terminal action_runs, all
+/// count as settled: those are exactly the rest states at which watchers must be
+/// woken. Terminal (complete/failed/cancelled) is settled.
+pub(crate) async fn issue_settled(db: &LocalDb, issue_id: &str) -> Result<bool, String> {
+    let issue_id = issue_id.to_string();
+    db.read(|conn| {
+        let issue_id = issue_id.clone();
+        Box::pin(async move { issue_settled_conn(conn, &issue_id).await })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+pub(crate) async fn issue_settled_conn(
+    conn: &cairn_db::turso::Connection,
+    issue_id: &str,
+) -> DbResult<bool> {
+    // A transient action_run (the pr action opening the PR, or any other action
+    // node mid-run) is imminent work. `blocked` (open-PR human gate), `complete`,
+    // and `failed` are settled.
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM action_runs ar
+             JOIN executions e ON e.id = ar.execution_id
+             WHERE e.issue_id = ?1 AND ar.status IN ('pending', 'running')
+             LIMIT 1",
+            (issue_id,),
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        return Ok(false);
+    }
+
+    // A ready-but-not-yet-dispatched action/pr node is imminent work too. This
+    // closes the window at builder completion, before the pr node's action_run is
+    // seeded, where the transient-action_run check above cannot yet see it: the pr
+    // node is DAG-ready (builder complete) but has no action_run row. Snapshot
+    // load errors (e.g. a snapshot-less fixture execution) are skipped rather than
+    // propagated — a real execution always has a snapshot.
+    let exec_ids = {
+        let mut rows = conn
+            .query("SELECT id FROM executions WHERE issue_id = ?1", (issue_id,))
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.text(0)?);
+        }
+        ids
+    };
+    for exec_id in &exec_ids {
+        if let Ok(ready) =
+            find_ready_nodes_conn(conn, exec_id, &["action", "pr"], "action_runs").await
+        {
+            if !ready.is_empty() {
+                return Ok(false);
+            }
+        }
+    }
+
+    let jobs = super::persistence::load_jobs_for_issue_conn(conn, issue_id).await?;
+    for job in &jobs {
+        if super::recompute::latest_turn_is_live(conn, &job.id).await? {
+            return Ok(false);
+        }
+        if job.status == "pending" && is_job_ready_conn(conn, job).await? {
+            return Ok(false);
+        }
+    }
     Ok(true)
 }
 
@@ -405,6 +492,57 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(is_job_ready_conn(conn, &job(Some("child"))).await.unwrap());
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn issue_settled_reflects_job_and_action_states() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                // deps merged -> the child's DAG-ready gate is satisfiable.
+                seed(conn, "merged").await;
+                // A pending, DAG-ready job is imminent work -> not settled.
+                conn.execute(
+                    "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, status, created_at, updated_at)
+                     VALUES('j-1','e-1','agent','child','p-1','pending',1,1)",
+                    (),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    !issue_settled_conn(conn, "child").await.unwrap(),
+                    "a pending DAG-ready job is imminent work"
+                );
+
+                // Terminal job, no action work -> settled.
+                conn.execute("UPDATE jobs SET status='complete' WHERE id='j-1'", ())
+                    .await
+                    .unwrap();
+                assert!(issue_settled_conn(conn, "child").await.unwrap());
+
+                // A transient (running) action_run holds the issue unsettled.
+                conn.execute(
+                    "INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, created_at)
+                     VALUES('ar','e-1','pr','builtin:pr','child','p-1','running',1)",
+                    (),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    !issue_settled_conn(conn, "child").await.unwrap(),
+                    "a transient action_run is imminent work"
+                );
+
+                // Once it blocks (open-PR human gate) the issue settles.
+                conn.execute("UPDATE action_runs SET status='blocked' WHERE id='ar'", ())
+                    .await
+                    .unwrap();
+                assert!(issue_settled_conn(conn, "child").await.unwrap());
                 Ok(())
             })
         })

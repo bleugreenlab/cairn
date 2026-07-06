@@ -71,27 +71,65 @@ const LOG_TAIL_CHARS: usize = 2_000;
 /// lifecycle) has already claimed the slot via `try_begin_turn_end_checks`; this
 /// function is responsible for releasing it on every path.
 pub async fn run_turn_end_checks(orch: Orchestrator, job_id: String) {
-    if let Err(e) = run_turn_end_checks_inner(&orch, &job_id).await {
-        log::warn!(
-            "turn-end checks for job {}: {}",
-            &job_id[..job_id.len().min(8)],
-            e
-        );
-    }
+    // `fresh_red` is true only when this launch ran a check that freshly failed
+    // (a non-cached failing verdict). Early-exit paths (no worktree, no checks, no
+    // changed files, all-cached) yield `false`, so a planner writing a plan still
+    // yields a prompt parent wake at the completion edge.
+    let fresh_red = match run_turn_end_checks_inner(&orch, &job_id).await {
+        Ok(fresh_red) => fresh_red,
+        Err(e) => {
+            log::warn!(
+                "turn-end checks for job {}: {}",
+                &job_id[..job_id.len().min(8)],
+                e
+            );
+            false
+        }
+    };
+    // Release the single-flight slot BEFORE evaluating review readiness so the
+    // checks-settled gate does not see this job's own in-flight marker.
     orch.end_turn_end_checks(&job_id);
+    // The checks pipeline owns review evaluation end-to-end (CAIRN-2483): every
+    // exit path lands here, so a green completion, an all-cached exit, an empty
+    // changed set, or an inner error all re-evaluate whether the reviewed issue
+    // has settled and, if so, wake its watchers.
+    if let Some(issue_id) = issue_id_for_job(&orch.db.local, &job_id).await {
+        crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, &issue_id, fresh_red)
+            .await;
+    }
 }
 
-async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+/// The issue a job belongs to, or `None` for a project-level job.
+async fn issue_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
+    db.read(|conn| {
+        let job_id = job_id.to_string();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT issue_id FROM jobs WHERE id = ?1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            crate::storage::next_opt_text(&mut rows, 0).await
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Returns `true` when a non-cached check freshly failed (`fresh_red`).
+async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
     // 1. Resolve the node's coordinates (project, issue, worktree, base anchors).
     let Some(coords) = resolve_job_coords(&orch.db.local, job_id).await? else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(worktree_path) = coords.worktree_path.clone().filter(|p| !p.is_empty()) else {
         log::debug!(
             "turn-end checks for job {}: no worktree; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(false);
     };
     let repo_root = Path::new(&worktree_path);
 
@@ -103,7 +141,7 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
                 "turn-end checks for job {}: no checks contract; nothing to run",
                 short_id(job_id)
             );
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -124,14 +162,14 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
             "turn-end checks for job {}: changed-file set unresolvable; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(false);
     };
     if changed.is_empty() {
         log::debug!(
             "turn-end checks for job {}: empty changed-file set; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // 5. Select the applicable turn-end checks (cadence + impact gate).
@@ -141,7 +179,7 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
             "turn-end checks for job {}: no applicable review check; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(false);
     }
 
     // 6. Resolve the sealed tree identity used as the cache key.
@@ -201,7 +239,7 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
             "turn-end checks for job {}: every applicable check is already cached for this tree; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(false);
     }
     log::info!(
         "turn-end checks for job {}: launching {} check(s) [{}] over {} changed file(s)",
@@ -331,7 +369,7 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
             );
         }
     }
-    Ok(())
+    Ok(any_failed)
 }
 
 /// The wake level a completed turn-end run is delivered at: a failure ROUSES the

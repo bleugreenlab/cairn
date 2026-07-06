@@ -374,6 +374,7 @@ fn parse_claude_usage_snapshot(raw_output: &str) -> ProviderUsageSnapshot {
         captured_at: chrono::Utc::now().timestamp(),
         windows,
         credits: None,
+        reset_credits: None,
         error: None,
         unsupported_reason: None,
         raw: Some(json!({ "output": sanitized, "normalized": normalized })),

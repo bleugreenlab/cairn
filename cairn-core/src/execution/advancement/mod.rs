@@ -43,6 +43,7 @@ pub use core::advance_execution_impl;
 pub use dependents::release_dependent_executions;
 pub use inputs::{format_resolved_inputs, ResolvedInput};
 pub use job_creation::create_jobs_for_new_nodes;
+pub(crate) use readiness::issue_settled;
 pub use readiness::{find_ready_action_nodes, find_ready_condition_nodes, is_action_node_ready};
 pub use recompute::{
     recompute_execution_jobs, recompute_execution_jobs_conn, recompute_job,

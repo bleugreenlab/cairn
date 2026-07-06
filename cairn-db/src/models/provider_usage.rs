@@ -33,6 +33,28 @@ pub struct ProviderCreditsSnapshot {
     pub currency: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsageResetCredit {
+    pub expires_at: Option<i64>,
+    pub expires_at_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsageResetCredits {
+    pub available_count: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credits: Vec<ProviderUsageResetCredit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUsageResetResult {
+    pub outcome: String,
+    pub snapshot: ProviderUsageSnapshot,
+}
+
 /// One model's recorded usage for a metered backend: its real billed cost over
 /// the snapshot's scope, plus billable tokens and run count when known.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,6 +77,7 @@ pub struct ProviderUsageSnapshot {
     pub captured_at: i64,
     pub windows: Vec<ProviderUsageWindow>,
     pub credits: Option<ProviderCreditsSnapshot>,
+    pub reset_credits: Option<ProviderUsageResetCredits>,
     pub error: Option<String>,
     pub unsupported_reason: Option<String>,
     pub raw: Option<Value>,
@@ -74,6 +97,7 @@ impl ProviderUsageSnapshot {
             captured_at: chrono::Utc::now().timestamp(),
             windows: Vec::new(),
             credits: None,
+            reset_credits: None,
             error: None,
             unsupported_reason: Some(reason.into()),
             raw: None,
@@ -93,6 +117,7 @@ impl ProviderUsageSnapshot {
             captured_at: chrono::Utc::now().timestamp(),
             windows: Vec::new(),
             credits: None,
+            reset_credits: None,
             error: Some(message.into()),
             unsupported_reason: None,
             raw,
@@ -130,6 +155,7 @@ mod tests {
             captured_at: 0,
             windows: Vec::new(),
             credits: None,
+            reset_credits: None,
             error: None,
             unsupported_reason: None,
             raw: None,

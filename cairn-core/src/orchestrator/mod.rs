@@ -303,6 +303,7 @@ impl OrchestratorBuilder {
             config_dir: self.config_dir,
             schema_dir: self.schema_dir,
             mcp_callback_port: self.mcp_callback_port,
+            attached_ui: Arc::new(Mutex::new(AttachedUi::default())),
             vibe_state: self.vibe_state,
             embed_tx: Arc::new(Mutex::new(None)),
             anon_device_manager,
@@ -331,6 +332,23 @@ impl OrchestratorBuilder {
 pub struct SetupHandle {
     pub cancel: Arc<AtomicBool>,
     pub child: Arc<Mutex<Option<Box<dyn ChildProcess>>>>,
+}
+
+/// The desktop UI attached over the runner's `/ws` channel, tracked so
+/// `process_info` (and thus `cairn://dev/pid`) can report the *window* pid.
+///
+/// Each `/ws` connection that carries a `ui_pid` takes a monotonic generation
+/// token when it registers. A connection detaches only when it still holds the
+/// current generation, so a same-pid reconnect or in-process reload — where the
+/// desktop process id is unchanged — is not clobbered by the old socket's late
+/// disconnect cleanup running after the new socket has already re-registered.
+#[derive(Debug, Default)]
+struct AttachedUi {
+    /// Next generation token to hand out; increments on every registration.
+    next_generation: u64,
+    /// The current registration as `(generation, pid)`, or `None` when no
+    /// desktop is attached.
+    current: Option<(u64, u32)>,
 }
 
 /// Central runtime state for agent orchestration.
@@ -433,6 +451,14 @@ pub struct Orchestrator {
     pub schema_dir: Option<PathBuf>,
     /// Port for the MCP callback server
     pub mcp_callback_port: u16,
+    /// Desktop UI attached over the runner's `/ws` channel. The window-owning
+    /// Tauri process registers its own `std::process::id()` on connect and
+    /// detaches on disconnect; the `process_info` tool reads the current pid so
+    /// `cairn://dev/pid` reports the *window* pid rather than this windowless
+    /// runner daemon's. Generation-tracked (see [`AttachedUi`]) so a same-pid
+    /// reconnect/reload is not clobbered by the old socket's late close.
+    /// Runtime-only; never persisted.
+    attached_ui: Arc<Mutex<AttachedUi>>,
     /// Vibe state for embedding-based color assignment (None if centroids unavailable)
     pub vibe_state: Option<Arc<VibeState>>,
     /// Sender into the async event-embed worker. None until the worker is started.
@@ -561,6 +587,47 @@ impl Orchestrator {
         executor: Arc<dyn EffectExecutor>,
     ) -> Result<(), Arc<dyn EffectExecutor>> {
         self.executor.set(executor)
+    }
+
+    /// Register the OS process id of the desktop UI now attached over the
+    /// runner's `/ws` channel and return a generation token identifying THIS
+    /// registration. The window-owning Tauri process sends its own
+    /// `std::process::id()` when it connects; `process_info` returns it so
+    /// `cairn://dev/pid` hands an external tool (e.g. Axon accessibility) the
+    /// *window* pid rather than this windowless runner daemon's. Pass the
+    /// returned token to [`detach_ui_pid`](Self::detach_ui_pid) on disconnect.
+    /// Called on WS connect.
+    pub fn attach_ui_pid(&self, pid: u32) -> u64 {
+        let mut guard = self.attached_ui.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = guard.next_generation;
+        guard.next_generation = guard.next_generation.wrapping_add(1);
+        guard.current = Some((generation, pid));
+        generation
+    }
+
+    /// Detach the desktop UI registration identified by `generation` on WS
+    /// disconnect, but only if it is still the current one. A newer connection
+    /// (even the same desktop pid, e.g. a reconnect or in-process reload) that
+    /// already re-registered bumped the generation, so this stale close is a
+    /// no-op and cannot clobber the live registration.
+    pub fn detach_ui_pid(&self, generation: u64) {
+        let mut guard = self.attached_ui.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .current
+            .is_some_and(|(current, _)| current == generation)
+        {
+            guard.current = None;
+        }
+    }
+
+    /// The OS process id of the desktop UI attached over `/ws`, or `None` when no
+    /// desktop is connected (a headless server, or the window fully quit).
+    pub fn attached_ui_pid(&self) -> Option<u32> {
+        self.attached_ui
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current
+            .map(|(_, pid)| pid)
     }
 
     /// Record whether a browser's page is currently loading. Called from the

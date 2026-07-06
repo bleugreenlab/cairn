@@ -3,8 +3,8 @@ use super::CODEX_BACKEND_NAME;
 use crate::agent_process::stream::{TokenCounts, TranscriptEvent, Usage};
 use crate::backends::run_state::is_task_spawned_run;
 use crate::models::{
-    ProviderCreditsSnapshot, ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow,
-    RunStatus,
+    ProviderCreditsSnapshot, ProviderUsageResetCredit, ProviderUsageResetCredits,
+    ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow, RunStatus,
 };
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
@@ -542,6 +542,7 @@ pub(super) fn codex_rate_limit_snapshot_from_value(raw: Value) -> Option<Provide
                 .map(str::to_string),
         })
     });
+    let reset_credits = codex_reset_credits_from_value(&raw);
 
     Some(ProviderUsageSnapshot {
         backend: "codex".to_string(),
@@ -549,10 +550,86 @@ pub(super) fn codex_rate_limit_snapshot_from_value(raw: Value) -> Option<Provide
         captured_at: chrono::Utc::now().timestamp(),
         windows,
         credits,
+        reset_credits,
         error: None,
         unsupported_reason: None,
         raw: Some(raw),
         model_breakdown: None,
+    })
+}
+
+fn codex_reset_credits_from_value(raw: &Value) -> Option<ProviderUsageResetCredits> {
+    let value = raw
+        .get("rateLimitResetCredits")
+        .or_else(|| raw.get("rate_limit_reset_credits"))
+        .or_else(|| raw.get("resetCredits"))
+        .or_else(|| raw.get("reset_credits"))?;
+    if value.is_null() {
+        return None;
+    }
+
+    let available_count = value
+        .get("availableCount")
+        .or_else(|| value.get("available_count"))
+        .and_then(Value::as_i64)
+        .or_else(|| value.as_i64())
+        .unwrap_or(0);
+
+    let credits = value
+        .get("credits")
+        .or_else(|| value.get("items"))
+        .or_else(|| value.get("available"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(codex_reset_credit_from_value)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(ProviderUsageResetCredits {
+        available_count,
+        credits,
+    })
+}
+
+fn codex_reset_credit_from_value(value: &Value) -> Option<ProviderUsageResetCredit> {
+    if value.is_null() {
+        return None;
+    }
+    let expires_at = value
+        .get("expiresAt")
+        .or_else(|| value.get("expires_at"))
+        .or_else(|| value.get("expirationTime"))
+        .or_else(|| value.get("expiration_time"))
+        .and_then(|value| {
+            value.as_i64().or_else(|| {
+                value.as_str().and_then(|text| {
+                    chrono::DateTime::parse_from_rfc3339(text)
+                        .ok()
+                        .map(|dt| dt.timestamp())
+                })
+            })
+        })
+        .or_else(|| {
+            value
+                .get("expiresInSeconds")
+                .or_else(|| value.get("expires_in_seconds"))
+                .and_then(Value::as_i64)
+                .map(|seconds| chrono::Utc::now().timestamp() + seconds)
+        });
+    let expires_at_text = value
+        .get("expiresAtText")
+        .or_else(|| value.get("expires_at_text"))
+        .or_else(|| value.get("expirationText"))
+        .or_else(|| value.get("expiration_text"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Some(ProviderUsageResetCredit {
+        expires_at,
+        expires_at_text,
     })
 }
 

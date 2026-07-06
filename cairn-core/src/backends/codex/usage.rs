@@ -22,7 +22,7 @@ use super::events::codex_rate_limit_snapshot_from_value;
 use super::refresh_codex_oauth_tokens_for_current_account;
 use crate::env::find_binary;
 use crate::identity::CodexAuth;
-use crate::models::ProviderUsageSnapshot;
+use crate::models::{ProviderUsageResetResult, ProviderUsageSnapshot};
 use crate::orchestrator::Orchestrator;
 
 pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapshot {
@@ -37,32 +37,10 @@ pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapsho
         }
     };
 
-    let mut env = HashMap::new();
-    let mut temp_home = None;
-    let mut uses_codex_oauth = false;
-    if let Some(identity) = orch.get_identity() {
-        match identity.codex_auth {
-            Some(CodexAuth::OAuthToken(auth_json)) => match prepare_codex_auth_home(&auth_json) {
-                Ok(home) => {
-                    env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
-                    temp_home = Some(home);
-                    uses_codex_oauth = true;
-                }
-                Err(err) => {
-                    return ProviderUsageSnapshot::error("codex", "codex_rate_limits", err, None);
-                }
-            },
-            Some(CodexAuth::ApiKey(key)) => {
-                env.insert("OPENAI_API_KEY".to_string(), key);
-            }
-            None => {}
-        }
-    }
-
-    let cwd = temp_home
-        .as_ref()
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|| orch.config_dir.to_string_lossy().to_string());
+    let (env, cwd, temp_home, uses_codex_oauth) = match codex_usage_probe_env(orch) {
+        Ok(parts) => parts,
+        Err(err) => return ProviderUsageSnapshot::error("codex", "codex_rate_limits", err, None),
+    };
 
     let snapshot = (|| -> Result<ProviderUsageSnapshot, String> {
         let client = Arc::new(
@@ -79,48 +57,8 @@ pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapsho
         });
 
         let result = (|| -> Result<ProviderUsageSnapshot, String> {
-            client.send_request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "cairn",
-                        "title": "Cairn",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": {
-                        "experimentalApi": true,
-                    }
-                }),
-            )?;
-            client.send_notification("initialized", json!({}))?;
-
-            if env.contains_key("OPENAI_API_KEY") {
-                client.send_request(
-                    "account/login/start",
-                    json!({
-                        "type": "apiKey",
-                        "apiKey": env.get("OPENAI_API_KEY").cloned().unwrap_or_default(),
-                    }),
-                )?;
-            } else {
-                let _ = client.send_request("account/read", json!({ "refreshToken": true }));
-            }
-
-            let response = client.send_request("account/rateLimits/read", Value::Null)?;
-            let raw = response.get("rateLimits").cloned().unwrap_or(Value::Null);
-            // A malformed / missing rate-limit payload surfaces as a clean error
-            // snapshot rather than empty windows; the shared parser returns None
-            // when `usedPercent` is absent.
-            Ok(
-                codex_rate_limit_snapshot_from_value(raw.clone()).unwrap_or_else(|| {
-                    ProviderUsageSnapshot::error(
-                        "codex",
-                        "codex_rate_limits",
-                        "Codex returned no rate-limit data",
-                        Some(raw),
-                    )
-                }),
-            )
+            initialize_codex_usage_client(&client, &env)?;
+            read_codex_usage_snapshot(&client)
         })();
 
         stop_notifications.store(true, Ordering::Relaxed);
@@ -143,6 +81,136 @@ pub fn collect_codex_usage_snapshot(orch: &Orchestrator) -> ProviderUsageSnapsho
 
     snapshot
         .unwrap_or_else(|err| ProviderUsageSnapshot::error("codex", "codex_rate_limits", err, None))
+}
+
+pub fn consume_codex_usage_reset(orch: &Orchestrator) -> Result<ProviderUsageResetResult, String> {
+    let codex_path = find_binary("codex").map_err(|err| format!("Codex CLI not found: {err}"))?;
+    let (env, cwd, temp_home, uses_codex_oauth) = codex_usage_probe_env(orch)?;
+
+    let result = (|| -> Result<ProviderUsageResetResult, String> {
+        let client = Arc::new(
+            AppServerClient::spawn(orch.services.process.as_ref(), &codex_path, &env, &cwd)
+                .map_err(|e| format!("Failed to start Codex app-server: {e}"))?,
+        );
+        let stop_notifications = Arc::new(AtomicBool::new(false));
+        let notification_thread = uses_codex_oauth.then(|| {
+            spawn_codex_usage_refresh_handler(
+                (*orch).clone(),
+                Arc::clone(&client),
+                Arc::clone(&stop_notifications),
+            )
+        });
+
+        let result = (|| -> Result<ProviderUsageResetResult, String> {
+            initialize_codex_usage_client(&client, &env)?;
+            let consume = client.send_request(
+                "account/rateLimitResetCredit/consume",
+                json!({ "idempotencyKey": Uuid::new_v4().to_string() }),
+            )?;
+            let outcome = consume
+                .get("outcome")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let snapshot = read_codex_usage_snapshot(&client)?;
+            Ok(ProviderUsageResetResult { outcome, snapshot })
+        })();
+
+        stop_notifications.store(true, Ordering::Relaxed);
+        client.shutdown();
+        if let Some(handle) = notification_thread {
+            let _ = handle.join();
+        }
+
+        result
+    })();
+
+    if let Some(home) = temp_home {
+        let _ = fs::remove_dir_all(home);
+    }
+
+    result
+}
+
+fn codex_usage_probe_env(
+    orch: &Orchestrator,
+) -> Result<(HashMap<String, String>, String, Option<PathBuf>, bool), String> {
+    let mut env = HashMap::new();
+    let mut temp_home = None;
+    let mut uses_codex_oauth = false;
+    if let Some(identity) = orch.get_identity() {
+        match identity.codex_auth {
+            Some(CodexAuth::OAuthToken(auth_json)) => {
+                let home = prepare_codex_auth_home(&auth_json)?;
+                env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
+                temp_home = Some(home);
+                uses_codex_oauth = true;
+            }
+            Some(CodexAuth::ApiKey(key)) => {
+                env.insert("OPENAI_API_KEY".to_string(), key);
+            }
+            None => {}
+        }
+    }
+
+    let cwd = temp_home
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| orch.config_dir.to_string_lossy().to_string());
+    Ok((env, cwd, temp_home, uses_codex_oauth))
+}
+
+fn initialize_codex_usage_client(
+    client: &AppServerClient,
+    env: &HashMap<String, String>,
+) -> Result<(), String> {
+    client.send_request(
+        "initialize",
+        json!({
+            "clientInfo": {
+                "name": "cairn",
+                "title": "Cairn",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "experimentalApi": true,
+            }
+        }),
+    )?;
+    client.send_notification("initialized", json!({}))?;
+
+    if env.contains_key("OPENAI_API_KEY") {
+        client.send_request(
+            "account/login/start",
+            json!({
+                "type": "apiKey",
+                "apiKey": env.get("OPENAI_API_KEY").cloned().unwrap_or_default(),
+            }),
+        )?;
+    } else {
+        let _ = client.send_request("account/read", json!({ "refreshToken": true }));
+    }
+    Ok(())
+}
+
+fn read_codex_usage_snapshot(client: &AppServerClient) -> Result<ProviderUsageSnapshot, String> {
+    let response = client.send_request("account/rateLimits/read", Value::Null)?;
+    let mut raw = response.get("rateLimits").cloned().unwrap_or(Value::Null);
+    if let Some(reset_credits) = response.get("rateLimitResetCredits") {
+        if let Some(object) = raw.as_object_mut() {
+            object.insert("rateLimitResetCredits".to_string(), reset_credits.clone());
+        }
+    }
+    Ok(
+        codex_rate_limit_snapshot_from_value(raw.clone()).unwrap_or_else(|| {
+            ProviderUsageSnapshot::error(
+                "codex",
+                "codex_rate_limits",
+                "Codex returned no rate-limit data",
+                Some(raw),
+            )
+        }),
+    )
 }
 
 fn spawn_codex_usage_refresh_handler(
@@ -231,6 +299,13 @@ mod tests {
                 "totalGranted": 20.0,
                 "totalUsed": 7.5,
                 "currency": "USD"
+            },
+            "rateLimitResetCredits": {
+                "availableCount": 2,
+                "credits": [
+                    { "expiresAt": 1_700_086_400 },
+                    { "expiresAtText": "expires in 12 days" }
+                ]
             }
         }))
         .expect("snapshot present when usedPercent is set");
@@ -247,6 +322,13 @@ mod tests {
                 .as_ref()
                 .and_then(|credits| credits.balance),
             Some(12.5)
+        );
+        let reset_credits = snapshot.reset_credits.expect("reset credits parsed");
+        assert_eq!(reset_credits.available_count, 2);
+        assert_eq!(reset_credits.credits[0].expires_at, Some(1_700_086_400));
+        assert_eq!(
+            reset_credits.credits[1].expires_at_text.as_deref(),
+            Some("expires in 12 days")
         );
     }
 
