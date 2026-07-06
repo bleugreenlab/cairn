@@ -9,7 +9,9 @@ use crate::execution::check_parsers::{
     format_failure_excerpt, format_failure_names, ParsedCheckResult,
 };
 use crate::execution::checks::load_live_project_checks;
-use crate::execution::checks_turn_end::{read_turn_end_log_tail, resolve_job_coords};
+use crate::execution::checks_turn_end::{
+    read_turn_end_log_tail, resolve_job_coords, turn_end_check_started,
+};
 use crate::execution::selection::plan_checks;
 use crate::jj::{node_changed_files, sealed_tree_hash, JjEnv};
 use crate::orchestrator::Orchestrator;
@@ -77,11 +79,6 @@ pub async fn node_check_statuses(
         .collect();
 
     let in_flight = orch.turn_end_checks_in_flight(job_id);
-    let log_tail = if in_flight {
-        read_turn_end_log_tail(orch, job_id)
-    } else {
-        None
-    };
     let changed = worktree_path.as_deref().and_then(|path| {
         node_changed_files(
             &jj,
@@ -108,16 +105,40 @@ pub async fn node_check_statuses(
                     return status_from_row(&name, check.policy, check.when, row);
                 }
 
-                let state = if in_flight && check.when == CheckWhen::Review {
-                    NodeCheckState::Running
-                } else if plans_by_name
+                // A review check does not apply when the impact gate excluded it
+                // from this tree's plan; it will never run, so it is neither
+                // running nor pending.
+                let not_applicable = plans_by_name
                     .as_ref()
                     .and_then(|plans| plans.get(&name))
-                    .is_some_and(|plan| !plan.applies)
-                {
+                    .is_some_and(|plan| !plan.applies);
+
+                // Turn-end review checks run SEQUENTIALLY, each into its OWN log
+                // file created the instant it starts. Existence of that file — not a
+                // non-empty tail — is the RUNNING signal, so a silent-but-active
+                // check is not mistaken for a queued one; checks still behind the
+                // active one have no file yet and stay pending. The tail is read
+                // separately and is None while a running check has yet to emit.
+                let started = in_flight
+                    && check.when == CheckWhen::Review
+                    && !not_applicable
+                    && turn_end_check_started(orch, job_id, &name);
+
+                let state = if not_applicable {
                     NodeCheckState::NotApplicable
+                } else if started {
+                    NodeCheckState::Running
                 } else {
                     NodeCheckState::Pending
+                };
+
+                // Only the actively-running check carries a live tail (and it may
+                // still be None before its first line); pending and not-applicable
+                // rows have none.
+                let output_tail = if started {
+                    read_turn_end_log_tail(orch, job_id, &name)
+                } else {
+                    None
                 };
 
                 NodeCheckStatus {
@@ -132,11 +153,7 @@ pub async fn node_check_statuses(
                     failed: None,
                     skipped: None,
                     failure_names: Vec::new(),
-                    output_tail: if state == NodeCheckState::Running {
-                        log_tail.clone()
-                    } else {
-                        None
-                    },
+                    output_tail,
                 }
             })
             .collect(),

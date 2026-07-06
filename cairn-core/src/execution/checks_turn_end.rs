@@ -253,10 +253,12 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         changed.len()
     );
 
-    // 8. Prepare the host-readable, job-scoped log file (truncated for a fresh run)
-    // so the PR-node / `/checks` render can tail it live while checks run.
-    let log_path = turn_end_log_path(orch, job_id);
-    prepare_log(&log_path);
+    // 8. Prepare the host-readable, job-scoped log DIRECTORY (cleared for a fresh
+    // run) so the PR-node / `/checks` render can tail each check's OWN log live
+    // while the suite runs. One file per check keeps a running check's preview
+    // scoped to that check instead of the whole suite's interleaved output.
+    let log_dir = turn_end_log_dir(orch, job_id);
+    prepare_log_dir(&log_dir);
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
@@ -267,6 +269,19 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
     let mut verdicts: Vec<String> = Vec::with_capacity(to_run.len());
     for (index, (plan, input_hash)) in to_run.iter().enumerate() {
         let stream_id = format!("turn-checks:{job_id}:{index}");
+        let log_path = turn_end_log_path(orch, job_id, &plan.name);
+        // Create this check's log file BEFORE it runs so the status model reads it
+        // as RUNNING (file exists) the instant we announce it — even a check that
+        // is silent before its first line. Then emit a `db-change` so any live view
+        // refetches, sees this check flip to running, and (re)starts its poll of the
+        // growing tail. Without the up-front create the check would read as pending
+        // until its first byte; without the emit the poll would not restart in the
+        // gap after the previous check finished (no running check → poll stops).
+        let _ = std::fs::write(&log_path, b"");
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "check_result_cache", "action": "update"}),
+        );
         let started = Instant::now();
         let (exit_code, passed, output) =
             match crate::mcp::handlers::run::run_check_command_unsandboxed(
@@ -513,32 +528,76 @@ pub(crate) async fn resolve_job_coords(
     .map_err(|e| format!("failed to resolve job coords: {e}"))
 }
 
-/// The host-readable, job-scoped log file for a turn-end run. Lives under the app
-/// state dir (not the worktree) so it survives worktree teardown for the PR-node
-/// render.
-fn turn_end_log_path(orch: &Orchestrator, job_id: &str) -> PathBuf {
-    orch.config_dir
-        .join("turn-checks")
-        .join(format!("{job_id}.log"))
+/// The host-readable, job-scoped directory holding ONE live log file per check
+/// for a turn-end run. Lives under the app state dir (not the worktree) so it
+/// survives worktree teardown for the PR-node render.
+fn turn_end_log_dir(orch: &Orchestrator, job_id: &str) -> PathBuf {
+    orch.config_dir.join("turn-checks").join(job_id)
 }
 
-/// Create the log's parent dir and truncate the file so a fresh run starts clean.
-/// Best-effort: a failure here only costs the live tail, never the run.
-fn prepare_log(path: &Path) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::write(path, b"");
+/// The live log file for a SINGLE check within a job's turn-end run. Turn-end
+/// checks run sequentially and each tees into its own file, so the PR-node /
+/// `/checks` render can tail exactly that check's output instead of a shared blob
+/// that made every running check preview the same interleaved text.
+fn turn_end_log_path(orch: &Orchestrator, job_id: &str, check_name: &str) -> PathBuf {
+    turn_end_log_dir(orch, job_id).join(format!("{}.log", sanitize_log_name(check_name)))
 }
 
-/// Last `max_chars` chars of the job's log file, or `None` when it is missing/empty.
-pub(crate) fn read_turn_end_log_tail(orch: &Orchestrator, job_id: &str) -> Option<String> {
-    let content = std::fs::read_to_string(turn_end_log_path(orch, job_id)).ok()?;
+/// Slugify a check name into a filesystem-safe log filename stem: any character
+/// outside `[A-Za-z0-9._-]` becomes `_`. Real check names are already slugs, so
+/// this only guards against pathological config.
+fn sanitize_log_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Clear the job's per-check log directory so a fresh suite starts clean — a stale
+/// per-check log must not make a not-yet-started check look like it is running
+/// with old output. Best-effort: a failure here only costs the live tail, never
+/// the run.
+fn prepare_log_dir(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::create_dir_all(dir);
+}
+
+/// Whether a single check's per-check log file exists yet. The runner creates the
+/// file the instant a check starts — before any output — so existence marks the
+/// check as actively RUNNING even while it is still silent (e.g. `tsc --noEmit`
+/// before its first line). A queued check has no file after `prepare_log_dir`
+/// cleared the directory, so it reads as pending instead.
+pub(crate) fn turn_end_check_started(orch: &Orchestrator, job_id: &str, check_name: &str) -> bool {
+    turn_end_log_path(orch, job_id, check_name).exists()
+}
+
+/// Last `max_chars` chars of a single check's live log file, or `None` when it is
+/// missing/empty (that check exists but has not produced output yet). Existence is
+/// a SEPARATE signal ([`turn_end_check_started`]): a running-but-silent check has
+/// a file with no tail, so callers must not infer "queued" from a `None` tail.
+pub(crate) fn read_turn_end_log_tail(
+    orch: &Orchestrator,
+    job_id: &str,
+    check_name: &str,
+) -> Option<String> {
+    read_log_tail(&turn_end_log_path(orch, job_id, check_name), LOG_TAIL_CHARS)
+}
+
+/// Last `max_chars` chars of a log file at `path`, or `None` when it is missing or
+/// blank. Split from [`read_turn_end_log_tail`] so the missing/empty-vs-content
+/// boundary is unit-testable without an [`Orchestrator`].
+fn read_log_tail(path: &Path, max_chars: usize) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
     let trimmed = content.trim_end();
     if trimmed.is_empty() {
         return None;
     }
-    Some(tail(trimmed, LOG_TAIL_CHARS))
+    Some(tail(trimmed, max_chars))
 }
 
 /// Last `max_chars` characters of `s`, on a char boundary.
@@ -618,6 +677,40 @@ mod tests {
         .unwrap();
         assert!(s.contains("docs: not applicable"));
         assert!(s.contains("lint: pending"));
+    }
+
+    #[test]
+    fn empty_log_file_exists_but_yields_no_tail() {
+        // A running-but-silent check: the file exists (started) but its tail is
+        // None until it emits. The status model must key RUNNING off existence,
+        // not off a non-empty tail, or a quiet check looks queued.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("cairn-checks-tail-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frontend-build.log");
+
+        std::fs::write(&path, b"").unwrap();
+        assert!(path.exists());
+        assert_eq!(read_log_tail(&path, LOG_TAIL_CHARS), None);
+
+        std::fs::write(&path, b"compiling...\n").unwrap();
+        assert_eq!(
+            read_log_tail(&path, LOG_TAIL_CHARS).as_deref(),
+            Some("compiling...")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_log_name_slugs_unsafe_chars() {
+        assert_eq!(sanitize_log_name("frontend-build"), "frontend-build");
+        assert_eq!(sanitize_log_name("rust_full.v2"), "rust_full.v2");
+        assert_eq!(sanitize_log_name("weird/name space"), "weird_name_space");
     }
 
     #[test]
