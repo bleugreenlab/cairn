@@ -186,6 +186,15 @@ pub(super) async fn resolve_job_inputs_conn(
             continue;
         }
 
+        // An Instruction node's content is injected into the running node's
+        // SYSTEM PROMPT (resolve_instruction_prompt_conn), never delivered as a
+        // job input. It runs no job, so skip it explicitly rather than falling
+        // through to a doomed live-job load that would log a spurious "source job
+        // not found" warning on every resolve.
+        if source_node.node_type == "instruction" {
+            continue;
+        }
+
         let Some(source_job) = crate::db_records::load_live_job_by_execution_node_conn(
             conn,
             execution_id,
@@ -707,6 +716,114 @@ pub(crate) fn resolve_ctx_self_schemas_with_snapshot(
         .collect()
 }
 
+/// Derive whether an agent node is "long-running" — settles `Idle` at clean
+/// turn-end instead of `Complete` — from the execution's recipe topology, not
+/// from any node flag. A node is long-running iff ALL hold:
+///   (a) it declares no resolvable output contract (`requires_output == false`,
+///       the caller's already-computed fact — its own schema or one inherited via
+///       a context-out edge);
+///   (b) it has no outgoing control edge (it is a control-terminal); and
+///   (c) the recipe contains no terminal action node — no `pr` node and no
+///       `action` node anywhere.
+///
+/// Intuitively: a standing recipe is one whose shape has no terminal action, so
+/// its final contract-less control-terminal agent keeps taking wakes instead of
+/// completing. This is the single source of the `long_running` fact — both the
+/// completion projection (fact gathering in `execution::advancement::recompute`)
+/// and coordinator prompt-mode resolution call it, so the rule lives in exactly
+/// one place. Non-agent nodes never qualify.
+pub(crate) fn is_long_running_node(
+    snapshot: &ExecutionSnapshot,
+    node_id: &str,
+    requires_output: bool,
+) -> bool {
+    // Only an agent node with no output contract can stand idle; trigger,
+    // artifact, and action/pr nodes always complete to advance the DAG.
+    let Some(node) = snapshot.recipe.nodes.iter().find(|n| n.id == node_id) else {
+        return false;
+    };
+    if node.agent_config.is_none() || requires_output {
+        return false;
+    }
+    // (b) A control-terminal has no outgoing control edge — nothing downstream
+    // depends on it completing.
+    let has_outgoing_control = snapshot.recipe.edges.iter().any(|edge| {
+        edge.edge_type == crate::models::RecipeEdgeType::Control && edge.source_node_id == node_id
+    });
+    if has_outgoing_control {
+        return false;
+    }
+    // (c) A recipe with any terminal action node (`pr` or `action`) is a shipping
+    // recipe, not a standing one, so no node in it stands idle.
+    !snapshot.recipe.nodes.iter().any(|n| {
+        matches!(
+            n.node_type,
+            crate::models::RecipeNodeType::Pr | crate::models::RecipeNodeType::Action
+        )
+    })
+}
+
+/// Assemble the system-prompt instruction text a running node inherits from its
+/// upstream Instruction nodes. Loads the execution snapshot and delegates to
+/// [`instruction_prompt_from_snapshot`] for the selection and ordering rules.
+/// Returns an empty string when the node has no upstream Instruction node, so
+/// injection is purely additive.
+pub(crate) async fn resolve_instruction_prompt_conn(
+    conn: &cairn_db::turso::Connection,
+    node_id: &str,
+    execution_id: &str,
+) -> DbResult<String> {
+    let snapshot = require_execution_snapshot_conn(conn, execution_id).await?;
+    Ok(instruction_prompt_from_snapshot(&snapshot, node_id))
+}
+
+/// Join the content of every Instruction node whose `context-out` feeds
+/// `node_id` via a context edge, in a deterministic top-to-bottom layout order
+/// (source `position.y`, then `position.x`, then edge index) so a recipe
+/// author's arrangement composes predictably. Multiple Instruction nodes join
+/// with a blank line. Only `Instruction` sources contribute — a `Context` node,
+/// whose content is a work packet delivered to the initial user message rather
+/// than framing, is deliberately ignored — so the result is empty for any
+/// recipe with no Instruction node.
+pub(crate) fn instruction_prompt_from_snapshot(
+    snapshot: &ExecutionSnapshot,
+    node_id: &str,
+) -> String {
+    let mut matched: Vec<(f32, f32, usize, &str)> = Vec::new();
+    for (idx, edge) in snapshot.recipe.edges.iter().enumerate() {
+        if edge.edge_type != crate::models::RecipeEdgeType::Context
+            || edge.target_node_id != node_id
+        {
+            continue;
+        }
+        let Some(source) = snapshot
+            .recipe
+            .nodes
+            .iter()
+            .find(|n| n.id == edge.source_node_id)
+        else {
+            continue;
+        };
+        if source.node_type != crate::models::RecipeNodeType::Instruction {
+            continue;
+        }
+        if let Some(content) = source.context_config.as_ref().map(|c| c.content.as_str()) {
+            matched.push((source.position.y, source.position.x, idx, content));
+        }
+    }
+    matched.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.cmp(&b.2))
+    });
+    matched
+        .iter()
+        .map(|(_, _, _, content)| *content)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 pub(super) async fn load_action_config_schema_conn(
     conn: &cairn_db::turso::Connection,
     action_config_id: &str,
@@ -763,9 +880,9 @@ pub(super) fn extract_schema_from_slot_config(
 mod port_model_tests {
     use super::*;
     use crate::models::{
-        ActionNodeConfig, AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, NodePosition,
-        RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger,
-        SchemaConfig, TriggerContext, TriggerType,
+        ActionNodeConfig, AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, ContextNodeConfig,
+        NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
+        RecipeTrigger, SchemaConfig, TriggerContext, TriggerType,
     };
     use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
     use std::collections::HashMap;
@@ -885,6 +1002,89 @@ mod port_model_tests {
             delegated_packets: vec![],
             created_at: 1,
         }
+    }
+
+    fn instruction_node(id: &str, content: &str, x: f32, y: f32) -> RecipeNode {
+        RecipeNode {
+            id: id.to_string(),
+            node_type: RecipeNodeType::Instruction,
+            name: id.to_string(),
+            position: NodePosition { x, y },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: Some(ContextNodeConfig {
+                content: content.to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn instruction_prompt_reads_single_upstream_node() {
+        // An Instruction node wired context-out -> agent context-in contributes
+        // its content to that agent's system-prompt instruction text.
+        let snap = snapshot(
+            vec![
+                agent("coordinator"),
+                instruction_node("i1", "framing", 0.0, 0.0),
+            ],
+            vec![ctx_edge(
+                "e1",
+                "i1",
+                "context-out",
+                "coordinator",
+                "context-in",
+            )],
+        );
+        assert_eq!(
+            instruction_prompt_from_snapshot(&snap, "coordinator"),
+            "framing"
+        );
+    }
+
+    #[test]
+    fn instruction_prompt_composes_in_layout_order() {
+        // Two Instruction nodes both feed the agent; they compose top-to-bottom
+        // by source (y, x), joined with a blank line — independent of edge order.
+        let snap = snapshot(
+            vec![
+                agent("coordinator"),
+                instruction_node("lower", "second", 0.0, 100.0),
+                instruction_node("upper", "first", 0.0, 10.0),
+            ],
+            vec![
+                ctx_edge("e1", "lower", "context-out", "coordinator", "context-in"),
+                ctx_edge("e2", "upper", "context-out", "coordinator", "context-in"),
+            ],
+        );
+        assert_eq!(
+            instruction_prompt_from_snapshot(&snap, "coordinator"),
+            "first\n\nsecond"
+        );
+    }
+
+    #[test]
+    fn instruction_prompt_empty_without_instruction_edge() {
+        // A recipe with no Instruction node yields the bare role prompt: a
+        // Context node feeding the agent is deliberately NOT treated as framing.
+        let snap = snapshot(
+            vec![
+                agent("coordinator"),
+                artifact_node("a", "plan", ConfirmPolicy::Auto),
+            ],
+            vec![ctx_edge(
+                "e1",
+                "a",
+                "context-out",
+                "coordinator",
+                "context-in",
+            )],
+        );
+        assert_eq!(instruction_prompt_from_snapshot(&snap, "coordinator"), "");
     }
 
     async fn test_db() -> LocalDb {

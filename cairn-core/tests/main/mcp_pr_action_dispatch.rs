@@ -61,7 +61,12 @@ async fn insert_merge_request(db: &LocalDb, project_id: &str, issue_id: &str) {
     .unwrap();
 }
 
-async fn change(orch: &Orchestrator, payload: serde_json::Value, preview: bool) -> String {
+async fn change_target(
+    orch: &Orchestrator,
+    target: &str,
+    payload: serde_json::Value,
+    preview: bool,
+) -> String {
     let request = McpCallbackRequest {
         cwd: std::env::temp_dir().to_string_lossy().to_string(),
         run_id: None,
@@ -69,7 +74,7 @@ async fn change(orch: &Orchestrator, payload: serde_json::Value, preview: bool) 
         payload: json!({
             "preview": preview,
             "changes": [{
-                "target": "cairn://p/PRA/1/1/builder/pr",
+                "target": target,
                 "mode": "patch",
                 "payload": payload
             }]
@@ -77,6 +82,27 @@ async fn change(orch: &Orchestrator, payload: serde_json::Value, preview: bool) 
         tool_use_id: None,
     };
     handle_write(orch, &request).await
+}
+
+/// Target the builder node's `pr` artifact (the NodeArtifact patch arm).
+async fn change(orch: &Orchestrator, payload: serde_json::Value, preview: bool) -> String {
+    change_target(orch, "cairn://p/PRA/1/1/builder/pr", payload, preview).await
+}
+
+/// Seed a first-class `pr` action node: an action_run with `uri_segment = 'pr'`
+/// whose `parent_job_id` is the builder job that owns the `merge_requests` row.
+async fn insert_pr_action_run(db: &LocalDb, project_id: &str, issue_id: &str) {
+    let project_id = project_id.to_string();
+    let issue_id = issue_id.to_string();
+    db.execute(
+        "INSERT INTO action_runs (
+            id, execution_id, recipe_node_id, action_config_id, issue_id, project_id,
+            status, created_at, parent_job_id, uri_segment
+         ) VALUES ('pr-action-run', 'exec-1', 'pr', 'builtin:pr', ?1, ?2, 'blocked', 2, 'job-builder', 'pr')",
+        params![issue_id.as_str(), project_id.as_str()],
+    )
+    .await
+    .unwrap();
 }
 
 async fn pr_action_node_fixture() -> (tempfile::TempDir, Arc<LocalDb>, String, String) {
@@ -128,6 +154,42 @@ async fn merge_action_dry_run_routes_to_merge() {
     assert!(
         result.contains("Would merge PR") && result.contains("method=rebase"),
         "expected merge dry-run summary, got: {result}"
+    );
+}
+
+/// The reported repro: the bare `pr` node arm (`nodes.rs`) resolves the `pr`
+/// node to its action_run, whose `parent_job_id` owns the builder-job-keyed
+/// `merge_requests` row. Before the shared resolver walked `parent_job_id`, this
+/// returned `has no PR yet`. The builder re-writing its create-pr artifact
+/// (title/body only, never `job_id`) is simulated first as a guard that it does
+/// not affect resolution.
+#[tokio::test]
+async fn pr_node_merge_resolves_through_parent_job() {
+    let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
+    insert_merge_request(&db, &project_id, &issue_id).await;
+    insert_pr_action_run(&db, &project_id, &issue_id).await;
+
+    // Simulate the builder re-writing its create-pr artifact: a title/body edit
+    // that never re-keys `job_id`. The pr-node merge must still resolve the row.
+    db.execute(
+        "UPDATE merge_requests SET title = 'Re-written', body = 'Re-written body' WHERE id = 'mr-1'",
+        (),
+    )
+    .await
+    .unwrap();
+
+    let orch = orchestrator(&temp, db);
+
+    let result = change_target(
+        &orch,
+        "cairn://p/PRA/1/1/pr",
+        json!({ "action": "merge", "method": "squash" }),
+        true,
+    )
+    .await;
+    assert!(
+        result.contains("Would merge PR") && !result.contains("has no PR yet"),
+        "expected the pr-node merge to resolve the parent-job-owned MR, got: {result}"
     );
 }
 

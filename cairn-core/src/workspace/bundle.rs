@@ -11,11 +11,29 @@ use super::repo::ensure_workspace_repo;
 const DEFAULT_BRANCH: &str = "main";
 const BUNDLE_SYNC_MARKER: &str = ".bundle-sync";
 
+/// Commit subjects the bundle sync itself authors. A bundled file whose most
+/// recent commit carries one of these has not been edited by the user since it
+/// was last shipped, so it is safe to overwrite in place when the bundle updates
+/// it. Any other last commit (a snapshotted user edit or an external commit)
+/// marks the file user-owned, and it is preserved. The list includes the two
+/// historical bundle-commit subjects so files shipped by earlier versions are
+/// still recognized as bundle-owned after an upgrade.
+const BUNDLE_COMMIT_SUBJECTS: &[&str] = &[
+    "Initialize Cairn workspace config",
+    "Add missing bundled workspace defaults",
+    "Sync bundled workspace defaults",
+];
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BundleSyncResult {
     pub updated: bool,
     pub skipped_conflicts: Vec<String>,
+}
+
+struct SyncOutcome {
+    changed: bool,
+    skipped_conflicts: Vec<String>,
 }
 
 pub fn sync_workspace_bundle(
@@ -32,53 +50,87 @@ pub fn sync_workspace_bundle(
     let repo_exists = git.is_repo(config_dir)?;
 
     if !repo_exists {
-        copy_missing_bundle_resources(fs, resource_dir, config_dir)?;
+        // Fresh install: no history to consult, so only copy missing files.
+        let outcome = sync_bundle_resources(git, fs, resource_dir, config_dir, false)?;
         ensure_workspace_repo(git, fs, config_dir, DEFAULT_BRANCH)?;
         write_marker(fs, &marker_path, &bundle_hash)?;
         return Ok(BundleSyncResult {
             updated: true,
-            skipped_conflicts: Vec::new(),
+            skipped_conflicts: outcome.skipped_conflicts,
         });
     }
 
     ensure_workspace_repo(git, fs, config_dir, DEFAULT_BRANCH)?;
 
     if git.root_commit(config_dir, DEFAULT_BRANCH).is_err() {
-        copy_missing_bundle_resources(fs, resource_dir, config_dir)?;
+        // Repo exists but has no commits yet: nothing to diff against, copy missing.
+        let outcome = sync_bundle_resources(git, fs, resource_dir, config_dir, false)?;
         git.add_all(config_dir)?;
         git.commit(config_dir, "Initialize Cairn workspace config")?;
         write_marker(fs, &marker_path, &bundle_hash)?;
         return Ok(BundleSyncResult {
             updated: true,
-            skipped_conflicts: Vec::new(),
+            skipped_conflicts: outcome.skipped_conflicts,
         });
     }
 
     let marker_was_current = marker_matches(fs, &marker_path, &bundle_hash);
-    let copied = copy_missing_bundle_resources(fs, resource_dir, config_dir)?;
-    if marker_was_current && !copied {
-        return Ok(BundleSyncResult::default());
+
+    if !marker_was_current {
+        // The bundle content changed since the last sync, so an in-place update
+        // may overwrite bundled files. Snapshot any uncommitted user edits first
+        // so an overwrite can never lose unsaved work, and so an edited file is
+        // committed under a non-bundle subject that marks it user-owned.
+        snapshot_pending_user_edits(git, config_dir)?;
     }
 
-    snapshot_pending_user_edits(git, config_dir)?;
-    if copied {
-        git.add_all(config_dir)?;
-        git.commit(config_dir, "Add missing bundled workspace defaults")?;
+    // Only diff/update existing bundled files when the bundle actually changed;
+    // otherwise just restore any that went missing (cheap, non-destructive).
+    let outcome = sync_bundle_resources(git, fs, resource_dir, config_dir, !marker_was_current)?;
+
+    if !outcome.changed {
+        if !marker_was_current {
+            // Bundle changed but every difference was a user-owned file we left
+            // alone; refresh the marker so we don't rescan on every startup.
+            write_marker(fs, &marker_path, &bundle_hash)?;
+        }
+        return Ok(BundleSyncResult {
+            updated: false,
+            skipped_conflicts: outcome.skipped_conflicts,
+        });
     }
+
+    if marker_was_current {
+        // Only copy-missing restore could have run; snapshot user edits before
+        // committing so they land as their own commit rather than the bundle's.
+        snapshot_pending_user_edits(git, config_dir)?;
+    }
+    git.add_all(config_dir)?;
+    git.commit(config_dir, "Sync bundled workspace defaults")?;
 
     write_marker(fs, &marker_path, &bundle_hash)?;
     Ok(BundleSyncResult {
-        updated: copied,
-        skipped_conflicts: Vec::new(),
+        updated: true,
+        skipped_conflicts: outcome.skipped_conflicts,
     })
 }
 
-fn copy_missing_bundle_resources(
+/// Copy bundled resources into the workspace config tree. Always copies files
+/// whose destination is missing. When `allow_update` is set (an established repo
+/// whose bundle content changed), a bundled file whose content differs from the
+/// shipped source is overwritten **only if it is still bundle-owned** (see
+/// `bundled_file_is_user_owned`); a user-customized file is left untouched and
+/// reported as a skipped conflict. Skill packages are multi-file directories and
+/// are only ever copy-when-missing.
+fn sync_bundle_resources(
+    git: &dyn GitClient,
     fs: &dyn FileSystem,
     resource_dir: &Path,
     target_dir: &Path,
-) -> Result<bool, String> {
-    let mut copied_any = false;
+    allow_update: bool,
+) -> Result<SyncOutcome, String> {
+    let mut changed = false;
+    let mut skipped_conflicts = Vec::new();
 
     for dir_name in BUNDLE_RESOURCE_DIRS {
         let source_dir = resource_dir.join(dir_name);
@@ -108,24 +160,83 @@ fn copy_missing_bundle_resources(
         for entry in entries {
             let source = entry.path();
             let file_name = entry.file_name();
-            let dest = dest_dir.join(file_name);
+            let dest = dest_dir.join(&file_name);
 
             if dir_name == "skills" {
+                // Skill packages are versioned directory trees; in-place update of
+                // a multi-file package is out of scope, so copy only when missing.
                 if source.is_dir() && source.join("SKILL.md").exists() && !fs.exists(&dest) {
                     fs.copy_dir_recursive(&source, &dest)?;
-                    copied_any = true;
+                    changed = true;
                 }
-            } else if source.is_file()
-                && bundled_file_matches_dir(dir_name, &source)
-                && !fs.exists(&dest)
-            {
+                continue;
+            }
+
+            if !(source.is_file() && bundled_file_matches_dir(dir_name, &source)) {
+                continue;
+            }
+
+            if !fs.exists(&dest) {
                 fs.copy_file(&source, &dest)?;
-                copied_any = true;
+                changed = true;
+                continue;
+            }
+
+            if !allow_update {
+                continue;
+            }
+
+            // Dest exists and the bundle changed. Overwrite only an unmodified
+            // (bundle-owned) file whose content actually differs from the source.
+            let source_content = fs.read_to_string(&source)?;
+            let dest_content = fs.read_to_string(&dest)?;
+            if source_content == dest_content {
+                continue;
+            }
+
+            let rel_path = format!("{dir_name}/{}", file_name.to_string_lossy());
+            if bundled_file_is_user_owned(git, target_dir, &rel_path)? {
+                skipped_conflicts.push(rel_path);
+            } else {
+                fs.copy_file(&source, &dest)?;
+                changed = true;
             }
         }
     }
 
-    Ok(copied_any)
+    Ok(SyncOutcome {
+        changed,
+        skipped_conflicts,
+    })
+}
+
+/// Whether a tracked bundled file has been edited by the user since it was last
+/// shipped. True when the most recent commit touching `rel_path` carries a
+/// subject the bundle sync did not author. An untracked file (no commit history)
+/// or an unreadable log is treated as user-owned so local work is never lost.
+fn bundled_file_is_user_owned(
+    git: &dyn GitClient,
+    config_dir: &Path,
+    rel_path: &str,
+) -> Result<bool, String> {
+    let output = git.run(
+        config_dir,
+        vec![
+            "log".to_string(),
+            "-1".to_string(),
+            "--format=%s".to_string(),
+            "--".to_string(),
+            rel_path.to_string(),
+        ],
+    )?;
+    if !output.success {
+        return Ok(true);
+    }
+    let subject = output.stdout.trim();
+    if subject.is_empty() {
+        return Ok(true);
+    }
+    Ok(!BUNDLE_COMMIT_SUBJECTS.contains(&subject))
 }
 
 fn bundled_file_matches_dir(dir_name: &str, path: &Path) -> bool {
@@ -278,6 +389,8 @@ mod tests {
         git.expect_root_commit()
             .with(eq(repo), eq(DEFAULT_BRANCH))
             .returning(|_, _| Ok("root".to_string()));
+        // A current marker with nothing missing short-circuits before any status,
+        // snapshot, or update scan.
         git.expect_status().times(0);
 
         let result =
@@ -286,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_install_copies_missing_bundled_files_without_merge_branch() {
+    fn existing_install_copies_missing_bundled_files() {
         let repo = Path::new("/home/user/.cairn");
         let temp = TempDir::new().unwrap();
         let resources = temp.path().join("resources");
@@ -315,8 +428,7 @@ mod tests {
         git.expect_add_all().with(eq(repo)).returning(|_| Ok(()));
         git.expect_commit()
             .withf(|path, msg| {
-                path == Path::new("/home/user/.cairn")
-                    && msg == "Add missing bundled workspace defaults"
+                path == Path::new("/home/user/.cairn") && msg == "Sync bundled workspace defaults"
             })
             .returning(|_, _| Ok(()));
 
@@ -326,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn real_temp_repo_adds_missing_bundles_without_touching_existing_files() {
+    fn real_temp_repo_adds_missing_bundles_and_preserves_user_edits() {
         use crate::services::{RealFileSystem, RealGitClient};
 
         let temp = TempDir::new().unwrap();
@@ -345,14 +457,53 @@ mod tests {
         git.commit(&repo, "User edits explore").unwrap();
 
         let result = sync_workspace_bundle(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
+        // The user-edited file is preserved and surfaced as a skipped conflict
+        // even though the bundle shipped a new version of it.
         assert_eq!(
             std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
             "user edit\n"
         );
+        assert_eq!(
+            result.skipped_conflicts,
+            vec!["agents/explore.md".to_string()]
+        );
+        // Genuinely new bundled resources are still installed.
         assert!(repo.join("agents/new-agent.md").exists());
         assert!(repo.join("recipes/memory-triage.yaml").exists());
         assert!(repo.join("skills/example/SKILL.md").exists());
+    }
+
+    #[test]
+    fn changed_bundle_file_propagates_to_unmodified_install() {
+        use crate::services::{RealFileSystem, RealGitClient};
+
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources_a = temp.path().join("resources-a");
+        let resources_b = temp.path().join("resources-b");
+        write_resources_a(&resources_a);
+        write_resources_b(&resources_b);
+
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+        sync_workspace_bundle(&git, &fs, &resources_a, &repo, "1.0.0").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
+            "bundle a\n"
+        );
+
+        // The user never touched explore.md, so the bundle's new version of it
+        // must reach this install on upgrade.
+        let result = sync_workspace_bundle(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
+        assert!(result.updated);
         assert!(result.skipped_conflicts.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
+            "bundle b\n"
+        );
+        // A repeated sync of the same bundle is a no-op (marker is current).
+        let again = sync_workspace_bundle(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
+        assert!(!again.updated);
     }
 
     #[test]

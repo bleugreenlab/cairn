@@ -227,6 +227,18 @@ async fn issue_progress_attention(
         > 0
     {
         IssueAttention::NeedsApproval
+    } else if issue_count(
+        conn,
+        issue_id,
+        // A long-running agent node resting Idle keeps the issue in `waiting`
+        // (awaiting a wake, not a human decision). Ranked below the
+        // human-decision attentions so a real prompt/permission/approval wins.
+        "SELECT COUNT(*) FROM jobs WHERE issue_id = ?1 AND status = 'idle'",
+    )
+    .await?
+        > 0
+    {
+        IssueAttention::Idle
     } else {
         IssueAttention::None
     };
@@ -315,6 +327,42 @@ mod tests {
         assert_eq!(
             issue_status_attention(&db).await,
             ("waiting".to_string(), "needs_approval".to_string())
+        );
+    }
+
+    async fn seed_issue_with_idle_job(db: &LocalDb) {
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at)
+              VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('i', 'p', 1, 'Issue', 'active', 'active', 'none', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e', 'recipe', 'i', 'p', 'running', 1, 1);
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+              VALUES('j', 'e', 'i', 'p', 'idle', 'coordinator', 'coordinator', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_job_holds_issue_waiting_with_idle_attention() {
+        // A long-running coordinator resting Idle keeps its issue in `waiting`
+        // with the dedicated `idle` attention — non-terminal, resumable.
+        let db = migrated_db().await;
+        seed_issue_with_idle_job(&db).await;
+
+        db.write(|conn| Box::pin(async move { recompute_issue_status_conn(conn, "i").await }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issue_status_attention(&db).await,
+            ("waiting".to_string(), "idle".to_string())
         );
     }
 

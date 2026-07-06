@@ -630,6 +630,38 @@ impl RecipeFile {
             }
         }
 
+        // An Instruction node injects its content into a consuming AGENT's system
+        // prompt (`resolve_instruction_prompt_conn`). Structurally it may only wire
+        // `context-out -> agent@context-in`; any other target (a PR, action,
+        // artifact, or another producer) silently drops the text at runtime. This
+        // node exists precisely to make recipe prose a validated structure rather
+        // than a magic prompt marker, so reject the mis-wire at authoring time.
+        {
+            let node_type_by_id: HashMap<&str, RecipeNodeType> = self
+                .nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.node_type.clone()))
+                .collect();
+            for edge in &self.edges {
+                let (source_node, source_handle) = parse_node_handle(&edge.from);
+                if node_type_by_id.get(source_node) != Some(&RecipeNodeType::Instruction) {
+                    continue;
+                }
+                let (target_node, target_handle) = parse_node_handle(&edge.to);
+                let target_is_agent =
+                    node_type_by_id.get(target_node) == Some(&RecipeNodeType::Agent);
+                if source_handle != Some("context-out")
+                    || !target_is_agent
+                    || target_handle != Some("context-in")
+                {
+                    errors.push(format!(
+                        "Instruction node '{}' must connect context-out -> an agent's context-in; its content is injected into that agent's system prompt and is dropped on any other target",
+                        source_node
+                    ));
+                }
+            }
+        }
+
         RecipeFileValidation {
             valid: errors.is_empty(),
             warnings,
@@ -659,10 +691,14 @@ impl RecipeFileNode {
         {
             // Only create agent config for agent nodes
             if self.node_type == RecipeNodeType::Agent {
-                // Build git_config if worktree_mode is specified
-                let git_config = config.worktree_mode.clone().map(|mode| AgentGitConfig {
-                    worktree_mode: mode,
-                });
+                // Build git_config when worktree_mode is specified
+                let git_config = if config.worktree_mode.is_some() {
+                    Some(AgentGitConfig {
+                        worktree_mode: config.worktree_mode.clone().unwrap_or_default(),
+                    })
+                } else {
+                    None
+                };
                 Some(AgentNodeConfig {
                     agent_config_id: config.agent,
                     output_schema: config.output_schema.clone(),
@@ -726,9 +762,14 @@ impl RecipeFileNode {
             None
         };
 
-        // Legacy Context node config (kept for old-snapshot tolerance; new
-        // recipes carry literal content on an ArtifactNode instead).
-        let context_config = if self.node_type == RecipeNodeType::Context {
+        // Context/Instruction node config: both carry a `{ content }` text block
+        // under `config.content`. Context feeds the initial user message (legacy;
+        // new recipes carry literal content on an ArtifactNode instead), while an
+        // Instruction node's content is injected into the system prompt.
+        let context_config = if matches!(
+            self.node_type,
+            RecipeNodeType::Context | RecipeNodeType::Instruction
+        ) {
             config
                 .content
                 .clone()
@@ -1316,6 +1357,86 @@ edges: []
         );
     }
 
+    #[test]
+    fn test_instruction_node_roundtrip() {
+        // An Instruction node reuses `context_config` for its `{ content }` block
+        // and must survive the RecipeFile YAML round-trip with both its content
+        // and its `Instruction` node_type intact (distinct from a Context node).
+        let recipe = Recipe {
+            id: "test-recipe".to_string(),
+            name: "Instruction Test".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![
+                RecipeNode {
+                    id: "trigger-1".to_string(),
+                    node_type: RecipeNodeType::Trigger,
+                    name: "Start".to_string(),
+                    position: NodePosition { x: 0.0, y: 0.0 },
+                    parent_id: None,
+                    trigger_config: Some(TriggerConfig {
+                        trigger_type: RecipeTrigger::Manual,
+                        scope: Some(TriggerScope::Issue),
+                        schedule_config: None,
+                        event_filter: None,
+                    }),
+                    agent_config: None,
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: None,
+                },
+                RecipeNode {
+                    id: "instructions-1".to_string(),
+                    node_type: RecipeNodeType::Instruction,
+                    name: "Framing".to_string(),
+                    position: NodePosition { x: 20.0, y: 260.0 },
+                    parent_id: None,
+                    trigger_config: None,
+                    agent_config: None,
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: Some(ContextNodeConfig {
+                        content: "You drive one feature.\n\n**Finish** when whole.".to_string(),
+                    }),
+                },
+            ],
+            edges: vec![],
+            created_at: 1000000,
+            updated_at: 1000000,
+        };
+
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(yaml.contains("You drive one feature"));
+
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+
+        let instruction_node = imported
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Instruction)
+            .expect("Instruction node should survive with its node_type");
+        let context_config = instruction_node
+            .context_config
+            .as_ref()
+            .expect("Instruction config should exist");
+        assert_eq!(
+            context_config.content,
+            "You drive one feature.\n\n**Finish** when whole."
+        );
+    }
+
     // =========================================================================
     // Accumulation validation tests
     // =========================================================================
@@ -1458,6 +1579,10 @@ edges: []
                 include_str!("../../../../recipes/coordinator.yaml"),
             ),
             (
+                "main-coordinator",
+                include_str!("../../../../recipes/main-coordinator.yaml"),
+            ),
+            (
                 "task-list",
                 include_str!("../../../../recipes/task-list.yaml"),
             ),
@@ -1477,6 +1602,151 @@ edges: []
                 validation.errors
             );
         }
+    }
+
+    #[test]
+    fn instruction_edge_to_non_agent_fails_validation() {
+        // An Instruction node wired to a non-agent target (here a PR node) drops
+        // its text at runtime, so validation must reject it. The bundled
+        // Feature/Manager recipes, whose Instruction edges target the coordinator
+        // agent's context-in, still pass (bundled_recipes_parse_and_validate).
+        let yaml = r#"
+cairnVersion: 1
+name: Bad Instruction
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+- id: agent-1
+  type: agent
+  name: Agent
+  position: 0@100
+  config:
+    agent: builder
+- id: pr-1
+  type: pr
+  name: PR
+  position: 0@200
+  config:
+    actionParams: {}
+- id: instructions-1
+  type: instruction
+  name: Framing
+  position: 200@100
+  config:
+    content: hello
+edges:
+- from: trigger-1@control-out
+  to: agent-1@control-in
+  type: control
+- from: instructions-1@context-out
+  to: pr-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).unwrap().validate();
+        assert!(!validation.valid, "Instruction -> PR must be rejected");
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|e| e.contains("Instruction node")),
+            "errors: {:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn instruction_edge_to_agent_context_in_validates() {
+        // The supported wiring: Instruction context-out -> agent context-in.
+        let yaml = r#"
+cairnVersion: 1
+name: Good Instruction
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+- id: agent-1
+  type: agent
+  name: Agent
+  position: 0@100
+  config:
+    agent: builder
+- id: instructions-1
+  type: instruction
+  name: Framing
+  position: 200@100
+  config:
+    content: hello
+edges:
+- from: trigger-1@control-out
+  to: agent-1@control-in
+  type: control
+- from: instructions-1@context-out
+  to: agent-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).unwrap().validate();
+        assert!(validation.valid, "errors: {:?}", validation.errors);
+    }
+
+    #[test]
+    fn coordinator_recipes_carry_mode_specific_instruction_framing() {
+        // The retired coordinator.md mode-blocks now live on each recipe's
+        // Instruction node, injected into the coordinator's system prompt. Feature
+        // framing speaks of the integration branch and never of the standing/idle
+        // endpoint; Manager framing is the inverse. This is the recipe-data-layer
+        // replacement for the deleted `coordinator_md_modes_do_not_blend`
+        // prompt-assembly test: separation is now guaranteed by the two recipes
+        // carrying different Instruction content, not by marker resolution.
+        fn instruction_content(yaml: &str) -> String {
+            let recipe = RecipeFile::from_yaml(yaml)
+                .unwrap()
+                .into_recipe(Some("default".to_string()), None);
+            recipe
+                .nodes
+                .iter()
+                .find(|n| n.node_type == RecipeNodeType::Instruction)
+                .and_then(|n| n.context_config.as_ref())
+                .map(|c| c.content.clone())
+                .expect("recipe carries an Instruction node with content")
+        }
+
+        let feature = instruction_content(include_str!("../../../../recipes/coordinator.yaml"));
+        assert!(
+            feature.contains("integration branch"),
+            "Feature framing keeps the integration-branch endpoint"
+        );
+        assert!(
+            !feature.contains("closes your issue"),
+            "Feature framing drops the standing close condition"
+        );
+        assert!(
+            !feature.contains("settle idle"),
+            "Feature framing drops the idle framing"
+        );
+
+        let manager =
+            instruction_content(include_str!("../../../../recipes/main-coordinator.yaml"));
+        assert!(
+            manager.contains("closes your issue"),
+            "Manager framing keeps the user-closes-issue endpoint"
+        );
+        assert!(
+            manager.contains("settle idle"),
+            "Manager framing keeps the idle framing"
+        );
+        assert!(
+            !manager.contains("integration branch"),
+            "Manager framing drops the feature-only integration-branch endpoint"
+        );
     }
 
     #[test]
@@ -1706,6 +1976,74 @@ edges:
             assert_eq!(input.name, "create-pr");
             assert_eq!(input.confirm_policy, crate::models::ConfirmPolicy::Auto);
         }
+    }
+
+    #[test]
+    fn main_coordinator_is_long_running_by_topology() {
+        // The standing main-coordinator has the exact topology the long-running
+        // derivation keys on (no node flag): no terminal action node, and a
+        // contract-less, control-terminal coordinator node. Children land their
+        // own PRs into the default branch, so the coordinator ships no PR of its
+        // own and never completes — it settles idle until the user closes the
+        // issue. cairn-db can't reach the cairn-core `is_long_running_node`
+        // helper, so this asserts the topological facts (a)/(b)/(c) it derives
+        // from; the end-to-end derivation is exercised in cairn-core's
+        // `long_running_derives_from_recipe_topology`.
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../../recipes/main-coordinator.yaml"))
+                .expect("main-coordinator parses");
+        assert!(parsed.validate().valid, "main-coordinator validates");
+
+        let coordinator = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "coordinator-1")
+            .expect("coordinator-1 node");
+        // Runs on the project's live checkout with no worktree (Branch: main) —
+        // the other half of the Main coordinator-mode key. Children route to the
+        // default branch naturally: a no-worktree parent job has no live branch
+        // for `resolve_parent_branch` to hand down.
+        assert_eq!(
+            coordinator
+                .config
+                .as_ref()
+                .and_then(|c| c.worktree_mode.clone()),
+            Some(WorktreeMode::None)
+        );
+
+        // (c) No terminal action node anywhere: no `pr` and no `action` node.
+        assert!(
+            !parsed
+                .nodes
+                .iter()
+                .any(|n| matches!(n.node_type, RecipeNodeType::Pr | RecipeNodeType::Action)),
+            "main-coordinator ships no terminal action node"
+        );
+
+        // (a) No terminal context-out output contract from the coordinator, and
+        // (b) it is a control-terminal — no outgoing control edge.
+        assert!(
+            !parsed
+                .edges
+                .iter()
+                .any(|e| e.from == "coordinator-1@context-out"),
+            "coordinator ships no terminal context-out output"
+        );
+        assert!(
+            !parsed.edges.iter().any(|e| {
+                e.from.starts_with("coordinator-1@") && e.edge_type == RecipeEdgeType::Control
+            }),
+            "coordinator is a control-terminal — no outgoing control edge"
+        );
+
+        // The living board is still wired through the context-self port.
+        let ctx_self: Vec<&RecipeFileEdge> = parsed
+            .edges
+            .iter()
+            .filter(|e| e.from == "coordinator-1@context-self")
+            .collect();
+        assert_eq!(ctx_self.len(), 1, "coordinator owns one context-self board");
+        assert_eq!(ctx_self[0].to, "board-1@context-in");
     }
 
     #[test]

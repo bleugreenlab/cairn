@@ -218,6 +218,18 @@ pub async fn issue_key_for_messages(db: &LocalDb, issue_id: &str) -> DbResult<St
     Ok(uri.trim_start_matches("cairn://p/").to_string())
 }
 
+/// The integration branch a child issue's job should base off — the parent
+/// issue's live (non-terminal) job branch — or `None` when there is none to use.
+///
+/// `None` is returned in two cases, both of which route the child onto the
+/// project default branch at every consumer (child base-branch resolution, PR
+/// target, pack anchor): the issue has no parent; or the parent has no live job
+/// with a worktree. The `worktree_path IS NOT NULL` filter is load-bearing: it
+/// is what makes an ambient coordinator (Branch: main / `worktreeMode: none`)
+/// route its children to the default branch. Such a coordinator has no worktree,
+/// so its live job never matches and there is no parent integration branch to
+/// hand down — the routing the deleted `childBase` flag used to force explicitly
+/// now falls out of the worktree topology itself.
 pub async fn resolve_parent_branch(
     conn: &cairn_db::turso::Connection,
     child_issue_id: &str,
@@ -254,7 +266,10 @@ pub async fn resolve_parent_branch(
         )
         .await?;
 
-    crate::storage::next_text(&mut branch_rows, 0).await
+    let Some(row) = branch_rows.next().await? else {
+        return Ok(None);
+    };
+    Ok(Some(row.text(0)?))
 }
 
 pub async fn validate_no_cycle(
@@ -471,6 +486,36 @@ mod parent_tests {
                     "INSERT INTO jobs(id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
                      VALUES(?1, 'p', 'parent', 'complete', 'agent/stale', '/tmp/parent', 10, 10)",
                     params!["terminal-parent-job"],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let branch = db
+            .read(|conn| Box::pin(async move { resolve_parent_branch(conn, "child").await }))
+            .await
+            .unwrap();
+        assert!(branch.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_parent_branch_none_when_parent_job_has_no_worktree() {
+        let db = migrated_db().await;
+        seed_parent_child(&db).await;
+
+        // An ambient (Branch: main / worktreeMode: none) coordinator's live job
+        // carries a branch but no worktree_path. The `worktree_path IS NOT NULL`
+        // filter excludes it, so the child routes to the default branch — the
+        // structural replacement for the deleted childBase mechanism.
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO jobs(id, project_id, issue_id, status, branch, worktree_path, created_at, updated_at)
+                     VALUES(?1, 'p', 'parent', 'blocked', 'agent/parent', NULL, 10, 10)",
+                    params!["ambient-parent-job"],
                 )
                 .await?;
                 Ok(())

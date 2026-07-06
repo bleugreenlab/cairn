@@ -172,7 +172,12 @@ pub enum CheckPolicy {
 #[serde(rename_all = "camelCase")]
 pub enum CheckWhen {
     Write,
-    Idle,
+    /// Turn-end cadence: runs the fuller suites at every turn-end. `idle` is
+    /// accepted as a legacy alias for un-migrated project configs — it used to
+    /// be a separate every-turn-end cadence that `review` (once PR-gated) now
+    /// subsumes — so an old `when: idle` still parses to this cadence instead of
+    /// silently disabling every check for that project.
+    #[serde(alias = "idle")]
     Review,
 }
 
@@ -205,7 +210,6 @@ impl CheckWhen {
     pub fn as_str(self) -> &'static str {
         match self {
             CheckWhen::Write => "write",
-            CheckWhen::Idle => "idle",
             CheckWhen::Review => "review",
         }
     }

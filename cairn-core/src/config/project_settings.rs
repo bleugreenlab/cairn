@@ -471,7 +471,9 @@ checks:
         let frontend = checks.get("frontend").unwrap();
         assert_eq!(frontend.command, "vitest related {changedFiles}");
         assert_eq!(frontend.policy, CheckPolicy::Gate);
-        assert_eq!(frontend.when, CheckWhen::Idle);
+        // `when: idle` is a legacy alias that deserializes to the merged Review
+        // cadence (see `CheckWhen`).
+        assert_eq!(frontend.when, CheckWhen::Review);
         assert_eq!(
             frontend.impact.as_deref(),
             Some(&["src/**".to_string(), "packages/ui/**".to_string()][..])
@@ -531,6 +533,25 @@ checks:
 "#;
         let settings = serde_yaml::from_str::<ProjectSettingsFile>(review)
             .expect("`review` cadence should parse");
+        assert_eq!(
+            settings.checks.unwrap().get("frontend").unwrap().when,
+            CheckWhen::Review
+        );
+    }
+
+    #[test]
+    fn legacy_idle_cadence_aliases_to_review() {
+        // The `idle` cadence was collapsed into `review`; a `#[serde(alias)]`
+        // keeps un-migrated project configs parsing (rather than silently
+        // disabling every check) by mapping the old name onto the merged cadence.
+        let yaml = r#"
+checks:
+  frontend:
+    command: vitest run
+    when: idle
+"#;
+        let settings =
+            serde_yaml::from_str::<ProjectSettingsFile>(yaml).expect("`idle` alias should parse");
         assert_eq!(
             settings.checks.unwrap().get("frontend").unwrap().when,
             CheckWhen::Review

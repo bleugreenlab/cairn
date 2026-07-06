@@ -10,9 +10,9 @@
 //!
 //! ## Cadence gate
 //!
-//! `when:idle` checks run at every work-turn-end; `when:review` checks run only
-//! when the node has an OPEN PR (see [`crate::orchestrator::attention_push::has_open_pr_for_issue`]).
-//! `when:write` never runs here. Selection reuses the write cadence's machinery
+//! `when:review` checks (including the `idle` legacy alias) run at every
+//! turn-end; `when:write` never runs here (it is the mid-turn cadence).
+//! Selection reuses the write cadence's machinery
 //! ([`crate::execution::selection::plan_checks`], the impact gate, placeholder
 //! substitution) via [`crate::execution::checks::applicable_turn_end_checks`], and
 //! results share the `check_result_cache` keyed by each check's input hash.
@@ -107,13 +107,10 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         }
     };
 
-    // 3. Is a PR open? Gates the `when:review` cadence.
+    // 3. Resolve the DB that owns this job (used below to queue the results push).
     let owning = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|e| e.to_string())?;
-    let pr_open = attention_push::has_open_pr_for_issue(&owning, &coords.issue_id)
-        .await
-        .unwrap_or(false);
 
     // 4. Compute the node's changed files (fork..@).
     let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
@@ -137,13 +134,12 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         return Ok(());
     }
 
-    // 5. Select the applicable turn-end checks (cadence + pr_open + impact gate).
-    let plans = applicable_turn_end_checks(&checks, &changed, repo_root, pr_open);
+    // 5. Select the applicable turn-end checks (cadence + impact gate).
+    let plans = applicable_turn_end_checks(&checks, &changed, repo_root);
     if plans.is_empty() {
         log::debug!(
-            "turn-end checks for job {}: no applicable idle/review check (pr_open={}); nothing to run",
-            short_id(job_id),
-            pr_open
+            "turn-end checks for job {}: no applicable review check; nothing to run",
+            short_id(job_id)
         );
         return Ok(());
     }
@@ -417,9 +413,6 @@ fn format_checks_section(
                 }
             }
             NodeCheckState::Pending => out.push_str(&format!("- {}: pending\n", status.name)),
-            NodeCheckState::AwaitingPr => {
-                out.push_str(&format!("- {}: awaiting PR\n", status.name));
-            }
             NodeCheckState::NotApplicable => {
                 out.push_str(&format!("- {}: not applicable\n", status.name));
             }
@@ -431,7 +424,6 @@ fn format_checks_section(
 /// The node's coordinates resolved from a `job_id` in one query.
 pub(crate) struct JobCoords {
     pub(crate) project_id: String,
-    pub(crate) issue_id: String,
     pub(crate) worktree_path: Option<String>,
     pub(crate) base_branch: Option<String>,
     pub(crate) base_commit: Option<String>,
@@ -454,7 +446,7 @@ pub(crate) async fn resolve_job_coords(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.project_id, j.issue_id, j.worktree_path, j.base_branch,
+                    "SELECT j.project_id, j.worktree_path, j.base_branch,
                             j.base_commit, p.key, i.number, e.seq, j.uri_segment
                      FROM jobs j
                      JOIN projects p ON p.id = j.project_id
@@ -467,14 +459,13 @@ pub(crate) async fn resolve_job_coords(
             match rows.next().await? {
                 Some(row) => Ok(Some(JobCoords {
                     project_id: row.text(0)?,
-                    issue_id: row.text(1)?,
-                    worktree_path: row.opt_text(2)?,
-                    base_branch: row.opt_text(3)?.filter(|s| !s.is_empty()),
-                    base_commit: row.opt_text(4)?.filter(|s| !s.is_empty()),
-                    project_key: row.text(5)?,
-                    number: row.i64(6)? as i32,
-                    exec_seq: row.i64(7)? as i32,
-                    node_segment: row.opt_text(8)?.unwrap_or_default(),
+                    worktree_path: row.opt_text(1)?,
+                    base_branch: row.opt_text(2)?.filter(|s| !s.is_empty()),
+                    base_commit: row.opt_text(3)?.filter(|s| !s.is_empty()),
+                    project_key: row.text(4)?,
+                    number: row.i64(5)? as i32,
+                    exec_seq: row.i64(6)? as i32,
+                    node_segment: row.opt_text(7)?.unwrap_or_default(),
                 })),
                 None => Ok(None),
             }
@@ -583,12 +574,10 @@ mod tests {
     #[test]
     fn section_renders_not_run_states() {
         let s = format_checks_section(&[
-            status("review", NodeCheckState::AwaitingPr),
             status("docs", NodeCheckState::NotApplicable),
             status("lint", NodeCheckState::Pending),
         ])
         .unwrap();
-        assert!(s.contains("review: awaiting PR"));
         assert!(s.contains("docs: not applicable"));
         assert!(s.contains("lint: pending"));
     }

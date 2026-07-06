@@ -55,7 +55,8 @@ mod worktrees;
 pub use child_tasks::create_child_task;
 pub(crate) use inputs::{
     find_downstream_artifact_schema_conn, find_downstream_artifact_schema_with_snapshot_conn,
-    resolve_ctx_self_schemas_conn, resolve_ctx_self_schemas_with_snapshot,
+    is_long_running_node, resolve_ctx_self_schemas_conn, resolve_ctx_self_schemas_with_snapshot,
+    resolve_instruction_prompt_conn,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;

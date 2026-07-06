@@ -153,6 +153,36 @@ pub struct RunCompletePayload {
     pub timed_out: bool,
 }
 
+/// Event payload for the live `when:write` check status line: a full snapshot of
+/// the planned checklist, re-emitted on every state transition. Snapshots (not
+/// deltas) keep the frontend stateless and self-healing — the latest snapshot for
+/// a `tool_use_id` wins, and a missed event never leaves the line inconsistent.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckStatusPayload {
+    pub run_id: String,
+    /// The committing call id (base, no `:check-` suffix). The frontend derives
+    /// each check's live-tail stream key as `"{toolUseId}:check-{index}"`.
+    pub tool_use_id: String,
+    pub checks: Vec<CheckStatusEntry>,
+}
+
+/// One check's live status within a [`CheckStatusPayload`] snapshot.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckStatusEntry {
+    /// Stable index; the frontend derives `"{toolUseId}:check-{index}"` from it to
+    /// find this check's live output tail.
+    pub index: usize,
+    pub name: String,
+    /// `"pending"` | `"running"` | `"passed"` | `"failed"`.
+    pub state: String,
+    /// The same annotation vocabulary as the final tool-result summary
+    /// (`summary_annotation`): `"12 tests"` | `"4.1s"` | `"cached"` |
+    /// `"2 of 40 failed, exit 101"` … `None` while pending or running.
+    pub annotation: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

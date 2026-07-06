@@ -79,6 +79,12 @@ pub struct JobFacts {
     pub requires_output: bool,
     /// An artifact row exists for this job (the declared output was produced).
     pub artifact_present: bool,
+    /// The node derives as long-running from its recipe's topology (a
+    /// contract-less control-terminal in a recipe with no terminal action node):
+    /// at clean turn-end with no unmet output contract it settles Idle
+    /// (non-terminal, resumable) instead of Complete, so it keeps taking wakes
+    /// until the issue is closed. Sourced from `is_long_running_node`, not a flag.
+    pub long_running: bool,
 }
 
 impl JobFacts {
@@ -96,6 +102,7 @@ impl JobFacts {
             resolution: Resolution::Pending,
             requires_output: false,
             artifact_present: false,
+            long_running: false,
         }
     }
 }
@@ -117,8 +124,9 @@ impl JobFacts {
 ///    cascade or readiness re-derivation; the job runs until its turn ends.
 /// 2. Latest turn failed, or resolution rejected -> **Failed**.
 /// 3. Latest turn completed -> **Complete**, unless a declared output is
-///    missing (-> **Blocked**, idle/resumable) or a User-policy confirm gate
-///    is unconfirmed (-> **Blocked**).
+///    missing (-> **Blocked**, idle/resumable), the node derives as
+///    long-running with no unmet output contract (-> **Idle**, non-terminal),
+///    or a User-policy confirm gate is unconfirmed (-> **Blocked**).
 /// 4. Upstream control-dep `Failed` -> **Failed** (cascade by derivation).
 /// 5. Dependencies unmet -> **Pending**.
 /// 6. DAG-ready, no turn yet: standalone-checkpoint nodes resolve from their
@@ -150,6 +158,14 @@ pub fn derive_job_status(facts: &JobFacts) -> JobStatus {
         // (idle, resumable) rather than advancing downstream onto empty work.
         if facts.requires_output && !facts.artifact_present {
             return JobStatus::Blocked;
+        }
+        // A long-running node with no unmet output contract settles Idle
+        // (non-terminal, resumable) instead of Complete, so it keeps taking
+        // wakes until the issue is closed. A node that still owes a required
+        // output stays on the contract path above; one whose contract is
+        // satisfied still completes normally.
+        if facts.long_running && !facts.requires_output {
+            return JobStatus::Idle;
         }
         return match facts.checkpoint {
             CheckpointGate::ConfirmGate if !confirmed => JobStatus::Blocked,
@@ -406,6 +422,59 @@ mod tests {
             resolution: Resolution::Pending,
         };
         assert_eq!(derive_job_status(&f), JobStatus::Blocked);
+    }
+
+    #[test]
+    fn idle_when_long_running_no_output() {
+        // The core coordinator-on-main case: a flagged node ends its turn with
+        // no output contract and settles Idle (non-terminal, resumable).
+        let f = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            long_running: true,
+            requires_output: false,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Idle);
+    }
+
+    #[test]
+    fn long_running_ignored_when_output_present() {
+        // A flagged node that still carries an output contract honors it: with
+        // the artifact produced it completes normally rather than idling.
+        let f = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            long_running: true,
+            requires_output: true,
+            artifact_present: true,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Complete);
+    }
+
+    #[test]
+    fn long_running_still_blocks_on_missing_output() {
+        // The missing-output wedge outranks the idle path: a flagged node that
+        // owes an output but has not produced it blocks, not idles.
+        let f = facts! {
+            dag_ready: true,
+            turn_complete: true,
+            long_running: true,
+            requires_output: true,
+            artifact_present: false,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Blocked);
+    }
+
+    #[test]
+    fn long_running_running_while_turn_live() {
+        // A live turn always outranks idle: the flagged node runs until its
+        // turn ends, then re-derives Idle.
+        let f = facts! {
+            dag_ready: true,
+            live_turn: true,
+            long_running: true,
+        };
+        assert_eq!(derive_job_status(&f), JobStatus::Running);
     }
 
     #[test]

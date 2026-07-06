@@ -2,7 +2,7 @@
 //!
 //! These record the resolution fact and recompute the job's status; the
 //! recompute emits its own follow-on effects (lifecycle message, DAG advance,
-//! manager wake), so these return no effects of their own.
+//! wakes), so these return no effects of their own.
 
 use crate::orchestrator::Orchestrator;
 

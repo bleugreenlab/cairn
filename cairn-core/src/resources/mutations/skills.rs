@@ -45,6 +45,32 @@ fn skill_not_found_message(skill_id: &str, explicit_project: Option<&str>) -> St
     }
 }
 
+fn reject_project_skill_write_from_jj_worktree(
+    request: &McpCallbackRequest,
+    skill_id: &str,
+    is_project_scoped: bool,
+) -> Result<(), String> {
+    reject_project_skill_write_from_jj_path(
+        std::path::Path::new(&request.cwd),
+        skill_id,
+        is_project_scoped,
+    )
+}
+
+fn reject_project_skill_write_from_jj_path(
+    cwd: &std::path::Path,
+    skill_id: &str,
+    is_project_scoped: bool,
+) -> Result<(), String> {
+    if !is_project_scoped || !crate::jj::is_jj_dir(cwd) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Project skill '{skill_id}' lives in this repository, but cairn:// skill mutations from an agent worktree are blocked because they bypass the normal file commit barrier and can write conflicted skill commits into shared main. Edit .cairn/skills/{skill_id}/SKILL.md as a file target with commit_msg instead."
+    ))
+}
+
 /// Resolve source issue: explicit payload value, else the current run's issue key.
 async fn skill_source_issue(
     orch: &Orchestrator,
@@ -80,6 +106,7 @@ pub(super) async fn apply_skill_create(
         super::payload_str(payload, "sourceIssue", &[]).map(ToOwned::to_owned);
 
     let is_project_scoped = explicit_project.is_some();
+    reject_project_skill_write_from_jj_worktree(request, name, is_project_scoped)?;
     let project_path = match explicit_project {
         Some(project) => Some(skills_resources::project_path_by_key(orch, project).await?),
         None => None,
@@ -181,6 +208,7 @@ pub(super) async fn apply_skill_patch(
         project_path.as_deref(),
     )?
     .ok_or_else(|| skill_not_found_message(skill_id, explicit_project))?;
+    reject_project_skill_write_from_jj_worktree(request, skill_id, skill.is_project_scoped)?;
 
     if let Some(description) = super::payload_str(payload, "description", &[]) {
         skill.description = description.to_string();
@@ -254,6 +282,7 @@ pub(super) async fn apply_skill_delete(
     else {
         return Err(skill_not_found_message(skill_id, explicit_project));
     };
+    reject_project_skill_write_from_jj_worktree(request, skill_id, skill.is_project_scoped)?;
     config_skills::delete_skill(&orch.config_dir, skill_id, project_path.as_deref())?;
     crate::config::commit_config_paths(
         std::slice::from_ref(&skill.dir_path),
@@ -272,4 +301,36 @@ pub(super) async fn apply_skill_delete(
         .map(|reason| format!(" (reason: {reason})"))
         .unwrap_or_default();
     Ok(format!("Deleted skill '{skill_id}'{reason}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_skill_write_is_rejected_from_jj_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".jj")).unwrap();
+
+        let error = reject_project_skill_write_from_jj_path(temp.path(), "rust-dev", true)
+            .expect_err("project skill writes from jj worktrees must be blocked");
+
+        assert!(error.contains("Project skill 'rust-dev'"));
+        assert!(error.contains("file target with commit_msg"));
+    }
+
+    #[test]
+    fn workspace_skill_write_is_allowed_from_jj_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".jj")).unwrap();
+
+        reject_project_skill_write_from_jj_path(temp.path(), "local", false).unwrap();
+    }
+
+    #[test]
+    fn project_skill_write_is_allowed_outside_jj_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+
+        reject_project_skill_write_from_jj_path(temp.path(), "rust-dev", true).unwrap();
+    }
 }

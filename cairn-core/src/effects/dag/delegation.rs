@@ -179,6 +179,19 @@ pub(super) fn expand_delegated_packets(
             });
         }
 
+        // An ambient (no-worktree) parent's delegated task cannot inherit a
+        // worktree and must not run in the user's live checkout, so the node owns
+        // a fresh ephemeral worktree (WorktreeMode::Own) off the default branch,
+        // reclaimed when the task job terminalizes. A worktree-backed parent's
+        // task inherits the parent's worktree via reparenting (WorktreeMode::None,
+        // unchanged). `reparent_delegated_jobs` marks the ambient case
+        // `owns_ephemeral_worktree`.
+        let worktree_mode = if parent_job_has_worktree(db, &packet_view.parent_job_id)? {
+            WorktreeMode::None
+        } else {
+            WorktreeMode::Own
+        };
+
         if !snapshot.recipe.nodes.iter().any(|node| node.id == agent_id) {
             snapshot.recipe.nodes.push(RecipeNode {
                 id: agent_id.clone(),
@@ -192,9 +205,7 @@ pub(super) fn expand_delegated_packets(
                     output_schema: Some(schema_config_from_output_contract(
                         &packet_view.output_contract,
                     )),
-                    git_config: Some(AgentGitConfig {
-                        worktree_mode: WorktreeMode::None,
-                    }),
+                    git_config: Some(AgentGitConfig { worktree_mode }),
                 }),
                 action_config: None,
                 checkpoint_config: None,
@@ -275,6 +286,35 @@ pub(super) fn expand_delegated_packets(
     }
 
     Ok(new_agent_node_ids)
+}
+
+/// Whether the delegating parent job owns a worktree. An ambient (Branch: main /
+/// no-worktree) parent returns `false`, which routes its task onto its own
+/// ephemeral worktree (`WorktreeMode::Own` at materialization,
+/// `owns_ephemeral_worktree` at reparenting).
+fn parent_job_has_worktree(db: &Arc<LocalDb>, parent_job_id: &str) -> Result<bool, String> {
+    let db = db.clone();
+    let parent_job_id = parent_job_id.to_string();
+    run_advancement_db(async move {
+        db.read(|conn| {
+            let parent_job_id = parent_job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT worktree_path FROM jobs WHERE id = ?1",
+                        params![parent_job_id.as_str()],
+                    )
+                    .await?;
+                let has_worktree = match rows.next().await? {
+                    Some(row) => row.opt_text(0)?.is_some(),
+                    None => false,
+                };
+                Ok(has_worktree)
+            })
+        })
+        .await
+        .map_err(|e| format!("Failed to read parent worktree state: {e}"))
+    })
 }
 
 fn find_job_id_for_node(
@@ -414,6 +454,14 @@ pub(super) async fn reparent_delegated_jobs(
                     .or_default()
                     .insert(slug.clone());
 
+                // An ambient (no-worktree) parent leaves `parent_worktree` NULL:
+                // the reparented job keeps a NULL worktree_path (its
+                // WorktreeMode::Own node mints a fresh worktree at activation) and
+                // is marked `owns_ephemeral_worktree` so it is reclaimed on
+                // completion. A worktree-backed parent inherits its path here and
+                // is not an ephemeral owner.
+                let owns_ephemeral_worktree: i64 = if parent_worktree.is_none() { 1 } else { 0 };
+
                 // Keep node_name and uri_segment in lockstep so the addressable
                 // segment is the disambiguated, parent-unique slug. Carry the
                 // packet's parent_tool_use_id onto the job so the transcript can
@@ -427,14 +475,16 @@ pub(super) async fn reparent_delegated_jobs(
                              task_index = ?3,
                              node_name = ?4,
                              uri_segment = ?4,
-                             parent_tool_use_id = ?5
-                         WHERE id = ?6",
+                             parent_tool_use_id = ?5,
+                             owns_ephemeral_worktree = ?6
+                         WHERE id = ?7",
                     params![
                         packet.parent_job_id.as_str(),
                         parent_worktree.as_deref(),
                         packet.task_index,
                         slug.as_str(),
                         packet.parent_tool_use_id.as_deref(),
+                        owns_ephemeral_worktree,
                         job_id.as_str(),
                     ],
                 )
@@ -553,5 +603,93 @@ mod tests {
         assert_eq!(inherited.2, Some(7));
         assert_eq!(inherited.3.as_deref(), Some("implement-child"));
         assert_eq!(inherited.4.as_deref(), Some("tool-1"));
+    }
+
+    #[tokio::test]
+    async fn reparented_delegated_job_ambient_parent_marks_ephemeral() {
+        // An ambient (Branch: main / no-worktree) parent's delegated task keeps a
+        // NULL worktree_path (its WorktreeMode::Own node mints a fresh worktree at
+        // activation) and is marked owns_ephemeral_worktree so it is reclaimed on
+        // completion — never inheriting, never running in the live checkout.
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
+                // Ambient parent: a branch but NO worktree_path.
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, uri_segment, node_name, created_at, updated_at) VALUES ('parent-job','e-1','i-1','p-1','running','agent/main','parent','Parent',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, recipe_node_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('child-job','e-1','i-1','p-1','delegated-agent','pending','child','Child',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let packet = DelegatedWorkPacket {
+            id: "packet-1".to_string(),
+            parent_job_id: "parent-job".to_string(),
+            parent_turn_id: Some("turn-1".to_string()),
+            parent_tool_use_id: Some("tool-1".to_string()),
+            origin: DelegationOrigin::TaskTool,
+            title: "Explore something".to_string(),
+            problem_statement: "Do the child task".to_string(),
+            agent_config_id: "explore".to_string(),
+            ownership: DelegatedOwnershipScope {
+                cwd: "/not/the/process/cwd".to_string(),
+                fence: None,
+                sandbox: None,
+                on_escape: None,
+            },
+            session: DelegatedSessionStrategy::default(),
+            acceptance: vec![],
+            output_contract: DelegatedOutputContract {
+                schema_type: "return".to_string(),
+                tool_name: None,
+                description: None,
+            },
+            status: DelegatedStatus::Materialized,
+            materialized_node_ids: vec!["delegated-agent".to_string()],
+            result_artifact_job_id: None,
+            task_index: Some(0),
+            tier_override: None,
+            backend_preference: None,
+            background: false,
+            created_at: 1,
+        };
+
+        reparent_delegated_jobs(
+            &db,
+            vec![("child-job".to_string(), Some("delegated-agent".to_string()))],
+            vec![packet],
+        )
+        .await
+        .unwrap();
+
+        let (worktree_path, owns_ephemeral): (Option<String>, i64) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT worktree_path, owns_ephemeral_worktree FROM jobs WHERE id = 'child-job'",
+                            (),
+                        )
+                        .await?;
+                    let row = rows
+                        .next()
+                        .await?
+                        .ok_or_else(|| DbError::Row("child job missing".to_string()))?;
+                    Ok::<_, DbError>((row.opt_text(0)?, row.i64(1)?))
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            worktree_path, None,
+            "ambient task keeps a NULL worktree_path"
+        );
+        assert_eq!(owns_ephemeral, 1, "ambient task is marked ephemeral-owning");
     }
 }

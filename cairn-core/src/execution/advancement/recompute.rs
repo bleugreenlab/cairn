@@ -4,14 +4,14 @@
 //! module gathers the facts a job's status derives from and writes the derived
 //! value as a cache, exactly as execution/issue status are recomputed beneath it.
 //!
-//! - [`recompute_job_status_conn`] gathers facts for one job and derives its
-//!   status (no write) — used by tests and the manager path.
+//! - [`recompute_job_status_conn`] gathers facts for one recipe-backed job and
+//!   derives its status without writing.
 //! - [`recompute_execution_jobs_conn`] sweeps every job in an execution in
 //!   topological order, writes the changed caches, recomputes execution + issue
 //!   status, and returns the diffs.
 //! - [`recompute_execution_jobs`] runs the sweep in a write transaction and
-//!   emits the follow-on effects (lifecycle messages, manager wake, JobEnded,
-//!   DAG advancement) keyed by each derived edge. This is the single entry
+//!   emits the follow-on effects (lifecycle messages, wakes, JobEnded, DAG
+//!   advancement) keyed by each derived edge. This is the single entry
 //!   point every former decider now calls.
 
 use super::*;
@@ -392,11 +392,12 @@ fn check_reachable(from: &JobStatus, to: &JobStatus, job_id: &str) {
     use JobStatus::*;
     let reachable = matches!(
         (from, to),
-        (Pending, Running | Blocked | Failed | Complete)
-            | (Running, Complete | Failed | Blocked | Pending)
-            | (Blocked, Complete | Failed | Pending | Running)
+        (Pending, Running | Blocked | Failed | Complete | Idle)
+            | (Running, Complete | Failed | Blocked | Pending | Idle)
+            | (Blocked, Complete | Failed | Pending | Running | Idle)
             | (Complete, Running | Pending)
             | (Failed, Running | Pending)
+            | (Idle, Running | Pending | Complete | Failed | Blocked)
     );
     if !reachable {
         log::warn!("job-status projection: unexpected transition {from} -> {to} for {job_id}");
@@ -439,8 +440,8 @@ fn topo_order(node_ids: &[&str], control: &[(String, String)]) -> Vec<String> {
     order
 }
 
-/// Recompute one job's status from its facts without writing. Used by tests and
-/// the manager path; the execution sweep computes the same facts in bulk.
+/// Recompute one recipe-backed job's status from its facts without writing. The
+/// execution sweep computes the same facts in bulk.
 pub async fn recompute_job_status_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
@@ -471,81 +472,41 @@ pub async fn recompute_job_status_conn(
     let turn = latest_turn_state(conn, job_id).await?;
     let live_turn = latest_turn_is_live(conn, job_id).await?;
 
-    // Standalone (no execution): liveness and resolution decide. A standalone
-    // job (e.g. an approved/rejected checkpoint with no DAG) resolves from its
-    // artifact confirmation.
-    let Some(execution_id) = execution_id else {
-        let confirmed = latest_artifact_confirmed(conn, job_id).await?;
-        let facts = JobFacts {
-            dag_ready: true,
-            upstream_failed: false,
-            live_turn,
-            turn_failed: matches!(
-                turn,
-                // Interrupt/cancel is a user-initiated pause, NOT a failure: the
-                // job rests resumable (derives Pending) and never cascades to
-                // downstream. Only a genuine agent/process failure terminalizes.
-                Some(TurnState::Failed)
-            ),
-            turn_complete: matches!(turn, Some(TurnState::Complete)),
-            // A standalone (no-execution) job resolves from its artifact: a
-            // confirmed artifact completes it via the Command gate. Manager jobs
-            // have no artifact and stay turn-driven (None).
-            checkpoint: if confirmed {
-                CheckpointGate::Command
-            } else {
-                CheckpointGate::None
-            },
-            resolution: if confirmed {
-                Resolution::Confirmed
-            } else {
-                Resolution::Pending
-            },
-            // Standalone / manager jobs have no DAG output contract.
-            requires_output: false,
-            artifact_present: false,
-        };
-        let derived = derive_job_status(&facts);
-        return Ok(derived);
-    };
+    let execution_id = execution_id
+        .ok_or_else(|| DbError::internal(format!("job has no execution_id: {job_id}")))?;
+    let recipe_node_id = recipe_node_id
+        .ok_or_else(|| DbError::internal(format!("job has no recipe_node_id: {job_id}")))?;
 
     let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
     let all_nodes_db = snapshot_nodes_to_db(&snapshot);
     let all_edges_db = snapshot_edges_to_db(&snapshot);
     let node_map_db: HashMap<&str, &DbRecipeNode> =
         all_nodes_db.iter().map(|n| (n.id.as_str(), n)).collect();
-    let node = recipe_node_id
-        .as_deref()
-        .and_then(|nid| snapshot.recipe.nodes.iter().find(|n| n.id == nid));
+    let node = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .find(|node| node.id == recipe_node_id);
 
-    let dag_ready = match recipe_node_id.as_deref() {
-        Some(node_id) => {
-            is_action_node_ready_with_snapshot_conn(
-                conn,
-                &execution_id,
-                node_id,
-                &all_edges_db,
-                &node_map_db,
-            )
-            .await?
-        }
-        None => true,
-    };
+    let dag_ready = is_action_node_ready_with_snapshot_conn(
+        conn,
+        &execution_id,
+        &recipe_node_id,
+        &all_edges_db,
+        &node_map_db,
+    )
+    .await?;
 
-    let upstream_failed = match recipe_node_id.as_deref() {
-        Some(node_id) => upstream_failed_conn(conn, &execution_id, node_id, &snapshot).await?,
-        None => false,
-    };
+    let upstream_failed =
+        upstream_failed_conn(conn, &execution_id, &recipe_node_id, &snapshot).await?;
 
-    let downstream_schema = match recipe_node_id.as_deref() {
-        Some(node_id) => {
-            crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
-                conn, &snapshot, node_id,
-            )
-            .await?
-        }
-        None => None,
-    };
+    let downstream_schema =
+        crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
+            conn,
+            &snapshot,
+            &recipe_node_id,
+        )
+        .await?;
     let requires_output = downstream_schema.is_some();
     let confirm_policy = downstream_schema
         .as_ref()
@@ -579,6 +540,11 @@ pub async fn recompute_job_status_conn(
         },
         requires_output,
         artifact_present,
+        long_running: crate::execution::jobs::is_long_running_node(
+            &snapshot,
+            &recipe_node_id,
+            requires_output,
+        ),
     };
     let derived = derive_job_status(&facts);
     Ok(derived)
@@ -745,6 +711,11 @@ pub async fn recompute_execution_jobs_conn(
                 },
                 requires_output,
                 artifact_present,
+                long_running: crate::execution::jobs::is_long_running_node(
+                    &snapshot,
+                    node_id,
+                    requires_output,
+                ),
             };
             let derived = derive_job_status(&facts);
             let current = status
@@ -803,10 +774,10 @@ pub async fn recompute_execution_jobs_conn(
     Ok(changes)
 }
 
-/// Recompute a single job by id, routing to the execution sweep when the job
-/// belongs to a DAG execution, or doing a standalone single-job write otherwise
-/// (manager jobs have no execution). This is the entry point for deciders that
-/// hold a `job_id` rather than an `execution_id`.
+/// Recompute a single recipe-backed job by id by routing to its execution sweep.
+/// This is the entry point for deciders that hold a `job_id` rather than an
+/// `execution_id`. Jobs without an execution are historical data and are not part
+/// of the live status projection.
 pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
     let owning_db = run_advancement_db({
         let dbs = orch.db.clone();
@@ -828,60 +799,10 @@ pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
     })?;
 
-    if let Some(execution_id) = execution_id {
-        return recompute_execution_jobs(orch, &execution_id);
-    }
-
-    // Standalone / manager job: derive and write in isolation. No DAG advance,
-    // no JobEnded — a manager is never terminalized by the projection.
-    let db = owning_db.clone();
-    let job_id_owned = job_id.to_string();
-    let changed = run_advancement_db(async move {
-        db.write(|conn| {
-            let job_id = job_id_owned.clone();
-            Box::pin(async move {
-                let current = {
-                    let mut rows = conn
-                        .query("SELECT status FROM jobs WHERE id = ?1", (job_id.as_str(),))
-                        .await?;
-                    match rows.next().await? {
-                        Some(row) => row
-                            .text(0)?
-                            .parse::<JobStatus>()
-                            .map_err(DbError::internal)?,
-                        None => return Ok(false),
-                    }
-                };
-                let derived = recompute_job_status_conn(conn, &job_id).await?;
-                if derived != current {
-                    check_reachable(&current, &derived, &job_id);
-                    write_job_status(conn, &job_id, &current, &derived).await?;
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
+    let execution_id = execution_id.ok_or_else(|| {
+        format!("Job {job_id} has no execution_id; standalone jobs are not recomputed")
     })?;
-
-    if changed {
-        let job = run_advancement_db({
-            let db = owning_db.clone();
-            let job_id = job_id.to_string();
-            async move {
-                crate::jobs::queries::get_job(&db, &job_id)
-                    .await
-                    .map_err(|e| e.to_string())
-            }
-        })?;
-        let _ = orch
-            .services
-            .emitter
-            .emit("db-change", crate::notify::job_db_change(&job, "update"));
-    }
-    Ok(())
+    recompute_execution_jobs(orch, &execution_id)
 }
 
 /// The single entry point every former decider calls: run the execution sweep in
@@ -1229,8 +1150,9 @@ mod artifact_present_tests {
     use super::{artifact_present_for, recompute_job, recompute_job_status_conn};
     use crate::db::DbState;
     use crate::models::{
-        AgentNodeConfig, ConfirmPolicy, ExecutionSnapshot, JobStatus, NodePosition, RecipeNode,
-        RecipeNodeType, RecipeSnapshot, RecipeTrigger, SchemaConfig, TriggerContext, TriggerType,
+        AgentNodeConfig, ConfirmPolicy, ExecutionSnapshot, JobStatus, NodePosition, RecipeFile,
+        RecipeNode, RecipeNodeType, RecipeSnapshot, RecipeTrigger, SchemaConfig, TriggerContext,
+        TriggerType,
     };
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
@@ -1296,6 +1218,75 @@ mod artifact_present_tests {
             condition_config: None,
             context_config: None,
         };
+        // The review fixture models a builder inside a SHIPPING recipe (it
+        // writes a create-pr artifact), so the snapshot carries the pr node
+        // real build/planbuild shapes have. Without it the topology derivation
+        // (`is_long_running_node`) reads a single-agent snapshot as a standing
+        // recipe — the fixture's name-only inline schema resolves to no output
+        // contract — and settles the job Idle where these tests assert the
+        // completion path.
+        let pr = RecipeNode {
+            id: "pr".to_string(),
+            node_type: RecipeNodeType::Pr,
+            name: "PR".to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        };
+        serde_json::to_string(&ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: "recipe".to_string(),
+                name: "Recipe".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![node, pr],
+                edges: vec![],
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: Some("i-review".to_string()),
+                project_id: "p-review".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 1,
+        })
+        .unwrap()
+    }
+
+    /// A single agent node with no output contract and no edges — no terminal
+    /// action node and a contract-less control-terminal — the coordinator-on-main
+    /// shape the topology derivation marks long-running, so it settles Idle at
+    /// clean turn-end.
+    fn long_running_snapshot_json() -> String {
+        let node = RecipeNode {
+            id: "coordinator".to_string(),
+            node_type: RecipeNodeType::Agent,
+            name: "Coordinator".to_string(),
+            position: NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: Some(AgentNodeConfig {
+                agent_config_id: Some("coordinator".to_string()),
+                output_schema: None,
+                git_config: None,
+            }),
+            action_config: None,
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        };
         serde_json::to_string(&ExecutionSnapshot {
             recipe: RecipeSnapshot {
                 id: "recipe".to_string(),
@@ -1319,6 +1310,232 @@ mod artifact_present_tests {
             created_at: 1,
         })
         .unwrap()
+    }
+
+    /// Build an `ExecutionSnapshot` from a bundled recipe YAML, mirroring the
+    /// production snapshot build (nodes + edges carried verbatim). Agents/skills
+    /// are irrelevant to the topology derivation and left empty.
+    fn snapshot_from_yaml(yaml: &str) -> ExecutionSnapshot {
+        let recipe = RecipeFile::from_yaml(yaml)
+            .expect("bundled recipe parses")
+            .into_recipe(Some("default".to_string()), None);
+        ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: recipe.id.clone(),
+                name: recipe.name.clone(),
+                description: recipe.description.clone(),
+                trigger: recipe.trigger.clone(),
+                nodes: recipe.nodes.clone(),
+                edges: recipe.edges.clone(),
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: None,
+                project_id: "p".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 1,
+        }
+    }
+
+    /// Assert `is_long_running_node` over every node of `snapshot`, expecting
+    /// exactly the agent node whose `agent_config_id` equals `long_running_agent`
+    /// (if any) to derive true, and every other node false. Nodes are keyed by
+    /// `agent_config_id` rather than node id because `into_recipe` reassigns node
+    /// ids to fresh UUIDs. `requires_output` is resolved through the real
+    /// terminal-contract resolver, so the derivation is exercised end to end.
+    async fn assert_recipe_derivation(
+        db: &LocalDb,
+        name: &str,
+        snapshot: ExecutionSnapshot,
+        long_running_agent: Option<&str>,
+    ) {
+        let name = name.to_string();
+        let long_running_agent = long_running_agent.map(str::to_string);
+        db.read(move |conn| {
+            Box::pin(async move {
+                for node in &snapshot.recipe.nodes {
+                    let requires_output =
+                        crate::execution::jobs::find_downstream_artifact_schema_with_snapshot_conn(
+                            conn, &snapshot, &node.id,
+                        )
+                        .await?
+                        .is_some();
+                    let derived = crate::execution::jobs::is_long_running_node(
+                        &snapshot,
+                        &node.id,
+                        requires_output,
+                    );
+                    let agent_config_id = node
+                        .agent_config
+                        .as_ref()
+                        .and_then(|c| c.agent_config_id.as_deref());
+                    let expected =
+                        long_running_agent.is_some() && agent_config_id == long_running_agent.as_deref();
+                    assert_eq!(
+                        derived, expected,
+                        "{name}: node `{}` (agent {agent_config_id:?}) long-running derivation (requires_output={requires_output})",
+                        node.id
+                    );
+                }
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn long_running_derives_from_recipe_topology() {
+        // The long-running fact is derived from recipe topology, not a node flag:
+        // an agent node stands idle at clean turn-end iff it declares no output
+        // contract, is a control-terminal, AND its recipe ships no terminal action
+        // (`pr`/`action`) node. Only main-coordinator's `coordinator` agent node
+        // qualifies.
+        //
+        // Every node of every shipping recipe derives false — crucially including
+        // planbuild's contract-less review sink, which is node-shape-identical to
+        // the standing coordinator (a contract-less control-terminal agent) yet
+        // sits in a recipe that DOES contain a `pr` node. That single recipe-level
+        // fact, condition (c), is exactly what separates the two.
+        //
+        // `assert_recipe_derivation` checks EVERY node, so it also pins the new
+        // Instruction node in both coordinator recipes to false: an Instruction
+        // node has no agent_config, so it can never derive long-running, and
+        // adding it changes no agent node's derivation (it feeds context-IN only).
+        // Feature (coordinator.yaml) still terminates via its `pr` node; Manager
+        // (main-coordinator.yaml) still stands via its only `coordinator` agent.
+        let db = test_db().await;
+
+        let shipping: &[(&str, &str)] = &[
+            (
+                "planbuild",
+                include_str!("../../../../../recipes/planbuild.yaml"),
+            ),
+            ("build", include_str!("../../../../../recipes/build.yaml")),
+            (
+                "coordinator",
+                include_str!("../../../../../recipes/coordinator.yaml"),
+            ),
+            (
+                "task-list",
+                include_str!("../../../../../recipes/task-list.yaml"),
+            ),
+            ("setup", include_str!("../../../../../recipes/setup.yaml")),
+            (
+                "memory-triage",
+                include_str!("../../../../../recipes/memory-triage.yaml"),
+            ),
+        ];
+        for (name, yaml) in shipping {
+            assert_recipe_derivation(&db, name, snapshot_from_yaml(yaml), None).await;
+        }
+
+        // main-coordinator: the one standing recipe — no terminal action node.
+        // Its `coordinator` agent node is the single node that derives
+        // long-running (the board artifact and trigger nodes do not).
+        assert_recipe_derivation(
+            &db,
+            "main-coordinator",
+            snapshot_from_yaml(include_str!("../../../../../recipes/main-coordinator.yaml")),
+            Some("coordinator"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn long_running_node_settles_idle_without_advancing() {
+        // A topology-derived long-running coordinator ends its turn with no output contract: it derives
+        // Idle (non-terminal), the execution stays running, the issue reads
+        // waiting/idle, and crucially NO advance_dag fires and the job never
+        // completes — the re-firing loop the bug exhibited is gone.
+        let temp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let snapshot = long_running_snapshot_json();
+        db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-review','recipe','i-review','p-review','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-review','e-review','coordinator','i-review','p-review','running','coordinator','coordinator',1,1)", ()).await?;
+                conn.execute("INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at) VALUES ('s-review','j-review','codex','open',1,1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at) VALUES ('t-review','s-review','j-review',1,'complete','initial',1,2,2)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let derived = db
+            .read(|conn| Box::pin(async move { recompute_job_status_conn(conn, "j-review").await }))
+            .await
+            .unwrap();
+        assert_eq!(derived, JobStatus::Idle);
+
+        let search_index =
+            Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        let (effect_tx, _effect_rx) = tokio::sync::mpsc::unbounded_channel();
+        let orch = OrchestratorBuilder::new(db_state, services, temp.path().join("config"))
+            .effect_tx(Some(effect_tx))
+            .build();
+
+        recompute_job(&orch, "j-review").unwrap();
+
+        let job_status = orch
+            .db
+            .local
+            .query_one("SELECT status FROM jobs WHERE id = 'j-review'", (), |row| {
+                row.text(0)
+            })
+            .await
+            .unwrap();
+        assert_eq!(job_status, "idle");
+
+        let exec_status = orch
+            .db
+            .local
+            .query_one(
+                "SELECT status FROM executions WHERE id = 'e-review'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exec_status, "running");
+
+        let (issue_status, issue_attention) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT status, attention FROM issues WHERE id = 'i-review'",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(issue_status, "waiting");
+        assert_eq!(issue_attention, "idle");
+
+        let advance_count = orch
+            .db
+            .local
+            .query_one(
+                "SELECT COUNT(*) FROM effect_outbox WHERE kind = 'advance_dag' AND dedupe_key = 'e-review'",
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(advance_count, 0, "an idle node must not advance the DAG");
     }
 
     #[tokio::test]

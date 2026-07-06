@@ -3,8 +3,8 @@
 //! Every worktree-mutating VCS operation on these paths flows through
 //! [`WorktreeVcs`]. An agent worktree is a `.jj` workspace over a shared store,
 //! so [`JjBackend`] is the production backend there. A non-worktree cwd — the
-//! project's live checkout behind a long-lived manager / triage / read-only
-//! agent (project chat included) — resolves to the read-only [`NonWorktreeVcs`]
+//! project's live checkout behind a long-lived triage / read-only agent or other
+//! non-worktree run — resolves to the read-only [`NonWorktreeVcs`]
 //! sentinel instead: changes can only happen in worktrees, so the barrier is a
 //! clean no-op there and never touches (or reverts) the user's checkout.
 //!
@@ -299,8 +299,8 @@ pub(crate) const NON_WORKTREE_SEAL_ERROR: &str =
      checkout (no worktree) and cannot commit.";
 
 /// Read-only [`WorktreeVcs`] for a non-jj cwd: the project's live checkout used
-/// by long-lived manager / triage / read-only-analysis agents (project chat
-/// included). Changes can only happen in worktrees, so there is nothing here for
+/// by long-lived triage / read-only-analysis agents and other no-worktree runs.
+/// Changes can only happen in worktrees, so there is nothing here for
 /// Cairn to *manage* — but it is NOT inert. `snapshot`/`changed_since` perform a
 /// read-only `git status` so the no-`commit_msg` barrier can detect when a run
 /// left stray dirt in the live checkout and WARN about it. They never mutate the
@@ -391,7 +391,7 @@ impl WorktreeVcs for NonWorktreeVcs {
 
 /// Resolve the VCS backend for an agent cwd. A `.jj` workspace resolves to
 /// [`JjBackend`] (the only place changes happen); any other cwd — the project's
-/// live checkout behind a no-worktree manager / triage / read-only agent —
+/// live checkout behind a no-worktree triage / read-only agent —
 /// resolves to the read-only [`NonWorktreeVcs`], so the commit barrier never
 /// shells jj in (or reverts) a plain checkout.
 pub fn resolve_worktree_vcs(
@@ -505,7 +505,15 @@ pub fn worktree_shell_vcs_env(
     #[cfg(unix)]
     match crate::jj::ensure_jj_shim_dir(&orch.config_dir) {
         Ok(shim_dir) => {
-            let current_path = crate::env::get_user_path();
+            // Compose on top of the agent shell PATH (which carries the
+            // host-owned `cairn` shim dir), NOT bare get_user_path(): this entry
+            // overrides the spawn site's own `agent_shell_path()` for a jj
+            // worktree (a later env with the same key wins), so it must itself
+            // keep the cairn bin dir or `cairn` stops resolving in the primary
+            // (worktree) case. Final order: jj shim first (bare-`jj
+            // update-stale` interception), then the cairn bin dir, then the
+            // user PATH.
+            let current_path = crate::env::agent_shell_path();
             let new_path = format!("{}:{}", shim_dir.display(), current_path);
             env.push(("PATH".into(), new_path));
             env.push(("CAIRN_JJ_BIN".into(), jj.binary_path().to_string()));
@@ -1052,7 +1060,16 @@ mod tests {
         );
         assert!(
             path.contains("/.bun/bin"),
-            "the shim is prepended onto env::get_user_path(), not the host process PATH: {path}"
+            "the shim is composed onto env::agent_shell_path(), not the host process PATH: {path}"
+        );
+        // The composition source is agent_shell_path(), so the host-owned cairn
+        // bin dir must survive into the worktree PATH — otherwise this entry
+        // (which overrides the spawn site's PATH) would drop `cairn` in the
+        // primary worktree case.
+        let cairn_bin = crate::env::cairn_bin_dir();
+        assert!(
+            path.contains(cairn_bin.to_string_lossy().as_ref()),
+            "the cairn CLI shim dir is composed into the worktree PATH so `cairn` resolves in agent worktree shells: {path}"
         );
     }
 

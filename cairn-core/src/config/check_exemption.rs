@@ -5,7 +5,7 @@
 //! for, nor hang on, a declared check/test command. This module provides the pure
 //! matcher that [`build_run_sandbox_policy`] consults to run such commands
 //! **unconfined** (host permissions, no fence prompt) — matching the turn-end
-//! cadence, which already runs these exact commands unconfined at idle. Exempting
+//! cadence, which already runs these exact commands unconfined at turn-end. Exempting
 //! them in the agent path only makes it match a trust decision the system already
 //! makes; the fence was never the guard on a declared check's *content*.
 //!

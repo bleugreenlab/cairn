@@ -92,7 +92,12 @@ pub(crate) async fn run_worktree_gc(orch: &Orchestrator) {
 /// shared per-target executor applies unchanged.
 ///
 /// A `LEFT JOIN` on issues keeps jobs whose issue row was deleted (`i.status IS
-/// NULL`) and jobs with a `NULL issue_id`, so orphaned rows are swept too.
+/// NULL`) and jobs with a `NULL issue_id`, so orphaned rows are swept too. It
+/// ALSO reclaims a terminal ephemeral-owner task job
+/// (`owns_ephemeral_worktree = 1`) regardless of its issue status: an ambient
+/// Manager issue is long-lived and never terminalizes, so without this backstop
+/// an ephemeral task worktree would leak whenever the app died between task
+/// completion and the detached finalize reclaim. The idle cutoff still guards it.
 pub(crate) async fn plan_gc_targets(
     db: &LocalDb,
     cutoff: i64,
@@ -108,7 +113,11 @@ pub(crate) async fn plan_gc_targets(
                          LEFT JOIN issues i ON j.issue_id = i.id
                          WHERE j.worktree_path IS NOT NULL
                            AND j.updated_at < ?1
-                           AND (i.status IS NULL OR i.status NOT IN ('active', 'waiting'))",
+                           AND (
+                             (i.status IS NULL OR i.status NOT IN ('active', 'waiting'))
+                             OR (j.owns_ephemeral_worktree = 1
+                                 AND j.status IN ('complete', 'failed', 'cancelled'))
+                           )",
                         params![cutoff],
                     )
                     .await?;

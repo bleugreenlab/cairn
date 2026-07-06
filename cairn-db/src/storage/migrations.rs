@@ -116,6 +116,45 @@ macro_rules! shared_tail_relink_merge_request_jobs {
     };
 }
 
+/// CAIRN-2460: per-job child-routing mode. `jobs` is a project-scoped shared
+/// table, so this append-only ADD COLUMN lands in both lineages. The column
+/// carries the resolved `childBase` of the agent node that produced the job.
+///
+/// DORMANT as of CAIRN-2475: the childBase mechanism was deleted (ambient
+/// no-worktree coordinators route their children to the default branch
+/// naturally, so the flag was redundant). Nothing reads or writes this column
+/// anymore. It is kept in place rather than dropped because `jobs` is a synced
+/// shared table, and dropping a column from a synced replica table (the
+/// create-new/copy/drop/rename rebuild) is exactly what the sync-safety rules
+/// forbid. A nullable, unwritten column is inert at runtime, and the migration
+/// stays in the lineage so no already-applied database carries a recorded
+/// migration the composed list no longer contains.
+macro_rules! shared_tail_jobs_child_base {
+    () => {
+        Migration::new(
+            "0096",
+            "jobs_child_base",
+            include_str!("../../../../turso_migrations/0096_jobs_child_base.sql"),
+        )
+    };
+}
+
+/// CAIRN-2476: mark a task job that owns a throwaway ephemeral worktree. `jobs`
+/// is a project-scoped shared table, so this append-only ADD COLUMN lands in both
+/// lineages. The column is set to 1 for a task delegated by an ambient
+/// (no-worktree) parent — such a task gets its own worktree off the default
+/// branch, reclaimed when the task job terminalizes — and read back by the
+/// finalize reclaim and the worktree GC backstop.
+macro_rules! shared_tail_jobs_owns_ephemeral_worktree {
+    () => {
+        Migration::new(
+            "0097",
+            "jobs_owns_ephemeral_worktree",
+            include_str!("../../../../turso_migrations/0097_jobs_owns_ephemeral_worktree.sql"),
+        )
+    };
+}
+
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -127,6 +166,8 @@ macro_rules! team_lineage {
             shared_tail_tool_invocation_durations!(),
             shared_tail_check_result_job_id!(),
             shared_tail_relink_merge_request_jobs!(),
+            shared_tail_jobs_child_base!(),
+            shared_tail_jobs_owns_ephemeral_worktree!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -204,6 +245,8 @@ macro_rules! private_lineage {
                 ),
             ),
             shared_tail_relink_merge_request_jobs!(),
+            shared_tail_jobs_child_base!(),
+            shared_tail_jobs_owns_ephemeral_worktree!(),
         ]
     };
 }
@@ -1292,6 +1335,8 @@ mod tests {
                 "0093_check_result_cache_job_id".to_string(),
                 "0094_tool_invocation_result_backfill_state".to_string(),
                 "0095_relink_merge_request_jobs".to_string(),
+                "0096_jobs_child_base".to_string(),
+                "0097_jobs_owns_ephemeral_worktree".to_string(),
             ]
         );
         Ok(db)
@@ -2605,6 +2650,8 @@ mod tests {
                 "0092_tool_invocation_durations".to_string(),
                 "0093_check_result_cache_job_id".to_string(),
                 "0095_relink_merge_request_jobs".to_string(),
+                "0096_jobs_child_base".to_string(),
+                "0097_jobs_owns_ephemeral_worktree".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

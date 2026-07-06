@@ -7,8 +7,8 @@ use super::*;
 /// Called when a job finishes. Advances the execution DAG if applicable.
 ///
 /// Only advances for jobs that are part of a recipe DAG (have both `execution_id`
-/// and `recipe_node_id`). Manager jobs have `execution_id` for config storage
-/// but no `recipe_node_id`, so they skip DAG advancement and worktree cleanup.
+/// and `recipe_node_id`). Rows missing either field are not runnable DAG jobs and
+/// are ignored here.
 pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<Vec<Job>, String> {
     // Tear down any external MCP gateway connections this job opened
     // (cairn://mcp/... family). Connections are pooled per job id, so closing
@@ -45,7 +45,7 @@ pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<V
         Some(exec_id) if recipe_node_id.is_some() => {
             crate::execution::advancement::advance_execution_with_actions(orch, &exec_id).await
         }
-        _ => Ok(vec![]), // Standalone job or manager job — no DAG to advance
+        _ => Ok(vec![]), // Not a runnable DAG job, so there is no DAG to advance.
     }
 }
 
@@ -101,53 +101,39 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     ))?;
 
     // ---- Determine node behavior ----------------------------------------
-    let (needs_worktree, inherits_worktree, step_name): (bool, bool, String) =
-        if let Some(node_id) = &job.recipe_node_id {
-            let execution_id = job
-                .execution_id
-                .as_ref()
-                .ok_or("Job has recipe node but no execution_id")?;
+    let node_id = job
+        .recipe_node_id
+        .as_ref()
+        .ok_or("Job has no recipe_node_id; standalone jobs are no longer runnable")?;
+    let execution_id = job
+        .execution_id
+        .as_ref()
+        .ok_or("Job has recipe node but no execution_id")?;
 
-            let all_nodes = run_db(load_nodes_from_execution(
-                owning_db.clone(),
-                execution_id.clone(),
-            ))?;
-            let node_map: HashMap<&str, &DbRecipeNode> =
-                all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let all_nodes = run_db(load_nodes_from_execution(
+        owning_db.clone(),
+        execution_id.clone(),
+    ))?;
+    let node_map: HashMap<&str, &DbRecipeNode> =
+        all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
-            let node = node_map
-                .get(node_id.as_str())
-                .ok_or_else(|| format!("Recipe node not found: {}", node_id))?;
+    let node = node_map
+        .get(node_id.as_str())
+        .ok_or_else(|| format!("Recipe node not found: {}", node_id))?;
 
-            if node.node_type == "action" {
-                return Err("Action nodes execute inline during DAG advancement".to_string());
-            }
-            if node.node_type == "checkpoint" {
-                return Err("Checkpoint nodes wait for approval, not session start".to_string());
-            }
+    if node.node_type == "action" {
+        return Err("Action nodes execute inline during DAG advancement".to_string());
+    }
+    if node.node_type == "checkpoint" {
+        return Err("Checkpoint nodes wait for approval, not session start".to_string());
+    }
 
-            let behavior = resolve_node_behavior(node);
-            (
-                behavior.needs_worktree,
-                behavior.inherits_worktree,
-                node.name.clone(),
-            )
-        } else {
-            // Standalone job (e.g., manager).
-            // If the job's pre-set branch matches the project default branch,
-            // run on the project root without a worktree.
-            let needs_wt = if let Some(ref branch) = job.branch {
-                let default_branch = run_db(load_project_default_branch(
-                    owning_db.clone(),
-                    job.project_id.clone(),
-                ))?
-                .unwrap_or_else(|| "main".to_string());
-                branch != &default_branch
-            } else {
-                true
-            };
-            (needs_wt, false, "standalone".to_string())
-        };
+    let behavior = resolve_node_behavior(node);
+    let (needs_worktree, inherits_worktree, step_name): (bool, bool, String) = (
+        behavior.needs_worktree,
+        behavior.inherits_worktree,
+        node.name.clone(),
+    );
 
     log::info!(
         "[prepare_job] job {job_id}: behavior needs_worktree={needs_worktree} inherits_worktree={inherits_worktree} step={step_name}"
@@ -247,7 +233,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             .join("worktrees");
 
         let (branch, wt_dir) = if let Some(ref existing) = job.branch {
-            // Job already has a branch (e.g., feature-branch manager) — use it
+            // Job already has a branch — use it.
             let dir = existing.replace('/', "-");
             (existing.clone(), dir)
         } else {

@@ -28,18 +28,9 @@ pub fn create_child_task(
         input.parent_job_id.clone(),
         "Parent job not found",
     ))?;
-    if parent_job.worktree_path.is_none() {
-        return Err("Parent job has no worktree - cannot spawn child task".to_string());
-    }
     let project_id = parent_job.project_id.clone();
     let issue_id = parent_job.issue_id.clone();
     let execution_id = parent_job.execution_id.clone();
-
-    let worktree_path = parent_job
-        .worktree_path
-        .as_ref()
-        .ok_or("Parent job has no worktree")?
-        .clone();
 
     let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
 
@@ -125,8 +116,40 @@ pub fn create_child_task(
     agent_config.selection = Some(selection);
     agent_config.extras = Some(extras);
 
-    // The child reuses the parent's worktree; its base_commit is that worktree's
-    // current HEAD.
+    // Resolve the child task's working directory. A worktree-backed parent shares
+    // its worktree with the child; an ambient (Branch: main / no-worktree) parent
+    // has none to inherit, so the task gets its own ephemeral worktree off the
+    // parent's base branch — isolation from the user's live checkout — reclaimed
+    // when the task job terminalizes (owns_ephemeral_worktree).
+    let (worktree_path, ephemeral_branch, owns_ephemeral_worktree) =
+        match parent_job.worktree_path.clone() {
+            Some(path) => (path, None, false),
+            None => {
+                let repo_path = project_path
+                    .as_ref()
+                    .ok_or("Project has no repo path for ephemeral task worktree")?
+                    .to_string_lossy()
+                    .to_string();
+                let base_ref = parent_job
+                    .base_branch
+                    .clone()
+                    .unwrap_or_else(|| "HEAD".to_string());
+                let (path, branch) = super::worktrees::ensure_ephemeral_task_worktree(
+                    orch,
+                    &repo_path,
+                    &job_id,
+                    issue_id.clone(),
+                    &base_ref,
+                )?;
+                // Record the branch on the child job (below) so teardown can
+                // `jj workspace forget` and delete it — the DAG path gets this from
+                // prepare_job's worktree write, but this synchronous path must set
+                // it explicitly or the ephemeral bookmark leaks in the jj store.
+                (path, Some(branch), true)
+            }
+        };
+
+    // The child's base_commit is its worktree's current HEAD.
     let base_commit = worktree_head_commit(orch, Path::new(&worktree_path));
 
     run_db(insert_child_job_session_run(
@@ -137,6 +160,7 @@ pub fn create_child_task(
             session_id: session_id.clone(),
             parent_job_id: input.parent_job_id.clone(),
             worktree_path: worktree_path.clone(),
+            branch: ephemeral_branch,
             agent_config_id: agent_config.id.clone(),
             project_id: project_id.clone(),
             issue_id: issue_id.clone(),
@@ -144,6 +168,7 @@ pub fn create_child_task(
             description: input.description.clone(),
             model: selected_model.as_ref().map(|m| m.to_string()),
             base_commit,
+            owns_ephemeral_worktree,
             now,
         },
     ))?;
@@ -178,7 +203,7 @@ pub fn create_child_task(
     };
 
     // ---- Start backend session -------------------------------------------
-    crate::orchestrator::session::start_agent_session(
+    if let Err(e) = crate::orchestrator::session::start_agent_session(
         orch,
         &run_id,
         &input.prompt,
@@ -193,7 +218,29 @@ pub fn create_child_task(
         false,
         execution_id.as_deref(),
         None, // Child task: inherits parent's execution identity
-    )?;
+    ) {
+        // The ephemeral worktree was minted before the session started. On a
+        // startup failure the job never terminalizes, so neither the finalize
+        // reclaim nor the terminal-status GC would fire — discard it now
+        // (best-effort) so a failed spawn cannot strand a worktree + branch.
+        if owns_ephemeral_worktree {
+            let cleanup_orch = orch.clone();
+            let cleanup_job_id = job_id.clone();
+            if let Err(teardown_err) = run_db(async move {
+                crate::execution::teardown::teardown_worktrees(
+                    &cleanup_orch,
+                    crate::execution::teardown::TeardownScope::Job(cleanup_job_id),
+                    crate::execution::teardown::TeardownReason::Discarded,
+                )
+                .await
+            }) {
+                log::warn!(
+                    "failed to reclaim ephemeral task worktree after session start failure: {teardown_err}"
+                );
+            }
+        }
+        return Err(e);
+    }
 
     Ok(CreateChildTaskResult { job_id, run_id })
 }

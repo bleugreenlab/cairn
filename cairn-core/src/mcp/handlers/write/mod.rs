@@ -420,8 +420,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     );
 
     // Changes can only happen in a worktree. A non-jj cwd is the project's live
-    // checkout behind a long-lived manager / triage / read-only agent (project
-    // chat included); reject any file-target edit BEFORE applying it so the
+    // checkout behind a long-lived triage / read-only agent or another
+    // no-worktree run; reject any file-target edit BEFORE applying it so the
     // user's checkout is never written to and never reverted. Resource-only
     // writes (issues, messages, todos, tasks) are unaffected.
     if !crate::jj::is_jj_dir(std::path::Path::new(&request.cwd)) {
@@ -445,7 +445,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     // effects and the slow-path resume can safely re-drive the whole batch.
     // `allow_escape` then permits the approved escaping write(s) on the apply
     // path. Resolution is once per call:
-    //   - no active run (project chat) -> worktree-jailed (today's behavior)
+    //   - no active run -> worktree-jailed (today's behavior)
     //   - fence allow -> writes anywhere, no fence
     //   - fence ask/deny -> fence each escaping target; allow_escape iff any
     //     escaping target was approved.

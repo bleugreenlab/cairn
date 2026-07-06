@@ -1688,7 +1688,7 @@ async fn spawn_terminal_session(
     for (key, value) in std::env::vars() {
         cmd.env(key, value);
     }
-    cmd.env("PATH", crate::env::get_user_path());
+    cmd.env("PATH", crate::env::agent_shell_path());
     apply_non_interactive_pager_env_to_pty(&mut cmd);
     // Same jj-only worktree VCS env as the inline spawn path, applied to the PTY /
     // background-terminal spawn too (the background-terminal regression hides if

@@ -47,13 +47,18 @@ pub fn resolve_node_behavior(node: &DbRecipeNode) -> StepBehavior {
 
 /// Parse worktree mode from node config JSON
 fn parse_worktree_mode(node: &DbRecipeNode) -> WorktreeMode {
+    parse_git_config(node)
+        .map(|gc| gc.worktree_mode)
+        .unwrap_or_default()
+}
+
+/// Parse the `gitConfig` block out of a recipe node's config JSON.
+fn parse_git_config(node: &DbRecipeNode) -> Option<AgentGitConfig> {
     node.config
         .as_ref()
         .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
         .and_then(|v| v.get("gitConfig").cloned())
         .and_then(|gc| serde_json::from_value::<AgentGitConfig>(gc).ok())
-        .map(|gc| gc.worktree_mode)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

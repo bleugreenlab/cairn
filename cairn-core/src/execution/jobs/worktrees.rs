@@ -331,3 +331,59 @@ pub(crate) fn prepare_worktree_for_job(
 
     Ok(())
 }
+
+/// Mint a throwaway worktree for a task delegated by an ambient (no-worktree)
+/// parent, off `base_ref`.
+///
+/// A task must never run in the user's live checkout, and an ambient parent has
+/// no worktree to inherit — so its task gets its own isolated worktree here. The
+/// delegated subgraph carries no PR machinery and this branch is discarded
+/// unconditionally at teardown, so no task commit can ever land; the owning task
+/// job is marked `owns_ephemeral_worktree` and the worktree is reclaimed the
+/// moment that job terminalizes. Returns `(worktree_path, branch)`.
+///
+/// This mirrors the synchronous cost `prepare_job` already pays for a
+/// worktree-backed node (jj workspace add + populate + setup), bounded by the
+/// task's lifetime. The delegation-DAG path reaches the same outcome through
+/// `prepare_job`'s `WorktreeMode::Own` branch; this helper is the synchronous
+/// `create_child_task` path's counterpart, keeping both task paths identical.
+pub(crate) fn ensure_ephemeral_task_worktree(
+    orch: &Orchestrator,
+    repo_path: &str,
+    job_id: &str,
+    issue_id: Option<String>,
+    base_ref: &str,
+) -> Result<(String, String), String> {
+    let worktrees_dir = dirs::home_dir()
+        .ok_or("Could not find home directory")?
+        .join(".cairn")
+        .join("worktrees");
+    // The job id is globally unique, so a directory keyed on it never collides
+    // with another task's ephemeral worktree.
+    let safe_id: String = job_id
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    let wt_dir = format!("task-{safe_id}");
+    let branch = format!("agent/{wt_dir}");
+    let wt_path = worktrees_dir.join(&wt_dir);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let child_slot = Arc::new(Mutex::new(None));
+    let sink = setup_progress::make_sink(orch, job_id, issue_id.clone());
+    prepare_worktree_for_job(
+        orch,
+        repo_path,
+        &wt_path,
+        &branch,
+        base_ref,
+        job_id,
+        issue_id,
+        &sink,
+        &cancel,
+        &child_slot,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok((wt_path.to_string_lossy().to_string(), branch))
+}

@@ -176,13 +176,55 @@ async fn query_pr_node_mr_context_for_artifact_job(
     Ok(None)
 }
 
+/// A `pr`/`create_pr` action_run does not own its PR row directly — the row is
+/// keyed to the action_run's `parent_job_id` (the producing builder job; see
+/// migration `0095_relink_merge_request_jobs`). Resolve the row through that
+/// parent when the input id is an action_run. `None` when the id is not an
+/// action_run, or its parent job owns no PR.
+async fn query_mr_context_for_action_run_parent(
+    conn: &cairn_db::turso::Connection,
+    action_run_id: &str,
+) -> DbResult<Option<MrContext>> {
+    let mut rows = conn
+        .query(
+            "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local
+             FROM action_runs ar
+             JOIN merge_requests mr ON mr.job_id = ar.parent_job_id
+             JOIN projects p ON mr.project_id = p.id
+             WHERE ar.id = ?1
+             LIMIT 1",
+            params![action_run_id],
+        )
+        .await?;
+
+    rows.next()
+        .await?
+        .map(|row| {
+            Ok(MrContext {
+                mr_id: row.text(0)?,
+                pr_url: row.opt_text(1)?.unwrap_or_default(),
+                github_pr_number: row.opt_i64(2)?.map(|value| value as i32),
+                repo_path: row.text(3)?,
+                job_id: row.text(4)?,
+                is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
+            })
+        })
+        .transpose()
+}
+
 pub(super) async fn query_mr_context_for_create_pr_artifact_job(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<MrContext>> {
+    // 1. Direct: the id owns the row (builder job, or a legacy action-run-keyed row).
     if let Some(context) = query_mr_context_for_job(conn, job_id).await? {
         return Ok(Some(context));
     }
+    // 2. The id is a `pr`/`create_pr` action_run: its `parent_job_id` owns the row.
+    if let Some(context) = query_mr_context_for_action_run_parent(conn, job_id).await? {
+        return Ok(Some(context));
+    }
+    // 3. Snapshot forward-walk from a producing job to its `pr` node (legacy/other).
     query_pr_node_mr_context_for_artifact_job(conn, job_id).await
 }
 
@@ -292,14 +334,16 @@ pub(super) async fn load_mr_branches(
 
 /// Try to resolve PR context for a job; `Ok(None)` when the job has no PR.
 ///
-/// Owner-aware: the direct `merge_requests.job_id = ?` lookup runs first, then a
-/// fallback that walks the execution snapshot from this job's node to the `pr`
-/// node that opened the row (`query_mr_context_for_create_pr_artifact_job`). A
-/// build recipe opens the child PR via a first-class `pr` action node, but the
-/// durable row is keyed by the producing builder job so analytics and file-change
-/// joins have a real `jobs.id`. The fallback preserves resolution from the
-/// builder artifact and from legacy action-run-keyed rows that could not be
-/// repaired.
+/// Owner-aware and id-shape-agnostic, so both action surfaces resolve the same
+/// row (`query_mr_context_for_create_pr_artifact_job`): (1) the direct
+/// `merge_requests.job_id = ?` lookup runs first — the builder-job id, or a
+/// legacy action-run-keyed row; (2) when the id is a `pr`/`create_pr` action_run
+/// (the node surface's owner id), resolve through `action_runs.parent_job_id`,
+/// the producing builder job that owns the row; (3) a final fallback walks the
+/// execution snapshot forward from a producing job's node to the `pr` node that
+/// opened the row. A build recipe opens the child PR via a first-class `pr`
+/// action node, but the durable row is keyed by the producing builder job so
+/// analytics and file-change joins have a real `jobs.id`.
 pub async fn try_resolve_mr_context_for_job(
     db: &LocalDb,
     job_id: &str,
@@ -352,6 +396,27 @@ mod tests {
         assert_eq!(
             ctx.job_id, "builder-job",
             "the resolved owner is the persisted builder job"
+        );
+    }
+
+    /// The node surface (`write .../pr {action:merge}`) resolves the `pr` node to
+    /// the `pr` action_run id, whose `parent_job_id` owns the builder-job-keyed
+    /// row. This mirrors `try_resolve_mr_context_follows_pr_node_owner` but starts
+    /// from the action_run id, reproducing the reported `node pr has no PR yet`
+    /// failure without the parent-job fallback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn try_resolve_mr_context_from_pr_action_run() {
+        let db = migrated_db().await;
+        seed_pr_node_merge_request_for_artifact_job(&db).await;
+
+        let ctx = try_resolve_mr_context_for_job(&db, "pr-action-run")
+            .await
+            .unwrap()
+            .expect("the pr action_run resolves its parent-job-owned MR");
+        assert_eq!(ctx.mr_id, "mr-pr-node");
+        assert_eq!(
+            ctx.job_id, "builder-job",
+            "resolution walks action_runs.parent_job_id to the builder job"
         );
     }
 }

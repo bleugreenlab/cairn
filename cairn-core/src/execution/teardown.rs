@@ -334,6 +334,12 @@ pub(crate) async fn execute_target_cleanup(
 pub enum TeardownScope {
     /// All jobs across an issue (PR merge/close, issue close/delete).
     Issue(String),
+    /// Exactly one job's worktree. Used to reclaim an ambient parent's ephemeral
+    /// task worktree the moment that task job terminalizes — job-scoped rather
+    /// than issue-scoped because the owning issue (an ambient Manager) is
+    /// long-lived and never terminalizes, so the issue-scoped sweep would let the
+    /// task worktree accumulate.
+    Job(String),
 }
 
 /// The branch-deletion policy for an issue teardown.
@@ -378,6 +384,7 @@ pub async fn plan_teardown(
 ) -> Result<Vec<TeardownTarget>, String> {
     let (scope_col, scope_id) = match scope {
         TeardownScope::Issue(id) => ("issue_id", id.clone()),
+        TeardownScope::Job(id) => ("id", id.clone()),
     };
 
     // `scope_col` is a fixed literal from the match above, never user input.
@@ -452,14 +459,30 @@ pub async fn teardown_worktrees(
     scope: TeardownScope,
     reason: TeardownReason,
 ) -> Result<(), String> {
-    // Route to the issue's owning database: a team issue's jobs (and their
+    // Route to the scope's owning database: a team issue's jobs (and their
     // worktree_path rows, terminals, and browsers) live wholly in its synced
     // replica, so planning and cleanup must read/write there or the team's
-    // worktrees leak and its terminal/browser rows are never cleared.
-    let TeardownScope::Issue(issue_id) = &scope;
-    let db = crate::issues::crud::owning_db_for_issue(&orch.db, issue_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    // worktrees leak and its terminal/browser rows are never cleared. A
+    // Job-scoped reclaim routes by the job instead.
+    let (db, issue_id): (std::sync::Arc<LocalDb>, Option<String>) = match &scope {
+        TeardownScope::Issue(issue_id) => (
+            crate::issues::crud::owning_db_for_issue(&orch.db, issue_id)
+                .await
+                .map_err(|e| e.to_string())?,
+            Some(issue_id.clone()),
+        ),
+        TeardownScope::Job(job_id) => (
+            crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+                .await
+                .map_err(|e| e.to_string())?,
+            None,
+        ),
+    };
+    // The Merged reason (landed-aware branch preservation) only ever pairs with an
+    // Issue scope; a Job-scoped reclaim is always Discarded. `issue_id` is None
+    // only in that Discarded case, so this empty fallback is never consulted for a
+    // real merge-target resolution.
+    let issue_id_str = issue_id.as_deref().unwrap_or("");
     let targets = plan_teardown(&db, &scope).await?;
     if targets.is_empty() {
         return Ok(());
@@ -492,8 +515,13 @@ pub async fn teardown_worktrees(
             let delete_branch = match reason {
                 TeardownReason::Discarded => true,
                 TeardownReason::Merged => {
-                    match resolve_merge_target_for_source(&db, issue_id, branch, &target.job_ids)
-                        .await
+                    match resolve_merge_target_for_source(
+                        &db,
+                        issue_id_str,
+                        branch,
+                        &target.job_ids,
+                    )
+                    .await
                     {
                         // A branch never lands "into itself" (a Coordinator whose
                         // own branch IS the target): nothing folds it elsewhere,
@@ -504,13 +532,13 @@ pub async fn teardown_worktrees(
                                 Ok(true) => true,
                                 Ok(false) => {
                                     log::warn!(
-                                        "Teardown: PRESERVING branch `{branch}` — its tip has NOT landed in merge target `{merge_target}` for merged issue {issue_id}; deleting it would strand commits. Keeping the local branch and skipping the remote delete.",
+                                        "Teardown: PRESERVING branch `{branch}` — its tip has NOT landed in merge target `{merge_target}` for merged issue {issue_id_str}; deleting it would strand commits. Keeping the local branch and skipping the remote delete.",
                                     );
                                     false
                                 }
                                 Err(e) => {
                                     log::warn!(
-                                        "Teardown: could not verify whether branch `{branch}` landed in `{merge_target}` for merged issue {issue_id} ({e}); PRESERVING it (fail-closed).",
+                                        "Teardown: could not verify whether branch `{branch}` landed in `{merge_target}` for merged issue {issue_id_str} ({e}); PRESERVING it (fail-closed).",
                                     );
                                     false
                                 }
@@ -518,7 +546,7 @@ pub async fn teardown_worktrees(
                         }
                         None => {
                             log::warn!(
-                                "Teardown: no merge target resolved for branch `{branch}` on merged issue {issue_id}; PRESERVING it (fail-closed).",
+                                "Teardown: no merge target resolved for branch `{branch}` on merged issue {issue_id_str}; PRESERVING it (fail-closed).",
                             );
                             false
                         }
@@ -1212,6 +1240,45 @@ mod tests {
             .await
             .unwrap();
         assert!(targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn job_scope_targets_only_that_job() {
+        // A Job-scoped teardown (ephemeral task worktree reclaim) selects exactly
+        // the named job's worktree, not the whole issue's — the ambient Manager
+        // issue never terminalizes, so an issue-scoped sweep would never fire.
+        let db = migrated_db().await;
+        seed_project(&db, "p-1", "CAIRN").await;
+        seed_issue(&db, "p-1", "i-1", 1).await;
+        seed_job(
+            &db,
+            "task",
+            "p-1",
+            Some("i-1"),
+            None,
+            Some("/wt/task"),
+            Some("agent/task"),
+            "complete",
+        )
+        .await;
+        seed_job(
+            &db,
+            "other",
+            "p-1",
+            Some("i-1"),
+            None,
+            Some("/wt/other"),
+            Some("agent/other"),
+            "running",
+        )
+        .await;
+
+        let targets = plan_teardown(&db, &TeardownScope::Job("task".into()))
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].worktree_path, "/wt/task");
+        assert_eq!(sorted_job_ids(&targets[0]), vec!["task"]);
     }
 
     /// The merged-teardown guard resolves a source branch's merge target through

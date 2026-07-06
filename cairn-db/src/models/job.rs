@@ -20,6 +20,13 @@ pub enum JobStatus {
     Complete, // Finished with artifacts
     Failed,   // Error occurred or cascaded from upstream
     Blocked,  // Checkpoint awaiting approval
+    // Idle: a long-running node ended its turn with no unmet output contract.
+    // Non-terminal and resumable — it fires no JobEnded, advances no DAG, and
+    // keeps taking wakes until the issue is closed. Only nodes a recipe's
+    // topology derives as long-running (a contract-less control-terminal in a
+    // recipe with no terminal action node) reach this; every other node still
+    // completes at turn-end.
+    Idle,
     // Archived: the job's recipe node was removed from the execution snapshot
     // mid-flight. Not derived from facts — it is an explicit override the status
     // projection treats as sticky (see `execution::advancement::recompute`). The
@@ -47,6 +54,7 @@ impl std::fmt::Display for JobStatus {
             JobStatus::Complete => write!(f, "complete"),
             JobStatus::Failed => write!(f, "failed"),
             JobStatus::Blocked => write!(f, "blocked"),
+            JobStatus::Idle => write!(f, "idle"),
             JobStatus::Cancelled => write!(f, "cancelled"),
         }
     }
@@ -65,6 +73,7 @@ impl std::str::FromStr for JobStatus {
             "complete" => Ok(JobStatus::Complete),
             "failed" => Ok(JobStatus::Failed),
             "blocked" => Ok(JobStatus::Blocked),
+            "idle" => Ok(JobStatus::Idle),
             "cancelled" => Ok(JobStatus::Cancelled),
             _ => Err(format!("Unknown job status: {}", s)),
         }

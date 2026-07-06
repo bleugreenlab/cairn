@@ -3,14 +3,17 @@
 //!
 //! `bun run dev:instance` (scripts/dev-instance.ts) launches a branch-keyed dev
 //! build whose home is `~/.cairn-dev-<key>` (key = slugified branch), database at
-//! `<home>/cairn.db`, and MCP callback port `3860 + slot` where the slot is
-//! persisted per branch in `~/.cairn-dev-instances.json`. That running
-//! build holds a process lock on its own database file, so this module never
-//! opens the file directly: it asks the instance's own MCP callback server to run
-//! the read-only `cairn://db` projection and relays the rows. The instance
-//! therefore re-validates the read-only statement policy on its side, and a
-//! not-running instance surfaces as an actionable error rather than a stale file
-//! read. See docs/dev-instances.md.
+//! `<home>/cairn.db`, and — since the runner-daemon cutover — a `cairn-runner`
+//! that owns that database and hosts the `/api/mcp` callback route on the runner
+//! transport port `3849 + slot`, where the slot is persisted per branch in
+//! `~/.cairn-dev-instances.json`. (Before the cutover this route lived on the
+//! separate MCP callback port `3860 + slot`; the runner unified the two, so the
+//! reachable port is now the runner port.) That running runner holds a process
+//! lock on its own database file, so this module never opens the file directly:
+//! it asks the instance's own runner to run the read-only `cairn://db` projection
+//! over `/api/mcp` and relays the rows. The instance therefore re-validates the
+//! read-only statement policy on its side, and a not-running instance surfaces as
+//! an actionable error rather than a stale file read. See docs/dev-instances.md.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -41,8 +44,9 @@ pub(crate) struct DevInstance {
     pub branch: String,
     /// Instance home directory (holds the `mcp_auth_secret`).
     pub home: PathBuf,
-    /// MCP callback port (`3860 + slot`).
-    pub callback_port: u16,
+    /// Runner transport port (`3849 + slot`); the instance's `cairn-runner`
+    /// hosts the `/api/mcp` callback route on this port.
+    pub runner_port: u16,
 }
 
 /// Why a selector could not be resolved to a single instance.
@@ -100,13 +104,13 @@ fn instances_from(home_root: &Path, registry: &BTreeMap<String, u32>) -> Vec<Dev
         .filter_map(|(branch, slot)| {
             let key = paths::dev_instance_slug(branch)?;
             let port =
-                paths::DEV_INSTANCE_CALLBACK_PORT_BASE.checked_add(u16::try_from(*slot).ok()?)?;
+                paths::DEV_INSTANCE_RUNNER_PORT_BASE.checked_add(u16::try_from(*slot).ok()?)?;
             let home = home_root.join(format!("{}{key}", paths::DEV_INSTANCE_HOME_PREFIX));
             Some(DevInstance {
                 key,
                 branch: branch.clone(),
                 home,
-                callback_port: port,
+                runner_port: port,
             })
         })
         .collect();
@@ -195,11 +199,9 @@ pub(crate) async fn resolve_instance(selector: Option<&str>) -> Result<DevInstan
 /// The registry accumulates an entry per branch ever launched, so a sequential
 /// probe would be slow — these run together under one probe timeout.
 async fn running_keys(instances: &[DevInstance]) -> Vec<String> {
-    let probes = instances.iter().map(|inst| async move {
-        is_running(inst.callback_port)
-            .await
-            .then(|| inst.key.clone())
-    });
+    let probes = instances
+        .iter()
+        .map(|inst| async move { is_running(inst.runner_port).await.then(|| inst.key.clone()) });
     join_all(probes).await.into_iter().flatten().collect()
 }
 
@@ -277,7 +279,7 @@ pub(crate) async fn query_db(
         payload: serde_json::json!({ "paths": [inner_uri] }),
         tool_use_id: None,
     };
-    let url = format!("http://127.0.0.1:{}/api/mcp", instance.callback_port);
+    let url = format!("http://127.0.0.1:{}/api/mcp", instance.runner_port);
 
     let client = reqwest::Client::builder()
         .timeout(DEV_DB_HTTP_TIMEOUT)
@@ -292,8 +294,8 @@ pub(crate) async fn query_db(
         .await
         .map_err(|error| {
             format!(
-                "Dev instance '{}' is not reachable on callback port {} ({error}). Start it from its worktree with `bun run dev:instance`, or pick another with cairn://dev/db?at=<key>.",
-                instance.key, instance.callback_port
+                "Dev instance '{}' is not reachable on runner port {} ({error}). Start it from its worktree with `bun run dev:instance`, or pick another with cairn://dev/db?at=<key>.",
+                instance.key, instance.runner_port
             )
         })?;
 
@@ -347,7 +349,7 @@ pub(crate) async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
         payload: serde_json::json!({}),
         tool_use_id: None,
     };
-    let url = format!("http://127.0.0.1:{}/api/mcp", instance.callback_port);
+    let url = format!("http://127.0.0.1:{}/api/mcp", instance.runner_port);
 
     let client = reqwest::Client::builder()
         .timeout(DEV_DB_HTTP_TIMEOUT)
@@ -362,8 +364,8 @@ pub(crate) async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
         .await
         .map_err(|error| {
             format!(
-                "not reachable on callback port {} ({error})",
-                instance.callback_port
+                "not reachable on runner port {} ({error})",
+                instance.runner_port
             )
         })?;
 
@@ -415,7 +417,7 @@ async fn partition_live() -> (Vec<DevInstance>, usize) {
 fn instance_line(inst: &DevInstance) -> String {
     format!(
         "- {} branch={} port={}",
-        inst.key, inst.branch, inst.callback_port
+        inst.key, inst.branch, inst.runner_port
     )
 }
 
@@ -521,7 +523,7 @@ async fn pid_line(inst: &DevInstance) -> String {
     match query_pid(inst).await {
         Ok(pid) => format!(
             "- {} branch={} pid={} port={}",
-            inst.key, inst.branch, pid, inst.callback_port
+            inst.key, inst.branch, pid, inst.runner_port
         ),
         Err(error) => format!(
             "- {} branch={} unavailable ({error})",
@@ -550,7 +552,7 @@ mod tests {
         let inst = &instances[0];
         assert_eq!(inst.key, "agent-cairn-1928-builder-0");
         assert_eq!(inst.branch, "agent/CAIRN-1928-builder-0");
-        assert_eq!(inst.callback_port, 3863); // 3860 + slot 3
+        assert_eq!(inst.runner_port, paths::DEV_INSTANCE_RUNNER_PORT_BASE + 3); // 3849 + slot 3
         assert_eq!(
             inst.home,
             Path::new("/home/u/.cairn-dev-agent-cairn-1928-builder-0")

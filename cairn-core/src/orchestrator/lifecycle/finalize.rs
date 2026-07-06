@@ -7,7 +7,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, RowExt};
 
 use super::common::*;
-use super::review_push::{emit_for_turn_end, spawn_turn_end_checks};
+use super::review_push::{detach_onto_runtime, emit_for_turn_end, spawn_turn_end_checks};
 
 /// Transition a run to warm state after successful turn completion.
 ///
@@ -54,9 +54,10 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
             // without depending on the recompute sweep poke that this work
             // is replacing.
             let needs_attention = emit_for_turn_end(orch, &job_id);
-            // Turn-end project checks (when:idle/when:review), detached so the
-            // suite never blocks the turn from ending.
+            // Turn-end project checks (when:review), detached so the suite never
+            // blocks the turn from ending.
             spawn_turn_end_checks(orch, &job_id);
+            maybe_reclaim_ephemeral_task_worktree(orch, &job_id);
             // Raise the desktop "completed" toast only when that idle left
             // something for the driver/user to act on — a plan awaiting
             // confirmation, a PR awaiting merge, a pending question, or a
@@ -339,6 +340,67 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
     finalize_run(orch, run_id, RunStatus::Crashed);
 }
 
+/// Reclaim a task's ephemeral worktree the moment its owning job terminalizes.
+///
+/// A task delegated by an ambient (no-worktree) parent runs in its own throwaway
+/// worktree marked `owns_ephemeral_worktree`; it has no PR machinery, so nothing
+/// else tears it down. When the job reaches a terminal status, discard that one
+/// worktree — detached so it never blocks the turn from ending. A task suspended
+/// waiting on its own sub-tasks is not terminal, so this cannot fire while
+/// inheritors still share the worktree; by the time the task terminalizes they
+/// already have. Both turn-end sites (warm transition and run finalize) call this
+/// after recompute so a clean completion and a crash are covered.
+fn maybe_reclaim_ephemeral_task_worktree(orch: &Orchestrator, job_id: &str) {
+    let Some((status, owns)) = load_job_status_and_ephemeral(orch, job_id) else {
+        return;
+    };
+    if !owns || !matches!(status.as_str(), "complete" | "failed" | "cancelled") {
+        return;
+    }
+    let orch = orch.clone();
+    let job_id = job_id.to_string();
+    detach_onto_runtime(
+        async move {
+            if let Err(e) = crate::execution::teardown::teardown_worktrees(
+                &orch,
+                crate::execution::teardown::TeardownScope::Job(job_id.clone()),
+                crate::execution::teardown::TeardownReason::Discarded,
+            )
+            .await
+            {
+                log::warn!("ephemeral task worktree reclaim failed for {job_id}: {e}");
+            }
+        },
+        || {},
+    );
+}
+
+fn load_job_status_and_ephemeral(orch: &Orchestrator, job_id: &str) -> Option<(String, bool)> {
+    let db = orch.db.local.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        db.read(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT status, owns_ephemeral_worktree FROM jobs WHERE id = ?1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                Ok(match rows.next().await? {
+                    Some(row) => Some((row.text(0)?, row.i64(1)? != 0)),
+                    None => None,
+                })
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .ok()
+    .flatten()
+}
+
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     // Clean up system prompt temp file
     crate::orchestrator::session::cleanup_prompt_file(run_id);
@@ -443,6 +505,7 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
             // suite never blocks the turn from ending. Mirrors the warm-transition
             // turn-end caller above.
             spawn_turn_end_checks(orch, &job_id);
+            maybe_reclaim_ephemeral_task_worktree(orch, &job_id);
             // Run-terminal idle: flush any directs/side-channel notices still
             // pending for this run so a queued child-attention update is not
             // stranded when the run never takes another turn (CAIRN-1297).

@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn issue_dependencies_gate_non_manager_jobs() {
+    async fn issue_dependencies_gate_issue_scoped_jobs() {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {

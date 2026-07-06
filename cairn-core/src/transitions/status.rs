@@ -223,6 +223,8 @@ fn valid_job_transition(from: &JobStatus, to: &JobStatus) -> bool {
             | (JobStatus::Complete, JobStatus::Pending)
             | (JobStatus::Failed, JobStatus::Running)
             | (JobStatus::Failed, JobStatus::Pending)
+            | (JobStatus::Idle, JobStatus::Running)
+            | (JobStatus::Idle, JobStatus::Pending)
     )
 }
 

@@ -12,7 +12,6 @@ use crate::execution::checks::load_live_project_checks;
 use crate::execution::checks_turn_end::{read_turn_end_log_tail, resolve_job_coords};
 use crate::execution::selection::plan_checks;
 use crate::jj::{node_changed_files, sealed_tree_hash, JjEnv};
-use crate::orchestrator::attention_push;
 use crate::orchestrator::Orchestrator;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -39,7 +38,6 @@ pub enum NodeCheckState {
     Failed,
     Running,
     Pending,
-    AwaitingPr,
     NotApplicable,
 }
 
@@ -78,12 +76,6 @@ pub async fn node_check_statuses(
         .map(|row| (row.check_name.clone(), row))
         .collect();
 
-    let owning = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
-        .await
-        .ok()?;
-    let pr_open = attention_push::has_open_pr_for_issue(&owning, &coords.issue_id)
-        .await
-        .unwrap_or(false);
     let in_flight = orch.turn_end_checks_in_flight(job_id);
     let log_tail = if in_flight {
         read_turn_end_log_tail(orch, job_id)
@@ -116,20 +108,17 @@ pub async fn node_check_statuses(
                     return status_from_row(&name, check.policy, check.when, row);
                 }
 
-                let state =
-                    if in_flight && matches!(check.when, CheckWhen::Idle | CheckWhen::Review) {
-                        NodeCheckState::Running
-                    } else if check.when == CheckWhen::Review && !pr_open {
-                        NodeCheckState::AwaitingPr
-                    } else if plans_by_name
-                        .as_ref()
-                        .and_then(|plans| plans.get(&name))
-                        .is_some_and(|plan| !plan.applies)
-                    {
-                        NodeCheckState::NotApplicable
-                    } else {
-                        NodeCheckState::Pending
-                    };
+                let state = if in_flight && check.when == CheckWhen::Review {
+                    NodeCheckState::Running
+                } else if plans_by_name
+                    .as_ref()
+                    .and_then(|plans| plans.get(&name))
+                    .is_some_and(|plan| !plan.applies)
+                {
+                    NodeCheckState::NotApplicable
+                } else {
+                    NodeCheckState::Pending
+                };
 
                 NodeCheckStatus {
                     name,

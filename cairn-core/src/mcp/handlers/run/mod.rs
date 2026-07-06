@@ -25,7 +25,10 @@ pub(crate) use process::{apply_non_interactive_pager_env_to_pty, MAX_BUFFER_SIZE
 pub use redact::redact_command;
 pub(crate) use sandbox_policy::build_run_sandbox_policy;
 pub(crate) use types::PromotedTerminal;
-pub use types::{RunCompletePayload, RunItem, RunItemPayload, RunOutputPayload, RunPayload};
+pub use types::{
+    CheckStatusEntry, CheckStatusPayload, RunCompletePayload, RunItem, RunItemPayload,
+    RunOutputPayload, RunPayload,
+};
 
 use commit_barrier::run_commit_barrier;
 use hygiene::{
@@ -124,8 +127,8 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     let branch_scoped_run = branch_checkout.is_some();
 
     // Changes can only happen in a worktree. A non-jj cwd is the project's live
-    // checkout behind a long-lived manager / triage / read-only agent (project
-    // chat included). A `commit_msg` means the caller intends to commit, which
+    // checkout behind a long-lived triage / read-only agent or another
+    // no-worktree run. A `commit_msg` means the caller intends to commit, which
     // requires a worktree; reject the whole batch BEFORE running any command, so
     // nothing executes against — or is left in — the user's live checkout. (The
     // commit barrier itself cannot help here: NonWorktreeVcs is a read-only
@@ -178,7 +181,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // Capture the pre-batch snapshot whenever a no-`commit_msg` run could leave
     // dirt the barrier must reconcile. For a worktree this is gated on the
     // hygiene fence (Ask/Deny). For the project's LIVE checkout we capture
-    // regardless of fence — project chat carries no execution snapshot and is
+    // regardless of fence; a request without an execution snapshot is
     // unconfined, yet a stray write there still violates the worktree boundary
     // and must be flagged (read-only detection; never reverted). The commit_msg
     // case on a non-worktree cwd already returned early above.

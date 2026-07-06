@@ -20,7 +20,7 @@ use super::{emit_attention, AttentionEvent};
 
 /// Inline budget the permission handlers wait synchronously before durably
 /// suspending the run. Mirrors `planning::INLINE_PROMPT_WAIT_BUDGET`: long
-/// enough that a human or manager answering promptly keeps the CLI process
+/// enough that a human or automation answering promptly keeps the CLI process
 /// warm, short enough to suspend before the surrounding callback budget
 /// expires. There is no auto-deny — a fence that no one answers stays pending
 /// and is answerable whenever via the UI or the `permissions` resource.
@@ -81,7 +81,7 @@ pub(crate) async fn await_permission_decision(
             let tool_input_json = tool_input_json.clone();
             let process_turn_id = process_turn_id.clone();
             Box::pin(async move {
-                // Owning node job for this run; None for project-chat runs.
+                // Owning node job for this run; None when the run has no job.
                 let job_id = {
                     let mut rows = conn
                         .query(
@@ -583,7 +583,7 @@ pub fn deny_response(message: &str) -> String {
 ///
 /// Path: run → job → execution → snapshot → agent.fence, applying
 /// [`Fence::default`] when the field is `None`. Returns `None` when the run has
-/// no execution snapshot (e.g. project chat) — in which case no fence applies,
+/// no execution snapshot — in which case no fence applies,
 /// preserving the unconfined default.
 pub(crate) async fn resolve_fence_policy(
     orch: &Orchestrator,
@@ -1435,7 +1435,7 @@ pub async fn record_permission_response(
                 // the predecessor. Without this the successor turn is never
                 // created, `should_resume_permission_response` stays false, and
                 // the run parks forever (allow and deny both no-ops). A request
-                // with no owning job (project chat) legitimately has no turn and
+                // with no owning job legitimately has no turn and
                 // must NOT be force-resumed, so the fallback is gated on job
                 // ownership.
                 let predecessor_turn_id = match row.opt_text(2)? {

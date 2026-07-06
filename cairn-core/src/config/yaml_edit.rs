@@ -368,7 +368,7 @@ mod tests {
     #[test]
     #[ignore]
     fn dump_tree() {
-        let src = "# header\nchecks:\n  # note\n  frontend:\n    command: vitest\n    when: idle\n  typecheck:\n    command: tsc\nsetupCommands:\n- npm install\n";
+        let src = "# header\nchecks:\n  # note\n  frontend:\n    command: vitest\n    when: review\n  typecheck:\n    command: tsc\nsetupCommands:\n- npm install\n";
         let ast = engine::parse(src, SupportLang::Yaml);
         fn walk(n: &SymbolNode, depth: usize, src: &str) {
             let range = n.range();
@@ -414,10 +414,10 @@ mod tests {
 
     #[test]
     fn noop_save_is_byte_identical() {
-        let original = "# Cairn Project Configuration\nchecks:\n  # frontend check\n  frontend:\n    command: vitest related {changedFiles}\n    when: idle\n  typecheck:\n    command: tsc --noEmit\nsetupCommands:\n- npm install\n";
+        let original = "# Cairn Project Configuration\nchecks:\n  # frontend check\n  frontend:\n    command: vitest related {changedFiles}\n    when: review\n  typecheck:\n    command: tsc --noEmit\nsetupCommands:\n- npm install\n";
         // Target equals the on-disk semantics.
         let target = map_of(
-            "checks:\n  frontend:\n    command: vitest related {changedFiles}\n    when: idle\n  typecheck:\n    command: tsc --noEmit\nsetupCommands:\n- npm install\n",
+            "checks:\n  frontend:\n    command: vitest related {changedFiles}\n    when: review\n  typecheck:\n    command: tsc --noEmit\nsetupCommands:\n- npm install\n",
         );
         let out = merge_into_yaml(original, &target, managed()).unwrap();
         assert_eq!(out, original, "no-op save must be byte-identical");
@@ -425,16 +425,16 @@ mod tests {
 
     #[test]
     fn scoped_edit_preserves_sibling_comments() {
-        let original = "# Cairn Project Configuration\nchecks:\n  # frontend runs vitest\n  frontend:\n    command: vitest related {changedFiles}\n    when: idle\n  # typecheck runs tsc\n  typecheck:\n    command: tsc --noEmit\n";
+        let original = "# Cairn Project Configuration\nchecks:\n  # frontend runs vitest\n  frontend:\n    command: vitest related {changedFiles}\n    when: review\n  # typecheck runs tsc\n  typecheck:\n    command: tsc --noEmit\n";
         let target = map_of(
-            "checks:\n  frontend:\n    command: NEWCMD\n    when: idle\n  typecheck:\n    command: tsc --noEmit\n",
+            "checks:\n  frontend:\n    command: NEWCMD\n    when: review\n  typecheck:\n    command: tsc --noEmit\n",
         );
         let out = merge_into_yaml(original, &target, managed()).unwrap();
         assert!(out.contains("# frontend runs vitest"), "out:\n{out}");
         assert!(out.contains("# typecheck runs tsc"), "out:\n{out}");
         assert!(out.contains("command: NEWCMD"), "out:\n{out}");
         assert!(out.contains("command: tsc --noEmit"), "out:\n{out}");
-        assert!(out.contains("when: idle"), "out:\n{out}");
+        assert!(out.contains("when: review"), "out:\n{out}");
         assert!(out.contains("# Cairn Project Configuration"), "out:\n{out}");
         // The change is scoped: the typecheck subtree bytes are untouched.
         assert!(

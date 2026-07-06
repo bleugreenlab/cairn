@@ -214,11 +214,11 @@ struct SessionDbContext {
     /// falling back to the project default for project-level runs or legacy rows.
     effective_base_branch: Option<String>,
     /// The run's job id, used to key the per-job scratch dir surfaced in the
-    /// orientation block. `None` for runs with no job (project chat).
+    /// orientation block. `None` for runs with no owning job.
     job_id: Option<String>,
     /// The run's recipe node id, used to resolve this node's `context-self`
     /// living-doc targets for the prompt affordance. `None` for sub-agent task
-    /// jobs and project chat (no recipe node).
+    /// jobs with no recipe node.
     recipe_node_id: Option<String>,
 }
 
@@ -318,7 +318,7 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
 
 /// Resolve a node's `context-self` living-doc targets for the prompt affordance:
 /// the ArtifactNodes this node owns and patches across its life (name + schema).
-/// Empty for jobs with no recipe node (sub-agent tasks, project chat) or no
+/// Empty for jobs with no recipe node or no
 /// `context-self` edges. A read failure degrades to no affordance rather than
 /// failing session startup.
 fn resolve_ctx_self_targets(
@@ -339,6 +339,38 @@ fn resolve_ctx_self_targets(
             Box::pin(async move {
                 crate::execution::jobs::resolve_ctx_self_schemas_conn(conn, &node_id, &execution_id)
                     .await
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or_default()
+}
+
+/// Resolve the system-prompt instruction text a running node inherits from its
+/// upstream Instruction nodes (see
+/// [`crate::execution::jobs::resolve_instruction_prompt_conn`]). Returns an empty
+/// string for any node with no Instruction edge, and on any read error, so
+/// session startup never fails on this and a recipe with no Instruction node
+/// yields the bare role prompt.
+fn resolve_instruction_prompt(orch: &Orchestrator, execution_id: &str, node_id: &str) -> String {
+    let dbs = orch.db.clone();
+    let execution_id = execution_id.to_string();
+    let node_id = node_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.read(|conn| {
+            let execution_id = execution_id.clone();
+            let node_id = node_id.clone();
+            Box::pin(async move {
+                crate::execution::jobs::resolve_instruction_prompt_conn(
+                    conn,
+                    &node_id,
+                    &execution_id,
+                )
+                .await
             })
         })
         .await
@@ -500,9 +532,9 @@ fn build_project_checks_section(
         "Configured checks from `.cairn/config.yaml`, run automatically on a cadence:\n\n\
          - `when: write` checks run right after each source-touching commit; their verdicts \
          (with test counts) are appended to the committing tool result.\n\
-         - `when: idle` checks run in the background at turn-end; `when: review` re-runs the \
-         full suites while a PR is open. A failing turn-end check wakes this session with the \
-         results inlined; passing results ride along passively into your next turn.\n\n\
+         - `when: review` checks run in the background at every turn-end, re-running the \
+         fuller suites. A failing turn-end check wakes this session with the results inlined; \
+         passing results ride along passively into your next turn.\n\n\
          Trust the cadence: a green verdict with a test count covers the diff, so the per-suite \
          commands exist for iterating on a failure a check surfaced, not for re-verifying a \
          finished diff. What checks do NOT cover: live UI/feature verification and cross-system \
@@ -1617,6 +1649,24 @@ pub fn start_agent_session(
                 .map(|a| a.prompt.clone())
                 .unwrap_or_default();
 
+            // Inject any upstream Instruction-node content into the system prompt,
+            // right after the role prompt and before the Available Agents section.
+            // Recipe authors carry role framing (for example, a coordinator's
+            // feature-specific tail) on Instruction nodes wired context-out -> context-in; a
+            // recipe with no Instruction node yields the bare role prompt.
+            let instruction = match (db_context.recipe_node_id.as_deref(), _execution_id) {
+                (Some(node_id), Some(execution_id)) => {
+                    resolve_instruction_prompt(orch, execution_id, node_id)
+                }
+                _ => String::new(),
+            };
+            if !instruction.is_empty() {
+                if !content.is_empty() {
+                    content.push_str("\n\n");
+                }
+                content.push_str(&instruction);
+            }
+
             // Append available agents list if the change tool is available.
             // Sub-agents are spawned by appending to the node's tasks collection
             // (`cairn:~/tasks`) via `write`, so the roster is gated on `write`.
@@ -2000,7 +2050,7 @@ mod tests {
         assert!(!block.contains("Base branch:"));
         assert!(!block.contains("Model:"));
         assert!(block.contains("Platform:"));
-        // No scratch line when the run has no job (e.g. project chat).
+        // No scratch line when the run has no owning job.
         assert!(!block.contains("Scratch dir"));
     }
 

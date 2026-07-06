@@ -1,4 +1,4 @@
-//! Project, project-issues, project-chat, and project-search resource readers.
+//! Project, project-issues, and project-search resource readers.
 
 use cairn_db::turso::params;
 

@@ -539,6 +539,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn base_branch_uses_default_when_parent_is_ambient() {
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+                     VALUES ('parent', 'proj-1', 1, 'Parent', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, parent_issue_id, created_at, updated_at)
+                     VALUES ('child', 'proj-1', 2, 'Child', 'parent', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-1', 'recipe-default', 'parent', 'proj-1', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                // The coordinator runs ambiently with no worktree (Branch:
+                // main), so its live job never matches the `worktree_path IS NOT
+                // NULL` filter in `resolve_parent_branch`: the child bases off
+                // the project default branch 'main' rather than any parent
+                // integration branch.
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, created_at, updated_at)
+                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', NULL, NULL, 1, 1)",
+                    (),
+                )
+                .await?;
+                let branch = base_branch_for_issue_job(conn, "proj-1", "child").await?;
+                assert_eq!(branch.as_deref(), Some("main"));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn base_branch_honors_project_config_override() {
         // Repo with a `.cairn/config.yaml` that overrides the default branch.
         let repo = tempfile::tempdir().unwrap();

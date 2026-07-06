@@ -25,8 +25,8 @@
 //!
 //! ## Scope
 //!
-//! Only the `when:write` cadence runs here; `when:idle`/`when:review` run at
-//! turn-end ([`crate::execution::checks_turn_end`]). A check passes iff its
+//! Only the `when:write` cadence runs here; `when:review` runs at turn-end
+//! ([`crate::execution::checks_turn_end`]). A check passes iff its
 //! command exits `0` — output parsing ([`crate::execution::check_parsers`]) is
 //! pure enrichment (failing test names + excerpt) and never changes a verdict;
 //! a spawn error or sandbox denial is a clear failure, never a silent pass.
@@ -68,6 +68,7 @@ use crate::execution::selection::{plan_checks, CheckPlan};
 use crate::jj::{
     node_changed_files, sealed_tree_entries, sealed_tree_hash, tree_entries, GraphFileChange, JjEnv,
 };
+use crate::mcp::handlers::run::{CheckStatusEntry, CheckStatusPayload};
 use crate::mcp::handlers::RunContext;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -213,6 +214,13 @@ pub async fn run_write_checks_after_seal(
         })
         .collect();
 
+    // The live status-line emitter. `run_planned_checks` calls this with a full
+    // checklist snapshot on every state transition; we forward each snapshot to
+    // the frontend as a `check-status` event keyed by the committing call id.
+    // Follows the `db-change` emit idiom below.
+    let emitter = orch.services.emitter.clone();
+    let notify_run_id = run_context.run_id.clone();
+    let notify_tool_use_id = tool_use_id.to_string();
     let results = run_planned_checks(
         orch.db.local.clone(),
         &run_context.project_id,
@@ -230,6 +238,17 @@ pub async fn run_write_checks_after_seal(
                 CHECK_TIMEOUT_MS,
             )
             .await
+        },
+        move |checks| {
+            let _ = emitter.emit(
+                "check-status",
+                serde_json::to_value(CheckStatusPayload {
+                    run_id: notify_run_id.clone(),
+                    tool_use_id: notify_tool_use_id.clone(),
+                    checks,
+                })
+                .unwrap_or(serde_json::Value::Null),
+            );
         },
     )
     .await;
@@ -386,20 +405,14 @@ fn checks_from_source(
 }
 
 /// The subset of planned checks that both apply to the change set AND run at the
-/// `write` cadence. This is the gate: `when:idle`/`when:review` are excluded, and an
-/// impact-scoped check that no changed file matches has `applies == false`. With
-/// every `when:write` check impact-scoped, a doc-only / non-source commit yields
-/// an empty set, so nothing runs.
-/// The subset of planned checks that both apply to the change set AND run at a
-/// TURN-END cadence, given whether the node currently has an open PR. `when:idle`
-/// runs at every work-turn-end; `when:review` runs only when a PR is open;
-/// `when:write` never runs here (it is the mid-turn cadence). Pure, so the
-/// cadence + pr_open gate is unit-tested.
+/// TURN-END cadence. `when:review` (including the `idle` legacy alias) runs at
+/// every turn-end; `when:write` never runs here (it is the mid-turn cadence). An
+/// impact-scoped check that no changed file matches has `applies == false`. Pure,
+/// so the cadence gate is unit-tested.
 pub fn applicable_turn_end_checks(
     checks: &HashMap<String, CheckCommand>,
     changed: &[GraphFileChange],
     repo_root: &Path,
-    pr_open: bool,
 ) -> Vec<CheckPlan> {
     plan_checks(checks, changed, repo_root)
         .into_iter()
@@ -408,8 +421,7 @@ pub fn applicable_turn_end_checks(
             checks
                 .get(&plan.name)
                 .is_some_and(|check| match check.when {
-                    CheckWhen::Idle => true,
-                    CheckWhen::Review => pr_open,
+                    CheckWhen::Review => true,
                     CheckWhen::Write => false,
                 })
         })
@@ -615,12 +627,38 @@ pub(crate) fn input_hash_for(
 /// over the spawn closure so the cache hit/miss behavior is unit-testable without
 /// spawning a real process. Returns one [`CheckOutcome`] per check in plan order.
 ///
+/// ## Ordering
+///
+/// The checks run SEQUENTIALLY, in plan order. This is a correctness boundary,
+/// not just simplicity: a `when:write` check may rewrite tracked files (a
+/// formatter, a `--fix` lint) and those edits are folded into the seal only after
+/// every check finishes ([`fold_worktree_after_checks`]). Because all checks
+/// share the one sealed checkout, running them concurrently would let a read-only
+/// check (e.g. `migrations` reading a Rust file) observe a formatter's
+/// half-written tree, and the folded commit could then describe a tree no check
+/// actually validated. Sequential execution lets each mutating check's edits
+/// settle before the next check observes the worktree. Correct concurrent
+/// execution would need per-check worktree isolation; it is tracked separately.
+///
+/// ## Live status snapshots
+///
+/// `notify` receives a FULL checklist snapshot on every state transition (never a
+/// delta), so a frontend consumer stays stateless — the latest snapshot wins. The
+/// planned set (all `pending`) is emitted immediately; each entry then moves to
+/// `running` when its command starts and to `passed`/`failed` (annotated exactly
+/// as the final summary via [`summary_annotation`]) when it finishes. A cache hit
+/// jumps straight from `pending` to its final state with no `running` phase.
+///
 /// A miss parses the runner's output into structured per-test results
 /// ([`parse_check_output`]) and persists them in the cache row's
 /// `target_results_json`; a hit rehydrates that column. Parsing is pure
 /// enrichment — `passed` / `exit_code` stay exit-code-driven either way, so a
 /// parser miss can never turn a failing exit into a pass.
-async fn run_planned_checks<F, Fut>(
+// Each parameter is a distinct scalar/closure the runner genuinely needs (cache
+// identity, plan set, spawn closure, live-status notifier); grouping them into a
+// struct would only add indirection here.
+#[allow(clippy::too_many_arguments)]
+async fn run_planned_checks<F, Fut, N>(
     db: Arc<LocalDb>,
     project_id: &str,
     tree_hash: &str,
@@ -628,17 +666,54 @@ async fn run_planned_checks<F, Fut>(
     plans: &[(CheckPlan, String)],
     tool_use_id: &str,
     execute: F,
+    notify: N,
 ) -> Vec<CheckOutcome>
 where
     F: Fn(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<(Option<i32>, String), String>>,
+    N: Fn(Vec<CheckStatusEntry>),
 {
+    // Checklist snapshot, seeded all-`pending` from the plan list. Each check
+    // transitions ITS OWN entry and re-emits the whole snapshot, so the live line
+    // is self-healing (latest snapshot wins). A std Mutex keeps the transition
+    // helper a plain `Fn`; it is only ever locked to mutate + clone and released
+    // before the (synchronous) emit, so no guard is held across an await.
+    let snapshot: std::sync::Mutex<Vec<CheckStatusEntry>> = std::sync::Mutex::new(
+        plans
+            .iter()
+            .enumerate()
+            .map(|(index, (plan, _))| CheckStatusEntry {
+                index,
+                name: plan.name.clone(),
+                state: "pending".to_string(),
+                annotation: None,
+            })
+            .collect(),
+    );
+
+    // Transition one entry and re-emit the full snapshot. Scopes the guard so it
+    // drops before the emit (which never awaits).
+    let transition = |index: usize, state: &str, annotation: Option<String>| {
+        let cloned = {
+            let mut guard = snapshot.lock().unwrap();
+            if let Some(entry) = guard.get_mut(index) {
+                entry.state = state.to_string();
+                entry.annotation = annotation;
+            }
+            guard.clone()
+        };
+        notify(cloned);
+    };
+
+    // Emit the planned set (all pending) up front.
+    notify(snapshot.lock().unwrap().clone());
+
     let mut results = Vec::with_capacity(plans.len());
     for (index, (plan, input_hash)) in plans.iter().enumerate() {
         // Cache hit ⇒ reuse the stored verdict and rehydrate the structured
         // detail; run nothing. The lookup is keyed by the per-check INPUT hash, so
-        // a commit that changed none of this check's impact-matched files hits even
-        // though the whole-tree hash moved.
+        // a commit that changed none of this check's impact-matched files hits
+        // even though the whole-tree hash moved.
         if let Ok(Some(entry)) = get_check_result(db.clone(), project_id, &plan.name, input_hash) {
             // Re-stamp the row onto the current whole tree so the `/checks` listing
             // (keyed by whole-tree hash) still surfaces this check at the current
@@ -664,7 +739,7 @@ where
                 .target_results_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<ParsedCheckResult>(s).ok());
-            results.push(CheckOutcome {
+            let outcome = CheckOutcome {
                 name: plan.name.clone(),
                 passed: entry.passed,
                 exit_code: Some(entry.exit_code),
@@ -672,12 +747,20 @@ where
                 output_tail: entry.output_tail,
                 cached: true,
                 duration_ms: entry.duration_ms,
-            });
+            };
+            // A cache hit jumps straight from pending to its final state.
+            transition(
+                index,
+                if outcome.passed { "passed" } else { "failed" },
+                summary_annotation(&outcome),
+            );
+            results.push(outcome);
             continue;
         }
 
         // Miss ⇒ run to completion (streaming) and record the result keyed by the
         // input hash, stamped with the current whole tree.
+        transition(index, "running", None);
         let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
         let started = Instant::now();
         let (exit_code, passed, output) = match execute(plan.command.clone(), stream_id).await {
@@ -709,7 +792,7 @@ where
             },
         );
 
-        results.push(CheckOutcome {
+        let outcome = CheckOutcome {
             name: plan.name.clone(),
             passed,
             exit_code,
@@ -717,7 +800,13 @@ where
             output_tail,
             cached: false,
             duration_ms,
-        });
+        };
+        transition(
+            index,
+            if passed { "passed" } else { "failed" },
+            summary_annotation(&outcome),
+        );
+        results.push(outcome);
     }
     results
 }
@@ -1185,10 +1274,6 @@ mod tests {
             check("run-w", Some(&["src/**"]), CheckWhen::Write),
         );
         checks.insert(
-            "i".to_string(),
-            check("run-i", Some(&["src/**"]), CheckWhen::Idle),
-        );
-        checks.insert(
             "r".to_string(),
             check("run-r", Some(&["src/**"]), CheckWhen::Review),
         );
@@ -1196,42 +1281,44 @@ mod tests {
     }
 
     #[test]
-    fn turn_end_gate_runs_idle_but_not_review_without_a_pr() {
+    fn turn_end_gate_runs_review_not_write() {
         let plans = applicable_turn_end_checks(
             &cadence_checks(),
             &[change("src/App.tsx")],
             Path::new("/repo"),
-            false,
         );
         let names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["i"],
-            "idle runs; review is gated off, write never"
+            vec!["r"],
+            "review runs at every turn-end; write never runs here"
         );
     }
 
     #[test]
-    fn turn_end_gate_adds_review_when_a_pr_is_open() {
-        let plans = applicable_turn_end_checks(
-            &cadence_checks(),
-            &[change("src/App.tsx")],
-            Path::new("/repo"),
-            true,
+    fn turn_end_gate_runs_an_idle_aliased_check() {
+        // `when: idle` in a project config deserializes to CheckWhen::Review, so
+        // an un-migrated check still runs at turn-end (the alias path).
+        let aliased: CheckWhen = serde_yaml::from_str("idle").unwrap();
+        assert_eq!(aliased, CheckWhen::Review);
+        let mut checks = HashMap::new();
+        checks.insert(
+            "legacy".to_string(),
+            check("run", Some(&["src/**"]), aliased),
         );
+        let plans =
+            applicable_turn_end_checks(&checks, &[change("src/App.tsx")], Path::new("/repo"));
         let names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["i", "r"], "idle + review run; write never");
+        assert_eq!(names, vec!["legacy"]);
     }
 
     #[test]
     fn turn_end_gate_excludes_a_non_matching_impact() {
-        // A doc-only change matches no impact glob, so nothing applies even with
-        // a PR open.
+        // A doc-only change matches no impact glob, so nothing applies.
         let plans = applicable_turn_end_checks(
             &cadence_checks(),
             &[change("docs/x.md")],
             Path::new("/repo"),
-            true,
         );
         assert!(plans.is_empty());
     }
@@ -1483,6 +1570,7 @@ mod tests {
                     Ok((Some(0), "ran".to_string()))
                 }
             },
+            |_| {},
         )
         .await;
 
@@ -1517,6 +1605,7 @@ mod tests {
                     Ok((Some(1), "vitest failed".to_string()))
                 }
             },
+            |_| {},
         )
         .await;
 
@@ -1560,6 +1649,7 @@ mod tests {
                 let out = nextest_output.clone();
                 async move { Ok((Some(100), out)) }
             },
+            |_| {},
         )
         .await;
 
@@ -1609,6 +1699,7 @@ mod tests {
                     Ok((Some(0), "ran".to_string()))
                 }
             },
+            |_| {},
         )
         .await;
         assert_eq!(r1.len(), 1);
@@ -1636,6 +1727,7 @@ mod tests {
                     Ok((Some(0), "ran".to_string()))
                 }
             },
+            |_| {},
         )
         .await;
         assert_eq!(r2.len(), 1);
@@ -1657,5 +1749,178 @@ mod tests {
         let rows = crate::execution::cache::list_check_results(db, "project-a", "tree-2").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].check_name, "rust");
+    }
+
+    // --- live status snapshots + sequential ordering ----------------------
+
+    fn find<'a>(snap: &'a [CheckStatusEntry], name: &str) -> &'a CheckStatusEntry {
+        snap.iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` entry in snapshot"))
+    }
+
+    /// The notify callback receives a full checklist snapshot on every
+    /// transition: the planned set is all-pending, a cache hit jumps straight to
+    /// its final state (annotated `cached`, never `running`), and a miss passes
+    /// through `running` before its annotated final state.
+    #[tokio::test]
+    async fn notify_emits_planned_running_and_final_snapshots() {
+        let db = cache_db().await;
+        // frontend is already cached (passing); typecheck is a fresh miss.
+        store_check_result(
+            db.clone(),
+            CheckResultCacheWrite {
+                project_id: "project-a".to_string(),
+                tree_hash: "tree-a".to_string(),
+                input_hash: "ih-frontend".to_string(),
+                check_name: "frontend".to_string(),
+                exit_code: 0,
+                passed: true,
+                output_tail: String::new(),
+                duration_ms: 1,
+                target_results_json: None,
+                job_id: Some("job-a".to_string()),
+                cached: Some(false),
+            },
+        )
+        .unwrap();
+
+        let plans = vec![
+            (plan("frontend", "run-frontend"), "ih-frontend".to_string()),
+            (
+                plan("typecheck", "run-typecheck"),
+                "ih-typecheck".to_string(),
+            ),
+        ];
+        let snapshots: Arc<std::sync::Mutex<Vec<Vec<CheckStatusEntry>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = snapshots.clone();
+        run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-a",
+            "job-a",
+            &plans,
+            "tool",
+            // typecheck misses and fails with a bare exit code.
+            move |_command, _stream_id| async move { Ok((Some(1), "boom".to_string())) },
+            move |checks| captured.lock().unwrap().push(checks),
+        )
+        .await;
+
+        let snaps = snapshots.lock().unwrap();
+        assert!(
+            snaps.len() >= 4,
+            "planned + hit + running + final, got {}",
+            snaps.len()
+        );
+
+        // First snapshot is the planned set: everything pending, unannotated.
+        let planned = &snaps[0];
+        assert!(planned
+            .iter()
+            .all(|e| e.state == "pending" && e.annotation.is_none()));
+
+        // frontend was a cache hit: it reaches `passed` annotated `cached` and is
+        // NEVER seen in a `running` state (no run phase for a hit).
+        assert!(
+            snaps.iter().all(|s| find(s, "frontend").state != "running"),
+            "a cache hit must never pass through `running`"
+        );
+        let frontend_final = find(snaps.last().unwrap(), "frontend");
+        assert_eq!(frontend_final.state, "passed");
+        assert_eq!(frontend_final.annotation.as_deref(), Some("cached"));
+
+        // typecheck (a miss) passes through `running` (unannotated) then `failed`
+        // with the same annotation the final summary uses.
+        assert!(
+            snaps.iter().any(|s| {
+                let e = find(s, "typecheck");
+                e.state == "running" && e.annotation.is_none()
+            }),
+            "a miss must surface a `running` snapshot"
+        );
+        let typecheck_final = find(snaps.last().unwrap(), "typecheck");
+        assert_eq!(typecheck_final.state, "failed");
+        assert_eq!(typecheck_final.annotation.as_deref(), Some("exit 1"));
+    }
+
+    /// Outcomes — and the summary built from them — come back in plan order.
+    #[tokio::test]
+    async fn checks_return_and_summarize_in_plan_order() {
+        let db = cache_db().await;
+        let plans = vec![
+            (plan("a", "cmd-a"), "ih-a".to_string()),
+            (plan("b", "cmd-b"), "ih-b".to_string()),
+            (plan("c", "cmd-c"), "ih-c".to_string()),
+        ];
+        let results = run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-p",
+            "job-a",
+            &plans,
+            "tool",
+            move |_command, _stream_id| async move { Ok((Some(0), String::new())) },
+            |_| {},
+        )
+        .await;
+
+        let names: Vec<&str> = results.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"], "outcomes must be in plan order");
+        // The summary follows the same plan order (each name carries a duration
+        // annotation, so match on relative position rather than exact text).
+        let summary = format_check_summary(&results);
+        let pos = |name: &str| summary.find(name).expect("name present in summary");
+        assert!(
+            pos("a") < pos("b") && pos("b") < pos("c"),
+            "the summary must reflect plan order: {summary}"
+        );
+    }
+
+    /// The runner executes checks ONE AT A TIME: a mutating check (a formatter /
+    /// `--fix` lint) must settle before the next check observes the shared sealed
+    /// worktree, so no two check commands may overlap. Even when each executor
+    /// yields at an await, the concurrent-invocation high-water mark stays 1. This
+    /// guards against re-introducing concurrent execution without per-check
+    /// worktree isolation (the formatter/reader race).
+    #[tokio::test]
+    async fn checks_run_one_at_a_time() {
+        let db = cache_db().await;
+        let plans = vec![
+            (plan("x", "cmd-x"), "ih-x".to_string()),
+            (plan("y", "cmd-y"), "ih-y".to_string()),
+        ];
+        let active = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        let a = active.clone();
+        let hw = high_water.clone();
+        run_planned_checks(
+            db.clone(),
+            "project-a",
+            "tree-c",
+            "job-a",
+            &plans,
+            "tool",
+            move |_command, _stream_id| {
+                let a = a.clone();
+                let hw = hw.clone();
+                async move {
+                    let now = a.fetch_add(1, Ordering::SeqCst) + 1;
+                    hw.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    a.fetch_sub(1, Ordering::SeqCst);
+                    Ok((Some(0), String::new()))
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(
+            high_water.load(Ordering::SeqCst),
+            1,
+            "checks must not overlap; exactly one may run at a time"
+        );
     }
 }

@@ -86,12 +86,40 @@ pub async fn complete_action_run(
     let now = chrono::Utc::now().timestamp() as i32;
     let output_json = result.as_ref().map(|v| v.to_string());
 
-    // A `pr` node holds the DAG open: the action ran (PR is open, `open` port
-    // fired) but it is not Complete — it is `Blocked` until the PR merges or
-    // closes. A blocked action_run drives the issue's `NeedsApproval` attention
-    // exactly as a blocked job does (see `issue_progress_attention`), without
-    // being a job. Resolution flips it to Complete. See CAIRN-1220.
+    // A `pr` node normally holds the DAG open: the action ran (PR is open,
+    // `open` port fired) but it is not Complete — it is `Blocked` until the PR
+    // merges or closes. A blocked action_run drives the issue's `NeedsApproval`
+    // attention exactly as a blocked job does (see `issue_progress_attention`),
+    // without being a job. Resolution flips it to Complete. See CAIRN-1220.
+    //
+    // Declarative unattended recipes can opt out of that human gate with
+    // `actionParams: { action: "merge", method?: "squash" | "merge" | "rebase" }`.
+    // After opening the PR, route through the same merge implementation used by
+    // patching the node with `action:"merge"`, so GitHub branch protection and
+    // local merge gates still fail closed before Cairn marks anything merged.
     if node.node_type == crate::models::RecipeNodeType::Pr {
+        if let Some(method) = pr_node_auto_merge_method(node)? {
+            update_action_run_status(
+                &db,
+                action_run_id,
+                ActionRunStatus::Running,
+                output_json.as_deref(),
+                now,
+            )
+            .await?;
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "action_runs", "action": "update"}),
+            );
+            let pr_action_run = get_action_run(&db, action_run_id).await?;
+            let owner_id = pr_action_run
+                .parent_job_id
+                .as_deref()
+                .ok_or("PR action run has no parent_job_id for declarative auto-merge")?;
+            crate::pr_data::actions::merge_pr_for_job(orch, owner_id, method).await?;
+            return Ok(result);
+        }
+
         update_action_run_status(
             &db,
             action_run_id,
@@ -133,6 +161,37 @@ pub async fn complete_action_run(
     );
 
     Ok(result)
+}
+
+fn pr_node_auto_merge_method(node: &RecipeNode) -> Result<Option<Option<String>>, String> {
+    let Some(action_config) = node.action_config.as_ref() else {
+        return Ok(None);
+    };
+    let params = &action_config.action_params;
+    if params.is_null() {
+        return Ok(None);
+    }
+    let Some(action) = params.get("action") else {
+        return Ok(None);
+    };
+    let action = action
+        .as_str()
+        .ok_or("pr node actionParams.action must be a string when present")?;
+    if action != "merge" {
+        return Err(format!(
+            "unsupported pr node actionParams.action '{action}'; expected 'merge'"
+        ));
+    }
+    let method = match params.get("method") {
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or("pr node actionParams.method must be a string when present")?
+                .to_string(),
+        ),
+        None => None,
+    };
+    Ok(Some(method))
 }
 
 /// Execute an action node inline during DAG advancement.
@@ -2224,6 +2283,60 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pr_node_auto_merge_method_reads_action_params() {
+        let mut node = pr_node_with_action_params(serde_json::json!({}));
+        assert_eq!(pr_node_auto_merge_method(&node).unwrap(), None);
+
+        node = pr_node_with_action_params(serde_json::json!({ "action": "merge" }));
+        assert_eq!(pr_node_auto_merge_method(&node).unwrap(), Some(None));
+
+        node = pr_node_with_action_params(
+            serde_json::json!({ "action": "merge", "method": "rebase" }),
+        );
+        assert_eq!(
+            pr_node_auto_merge_method(&node).unwrap(),
+            Some(Some("rebase".to_string()))
+        );
+    }
+
+    #[test]
+    fn pr_node_auto_merge_method_rejects_invalid_action_params() {
+        let node = pr_node_with_action_params(serde_json::json!({ "action": "close" }));
+        assert!(pr_node_auto_merge_method(&node)
+            .unwrap_err()
+            .contains("expected 'merge'"));
+
+        let node =
+            pr_node_with_action_params(serde_json::json!({ "action": "merge", "method": 7 }));
+        assert!(pr_node_auto_merge_method(&node)
+            .unwrap_err()
+            .contains("method must be a string"));
+    }
+
+    fn pr_node_with_action_params(action_params: serde_json::Value) -> RecipeNode {
+        RecipeNode {
+            id: "pr".to_string(),
+            node_type: crate::models::RecipeNodeType::Pr,
+            name: "PR".to_string(),
+            position: crate::models::NodePosition { x: 0.0, y: 0.0 },
+            parent_id: None,
+            trigger_config: None,
+            agent_config: None,
+            action_config: Some(ActionNodeConfig {
+                action_config_id: None,
+                action: String::new(),
+                action_params,
+                input_schema: None,
+                output_schema: None,
+            }),
+            checkpoint_config: None,
+            artifact_config: None,
+            condition_config: None,
+            context_config: None,
+        }
     }
 
     #[test]

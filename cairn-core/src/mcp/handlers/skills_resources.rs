@@ -76,8 +76,7 @@ pub(crate) async fn project_path_by_key(
 /// Pick the directory whose `.cairn/skills/` should be read for project-scoped
 /// skills. Prefers an active worktree checkout so a skill authored or edited on
 /// the run's branch is visible from within that run; falls back to `base` (the
-/// project's base checkout) when there is no worktree or it is gone from disk —
-/// keeping the project-chat / manager path on base resolution.
+/// project's base checkout) when there is no worktree or it is gone from disk.
 fn prefer_worktree_root(worktree_path: Option<&str>, base: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(path) = worktree_path {
         let candidate = PathBuf::from(path);
@@ -698,8 +697,8 @@ mod tests {
     //
     // These exercise the real read path end-to-end against a migrated DB with a
     // seeded run, proving that an active worktree run resolves project skills
-    // from its branch checkout while a project-level (manager/chat) run keeps
-    // the base-checkout resolution.
+    // from its branch checkout while a no-worktree run keeps the base-checkout
+    // resolution.
 
     async fn worktree_orch(config_dir: &Path) -> Orchestrator {
         use crate::db::DbState;
@@ -830,7 +829,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_chat_run_without_worktree_resolves_from_base() {
+    async fn run_without_worktree_resolves_project_skills_from_base() {
         let config = tempdir().unwrap();
         let base = tempdir().unwrap();
         // A project skill committed in the base checkout.
@@ -852,7 +851,7 @@ mod tests {
             ),
         )
         .await;
-        // Project-level (manager / project-chat) job: no issue, no worktree.
+        // No-worktree job: project skill resolution falls back to the base checkout.
         exec_sql(
             &orch,
             "INSERT INTO jobs (id, project_id, status, created_at, updated_at) \

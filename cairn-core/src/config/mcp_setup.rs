@@ -14,8 +14,9 @@
 /// the disk-fallback path rather than the base `~/.cairn[-dev]`.
 ///
 /// `cairn_env` ("dev"/"prod") is always set as `CAIRN_ENV` in the MCP server env
-/// so the child (built `--release`) resolves the same Cairn home and callback
-/// port as the app that spawned it, rather than keying on its own build profile.
+/// so the child (built `--release`) resolves the same Cairn home as the host
+/// that spawned it, rather than keying on its own build profile. The callback
+/// endpoint itself is passed through `CAIRN_CALLBACK_URL` below.
 ///
 /// `log_level` (a `LogLevel` name: "quiet"/"standard"/"verbose") is set as
 /// `CAIRN_LOG_LEVEL` so the child's `logging::init` resolves the same file-log
@@ -69,7 +70,8 @@ pub fn build_mcp_config_json(
 /// inline removes the shared mutable file entirely.
 ///
 /// `mcp_binary_path` is the path to the cairn-cmd binary.
-/// `callback_port` is the MCP callback server port.
+/// `callback_port` is the host HTTP port serving `/api/mcp` (the runner
+/// transport port locally, or the server port in headless deployments).
 pub fn build_mcp_config_string(
     mcp_binary_path: &str,
     callback_port: u16,
@@ -100,7 +102,7 @@ mod tests {
     fn test_build_mcp_config_json_basic() {
         let config = build_mcp_config_json(
             "/usr/bin/cairn-cmd",
-            "http://127.0.0.1:3847/api/mcp",
+            "http://127.0.0.1:3849/api/mcp",
             None,
             None,
             "prod",
@@ -117,7 +119,7 @@ mod tests {
         let env = cairn.get("env").unwrap();
         assert_eq!(
             env.get("CAIRN_CALLBACK_URL").unwrap().as_str().unwrap(),
-            "http://127.0.0.1:3847/api/mcp"
+            "http://127.0.0.1:3849/api/mcp"
         );
         // CAIRN_ENV is always propagated to the child.
         assert_eq!(env.get("CAIRN_ENV").unwrap().as_str().unwrap(), "prod");
@@ -154,7 +156,7 @@ mod tests {
     fn test_build_mcp_config_json_with_home_uri() {
         let config = build_mcp_config_json(
             "/usr/bin/cairn-cmd",
-            "http://127.0.0.1:3847/api/mcp",
+            "http://127.0.0.1:3849/api/mcp",
             None,
             Some("cairn://p/CAIRN/42/1/builder"),
             "dev",
@@ -174,7 +176,7 @@ mod tests {
     fn test_build_mcp_config_string_is_parseable_and_run_specific() {
         let a = build_mcp_config_string(
             "/usr/bin/cairn-cmd",
-            3847,
+            3849,
             None,
             Some("cairn://p/CAIRN/1/1/planner/task/agent-spawn"),
             "prod",
@@ -183,7 +185,7 @@ mod tests {
         );
         let b = build_mcp_config_string(
             "/usr/bin/cairn-cmd",
-            3847,
+            3849,
             None,
             Some("cairn://p/CAIRN/1/1/planner/task/planbuild-recipe"),
             "prod",
@@ -206,7 +208,7 @@ mod tests {
     fn test_build_mcp_config_json_with_agents() {
         let config = build_mcp_config_json(
             "/usr/bin/cairn-cmd",
-            "http://127.0.0.1:3847/api/mcp",
+            "http://127.0.0.1:3849/api/mcp",
             Some("[{\"name\":\"Explore\",\"description\":\"x\"}]"),
             None,
             "prod",

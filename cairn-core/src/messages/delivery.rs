@@ -16,7 +16,7 @@ use crate::storage::{run_db_blocking, DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 
 /// Look up the most recent run id for a job. Used by callers that have a job
-/// id (PR conflict resolution, manager wake, etc.) and need to address the
+/// id (PR conflict resolution, wake delivery, etc.) and need to address the
 /// recipient by run id for direct-message delivery.
 pub fn latest_run_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     let job_id = job_id.to_string();

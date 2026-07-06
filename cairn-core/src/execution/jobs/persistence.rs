@@ -101,18 +101,6 @@ pub(super) async fn load_project_path(
         })
 }
 
-pub(super) async fn load_project_default_branch(
-    db: Arc<LocalDb>,
-    project_id: String,
-) -> Result<Option<String>, String> {
-    db.query_opt_text(
-        "SELECT default_branch FROM projects WHERE id = ?1",
-        params![project_id.as_str()],
-    )
-    .await
-    .map_err(|e| db_error("Failed to load project default branch", e))
-}
-
 pub(super) async fn load_execution_seq(
     db: Arc<LocalDb>,
     execution_id: String,
@@ -681,6 +669,10 @@ pub(super) struct ChildInsert {
     pub(super) session_id: String,
     pub(super) parent_job_id: String,
     pub(super) worktree_path: String,
+    /// The child's own branch. `None` for an inherited-worktree child (it shares
+    /// the parent's branch); `Some(ephemeral)` for an ambient parent's ephemeral
+    /// worktree, so teardown can forget the jj workspace and delete the branch.
+    pub(super) branch: Option<String>,
     pub(super) agent_config_id: String,
     pub(super) project_id: String,
     pub(super) issue_id: Option<String>,
@@ -689,6 +681,9 @@ pub(super) struct ChildInsert {
     pub(super) model: Option<String>,
     /// HEAD sha of the inherited parent worktree at creation.
     pub(super) base_commit: Option<String>,
+    /// 1 when this child owns a throwaway ephemeral worktree (ambient parent);
+    /// reclaimed when the child job terminalizes.
+    pub(super) owns_ephemeral_worktree: bool,
     pub(super) now: i32,
 }
 
@@ -705,6 +700,7 @@ pub(super) async fn insert_child_job_session_run(
             session_id: input.session_id.clone(),
             parent_job_id: input.parent_job_id.clone(),
             worktree_path: input.worktree_path.clone(),
+            branch: input.branch.clone(),
             agent_config_id: input.agent_config_id.clone(),
             project_id: input.project_id.clone(),
             issue_id: input.issue_id.clone(),
@@ -712,6 +708,7 @@ pub(super) async fn insert_child_job_session_run(
             description: input.description.clone(),
             model: input.model.clone(),
             base_commit: input.base_commit.clone(),
+            owns_ephemeral_worktree: input.owns_ephemeral_worktree,
             now: input.now,
         };
         Box::pin(async move {
@@ -738,15 +735,15 @@ pub(super) async fn insert_child_job_session_run(
                     status, agent_config_id, issue_id, project_id, task_description,
                     created_at, updated_at, completed_at, parent_tool_use_id, task_index,
                     started_at, model, node_name, base_branch, current_turn_id, uri_segment,
-                    pack_anchor
+                    pack_anchor, owns_ephemeral_worktree
                 )
                 VALUES (
                     ?1, ?2, NULL, ?3,
-                    ?4, NULL, ?13, ?5, NULL,
+                    ?4, ?16, ?13, ?5, NULL,
                     'running', ?6, ?7, ?8, ?9,
                     ?10, ?10, NULL, NULL, NULL,
                     ?10, ?11, NULL, NULL, NULL, ?12,
-                    ?14
+                    ?14, ?15
                 )",
                 params![
                     input.job_id.as_str(),
@@ -763,6 +760,8 @@ pub(super) async fn insert_child_job_session_run(
                     uri_segment.as_str(),
                     input.base_commit.as_deref(),
                     pack_anchor.as_deref(),
+                    input.owns_ephemeral_worktree as i64,
+                    input.branch.as_deref(),
                 ],
             )
             .await

@@ -98,8 +98,8 @@ pub(super) fn emit_for_turn_end(orch: &Orchestrator, job_id: &str) -> bool {
     true
 }
 
-/// Fire the turn-end (`when:idle`/`when:review`) project checks for a job that
-/// just idled, detached onto a background task so the minutes-long suite never
+/// Fire the turn-end (`when:review`) project checks for a job that just idled,
+/// detached onto a background task so the minutes-long suite never
 /// blocks the turn from ending. Skipped for a trailing memory-review turn (not a
 /// work turn) and when a run is already in flight for the job (single-flight).
 /// Runs UNSANDBOXED in the background; on any check failure it resumes the idle

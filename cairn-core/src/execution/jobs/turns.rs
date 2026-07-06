@@ -433,7 +433,11 @@ pub fn start_turn(orch: &Orchestrator, turn_id: &str, run_id: &str) -> Result<()
 pub(super) fn valid_running_transition(from: &JobStatus) -> bool {
     matches!(
         from,
-        JobStatus::Pending | JobStatus::Complete | JobStatus::Failed | JobStatus::Blocked
+        JobStatus::Pending
+            | JobStatus::Complete
+            | JobStatus::Failed
+            | JobStatus::Blocked
+            | JobStatus::Idle
     )
 }
 

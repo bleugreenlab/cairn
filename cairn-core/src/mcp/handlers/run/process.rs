@@ -535,6 +535,9 @@ pub(super) async fn execute_process(
                 "CAIRN_CALLBACK_URL",
                 &format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
             )
+            // Put the host-owned `cairn` shim dir ahead of the resolved user
+            // PATH so an in-run `cairn read|write|watch …` resolves the CLI.
+            .env("PATH", &crate::env::agent_shell_path())
             .sandbox(sandbox_policy),
     );
     // Make bare `git`/`jj` behave correctly inside a jj-only worktree: managed

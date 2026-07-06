@@ -11,8 +11,8 @@ use crate::services::sandbox;
 /// Two regimes:
 /// - **Worktree cwd**: gated on the fence — `allow` (or no run context) runs
 ///   unconfined; `ask`/`deny` confine writes to the worktree.
-/// - **Non-worktree cwd** (the project's live checkout — project chat / manager /
-///   triage): a read-only-checkout policy applies STRUCTURALLY, regardless of
+/// - **Non-worktree cwd** (the project's live checkout, for example triage or
+///   read-only analysis): a read-only-checkout policy applies STRUCTURALLY, regardless of
 ///   fence, so a stray write into the live checkout is kernel-denied while the
 ///   checkout stays readable.
 ///
@@ -115,10 +115,10 @@ pub(crate) async fn build_run_sandbox_policy(
 ) -> Option<(sandbox::SandboxPolicy, Fence)> {
     use crate::mcp::handlers::permission::resolve_fence_policy;
 
-    // The project's live checkout (a non-jj cwd: project chat / manager / triage)
+    // The project's live checkout (a non-jj cwd: triage / read-only analysis)
     // is read-only for agents, non-negotiable, so the read-only-checkout sandbox
-    // applies STRUCTURALLY regardless of fence — project chat carries no
-    // execution snapshot and would otherwise be fully unconfined. A real worktree
+    // applies STRUCTURALLY regardless of fence; a request without an execution
+    // snapshot would otherwise be fully unconfined. A real worktree
     // keeps the fence gate (ask/deny confine; allow runs free).
     let non_worktree = !crate::jj::is_jj_dir(std::path::Path::new(cwd));
     let readonly_non_worktree = non_worktree && !branch_scoped_run;

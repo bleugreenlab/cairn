@@ -143,7 +143,7 @@ fn start_terminal_session(
     for (key, value) in std::env::vars() {
         cmd.env(key, value);
     }
-    cmd.env("PATH", crate::env::get_user_path());
+    cmd.env("PATH", crate::env::agent_shell_path());
     cmd.env("TERM", "xterm-256color");
     apply_shell_integration(&mut cmd, &shell_path, &integration_dir());
     let components = pair.spawn_and_split(cmd)?;
@@ -585,13 +585,53 @@ async fn generate_slug_from_title(
     .map_err(|error| error.to_string())
 }
 
+/// Resolve the working directory for a job's terminal, mirroring the agent (MCP)
+/// terminal path: a worktree-backed job uses its worktree; an ambient
+/// (Branch: main / no-worktree) job falls back to the project root — the same
+/// `COALESCE(worktree_path, repo_path)` its `run` commands already use. Resolving
+/// server-side means the frontend never supplies a cwd, so an ambient node can no
+/// longer be handed a null path (the bug this closes).
+async fn resolve_job_terminal_cwd(db: &LocalDb, job_id: &str) -> Result<String, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT COALESCE(j.worktree_path, p.repo_path)
+                     FROM jobs j
+                     JOIN projects p ON j.project_id = p.id
+                     WHERE j.id = ?1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.text(0)?),
+                None => Err(DbError::internal(format!(
+                    "Job not found for terminal cwd: {job_id}"
+                ))),
+            }
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 pub async fn create_job_terminal(
     orch: &Orchestrator,
     job_id: String,
-    cwd: String,
     title: String,
     initial_command: Option<String>,
 ) -> Result<JobTerminal, String> {
+    // The job (and its project) may live in a team replica rather than the
+    // private DB, so resolve the owning database before reading its worktree/repo
+    // path — the caller no longer supplies a cwd, and a local-only lookup would
+    // fail for a team job. The terminal ROW itself stays on the local DB
+    // (host-local PTY state), matching slug allocation and insert_terminal below.
+    let owning_db = crate::execution::routing::owning_db_for_job(&orch.db, &job_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let cwd = resolve_job_terminal_cwd(&owning_db, &job_id).await?;
     let started = start_terminal_session(&orch.pty_state, &orch.services, &cwd)?;
     let command = initial_command
         .clone()
@@ -927,4 +967,41 @@ pub async fn get_project_terminals(
         })
         .await
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    async fn seeded_db() -> LocalDb {
+        let db = crate::storage::migrated_test_db("terminal-cwd-test.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','w','P','CAIRN','/tmp/repo',1,1);
+             INSERT INTO jobs (id, status, project_id, created_at, updated_at)
+               VALUES ('ambient','running','p',1,1);
+             INSERT INTO jobs (id, status, project_id, worktree_path, created_at, updated_at)
+               VALUES ('backed','running','p','/tmp/repo/wt',1,1);",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn ambient_job_terminal_cwd_falls_back_to_project_root() {
+        // A no-worktree (Branch: main) job resolves its terminal cwd to the
+        // project root — the bug this closes was the UI handing a null cwd.
+        let db = seeded_db().await;
+        let cwd = resolve_job_terminal_cwd(&db, "ambient").await.unwrap();
+        assert_eq!(cwd, "/tmp/repo");
+    }
+
+    #[tokio::test]
+    async fn worktree_backed_job_terminal_cwd_uses_worktree() {
+        let db = seeded_db().await;
+        let cwd = resolve_job_terminal_cwd(&db, "backed").await.unwrap();
+        assert_eq!(cwd, "/tmp/repo/wt");
+    }
 }

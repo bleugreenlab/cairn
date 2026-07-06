@@ -5,7 +5,7 @@
 //! [`raise_fence`]. The fence consults the agent's [`Fence`] policy:
 //!
 //! - `Allow` — the crossing proceeds (no DB row, no prompt).
-//! - `Deny` — the crossing is rejected immediately (headless/manager runs).
+//! - `Deny` — the crossing is rejected immediately (headless/noninteractive runs).
 //! - `Ask` — a session grant short-circuits to allow; otherwise the request
 //!   suspends on the shared [`super::permission::await_permission_decision`]
 //!   primitive (durable suspend, no auto-deny) and is answerable via the UI or
@@ -34,7 +34,7 @@ use super::permission::{await_permission_decision, resolve_fence_policy, Permiss
 
 /// Resolve the canonical run and its fence policy for a verb request, looking
 /// the run up by id or, failing that, by cwd. Returns `None` when there is no
-/// active run (project chat / unknown cwd) — no fence applies.
+/// active run or the cwd is unknown — no fence applies.
 pub async fn resolve_run_fence(
     orch: &Orchestrator,
     request: &McpCallbackRequest,

@@ -18,15 +18,16 @@ use crate::server::CairnCmd;
 // ============================================================================
 
 pub(crate) fn default_callback_url() -> String {
-    // Use the shared resolver so cairn-cmd (built --release) targets the same
-    // port as the app that spawned it. The app sets CAIRN_ENV in the MCP child
-    // env; manual terminal use selects the port via CAIRN_ENV=dev.
-    let port = cairn_common::paths::callback_port();
+    // The runner owns the local MCP callback endpoint after the daemon cutover.
+    // Agent-spawned processes still receive CAIRN_CALLBACK_URL explicitly, but
+    // bare CLI and externally installed MCP invocations should target the runner
+    // transport by convention.
+    let port = cairn_common::paths::runner_port();
     format!("http://127.0.0.1:{}/api/mcp", port)
 }
 
-/// Callback URL for CLI use: explicit env var (set by the app for in-run
-/// invocations), else the build-profile default app port.
+/// Callback URL for CLI use: explicit env var (set by the runner for in-run
+/// invocations), else the runner transport port.
 fn cli_callback_url() -> String {
     env::var("CAIRN_CALLBACK_URL").unwrap_or_else(|_| default_callback_url())
 }
@@ -93,7 +94,7 @@ fn callback_host_port(callback_url: &str) -> Option<(String, u16)> {
     Some((host, port))
 }
 
-/// True if something is listening on the callback port.
+/// True if something is listening on the callback endpoint.
 fn probe_callback(callback_url: &str) -> bool {
     use std::net::{TcpStream, ToSocketAddrs};
     let Some((host, port)) = callback_host_port(callback_url) else {
@@ -107,53 +108,15 @@ fn probe_callback(callback_url: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Launch the Cairn app in the background (macOS). Returns whether launch was
-/// dispatched; readiness is confirmed separately by polling the callback.
-fn autostart_app(callback_url: &str) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let dev = callback_host_port(callback_url)
-            .map(|(_, port)| port == 3857)
-            .unwrap_or(false);
-        let bundle = if dev {
-            "com.cairn.desktop.dev"
-        } else {
-            "com.cairn.desktop"
-        };
-        // -g: don't foreground, -j: launch hidden, -b: by bundle id.
-        match std::process::Command::new("open")
-            .args(["-gjb", bundle])
-            .status()
-        {
-            Ok(status) => status.success(),
-            Err(e) => {
-                tracing::warn!("failed to launch Cairn app: {e}");
-                false
-            }
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = callback_url;
-        false
-    }
+/// Ensure the local MCP callback endpoint is reachable.
+async fn ensure_callback_reachable(callback_url: &str) -> bool {
+    probe_callback(callback_url)
 }
 
-/// Ensure the app is reachable: probe, and if not, autostart and poll (~30s).
-async fn ensure_app_reachable(callback_url: &str) -> bool {
-    if probe_callback(callback_url) {
-        return true;
-    }
-    if !autostart_app(callback_url) {
-        return probe_callback(callback_url);
-    }
-    for _ in 0..60 {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        if probe_callback(callback_url) {
-            return true;
-        }
-    }
-    false
+fn print_unreachable_callback(callback_url: &str) {
+    eprintln!(
+        "cairn: requires a running Cairn runner or server at {callback_url} (set CAIRN_CALLBACK_URL to override)."
+    );
 }
 
 /// Parse a `ChangeInput` from a JSON object (with `changes`) or a bare array.
@@ -190,8 +153,8 @@ pub(crate) async fn run_cli_read(
     };
 
     let callback_url = cli_callback_url();
-    if !ensure_app_reachable(&callback_url).await {
-        eprintln!("cairn: requires a running Cairn app (could not reach or start it).");
+    if !ensure_callback_reachable(&callback_url).await {
+        print_unreachable_callback(&callback_url);
         return false;
     }
     let client = build_cli_client(callback_url);
@@ -242,8 +205,8 @@ fn fold_cli_scope(
 /// driver) or `resolved` (reached a terminal status — merged/closed/failed).
 pub(crate) async fn run_cli_watch(issue_uri: String, since: Option<i64>) -> bool {
     let callback_url = cli_callback_url();
-    if !ensure_app_reachable(&callback_url).await {
-        eprintln!("cairn: requires a running Cairn app (could not reach or start it).");
+    if !ensure_callback_reachable(&callback_url).await {
+        print_unreachable_callback(&callback_url);
         return false;
     }
     let client = build_cli_client(callback_url);
@@ -332,8 +295,8 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
         input.commit_msg = commit_msg;
     }
     let callback_url = cli_callback_url();
-    if !ensure_app_reachable(&callback_url).await {
-        eprintln!("cairn: requires a running Cairn app (could not reach or start it).");
+    if !ensure_callback_reachable(&callback_url).await {
+        print_unreachable_callback(&callback_url);
         return false;
     }
     let client = build_cli_client(callback_url);

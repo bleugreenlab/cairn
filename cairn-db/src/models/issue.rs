@@ -115,6 +115,10 @@ pub enum IssueAttention {
     NeedsInput,
     NeedsAuthorization,
     NeedsApproval,
+    /// A long-running agent node is resting Idle: non-terminal, resumable, and
+    /// awaiting a wake. Blocks the status projection (the issue reads `waiting`)
+    /// but is distinct from the human-decision attentions above.
+    Idle,
 }
 
 impl IssueAttention {
@@ -130,6 +134,7 @@ impl std::fmt::Display for IssueAttention {
             IssueAttention::NeedsInput => write!(f, "needs_input"),
             IssueAttention::NeedsAuthorization => write!(f, "needs_authorization"),
             IssueAttention::NeedsApproval => write!(f, "needs_approval"),
+            IssueAttention::Idle => write!(f, "idle"),
         }
     }
 }
@@ -143,6 +148,7 @@ impl std::str::FromStr for IssueAttention {
             "needs_input" => Ok(IssueAttention::NeedsInput),
             "needs_authorization" => Ok(IssueAttention::NeedsAuthorization),
             "needs_approval" => Ok(IssueAttention::NeedsApproval),
+            "idle" => Ok(IssueAttention::Idle),
             _ => Err(format!("Unknown attention: {}", s)),
         }
     }
@@ -310,6 +316,7 @@ mod tests {
             IssueAttention::NeedsInput,
             IssueAttention::NeedsAuthorization,
             IssueAttention::NeedsApproval,
+            IssueAttention::Idle,
         ];
         for v in &variants {
             let s = v.to_string();
@@ -334,6 +341,7 @@ mod tests {
             IssueAttention::NeedsInput,
             IssueAttention::NeedsAuthorization,
             IssueAttention::NeedsApproval,
+            IssueAttention::Idle,
         ];
         for v in &blocking {
             assert!(

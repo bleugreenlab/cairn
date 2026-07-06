@@ -6,6 +6,7 @@
 //!
 //! On Windows, similar issues can occur with PATH resolution in GUI apps.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -26,6 +27,8 @@ static USER_PATH: OnceLock<String> = OnceLock::new();
 /// Get the PATH separator for the current platform
 #[cfg(windows)]
 const PATH_SEP: char = ';';
+#[cfg(not(windows))]
+const PATH_SEP: char = ':';
 
 /// Get the user's home directory
 fn get_home_dir() -> String {
@@ -103,6 +106,126 @@ pub fn get_user_path() -> &'static str {
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Agent CLI shim: `<cairn_home>/bin/cairn` -> the bundled `cairn-cmd`.
+//
+// Agent-spawned shells (inline `run` commands, background + PTY terminals)
+// already receive the callback env (`CAIRN_CALLBACK_URL`, `CAIRN_MCP_SECRET`,
+// …), so `cairn read|write|watch` works from them the moment the binary
+// resolves. Rather than depend on the best-effort user-facing installer
+// (`cli_install`, desktop-only and PATH-dependent), the host owns a bin dir
+// keyed off the resolved Cairn home and prepends it to every agent-facing
+// spawn's PATH. Keying off `cairn_home()` makes dev instances (`~/.cairn-dev*`)
+// fall out naturally: each home gets its own shim tracking its own rebuild.
+// ---------------------------------------------------------------------------
+
+/// The host-owned bin directory (`<cairn_home>/bin`) that holds the `cairn`
+/// shim pointing at the bundled `cairn-cmd`. Keyed off the resolved Cairn home,
+/// so a dev instance's separate `~/.cairn-dev*` home gets its own shim dir and
+/// tracks its own dev rebuild automatically.
+pub fn cairn_bin_dir() -> PathBuf {
+    cairn_common::paths::cairn_home().join("bin")
+}
+
+/// Compose an agent-shell PATH by placing `bin_dir` ahead of `user_path`.
+fn prepend_cairn_bin(bin_dir: &Path, user_path: &str) -> String {
+    format!("{}{}{}", bin_dir.display(), PATH_SEP, user_path)
+}
+
+/// PATH for agent-spawned shells: the host-owned cairn bin dir (holding the
+/// `cairn` shim) ahead of the resolved user PATH, so an in-run `cairn read …`
+/// resolves regardless of how the user's own PATH is configured. Every
+/// agent-facing spawn site (inline `run` commands, background + PTY terminals)
+/// sets `PATH` to this instead of bare [`get_user_path`].
+pub fn agent_shell_path() -> String {
+    prepend_cairn_bin(&cairn_bin_dir(), get_user_path())
+}
+
+/// Maintain `<cairn_home>/bin/cairn` pointing at `cli_binary` (the resolved
+/// `cairn-cmd` path), so agent-spawned shells resolve `cairn`. Called at
+/// startup by whichever host owns the orchestrator (the runner and
+/// `cairn-server`); the desktop thin host does not maintain it.
+///
+/// Best-effort and idempotent, mirroring `cli_install`'s semantics: an
+/// already-correct symlink is left alone, a stale symlink (old build path) is
+/// replaced, and a real file that is not our symlink is never clobbered.
+/// Failures are logged, never fatal. The shim points at the sibling `cairn-cmd`
+/// so it tracks app updates (prod) and rebuilds (dev) automatically.
+pub fn ensure_agent_cli_shim(cli_binary: &str) {
+    ensure_agent_cli_shim_in(&cairn_bin_dir(), cli_binary);
+}
+
+/// Testable core of [`ensure_agent_cli_shim`] with an explicit bin dir.
+fn ensure_agent_cli_shim_in(bin_dir: &Path, cli_binary: &str) {
+    let target = PathBuf::from(cli_binary);
+    if !target.exists() {
+        log::debug!("cairn CLI shim skipped: {cli_binary} does not exist");
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(bin_dir) {
+        log::warn!(
+            "cairn CLI shim skipped: cannot create {}: {e}",
+            bin_dir.display()
+        );
+        return;
+    }
+    #[cfg(unix)]
+    install_shim_unix(bin_dir, &target);
+    #[cfg(windows)]
+    install_shim_windows(bin_dir, &target);
+    #[cfg(not(any(unix, windows)))]
+    let _ = target;
+}
+
+// Unix: symlink `cairn` -> the absolute `cairn-cmd`, so it tracks the target.
+#[cfg(unix)]
+fn install_shim_unix(bin_dir: &Path, target: &Path) {
+    let link = bin_dir.join("cairn");
+    match std::fs::read_link(&link) {
+        // Already points where we want.
+        Ok(existing) if existing == target => return,
+        // Stale symlink (old build path) — replace it.
+        Ok(_) => {
+            let _ = std::fs::remove_file(&link);
+        }
+        // A real file that isn't a symlink — don't clobber it.
+        Err(_) if link.exists() => {
+            log::warn!(
+                "cairn CLI shim skipped: {} exists and is not our symlink",
+                link.display()
+            );
+            return;
+        }
+        Err(_) => {}
+    }
+    match std::os::unix::fs::symlink(target, &link) {
+        Ok(()) => log::info!(
+            "Installed `cairn` -> {} at {}",
+            target.display(),
+            link.display()
+        ),
+        Err(e) => log::warn!("Failed to install `cairn` shim at {}: {e}", link.display()),
+    }
+}
+
+// Windows: symlinks need privilege, so write a `cairn.cmd` shim that calls the
+// bundled cli by absolute path (tracks updates).
+#[cfg(windows)]
+fn install_shim_windows(bin_dir: &Path, target: &Path) {
+    let shim = bin_dir.join("cairn.cmd");
+    let body = format!("@echo off\r\n\"{}\" %*\r\n", target.display());
+    if std::fs::read_to_string(&shim)
+        .map(|c| c == body)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    match std::fs::write(&shim, &body) {
+        Ok(()) => log::info!("Installed `cairn` shim at {}", shim.display()),
+        Err(e) => log::warn!("Failed to install `cairn` shim at {}: {e}", shim.display()),
+    }
 }
 
 #[cfg(not(windows))]
@@ -234,7 +357,73 @@ pub fn gh() -> Command {
 #[cfg(test)]
 #[cfg(not(windows))]
 mod tests {
-    use super::parse_path_from_env_output;
+    use super::{ensure_agent_cli_shim_in, parse_path_from_env_output, prepend_cairn_bin};
+    use std::path::Path;
+
+    #[test]
+    fn prepend_cairn_bin_places_bin_dir_first() {
+        assert_eq!(
+            prepend_cairn_bin(Path::new("/home/u/.cairn/bin"), "/usr/local/bin:/usr/bin"),
+            "/home/u/.cairn/bin:/usr/local/bin:/usr/bin"
+        );
+    }
+
+    #[test]
+    fn agent_cli_shim_creates_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let target = dir.path().join("cairn-cmd");
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        let target_str = target.to_string_lossy().to_string();
+
+        ensure_agent_cli_shim_in(&bin, &target_str);
+        let link = bin.join("cairn");
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+
+        // Second call is a no-op and leaves the correct symlink in place.
+        ensure_agent_cli_shim_in(&bin, &target_str);
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    }
+
+    #[test]
+    fn agent_cli_shim_replaces_stale_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let stale = dir.path().join("old-cairn-cmd");
+        std::fs::write(&stale, b"x").unwrap();
+        let link = bin.join("cairn");
+        std::os::unix::fs::symlink(&stale, &link).unwrap();
+
+        let target = dir.path().join("cairn-cmd");
+        std::fs::write(&target, b"y").unwrap();
+        ensure_agent_cli_shim_in(&bin, &target.to_string_lossy());
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+    }
+
+    #[test]
+    fn agent_cli_shim_never_clobbers_real_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let link = bin.join("cairn");
+        std::fs::write(&link, b"user's own cairn").unwrap();
+
+        let target = dir.path().join("cairn-cmd");
+        std::fs::write(&target, b"y").unwrap();
+        ensure_agent_cli_shim_in(&bin, &target.to_string_lossy());
+        // Untouched: still a real file (not a symlink) with its original bytes.
+        assert!(std::fs::read_link(&link).is_err());
+        assert_eq!(std::fs::read(&link).unwrap(), b"user's own cairn");
+    }
+
+    #[test]
+    fn agent_cli_shim_skips_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        ensure_agent_cli_shim_in(&bin, "/nonexistent/cairn-cmd");
+        assert!(!bin.join("cairn").exists());
+    }
 
     #[test]
     fn parse_path_from_env_output_picks_path_line() {

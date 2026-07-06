@@ -254,6 +254,11 @@ pub enum RecipeNodeType {
     Artifact,
     Condition,
     Context,
+    /// Author-facing text block whose content is injected into the running
+    /// node's system prompt (after the role prompt). Distinct from `Context`,
+    /// whose content flows to the initial user message / work packet. Reuses
+    /// `context_config` for its `{ content }` payload.
+    Instruction,
 }
 
 impl std::fmt::Display for RecipeNodeType {
@@ -267,6 +272,7 @@ impl std::fmt::Display for RecipeNodeType {
             RecipeNodeType::Artifact => write!(f, "artifact"),
             RecipeNodeType::Condition => write!(f, "condition"),
             RecipeNodeType::Context => write!(f, "context"),
+            RecipeNodeType::Instruction => write!(f, "instruction"),
         }
     }
 }
@@ -284,6 +290,7 @@ impl std::str::FromStr for RecipeNodeType {
             "artifact" => Ok(RecipeNodeType::Artifact),
             "condition" => Ok(RecipeNodeType::Condition),
             "context" => Ok(RecipeNodeType::Context),
+            "instruction" => Ok(RecipeNodeType::Instruction),
             _ => Err(format!("Unknown recipe node type: {}", s)),
         }
     }
@@ -884,8 +891,13 @@ impl TryFrom<crate::db_records::DbRecipeNode> for RecipeNode {
                     None
                 },
                 condition_config,
-                // Legacy Context node config (kept for old-snapshot tolerance).
-                if node_type == RecipeNodeType::Context {
+                // Context/Instruction node config: both carry a `{ content }`
+                // text block. Context content flows to the initial user message;
+                // Instruction content is injected into the system prompt.
+                if matches!(
+                    node_type,
+                    RecipeNodeType::Context | RecipeNodeType::Instruction
+                ) {
                     cfg.content
                         .clone()
                         .map(|content| ContextNodeConfig { content })
@@ -995,6 +1007,7 @@ mod tests {
             ("artifact", RecipeNodeType::Artifact),
             ("condition", RecipeNodeType::Condition),
             ("context", RecipeNodeType::Context),
+            ("instruction", RecipeNodeType::Instruction),
         ]);
         assert_parse_cases(&[
             ("control", RecipeEdgeType::Control),
@@ -1320,6 +1333,7 @@ mod tests {
         assert_eq!(RecipeNodeType::Artifact.to_string(), "artifact");
         assert_eq!(RecipeNodeType::Condition.to_string(), "condition");
         assert_eq!(RecipeNodeType::Context.to_string(), "context");
+        assert_eq!(RecipeNodeType::Instruction.to_string(), "instruction");
     }
 
     #[test]
