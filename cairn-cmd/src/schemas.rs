@@ -128,18 +128,48 @@ pub(crate) fn validate_run_input(input: &RunInput) -> Result<(), String> {
         return Err("`commands` must contain at least one item".to_string());
     }
     for (i, item) in input.commands.iter().enumerate() {
-        match (item.command.as_deref(), item.target.as_deref()) {
-            (Some(_), Some(_)) => {
+        // Exactly one of `command` / `target` / `code`. Kept in lockstep with
+        // cairn-core's `resolve_run_item` so a headless caller that bypasses
+        // cairn-cmd gets the same three-way exclusivity message.
+        let present: Vec<&str> = [
+            item.command.as_deref().map(|_| "command"),
+            item.target.as_deref().map(|_| "target"),
+            item.code.as_deref().map(|_| "code"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match present.as_slice() {
+            [] => {
                 return Err(format!(
-                    "commands[{i}] has both `command` and `target`; provide exactly one"
+                    "commands[{i}] has none of `command`, `target`, or `code`; provide exactly one"
                 ));
             }
-            (None, None) => {
+            [first, second, ..] => {
                 return Err(format!(
-                    "commands[{i}] has neither `command` nor `target`; provide exactly one"
+                    "commands[{i}] has both `{first}` and `{second}`; provide exactly one of `command`, `target`, or `code`"
                 ));
             }
             _ => {}
+        }
+        // `code` requires an `interpreter`, and `interpreter` is only valid with
+        // inline `code`.
+        if item.code.is_some() && item.interpreter.is_none() {
+            return Err(format!(
+                "commands[{i}] has `code` but no `interpreter`; set `interpreter` to one of: typescript (ts), javascript (js), python (py)"
+            ));
+        }
+        if item.interpreter.is_some() && item.code.is_none() {
+            return Err(format!(
+                "commands[{i}] has `interpreter` but no `code`; `interpreter` is only valid with inline `code`"
+            ));
+        }
+        // `payload` is meaningless for inline code — reject it at the front door so
+        // this edge matches cairn-core's `resolve_code_spec` (both refuse it).
+        if item.code.is_some() && item.payload.is_some() {
+            return Err(format!(
+                "commands[{i}] has both `code` and `payload`; inline code takes no payload"
+            ));
         }
     }
     Ok(())
@@ -192,6 +222,17 @@ pub(crate) struct RunItemInput {
     /// Structured args for a `target` skill script.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload: Option<RunItemPayloadInput>,
+    /// Inline source to execute (light, synchronous compute). Mutually exclusive
+    /// with `command`/`target`; requires `interpreter`. Runs as `bun -e <code>`
+    /// (typescript/javascript) or `python3 -c <code>` (python) — direct argv, no
+    /// shell. Inline TypeScript gets zero-config `@cairn/sdk` from the worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) code: Option<String>,
+    /// Language for an inline `code` item: `typescript`/`ts` or `javascript`/`js`
+    /// (both via bun), or `python`/`py` (via python3, currently stdlib-only).
+    /// Required iff `code` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) interpreter: Option<String>,
 }
 
 /// Structured args for a `target`: positional `args` for a skill script, or a
@@ -334,12 +375,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_run_input_rejects_item_with_neither() {
+    fn validate_run_input_rejects_item_with_none_of_the_three_kinds() {
         let input = run_input(serde_json::json!({
             "commands": [{ "description": "nothing" }]
         }));
         let err = validate_run_input(&input).unwrap_err();
-        assert!(err.contains("neither"));
+        assert!(err.contains("none of"), "got: {err}");
     }
 
     #[test]
@@ -351,5 +392,66 @@ mod tests {
             ]
         }));
         assert!(validate_run_input(&input).is_ok());
+    }
+
+    #[test]
+    fn validate_run_input_accepts_code_item_with_interpreter() {
+        let input = run_input(serde_json::json!({
+            "commands": [{ "code": "console.log(1)", "interpreter": "typescript" }]
+        }));
+        assert!(validate_run_input(&input).is_ok());
+        assert_eq!(input.commands[0].code.as_deref(), Some("console.log(1)"));
+        assert_eq!(input.commands[0].interpreter.as_deref(), Some("typescript"));
+    }
+
+    #[test]
+    fn validate_run_input_rejects_code_with_command() {
+        let input = run_input(serde_json::json!({
+            "commands": [{ "code": "print(1)", "interpreter": "python", "command": "echo hi" }]
+        }));
+        let err = validate_run_input(&input).unwrap_err();
+        assert!(err.contains("both") && err.contains("code"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_run_input_rejects_code_with_target() {
+        let input = run_input(serde_json::json!({
+            "commands": [{ "code": "print(1)", "interpreter": "python", "target": "cairn://skills/ui/scripts/x.sh" }]
+        }));
+        let err = validate_run_input(&input).unwrap_err();
+        assert!(err.contains("both"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_run_input_rejects_code_without_interpreter() {
+        let input = run_input(serde_json::json!({
+            "commands": [{ "code": "print(1)" }]
+        }));
+        let err = validate_run_input(&input).unwrap_err();
+        assert!(err.contains("interpreter"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_run_input_rejects_interpreter_without_code() {
+        let input = run_input(serde_json::json!({
+            "commands": [{ "command": "echo hi", "interpreter": "python" }]
+        }));
+        let err = validate_run_input(&input).unwrap_err();
+        assert!(
+            err.contains("interpreter") && err.contains("code"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_run_input_rejects_code_with_payload() {
+        let input = run_input(serde_json::json!({
+            "commands": [{ "code": "print(1)", "interpreter": "python", "payload": { "args": ["x"] } }]
+        }));
+        let err = validate_run_input(&input).unwrap_err();
+        assert!(
+            err.contains("payload") && err.contains("code"),
+            "got: {err}"
+        );
     }
 }

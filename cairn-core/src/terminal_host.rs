@@ -143,6 +143,9 @@ fn start_terminal_session(
     for (key, value) in std::env::vars() {
         cmd.env(key, value);
     }
+    // Strip a host dev-instance's shared build-target routing so a worktree
+    // shell builds into its own target dir (CAIRN-2533).
+    crate::mcp::handlers::run::scrub_dev_instance_routing_pty(&mut cmd);
     cmd.env("PATH", crate::env::agent_shell_path());
     cmd.env("TERM", "xterm-256color");
     apply_shell_integration(&mut cmd, &shell_path, &integration_dir());
@@ -295,6 +298,9 @@ pub fn create_pty(
     for (key, value) in std::env::vars() {
         cmd.env(key, value);
     }
+    // Strip a host dev-instance's shared build-target routing so a worktree
+    // shell builds into its own target dir (CAIRN-2533).
+    crate::mcp::handlers::run::scrub_dev_instance_routing_pty(&mut cmd);
     apply_shell_integration(&mut cmd, &shell_path, &integration_dir());
     let components = pair.spawn_and_split(cmd)?;
     let session_id = Uuid::new_v4().to_string();

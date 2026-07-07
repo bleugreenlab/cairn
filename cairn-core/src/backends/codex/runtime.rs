@@ -904,6 +904,39 @@ impl CodexBackend {
                         .pointer("/params/turn/status")
                         .and_then(|v| v.as_str())
                         .unwrap_or("completed");
+                    // Schema-constrained call (CAIRN-2505): when the turn's final
+                    // agent message is the native structured output, capture it as
+                    // the return artifact server-side BEFORE the run finalizes.
+                    // Self-guarding (a no-op for any run without an output
+                    // contract) and idempotent (a no-op if the model also wrote
+                    // cairn:~/return), so non-call turns and schema-less codex
+                    // sessions are unaffected.
+                    if status == "completed" {
+                        if let Some(value) = last_direct_assistant_text
+                            .as_deref()
+                            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                        {
+                            let orch_capture = orch.clone();
+                            let run_id_capture = run_id.to_string();
+                            if let Err(e) = crate::backends::run_state::run_backend_db(
+                                super::CODEX_BACKEND_NAME,
+                                async move {
+                                    crate::mcp::handlers::comments_artifacts::capture_call_structured_output(
+                                        &orch_capture,
+                                        &run_id_capture,
+                                        value,
+                                    )
+                                    .await
+                                },
+                            ) {
+                                log::warn!(
+                                    "Failed to capture Codex structured output for run {}: {}",
+                                    run_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
                     handle_turn_completed(
                         orch,
                         &run_db,

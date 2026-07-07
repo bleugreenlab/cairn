@@ -21,6 +21,7 @@ mod mcp;
 mod memories;
 mod messages;
 mod nodes;
+mod progress;
 mod projects;
 mod prompts;
 mod recipes;
@@ -165,6 +166,10 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         messages::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        progress::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else if let Some(summary) =

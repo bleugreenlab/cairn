@@ -921,6 +921,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::IssueComment => "cairn://p/CAIRN/1/comments/1",
         K::Node => "cairn://p/CAIRN/1/1/builder",
         K::NodeMessages => "cairn://p/CAIRN/1/1/builder/messages",
+        K::NodeProgress => "cairn://p/CAIRN/1/1/builder/progress",
         K::NodeArtifact => "cairn://p/CAIRN/1/1/builder/plan",
         K::NodeTerminal => "cairn://p/CAIRN/1/1/builder/terminal/dev",
         K::TaskTerminal => "cairn://p/CAIRN/1/1/builder/task/sub/terminal/dev",
@@ -957,6 +958,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::Action => "cairn://actions/example",
         K::ProjectActions => "cairn://p/CAIRN/actions",
         K::ProjectAction => "cairn://p/CAIRN/actions/example",
+        K::NodeCalls => "cairn://p/CAIRN/1/1/builder/calls",
         other => {
             panic!("sample_resource: {other:?} carries a mutation but has no sample URI; add one")
         }

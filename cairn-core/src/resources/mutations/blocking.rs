@@ -1,9 +1,11 @@
 use crate::execution::delegation::{
-    DelegatedTaskPayload, DelegatedTaskSessionMode, SpawnTaskPacketsInput,
+    DelegatedCallPayload, DelegatedTaskPayload, DelegatedTaskSessionMode, SpawnCallPacketsInput,
+    SpawnTaskPacketsInput,
 };
-use crate::execution::jobs::CreateChildTaskInput;
+use crate::execution::jobs::{CallWorktree, CreateChildTaskInput};
 use crate::mcp::types::{
-    AskUserPayload, ChangeItem, ChangeMode, McpCallbackRequest, TaskPayload, TaskSessionMode,
+    AskUserPayload, CallPayload, CallWorktreeMode, ChangeItem, ChangeMode, McpCallbackRequest,
+    TaskPayload, TaskSessionMode,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
@@ -13,6 +15,7 @@ use cairn_common::uri::{build_node_uri, parse_uri, CairnResource};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockingKind {
     Tasks,
+    Calls,
     Questions,
 }
 
@@ -24,6 +27,7 @@ pub(crate) fn blocking_append_kind(item: &ChangeItem) -> Option<BlockingKind> {
     }
     match parse_uri(&item.target) {
         Some(CairnResource::NodeTasks { .. }) => Some(BlockingKind::Tasks),
+        Some(CairnResource::NodeCalls { .. }) => Some(BlockingKind::Calls),
         Some(CairnResource::NodeQuestions { .. }) => Some(BlockingKind::Questions),
         _ => None,
     }
@@ -42,22 +46,29 @@ pub(crate) fn validate_blocking_group(
         return Ok(None);
     }
     let mut tasks = 0usize;
+    let mut calls = 0usize;
     let mut questions = 0usize;
     for &i in indices {
         match blocking_append_kind(&changes[i]) {
             Some(BlockingKind::Tasks) => tasks += 1,
+            Some(BlockingKind::Calls) => calls += 1,
             Some(BlockingKind::Questions) => questions += 1,
             None => {}
         }
     }
-    if tasks > 0 && questions > 0 {
-        return Err("Cannot mix task and question appends in a single change call".to_string());
+    let categories = (tasks > 0) as u8 + (calls > 0) as u8 + (questions > 0) as u8;
+    if categories > 1 {
+        return Err(
+            "Cannot mix task, call, and question appends in a single change call".to_string(),
+        );
     }
     if questions > 1 {
         return Err("Only one questions append is supported per change call".to_string());
     }
     Ok(Some(if tasks > 0 {
         BlockingKind::Tasks
+    } else if calls > 0 {
+        BlockingKind::Calls
     } else {
         BlockingKind::Questions
     }))
@@ -74,6 +85,7 @@ pub(crate) async fn run_blocking_group(
 ) -> String {
     match kind {
         BlockingKind::Tasks => run_tasks_group(orch, request, changes, indices).await,
+        BlockingKind::Calls => run_calls_group(orch, request, changes, indices).await,
         BlockingKind::Questions => {
             let Some(payload) = changes[indices[0]].payload.clone() else {
                 return "Question append requires payload with a questions array".to_string();
@@ -234,6 +246,98 @@ async fn run_tasks_group(
     }
 }
 
+/// Run a validated calls-append group (CAIRN-2481). Calls are always self-spawned
+/// under the caller (never cross-node), so this parses each item, enforces a
+/// shared background disposition, and hands the batch to `spawn_call_packets` —
+/// the caller is resolved from the run id / cwd, not the addressed node.
+async fn run_calls_group(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    changes: &[ChangeItem],
+    indices: &[usize],
+) -> String {
+    let mut calls: Vec<DelegatedCallPayload> = Vec::with_capacity(indices.len());
+    let mut background: Option<bool> = None;
+    for &i in indices {
+        let Some(payload) = changes[i].payload.clone() else {
+            return "Call append requires payload with at least a prompt".to_string();
+        };
+        let call: CallPayload = match serde_json::from_value(payload) {
+            Ok(call) => call,
+            Err(e) => return format!("Invalid call append payload: {e}"),
+        };
+        let call_bg = call.run_in_background.unwrap_or(false);
+        match background {
+            Some(prev) if prev != call_bg => {
+                return "All call appends in a single change call must share the same background value".to_string();
+            }
+            _ => background = Some(call_bg),
+        }
+        calls.push(delegated_call_payload(call));
+    }
+
+    let group_id = uuid::Uuid::new_v4().to_string();
+    let resolved_tool_use_id = match request.run_id.as_deref() {
+        Some(run_id) => resolve_change_tool_use_id(orch, run_id, "/calls").await,
+        None => None,
+    };
+    let parent_tool_use_id = request
+        .tool_use_id
+        .as_deref()
+        .or(resolved_tool_use_id.as_deref());
+    let response = crate::execution::delegation::spawn_call_packets(
+        orch,
+        SpawnCallPacketsInput {
+            run_id: request.run_id.as_deref(),
+            cwd: &request.cwd,
+            payloads: &calls,
+            group_id: &group_id,
+            parent_tool_use_id,
+            background: background.unwrap_or(false),
+        },
+    )
+    .await;
+    response.result
+}
+
+/// Convert a wire `CallPayload` into the resolved `DelegatedCallPayload`,
+/// applying the `Explore` default worker and deriving a display title from the
+/// description, label, or a prompt prefix.
+fn delegated_call_payload(call: CallPayload) -> DelegatedCallPayload {
+    let worktree = match call.worktree.unwrap_or_default() {
+        CallWorktreeMode::Inherit => CallWorktree::Inherit,
+        CallWorktreeMode::None => CallWorktree::None,
+    };
+    let description = call
+        .description
+        .filter(|d| !d.is_empty())
+        .or_else(|| call.label.clone())
+        .unwrap_or_else(|| {
+            let prefix: String = call.prompt.trim().chars().take(60).collect();
+            if prefix.is_empty() {
+                "call".to_string()
+            } else {
+                prefix
+            }
+        });
+    DelegatedCallPayload {
+        description,
+        prompt: call.prompt,
+        subagent_type: call
+            .subagent_type
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Explore".to_string()),
+        tier: call.tier,
+        backend_preference: call.backend_preference,
+        output_schema: call.output_schema,
+        worktree,
+        label: call.label,
+        phase: call.phase,
+        task_index: call.task_index,
+        ordinal: call.ordinal,
+    }
+}
+
 /// The resolved routing decision for a tasks-append batch: the caller's own node
 /// job, the job each append addresses, and how the batch routes.
 #[derive(Debug)]
@@ -322,12 +426,34 @@ async fn run_self_task_spawn(
 /// `create_child_task`, inheriting that node's worktree (the rescue/injection
 /// path). Cross-node spawns never suspend the caller, so they return
 /// immediately regardless of any `background` flag.
+/// Cross-node (rescue) task jobs are bare child jobs with no recipe node, so the
+/// artifact-write handler has no per-task schema to resolve and validates their
+/// return against the fixed `return` contract. Rather than silently drop a
+/// caller's `outputSchema` (or worse, tell the child to produce a shape whose
+/// write is then rejected against `return`), reject the append with a clear
+/// error. Per-task output schemas are honored only on the self route, which
+/// materializes the task as a recipe node carrying the schema.
+fn reject_cross_node_output_schema(tasks: &[TaskPayload]) -> Option<String> {
+    tasks.iter().find(|t| t.output_schema.is_some()).map(|t| {
+        format!(
+            "outputSchema is not supported on cross-node task appends: the target node's rescue worker returns freeform output. Omit outputSchema, or spawn under your own node (cairn:~/tasks), where a per-task schema is enforced. (task: '{}')",
+            t.description
+        )
+    })
+}
+
 async fn run_cross_node_task_spawn(
     orch: &Orchestrator,
     tasks: &[TaskPayload],
     target_job_ids: &[String],
     coords: &[NodeTasksCoords],
 ) -> String {
+    // Reject up front so a caller who attached a schema learns their contract
+    // cannot be honored here, instead of receiving a silent freeform result.
+    if let Some(err) = reject_cross_node_output_schema(tasks) {
+        return err;
+    }
+
     let mut lines = Vec::with_capacity(tasks.len());
     let mut ignored_fork = false;
     for (idx, task) in tasks.iter().enumerate() {
@@ -511,6 +637,7 @@ fn delegated_task_payload(task: TaskPayload) -> DelegatedTaskPayload {
         backend_preference: task.backend_preference,
         session,
         task_index: task.task_index,
+        output_schema: task.output_schema,
     }
 }
 
@@ -588,6 +715,7 @@ mod blocking_group_tests {
             run_in_background: None,
             session: None,
             task_index: None,
+            output_schema: None,
         }
     }
 
@@ -595,6 +723,92 @@ mod blocking_group_tests {
     fn delegated_payload_keeps_explicit_description() {
         let task = task_payload("Explicit title", "do the thing");
         assert_eq!(delegated_task_payload(task).description, "Explicit title");
+    }
+
+    fn call_payload(prompt: &str) -> CallPayload {
+        CallPayload {
+            prompt: prompt.to_string(),
+            subagent_type: None,
+            description: None,
+            tier: None,
+            backend_preference: None,
+            output_schema: None,
+            worktree: None,
+            label: None,
+            phase: None,
+            run_in_background: None,
+            task_index: None,
+            ordinal: None,
+        }
+    }
+
+    #[test]
+    fn call_payload_defaults_explore_and_inherit() {
+        let d = delegated_call_payload(call_payload("Summarize the parser"));
+        assert_eq!(d.subagent_type, "Explore");
+        assert_eq!(d.worktree, CallWorktree::Inherit);
+        // Description derives from the prompt when none is given.
+        assert_eq!(d.description, "Summarize the parser");
+    }
+
+    #[test]
+    fn call_payload_none_worktree_and_label_title() {
+        let mut c = call_payload("do it");
+        c.worktree = Some(CallWorktreeMode::None);
+        c.label = Some("verifier".to_string());
+        let d = delegated_call_payload(c);
+        assert_eq!(d.worktree, CallWorktree::None);
+        // Description falls back to the label before the prompt.
+        assert_eq!(d.description, "verifier");
+    }
+
+    #[test]
+    fn classifies_node_calls_append() {
+        assert_eq!(
+            blocking_append_kind(&append("cairn://p/CAIRN/1/1/builder/calls")),
+            Some(BlockingKind::Calls)
+        );
+    }
+
+    #[test]
+    fn validate_blocking_group_calls_only_and_mixes() {
+        let calls = vec![
+            append("cairn://p/CAIRN/1/1/builder/calls"),
+            append("cairn://p/CAIRN/1/1/builder/calls"),
+        ];
+        assert_eq!(
+            validate_blocking_group(&calls, &[0, 1]).unwrap(),
+            Some(BlockingKind::Calls)
+        );
+
+        // Mixing calls with tasks or questions is rejected.
+        let call_task = vec![
+            append("cairn://p/CAIRN/1/1/builder/calls"),
+            append("cairn://p/CAIRN/1/1/builder/tasks"),
+        ];
+        assert!(validate_blocking_group(&call_task, &[0, 1]).is_err());
+        let call_question = vec![
+            append("cairn://p/CAIRN/1/1/builder/calls"),
+            append("cairn://p/CAIRN/1/1/builder/questions"),
+        ];
+        assert!(validate_blocking_group(&call_question, &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn cross_node_append_rejects_output_schema() {
+        // No schema -> no rejection.
+        let mut task = task_payload("rescue", "finish it");
+        assert!(reject_cross_node_output_schema(std::slice::from_ref(&task)).is_none());
+        // A schema on the cross-node route is rejected with a clear error naming
+        // the limitation, rather than silently dropped.
+        task.output_schema = Some(crate::models::OutputSchema::Preset("review".to_string()));
+        let err = reject_cross_node_output_schema(std::slice::from_ref(&task))
+            .expect("schema on cross-node append is rejected");
+        assert!(
+            err.contains("outputSchema is not supported on cross-node"),
+            "{err}"
+        );
+        assert!(err.contains("rescue"), "{err}");
     }
 
     #[test]

@@ -159,7 +159,7 @@ pub fn create_child_task(
             run_id: run_id.clone(),
             session_id: session_id.clone(),
             parent_job_id: input.parent_job_id.clone(),
-            worktree_path: worktree_path.clone(),
+            worktree_path: Some(worktree_path.clone()),
             branch: ephemeral_branch,
             agent_config_id: agent_config.id.clone(),
             project_id: project_id.clone(),
@@ -169,6 +169,14 @@ pub fn create_child_task(
             model: selected_model.as_ref().map(|m| m.to_string()),
             base_commit,
             owns_ephemeral_worktree,
+            // A cross-node child task keeps the fixed `return` contract via the
+            // artifact-write handler's `task_name -> return` fallback; it does not
+            // persist a per-run output_contract (CAIRN-2481).
+            output_contract: None,
+            label: None,
+            phase: None,
+            parent_tool_use_id: None,
+            task_index: None,
             now,
         },
     ))?;
@@ -215,6 +223,10 @@ pub fn create_child_task(
         None,
         Some(&agent_config),
         Some(&output_schema),
+        // A delegated task is a multi-turn subagent that writes its artifact via
+        // the write verb (with confirm gates); it stays prompt-driven, not
+        // natively constrained (CAIRN-2505).
+        false,
         false,
         execution_id.as_deref(),
         None, // Child task: inherits parent's execution identity

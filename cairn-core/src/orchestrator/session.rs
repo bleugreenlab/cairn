@@ -1398,6 +1398,11 @@ pub fn start_agent_session(
     _initial_user_message: Option<&str>,
     agent_config: Option<&crate::models::AgentConfig>,
     _output_schema: Option<&crate::models::OutputSchemaInfo>,
+    // When true, the session's output is constrained to `_output_schema`'s
+    // resolved JSON Schema via the backend's NATIVE structured-output mechanism
+    // (CAIRN-2505). Set only for node-less ephemeral calls; every other session
+    // (recipe nodes, delegated task nodes) passes `false` and is unchanged.
+    constrain_output_natively: bool,
     _is_job_level: bool,
     _execution_id: Option<&str>,
     identity_override: Option<crate::identity::UserIdentity>,
@@ -1904,6 +1909,18 @@ pub fn start_agent_session(
         orch.resolve_identity_for_project(session_project_id.as_deref(), project_overrides.as_ref())
     });
 
+    // Resolve the native output-constraint schema for a schema-constrained call.
+    // Only calls opt in (`constrain_output_natively`); the same contract that
+    // validates the stored artifact drives the constraint, so they cannot drift.
+    let native_output_schema = if constrain_output_natively {
+        _output_schema.and_then(|info| {
+            crate::output_schemas::resolve_output_schema(orch.schema_dir.as_deref(), &info.schema)
+                .ok()
+        })
+    } else {
+        None
+    };
+
     let session_config = SessionConfig {
         run_id: run_id.to_string(),
         working_dir: working_dir.to_string(),
@@ -1922,6 +1939,7 @@ pub fn start_agent_session(
         permissions,
         bidirectional: true,
         identity: resolved_identity,
+        output_schema: native_output_schema,
     };
 
     backend.start_session(session_config, orch)

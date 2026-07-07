@@ -851,7 +851,10 @@ async fn close_pr_for_job_marks_closed() {
     insert_github_app(&db).await;
     let project = create_project(&db, "CL", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
+    // A recipe-backed producing job: standalone (execution-less) jobs were
+    // retired, so resolving the PR recomputes through the job's execution sweep.
+    insert_execution(&db, "exec-cl", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-cl")).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
 
     let http = MockHttpClient::new()
@@ -920,7 +923,10 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
     let repo = temp_jj_project();
     let project = create_project(&db, "MG", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
+    // A recipe-backed producing job: standalone (execution-less) jobs were
+    // retired, so resolving the PR recomputes through the job's execution sweep.
+    insert_execution(&db, "exec-mg", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mg")).await;
     let mr = create_local_merge_request(&db, &job, &project, &issue).await;
 
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
@@ -944,7 +950,10 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
     insert_github_app(&db).await;
     let project = create_project(&db, "GH", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
+    // A recipe-backed producing job: standalone (execution-less) jobs were
+    // retired, so resolving the PR recomputes through the job's execution sweep.
+    insert_execution(&db, "exec-gh", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-gh")).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
 
     let http = MockHttpClient::new()
@@ -1100,7 +1109,10 @@ async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
     let repo = temp_jj_project();
     let project = create_project(&db, "MGSQ", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
+    // A recipe-backed producing job: standalone (execution-less) jobs were
+    // retired, so resolving the PR recomputes through the job's execution sweep.
+    insert_execution(&db, "exec-mgsq", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mgsq")).await;
     let mr = create_local_merge_request(&db, &job, &project, &issue).await;
 
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
@@ -1152,7 +1164,10 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     let repo = temp_jj_project();
     let project = create_project(&db, "MGRT", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
+    // A recipe-backed producing job: standalone (execution-less) jobs were
+    // retired, so resolving the PR recomputes through the job's execution sweep.
+    insert_execution(&db, "exec-mgrt", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mgrt")).await;
     let mr = create_local_merge_request(&db, &job, &project, &issue).await;
 
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;
@@ -1189,7 +1204,10 @@ async fn merge_pr_for_job_workspace_keeps_real_commits() {
     let repo = temp_jj_project();
     let project = create_workspace_project(&db, "MGWS", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
-    let job = create_job(&db, &project, &issue).await;
+    // A recipe-backed producing job: standalone (execution-less) jobs were
+    // retired, so resolving the PR recomputes through the job's execution sweep.
+    insert_execution(&db, "exec-mgws", &project, &issue).await;
+    let job = create_job_with_execution(&db, &project, &issue, Some("exec-mgws")).await;
     let mr = create_local_merge_request(&db, &job, &project, &issue).await;
 
     let (cfg, orch) = orchestrator_with_http(db, MockHttpClient::new()).await;

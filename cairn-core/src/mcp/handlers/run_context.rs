@@ -111,7 +111,8 @@ async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String,
                             issues.number,
                             executions.seq,
                             jobs.uri_segment,
-                            parent_jobs.uri_segment AS parent_uri_segment
+                            parent_jobs.uri_segment AS parent_uri_segment,
+                            jobs.agent_config_id
                      FROM runs
                      LEFT JOIN issues ON runs.issue_id = issues.id
                      LEFT JOIN projects ON COALESCE(runs.project_id, issues.project_id) = projects.id
@@ -132,6 +133,16 @@ async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String,
             let exec_seq = row.opt_i64(2)?.map(|value| value as i32);
             let uri_segment = row.opt_text(3)?;
             let parent_uri_segment = row.opt_text(4)?;
+            let agent_config_id = row.opt_text(5)?;
+            // A workflow run is a child job (for the delegation tree) but is
+            // addressable as a NODE: build a node-shaped home (ignore the parent
+            // segment) so `cairn:~/calls`, `cairn:~/progress`, and the harness's
+            // output-artifact write resolve as node resources.
+            let parent_for_uri = if agent_config_id.as_deref() == Some("workflow") {
+                None
+            } else {
+                parent_uri_segment.as_deref()
+            };
             match (
                 project_key.as_deref(),
                 issue_number,
@@ -139,13 +150,7 @@ async fn lookup_home_uri_by_run_id(db: &LocalDb, run_id: &str) -> Result<String,
                 uri_segment.as_deref(),
             ) {
                 (Some(key), Some(number), Some(seq), Some(segment)) => Ok(
-                    cairn_common::uri::build_job_base_uri(
-                        key,
-                        number,
-                        seq,
-                        segment,
-                        parent_uri_segment.as_deref(),
-                    ),
+                    cairn_common::uri::build_job_base_uri(key, number, seq, segment, parent_for_uri),
                 ),
                 _ => Err(DbError::Row(format!(
                     "Cannot build home URI for run {}: project_key={:?}, issue_number={:?}, exec_seq={:?}, uri_segment={:?}",
@@ -325,6 +330,30 @@ mod tests {
         assert!(
             Arc::ptr_eq(&db, &dbs.local),
             "a private run resolves to the private database (strict no-op for local installs)"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_child_run_gets_a_node_shaped_home() {
+        let dbs = local_dbs().await;
+        // A caller node `builder` and a workflow that is a CHILD of it but is
+        // addressable as a node. Its home must be node-shaped so the harness's
+        // `cairn:~/calls` resolves as a NodeCalls collection.
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',9,'T','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment) VALUES ('j-b','e','i','p','Builder','running',1,1,'builder')",
+            "INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment) VALUES ('j-wf','e','j-b','i','p','WF','workflow','running',1,1,'wf')",
+            "INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at) VALUES ('r-wf','i','p','j-wf','live',1,1)",
+        ] {
+            dbs.local.execute(sql, ()).await.unwrap();
+        }
+        let home = lookup_home_uri_by_run_id(&dbs.local, "r-wf").await.unwrap();
+        assert!(
+            !home.contains("/task/") && home.ends_with("/wf"),
+            "workflow home must be node-shaped, got: {home}"
         );
     }
 

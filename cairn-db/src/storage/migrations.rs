@@ -155,6 +155,36 @@ macro_rules! shared_tail_jobs_owns_ephemeral_worktree {
     };
 }
 
+/// CAIRN-2481: schema + workflow-tag carriers for the ephemeral call primitive.
+/// `jobs.output_contract` gives node-less runs (ephemeral calls and, going
+/// forward, child tasks) a per-run output schema the artifact-write handler can
+/// resolve without a recipe node; `runs.label`/`runs.phase` are durable workflow
+/// tags. Both `jobs` and `runs` are project-scoped SHARED tables, so this change
+/// is written once here and appended after 0097 in each lineage.
+macro_rules! shared_tail_call_output_contract {
+    () => {
+        Migration::new(
+            "0098",
+            "call_output_contract_and_run_tags",
+            include_str!("../../../../turso_migrations/0098_call_output_contract_and_run_tags.sql"),
+        )
+    };
+}
+
+/// CAIRN-2499: durable phase/log progress timeline for a workflow node, the
+/// reader the workflow monitoring panel renders. A project-scoped SHARED table
+/// (a new CREATE TABLE), so it is written once here and appended after 0098 in
+/// both lineages -- it lives alongside the jobs/runs the monitor joins it with,
+/// and its progress syncs so teammates see the panel.
+macro_rules! shared_tail_workflow_progress {
+    () => {
+        Migration::new(
+            "0101",
+            "workflow_progress",
+            include_str!("../../../../turso_migrations/0101_workflow_progress.sql"),
+        )
+    };
+}
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -168,6 +198,8 @@ macro_rules! team_lineage {
             shared_tail_relink_merge_request_jobs!(),
             shared_tail_jobs_child_base!(),
             shared_tail_jobs_owns_ephemeral_worktree!(),
+            shared_tail_call_output_contract!(),
+            shared_tail_workflow_progress!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -247,6 +279,30 @@ macro_rules! private_lineage {
             shared_tail_relink_merge_request_jobs!(),
             shared_tail_jobs_child_base!(),
             shared_tail_jobs_owns_ephemeral_worktree!(),
+            shared_tail_call_output_contract!(),
+            shared_tail_workflow_progress!(),
+            // CAIRN-2487: durable journal for the workflow harness's agent()
+            // calls. A per-machine runner-transient replay cache (never synced),
+            // so it lives ONLY in the private lineage's tail -- absent from
+            // TEAM_MIGRATIONS.
+            Migration::new(
+                "0099",
+                "workflow_journal",
+                include_str!("../../../../turso_migrations/0099_workflow_journal.sql"),
+            ),
+            // CAIRN-2498: workflow restart durability. workflow_run records the
+            // durable spawn params for startup re-dispatch; workflow_call links
+            // an in-flight ephemeral call back to its journal key. Both are
+            // per-machine runner-transient replay state (never synced), so they
+            // live ONLY in the private lineage's tail -- absent from
+            // TEAM_MIGRATIONS, like workflow_journal above.
+            Migration::new(
+                "0100",
+                "workflow_restart_durability",
+                include_str!(
+                    "../../../../turso_migrations/0100_workflow_restart_durability.sql"
+                ),
+            ),
         ]
     };
 }
@@ -860,6 +916,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("tool_invocations", TableScope::ProjectScoped),
     ("turns", TableScope::ProjectScoped),
     ("wake_subscriptions", TableScope::ProjectScoped),
+    ("workflow_progress", TableScope::ProjectScoped),
     // ── SharedContent: content-addressed, owned by CAIRN-2188 ────────────────
     // Named here so the category exists; 2188 builds the store and moves them.
     // Each stays in its CURRENT lineage until then so the projection is exact.
@@ -924,6 +981,18 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "trigger_accumulator_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "workflow_journal",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "workflow_run",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "workflow_call",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // ── Private: rebuildable / refetchable caches ────────────────────────────
@@ -1200,6 +1269,13 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         table: "wake_subscriptions",
         id_columns: &["id", "job_id"],
     },
+    // workflow_progress.id is the composite `{job_id}:{seq}` (a non-uuid, so
+    // rekey_to_team leaves it as-is); job_id is the routable column that gets
+    // re-prefixed to the team scope on a local->team promotion.
+    RekeyTableManifest {
+        table: "workflow_progress",
+        id_columns: &["id", "job_id"],
+    },
 ];
 
 #[cfg(test)]
@@ -1337,6 +1413,10 @@ mod tests {
                 "0095_relink_merge_request_jobs".to_string(),
                 "0096_jobs_child_base".to_string(),
                 "0097_jobs_owns_ephemeral_worktree".to_string(),
+                "0098_call_output_contract_and_run_tags".to_string(),
+                "0101_workflow_progress".to_string(),
+                "0099_workflow_journal".to_string(),
+                "0100_workflow_restart_durability".to_string(),
             ]
         );
         Ok(db)
@@ -2652,6 +2732,8 @@ mod tests {
                 "0095_relink_merge_request_jobs".to_string(),
                 "0096_jobs_child_base".to_string(),
                 "0097_jobs_owns_ephemeral_worktree".to_string(),
+                "0098_call_output_contract_and_run_tags".to_string(),
+                "0101_workflow_progress".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

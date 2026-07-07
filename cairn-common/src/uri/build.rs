@@ -42,6 +42,10 @@ pub fn build_node_messages_uri(project: &str, number: i32, exec_seq: i32, node_i
     build_node_subresource_uri(project, number, exec_seq, node_id, "messages")
 }
 
+pub fn build_node_progress_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "progress")
+}
+
 pub fn build_task_messages_uri(
     project: &str,
     number: i32,
@@ -260,6 +264,10 @@ pub fn build_node_tasks_uri(project: &str, number: i32, exec_seq: i32, node_id: 
     build_node_subresource_uri(project, number, exec_seq, node_id, "tasks")
 }
 
+pub fn build_node_calls_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "calls")
+}
+
 pub fn build_node_wakes_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "wakes")
 }
@@ -465,6 +473,22 @@ pub fn build_project_recipes_uri(project: &str) -> String {
 
 pub fn build_project_recipe_uri(project: &str, recipe_id: &str) -> String {
     format!("{}/recipes/{}", build_project_uri(project), recipe_id)
+}
+
+pub fn build_workflows_uri() -> String {
+    "cairn://workflows".to_string()
+}
+
+pub fn build_workflow_uri(workflow_id: &str) -> String {
+    format!("cairn://workflows/{}", workflow_id)
+}
+
+pub fn build_project_workflows_uri(project: &str) -> String {
+    format!("{}/workflows", build_project_uri(project))
+}
+
+pub fn build_project_workflow_uri(project: &str, workflow_id: &str) -> String {
+    format!("{}/workflows/{}", build_project_uri(project), workflow_id)
 }
 
 pub fn build_agents_uri() -> String {
@@ -679,6 +703,12 @@ impl CairnResource {
                 exec_seq,
                 node_id,
             } => build_node_tasks_uri(project, *number, *exec_seq, node_id),
+            Self::NodeCalls {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_calls_uri(project, *number, *exec_seq, node_id),
             Self::NodeWakes {
                 project,
                 number,
@@ -740,6 +770,12 @@ impl CairnResource {
                 exec_seq,
                 node_id,
             } => build_node_messages_uri(project, *number, *exec_seq, node_id),
+            Self::NodeProgress {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_progress_uri(project, *number, *exec_seq, node_id),
             Self::TaskMessages {
                 project,
                 number,
@@ -833,6 +869,13 @@ impl CairnResource {
             Self::ProjectRecipe { project, recipe_id } => {
                 build_project_recipe_uri(project, recipe_id)
             }
+            Self::Workflows => build_workflows_uri(),
+            Self::Workflow { workflow_id } => build_workflow_uri(workflow_id),
+            Self::ProjectWorkflows { project } => build_project_workflows_uri(project),
+            Self::ProjectWorkflow {
+                project,
+                workflow_id,
+            } => build_project_workflow_uri(project, workflow_id),
             Self::Agents => build_agents_uri(),
             Self::Agent { agent_id } => build_agent_uri(agent_id),
             Self::ProjectAgents { project } => build_project_agents_uri(project),

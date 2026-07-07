@@ -924,6 +924,16 @@ impl Orchestrator {
         crate::execution::scheduler::spawn_recipe_scheduler(self.clone());
     }
 
+    /// Re-dispatch workflow runs that were in flight when the process died
+    /// (CAIRN-2498): re-spawn each crashed workflow's `bun <script>` for the
+    /// SAME run_id so its journal replays already-completed `agent()` calls
+    /// instead of re-running them. Called once at host startup, after the MCP
+    /// callback server is bound so the re-spawned scripts can call back. Owned
+    /// by the always-on hosts (runner, non-inert server).
+    pub async fn redispatch_crashed_workflows(&self) {
+        crate::execution::jobs::redispatch_crashed_workflows(self).await;
+    }
+
     /// Spawn the memory-triage reconciliation sweep: once immediately at
     /// startup, then on a periodic timer. The sweep is driven entirely by DB
     /// state and guarantees every at-threshold pending pool has a triage issue

@@ -1,5 +1,5 @@
-//! Run-item resolution: classify each item into a shell command, a skill-script
-//! spec, or a proxied MCP `tools/call`.
+//! Run-item resolution: classify each item into a shell command, inline code, a
+//! skill-script spec, or a proxied MCP `tools/call`.
 
 use super::types::{McpCallSpec, RunItem, RunSpec};
 use crate::config::mcp_servers::McpServerConfig;
@@ -16,16 +16,37 @@ pub(super) async fn resolve_run_item(
     run_context: Option<&RunContext>,
     item: &RunItem,
 ) -> (String, Result<RunSpec, String>) {
-    match (item.command.as_deref(), item.target.as_deref()) {
-        (Some(_), Some(_)) => (
+    // `interpreter` is only meaningful for inline `code`; a stray one on a
+    // command/target item is a mistake worth naming rather than silently ignoring.
+    if item.interpreter.is_some() && item.code.is_none() {
+        return (
             "<invalid item>".to_string(),
-            Err("Run item has both `command` and `target`; provide exactly one".to_string()),
-        ),
-        (None, None) => (
+            Err("Run item has `interpreter` but no `code`; `interpreter` is only valid with inline `code`".to_string()),
+        );
+    }
+
+    // Exactly one of `command` / `target` / `code`.
+    let present: Vec<&str> = [
+        item.command.as_deref().map(|_| "command"),
+        item.target.as_deref().map(|_| "target"),
+        item.code.as_deref().map(|_| "code"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match present.as_slice() {
+        [] => (
             "<invalid item>".to_string(),
-            Err("Run item has neither `command` nor `target`; provide exactly one".to_string()),
+            Err("Run item has none of `command`, `target`, or `code`; provide exactly one".to_string()),
         ),
-        (Some(command), None) => {
+        [first, second, ..] => (
+            "<invalid item>".to_string(),
+            Err(format!(
+                "Run item has both `{first}` and `{second}`; provide exactly one of `command`, `target`, or `code`"
+            )),
+        ),
+        ["command"] => {
+            let command = item.command.as_deref().unwrap_or_default();
             // Unwrap launcher forms (e.g. `bash -lc '...'`) like the old path did.
             let unwrapped = unwrap_shell_launcher(command);
             let command = if command.trim() != unwrapped {
@@ -42,7 +63,8 @@ pub(super) async fn resolve_run_item(
                 }),
             )
         }
-        (None, Some(target)) => {
+        ["target"] => {
+            let target = item.target.as_deref().unwrap_or_default();
             let header = target.to_string();
             // Branch on the target URI family: MCP gateway tool calls are
             // proxied RPC; everything else is a skill-script process exec.
@@ -57,6 +79,85 @@ pub(super) async fn resolve_run_item(
                 }
             }
         }
+        ["code"] => resolve_code_spec(item),
+        _ => unreachable!("present holds only command/target/code"),
+    }
+}
+
+/// Resolve an inline-code run item into a header + `Script` spec.
+///
+/// Inline code reuses `RunSpec::Script` so `process.rs` runs it through the exact
+/// same spawn/env/fence/timeout path as a skill script — the only new work is
+/// mapping the language-named interpreter to `(program, eval-flag)` and deriving
+/// a header. The code is passed as a single argv argument (`bun -e <code>` /
+/// `python3 -c <code>`): no shell (so no quoting), no temp file (no lifecycle).
+/// Because `execute_process` injects the callback env, inline TypeScript gets
+/// zero-config `@cairn/sdk` from the worktree `node_modules`.
+fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
+    let code = item.code.as_deref().unwrap_or_default();
+    let header = item
+        .description
+        .clone()
+        .unwrap_or_else(|| first_line_header(code));
+
+    // `payload` (args / args_json) is meaningless for inline code — reject it so
+    // the item kinds stay cleanly separated rather than silently dropping it.
+    if item.payload.is_some() {
+        return (
+            header,
+            Err("Run item has both `code` and `payload`; inline code takes no payload".to_string()),
+        );
+    }
+
+    let interpreter = match item.interpreter.as_deref() {
+        Some(i) => i,
+        None => {
+            return (
+                header,
+                Err("Run item has `code` but no `interpreter`; set `interpreter` to one of: typescript (ts), javascript (js), python (py)".to_string()),
+            )
+        }
+    };
+
+    let (program, flag) = match interpreter.trim().to_ascii_lowercase().as_str() {
+        // bun runs TypeScript and JavaScript identically; the ts/js split only
+        // matters to the presentation-layer syntax highlighter.
+        "typescript" | "ts" | "javascript" | "js" => ("bun", "-e"),
+        "python" | "py" => ("python3", "-c"),
+        other => {
+            return (
+                header,
+                Err(format!(
+                    "Run item has an unknown `interpreter` '{other}'; accepted values: typescript (ts), javascript (js), python (py)"
+                )),
+            )
+        }
+    };
+
+    (
+        header,
+        Ok(RunSpec::Script {
+            program: program.to_string(),
+            args: vec![flag.to_string(), code.to_string()],
+            timeout: item.timeout,
+        }),
+    )
+}
+
+/// Header for an inline-code item lacking a `description`: its first non-blank
+/// source line, truncated for the composed-output `=== <header> ===` label.
+fn first_line_header(code: &str) -> String {
+    const MAX: usize = 80;
+    let line = code
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() > MAX {
+        let truncated: String = line.chars().take(MAX).collect();
+        format!("{truncated}\u{2026}")
+    } else {
+        line.to_string()
     }
 }
 
@@ -264,5 +365,117 @@ mod tests {
         let p = dir.path().join("script.xyz");
         std::fs::write(&p, "data\n").unwrap();
         assert!(resolve_interpreter(&p).is_err());
+    }
+
+    fn code_item(code: &str, interpreter: Option<&str>) -> RunItem {
+        RunItem {
+            command: None,
+            description: None,
+            timeout: None,
+            target: None,
+            payload: None,
+            code: Some(code.to_string()),
+            interpreter: interpreter.map(str::to_string),
+            background: None,
+        }
+    }
+
+    fn script(spec: Result<RunSpec, String>) -> (String, Vec<String>) {
+        match spec {
+            Ok(RunSpec::Script { program, args, .. }) => (program, args),
+            _ => panic!("expected a Script spec"),
+        }
+    }
+
+    // `RunSpec` is intentionally not `Debug`, so extract the error by match
+    // rather than `unwrap_err` (which needs `T: Debug`).
+    fn err(spec: Result<RunSpec, String>) -> String {
+        match spec {
+            Err(e) => e,
+            Ok(_) => panic!("expected an error spec"),
+        }
+    }
+
+    #[test]
+    fn resolve_code_spec_maps_ts_and_js_aliases_to_bun_eval() {
+        for interp in ["typescript", "ts", "javascript", "js"] {
+            let (_h, spec) = resolve_code_spec(&code_item("console.log(1)", Some(interp)));
+            let (program, args) = script(spec);
+            assert_eq!(program, "bun", "interpreter {interp}");
+            assert_eq!(
+                args,
+                vec!["-e".to_string(), "console.log(1)".to_string()],
+                "interpreter {interp}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_code_spec_maps_python_aliases_to_python3_c() {
+        for interp in ["python", "py", "PYTHON"] {
+            let (_h, spec) = resolve_code_spec(&code_item("print(1)", Some(interp)));
+            let (program, args) = script(spec);
+            assert_eq!(program, "python3", "interpreter {interp}");
+            assert_eq!(
+                args,
+                vec!["-c".to_string(), "print(1)".to_string()],
+                "interpreter {interp}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_code_spec_missing_interpreter_errors() {
+        let (_h, spec) = resolve_code_spec(&code_item("print(1)", None));
+        let err = err(spec);
+        assert!(err.contains("interpreter"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_code_spec_unknown_interpreter_names_accepted_set() {
+        let (_h, spec) = resolve_code_spec(&code_item("puts 1", Some("ruby")));
+        let err = err(spec);
+        assert!(
+            err.contains("typescript") && err.contains("python"),
+            "the error must name the accepted set: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_code_spec_rejects_payload() {
+        let mut item = code_item("print(1)", Some("python"));
+        item.payload = Some(super::super::types::RunItemPayload::default());
+        let (_h, spec) = resolve_code_spec(&item);
+        let err = err(spec);
+        assert!(err.contains("payload"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_code_spec_header_uses_first_nonblank_line() {
+        let (header, _spec) = resolve_code_spec(&code_item(
+            "\n\n  const x = 1;\n  console.log(x);\n",
+            Some("ts"),
+        ));
+        assert_eq!(header, "const x = 1;");
+    }
+
+    #[test]
+    fn resolve_code_spec_header_prefers_description() {
+        let mut item = code_item("console.log(1)", Some("ts"));
+        item.description = Some("greet the world".to_string());
+        let (header, _spec) = resolve_code_spec(&item);
+        assert_eq!(header, "greet the world");
+    }
+
+    #[test]
+    fn first_line_header_truncates_long_lines() {
+        let long = "x".repeat(200);
+        let header = first_line_header(&long);
+        assert!(
+            header.chars().count() <= 81,
+            "got {} chars",
+            header.chars().count()
+        );
+        assert!(header.ends_with('\u{2026}'));
     }
 }

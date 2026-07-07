@@ -79,10 +79,8 @@ impl AgentBackend for CodexBackend {
 
         allowed.retain(|tool| tool != "apply_patch");
 
-        // Auto-add submission tool
-        if !allowed.contains(&"mcp__cairn__return".to_string()) {
-            allowed.push("mcp__cairn__return".to_string());
-        }
+        // The retired `mcp__cairn__return` tool is no longer injected: returning
+        // is `write cairn:~/return` (CAIRN-2505). No MCP handler dispatched it.
 
         // Codex ignores `--disallowedTools` — tool access is governed by its own
         // MCP/approval config. Native-off is enforced by simply not allowing
@@ -422,6 +420,13 @@ impl AgentBackend for CodexBackend {
         });
         if let Some(ref model) = model_str {
             turn_params["model"] = serde_json::json!(model);
+        }
+        // Schema-constrained call (CAIRN-2505): request native structured output.
+        // The app-server maps `outputSchema` to the provider's
+        // `final_output_json_schema`, so the constrained result arrives as the
+        // turn's final agent message, captured server-side at turn/completed.
+        if let Some(ref schema) = config.output_schema {
+            turn_params["outputSchema"] = schema.clone();
         }
         let turn_resp = client.send_request("turn/start", turn_params)?;
 
@@ -879,6 +884,12 @@ pub(crate) fn start_app_server_session(
     });
     if let Some(ref model) = model_str {
         turn_params["model"] = serde_json::json!(model);
+    }
+    // Schema-constrained call (CAIRN-2505): request native structured output,
+    // mirroring the primary `start_session` turn/start path so the two never
+    // drift.
+    if let Some(ref schema) = config.output_schema {
+        turn_params["outputSchema"] = schema.clone();
     }
     let turn_resp = client.send_request("turn/start", turn_params)?;
 

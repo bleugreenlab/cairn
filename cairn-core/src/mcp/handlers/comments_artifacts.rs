@@ -90,7 +90,7 @@ pub async fn handle_add_comment(orch: &Orchestrator, request: &McpCallbackReques
 /// error naming the failing fields. Now that the artifact schema is no longer a
 /// visible tool input, this is where the agent gets corrective feedback for a
 /// malformed write.
-fn validate_against_schema(
+pub(crate) fn validate_against_schema(
     schema: &serde_json::Value,
     payload: &serde_json::Value,
 ) -> Result<(), String> {
@@ -204,6 +204,27 @@ pub(crate) struct ResolvedArtifactContract {
 /// auto-confirms, and NEVER arms the terminal interrupt or satisfies the output
 /// contract (repeated create+patch across the run is normal). Anything else
 /// takes the terminal contract.
+/// Load and parse a node-less job's persisted `DelegatedOutputContract`
+/// (CAIRN-2481). `None` when the column is NULL (a child task) or the job is
+/// absent, so the caller falls through to the fixed `return` contract.
+async fn load_job_output_contract(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Option<crate::models::DelegatedOutputContract> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .ok()?;
+    let json = db
+        .query_opt_text(
+            "SELECT output_contract FROM jobs WHERE id = ?1",
+            (job_id.to_string(),),
+        )
+        .await
+        .ok()
+        .flatten()?;
+    serde_json::from_str(&json).ok()
+}
+
 pub(crate) async fn resolve_artifact_contract(
     orch: &Orchestrator,
     job_id: &str,
@@ -227,6 +248,12 @@ pub(crate) async fn resolve_artifact_contract(
             terminal_schema = Some(info.schema);
         }
         self_targets = resolve_ctx_self_schemas(orch, node_id, execution_id).await;
+    } else if let Some(contract) = load_job_output_contract(orch, job_id).await {
+        // A node-less run (an ephemeral call) carries its resolved output
+        // contract on the job row, so prompt and validation read one source
+        // (CAIRN-2481). This takes precedence over the fixed `return` fallback.
+        terminal_name = Some(contract.artifact_name());
+        terminal_schema = Some(contract.schema_type);
     } else if task_name.is_some() {
         terminal_name = Some("result".to_string());
         terminal_schema = Some(crate::models::OutputSchema::Preset("return".to_string()));
@@ -533,6 +560,109 @@ pub(crate) async fn write_artifact_change(
             ""
         }
     ))
+}
+
+/// Server-side capture of a schema-constrained ephemeral call's NATIVE
+/// structured output as its return artifact (CAIRN-2505).
+///
+/// A node-less call constrained to a JSON Schema (Claude `--json-schema`,
+/// OpenRouter `response_format`, Codex per-turn `outputSchema`) produces its
+/// result through the provider's structured-output mechanism rather than by the
+/// model choosing to `write cairn:~/return`. When that constrained result comes
+/// back, store it as the call's return artifact directly — validated against the
+/// SAME contract the model's own write would validate against — so cheap/fast
+/// tiers reliably yield a schema-valid artifact.
+///
+/// Returns `Ok(true)` when it stored the artifact, `Ok(false)` when there is
+/// nothing to capture (the run is not a schema-bearing call, or the artifact
+/// already exists — e.g. the model also wrote it). A schema-validation failure is
+/// returned as `Err` and NEVER stored: silent provider non-conformance surfaces
+/// as a loud failure (the call resolves to null), never corrupt data.
+pub(crate) async fn capture_call_structured_output(
+    orch: &Orchestrator,
+    run_id: &str,
+    value: serde_json::Value,
+) -> Result<bool, String> {
+    // run_id -> job_id (a call's run may live in a team replica).
+    let owning = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(job_id) = owning
+        .query_opt_text(
+            "SELECT job_id FROM runs WHERE id = ?1",
+            (run_id.to_string(),),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(false);
+    };
+
+    // Only node-less calls carry a persisted output contract; every other run is
+    // left to its normal artifact-write flow (unchanged).
+    let Some(contract) = load_job_output_contract(orch, &job_id).await else {
+        return Ok(false);
+    };
+    let output_name = contract.artifact_name();
+
+    // If the model already wrote the artifact, don't overwrite it.
+    if load_latest_artifact(orch, &job_id, &output_name)
+        .await
+        .is_some()
+    {
+        return Ok(false);
+    }
+
+    // Validate against the resolved contract schema. A failure is loud (the
+    // artifact is never stored), so silent non-conformance can't corrupt data.
+    let schema_value = crate::output_schemas::resolve_output_schema(
+        orch.schema_dir.as_deref(),
+        &contract.schema_type,
+    )
+    .map_err(|e| format!("Failed to resolve call output schema: {e}"))?;
+    validate_against_schema(&schema_value, &value)?;
+
+    let data_json = serde_json::to_string(&value)
+        .map_err(|e| format!("Failed to serialize captured structured output: {e}"))?;
+
+    // A call has no review gate, so its captured artifact auto-confirms.
+    let stored = store_artifact(orch, &job_id, &output_name, &output_name, data_json, true).await?;
+
+    let artifact = crate::models::Artifact {
+        id: stored.artifact_id.clone(),
+        job_id: Some(job_id.clone()),
+        artifact_type: stored.artifact_type.clone(),
+        schema_version: 1,
+        data: value,
+        version: stored.version,
+        parent_version_id: stored.parent_version_id.clone(),
+        output_name: stored.output_name.clone(),
+        created_at: stored.created_at as i64,
+        updated_at: stored.updated_at as i64,
+        seen_at: None,
+        confirmed: true,
+    };
+    orch.notifier.artifact(&artifact);
+    let _ = orch.services.emitter.emit(
+        "artifact-submitted",
+        serde_json::json!({
+            "artifact_id": stored.artifact_id,
+            "job_id": job_id,
+            "artifact_type": stored.artifact_type,
+            "version": stored.version,
+        }),
+    );
+
+    // Re-derive the call job's status now that its terminal artifact exists.
+    if let Err(e) = crate::execution::advancement::recompute_job(orch, &job_id) {
+        log::warn!("recompute_job after captured call output failed for {job_id}: {e}");
+    }
+
+    log::info!(
+        "Captured native structured output as call artifact: run={run_id} job={job_id} type={output_name} v{}",
+        stored.version
+    );
+    Ok(true)
 }
 
 struct StoredArtifact {
@@ -1161,6 +1291,36 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn persisted_output_contract_drives_validation() {
+        // CAIRN-2481: a call persists its resolved DelegatedOutputContract on the
+        // job row as JSON; resolve_artifact_contract parses it back and uses
+        // schema_type as the validation schema. This pins that a conforming
+        // return payload is accepted and a violating one is rejected — the exact
+        // resolve_output_schema + validate_against_schema path the write handler
+        // runs, keyed off the persisted contract rather than the `return`
+        // fallback.
+        use crate::models::{DelegatedOutputContract, OutputSchema};
+        let contract = DelegatedOutputContract {
+            schema_type: OutputSchema::Custom(json!({
+                "type": "object",
+                "properties": {"score": {"type": "number"}},
+                "required": ["score"],
+                "additionalProperties": false
+            })),
+            tool_name: None,
+            description: None,
+        };
+        let stored = serde_json::to_string(&contract).unwrap();
+        let parsed: DelegatedOutputContract = serde_json::from_str(&stored).unwrap();
+        // A custom inline schema still writes to the canonical `return` artifact.
+        assert_eq!(parsed.artifact_name(), "return");
+        let schema =
+            crate::output_schemas::resolve_output_schema(None, &parsed.schema_type).unwrap();
+        assert!(validate_against_schema(&schema, &json!({"score": 7})).is_ok());
+        assert!(validate_against_schema(&schema, &json!({"nope": true})).is_err());
+    }
+
+    #[test]
     fn create_takes_policy() {
         assert!(!resolve_confirmed(false, None, ConfirmPolicy::User));
         assert!(resolve_confirmed(false, None, ConfirmPolicy::Auto));
@@ -1554,5 +1714,153 @@ mod tests {
             v3.parent_version_id.as_deref(),
             Some(v2.artifact_id.as_str())
         );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    //! Server-side capture of a schema-constrained call's native structured
+    //! output as its return artifact (CAIRN-2505).
+    use crate::db::DbState;
+    use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    async fn orch_with_db() -> (Orchestrator, Arc<LocalDb>) {
+        let local = Arc::new(
+            LocalDb::open(tempfile::tempdir().unwrap().keep().join("capture.db"))
+                .await
+                .unwrap(),
+        );
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(local.clone(), search));
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        (orch, local)
+    }
+
+    /// A call contract whose custom schema requires a numeric `score`.
+    fn score_contract() -> String {
+        serde_json::to_string(&crate::models::DelegatedOutputContract {
+            schema_type: crate::models::OutputSchema::Custom(json!({
+                "type": "object",
+                "properties": {"score": {"type": "number"}},
+                "required": ["score"],
+                "additionalProperties": false
+            })),
+            tool_name: None,
+            description: None,
+        })
+        .unwrap()
+    }
+
+    /// Seed a node-less call (job carrying a persisted `output_contract` + NULL
+    /// recipe_node_id) plus its run. A NULL `contract` models a non-call run.
+    async fn seed_call(db: &LocalDb, job_id: &str, run_id: &str, contract: Option<String>) {
+        let job_id = job_id.to_string();
+        let run_id = run_id.to_string();
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            let run_id = run_id.clone();
+            let contract = contract.clone();
+            Box::pin(async move {
+                conn.execute("INSERT OR IGNORE INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)", ()).await?;
+                conn.execute("INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT OR IGNORE INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',7,'T','active',1,1)", ()).await?;
+                conn.execute("INSERT OR IGNORE INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)", ()).await?;
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, agent_config_id, output_contract, created_at, updated_at) VALUES (?1,'e','i','p','running','web-researcher',?2,1,1)",
+                    params![job_id.as_str(), contract.as_deref()],
+                ).await?;
+                conn.execute(
+                    "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES (?1,?2,'i','live',1,1)",
+                    params![run_id.as_str(), job_id.as_str()],
+                ).await?;
+                Ok(())
+            })
+        }).await.unwrap();
+    }
+
+    async fn artifact_count(db: &LocalDb, job_id: &str) -> i64 {
+        let job_id = job_id.to_string();
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM artifacts WHERE job_id = ?1",
+                        (job_id.as_str(),),
+                    )
+                    .await?;
+                let row = rows.next().await?.unwrap();
+                row.i64(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn captures_conforming_output_as_return_artifact() {
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "j-call", "r-call", Some(score_contract())).await;
+
+        assert!(
+            super::capture_call_structured_output(&orch, "r-call", json!({"score": 7}))
+                .await
+                .unwrap(),
+            "a fresh conforming result is captured"
+        );
+        assert_eq!(artifact_count(&db, "j-call").await, 1);
+
+        // Idempotent: once the artifact exists, capture is a no-op (the model's
+        // own write, if any, is never clobbered and no duplicate is stored).
+        assert!(
+            !super::capture_call_structured_output(&orch, "r-call", json!({"score": 9}))
+                .await
+                .unwrap(),
+            "capture is a no-op once the artifact exists"
+        );
+        assert_eq!(artifact_count(&db, "j-call").await, 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_conforming_output_without_storing() {
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "j-bad", "r-bad", Some(score_contract())).await;
+
+        // Silent provider non-conformance surfaces as a loud failure, never data.
+        assert!(
+            super::capture_call_structured_output(&orch, "r-bad", json!({"nope": true}))
+                .await
+                .is_err()
+        );
+        assert_eq!(artifact_count(&db, "j-bad").await, 0);
+    }
+
+    #[tokio::test]
+    async fn no_op_when_run_carries_no_output_contract() {
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "j-node", "r-node", None).await;
+
+        // A run with no persisted output contract (a node, not a call) is left
+        // to its own artifact-write flow — unchanged.
+        assert!(
+            !super::capture_call_structured_output(&orch, "r-node", json!({"score": 7}))
+                .await
+                .unwrap()
+        );
+        assert_eq!(artifact_count(&db, "j-node").await, 0);
     }
 }

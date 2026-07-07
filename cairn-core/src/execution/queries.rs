@@ -18,7 +18,7 @@ use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 const EXECUTION_COLUMNS: &str = "id, recipe_id, issue_id, project_id, status, started_at,
-    completed_at, snapshot, seq, initiator_sub, initiator_auth_mode, initiator_org_id,
+    completed_at, snapshot, seq, initiator_sub, initiator_org_id,
     triggered_by";
 
 const ACTION_RUN_COLUMNS: &str = "id, execution_id, recipe_node_id, action_config_id,
@@ -281,11 +281,14 @@ async fn list_all_executions_async(
                 offset
             ],
             |row| {
+                // The three joined columns (i.number, i.project_id, p.name) follow
+                // the EXECUTION_COLUMNS block, so their indices track its width:
+                // 12 execution columns (0..=11) put the joins at 12, 13, 14.
                 Ok((
                     db_execution_from_row(row)?,
-                    row.opt_i64(13)?.map(|value| value as i32),
+                    row.opt_i64(12)?.map(|value| value as i32),
+                    row.opt_text(13)?,
                     row.opt_text(14)?,
-                    row.opt_text(15)?,
                 ))
             },
         )
@@ -834,9 +837,8 @@ fn db_execution_from_row(row: &cairn_db::turso::Row) -> DbResult<DbExecution> {
         snapshot: row.opt_text(7)?,
         seq: row.opt_i64(8)?.map(|value| value as i32),
         initiator_sub: row.opt_text(9)?,
-        initiator_auth_mode: row.opt_text(10)?,
-        initiator_org_id: row.opt_text(11)?,
-        triggered_by: row.text(12)?,
+        initiator_org_id: row.opt_text(10)?,
+        triggered_by: row.text(11)?,
     })
 }
 
@@ -858,4 +860,81 @@ fn db_action_run_from_row(row: &cairn_db::turso::Row) -> Result<DbActionRun, DbE
         parent_job_id: row.opt_text(13)?,
         uri_segment: row.opt_text(14)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
+    async fn exec(db: &LocalDb, sql: &'static str) {
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(sql, ()).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn migrated_db() -> LocalDb {
+        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    /// Regression for the positional mapper in `list_all_executions_async`: the
+    /// three joined columns (`i.number`, `i.project_id`, `p.name`) are read by
+    /// index immediately after the `EXECUTION_COLUMNS` block, so their indices
+    /// must track its width. Removing `initiator_auth_mode` shrank the block
+    /// from 13 to 12 columns, shifting the joins to 12/13/14. If they drift,
+    /// `issue_number` reads `i.project_id` (a TEXT) and `project_name` reads
+    /// past the last selected column.
+    #[tokio::test]
+    async fn list_all_executions_maps_joined_issue_and_project_columns() {
+        let db = migrated_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-1','default','Cairn','CAIRN','/tmp/repo',1,1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-1','proj-1',42,'T','active',1,1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-1','r','issue-1','proj-1','running',1,1)",
+        )
+        .await;
+
+        let result = list_all_executions_async(&db, &ExecutionFilters::default(), 10, 0)
+            .await
+            .unwrap();
+
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(item.id, "exec-1");
+        assert_eq!(
+            item.issue_number,
+            Some(42),
+            "issue_number must map i.number, not the adjacent i.project_id"
+        );
+        assert_eq!(item.project_id.as_deref(), Some("proj-1"));
+        assert_eq!(
+            item.project_name.as_deref(),
+            Some("Cairn"),
+            "project_name must map p.name"
+        );
+    }
 }

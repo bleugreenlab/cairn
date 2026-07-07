@@ -52,19 +52,18 @@ pub(super) fn ensure_agent_snapshot(
 }
 
 fn schema_config_from_output_contract(contract: &DelegatedOutputContract) -> SchemaConfig {
-    // The contract's schema_type names the preset shape (e.g. "return"); it
-    // doubles as the artifact name/URI segment. Bake the preset's JSON Schema
-    // inline so the node is self-contained (no runtime preset reference).
-    let name = if contract.schema_type.is_empty() {
-        "return".to_string()
-    } else {
-        contract.schema_type.clone()
+    // The contract's schema doubles as the artifact name/URI segment. Bake the
+    // resolved JSON Schema inline so the node is self-contained: a preset resolves
+    // to its embedded schema, a custom inline schema is used verbatim.
+    let name = contract.artifact_name();
+    let schema = match &contract.schema_type {
+        crate::models::OutputSchema::Custom(value) => Some(value.clone()),
+        crate::models::OutputSchema::Preset(_) => crate::output_schemas::resolve_output_schema(
+            None,
+            &crate::models::OutputSchema::Preset(name.clone()),
+        )
+        .ok(),
     };
-    let schema = crate::output_schemas::resolve_output_schema(
-        None,
-        &crate::models::OutputSchema::Preset(name.clone()),
-    )
-    .ok();
     SchemaConfig {
         name,
         schema,
@@ -551,7 +550,7 @@ mod tests {
             session: DelegatedSessionStrategy::default(),
             acceptance: vec![],
             output_contract: DelegatedOutputContract {
-                schema_type: "return".to_string(),
+                schema_type: crate::models::OutputSchema::Preset("return".to_string()),
                 tool_name: None,
                 description: None,
             },
@@ -645,7 +644,7 @@ mod tests {
             session: DelegatedSessionStrategy::default(),
             acceptance: vec![],
             output_contract: DelegatedOutputContract {
-                schema_type: "return".to_string(),
+                schema_type: crate::models::OutputSchema::Preset("return".to_string()),
                 tool_name: None,
                 description: None,
             },
@@ -691,5 +690,84 @@ mod tests {
             "ambient task keeps a NULL worktree_path"
         );
         assert_eq!(owns_ephemeral, 1, "ambient task is marked ephemeral-owning");
+    }
+
+    #[test]
+    fn schema_config_bakes_inline_custom_schema_into_node() {
+        let inline = serde_json::json!({
+            "type": "object",
+            "properties": {"score": {"type": "number"}},
+            "required": ["score"],
+            "additionalProperties": false
+        });
+        let contract = crate::models::DelegatedOutputContract {
+            schema_type: crate::models::OutputSchema::Custom(inline.clone()),
+            tool_name: None,
+            description: Some("Submit the task result".to_string()),
+        };
+        let config = schema_config_from_output_contract(&contract);
+        // A custom inline schema writes to the canonical `return` artifact and
+        // bakes the schema verbatim into the node config.
+        assert_eq!(config.name, "return");
+        assert_eq!(config.schema, Some(inline));
+    }
+
+    #[test]
+    fn schema_config_resolves_preset_schema_into_node() {
+        let contract = crate::models::DelegatedOutputContract {
+            schema_type: crate::models::OutputSchema::Preset("review".to_string()),
+            tool_name: None,
+            description: None,
+        };
+        let config = schema_config_from_output_contract(&contract);
+        assert_eq!(config.name, "review");
+        // The preset's embedded JSON Schema is baked in (review requires approval).
+        let schema = config.schema.expect("preset schema resolved");
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "approval"));
+    }
+
+    #[test]
+    fn schema_config_default_return_contract_unchanged() {
+        let contract = crate::models::DelegatedOutputContract {
+            schema_type: crate::models::OutputSchema::Preset("return".to_string()),
+            tool_name: None,
+            description: Some("Submit the task result".to_string()),
+        };
+        let config = schema_config_from_output_contract(&contract);
+        assert_eq!(config.name, "return");
+        let schema = config.schema.expect("return schema resolved");
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "content"));
+    }
+
+    #[test]
+    fn child_return_write_validates_against_custom_schema() {
+        // The schema a delegated child validates its return artifact against is
+        // the one baked into its node config. Reconstruct that schema and confirm
+        // it accepts a conforming payload and rejects a violating one.
+        let inline = serde_json::json!({
+            "type": "object",
+            "properties": {"score": {"type": "number"}},
+            "required": ["score"],
+            "additionalProperties": false
+        });
+        let contract = crate::models::DelegatedOutputContract {
+            schema_type: crate::models::OutputSchema::Custom(inline),
+            tool_name: None,
+            description: None,
+        };
+        let schema = schema_config_from_output_contract(&contract)
+            .schema
+            .expect("custom schema baked in");
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&serde_json::json!({"score": 42})));
+        assert!(!validator.is_valid(&serde_json::json!({"nope": true})));
     }
 }

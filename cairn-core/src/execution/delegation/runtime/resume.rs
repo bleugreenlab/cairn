@@ -487,6 +487,10 @@ fn delegated_sibling_ids(
         .filter(|candidate| {
             candidate.parent_job_id == trigger.parent_job_id
                 && candidate.background == trigger.background
+                // Origin partitions the group too (CAIRN-2481): a parent can spawn
+                // a background task batch and a background call batch in the same
+                // turn, sharing the anchor but with independent resume identities.
+                && candidate.origin == trigger.origin
                 && match trigger.parent_turn_id.as_deref() {
                     Some(anchor) => candidate.parent_turn_id.as_deref() == Some(anchor),
                     None => candidate.id == trigger.id,
@@ -777,6 +781,46 @@ mod tests {
         anchor: Option<&str>,
     ) -> crate::models::DelegatedWorkPacket {
         packet_with_tool(id, parent_job, anchor, None)
+    }
+
+    fn packet_origin(
+        id: &str,
+        parent_job: &str,
+        anchor: Option<&str>,
+        origin: &str,
+    ) -> crate::models::DelegatedWorkPacket {
+        let value = serde_json::json!({
+            "id": id,
+            "parentJobId": parent_job,
+            "parentTurnId": anchor,
+            "origin": origin,
+            "title": "X",
+            "problemStatement": "x",
+            "agentConfigId": "A",
+            "ownership": { "cwd": "/tmp" },
+            "outputContract": { "schemaType": "return" },
+            "status": "completed",
+            "createdAt": 0
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// A background task batch and a background call batch spawned in the same
+    /// turn (shared anchor + background) never group together, so one never
+    /// resumes on the other's completion (CAIRN-2481).
+    #[test]
+    fn sibling_ids_partition_by_origin() {
+        let task = packet_origin("t", "job", Some("T1"), "task_tool");
+        let call = packet_origin("c", "job", Some("T1"), "call_tool");
+        let packets = vec![task.clone(), call.clone()];
+        assert_eq!(
+            delegated_sibling_ids(&packets, &task),
+            vec!["t".to_string()]
+        );
+        assert_eq!(
+            delegated_sibling_ids(&packets, &call),
+            vec!["c".to_string()]
+        );
     }
 
     fn packet_bg(

@@ -284,14 +284,20 @@ fn normalize_result_text(text: String) -> Option<String> {
 }
 
 fn parse_nonempty_artifact_content(data_json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(data_json)
-        .ok()
-        .and_then(|data| {
-            data.get("content")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-        })
-        .and_then(normalize_result_text)
+    let data: serde_json::Value = serde_json::from_str(data_json).ok()?;
+    // A freeform `return` artifact carries its result in a `content` string.
+    if let Some(content) = data.get("content").and_then(|value| value.as_str()) {
+        return normalize_result_text(content.to_string());
+    }
+    // A structured artifact (a preset like `review` or an inline custom schema)
+    // has no `content` field; render the whole validated JSON so the parent
+    // receives the structured result instead of falling back to chat text.
+    match &data {
+        serde_json::Value::Object(map) if !map.is_empty() => serde_json::to_string_pretty(&data)
+            .ok()
+            .and_then(normalize_result_text),
+        _ => None,
+    }
 }
 
 fn parse_nonempty_assistant_content(data_json: &str) -> Option<String> {
@@ -393,4 +399,28 @@ pub(super) async fn latest_nonempty_assistant_content_arc(
     run_id: String,
 ) -> Option<String> {
     latest_nonempty_assistant_content(&db, &run_id).await
+}
+
+#[cfg(test)]
+mod result_render_tests {
+    use super::parse_nonempty_artifact_content;
+
+    #[test]
+    fn freeform_return_artifact_uses_content_field() {
+        let out = parse_nonempty_artifact_content(r#"{"content":"the result"}"#);
+        assert_eq!(out.as_deref(), Some("the result"));
+    }
+
+    #[test]
+    fn structured_artifact_renders_full_json() {
+        let out = parse_nonempty_artifact_content(r#"{"approval":"approved","summary":"ok"}"#)
+            .expect("structured artifact renders");
+        assert!(out.contains("approval"));
+        assert!(out.contains("approved"));
+    }
+
+    #[test]
+    fn empty_artifact_object_is_none() {
+        assert!(parse_nonempty_artifact_content("{}").is_none());
+    }
 }

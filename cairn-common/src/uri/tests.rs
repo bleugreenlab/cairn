@@ -1175,6 +1175,50 @@ fn round_trips_skill_resources() {
 }
 
 #[test]
+fn round_trips_workflow_resources() {
+    let resources = vec![
+        CairnResource::Workflows,
+        CairnResource::Workflow {
+            workflow_id: "deep-research".to_string(),
+        },
+        CairnResource::ProjectWorkflows {
+            project: "CAIRN".to_string(),
+        },
+        CairnResource::ProjectWorkflow {
+            project: "CAIRN".to_string(),
+            workflow_id: "deep-research".to_string(),
+        },
+    ];
+    for resource in resources {
+        assert_eq!(parse_uri(&resource.to_uri()), Some(resource.clone()));
+        assert!(crate::contract::contract_for(resource.kind()).is_some());
+    }
+}
+
+#[test]
+fn workflow_resources_project_and_route() {
+    assert_eq!(CairnResource::Workflows.project(), None);
+    assert_eq!(CairnResource::Workflows.to_route(), None);
+    assert_eq!(
+        CairnResource::ProjectWorkflows {
+            project: "CAIRN".to_string(),
+        }
+        .project(),
+        Some("CAIRN")
+    );
+    assert_eq!(
+        CairnResource::ProjectWorkflow {
+            project: "CAIRN".to_string(),
+            workflow_id: "deep-research".to_string(),
+        }
+        .to_route(),
+        None
+    );
+    // Identity-only: workflows carry no issue number.
+    assert_eq!(CairnResource::Workflows.issue_number(), None);
+}
+
+#[test]
 fn project_reference_resources_report_project_and_kind() {
     let collection = parse_uri("cairn://p/cairn/references").unwrap();
     assert_eq!(collection.project(), Some("CAIRN"));

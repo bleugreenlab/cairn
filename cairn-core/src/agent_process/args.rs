@@ -23,6 +23,12 @@ pub struct ClaudeArgsConfig {
     pub system_prompt_file: Option<PathBuf>, // Path to file replacing Claude's default system prompt via --system-prompt-file
     pub settings_path: Option<PathBuf>,      // Path to additional settings JSON via --settings
     pub bidirectional: bool, // Enable stdin streaming with --input-format stream-json
+    /// Resolved JSON Schema to constrain output via the CLI's built-in
+    /// StructuredOutput tool (`--json-schema`). `Some` only for schema-
+    /// constrained ephemeral calls; the structured result rides the terminal
+    /// `result` event's `structured_output` (CAIRN-2505). `None` leaves output
+    /// unconstrained (every non-call session).
+    pub json_schema: Option<serde_json::Value>,
 }
 
 /// Build Claude CLI arguments from configuration.
@@ -105,6 +111,15 @@ pub fn build_claude_args(config: &ClaudeArgsConfig) -> Vec<String> {
     args.push("--disallowedTools".to_string());
     args.push(config.disallowed_tools.join(","));
 
+    // Constrain output to a JSON Schema via the CLI's built-in StructuredOutput
+    // tool. The schema-valid object comes back on the terminal `result` event as
+    // `structured_output`, which Cairn captures server-side as the call's return
+    // artifact (CAIRN-2505). Emitted only for schema-constrained ephemeral calls.
+    if let Some(schema) = &config.json_schema {
+        args.push("--json-schema".to_string());
+        args.push(schema.to_string());
+    }
+
     match &config.session_start {
         SessionStart::New { session_id } => {
             args.push("--session-id".to_string());
@@ -165,7 +180,36 @@ mod tests {
             system_prompt_file: None,
             settings_path: None,
             bidirectional: false,
+            json_schema: None,
         }
+    }
+
+    #[test]
+    fn test_json_schema_absent_by_default() {
+        let args = build_claude_args(&base_config());
+        assert!(!args.contains(&"--json-schema".to_string()));
+    }
+
+    #[test]
+    fn test_json_schema_emitted_when_present() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}}
+        });
+        let config = ClaudeArgsConfig {
+            json_schema: Some(schema.clone()),
+            ..base_config()
+        };
+        let args = build_claude_args(&config);
+        let idx = args
+            .iter()
+            .position(|x| x == "--json-schema")
+            .expect("--json-schema flag missing");
+        // The value is the compact JSON of the schema.
+        assert_eq!(args[idx + 1], schema.to_string());
+        // Output format stays stream-json (structured_output rides the result event).
+        assert!(args.contains(&"stream-json".to_string()));
     }
 
     #[test]

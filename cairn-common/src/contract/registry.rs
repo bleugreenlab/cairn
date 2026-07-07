@@ -106,6 +106,50 @@ pub(crate) const PROJECT_RECIPE_CONTRACT: ResourceContract =
         ],
     };
 
+pub(crate) const WORKFLOWS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Workflows,
+    uri_template: "cairn://workflows",
+    name: "Workflows",
+    description: "Workspace and current-project workflows: reusable Bun scripts that orchestrate ephemeral agent calls and deterministic code",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const WORKFLOW_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::Workflow,
+    uri_template: "cairn://workflows/{workflow_id}",
+    name: "Workflow",
+    description: "A single workflow package's metadata: name, description, args JSON Schema, output schema, and script entry",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const PROJECT_WORKFLOWS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectWorkflows,
+    uri_template: "cairn://p/{project}/workflows",
+    name: "Project workflows",
+    description: "Workflows available in a project's context (workspace + project)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const PROJECT_WORKFLOW_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectWorkflow,
+    uri_template: "cairn://p/{project}/workflows/{workflow_id}",
+    name: "Project workflow",
+    description: "A single project-scoped workflow package's metadata",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const AGENTS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::Agents,

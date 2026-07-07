@@ -143,6 +143,24 @@ pub fn agent_shell_path() -> String {
     prepend_cairn_bin(&cairn_bin_dir(), get_user_path())
 }
 
+/// Environment variables that route a dev-instance's cargo builds into the one
+/// shared dev target dir (`~/.cairn-dev-target/target`).
+///
+/// A host orchestrator launched by `bun dev:instance` carries BOTH: it sets
+/// `CAIRN_INSTANCE=1`, and `scripts/rust-cache-env.ts` derives
+/// `CARGO_TARGET_DIR` from that signal. That routing is correct for the dev
+/// instance's own build (its app binary must survive worktree teardown), but it
+/// must never leak into a spawned worktree command: command spawns inherit the
+/// orchestrator's env wholesale, so an un-stripped child routes its cargo checks
+/// into the single shared dir and concurrent worktrees corrupt each other's
+/// build-script `OUT_DIR` (the tree-sitter `stdlib-symbols.txt` ENOENT race —
+/// CAIRN-2533). Every agent-facing spawn seam strips both keys so each worktree
+/// builds into its own per-worktree `src-tauri/target`. Both are required:
+/// dropping only `CARGO_TARGET_DIR` lets the child's own `rustCacheEnv`
+/// re-derive the shared dir from `CAIRN_INSTANCE=1`; dropping only
+/// `CAIRN_INSTANCE` leaves the directly-inherited `CARGO_TARGET_DIR` in place.
+pub const DEV_INSTANCE_ROUTING_ENV: [&str; 2] = ["CAIRN_INSTANCE", "CARGO_TARGET_DIR"];
+
 /// Maintain `<cairn_home>/bin/cairn` pointing at `cli_binary` (the resolved
 /// `cairn-cmd` path), so agent-spawned shells resolve `cairn`. Called at
 /// startup by whichever host owns the orchestrator (the runner and
@@ -452,5 +470,15 @@ mod tests {
     #[test]
     fn parse_path_from_env_output_rejects_empty_path() {
         assert_eq!(parse_path_from_env_output("PATH=\n"), None);
+    }
+
+    #[test]
+    fn dev_instance_routing_env_covers_both_routing_vars() {
+        use super::DEV_INSTANCE_ROUTING_ENV;
+        // Both vars are load-bearing (see the const's doc): stripping only one
+        // still lets a worktree command reach the shared dev target dir.
+        assert!(DEV_INSTANCE_ROUTING_ENV.contains(&"CAIRN_INSTANCE"));
+        assert!(DEV_INSTANCE_ROUTING_ENV.contains(&"CARGO_TARGET_DIR"));
+        assert_eq!(DEV_INSTANCE_ROUTING_ENV.len(), 2);
     }
 }

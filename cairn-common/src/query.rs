@@ -73,6 +73,14 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "in",
     "ast",
     "outline",
+    // Blocking long-poll on a call/task-artifact URI (`?wait`): the workflow
+    // harness `agent()` await. Bare key (no value).
+    "wait",
+    // Node/task transcript digest projections: turn ordering (latest) and the
+    // opt-in reseed-fidelity knobs (messages=full, diffs=true).
+    "latest",
+    "messages",
+    "diffs",
 ];
 
 /// Return true when the start of `rest` (the text immediately after a `&`) is a

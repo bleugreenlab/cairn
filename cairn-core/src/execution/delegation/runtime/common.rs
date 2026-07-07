@@ -1,14 +1,15 @@
 use crate::effects::types::WorkflowEffect;
 use crate::models::{
-    AgentConfig, DelegatedOutputContract, DelegatedStatus, ExecutionSnapshot, RecipeSnapshot,
-    RecipeTrigger, TriggerContext, TriggerType,
+    AgentConfig, DelegatedStatus, ExecutionSnapshot, RecipeSnapshot, RecipeTrigger, TriggerContext,
+    TriggerType,
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::ids;
 
 use crate::execution::delegation::{
-    create_or_reuse_task_packet, CreateDelegatedPacketInput, DelegatedTaskPayload,
+    create_call_packet, create_or_reuse_task_packet, CreateCallPacketInput,
+    CreateDelegatedPacketInput, DelegatedTaskPayload,
 };
 
 /// Parent run context needed to materialize and resume delegated tasks.
@@ -433,6 +434,10 @@ pub(super) async fn persist_task_packet(
     .and_then(crate::backends::backend_for_model);
     let session = payload.session.into();
 
+    let output_contract = crate::execution::delegation::resolve_delegated_output_contract(
+        payload.output_schema.as_ref(),
+    )?;
+
     let packet = create_or_reuse_task_packet(
         &mut snapshot,
         CreateDelegatedPacketInput {
@@ -445,11 +450,7 @@ pub(super) async fn persist_task_packet(
             cwd,
             fence: agent_config.fence,
             acceptance: vec!["Return the delegated result with the return tool".to_string()],
-            output_contract: DelegatedOutputContract {
-                schema_type: "return".to_string(),
-                tool_name: None,
-                description: Some("Submit the task result".to_string()),
-            },
+            output_contract,
             session,
             task_index: payload.task_index,
             tier_override: payload.tier.as_deref(),
@@ -463,6 +464,95 @@ pub(super) async fn persist_task_packet(
     update_execution_snapshot(&db, execution_id, snapshot_json)
         .await
         .map_err(|e| format!("Failed to persist delegated packet: {}", e))?;
+
+    Ok(packet)
+}
+
+/// Persist a pre-materialized call packet into the execution snapshot
+/// (CAIRN-2481). The call sibling of [`persist_task_packet`]: it takes the same
+/// per-execution snapshot lock and anchor resolution, but writes a `Materialized`
+/// `CallTool` packet whose `result_artifact_job_id` is the already-created call
+/// job, so the DAG never expands it into a node.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn persist_call_packet(
+    orch: &Orchestrator,
+    execution_id: &str,
+    parent_ctx: &ParentRunContext,
+    agent_config_id: &str,
+    title: &str,
+    problem_statement: &str,
+    cwd: &str,
+    output_contract: crate::models::DelegatedOutputContract,
+    result_artifact_job_id: &str,
+    parent_tool_use_id: Option<&str>,
+    tier_override: Option<&str>,
+    task_index: Option<i32>,
+    background: bool,
+) -> Result<crate::models::DelegatedWorkPacket, String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
+    // Serialize the snapshot read-modify-write per execution so a batch of calls
+    // never overwrites each other's packets.
+    let lock = orch.execution_lock(execution_id);
+    let _guard = lock.lock().await;
+
+    let snapshot_json = select_optional_text(
+        &db,
+        "SELECT snapshot FROM executions WHERE id = ?1",
+        execution_id,
+    )
+    .await
+    .map_err(|e| format!("Failed to load execution: {}", e))?;
+    let snapshot_json = snapshot_json.ok_or("Execution has no snapshot")?;
+    let mut snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
+        .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
+
+    let parent_turn_id = match select_optional_text(
+        &db,
+        "SELECT current_turn_id FROM jobs WHERE id = ?1",
+        &parent_ctx.job_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    {
+        Some(current) => resolve_delegated_wait_anchor(&db, &current).await,
+        None => None,
+    };
+    let parent_backend = select_optional_text(
+        &db,
+        "SELECT model FROM jobs WHERE id = ?1",
+        &parent_ctx.job_id,
+    )
+    .await
+    .ok()
+    .flatten()
+    .as_deref()
+    .and_then(crate::backends::backend_for_model);
+
+    let packet = create_call_packet(
+        &mut snapshot,
+        CreateCallPacketInput {
+            parent_job_id: &parent_ctx.job_id,
+            parent_turn_id: parent_turn_id.as_deref(),
+            parent_tool_use_id,
+            title,
+            problem_statement,
+            agent_config_id,
+            cwd,
+            output_contract,
+            result_artifact_job_id,
+            task_index,
+            tier_override,
+            backend_preference: parent_backend,
+            background,
+        },
+    );
+
+    let snapshot_json = serde_json::to_string(&snapshot)
+        .map_err(|e| format!("Failed to serialize execution snapshot: {}", e))?;
+    update_execution_snapshot(&db, execution_id, snapshot_json)
+        .await
+        .map_err(|e| format!("Failed to persist call packet: {}", e))?;
 
     Ok(packet)
 }
@@ -527,10 +617,10 @@ async fn insert_synthetic_execution(
                 "
                 INSERT INTO executions (
                     id, recipe_id, issue_id, project_id, status, started_at,
-                    completed_at, snapshot, seq, initiator_sub, initiator_auth_mode,
+                    completed_at, snapshot, seq, initiator_sub,
                     initiator_org_id, triggered_by
                 )
-                VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, ?6, ?7, NULL, NULL, NULL, 'manual')
+                VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, ?6, ?7, NULL, NULL, 'manual')
                 ",
                 (
                     execution_id.as_str(),

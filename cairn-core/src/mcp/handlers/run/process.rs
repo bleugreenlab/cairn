@@ -59,6 +59,35 @@ pub(crate) fn apply_non_interactive_pager_env_to_pty(cmd: &mut CommandBuilder) {
     cmd.env("PAGER", NON_INTERACTIVE_PAGER);
 }
 
+/// Strip the dev-instance build-target routing env from a worktree command's
+/// spawn config (see [`crate::env::DEV_INSTANCE_ROUTING_ENV`]).
+///
+/// A host orchestrator launched by `bun dev:instance` carries `CAIRN_INSTANCE=1`
+/// plus a derived `CARGO_TARGET_DIR` pointing at the single shared dev target
+/// dir. Command spawns inherit that env wholesale, so without this strip every
+/// worktree's cargo checks route into the one shared dir and concurrent
+/// worktrees corrupt each other's build-script `OUT_DIR` (CAIRN-2533). Removing
+/// both keys restores the design's per-worktree `src-tauri/target`. This one
+/// seam covers both check cadences (sandboxed when:write and turn-end
+/// when:review) and the agent's own `run` cargo, since all route through
+/// `execute_process`.
+fn strip_dev_instance_routing_env(mut config: SpawnConfig) -> SpawnConfig {
+    for key in crate::env::DEV_INSTANCE_ROUTING_ENV {
+        config = config.env_remove(key);
+    }
+    config
+}
+
+/// PTY-spawn counterpart of [`strip_dev_instance_routing_env`]: removes the same
+/// dev-instance build-target routing keys from a `CommandBuilder` (whose base
+/// env is seeded from the host process) so a worktree terminal builds into its
+/// own target dir (CAIRN-2533).
+pub(crate) fn scrub_dev_instance_routing_pty(cmd: &mut CommandBuilder) {
+    for key in crate::env::DEV_INSTANCE_ROUTING_ENV {
+        cmd.env_remove(key);
+    }
+}
+
 /// Run a single resolved item: execute it, format its body, and (for shell
 /// items only) cache checkpoint results and auto-push on `git commit`.
 #[allow(clippy::too_many_arguments)]
@@ -524,7 +553,7 @@ pub(super) async fn execute_process(
     for arg in args {
         spawn_config = spawn_config.arg(arg);
     }
-    let mut spawn_config = apply_non_interactive_pager_env(
+    let mut spawn_config = strip_dev_instance_routing_env(apply_non_interactive_pager_env(
         spawn_config
             .cwd(cwd)
             // Explicit worktree anchor so an agent that `cd`s into a subdir can still
@@ -539,7 +568,7 @@ pub(super) async fn execute_process(
             // PATH so an in-run `cairn read|write|watch …` resolves the CLI.
             .env("PATH", &crate::env::agent_shell_path())
             .sandbox(sandbox_policy),
-    );
+    ));
     // Make bare `git`/`jj` behave correctly inside a jj-only worktree: managed
     // `JJ_CONFIG`/editor so a bare `jj` commit is pushable, and a
     // `GIT_CEILING_DIRECTORIES` ceiling so a bare `git` fails loudly instead of
@@ -1121,6 +1150,27 @@ mod tests {
             "[served from Cairn's warm search index, not a spawned process]"
         );
     }
+    #[test]
+    fn strip_dev_instance_routing_env_marks_both_keys_for_removal() {
+        let config = strip_dev_instance_routing_env(SpawnConfig::new("bash"));
+        for key in crate::env::DEV_INSTANCE_ROUTING_ENV {
+            assert!(
+                config.env_remove.iter().any(|k| k == key),
+                "{key} must be stripped so a worktree command builds into its own target dir"
+            );
+        }
+    }
+
+    #[test]
+    fn scrub_dev_instance_routing_pty_removes_both_keys() {
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.env("CAIRN_INSTANCE", "1");
+        cmd.env("CARGO_TARGET_DIR", "/shared/target");
+        scrub_dev_instance_routing_pty(&mut cmd);
+        assert!(cmd.get_env("CAIRN_INSTANCE").is_none());
+        assert!(cmd.get_env("CARGO_TARGET_DIR").is_none());
+    }
+
     #[test]
     fn non_interactive_pager_env_defaults_to_cat() {
         let config = apply_non_interactive_pager_env(SpawnConfig::new("bash"));

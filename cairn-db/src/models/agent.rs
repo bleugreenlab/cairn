@@ -7,7 +7,7 @@ use super::permissions::{Fence, LegacyOnEscape, LegacySandbox};
 use super::recipe::ConfirmPolicy;
 
 /// Output schema for an agent - either a preset name or custom JSON Schema
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum OutputSchema {
     /// Preset schema name: "document", "plan", "review", "checklist"

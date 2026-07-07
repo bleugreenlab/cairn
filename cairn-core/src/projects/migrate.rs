@@ -101,6 +101,7 @@ const COPY_ORDER: &[TableCopySpec] = &[
     spec("wake_subscriptions", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("suppressed_wakes", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR subscription_id IN (SELECT id FROM wake_subscriptions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("todos", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("workflow_progress", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("attention_pushes", "recipient IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("attention_read_cursors", "recipient IN (SELECT id FROM jobs WHERE project_id = ?1) OR source IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("event_read_tokens", "event_id IN (SELECT id FROM events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?1))"),

@@ -4,8 +4,8 @@
 //! batches, but share the same process/sandbox primitives where behavior overlaps.
 
 use super::run::{
-    apply_non_interactive_pager_env_to_pty, build_run_sandbox_policy, PromotedTerminal,
-    MAX_BUFFER_SIZE,
+    apply_non_interactive_pager_env_to_pty, build_run_sandbox_policy,
+    scrub_dev_instance_routing_pty, PromotedTerminal, MAX_BUFFER_SIZE,
 };
 use crate::services::{
     ensure_submitted_line, get_default_shell, sandbox, submit_command_exiting_shell, PtySession,
@@ -1688,6 +1688,9 @@ async fn spawn_terminal_session(
     for (key, value) in std::env::vars() {
         cmd.env(key, value);
     }
+    // Strip a host dev-instance's shared build-target routing so this worktree
+    // shell builds into its own target dir (CAIRN-2533).
+    scrub_dev_instance_routing_pty(&mut cmd);
     cmd.env("PATH", crate::env::agent_shell_path());
     apply_non_interactive_pager_env_to_pty(&mut cmd);
     // Same jj-only worktree VCS env as the inline spawn path, applied to the PTY /

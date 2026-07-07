@@ -7,6 +7,12 @@ use super::types::*;
 // where the key name + type + example don't already make the value obvious; an
 // empty note renders as just `key(type)`.
 pub(crate) const CONTENT: KeySpec = KeySpec::new("content", KeyType::Str, "");
+pub(crate) const PROGRESS_KIND: KeySpec = KeySpec::new("kind", KeyType::Str, "phase | log");
+pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(
+    "text",
+    KeyType::Str,
+    "phase name (kind=phase) or log message (kind=log)",
+);
 pub(crate) const OLD_STRING: KeySpec = KeySpec::new(
     "old_string",
     KeyType::Str,
@@ -480,6 +486,11 @@ pub(crate) const NODE_RELATED: &[RelatedSpec] = &[RelatedSpec {
     actions: true,
 }];
 pub(crate) const NODE_MESSAGES_RELATED: &[RelatedSpec] = &[RelatedSpec {
+    label: "up",
+    kind: ResourceKind::Node,
+    actions: true,
+}];
+pub(crate) const NODE_PROGRESS_RELATED: &[RelatedSpec] = &[RelatedSpec {
     label: "up",
     kind: ResourceKind::Node,
     actions: true,

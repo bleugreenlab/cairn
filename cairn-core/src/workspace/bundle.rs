@@ -318,6 +318,64 @@ fn collect_bundle_files(
     Ok(())
 }
 
+/// Subdirectory of `CAIRN_HOME` (and of the app's bundled resources) holding the
+/// Cairn-owned workflow runtime: `runtime/node_modules/@cairn/{harness,sdk}`.
+const RUNTIME_DIR: &str = "runtime";
+/// Marker recording the content hash of the last-provisioned runtime, so a
+/// version change re-syncs and staleness is detectable (bundle-sync precedent).
+const RUNTIME_MARKER: &str = ".runtime-version";
+
+/// Provision the Cairn-owned workflow runtime (`@cairn/harness` + `@cairn/sdk`)
+/// into `<cairn_home>/runtime` from the app's bundled `runtime/` resource
+/// (CAIRN-2504). A workflow spawned from ANY project sets `NODE_PATH` to this
+/// runtime first (see `backends::workflow`), so the harness resolves regardless
+/// of the invoking project's own `node_modules`.
+///
+/// No-op when the bundle ships no `runtime/` (a dev build resolves the harness
+/// from the Cairn repo's own `node_modules` instead). The runtime is
+/// Cairn-owned and never user-edited, so a content-hash change replaces the tree
+/// wholesale — the same marker precedent the workspace bundle uses, making
+/// version skew self-healing on the next startup. Returns whether it (re)synced.
+pub fn provision_workflow_runtime(
+    fs: &dyn FileSystem,
+    resource_dir: &Path,
+    cairn_home: &Path,
+) -> Result<bool, String> {
+    let source = resource_dir.join(RUNTIME_DIR);
+    if !fs.exists(&source) {
+        return Ok(false);
+    }
+    let hash = runtime_content_hash(&source)?;
+    let dest = cairn_home.join(RUNTIME_DIR);
+    let marker_path = dest.join(RUNTIME_MARKER);
+    if marker_matches(fs, &marker_path, &hash) {
+        return Ok(false);
+    }
+    if fs.exists(&dest) {
+        fs.remove_dir_all(&dest)?;
+    }
+    fs.copy_dir_recursive(&source, &dest)?;
+    write_marker(fs, &marker_path, &hash)?;
+    Ok(true)
+}
+
+/// Content hash of every file under the bundled runtime tree, so a shipped
+/// change (a new harness protocol) forces a re-provision.
+fn runtime_content_hash(source: &Path) -> Result<String, String> {
+    let mut entries = Vec::new();
+    collect_bundle_files(source, source, &mut entries)?;
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut hasher = Sha256::new();
+    for (relative_path, bytes) in entries {
+        let path_bytes = relative_path.as_bytes();
+        hasher.update((path_bytes.len() as u64).to_le_bytes());
+        hasher.update(path_bytes);
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn snapshot_pending_user_edits(git: &dyn GitClient, config_dir: &Path) -> Result<(), String> {
     if !git.status(config_dir)?.trim().is_empty() {
         git.add_all(config_dir)?;
@@ -545,6 +603,55 @@ mod tests {
                 .trim(),
             bundle_content_hash(&resources_b).unwrap()
         );
+    }
+
+    #[test]
+    fn provision_runtime_syncs_then_short_circuits_then_resyncs_on_change() {
+        use crate::services::RealFileSystem;
+
+        let temp = TempDir::new().unwrap();
+        let resource_dir = temp.path().join("resources");
+        let cairn_home = temp.path().join("home");
+        let harness = resource_dir.join("runtime/node_modules/@cairn/harness");
+        std::fs::create_dir_all(harness.join("src")).unwrap();
+        std::fs::write(
+            harness.join("package.json"),
+            "{\"name\":\"@cairn/harness\"}",
+        )
+        .unwrap();
+        std::fs::write(harness.join("src/index.ts"), "export const v = 1;\n").unwrap();
+
+        let fs = RealFileSystem;
+        // First provision installs the runtime and its marker.
+        assert!(provision_workflow_runtime(&fs, &resource_dir, &cairn_home).unwrap());
+        let dest_harness = cairn_home.join("runtime/node_modules/@cairn/harness/src/index.ts");
+        assert!(dest_harness.exists());
+        assert!(cairn_home.join("runtime/.runtime-version").exists());
+
+        // A repeat with unchanged content is a no-op (marker current).
+        assert!(!provision_workflow_runtime(&fs, &resource_dir, &cairn_home).unwrap());
+
+        // A shipped change re-syncs the tree.
+        std::fs::write(harness.join("src/index.ts"), "export const v = 2;\n").unwrap();
+        assert!(provision_workflow_runtime(&fs, &resource_dir, &cairn_home).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&dest_harness).unwrap(),
+            "export const v = 2;\n"
+        );
+    }
+
+    #[test]
+    fn provision_runtime_is_noop_without_a_bundled_runtime() {
+        use crate::services::RealFileSystem;
+
+        let temp = TempDir::new().unwrap();
+        let resource_dir = temp.path().join("resources");
+        std::fs::create_dir_all(&resource_dir).unwrap();
+        let cairn_home = temp.path().join("home");
+
+        // No `runtime/` in the bundle (the dev case): nothing provisioned.
+        assert!(!provision_workflow_runtime(&RealFileSystem, &resource_dir, &cairn_home).unwrap());
+        assert!(!cairn_home.join("runtime").exists());
     }
 
     fn write_resources_a(root: &Path) {

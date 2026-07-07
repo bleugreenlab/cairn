@@ -21,7 +21,9 @@ mod types;
 pub(crate) use checks::{
     check_stream_id, run_check_command, run_check_command_unsandboxed, run_item_stream_id,
 };
-pub(crate) use process::{apply_non_interactive_pager_env_to_pty, MAX_BUFFER_SIZE};
+pub(crate) use process::{
+    apply_non_interactive_pager_env_to_pty, scrub_dev_instance_routing_pty, MAX_BUFFER_SIZE,
+};
 pub use redact::redact_command;
 pub(crate) use sandbox_policy::build_run_sandbox_policy;
 pub(crate) use types::PromotedTerminal;
@@ -72,6 +74,31 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             "Invalid payload: `commands` must contain at least one item".to_string(),
             Vec::new(),
         );
+    }
+
+    // A run item targeting a workflow URI is a DELEGATION, not a subprocess: it
+    // starts a workflow node under the caller and durably suspends the caller
+    // (reusing the call-packet suspend/resume tail), off the 600s run-item path.
+    // It must be the sole item in its batch, since it suspends the whole call.
+    if let Some((project, workflow_id)) =
+        crate::mcp::handlers::workflows::detect_workflow_target(&payload.commands)
+    {
+        if payload.commands.len() != 1 {
+            return run_envelope(
+                "A workflow run target must be the only item in its batch (it suspends the caller)."
+                    .to_string(),
+                Vec::new(),
+            );
+        }
+        let result = crate::mcp::handlers::workflows::invoke_workflow(
+            orch,
+            request,
+            project,
+            workflow_id,
+            &payload.commands[0],
+        )
+        .await;
+        return run_envelope(result, Vec::new());
     }
 
     let mut cwd = request.cwd.clone();

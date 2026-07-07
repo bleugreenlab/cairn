@@ -136,10 +136,20 @@ pub(crate) const TASK_CHAT_CONTRACT: ResourceContract = ResourceContract {
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{name}/chat",
     name: "Task transcript",
     description: "Turn-structured digest of the sub-task conversation",
-    read_projections: &[ProjectionSpec {
-        key: "latest",
-        values: "true|false (newest turn first; events within a turn stay chronological)",
-    }],
+    read_projections: &[
+        ProjectionSpec {
+            key: "latest",
+            values: "true|false (newest turn first; events within a turn stay chronological)",
+        },
+        ProjectionSpec {
+            key: "messages",
+            values: "full (render user & assistant messages unabridged instead of truncated)",
+        },
+        ProjectionSpec {
+            key: "diffs",
+            values: "true (inline each file write's change body beneath its row)",
+        },
+    ],
     related: &[
         RelatedSpec {
             label: "full turn",

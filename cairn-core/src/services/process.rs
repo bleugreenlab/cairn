@@ -29,6 +29,13 @@ pub struct SpawnConfig {
     /// OS-level filesystem confinement to apply to this spawn. `None` = run
     /// unconfined (trusted agent, no run context, or platform without support).
     pub sandbox: Option<SandboxPolicy>,
+    /// Environment variables to explicitly REMOVE from the inherited process env
+    /// before spawn. Applied after the `env` overlay in `build_command`, so a
+    /// removal is unconditional (it wins over both inheritance and the overlay).
+    /// Used to strip a host dev-instance's build-target routing
+    /// (`crate::env::DEV_INSTANCE_ROUTING_ENV`) so a worktree command builds into
+    /// its own target dir rather than the shared one.
+    pub env_remove: Vec<String>,
 }
 
 impl SpawnConfig {
@@ -42,6 +49,7 @@ impl SpawnConfig {
             capture_stderr: true,
             capture_stdin: false,
             sandbox: None,
+            env_remove: Vec::new(),
         }
     }
 
@@ -78,6 +86,14 @@ impl SpawnConfig {
 
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Mark an environment variable for removal from the inherited env before
+    /// spawn. Applied after the `env` overlay in `build_command`, so the removal
+    /// is unconditional.
+    pub fn env_remove(mut self, key: &str) -> Self {
+        self.env_remove.push(key.to_string());
         self
     }
 }
@@ -188,6 +204,13 @@ fn build_command(config: &SpawnConfig) -> std::process::Command {
 
     for (key, value) in &config.env {
         cmd.env(key, value);
+    }
+
+    // Explicit removals are applied last so they win over both the inherited env
+    // and the overlay above — a spawned worktree command must not carry a host
+    // dev-instance's build-target routing (see `SpawnConfig::env_remove`).
+    for key in &config.env_remove {
+        cmd.env_remove(key);
     }
 
     if config.sandbox.is_some() {
@@ -479,12 +502,14 @@ mod tests {
             .arg("hello")
             .args(vec!["world", "!"])
             .cwd("/tmp")
-            .env("KEY", "value");
+            .env("KEY", "value")
+            .env_remove("DROP");
 
         assert_eq!(config.program, "echo");
         assert_eq!(config.args, vec!["hello", "world", "!"]);
         assert_eq!(config.cwd, Some("/tmp".to_string()));
         assert_eq!(config.env.get("KEY"), Some(&"value".to_string()));
+        assert_eq!(config.env_remove, vec!["DROP".to_string()]);
     }
 
     #[test]
@@ -584,6 +609,34 @@ mod tests {
         // Unsandboxed spawn: CAIRN_SANDBOXED is absent.
         let plain = envs(&build_command(&SpawnConfig::new("echo")));
         assert!(!plain.contains_key("CAIRN_SANDBOXED"));
+    }
+
+    #[test]
+    fn build_command_applies_env_removals() {
+        // Removals are recorded on the Command as (key, None) and win over the
+        // additive overlay, so a spawned worktree command never carries an
+        // inherited var it explicitly dropped.
+        let cfg = SpawnConfig::new("echo")
+            .env("KEEP", "1")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CAIRN_INSTANCE");
+        let cmd = build_command(&cfg);
+
+        let mut removed: Vec<String> = cmd
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec!["CAIRN_INSTANCE".to_string(), "CARGO_TARGET_DIR".to_string()]
+        );
+
+        let kept = cmd
+            .get_envs()
+            .any(|(k, v)| k == "KEEP" && v == Some(std::ffi::OsStr::new("1")));
+        assert!(kept, "additive env must survive alongside removals");
     }
 
     #[test]

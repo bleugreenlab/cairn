@@ -619,6 +619,9 @@ pub fn continue_job_impl(
     // prior backend's resume handle is invalid on the new backend, so rotate to a
     // fresh session on the new backend rather than resuming with a wrong handle.
     // This runs before the warm/cold split, so it covers cold continues too.
+    // Cold-resume reseed decision (CAIRN-2534) is produced in the plain-resume
+    // arm below and threaded into prompt assembly + seed-event storage.
+    let mut reseed_outcome: Option<ReseedOutcome> = None;
     let (session_id, session_start, run_start_mode) = match run_db(load_session_optional(
         owning_db.clone(),
         current_session_id.clone(),
@@ -705,9 +708,31 @@ pub fn continue_job_impl(
                         (new_session.id, session_start, run_start_mode)
                     }
                     None => {
-                        let session_start = resolve_continue_session_start(&session)?;
-                        let run_start_mode = run_start_mode(&session_start).to_string();
-                        (session.id.clone(), session_start, run_start_mode)
+                        // Plain resume of an open session. If the session has
+                        // gone stale (last event older than the staleness
+                        // threshold), a native backend resume would reload a
+                        // prompt cache the provider has likely evicted; reseed
+                        // instead by rotating to a fresh session primed with the
+                        // node's `/chat` digest (CAIRN-2534). Any failure in the
+                        // attempt falls open to native resume with session state
+                        // untouched.
+                        let now_secs = orch.services.clock.now();
+                        match attempt_session_reseed(orch, &owning_db, &job, &session, now_secs) {
+                            Some(outcome) => {
+                                let session_start = crate::backends::SessionStart::New {
+                                    session_id: outcome.new_session_id.clone(),
+                                };
+                                let run_start_mode = run_start_mode(&session_start).to_string();
+                                let new_id = outcome.new_session_id.clone();
+                                reseed_outcome = Some(outcome);
+                                (new_id, session_start, run_start_mode)
+                            }
+                            None => {
+                                let session_start = resolve_continue_session_start(&session)?;
+                                let run_start_mode = run_start_mode(&session_start).to_string();
+                                (session.id.clone(), session_start, run_start_mode)
+                            }
+                        }
                     }
                 }
             }
@@ -946,6 +971,12 @@ pub fn continue_job_impl(
         side_channel_block,
         push_prompt.as_deref(),
     );
+    // Reseed: the seed (header + prior-session digest) leads the delivered
+    // prompt so the fresh session opens with reconstructed context; the normal
+    // trigger tail follows. The seed is also stored as a collapsible `user:seed`
+    // event below, while the trigger keeps its own verbatim user event
+    // (CAIRN-2534).
+    let prompt = apply_reseed_seed(prompt, reseed_outcome.as_ref());
 
     let job_model = job.model.as_ref().map(Model::new);
 
@@ -967,6 +998,21 @@ pub fn continue_job_impl(
     // pushes already ride in the resume prompt above, so they are delivered
     // regardless of `suppress_user_event`; recovery redelivers only pushes whose
     // carrying event never durably landed.
+    // Reseed: store the seed (header + digest) as a collapsible `user:seed`
+    // event ahead of every other event in this turn, so the transcript renders a
+    // divider followed by the verbatim trigger message rather than a giant seed
+    // bubble, and future digests collapse the seed to one line (CAIRN-2534).
+    if let Some(outcome) = &reseed_outcome {
+        store_seed_event_with_turn(
+            orch,
+            &run_id,
+            &session_id,
+            &outcome.seed_content,
+            now,
+            -1,
+            Some(&turn_id),
+        )?;
+    }
     if let Some(text) = &push_summary {
         let push_ids: Vec<String> = drained_pushes.iter().map(|p| p.id.clone()).collect();
         crate::execution::jobs::snapshots::store_attention_push_event(
@@ -1053,6 +1099,10 @@ pub fn continue_job_impl(
             None,
             agent_config.as_ref(),
             artifact_schema_info.as_ref(),
+            // Recipe node jobs write their artifact via the write verb through
+            // the normal confirm/review flow; they are never natively
+            // constrained (CAIRN-2505).
+            false,
             false,
             job.execution_id.as_deref(),
             identity_override,
@@ -1135,6 +1185,142 @@ fn assemble_resume_prompt(
     } else {
         parts.join("\n\n")
     }
+}
+
+// ============================================================================
+// Cold-resume reseed (CAIRN-2534)
+// ============================================================================
+
+/// Cold-resume reseed staleness threshold: when an open session's last event is
+/// older than this at resume, the native backend resume is replaced by a fresh
+/// session seeded with the node's `/chat` digest. One hour comfortably outlives
+/// a provider's prompt-cache TTL, so a resume inside the window still hits a warm
+/// cache and reseeding would buy nothing.
+const SESSION_STALENESS_THRESHOLD_SECS: i64 = 60 * 60;
+
+/// Header that leads the reseed seed prompt, framing the digest that follows.
+const RESEED_SEED_HEADER: &str = "The prior events in this session are summarized below because the underlying agent session was reconstructed after a period of inactivity (tool-result bodies were elided). Re-read any files whose content is still relevant, and re-read your working documents (todos/plan/board) for the current plan state before acting.";
+
+/// Resolve the staleness threshold, honoring the `CAIRN_SESSION_STALENESS_SECS`
+/// dev/test override (parsed, non-empty) and falling back to the constant —
+/// mirroring the `CAIRN_JJ_BIN` env-override convention.
+fn staleness_threshold_secs() -> i64 {
+    std::env::var("CAIRN_SESSION_STALENESS_SECS")
+        .ok()
+        .and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                trimmed.parse::<i64>().ok()
+            }
+        })
+        .unwrap_or(SESSION_STALENESS_THRESHOLD_SECS)
+}
+
+/// Pure staleness predicate: the session is stale once its last event is more
+/// than `threshold` seconds behind `now`. A resume exactly at the boundary is
+/// not stale (native resume), so the comparison is strict.
+fn is_session_stale(now: i64, last_event_at: i64, threshold: i64) -> bool {
+    now - last_event_at > threshold
+}
+
+/// The seed content delivered and stored on a reseed: the header framing the
+/// digest, then the digest itself (`header + digest`). The trigger is appended
+/// separately at delivery and stored as its own verbatim `user` event.
+fn build_reseed_seed_content(digest: &str) -> String {
+    format!("{RESEED_SEED_HEADER}\n\n{digest}")
+}
+
+/// Prepend the reseed seed to the trigger prompt when this resume reseeded;
+/// identity otherwise. Keeps the seed-before-trigger ordering in one place.
+fn apply_reseed_seed(prompt: String, reseed: Option<&ReseedOutcome>) -> String {
+    match reseed {
+        Some(outcome) => format!("{}\n\n{}", outcome.seed_content, prompt),
+        None => prompt,
+    }
+}
+
+/// A successful cold-resume reseed: the fresh session that was rotated in, and
+/// the seed (header + prior-session digest) to deliver and store.
+struct ReseedOutcome {
+    new_session_id: String,
+    seed_content: String,
+}
+
+/// Attempt a cold-resume reseed for an open, stale session (CAIRN-2534).
+///
+/// Returns `Some` only when the session is stale AND a fresh session was
+/// successfully rotated in; the caller then spawns that fresh session and stores
+/// the seed. Returns `None` — fail open — when the session is still fresh or any
+/// step fails. Rotation is the last, only-persisted mutation, so a `None` from a
+/// mid-attempt failure leaves session state exactly as a native resume would.
+///
+/// The digest is rendered from the prior history *before* any rotation or new
+/// event, so it can never contain itself.
+fn attempt_session_reseed(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    session: &Session,
+    now: i64,
+) -> Option<ReseedOutcome> {
+    let last_event_at = run_db(load_last_event_time_for_session(
+        owning_db.clone(),
+        session.id.clone(),
+    ))
+    .ok()
+    .flatten()?;
+    if !is_session_stale(now, last_event_at, staleness_threshold_secs()) {
+        return None;
+    }
+
+    // Render the digest of the prior history before rotating or storing any
+    // event, through the one canonical digest path.
+    let digest = {
+        let db = owning_db.clone();
+        let job = job.clone();
+        run_db(
+            async move { Ok::<_, String>(crate::resources::render_reseed_digest(&db, &job).await) },
+        )
+        .ok()?
+    };
+    if digest.trim().is_empty() || digest == "No runs found for this node." {
+        return None;
+    }
+    let seed_content = build_reseed_seed_content(&digest);
+
+    // Evict any live process bound to the old session; the fresh session id then
+    // cold-spawns naturally (its warm-process lookup returns None).
+    if let Some(old_run) = orch.process_state.find_process_by_session(&session.id) {
+        orch.process_state.stop_and_remove(&old_run);
+    }
+
+    // Rotate LAST — the only persisted mutation. A failure here still leaves the
+    // native-resume path fully intact.
+    let new_session =
+        run_db({
+            let db = owning_db.clone();
+            let session = session.clone();
+            let job_id = job.id.clone();
+            async move {
+                crate::sessions::queries::rotate_job_session(db.as_ref(), &session, &job_id).await
+            }
+        })
+        .ok()?;
+
+    log::info!(
+        "Cold-resume reseed for job {}: rotated session {} -> {} ({}s idle > {}s)",
+        &job.id[..job.id.len().min(8)],
+        &session.id[..session.id.len().min(8)],
+        &new_session.id[..new_session.id.len().min(8)],
+        now - last_event_at,
+        staleness_threshold_secs(),
+    );
+    Some(ReseedOutcome {
+        new_session_id: new_session.id,
+        seed_content,
+    })
 }
 
 /// Outcome of reconciling a reusable process against the job's requested model.
@@ -1363,7 +1549,11 @@ pub fn reconcile_stale_active_turn_for_continue_for_test(
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_resume_prompt, ensure_reused_process_model, ReuseDecision};
+    use super::{
+        apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content,
+        ensure_reused_process_model, is_session_stale, staleness_threshold_secs, ReseedOutcome,
+        ReuseDecision, RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
+    };
     use crate::agent_process::process::{wrap_plain_stdin, AgentProcessState, RunHandle};
     use std::sync::{Arc, Mutex};
 
@@ -1434,6 +1624,75 @@ mod tests {
         // A normal (non-suspended) resume passes no note and is unchanged.
         let prompt = assemble_resume_prompt(None, None, "B", None, None);
         assert_eq!(prompt, "B");
+    }
+
+    #[test]
+    fn fresh_session_is_not_stale() {
+        // Under the threshold → native resume (not stale).
+        assert!(!is_session_stale(1_000, 1_000, 3_600));
+        assert!(!is_session_stale(4_599, 1_000, 3_600));
+    }
+
+    #[test]
+    fn stale_session_is_detected() {
+        // Over the threshold → reseed (stale).
+        assert!(is_session_stale(4_601, 1_000, 3_600));
+    }
+
+    #[test]
+    fn staleness_boundary_is_not_stale() {
+        // Exactly at the threshold is NOT stale — the comparison is strict, so a
+        // resume right at the edge takes the native path.
+        assert!(!is_session_stale(4_600, 1_000, 3_600));
+    }
+
+    #[test]
+    #[serial_test::serial(reseed_staleness_env)]
+    fn staleness_threshold_honors_env_override_then_falls_back() {
+        let original = std::env::var("CAIRN_SESSION_STALENESS_SECS").ok();
+
+        std::env::set_var("CAIRN_SESSION_STALENESS_SECS", "30");
+        assert_eq!(staleness_threshold_secs(), 30);
+
+        // Blank / unparseable values fall back to the constant.
+        std::env::set_var("CAIRN_SESSION_STALENESS_SECS", "  ");
+        assert_eq!(staleness_threshold_secs(), SESSION_STALENESS_THRESHOLD_SECS);
+        std::env::set_var("CAIRN_SESSION_STALENESS_SECS", "not-a-number");
+        assert_eq!(staleness_threshold_secs(), SESSION_STALENESS_THRESHOLD_SECS);
+
+        std::env::remove_var("CAIRN_SESSION_STALENESS_SECS");
+        assert_eq!(staleness_threshold_secs(), SESSION_STALENESS_THRESHOLD_SECS);
+
+        match original {
+            Some(value) => std::env::set_var("CAIRN_SESSION_STALENESS_SECS", value),
+            None => std::env::remove_var("CAIRN_SESSION_STALENESS_SECS"),
+        }
+    }
+
+    #[test]
+    fn reseed_seed_orders_header_digest_then_trigger() {
+        // The seed content is HEADER + digest; applying it to the trigger yields
+        // HEADER + digest + trigger, in that order (CAIRN-2534).
+        let seed_content = build_reseed_seed_content("DIGEST_BODY");
+        assert!(seed_content.starts_with(RESEED_SEED_HEADER));
+        assert!(seed_content.contains("DIGEST_BODY"));
+
+        let outcome = ReseedOutcome {
+            new_session_id: "sess-new".to_string(),
+            seed_content: seed_content.clone(),
+        };
+        let delivered = apply_reseed_seed("TRIGGER".to_string(), Some(&outcome));
+        assert_eq!(delivered, format!("{seed_content}\n\nTRIGGER"));
+        let header_at = delivered.find(RESEED_SEED_HEADER).unwrap();
+        let digest_at = delivered.find("DIGEST_BODY").unwrap();
+        let trigger_at = delivered.find("TRIGGER").unwrap();
+        assert!(header_at < digest_at && digest_at < trigger_at);
+    }
+
+    #[test]
+    fn apply_reseed_seed_is_identity_without_reseed() {
+        // A non-reseed resume delivers the trigger unchanged.
+        assert_eq!(apply_reseed_seed("TRIGGER".to_string(), None), "TRIGGER");
     }
 
     /// Register a warm process with a recorded model and backend. The stdin is an

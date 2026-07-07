@@ -32,8 +32,10 @@ pub struct RunPayload {
     pub branch: Option<String>,
 }
 
-/// A single run invocation: exactly one of `command` (shell) or `target`
-/// (a `cairn://skills/<id>/scripts/<name>` URI).
+/// A single run invocation: exactly one of three kinds — a shell `command`, a
+/// `target` (a `cairn://skills/<id>/scripts/<name>` or `cairn://mcp/...` URI),
+/// or inline `code` (with a required `interpreter`). Inline code runs under the
+/// identical process/env/fence/timeout/commit machinery as any other item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunItem {
     #[serde(default)]
@@ -46,6 +48,21 @@ pub struct RunItem {
     pub target: Option<String>,
     #[serde(default)]
     pub payload: Option<RunItemPayload>,
+    /// Inline source code to execute. Mutually exclusive with `command`/`target`;
+    /// requires `interpreter`. Resolved to `bun -e <code>` (typescript/javascript)
+    /// or `python3 -c <code>` (python) — a direct argv exec, no shell, no temp file.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Fire-and-forget flag for a workflow run target (CAIRN-2487): `true`
+    /// returns the workflow URI immediately and wakes the caller on completion
+    /// instead of suspending it inline. Ignored for non-workflow items.
+    #[serde(default)]
+    pub background: Option<bool>,
+    /// Language for an inline `code` item: `typescript`/`ts`, `javascript`/`js`
+    /// (both via `bun`), or `python`/`py` (via `python3`). Required iff `code` is
+    /// present; forbidden otherwise.
+    #[serde(default)]
+    pub interpreter: Option<String>,
 }
 
 /// Structured args for a run item's target.

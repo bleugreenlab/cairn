@@ -149,12 +149,69 @@ pub struct TaskPayload {
     /// Task index for batch_tasks ordering (0, 1, 2...)
     #[serde(default)]
     pub task_index: Option<i32>,
+    /// Optional per-task output schema: a preset name (string) or an inline
+    /// custom JSON Schema (object). Absent preserves the default `return`
+    /// contract. Untagged, mirroring the recipe/agent `OutputSchema`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<crate::models::OutputSchema>,
 }
 
 impl TaskPayload {
     pub fn session_mode(&self) -> Result<TaskSessionMode, String> {
         Ok(self.session.unwrap_or(TaskSessionMode::New))
     }
+}
+
+/// Worktree binding for an ephemeral call (CAIRN-2481).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CallWorktreeMode {
+    /// Run in the caller's inherited worktree; mutating calls are first-class.
+    #[default]
+    Inherit,
+    /// Run in a fresh scratch dir with no project-tree binding.
+    None,
+}
+
+/// Payload for the calls collection (CAIRN-2481): one prompt in,
+/// schema-validated JSON out, run as a node-less ephemeral call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CallPayload {
+    /// The call's instruction.
+    pub prompt: String,
+    /// Worker agent; defaults to `Explore` when absent.
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    /// Display title; defaults to the label or a prompt prefix.
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default, alias = "model")]
+    pub tier: Option<String>,
+    #[serde(default, rename = "backend", alias = "backendPreference")]
+    pub backend_preference: Option<String>,
+    /// Preset name (string) or an inline custom JSON Schema (object). Absent
+    /// preserves the default `return` contract.
+    #[serde(default)]
+    pub output_schema: Option<crate::models::OutputSchema>,
+    #[serde(default)]
+    pub worktree: Option<CallWorktreeMode>,
+    /// Durable workflow tags (no UI yet).
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// Fire-and-forget when true: spawn and return the call URI without blocking.
+    #[serde(default, alias = "background")]
+    pub run_in_background: Option<bool>,
+    #[serde(default)]
+    pub task_index: Option<i32>,
+    /// The harness's per-run monotonic dispatch ordinal (CAIRN-2498). Present
+    /// only for `agent()` calls from a workflow script; it keys the call into
+    /// the workflow journal so a host-restart replay short-circuits already-
+    /// resolved calls. Absent for ordinary `cairn:~/calls` appends.
+    #[serde(default)]
+    pub ordinal: Option<i64>,
 }
 
 // ============================================================================
@@ -297,6 +354,44 @@ mod tests {
         assert_eq!(task.subagent_type, "Explore");
         assert_eq!(task.description, "map parser flow");
         assert_eq!(task.prompt, "trace the parser end to end");
+    }
+
+    #[test]
+    fn task_payload_parses_output_schema_preset_and_inline() {
+        // A preset name.
+        let json = serde_json::json!({
+            "subagentType": "PR Review",
+            "description": "review",
+            "prompt": "review the diff",
+            "outputSchema": "review"
+        });
+        let task: TaskPayload = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            task.output_schema,
+            Some(crate::models::OutputSchema::Preset(ref n)) if n == "review"
+        ));
+
+        // An inline JSON Schema object.
+        let json = serde_json::json!({
+            "subagentType": "Explore",
+            "description": "score",
+            "prompt": "return a score",
+            "outputSchema": {"type": "object", "required": ["score"]}
+        });
+        let task: TaskPayload = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            task.output_schema,
+            Some(crate::models::OutputSchema::Custom(_))
+        ));
+
+        // Absent -> None (default return contract).
+        let json = serde_json::json!({
+            "subagentType": "Explore",
+            "description": "x",
+            "prompt": "y"
+        });
+        let task: TaskPayload = serde_json::from_value(json).unwrap();
+        assert!(task.output_schema.is_none());
     }
 
     #[test]

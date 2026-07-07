@@ -29,6 +29,7 @@ pub(crate) mod target;
 pub mod terminal;
 pub mod watch;
 pub mod web;
+pub mod workflows;
 pub mod write;
 
 /// Payload for `agent-attention` events.

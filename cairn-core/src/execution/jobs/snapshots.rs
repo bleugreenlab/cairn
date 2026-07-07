@@ -147,6 +147,52 @@ pub(crate) fn store_user_event_with_turn(
     sequence: i32,
     turn_id: Option<&str>,
 ) -> Result<(), String> {
+    store_user_like_event_with_turn(
+        orch, run_id, session_id, content, now, sequence, turn_id, "user",
+    )
+}
+
+/// Store the cold-resume seed as a `user:seed` event (CAIRN-2534).
+///
+/// Same shape as a user event but with the namespaced `user:seed` type so the
+/// digest renderer collapses it to one line and the frontend draws a divider
+/// instead of a giant bubble. Stored ahead of the trigger's own `user` event so
+/// the trigger stays a verbatim, visible user message.
+pub(crate) fn store_seed_event_with_turn(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    content: &str,
+    now: i32,
+    sequence: i32,
+    turn_id: Option<&str>,
+) -> Result<(), String> {
+    store_user_like_event_with_turn(
+        orch,
+        run_id,
+        session_id,
+        content,
+        now,
+        sequence,
+        turn_id,
+        "user:seed",
+    )
+}
+
+/// Shared storage path for a user-authored transcript event (`user` and its
+/// `user:seed` sibling): resolve the sequence, build the `TranscriptEvent` with
+/// the given `event_type`, and persist it.
+#[allow(clippy::too_many_arguments)]
+fn store_user_like_event_with_turn(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+    content: &str,
+    now: i32,
+    sequence: i32,
+    turn_id: Option<&str>,
+    event_type: &str,
+) -> Result<(), String> {
     let sequence = if sequence >= 0 {
         sequence
     } else {
@@ -162,7 +208,7 @@ pub(crate) fn store_user_event_with_turn(
         get_next_sequence(owning, run_id)?
     };
     let transcript_event = TranscriptEvent {
-        event_type: "user".to_string(),
+        event_type: event_type.to_string(),
         session_id: Some(session_id.to_string()),
         parent_tool_use_id: None,
         content: Some(content.to_string()),

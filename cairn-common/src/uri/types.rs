@@ -31,6 +31,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "browser",
     "task",
     "messages",
+    "progress",
     "annotations",
     "symbols",
 ];
@@ -222,6 +223,13 @@ pub enum CairnResource {
         exec_seq: i32,
         node_id: String,
     },
+    /// Ephemeral agent calls owned by a node job (collection, CAIRN-2481).
+    NodeCalls {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
     /// Wake subscriptions owned by a node job (collection).
     NodeWakes {
         project: String,
@@ -295,6 +303,17 @@ pub enum CairnResource {
     /// direct-message stream. The bare-node append (`Node` + append) is kept
     /// as a backward-compatible alias.
     NodeMessages {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// Durable phase/log progress timeline for a workflow node (collection).
+    /// Append records a typed entry (`kind` = `phase` | `log`, `text` = phase
+    /// name or log message); read returns the chronological timeline. The
+    /// harness `phase()`/`log()` verbs write here and the workflow monitoring
+    /// panel renders it. Resolves from a workflow node's `cairn:~/progress`.
+    NodeProgress {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -423,6 +442,22 @@ pub enum CairnResource {
         project: String,
         recipe_id: String,
     },
+    /// Contextual workflows collection (workspace + current project).
+    Workflows,
+    /// A single workflow package addressed by id (resolves project-first, then
+    /// workspace).
+    Workflow {
+        workflow_id: String,
+    },
+    /// Explicit project workflows collection.
+    ProjectWorkflows {
+        project: String,
+    },
+    /// Explicit project-scoped workflow package.
+    ProjectWorkflow {
+        project: String,
+        workflow_id: String,
+    },
     /// Contextual agents collection (workspace + current project).
     Agents,
     /// A single agent addressed by id (resolves project-first, then workspace).
@@ -524,6 +559,7 @@ impl CairnResource {
             Self::IssueComments { .. } => ResourceKind::IssueComments,
             Self::IssueComment { .. } => ResourceKind::IssueComment,
             Self::NodeMessages { .. } => ResourceKind::NodeMessages,
+            Self::NodeProgress { .. } => ResourceKind::NodeProgress,
             Self::TaskMessages { .. } => ResourceKind::TaskMessages,
             Self::Node { .. } => ResourceKind::Node,
             Self::NodeChat { .. } => ResourceKind::NodeChat,
@@ -544,6 +580,7 @@ impl CairnResource {
             Self::TaskArtifact { .. } => ResourceKind::TaskArtifact,
             Self::JobTodos { .. } => ResourceKind::JobTodos,
             Self::NodeTasks { .. } => ResourceKind::NodeTasks,
+            Self::NodeCalls { .. } => ResourceKind::NodeCalls,
             Self::NodeWakes { .. } => ResourceKind::NodeWakes,
             Self::NodeChecks { .. } => ResourceKind::NodeChecks,
             Self::NodeQuestions { .. } => ResourceKind::NodeQuestions,
@@ -575,6 +612,10 @@ impl CairnResource {
             Self::Recipe { .. } => ResourceKind::Recipe,
             Self::ProjectRecipes { .. } => ResourceKind::ProjectRecipes,
             Self::ProjectRecipe { .. } => ResourceKind::ProjectRecipe,
+            Self::Workflows => ResourceKind::Workflows,
+            Self::Workflow { .. } => ResourceKind::Workflow,
+            Self::ProjectWorkflows { .. } => ResourceKind::ProjectWorkflows,
+            Self::ProjectWorkflow { .. } => ResourceKind::ProjectWorkflow,
             Self::Agents => ResourceKind::Agents,
             Self::Agent { .. } => ResourceKind::Agent,
             Self::ProjectAgents { .. } => ResourceKind::ProjectAgents,

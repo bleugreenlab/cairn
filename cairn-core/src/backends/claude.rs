@@ -798,10 +798,10 @@ impl AgentBackend for ClaudeBackend {
         // `write cairn:~/return` trips the permission prompt and wedges the run.
         toolkits::ensure_core_verbs(&mut allowed);
 
-        // Auto-add submission tool
-        if !allowed.contains(&"mcp__cairn__return".to_string()) {
-            allowed.push("mcp__cairn__return".to_string());
-        }
+        // The retired `mcp__cairn__return` tool is no longer injected: returning
+        // is `write cairn:~/return`, and schema-constrained calls capture the
+        // native structured output server-side (CAIRN-2505). No MCP handler ever
+        // dispatched a `return` tool, so it was dead weight on the allow-list.
 
         // Defensively strip always-disallowed tools from allowed (in case an
         // agent config lists planning/todo tools).
@@ -905,6 +905,7 @@ impl AgentBackend for ClaudeBackend {
             system_prompt_file: Some(system_prompt_path),
             settings_path: hook_settings_path,
             bidirectional: config.bidirectional,
+            json_schema: config.output_schema.clone(),
         };
         let claude_args = build_claude_args(&args_config);
 
@@ -1353,6 +1354,36 @@ impl ClaudeBackend {
                     // capture it before any branch so a later EOF finalizes Exited.
                     if matches!(&event, ClaudeEvent::Result { .. }) {
                         saw_terminal_result = true;
+                        // A schema-constrained call returns its result through the
+                        // CLI's StructuredOutput tool, surfaced on the terminal
+                        // result event as `structured_output`. Store it as the
+                        // call's return artifact server-side (CAIRN-2505) BEFORE the
+                        // run finalizes below, so the parent resumes to a
+                        // schema-valid artifact instead of relying on the model to
+                        // have written `cairn:~/return`. Best-effort + idempotent.
+                        if let Some(structured) = raw
+                            .get("structured_output")
+                            .filter(|v| !v.is_null())
+                            .cloned()
+                        {
+                            let orch_capture = orch.clone();
+                            let run_id_capture = run_id.to_string();
+                            match run_backend_db(CLAUDE_BACKEND_NAME, async move {
+                                crate::mcp::handlers::comments_artifacts::capture_call_structured_output(
+                                    &orch_capture,
+                                    &run_id_capture,
+                                    structured,
+                                )
+                                .await
+                            }) {
+                                Ok(_) => {}
+                                Err(e) => log::warn!(
+                                    "Failed to capture structured_output for run {}: {}",
+                                    &run_id[..run_id.len().min(8)],
+                                    e
+                                ),
+                            }
+                        }
                     }
 
                     if !backend_id_confirmed {

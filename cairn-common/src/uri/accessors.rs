@@ -36,6 +36,7 @@ impl CairnResource {
             | TaskArtifact { project, .. }
             | JobTodos { project, .. }
             | NodeTasks { project, .. }
+            | NodeCalls { project, .. }
             | NodeWakes { project, .. }
             | NodeChecks { project, .. }
             | NodeQuestions { project, .. }
@@ -45,6 +46,7 @@ impl CairnResource {
             | TaskPermissions { project, .. }
             | TaskPermission { project, .. }
             | NodeMessages { project, .. }
+            | NodeProgress { project, .. }
             | TaskMessages { project, .. }
             | ProjectMessages { project, .. }
             | IssueMessages { project, .. }
@@ -202,6 +204,7 @@ impl CairnResource {
             | Self::TaskArtifact { .. }
             | Self::JobTodos { .. }
             | Self::NodeTasks { .. }
+            | Self::NodeCalls { .. }
             | Self::NodeWakes { .. }
             | Self::NodeChecks { .. }
             | Self::NodeQuestions { .. }
@@ -211,6 +214,7 @@ impl CairnResource {
             | Self::TaskPermissions { .. }
             | Self::TaskPermission { .. }
             | Self::NodeMessages { .. }
+            | Self::NodeProgress { .. }
             | Self::TaskMessages { .. }
             | Self::ProjectIssues { .. }
             | Self::ProjectMessages { .. }
@@ -251,6 +255,10 @@ impl CairnResource {
             | Self::Bug
             | Self::Help
             | Self::WebSearch
+            | Self::Workflows
+            | Self::Workflow { .. }
+            | Self::ProjectWorkflows { .. }
+            | Self::ProjectWorkflow { .. }
             | Self::Mcp { .. } => None,
         }
     }
@@ -280,6 +288,7 @@ impl CairnResource {
             | Self::TaskArtifact { project, .. }
             | Self::JobTodos { project, .. }
             | Self::NodeTasks { project, .. }
+            | Self::NodeCalls { project, .. }
             | Self::NodeWakes { project, .. }
             | Self::NodeChecks { project, .. }
             | Self::NodeQuestions { project, .. }
@@ -289,6 +298,7 @@ impl CairnResource {
             | Self::TaskPermissions { project, .. }
             | Self::TaskPermission { project, .. }
             | Self::NodeMessages { project, .. }
+            | Self::NodeProgress { project, .. }
             | Self::TaskMessages { project, .. }
             | Self::ProjectMessages { project }
             | Self::IssueMessages { project, .. }
@@ -308,6 +318,8 @@ impl CairnResource {
             | Self::NodeMemory { project, .. }
             | Self::ProjectRecipes { project }
             | Self::ProjectRecipe { project, .. }
+            | Self::ProjectWorkflows { project }
+            | Self::ProjectWorkflow { project, .. }
             | Self::ProjectAgents { project }
             | Self::ProjectAgent { project, .. }
             | Self::ProjectActions { project }
@@ -320,6 +332,8 @@ impl CairnResource {
             | Self::Label { .. }
             | Self::Recipes
             | Self::Recipe { .. }
+            | Self::Workflows
+            | Self::Workflow { .. }
             | Self::Agents
             | Self::Agent { .. }
             | Self::Actions
@@ -358,6 +372,7 @@ impl CairnResource {
             | Self::TaskArtifact { number, .. }
             | Self::JobTodos { number, .. }
             | Self::NodeTasks { number, .. }
+            | Self::NodeCalls { number, .. }
             | Self::NodeWakes { number, .. }
             | Self::NodeChecks { number, .. }
             | Self::NodeQuestions { number, .. }
@@ -367,6 +382,7 @@ impl CairnResource {
             | Self::TaskPermissions { number, .. }
             | Self::TaskPermission { number, .. }
             | Self::NodeMessages { number, .. }
+            | Self::NodeProgress { number, .. }
             | Self::TaskMessages { number, .. }
             | Self::IssueMessages { number, .. }
             | Self::IssueComments { number, .. }
@@ -403,6 +419,10 @@ impl CairnResource {
             | Self::Action { .. }
             | Self::ProjectActions { .. }
             | Self::ProjectAction { .. }
+            | Self::Workflows
+            | Self::Workflow { .. }
+            | Self::ProjectWorkflows { .. }
+            | Self::ProjectWorkflow { .. }
             | Self::ProjectSymbols { .. }
             | Self::Db
             | Self::Dev
@@ -436,6 +456,7 @@ impl CairnResource {
             | Self::TaskArtifact { node_id, .. }
             | Self::JobTodos { node_id, .. }
             | Self::NodeTasks { node_id, .. }
+            | Self::NodeCalls { node_id, .. }
             | Self::NodeQuestions { node_id, .. }
             | Self::NodeQuestion { node_id, .. }
             | Self::NodePermissions { node_id, .. }
@@ -443,6 +464,7 @@ impl CairnResource {
             | Self::TaskPermissions { node_id, .. }
             | Self::TaskPermission { node_id, .. }
             | Self::NodeMessages { node_id, .. }
+            | Self::NodeProgress { node_id, .. }
             | Self::TaskMessages { node_id, .. }
             | Self::NodeChanged { node_id, .. }
             | Self::NodeMemories { node_id, .. }

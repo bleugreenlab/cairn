@@ -572,6 +572,104 @@ async fn bare_jj_git_push_survives_injected_ceiling_env() {
     );
 }
 
+/// Build a run request whose single item is inline `code` (no shell command),
+/// so the commit barrier's batch-level, VCS-based governance is exercised over a
+/// code item exactly as over a shell command.
+fn code_run_request(
+    cwd: &str,
+    run_id: &str,
+    code: &str,
+    interpreter: &str,
+    commit_msg: Option<&str>,
+) -> McpCallbackRequest {
+    let mut payload = json!({ "commands": [{ "code": code, "interpreter": interpreter }] });
+    if let Some(commit_msg) = commit_msg {
+        payload["commit_msg"] = json!(commit_msg);
+    }
+    McpCallbackRequest {
+        cwd: cwd.to_string(),
+        run_id: Some(run_id.to_string()),
+        tool: "run".to_string(),
+        payload,
+        tool_use_id: Some("toolu-run".to_string()),
+    }
+}
+
+fn python3_available() -> bool {
+    Command::new("python3")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The commit barrier is batch-level and VCS-based, not shell-keyed: a code item
+/// that dirties the worktree is sealed by `commit_msg` exactly like a shell item.
+#[tokio::test]
+async fn code_item_with_commit_msg_seals_and_cleans() {
+    if !python3_available() {
+        eprintln!("skipping code_item_with_commit_msg_seals_and_cleans: python3 not resolvable");
+        return;
+    }
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!("skipping code_item_with_commit_msg_seals_and_cleans: jj not resolvable");
+        return;
+    };
+    let (temp, orch, cwd) = setup("run-code-commit").await;
+    let result = handle_run(
+        &orch,
+        &code_run_request(
+            &cwd,
+            "run-code-commit",
+            "open('code-gen.txt', 'w').write('x')",
+            "python",
+            Some("commit code-generated file"),
+        ),
+    )
+    .await;
+
+    assert!(result.contains("Committed changes"), "result: {result}");
+    assert!(Path::new(&cwd).join("code-gen.txt").exists());
+    assert!(ws_clean(&temp.path().join("config"), Path::new(&cwd)));
+}
+
+/// The mirror of `run_without_commit_msg_reverts_new_dirt` for a code item: no
+/// `commit_msg` means the code item's new dirt is reverted to HEAD, proving the
+/// barrier needs no per-kind special-casing.
+#[tokio::test]
+async fn code_item_without_commit_msg_reverts_new_dirt() {
+    // Spawns a real sandbox-exec-confined process; nested inside the agent fence
+    // the in-worktree write is denied, so the hygiene revert never sees dirt.
+    // Skip in a fence; unfenced CI exercises the real revert.
+    if common::skip_if_fenced("code_item_without_commit_msg_reverts_new_dirt") {
+        return;
+    }
+    if !python3_available() {
+        eprintln!("skipping code_item_without_commit_msg_reverts_new_dirt: python3 not resolvable");
+        return;
+    }
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!("skipping code_item_without_commit_msg_reverts_new_dirt: jj not resolvable");
+        return;
+    };
+    let (temp, orch, cwd) = setup_deny("run-code-revert").await;
+    let result = handle_run(
+        &orch,
+        &code_run_request(
+            &cwd,
+            "run-code-revert",
+            "open('code-gen.txt', 'w').write('x')",
+            "python",
+            None,
+        ),
+    )
+    .await;
+
+    assert!(result.contains("Run reverted"), "result: {result}");
+    assert!(!Path::new(&cwd).join("code-gen.txt").exists());
+    assert!(ws_clean(&temp.path().join("config"), Path::new(&cwd)));
+}
+
 #[tokio::test]
 async fn dirty_worktree_notice_skips_non_worktree_request() {
     let dir = tempfile::tempdir().unwrap();

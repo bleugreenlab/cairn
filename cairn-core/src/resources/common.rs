@@ -785,7 +785,10 @@ pub(super) async fn find_job_by_node_name(
         FROM jobs
         WHERE issue_id = ?1
           AND execution_id = ?2
-          AND parent_job_id IS NULL
+          -- Top-level nodes have no parent; a workflow is a child job (for the
+          -- delegation tree) yet is addressable as a node by its segment, so its
+          -- `cairn:~/calls` and child-call `?wait` URIs resolve.
+          AND (parent_job_id IS NULL OR agent_config_id = 'workflow')
           AND uri_segment = ?3
         LIMIT 1
         "

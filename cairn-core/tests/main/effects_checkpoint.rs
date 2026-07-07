@@ -38,6 +38,12 @@ async fn test_context() -> TestContext {
 
 async fn insert_job(db: &LocalDb, id: &str, status: &str) {
     let project_id = common::create_project(db, &format!("CP{}", &id[id.len() - 1..])).await;
+    // Seed a single-node checkpoint execution so the job is recipe-backed.
+    // Standalone (execution-less) jobs were retired, so approval now derives
+    // Complete through the execution sweep's checkpoint gate rather than a
+    // special-cased single-job path.
+    let exec_id = format!("exec-{id}");
+    insert_checkpoint_execution(db, &exec_id).await;
     let now = chrono::Utc::now().timestamp();
     let id = id.to_string();
     let status = status.to_string();
@@ -46,18 +52,20 @@ async fn insert_job(db: &LocalDb, id: &str, status: &str) {
         let id = id.clone();
         let status = status.clone();
         let project_id = project_id.clone();
+        let exec_id = exec_id.clone();
         Box::pin(async move {
             conn.execute(
                 "
                 INSERT INTO jobs (
-                    id, project_id, status, created_at, updated_at, started_at, completed_at,
-                    node_name
+                    id, project_id, execution_id, recipe_node_id, status, created_at,
+                    updated_at, started_at, completed_at, node_name
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'Checkpoint')
+                VALUES (?1, ?2, ?3, 'ckpt', ?4, ?5, ?6, ?7, ?8, 'Checkpoint')
                 ",
                 params![
                     id.as_str(),
                     project_id.as_str(),
+                    exec_id.as_str(),
                     status.as_str(),
                     now,
                     now,
@@ -73,6 +81,59 @@ async fn insert_job(db: &LocalDb, id: &str, status: &str) {
             Ok(())
         })
     })
+    .await
+    .unwrap();
+}
+
+/// Seed a running execution whose recipe is a `checkpoint` node (`ckpt`) gated
+/// behind a trigger. The trigger edge makes the checkpoint DAG-ready without a
+/// seeded upstream job; a checkpoint node's gate then resolves from artifact
+/// confirmation, so confirming the job's artifact derives Complete through the
+/// ordinary execution sweep.
+async fn insert_checkpoint_execution(db: &LocalDb, exec_id: &str) {
+    let snapshot = serde_json::json!({
+        "recipe": {
+            "id": "recipe-1",
+            "name": "checkpoint",
+            "trigger": "manual",
+            "nodes": [
+                {
+                    "id": "trigger",
+                    "name": "Trigger",
+                    "nodeType": "trigger",
+                    "position": { "x": 0.0, "y": 0.0 }
+                },
+                {
+                    "id": "ckpt",
+                    "name": "Checkpoint",
+                    "nodeType": "checkpoint",
+                    "position": { "x": 0.0, "y": 1.0 },
+                    "checkpointConfig": { "command": "true" }
+                }
+            ],
+            "edges": [{
+                "id": "e1",
+                "edgeType": "control",
+                "sourceNodeId": "trigger",
+                "sourceHandle": "control-out",
+                "targetNodeId": "ckpt",
+                "targetHandle": "control-in"
+            }]
+        },
+        "agents": {},
+        "skills": {},
+        "tools": {},
+        "triggerContext": { "projectId": "test-project", "triggerType": "manual" },
+        "createdAt": 0
+    });
+    let snapshot = serde_json::to_string(&snapshot).unwrap();
+    let exec_id = exec_id.to_string();
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "INSERT INTO executions (id, recipe_id, status, started_at, seq, snapshot)
+         VALUES (?1, 'recipe-1', 'running', ?2, 1, ?3)",
+        params![exec_id.as_str(), now, snapshot.as_str()],
+    )
     .await
     .unwrap();
 }

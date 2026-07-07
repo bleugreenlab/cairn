@@ -25,6 +25,7 @@ pub mod context_window;
 pub mod openrouter;
 mod run_state;
 pub mod stdin;
+pub(crate) mod workflow;
 
 pub use claude_usage::collect_claude_usage_snapshot;
 
@@ -254,6 +255,12 @@ pub struct SessionConfig {
     /// Pre-resolved identity for this session (includes project overrides).
     /// If set, backends use this instead of calling `orch.get_identity()`.
     pub identity: Option<crate::identity::UserIdentity>,
+    /// Resolved JSON Schema to constrain the model's output natively (CAIRN-2505).
+    /// Set only for node-less ephemeral calls that carry an output contract, so
+    /// each backend passes the provider's native output constraint (Claude
+    /// `--json-schema`, OpenRouter `response_format`, Codex per-turn
+    /// `outputSchema`). `None` for ordinary agent sessions, which are unchanged.
+    pub output_schema: Option<serde_json::Value>,
 }
 
 impl SessionConfig {}
@@ -550,9 +557,10 @@ pub(crate) mod tests {
                 "{tool} must be in Claude's disallowed list"
             );
         }
-        // Only the aliased read verb + auto-added return survive.
+        // Only the aliased read verb survives (the dead `return` tool is no
+        // longer auto-added — CAIRN-2505).
         assert!(rt.allowed.contains(&"mcp__cairn__read".into()));
-        assert!(rt.allowed.contains(&"mcp__cairn__return".into()));
+        assert!(!rt.allowed.contains(&"mcp__cairn__return".into()));
     }
 
     #[test]
@@ -568,15 +576,15 @@ pub(crate) mod tests {
             ],
             &[],
         );
-        // None of the dead names survive; the always-on core-verb floor
-        // (CAIRN-1172) plus the auto-added return are all that remain.
+        // None of the dead names survive; only the always-on core-verb floor
+        // (CAIRN-1172) remains (the dead `return` tool is no longer auto-added
+        // — CAIRN-2505).
         assert_eq!(
             rt.allowed,
             vec![
                 "mcp__cairn__read".to_string(),
                 "mcp__cairn__write".to_string(),
                 "mcp__cairn__run".to_string(),
-                "mcp__cairn__return".to_string(),
             ]
         );
     }
@@ -633,12 +641,14 @@ pub(crate) mod tests {
     // =========================================================================
 
     #[test]
-    fn claude_resolve_tools_auto_adds_return() {
+    fn claude_resolve_tools_does_not_add_dead_return() {
         let backend = claude::ClaudeBackend;
         let rt = backend.resolve_tools(&["Read".into()], &[]);
+        // The `return` tool was retired (return is now `write cairn:~/return`);
+        // it must not be injected into the allow-list (CAIRN-2505).
         assert!(
-            rt.allowed.contains(&"mcp__cairn__return".into()),
-            "return tool should be auto-added"
+            !rt.allowed.contains(&"mcp__cairn__return".into()),
+            "dead return tool must not be auto-added"
         );
         assert!(
             !rt.allowed.contains(&"mcp__cairn__skill".into()),
@@ -726,12 +736,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn codex_resolve_tools_auto_adds_return() {
+    fn codex_resolve_tools_does_not_add_dead_return() {
         let backend = codex::CodexBackend;
         let rt = backend.resolve_tools(&["Read".into()], &[]);
+        // The `return` tool was retired; it must not be injected (CAIRN-2505).
         assert!(
-            rt.allowed.contains(&"mcp__cairn__return".into()),
-            "return tool should be auto-added"
+            !rt.allowed.contains(&"mcp__cairn__return".into()),
+            "dead return tool must not be auto-added"
         );
         assert!(
             !rt.allowed.contains(&"mcp__cairn__skill".into()),

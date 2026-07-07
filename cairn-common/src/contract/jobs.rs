@@ -126,6 +126,57 @@ pub(crate) const NODE_TASKS_CONTRACT: ResourceContract =
         }],
     };
 
+pub(crate) const NODE_CALLS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeCalls,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/calls",
+    name: "Node calls",
+    description:
+        "Ephemeral agent calls owned by a node job — one prompt in, schema-validated JSON out (read; spawn via change append)",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Append,
+        required: &[KeySpec::new("prompt", KeyType::Str, "the call's instruction")],
+        optional: &[
+            KeySpec::new(
+                "subagentType",
+                KeyType::Str,
+                "worker agent name; defaults to Explore",
+            ),
+            KeySpec::new(
+                "outputSchema",
+                KeyType::Str,
+                "preset name or inline JSON Schema; defaults to the return contract",
+            ),
+            KeySpec::new(
+                "worktree",
+                KeyType::Str,
+                "inherit (default; caller's worktree) | none (scratch dir, no project tree)",
+            ),
+            KeySpec::new(
+                "tier",
+                KeyType::Str,
+                "sm|md|lg preset, or a model name; defaults to the parent's",
+            ),
+            KeySpec::new(
+                "backend",
+                KeyType::Str,
+                "claude|codex; defaults to the parent's",
+            ),
+            KeySpec::new("label", KeyType::Str, "durable workflow tag"),
+            KeySpec::new("phase", KeyType::Str, "durable workflow phase tag"),
+            KeySpec::new(
+                "background",
+                KeyType::Bool,
+                "fire-and-forget; returns call URIs without waiting",
+            ),
+        ],
+        label: "spawn call",
+        example: "write({changes:[{target:\"cairn:~/calls\",mode:\"append\",payload:{prompt:\"Summarize X as JSON\",outputSchema:\"return\"}}]})",
+    }],
+};
+
 pub(crate) const NODE_QUESTIONS_CONTRACT: ResourceContract =
     ResourceContract {
         kind: ResourceKind::NodeQuestions,

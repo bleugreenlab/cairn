@@ -18,12 +18,14 @@ use super::labels::{read_label, read_labels};
 use super::memories::{read_node_memories_collection, read_node_memory};
 use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
 use super::node::{
-    read_job_todos, read_node, read_node_artifact, read_node_chat, read_node_chat_event,
-    read_node_chat_raw, read_node_chat_turn, read_node_checks, read_node_permission,
-    read_node_permissions, read_node_question, read_node_questions, read_node_tasks,
-    read_node_wakes, read_task, read_task_artifact, read_task_chat, read_task_chat_event,
-    read_task_chat_raw, read_task_chat_turn, read_task_permission, read_task_permissions,
+    read_job_todos, read_node, read_node_artifact, read_node_calls, read_node_chat,
+    read_node_chat_event, read_node_chat_raw, read_node_chat_turn, read_node_checks,
+    read_node_permission, read_node_permissions, read_node_question, read_node_questions,
+    read_node_tasks, read_node_wakes, read_task, read_task_artifact, read_task_chat,
+    read_task_chat_event, read_task_chat_raw, read_task_chat_turn, read_task_permission,
+    read_task_permissions,
 };
+use super::progress::read_node_progress;
 use super::symbols::{read_node_symbols, read_project_symbols};
 
 use super::actions::{read_action, read_actions_collection};
@@ -34,6 +36,7 @@ use super::project::{
 };
 use super::recipes::{read_recipe, read_recipes_collection};
 use super::settings::read_settings;
+use super::workflows::{read_workflow, read_workflows_collection};
 
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
@@ -895,6 +898,34 @@ pub(crate) async fn produce_cairn_resource(
         }
     };
 
+    // `?wait` on a call/task-artifact URI: block until the delegated run behind
+    // it is terminal, then return the raw artifact JSON (or a pending/failed
+    // sentinel). No affordance — the harness (`@cairn/harness`) parses the body
+    // directly. Scoped to task-artifact URIs; every other resource rejects the
+    // `wait` param as unsupported. Intercepted here, before affordance/grep, so
+    // the body stays clean for machine parsing.
+    if let CairnResource::TaskArtifact {
+        project,
+        number,
+        exec_seq,
+        node_id,
+        task_name,
+        ..
+    } = &resource
+    {
+        if find_query_value(&split.params, "wait").is_some() {
+            let routed = match resource.project_key() {
+                Some(key) => orch.db.for_project(key).await,
+                None => orch.db.local.clone(),
+            };
+            let body = super::node::wait_for_task_artifact(
+                orch, &routed, project, *number, *exec_seq, node_id, task_name,
+            )
+            .await;
+            return RenderedResource::line(body, None, None, None);
+        }
+    }
+
     let affordance = {
         // Node/task artifacts derive their affordance example from the schema the
         // addressed name actually validates against, so a copied example is a
@@ -1117,7 +1148,9 @@ pub(crate) async fn produce_cairn_resource(
     // window), and never re-window by `limit`.
     let renderer_owns_params = matches!(
         resource,
-        CairnResource::Changed { .. } | CairnResource::NodeChanged { .. }
+        CairnResource::Changed { .. }
+            | CairnResource::NodeChanged { .. }
+            | CairnResource::NodeProgress { .. }
     ) || matches!(resource, CairnResource::Project { .. })
         && find_query_value(&split.params, "search").is_some();
 
@@ -1434,6 +1467,18 @@ async fn render_resource_body(
                 read_node_tasks(db, &project, number, exec_seq, &node_id).await
             }
         }
+        CairnResource::NodeCalls {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => {
+            if let Some(error) = reject_query_params("node calls", &params) {
+                error
+            } else {
+                read_node_calls(db, &project, number, exec_seq, &node_id).await
+            }
+        }
         CairnResource::NodeWakes {
             project,
             number,
@@ -1589,6 +1634,12 @@ async fn render_resource_body(
             exec_seq,
             node_id,
         } => read_node_messages(db, &project, number, exec_seq, &node_id, None, &params).await,
+        CairnResource::NodeProgress {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => read_node_progress(db, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::TaskMessages {
             project,
             number,
@@ -1741,6 +1792,37 @@ async fn render_resource_body(
                 error
             } else {
                 read_recipe(orch, request, &recipe_id, Some(&project)).await
+            }
+        }
+        CairnResource::Workflows => {
+            if let Some(error) = reject_query_params("workflows", &params) {
+                error
+            } else {
+                read_workflows_collection(orch, request, None).await
+            }
+        }
+        CairnResource::Workflow { workflow_id } => {
+            if let Some(error) = reject_query_params("workflow", &params) {
+                error
+            } else {
+                read_workflow(orch, request, &workflow_id, None).await
+            }
+        }
+        CairnResource::ProjectWorkflows { project } => {
+            if let Some(error) = reject_query_params("project workflows", &params) {
+                error
+            } else {
+                read_workflows_collection(orch, request, Some(&project)).await
+            }
+        }
+        CairnResource::ProjectWorkflow {
+            project,
+            workflow_id,
+        } => {
+            if let Some(error) = reject_query_params("project workflow", &params) {
+                error
+            } else {
+                read_workflow(orch, request, &workflow_id, Some(&project)).await
             }
         }
         CairnResource::Agents => {

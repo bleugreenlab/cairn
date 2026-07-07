@@ -53,6 +53,7 @@ pub mod skills;
 pub mod snapshot_migrate;
 pub mod web_fetch;
 pub mod web_search;
+pub mod workflows;
 pub mod yaml_edit;
 
 use std::collections::HashSet;

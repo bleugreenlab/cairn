@@ -479,6 +479,44 @@ mod tests {
         std::fs::write(dir.join("SKILL.md"), markdown).unwrap();
     }
 
+    /// Every skill shipped in-repo under `src-tauri/skills/` is copied into the
+    /// workspace by the bundle sync (`BUNDLE_RESOURCE_DIRS` includes `skills`)
+    /// and then read as `cairn://skills/<id>`. Guard that each bundled package
+    /// parses, and that the `workflows` skill is present and well-formed.
+    /// Verifying the shipped file directly beats dogfooding through the running
+    /// host, which serves a stale binary and a stale synced copy.
+    #[test]
+    fn bundled_skills_load_and_include_workflows() {
+        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills")
+            .canonicalize()
+            .expect("bundled skills dir exists at src-tauri/skills");
+        let mut saw_workflows = false;
+        for entry in std::fs::read_dir(&bundled).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.join("SKILL.md").exists() {
+                continue;
+            }
+            let id = path.file_name().unwrap().to_str().unwrap().to_string();
+            match load_skill_dir(&path, false) {
+                ConfigResult::Ok(skill) => {
+                    assert!(
+                        !skill.description.trim().is_empty(),
+                        "bundled skill `{id}` must declare a description"
+                    );
+                    if id == "workflows" {
+                        saw_workflows = true;
+                        assert_eq!(skill.name, "workflows");
+                    }
+                }
+                ConfigResult::Err { error, .. } => {
+                    panic!("bundled skill `{id}` failed to load: {error}")
+                }
+            }
+        }
+        assert!(saw_workflows, "the bundled `workflows` skill must exist");
+    }
+
     #[test]
     fn test_load_skill_dir_basic() {
         let temp = tempdir().unwrap();

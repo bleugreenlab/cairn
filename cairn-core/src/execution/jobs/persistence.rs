@@ -437,6 +437,32 @@ pub(super) async fn load_session_optional(
     .map_err(|e| db_error("Failed to load session", e))
 }
 
+/// Latest event `created_at` for a session, or `None` when the session has no
+/// events yet. Backs the cold-resume staleness gate (CAIRN-2534) — the single
+/// notion of a session's last activity, reused rather than duplicated.
+pub(super) async fn load_last_event_time_for_session(
+    db: Arc<LocalDb>,
+    session_id: String,
+) -> Result<Option<i64>, String> {
+    db.read(|conn| {
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT MAX(created_at) FROM events WHERE session_id = ?1",
+                    params![session_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.opt_i64(0)?),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(|e| db_error("Failed to load last event time", e))
+}
+
 pub(super) async fn insert_session_conn(
     conn: &cairn_db::turso::Connection,
     session_id: &str,
@@ -663,31 +689,45 @@ pub(super) async fn load_run(
     .map_err(|e| db_error(context, e))
 }
 
-pub(super) struct ChildInsert {
-    pub(super) job_id: String,
-    pub(super) run_id: String,
-    pub(super) session_id: String,
-    pub(super) parent_job_id: String,
-    pub(super) worktree_path: String,
+pub(crate) struct ChildInsert {
+    pub(crate) job_id: String,
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) parent_job_id: String,
+    /// The inherited worktree path, or `None` for a worktree-less child (an
+    /// ephemeral `worktree: none` call runs in a scratch dir with no project
+    /// tree binding).
+    pub(crate) worktree_path: Option<String>,
     /// The child's own branch. `None` for an inherited-worktree child (it shares
     /// the parent's branch); `Some(ephemeral)` for an ambient parent's ephemeral
     /// worktree, so teardown can forget the jj workspace and delete the branch.
-    pub(super) branch: Option<String>,
-    pub(super) agent_config_id: String,
-    pub(super) project_id: String,
-    pub(super) issue_id: Option<String>,
-    pub(super) execution_id: Option<String>,
-    pub(super) description: String,
-    pub(super) model: Option<String>,
+    pub(crate) branch: Option<String>,
+    pub(crate) agent_config_id: String,
+    pub(crate) project_id: String,
+    pub(crate) issue_id: Option<String>,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) description: String,
+    pub(crate) model: Option<String>,
     /// HEAD sha of the inherited parent worktree at creation.
-    pub(super) base_commit: Option<String>,
+    pub(crate) base_commit: Option<String>,
     /// 1 when this child owns a throwaway ephemeral worktree (ambient parent);
     /// reclaimed when the child job terminalizes.
-    pub(super) owns_ephemeral_worktree: bool,
-    pub(super) now: i32,
+    pub(crate) owns_ephemeral_worktree: bool,
+    /// JSON-serialized `DelegatedOutputContract` (CAIRN-2481): the per-run output
+    /// schema the artifact-write handler resolves for this node-less job. `None`
+    /// preserves the `task_name -> return` fallback (child tasks).
+    pub(crate) output_contract: Option<String>,
+    /// Durable workflow tags persisted on the run (CAIRN-2481). No UI yet.
+    pub(crate) label: Option<String>,
+    pub(crate) phase: Option<String>,
+    /// Links this child job to the originating `write` tool-use for transcript
+    /// correlation; `None` for child tasks.
+    pub(crate) parent_tool_use_id: Option<String>,
+    pub(crate) task_index: Option<i32>,
+    pub(crate) now: i32,
 }
 
-pub(super) async fn insert_child_job_session_run(
+pub(crate) async fn insert_child_job_session_run(
     db: Arc<LocalDb>,
     input: ChildInsert,
 ) -> Result<(), String> {
@@ -709,6 +749,11 @@ pub(super) async fn insert_child_job_session_run(
             model: input.model.clone(),
             base_commit: input.base_commit.clone(),
             owns_ephemeral_worktree: input.owns_ephemeral_worktree,
+            output_contract: input.output_contract.clone(),
+            label: input.label.clone(),
+            phase: input.phase.clone(),
+            parent_tool_use_id: input.parent_tool_use_id.clone(),
+            task_index: input.task_index,
             now: input.now,
         };
         Box::pin(async move {
@@ -735,21 +780,21 @@ pub(super) async fn insert_child_job_session_run(
                     status, agent_config_id, issue_id, project_id, task_description,
                     created_at, updated_at, completed_at, parent_tool_use_id, task_index,
                     started_at, model, node_name, base_branch, current_turn_id, uri_segment,
-                    pack_anchor, owns_ephemeral_worktree
+                    pack_anchor, owns_ephemeral_worktree, output_contract
                 )
                 VALUES (
                     ?1, ?2, NULL, ?3,
-                    ?4, ?16, ?13, ?5, NULL,
+                    ?4, ?19, ?13, ?5, NULL,
                     'running', ?6, ?7, ?8, ?9,
-                    ?10, ?10, NULL, NULL, NULL,
+                    ?10, ?10, NULL, ?15, ?16,
                     ?10, ?11, NULL, NULL, NULL, ?12,
-                    ?14, ?15
+                    ?14, ?18, ?17
                 )",
                 params![
                     input.job_id.as_str(),
                     input.execution_id.as_deref(),
                     input.parent_job_id.as_str(),
-                    input.worktree_path.as_str(),
+                    input.worktree_path.as_deref(),
                     input.session_id.as_str(),
                     input.agent_config_id.as_str(),
                     input.issue_id.as_deref(),
@@ -760,6 +805,9 @@ pub(super) async fn insert_child_job_session_run(
                     uri_segment.as_str(),
                     input.base_commit.as_deref(),
                     pack_anchor.as_deref(),
+                    input.parent_tool_use_id.as_deref(),
+                    input.task_index,
+                    input.output_contract.as_deref(),
                     input.owns_ephemeral_worktree as i64,
                     input.branch.as_deref(),
                 ],
@@ -781,9 +829,9 @@ pub(super) async fn insert_child_job_session_run(
                 "INSERT INTO runs(
                     id, issue_id, project_id, job_id, chat_id, status, session_id,
                     error_message, started_at, exited_at, created_at, updated_at,
-                    exit_reason, start_mode
+                    exit_reason, start_mode, label, phase
                 )
-                VALUES (?1, ?2, ?3, ?4, NULL, 'starting', ?5, NULL, ?6, NULL, ?6, ?6, NULL, 'fresh')",
+                VALUES (?1, ?2, ?3, ?4, NULL, 'starting', ?5, NULL, ?6, NULL, ?6, ?6, NULL, 'fresh', ?7, ?8)",
                 params![
                     input.run_id.as_str(),
                     input.issue_id.as_deref(),
@@ -791,6 +839,8 @@ pub(super) async fn insert_child_job_session_run(
                     Some(input.job_id.as_str()),
                     Some(input.session_id.as_str()),
                     input.now,
+                    input.label.as_deref(),
+                    input.phase.as_deref(),
                 ],
             )
             .await

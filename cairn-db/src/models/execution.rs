@@ -41,17 +41,21 @@ impl std::str::FromStr for ExecutionStatus {
     }
 }
 
-/// Resolver key stored on the execution record. Captures enough information
-/// to re-resolve credentials for auto-started DAG jobs and cold resumes.
+/// Resolver key stored on the execution record. Captures the initiating user
+/// so auto-started DAG jobs and cold resumes can re-resolve credentials from
+/// the local identity store.
 ///
-/// Not identity persistence — just a key that maps to cached credentials
-/// (BYOT) or a vault lookup (shared mode).
+/// Not identity persistence — just a `(sub, org_id)` key.
+///
+/// Note: the `executions.initiator_auth_mode` column that once backed a removed
+/// `auth_mode` field is intentionally left dormant (nullable, unwritten) rather
+/// than dropped. `executions` is a ProjectScoped synced replica table, and
+/// dropping a column from one is forbidden by sync-safety canon (see the
+/// `shared_tail_jobs_child_base` precedent in cairn-core's migrations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Initiator {
     /// JWT `sub` claim — the user who initiated this execution.
     pub sub: String,
-    /// Credential mode: "byot" or "shared".
-    pub auth_mode: String,
     /// Organization ID (empty string for personal accounts).
     pub org_id: String,
 }
@@ -92,16 +96,8 @@ impl TryFrom<crate::db_records::DbExecution> for Execution {
             .map_err(|e: String| format!("Invalid execution status: {}", e))?;
 
         // Reconstruct Initiator from nullable columns (all-or-nothing).
-        let initiator = match (
-            db.initiator_sub,
-            db.initiator_auth_mode,
-            db.initiator_org_id,
-        ) {
-            (Some(sub), Some(auth_mode), Some(org_id)) => Some(Initiator {
-                sub,
-                auth_mode,
-                org_id,
-            }),
+        let initiator = match (db.initiator_sub, db.initiator_org_id) {
+            (Some(sub), Some(org_id)) => Some(Initiator { sub, org_id }),
             _ => None,
         };
 
@@ -269,7 +265,6 @@ mod tests {
             snapshot: None,
             seq: Some(1),
             initiator_sub: None,
-            initiator_auth_mode: None,
             initiator_org_id: None,
             triggered_by: "manual".to_string(),
         }
@@ -279,14 +274,12 @@ mod tests {
     fn try_from_db_execution_all_initiator_columns_present() {
         let db = DbExecution {
             initiator_sub: Some("user-123".to_string()),
-            initiator_auth_mode: Some("byot".to_string()),
             initiator_org_id: Some("org-456".to_string()),
             ..base_db_execution()
         };
         let exec: super::Execution = db.try_into().unwrap();
         let initiator = exec.initiator.expect("should have initiator");
         assert_eq!(initiator.sub, "user-123");
-        assert_eq!(initiator.auth_mode, "byot");
         assert_eq!(initiator.org_id, "org-456");
     }
 
@@ -298,33 +291,31 @@ mod tests {
     }
 
     #[test]
-    fn try_from_db_execution_partial_initiator_is_none() {
-        // Only sub present, auth_mode and org_id missing → None (all-or-nothing)
+    fn try_from_db_execution_sub_without_org_id_is_none() {
+        // Only sub present, org_id missing → None (all-or-nothing)
         let db = DbExecution {
             initiator_sub: Some("user-123".to_string()),
-            initiator_auth_mode: None,
             initiator_org_id: None,
             ..base_db_execution()
         };
         let exec: super::Execution = db.try_into().unwrap();
         assert!(
             exec.initiator.is_none(),
-            "partial initiator columns should produce None"
+            "sub without org_id should produce None"
         );
     }
 
     #[test]
-    fn try_from_db_execution_two_of_three_initiator_is_none() {
+    fn try_from_db_execution_org_id_without_sub_is_none() {
         let db = DbExecution {
-            initiator_sub: Some("user-123".to_string()),
-            initiator_auth_mode: Some("shared".to_string()),
-            initiator_org_id: None,
+            initiator_sub: None,
+            initiator_org_id: Some("org-456".to_string()),
             ..base_db_execution()
         };
         let exec: super::Execution = db.try_into().unwrap();
         assert!(
             exec.initiator.is_none(),
-            "two of three initiator columns should produce None"
+            "org_id without sub should produce None"
         );
     }
 
@@ -333,7 +324,6 @@ mod tests {
         // Empty string org_id (personal account) is valid — it's Some(""), not None
         let db = DbExecution {
             initiator_sub: Some("user-123".to_string()),
-            initiator_auth_mode: Some("byot".to_string()),
             initiator_org_id: Some("".to_string()),
             ..base_db_execution()
         };
@@ -348,26 +338,23 @@ mod tests {
     fn initiator_serde_roundtrip() {
         let initiator = super::Initiator {
             sub: "user-123".to_string(),
-            auth_mode: "byot".to_string(),
             org_id: "org-456".to_string(),
         };
         let json = serde_json::to_string(&initiator).unwrap();
         let parsed: super::Initiator = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.sub, "user-123");
-        assert_eq!(parsed.auth_mode, "byot");
         assert_eq!(parsed.org_id, "org-456");
     }
 
     #[test]
-    fn initiator_serde_shared_mode() {
+    fn initiator_serde_empty_org_id() {
         let initiator = super::Initiator {
             sub: "user-789".to_string(),
-            auth_mode: "shared".to_string(),
             org_id: "".to_string(),
         };
         let json = serde_json::to_string(&initiator).unwrap();
         let parsed: super::Initiator = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.auth_mode, "shared");
+        assert_eq!(parsed.sub, "user-789");
         assert_eq!(parsed.org_id, "");
     }
 

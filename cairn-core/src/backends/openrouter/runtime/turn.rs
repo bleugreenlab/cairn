@@ -351,6 +351,41 @@ fn run_http_turn(
                 response_model.as_deref(),
                 exact_cost,
             )?;
+            // Schema-constrained call: capture the model's final structured
+            // content as the return artifact server-side (CAIRN-2505), validated
+            // against the contract, BEFORE finishing the run. A parse/validation
+            // failure logs and leaves the call artifactless (it resolves to null)
+            // rather than storing non-conforming data.
+            if config.output_schema.is_some() && !assistant_text.is_empty() {
+                match serde_json::from_str::<serde_json::Value>(&assistant_text) {
+                    Ok(value) => {
+                        let orch_capture = orch.clone();
+                        let run_id_capture = config.run_id.clone();
+                        if let Err(e) = crate::backends::run_state::run_backend_db(
+                            OPENROUTER_BACKEND_KEY,
+                            async move {
+                                crate::mcp::handlers::comments_artifacts::capture_call_structured_output(
+                                    &orch_capture,
+                                    &run_id_capture,
+                                    value,
+                                )
+                                .await
+                            },
+                        ) {
+                            log::warn!(
+                                "Failed to capture OpenRouter structured output for run {}: {}",
+                                config.run_id,
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "OpenRouter schema-constrained call produced non-JSON content for run {}: {}",
+                        config.run_id,
+                        e
+                    ),
+                }
+            }
             finish_run(orch, &config.run_id, RunStatus::Exited);
             return Ok(());
         }

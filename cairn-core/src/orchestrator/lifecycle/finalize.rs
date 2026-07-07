@@ -270,6 +270,86 @@ fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str
     });
 }
 
+/// Journal a completed workflow-parented ephemeral call's result under its
+/// `(workflow_run_id, ordinal)` key, then drop the pending link. A clean exit
+/// with an artifact journals the validated result (a later replay returns it
+/// with no spawn); any other outcome journals a failure (replays as `null`). A
+/// call with no journal link (an ordinary call, or a workflow call that hit the
+/// journal) is a no-op. All errors are logged and swallowed.
+fn maybe_journal_call_result(
+    orch: &Orchestrator,
+    run_id: &str,
+    job_id: Option<&str>,
+    status: RunStatus,
+) {
+    let Some(job_id) = job_id else { return };
+    let outcome = run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        let job_id = job_id.to_string();
+        move || async move {
+            let private = dbs.local.clone();
+            let Some(link) = crate::workflow_journal::load_call_link(&private, &run_id).await?
+            else {
+                return Ok(false);
+            };
+            // Success iff a clean exit produced a result artifact; anything else
+            // (a crash, a terminal run with no artifact) is a journaled failure
+            // that replays as `null`, mirroring the `?wait` terminal mapping.
+            let (result_json, jstatus) = if status == RunStatus::Exited {
+                // The call's artifact lives in the run's owning database (a team
+                // run in its replica); route to it rather than assuming private.
+                let owning = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                    .await
+                    .unwrap_or_else(|_| dbs.local.clone());
+                match latest_artifact_data(&owning, &job_id).await? {
+                    Some(data) => (Some(data), crate::workflow_journal::JournalStatus::Success),
+                    None => (None, crate::workflow_journal::JournalStatus::Failure),
+                }
+            } else {
+                (None, crate::workflow_journal::JournalStatus::Failure)
+            };
+            crate::workflow_journal::store_entry(
+                &private,
+                &link.workflow_run_id,
+                link.ordinal,
+                &link.prompt_hash,
+                result_json.as_deref(),
+                jstatus,
+            )
+            .await?;
+            crate::workflow_journal::delete_call_link(&private, &run_id).await?;
+            Ok(true)
+        }
+    });
+    if let Err(e) = outcome {
+        log::warn!("Failed to journal workflow call result for run {run_id}: {e}");
+    }
+}
+
+/// Raw `data` of the most recent artifact written for a job, or `None`.
+async fn latest_artifact_data(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT data FROM artifacts WHERE job_id = ?1 \
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
     let Some(job_id) = job_id_for_run(orch, run_id) else {
         return;
@@ -482,6 +562,13 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     }
 
     let job_id = job_id_for_run(orch, run_id);
+
+    // Journal a workflow-parented call's result on completion (CAIRN-2498), so a
+    // host-restart replay of the workflow short-circuits this ordinal instead of
+    // re-running the call. This is the genuine first finalize (the re-entry above
+    // already returned), and the link is deleted after storing so it is never
+    // double-recorded. Best-effort: a journal failure never affects the run.
+    maybe_journal_call_result(orch, run_id, job_id.as_deref(), status.clone());
 
     if had_active_turn {
         // Finalize todos: mark any in_progress as completed

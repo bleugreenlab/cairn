@@ -452,7 +452,7 @@ async fn load_execution_dispatch_context_conn(
 ) -> DbResult<ExecutionDispatchContext> {
     let mut rows = conn
         .query(
-            "SELECT snapshot, seq, initiator_sub, initiator_auth_mode, initiator_org_id
+            "SELECT snapshot, seq, initiator_sub, initiator_org_id
              FROM executions
              WHERE id = ?1",
             params![execution_id],
@@ -473,16 +473,11 @@ async fn load_execution_dispatch_context_conn(
         .is_some_and(|snapshot| is_event_triggered(&snapshot));
     let exec_seq = row.opt_i64(1)?.map(|value| value as i32);
     let sub = row.opt_text(2)?;
-    let auth_mode = row.opt_text(3)?;
-    let org_id = row.opt_text(4)?;
-    let initiator = match (sub, auth_mode) {
-        (Some(sub), Some(auth_mode)) => Some(Initiator {
-            sub,
-            auth_mode,
-            org_id: org_id.unwrap_or_default(),
-        }),
-        _ => None,
-    };
+    let org_id = row.opt_text(3)?;
+    let initiator = sub.map(|sub| Initiator {
+        sub,
+        org_id: org_id.unwrap_or_default(),
+    });
 
     Ok(ExecutionDispatchContext {
         skip_event_triggered,

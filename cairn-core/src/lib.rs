@@ -29,6 +29,8 @@ pub use cairn_symbols::symbols;
 pub mod terminal_host;
 pub mod todos;
 pub mod turns;
+pub mod workflow_journal;
+pub mod workflow_progress;
 pub use cairn_symbols::worktree_search;
 
 // ── Stable public operations ───────────────────────────

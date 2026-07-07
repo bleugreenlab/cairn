@@ -29,29 +29,28 @@ async fn account_upsert_replaces_current_connection() {
     queries::upsert(&db, &account("user-1", "free"))
         .await
         .unwrap();
-    queries::upsert(&db, &account("user-2", "pro"))
+    queries::upsert(&db, &account("user-2", "team"))
         .await
         .unwrap();
 
     let loaded = queries::get(&db).await.unwrap().unwrap();
     assert_eq!(loaded.user_id, "user-2");
     assert_eq!(loaded.email, "user-2@example.com");
-    assert_eq!(loaded.plan, "pro");
+    assert_eq!(loaded.plan, "team");
     assert_eq!(loaded.org_memberships.len(), 1);
     assert_eq!(loaded.org_memberships[0].org_id, "org-1");
 }
 
 #[tokio::test]
-async fn account_jwt_plan_and_delete_roundtrip() {
+async fn account_jwt_and_delete_roundtrip() {
     let (_temp, db) = common::migrated_db().await;
 
-    queries::upsert(&db, &account("user-1", "free"))
+    queries::upsert(&db, &account("user-1", "team"))
         .await
         .unwrap();
     queries::update_jwt(&db, "encrypted-token", 1234)
         .await
         .unwrap();
-    queries::update_plan(&db, "remote").await.unwrap();
 
     assert_eq!(
         queries::get_jwt_data(&db).await.unwrap(),
@@ -59,7 +58,7 @@ async fn account_jwt_plan_and_delete_roundtrip() {
     );
     assert_eq!(
         queries::get(&db).await.unwrap().unwrap().plan.as_str(),
-        "remote"
+        "team"
     );
 
     queries::delete(&db).await.unwrap();

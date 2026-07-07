@@ -462,6 +462,157 @@ async fn setsid_escapee_does_not_hang_the_call() {
     );
 }
 
+/// Whether an interpreter binary resolves on the test PATH, so a minimal CI
+/// image without bun / python3 self-skips these code-item tests rather than
+/// failing (mirroring the `jj_bin` skip pattern).
+fn binary_available(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn typescript_code_item_executes_via_bun() {
+    if !binary_available("bun") {
+        eprintln!("skipping typescript_code_item_executes_via_bun: bun not resolvable");
+        return;
+    }
+    let (_temp, _db, orch, cwd) = setup("run-code-ts").await;
+    let payload = json!({
+        "commands": [{
+            "code": "const n: number = 41; console.log(`answer=${n + 1}`)",
+            "interpreter": "typescript"
+        }],
+    });
+    let result = handle_run(&orch, &request(&cwd, Some("run-code-ts"), payload)).await;
+    assert!(
+        result.contains("answer=42"),
+        "a typescript code item must run via `bun -e` and return its stdout: {result}"
+    );
+}
+
+#[tokio::test]
+async fn python_code_item_executes_via_python3() {
+    if !binary_available("python3") {
+        eprintln!("skipping python_code_item_executes_via_python3: python3 not resolvable");
+        return;
+    }
+    let (_temp, _db, orch, cwd) = setup("run-code-py").await;
+    let payload = json!({
+        "commands": [{
+            "code": "import sys; print(f'py{sys.version_info[0]}')",
+            "interpreter": "python"
+        }],
+    });
+    let result = handle_run(&orch, &request(&cwd, Some("run-code-py"), payload)).await;
+    assert!(
+        result.contains("py3"),
+        "a python code item must run via `python3 -c` and return its stdout: {result}"
+    );
+}
+
+/// Guards the load-bearing zero-config `@cairn/sdk` story: under `bun -e` a bare
+/// package specifier resolves from the run cwd's `node_modules`. We stand up a
+/// minimal `@cairn/sdk`-named fixture package in the worktree so the test proves
+/// the *resolution mechanism* independent of the real package's current exports.
+#[tokio::test]
+async fn code_item_resolves_bare_package_import_from_worktree_node_modules() {
+    if !binary_available("bun") {
+        eprintln!("skipping code_item_resolves_bare_package_import_from_worktree_node_modules: bun not resolvable");
+        return;
+    }
+    let (_temp, _db, orch, cwd) = setup("run-code-sdk").await;
+    let pkg = Path::new(&cwd).join("node_modules/@cairn/sdk");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"@cairn/sdk","type":"module","exports":{".":"./index.ts"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join("index.ts"),
+        "export const marker = \"SDK_IMPORT_OK\";\n",
+    )
+    .unwrap();
+    let payload = json!({
+        "commands": [{
+            "code": "import { marker } from \"@cairn/sdk\"; console.log(marker)",
+            "interpreter": "typescript"
+        }],
+    });
+    let result = handle_run(&orch, &request(&cwd, Some("run-code-sdk"), payload)).await;
+    assert!(
+        result.contains("SDK_IMPORT_OK"),
+        "`bun -e` must resolve a bare package import from the worktree node_modules: {result}"
+    );
+}
+
+#[tokio::test]
+async fn code_item_nonzero_exit_is_reported_as_failure() {
+    if !binary_available("python3") {
+        eprintln!("skipping code_item_nonzero_exit_is_reported_as_failure: python3 not resolvable");
+        return;
+    }
+    let (_temp, _db, orch, cwd) = setup("run-code-exit").await;
+    let payload = json!({
+        "commands": [{
+            "code": "import sys; print('before exit'); sys.exit(3)",
+            "interpreter": "python"
+        }],
+    });
+    let result = handle_run(&orch, &request(&cwd, Some("run-code-exit"), payload)).await;
+    // Partial stdout before the exit is captured, and the non-zero exit surfaces
+    // exactly like a failed shell command (`Exit code: N`).
+    assert!(
+        result.contains("before exit"),
+        "partial stdout missing: {result}"
+    );
+    assert!(
+        result.contains("Exit code: 3"),
+        "a non-zero interpreter exit must be surfaced like a failed command: {result}"
+    );
+}
+
+/// A timed-out code item flows through the identical partial-output +
+/// promote-to-terminal path as a shell timeout — the timeout machinery is
+/// per-spawn and kind-agnostic, so inline code inherits it unchanged.
+#[tokio::test]
+async fn timed_out_code_item_promotes_to_terminal_with_partial_output() {
+    if !binary_available("python3") {
+        eprintln!("skipping timed_out_code_item_promotes_to_terminal_with_partial_output: python3 not resolvable");
+        return;
+    }
+    let (_temp, db, orch, cwd) = setup("run-code-timeout").await;
+    let payload = json!({
+        "commands": [{
+            "code": "import time,sys; print('started'); sys.stdout.flush(); time.sleep(30)",
+            "interpreter": "python",
+            "timeout": 800
+        }],
+    });
+    let result = handle_run(&orch, &request(&cwd, Some("run-code-timeout"), payload)).await;
+    assert!(
+        result.contains("started"),
+        "missing partial output: {result}"
+    );
+    assert!(
+        result.contains("terminal/run-1"),
+        "missing terminal URI: {result}"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM job_terminals WHERE slug = 'run-1'"
+        )
+        .await,
+        1,
+        "a timed-out code item must promote to a terminal like a shell timeout"
+    );
+    kill_all_sessions(&orch);
+}
+
 #[tokio::test]
 async fn chained_commands_surface_all_segments() {
     let (_temp, _db, orch, cwd) = setup("run-chain").await;

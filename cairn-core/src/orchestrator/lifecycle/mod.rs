@@ -32,7 +32,7 @@ pub use review_push::{
 };
 pub use stop::{
     kill_session, kill_session_with_reason, live_run_id_for_job, stop_active_turn_for_run,
-    stop_job, stop_session, suspend_run_for_durable_wait,
+    stop_call, stop_job, stop_session, stop_workflow, suspend_run_for_durable_wait,
 };
 
 #[cfg(test)]

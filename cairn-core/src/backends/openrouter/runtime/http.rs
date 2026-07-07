@@ -51,9 +51,41 @@ pub(super) fn post_chat_completion(
         body["reasoning"] = json!({ "effort": effort });
     }
     body["provider"] = provider.clone();
+    apply_output_schema(&mut body, config.output_schema.as_ref());
     post_chat_completion_streaming(
         orch, run_db, api_key, body, run_id, session_id, turn_id, sequence, cancel,
     )
+}
+
+/// Inject the native structured-output constraint into an OpenRouter request
+/// body for a schema-constrained call (CAIRN-2505). `response_format` json_schema
+/// with `strict` demands conformance; `provider.require_parameters` routes ONLY
+/// to providers that honor it, so a routed provider can't silently drop the
+/// schema. Cairn's server-side validation of the stored artifact is the backstop
+/// if one still does — non-conformance is a loud failure, never corrupt data. A
+/// model with no schema-capable provider then fails the request loudly (an HTTP
+/// error naming the model), which is the intended behavior. A no-op when the run
+/// carries no output schema, leaving schema-less sessions bit-for-bit unchanged.
+fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
+    let Some(schema) = schema else {
+        return;
+    };
+    body["response_format"] = json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "cairn_output",
+            "strict": true,
+            "schema": schema,
+        }
+    });
+    match body.get_mut("provider").and_then(Value::as_object_mut) {
+        Some(obj) => {
+            obj.insert("require_parameters".to_string(), json!(true));
+        }
+        None => {
+            body["provider"] = json!({ "require_parameters": true });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -237,4 +269,46 @@ fn openrouter_headers(api_key: &str) -> Result<HeaderMap, String> {
     );
     headers.insert("X-OpenRouter-Title", HeaderValue::from_static("Cairn"));
     Ok(headers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_output_schema;
+    use serde_json::json;
+
+    #[test]
+    fn no_schema_leaves_body_unconstrained() {
+        let mut body = json!({ "model": "m", "provider": { "sort": "throughput" } });
+        apply_output_schema(&mut body, None);
+        assert!(body.get("response_format").is_none());
+        // The existing provider object is untouched.
+        assert!(body["provider"].get("require_parameters").is_none());
+    }
+
+    #[test]
+    fn schema_sets_response_format_and_require_parameters() {
+        let schema = json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string"}}
+        });
+        let mut body = json!({ "model": "m", "provider": { "sort": "throughput" } });
+        apply_output_schema(&mut body, Some(&schema));
+
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+        // require_parameters is merged into the existing provider object, not
+        // clobbering its routing prefs.
+        assert_eq!(body["provider"]["require_parameters"], true);
+        assert_eq!(body["provider"]["sort"], "throughput");
+    }
+
+    #[test]
+    fn schema_creates_provider_object_when_absent() {
+        let schema = json!({ "type": "object" });
+        let mut body = json!({ "model": "m" });
+        apply_output_schema(&mut body, Some(&schema));
+        assert_eq!(body["provider"]["require_parameters"], true);
+    }
 }

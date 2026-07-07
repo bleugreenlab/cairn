@@ -63,6 +63,12 @@ pub async fn handle_read_batch(
             if is_browser_resource_target(&segment.meta.uri) {
                 continue;
             }
+            // A `?wait` long-poll is an intentional repeated read of the same
+            // call URI until it resolves; consecutive pending results are
+            // identical by design, so it must bypass flail dedup.
+            if is_wait_poll_target(&segment.meta.uri) {
+                continue;
+            }
             let fingerprint = format!("read_batch_target\u{1}{}", segment.meta.uri);
             let hash = crate::dispatch::hash_content(&segment.body);
             if let crate::agent_process::process::DedupOutcome::Duplicate {
@@ -186,6 +192,22 @@ fn is_browser_resource_target(target: &str) -> bool {
         Some(CairnResource::NodeBrowser { .. })
             | Some(CairnResource::TaskBrowser { .. })
             | Some(CairnResource::ProjectBrowser { .. })
+    )
+}
+
+/// A `?wait` long-poll on a call/task-artifact URI (the harness `agent()`
+/// await). Repeated reads of the same URI are intentional polling, not flailing,
+/// so this target bypasses the batch dedup.
+fn is_wait_poll_target(target: &str) -> bool {
+    let Ok(split) = split_target_query(target) else {
+        return false;
+    };
+    if !split.params.iter().any(|p| p.key == "wait") {
+        return false;
+    }
+    matches!(
+        parse_uri(&split.identity),
+        Some(CairnResource::TaskArtifact { .. })
     )
 }
 

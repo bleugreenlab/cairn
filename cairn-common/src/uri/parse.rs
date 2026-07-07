@@ -130,6 +130,19 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             project: canonical_project(project),
             recipe_id: (*recipe_id).to_string(),
         }),
+        ["workflows"] => Some(CairnResource::Workflows),
+        ["workflows", workflow_id] => Some(CairnResource::Workflow {
+            workflow_id: (*workflow_id).to_string(),
+        }),
+        [PROJECT_SCOPE, project, "workflows"] => Some(CairnResource::ProjectWorkflows {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "workflows", workflow_id] => {
+            Some(CairnResource::ProjectWorkflow {
+                project: canonical_project(project),
+                workflow_id: (*workflow_id).to_string(),
+            })
+        }
         ["agents"] => Some(CairnResource::Agents),
         ["agents", agent_id] => Some(CairnResource::Agent {
             agent_id: (*agent_id).to_string(),
@@ -323,6 +336,14 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 node_id: (*node_id).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "calls"] => {
+            Some(CairnResource::NodeCalls {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "wakes"] => {
             Some(CairnResource::NodeWakes {
                 project: canonical_project(project),
@@ -375,6 +396,14 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "messages"] => {
             Some(CairnResource::NodeMessages {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "progress"] => {
+            Some(CairnResource::NodeProgress {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,

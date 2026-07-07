@@ -445,6 +445,17 @@ pub struct AgentProcessState {
     pub processes: Mutex<RunRegistry>,
     /// Cached path to default CLI binary (resolved once on first use)
     pub cli_binary_path: Mutex<Option<String>>,
+    /// Run ids of workflow processes the user deliberately stopped (CAIRN-2516).
+    /// A workflow process has no stdin, so a Stop hard-kills it; without this
+    /// marker the supervisor would read the signal-killed exit as a crash and
+    /// finalize the run `crashed` — which startup re-dispatch then resurrects.
+    /// The stop path sets the marker before killing; the supervisor reads it on
+    /// finalize to map the outcome to a terminal, non-crashed (cancelled) state
+    /// that is not auto-re-dispatched. It lives on the state (not the per-run
+    /// handle) so it survives the handle's removal during the kill. In-memory is
+    /// sufficient: a host restart before the process dies is itself a crash,
+    /// which is correctly re-dispatched.
+    pub workflow_stop_requested: Mutex<std::collections::HashSet<String>>,
 }
 
 impl AgentProcessState {
@@ -555,6 +566,25 @@ impl AgentProcessState {
                     .get(run_id)
                     .map(|process| process.terminal_tool_called.load(Ordering::Acquire))
             })
+            .unwrap_or(false)
+    }
+
+    /// Record that a workflow run was deliberately stopped by the user, so the
+    /// supervisor's finalize maps its killed process to a terminal, non-crashed
+    /// outcome instead of a crash. Set BEFORE killing the process (CAIRN-2516).
+    pub fn mark_workflow_stop_requested(&self, run_id: &str) {
+        if let Ok(mut set) = self.workflow_stop_requested.lock() {
+            set.insert(run_id.to_string());
+        }
+    }
+
+    /// Check-and-clear the deliberate-stop marker for a run. One-shot: the
+    /// supervisor calls this exactly once on finalize, so a later crash-driven
+    /// finalize of a re-dispatched run never sees a stale marker.
+    pub fn take_workflow_stop_requested(&self, run_id: &str) -> bool {
+        self.workflow_stop_requested
+            .lock()
+            .map(|mut set| set.remove(run_id))
             .unwrap_or(false)
     }
 
@@ -941,6 +971,7 @@ impl Default for AgentProcessState {
         Self {
             processes: Mutex::new(RunRegistry::default()),
             cli_binary_path: Mutex::new(None),
+            workflow_stop_requested: Mutex::new(std::collections::HashSet::new()),
         }
     }
 }

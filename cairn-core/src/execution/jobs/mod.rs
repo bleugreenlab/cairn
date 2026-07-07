@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod calls;
 mod child_tasks;
 mod config_loading;
 mod inputs;
@@ -50,8 +51,13 @@ mod slash_commands;
 mod snapshots;
 mod status;
 mod turns;
+mod workflow;
 mod worktrees;
 
+pub(crate) use calls::{prepare_call_run, start_call_run};
+// The per-call Restart action reaches this via
+// `cairn_core::internal::execution::jobs::restart_call`.
+pub use calls::restart_call;
 pub use child_tasks::create_child_task;
 pub(crate) use inputs::{
     find_downstream_artifact_schema_conn, find_downstream_artifact_schema_with_snapshot_conn,
@@ -63,6 +69,13 @@ pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;
 pub use lifecycle::{continue_job_impl, on_job_complete_impl, prepare_job, ResumeContext};
 pub use slash_commands::resolve_skill_slash_command;
 pub use snapshots::store_tool_result_event_with_turn;
+pub(crate) use workflow::{
+    delete_workflow_run_row, prepare_workflow_run, redispatch_crashed_workflows,
+    start_workflow_run, CreateWorkflowRunInput,
+};
+// The header Restart action reaches this from the host crates via
+// `cairn_core::internal::execution::jobs::restart_workflow`.
+pub use workflow::restart_workflow;
 // The canonical, routing-aware turn-start. Host job-start paths call this
 // instead of hand-rolling the turns UPDATE against the private DB (CAIRN-2206).
 pub use turns::start_turn;
@@ -104,6 +117,56 @@ pub struct CreateChildTaskInput {
 pub struct CreateChildTaskResult {
     pub job_id: String,
     pub run_id: String,
+}
+
+/// Worktree binding for an ephemeral call (CAIRN-2481).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallWorktree {
+    /// Run in the caller's inherited worktree; mutating calls are first-class.
+    #[default]
+    Inherit,
+    /// Run in a fresh scratch dir with no project-tree binding (a pure
+    /// prompt->JSON worker, e.g. web-research calls).
+    None,
+}
+
+/// Input for creating an ephemeral agent-call run.
+pub struct CreateCallRunInput {
+    pub parent_job_id: String,
+    /// The parent's task-execution id (the snapshot that carries the call
+    /// packet); falls back to the parent job's execution_id when absent.
+    pub execution_id: Option<String>,
+    pub subagent_type: String,
+    pub description: String,
+    pub prompt: String,
+    pub tier: Option<String>,
+    pub backend_preference: Option<String>,
+    pub output_contract: crate::models::DelegatedOutputContract,
+    pub worktree: CallWorktree,
+    pub label: Option<String>,
+    pub phase: Option<String>,
+    pub parent_tool_use_id: Option<String>,
+    pub task_index: Option<i32>,
+    /// When set (a workflow-parented call that missed the journal), the call's
+    /// run is linked to this journal key so its result is journaled on
+    /// completion (CAIRN-2498). `None` for an ordinary call.
+    pub workflow_journal_link: Option<crate::workflow_journal::CallLink>,
+}
+
+/// A prepared ephemeral call run: all DB rows and the transcript seed exist, but
+/// the backend session has not started yet (the caller persists the call packet
+/// first, then calls [`start_call_run`]).
+pub struct PreparedCallRun {
+    pub job_id: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub agent_config: AgentConfig,
+    pub selected_model: Option<Model>,
+    pub working_dir: String,
+    pub prompt: String,
+    pub output_schema: OutputSchemaInfo,
+    pub execution_id: Option<String>,
+    pub worktree_path: Option<String>,
 }
 
 /// Everything needed by the host layer to spawn a Claude process for a job.

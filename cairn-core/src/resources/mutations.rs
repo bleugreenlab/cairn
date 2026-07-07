@@ -139,6 +139,20 @@ pub(super) async fn scope_project_path(
     }
 }
 
+/// Resolve a home-relative (`cairn:~/...`) change target to its canonical URI.
+/// The dispatch path resolves this itself, but blocking-append classification
+/// runs on the raw target BEFORE dispatch, so the write handler resolves up
+/// front to classify uniformly. A canonical or `file:` target is returned
+/// unchanged. SDK writers send `cairn:~/` raw; `cairn-cmd` resolves it
+/// client-side, so agents already send canonical targets.
+pub(crate) async fn resolve_change_target_uri(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    target: &str,
+) -> Result<String, String> {
+    super::common::resolve_home_relative_resource_uri(&orch.db, request, target).await
+}
+
 pub(super) async fn target_resource_for_request(
     orch: &Orchestrator,
     request: &McpCallbackRequest,

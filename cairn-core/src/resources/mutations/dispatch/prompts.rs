@@ -34,6 +34,26 @@ pub(super) async fn dispatch(
                 ));
             }
         }
+        (CairnResource::NodeCalls { .. }, ChangeMode::Append) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| build_failure(index, item, "call append requires payload"))?;
+            let prompt = payload_non_empty_str(payload, "prompt", &[])
+                .ok_or_else(|| build_failure(index, item, "payload.prompt is required"))?;
+            if dry_run {
+                let head: String = prompt.chars().take(48).collect();
+                format!("Would spawn call: {head}")
+            } else {
+                // Apply routes call appends through the blocking group before reaching
+                // dispatch; arriving here means the caller bypassed that path.
+                return Err(build_failure(
+                    index,
+                    item,
+                    "internal: call append must run through the blocking group, not dispatch",
+                ));
+            }
+        }
         (
             CairnResource::NodeQuestion {
                 project,

@@ -295,6 +295,7 @@ fn cairn_kind(path: &str) -> String {
         "terminal",
         "skills",
         "recipes",
+        "workflows",
         "executions",
         "create-pr",
         "plan",

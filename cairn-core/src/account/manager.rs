@@ -12,7 +12,7 @@ use crate::db::DbState;
 use crate::services::EventEmitter;
 use crate::storage::{DbError, RowExt};
 
-use super::connection::{AccountConnection, DbAccount, OrgMembership};
+use super::connection::{canonical_plan, AccountConnection, DbAccount, OrgMembership};
 
 const CHECK_INTERVAL_SECS: u64 = 30 * 60; // 30 minutes
                                           // Must exceed CHECK_INTERVAL_SECS: with a 1-hour token, the T+30 tick then sees
@@ -77,12 +77,18 @@ impl AccountManager {
         let encrypted_jwt = encrypt_jwt_for_storage(jwt)?;
         let now = chrono::Utc::now().timestamp() as i32;
 
+        // Canonicalize the deep-link plan at the write boundary so a malformed or
+        // legacy callback (or a direct invocation with a retired literal) never
+        // persists `pro`/`remote` into SQLite or returns it in the connection
+        // result/event. Mirrors the read-boundary guard in AccountConnection::from.
+        let plan = canonical_plan(plan);
+
         let db_account = DbAccount {
             user_id: claims.sub.clone(),
             email: user_email.to_string(),
             name: user_name.to_string(),
             device_id: device_id.to_string(),
-            plan: plan.to_string(),
+            plan: plan.clone(),
             jwt_encrypted: Some(encrypted_jwt),
             jwt_expires_at: Some(claims.exp as i32),
             org_memberships: org_memberships
@@ -99,7 +105,7 @@ impl AccountManager {
             email: user_email.to_string(),
             name: user_name.to_string(),
             device_id: device_id.to_string(),
-            plan: plan.to_string(),
+            plan,
             org_memberships: org_memberships.unwrap_or_default(),
             connected_at: now as i64,
         };

@@ -385,10 +385,26 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     // After validation passes this deserialize is an invariant, not the
     // user-facing gate; the `Invalid payload` branch is a defensive
     // internal-error path.
-    let payload: ChangePayload = match crate::mcp::handlers::parse_payload(request) {
+    let mut payload: ChangePayload = match crate::mcp::handlers::parse_payload(request) {
         Ok(payload) => payload,
         Err(error) => return error,
     };
+
+    // Resolve home-relative (`cairn:~/...`) targets to canonical up front, so
+    // blocking-append classification — which runs on the raw target before the
+    // dispatch that would otherwise resolve it — sees the real resource. SDK
+    // writers (the workflow harness) send `cairn:~/` raw; `cairn-cmd` resolves it
+    // client-side, so canonical targets pass through unchanged.
+    for item in payload.changes.iter_mut() {
+        if item.target.starts_with("cairn:~") {
+            if let Ok(resolved) =
+                crate::resources::mutations::resolve_change_target_uri(orch, request, &item.target)
+                    .await
+            {
+                item.target = resolved;
+            }
+        }
+    }
 
     if let Some(result) = handle_apply_change(orch, request, &payload).await {
         return result;

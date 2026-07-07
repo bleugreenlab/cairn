@@ -99,12 +99,3 @@ pub async fn get_jwt_data(db: &LocalDb) -> Result<Option<(String, Option<i64>)>,
     .await
     .map_err(|e| format!("Failed to get account JWT data: {e}"))
 }
-
-/// Update the account plan.
-pub async fn update_plan(db: &LocalDb, plan: &str) -> Result<(), String> {
-    let plan = plan.to_string();
-    db.execute("UPDATE account SET plan = ?1", (plan.as_str(),))
-        .await
-        .map(|_| ())
-        .map_err(|e| format!("Failed to update account plan: {e}"))
-}

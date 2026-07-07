@@ -423,6 +423,13 @@ const DIGEST_ASSISTANT_PREVIEW: usize = 2000;
 const ERROR_LINE_PREVIEW: usize = 200;
 const ROW_LABEL_PREVIEW: usize = 120;
 
+// Inline write-diff body (opt-in `diffs=true`): the per-write body cap with an
+// explicit truncation marker, and the create/replace/append content preview
+// window before a `[+K more lines]` marker so a large new file can't flood the
+// digest.
+const WRITE_BODY_MAX_LINES: usize = 40;
+const WRITE_CONTENT_PREVIEW_LINES: usize = 20;
+
 fn json_value_to_display(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.to_string(),
@@ -636,13 +643,18 @@ struct ResultInfo {
     is_error: bool,
 }
 
-/// One rendered digest row: `<bullet> <text> [metric] — <detail> <trailer>`.
+/// One rendered digest row: `<bullet> <text> [metric] — <detail> <trailer>`,
+/// optionally followed by an indented multi-line `body` block (opt-in inline
+/// write diffs).
 struct DigestRow {
     error: bool,
     text: String,
     metric: Option<String>,
     detail: Option<String>,
     trailer: Option<String>,
+    /// Multi-line change body rendered beneath the row line under `diffs=true`.
+    /// Indented into a markdown code block so its `+`/`-` markers render safely.
+    body: Option<String>,
 }
 
 impl DigestRow {
@@ -660,6 +672,13 @@ impl DigestRow {
         if let Some(trailer) = self.trailer.as_deref().filter(|t| !t.is_empty()) {
             line.push(' ');
             line.push_str(trailer);
+        }
+        if let Some(body) = self.body.as_deref().filter(|b| !b.is_empty()) {
+            for body_line in body.lines() {
+                line.push('\n');
+                line.push_str("    ");
+                line.push_str(body_line);
+            }
         }
         line
     }
@@ -844,11 +863,12 @@ fn rows_for_tool_call(
     name: &str,
     input: &serde_json::Value,
     result: Option<&ResultInfo>,
+    inline_diffs: bool,
 ) -> Vec<DigestRow> {
     let cleaned = cleaned_tool_name(name);
     let mut rows = match cleaned.to_ascii_lowercase().as_str() {
         "read" => read_rows(input, result),
-        "write" | "change" | "filechange" => write_rows(input, result),
+        "write" | "change" | "filechange" => write_rows(input, result, inline_diffs),
         "run" | "bash" => run_rows(input, result),
         "task" => task_rows(input, result),
         "message" => message_rows(name, input, result),
@@ -897,6 +917,7 @@ fn read_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dige
                     None
                 },
                 trailer: None,
+                body: None,
             });
         }
         if !rows.is_empty() {
@@ -917,10 +938,15 @@ fn read_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dige
         metric,
         detail: error_detail,
         trailer: None,
+        body: None,
     }]
 }
 
-fn write_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<DigestRow> {
+fn write_rows(
+    input: &serde_json::Value,
+    result: Option<&ResultInfo>,
+    inline_diffs: bool,
+) -> Vec<DigestRow> {
     let is_error = result.map(|r| r.is_error).unwrap_or(false);
     let report = result.and_then(|r| serde_json::from_str::<serde_json::Value>(&r.text).ok());
 
@@ -991,6 +1017,7 @@ fn write_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dig
                 .filter(|r| r.is_error)
                 .map(|r| first_result_line(&r.text)),
             trailer: commit_trailer,
+            body: None,
         }];
     };
 
@@ -1014,6 +1041,7 @@ fn write_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dig
                 metric: None,
                 detail: Some(single_line_preview(error, ERROR_LINE_PREVIEW)),
                 trailer: None,
+                body: None,
             });
             continue;
         }
@@ -1032,12 +1060,21 @@ fn write_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dig
         } else {
             first_nonempty_line(&summary).map(|line| single_line_preview(&line, ERROR_LINE_PREVIEW))
         };
+        // Under `diffs=true` a file write also renders its change body beneath
+        // the row so a reseed reader can reconstruct the edit; resource writes
+        // keep their summary-only rendering.
+        let body = if is_file && inline_diffs {
+            write_body_for_change(mode, change.get("payload"))
+        } else {
+            None
+        };
         rows.push(DigestRow {
             error: false,
             text: format!("write {}", short),
             metric,
             detail,
             trailer: None,
+            body,
         });
     }
 
@@ -1051,6 +1088,7 @@ fn write_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dig
                 metric: None,
                 detail: None,
                 trailer: Some(trailer),
+                body: None,
             });
         }
     }
@@ -1062,6 +1100,7 @@ fn write_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dig
             metric: None,
             detail: None,
             trailer: None,
+            body: None,
         });
     }
 
@@ -1092,6 +1131,85 @@ fn diffstat_for_change(mode: &str, payload: Option<&serde_json::Value>) -> Optio
         }
     }
     None
+}
+
+/// Build the inline change body for a file-target write row under `diffs=true`:
+/// a capped, reconstructable rendering of the edit. `diff`/`patch` payloads
+/// render as-is; `old_string`/`new_string` render as a `-`/`+` block;
+/// create/replace/append `content` renders as a `+`-prefixed preview. Returns
+/// `None` for a payload shape with nothing to render.
+fn write_body_for_change(mode: &str, payload: Option<&serde_json::Value>) -> Option<String> {
+    let payload = payload?;
+    if let Some(diff) = payload.get("diff").and_then(|value| value.as_str()) {
+        return Some(cap_body_lines(
+            diff.trim_end_matches('\n'),
+            WRITE_BODY_MAX_LINES,
+        ));
+    }
+    if let Some(patch) = payload.get("patch").and_then(|value| value.as_str()) {
+        return Some(cap_body_lines(
+            patch.trim_end_matches('\n'),
+            WRITE_BODY_MAX_LINES,
+        ));
+    }
+    if let (Some(old), Some(new)) = (
+        payload.get("old_string").and_then(|value| value.as_str()),
+        payload.get("new_string").and_then(|value| value.as_str()),
+    ) {
+        let mut block = String::new();
+        for line in old.lines() {
+            block.push_str("- ");
+            block.push_str(line);
+            block.push('\n');
+        }
+        for line in new.lines() {
+            block.push_str("+ ");
+            block.push_str(line);
+            block.push('\n');
+        }
+        return Some(cap_body_lines(
+            block.trim_end_matches('\n'),
+            WRITE_BODY_MAX_LINES,
+        ));
+    }
+    if matches!(mode, "create" | "replace" | "append") {
+        if let Some(content) = payload.get("content").and_then(|value| value.as_str()) {
+            return Some(preview_added_content(content));
+        }
+    }
+    None
+}
+
+/// Preview added content (create/replace/append) as the first
+/// `WRITE_CONTENT_PREVIEW_LINES` lines prefixed `+`, then a `[+K more lines]`
+/// marker so a large new file can't flood the digest.
+fn preview_added_content(content: &str) -> String {
+    let total = content.lines().count();
+    let mut out = String::new();
+    for line in content.lines().take(WRITE_CONTENT_PREVIEW_LINES) {
+        out.push_str("+ ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    let remaining = total.saturating_sub(total.min(WRITE_CONTENT_PREVIEW_LINES));
+    if remaining > 0 {
+        out.push_str(&format!("[+{} more lines]", remaining));
+    }
+    out.trim_end_matches('\n').to_string()
+}
+
+/// Cap a rendered body to `max` lines, appending an explicit `[+K more lines]`
+/// truncation marker when it overflows.
+fn cap_body_lines(body: &str, max: usize) -> String {
+    let total = body.lines().count();
+    if total <= max {
+        return body.to_string();
+    }
+    let mut out = body.lines().take(max).collect::<Vec<_>>().join("\n");
+    let remaining = total.saturating_sub(max);
+    out.push('\n');
+    out.push_str(&format!("[+{} more lines]", remaining));
+    out
 }
 
 fn command_label(value: &serde_json::Value) -> String {
@@ -1142,6 +1260,7 @@ fn run_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Diges
                     None
                 },
                 trailer: None,
+                body: None,
             });
         }
         if !rows.is_empty() {
@@ -1159,6 +1278,7 @@ fn run_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Diges
         metric,
         detail: error_detail,
         trailer: None,
+        body: None,
     }]
 }
 
@@ -1180,6 +1300,7 @@ fn task_rows(input: &serde_json::Value, result: Option<&ResultInfo>) -> Vec<Dige
             .filter(|r| r.is_error)
             .map(|r| first_result_line(&r.text)),
         trailer: None,
+        body: None,
     }]
 }
 
@@ -1202,6 +1323,7 @@ fn message_rows(
             .filter(|r| r.is_error)
             .map(|r| first_result_line(&r.text)),
         trailer: None,
+        body: None,
     }]
 }
 
@@ -1229,9 +1351,27 @@ fn generic_rows(
             .filter(|r| r.is_error)
             .map(|r| first_result_line(&r.text)),
         trailer: None,
+        body: None,
     }]
 }
 
+/// Rendering options for the node/task transcript digest. `latest`,
+/// `turn_offset`, and `turn_limit` are the always-available paging controls;
+/// `unabridged` and `inline_diffs` are the opt-in reseed-fidelity knobs
+/// (`messages=full` / `diffs=true`) whose defaults keep the output
+/// byte-identical to the lean digest.
+pub(super) struct DigestOptions {
+    pub latest: bool,
+    pub turn_offset: Option<i64>,
+    pub turn_limit: Option<usize>,
+    pub unabridged: bool,
+    pub inline_diffs: bool,
+}
+
+/// Default-options entry retained only for the `digest_*` unit tests, which
+/// assert the no-fidelity-flags output is byte-identical. Production reads call
+/// [`format_transcript_digest_with`] directly with parsed options.
+#[cfg(test)]
 pub(super) fn format_transcript_digest(
     events: &[EventRow],
     base_uri: &str,
@@ -1240,6 +1380,28 @@ pub(super) fn format_transcript_digest(
     latest: bool,
     turn_offset: Option<i64>,
     turn_limit: Option<usize>,
+) -> String {
+    format_transcript_digest_with(
+        events,
+        base_uri,
+        meta,
+        turn_sequences,
+        &DigestOptions {
+            latest,
+            turn_offset,
+            turn_limit,
+            unabridged: false,
+            inline_diffs: false,
+        },
+    )
+}
+
+pub(super) fn format_transcript_digest_with(
+    events: &[EventRow],
+    base_uri: &str,
+    meta: &DigestMeta,
+    turn_sequences: &HashMap<String, i32>,
+    opts: &DigestOptions,
 ) -> String {
     if events.is_empty() {
         return "No runs found for this node.".to_string();
@@ -1297,14 +1459,15 @@ pub(super) fn format_transcript_digest(
     ));
 
     let mut order: Vec<usize> = (0..blocks.len()).collect();
-    if latest {
+    if opts.latest {
         order.reverse();
     }
-    let start = match turn_offset.unwrap_or(0) {
+    let start = match opts.turn_offset.unwrap_or(0) {
         raw if raw < 0 => blocks.len().saturating_sub(raw.unsigned_abs() as usize),
         raw => (raw as usize).min(blocks.len()),
     };
-    let end = turn_limit
+    let end = opts
+        .turn_limit
         .map(|limit| (start + limit).min(order.len()))
         .unwrap_or(order.len());
     let order = &order[start..end];
@@ -1322,7 +1485,7 @@ pub(super) fn format_transcript_digest(
         .unwrap_or_default();
         out.push_str(&format!("\n## Turn {} · {}\n", turn_label, time));
         let turn_ref = linkable.then_some(turn_label.as_str());
-        render_block(&mut out, &block.events, &results, base_uri, turn_ref);
+        render_block(&mut out, &block.events, &results, base_uri, turn_ref, opts);
     }
 
     out
@@ -1334,6 +1497,7 @@ fn render_block(
     results: &HashMap<String, ResultInfo>,
     base_uri: &str,
     turn_ref: Option<&str>,
+    opts: &DigestOptions,
 ) {
     let mut seen_user = false;
     for event in events {
@@ -1359,15 +1523,19 @@ fn render_block(
                     ));
                 } else {
                     seen_user = true;
-                    push_truncated(
-                        out,
-                        "**User:** ",
-                        content,
-                        USER_CONTENT_THRESHOLD,
-                        USER_CONTENT_PREVIEW,
-                        base_uri,
-                        turn_ref,
-                    );
+                    if opts.unabridged {
+                        push_verbatim(out, "**User:** ", content);
+                    } else {
+                        push_truncated(
+                            out,
+                            "**User:** ",
+                            content,
+                            USER_CONTENT_THRESHOLD,
+                            USER_CONTENT_PREVIEW,
+                            base_uri,
+                            turn_ref,
+                        );
+                    }
                 }
             }
             "assistant" => {
@@ -1376,15 +1544,19 @@ fn render_block(
                     .and_then(|value| value.as_str())
                     .filter(|value| !value.is_empty())
                 {
-                    push_truncated(
-                        out,
-                        "**Assistant:** ",
-                        content,
-                        DIGEST_ASSISTANT_THRESHOLD,
-                        DIGEST_ASSISTANT_PREVIEW,
-                        base_uri,
-                        turn_ref,
-                    );
+                    if opts.unabridged {
+                        push_verbatim(out, "**Assistant:** ", content);
+                    } else {
+                        push_truncated(
+                            out,
+                            "**Assistant:** ",
+                            content,
+                            DIGEST_ASSISTANT_THRESHOLD,
+                            DIGEST_ASSISTANT_PREVIEW,
+                            base_uri,
+                            turn_ref,
+                        );
+                    }
                 }
                 if let Some(tool_uses) = data.get("toolUses").and_then(|value| value.as_array()) {
                     for tool in tool_uses {
@@ -1398,16 +1570,32 @@ fn render_block(
                             .get("input")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
-                        for row in rows_for_tool_call(name, &input, result) {
+                        for row in rows_for_tool_call(name, &input, result, opts.inline_diffs) {
                             out.push_str(&row.render());
                             out.push('\n');
                         }
                     }
                 }
             }
+            "user:seed" => {
+                // A cold-resume seed marker (CAIRN-2534): collapse to one line
+                // regardless of `opts.unabridged`, so `messages=full` never
+                // re-expands the embedded prior digest and a chain of hourly
+                // reseeds stays bounded.
+                out.push_str("· [reseeded from prior session digest]\n");
+            }
             _ => {}
         }
     }
+}
+
+/// Render a message verbatim (opt-in `messages=full`): on reseed, misremembering
+/// the user's instructions or losing the assistant's reasoning trail is the worst
+/// failure mode, so the truncation window is bypassed entirely.
+fn push_verbatim(out: &mut String, prefix: &str, content: &str) {
+    out.push_str(prefix);
+    out.push_str(content.trim_end());
+    out.push('\n');
 }
 
 fn push_truncated(
@@ -1835,6 +2023,64 @@ mod tests {
     }
 
     #[test]
+    fn digest_collapses_seed_and_keeps_trigger_verbatim_in_both_modes() {
+        // A `user:seed` event (carrying a large embedded prior digest) followed
+        // by the trigger's own `user` event. In BOTH default and unabridged
+        // modes the seed must collapse to exactly one marker line — its embedded
+        // body never resurfacing — while the trigger user message renders
+        // verbatim (CAIRN-2534).
+        let embedded = "EMBEDDED_PRIOR_DIGEST_BODY_THAT_MUST_NOT_APPEAR";
+        let seed_body = format!("Reseed header\n\n# builder — prior\n{embedded}");
+        let events = vec![
+            digest_ev(
+                0,
+                "t1",
+                "user:seed",
+                serde_json::json!({ "content": seed_body }),
+            ),
+            digest_ev(
+                1,
+                "t1",
+                "user",
+                serde_json::json!({ "content": "please continue the plan" }),
+            ),
+        ];
+        let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
+        for unabridged in [false, true] {
+            let out = format_transcript_digest_with(
+                &events,
+                "cairn://p/CAIRN/1666/1/builder/chat",
+                &digest_meta(),
+                &turns,
+                &DigestOptions {
+                    latest: false,
+                    turn_offset: None,
+                    turn_limit: None,
+                    unabridged,
+                    inline_diffs: false,
+                },
+            );
+            assert!(
+                out.contains("[reseeded from prior session digest]"),
+                "seed marker missing (unabridged={unabridged}): {out}"
+            );
+            assert!(
+                !out.contains(embedded),
+                "embedded prior digest leaked (unabridged={unabridged}): {out}"
+            );
+            assert!(
+                out.contains("**User:** please continue the plan"),
+                "trigger not verbatim (unabridged={unabridged}): {out}"
+            );
+            assert_eq!(
+                out.matches("[reseeded from prior session digest]").count(),
+                1,
+                "seed should collapse to exactly one line (unabridged={unabridged}): {out}"
+            );
+        }
+    }
+
+    #[test]
     fn digest_latest_reverses_turn_order() {
         let events = vec![
             digest_ev(0, "t1", "user", serde_json::json!({ "content": "first" })),
@@ -1893,5 +2139,238 @@ mod tests {
         let out =
             format_transcript_digest(&events, "base", &digest_meta(), &turns, false, None, None);
         assert!(out.contains("· read src/x.rs [pending]"));
+    }
+
+    fn digest_opts(latest: bool, unabridged: bool, inline_diffs: bool) -> DigestOptions {
+        DigestOptions {
+            latest,
+            turn_offset: None,
+            turn_limit: None,
+            unabridged,
+            inline_diffs,
+        }
+    }
+
+    #[test]
+    fn digest_messages_full_renders_user_message_unabridged() {
+        let big = (1..=300)
+            .map(|i| format!("user instruction line {i} that must survive a reseed"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let events = vec![digest_ev(
+            0,
+            "t1",
+            "user",
+            serde_json::json!({ "content": big }),
+        )];
+        let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
+        let base = "cairn://p/CAIRN/1666/1/builder/chat";
+
+        // Default: truncated with a turn-link trailer; the tail is dropped.
+        let truncated = format_transcript_digest_with(
+            &events,
+            base,
+            &digest_meta(),
+            &turns,
+            &digest_opts(false, false, false),
+        );
+        assert!(truncated.contains("→ cairn://p/CAIRN/1666/1/builder/chat/turn/1]"));
+        assert!(!truncated.contains("user instruction line 300"));
+
+        // messages=full: the whole message renders, no truncation trailer.
+        let full = format_transcript_digest_with(
+            &events,
+            base,
+            &digest_meta(),
+            &turns,
+            &digest_opts(false, true, false),
+        );
+        assert!(full.contains("user instruction line 1 that must survive a reseed"));
+        assert!(full.contains("user instruction line 300 that must survive a reseed"));
+        assert!(!full.contains("→ cairn://p/CAIRN/1666/1/builder/chat/turn/1]"));
+    }
+
+    #[test]
+    fn digest_messages_full_renders_assistant_message_unabridged() {
+        let big = (1..=400)
+            .map(|i| format!("assistant reasoning step {i} preserved across the reseed"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let events = vec![digest_ev(
+            0,
+            "t1",
+            "assistant",
+            serde_json::json!({ "content": big }),
+        )];
+        let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
+
+        let truncated = format_transcript_digest_with(
+            &events,
+            "base",
+            &digest_meta(),
+            &turns,
+            &digest_opts(false, false, false),
+        );
+        assert!(!truncated.contains("assistant reasoning step 400"));
+
+        let full = format_transcript_digest_with(
+            &events,
+            "base",
+            &digest_meta(),
+            &turns,
+            &digest_opts(false, true, false),
+        );
+        assert!(full.contains("assistant reasoning step 400 preserved across the reseed"));
+    }
+
+    #[test]
+    fn digest_diffs_inlines_file_write_bodies() {
+        let events = vec![
+            digest_ev(
+                0,
+                "t1",
+                "assistant",
+                serde_json::json!({
+                    "toolUses": [{
+                        "id": "w1", "name": "mcp__cairn__write",
+                        "input": { "changes": [
+                            { "target": "file:a.rs", "mode": "patch", "payload": { "diff": "@@\n+alpha\n-beta" } },
+                            { "target": "file:b.rs", "mode": "patch", "payload": { "old_string": "old one\nold two", "new_string": "new one" } },
+                            { "target": "file:c.rs", "mode": "create", "payload": { "content": "l1\nl2\nl3" } },
+                            { "target": "cairn:~/todos", "mode": "replace", "payload": {} }
+                        ]}
+                    }]
+                }),
+            ),
+            digest_ev(
+                1,
+                "t1",
+                "tool_result",
+                serde_json::json!({
+                    "toolUseId": "w1",
+                    "toolResult": serde_json::json!({
+                        "applied": [
+                            { "index": 0, "target": "file:a.rs", "mode": "patch", "kind": "file", "summary": "~a.rs" },
+                            { "index": 1, "target": "file:b.rs", "mode": "patch", "kind": "file", "summary": "~b.rs" },
+                            { "index": 2, "target": "file:c.rs", "mode": "create", "kind": "file", "summary": "+c.rs" },
+                            { "index": 3, "target": "cairn:~/todos", "mode": "replace", "kind": "resource", "summary": "Replaced 2 todos" }
+                        ]
+                    }).to_string()
+                }),
+            ),
+        ];
+        let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
+
+        // Default: diffstat only, no inlined bodies.
+        let plain = format_transcript_digest_with(
+            &events,
+            "base",
+            &digest_meta(),
+            &turns,
+            &digest_opts(false, false, false),
+        );
+        assert!(plain.contains("· write a.rs (+1 −1)"));
+        assert!(!plain.contains("    +alpha"));
+
+        // diffs=true: each file write renders its indented body; resource write
+        // keeps summary-only rendering.
+        let full = format_transcript_digest_with(
+            &events,
+            "base",
+            &digest_meta(),
+            &turns,
+            &digest_opts(false, false, true),
+        );
+        assert!(full.contains("    +alpha"));
+        assert!(full.contains("    -beta"));
+        assert!(full.contains("    - old one"));
+        assert!(full.contains("    - old two"));
+        assert!(full.contains("    + new one"));
+        assert!(full.contains("    + l1"));
+        assert!(full.contains("· write todos — Replaced 2 todos"));
+    }
+
+    #[test]
+    fn digest_diffs_caps_large_create_content() {
+        let content = (1..=360)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let events = vec![
+            digest_ev(
+                0,
+                "t1",
+                "assistant",
+                serde_json::json!({
+                    "toolUses": [{
+                        "id": "w1", "name": "mcp__cairn__write",
+                        "input": { "changes": [
+                            { "target": "file:big.rs", "mode": "create", "payload": { "content": content } }
+                        ]}
+                    }]
+                }),
+            ),
+            digest_ev(
+                1,
+                "t1",
+                "tool_result",
+                serde_json::json!({
+                    "toolUseId": "w1",
+                    "toolResult": serde_json::json!({
+                        "applied": [
+                            { "index": 0, "target": "file:big.rs", "mode": "create", "kind": "file", "summary": "+big.rs" }
+                        ]
+                    }).to_string()
+                }),
+            ),
+        ];
+        let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
+        let full = format_transcript_digest_with(
+            &events,
+            "base",
+            &digest_meta(),
+            &turns,
+            &digest_opts(false, false, true),
+        );
+        assert!(full.contains("    + line 1"));
+        assert!(full.contains("    + line 20"));
+        assert!(!full.contains("    + line 21"));
+        // 360 total − 20 previewed = 340 remaining.
+        assert!(full.contains("[+340 more lines]"));
+    }
+
+    #[test]
+    fn digest_fidelity_params_compose_with_latest_and_paging() {
+        let big1 = (1..=300)
+            .map(|i| format!("turn one line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let big2 = (1..=300)
+            .map(|i| format!("turn two line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let events = vec![
+            digest_ev(0, "t1", "user", serde_json::json!({ "content": big1 })),
+            digest_ev(1, "t2", "user", serde_json::json!({ "content": big2 })),
+        ];
+        let turns =
+            std::collections::HashMap::from([("t1".to_string(), 1i32), ("t2".to_string(), 2i32)]);
+
+        // latest reverses to [t2, t1]; the turn window (offset 0, limit 1) keeps
+        // only the newest turn, and messages=full renders it unabridged.
+        let opts = DigestOptions {
+            latest: true,
+            turn_offset: Some(0),
+            turn_limit: Some(1),
+            unabridged: true,
+            inline_diffs: false,
+        };
+        let out = format_transcript_digest_with(&events, "base", &digest_meta(), &turns, &opts);
+        assert!(out.contains("## Turn 2"));
+        assert!(!out.contains("## Turn 1"));
+        assert!(out.contains("turn two line 300"));
+        assert!(!out.contains("turn one line"));
+        // Unabridged: no truncation trailer anywhere.
+        assert!(!out.contains("[+"));
     }
 }

@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::agent::OutputSchema;
 use super::common::{Model, ModelSelection, Preset, RuntimeExtras};
 use super::execution::TriggerType;
 use super::permissions::{Fence, LegacyOnEscape, LegacySandbox};
@@ -29,7 +30,9 @@ pub struct DelegatedSessionStrategy {
 }
 
 /// Durable record of a delegated task lowered into the execution snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// No `Eq`: `output_contract` can carry an inline custom JSON Schema
+// (`serde_json::Value`), which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegatedWorkPacket {
     pub id: String,
@@ -76,6 +79,9 @@ pub enum DelegationOrigin {
     TaskTool,
     Manager,
     Planner,
+    /// An ephemeral agent call (CAIRN-2481): a node-less run created directly
+    /// with a pre-materialized packet, never expanded into a recipe node.
+    CallTool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,14 +107,32 @@ pub struct DelegatedOwnershipScope {
     pub on_escape: Option<LegacyOnEscape>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// No `Eq`: `schema_type` may carry an inline custom JSON Schema
+// (`serde_json::Value`), which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegatedOutputContract {
-    pub schema_type: String,
+    /// The delegated task's output schema: a preset name (serialized as a bare
+    /// string, e.g. `"return"`) or an inline custom JSON Schema (serialized as an
+    /// object). `OutputSchema` is untagged, so the on-disk `schemaType` key stays
+    /// back-compatible with snapshots written before custom schemas existed.
+    pub schema_type: OutputSchema,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+impl DelegatedOutputContract {
+    /// The artifact name / URI segment the delegated child writes its result to.
+    /// A preset uses its own name (defaulting to `return` when empty); a custom
+    /// inline schema always writes to the canonical `return` artifact.
+    pub fn artifact_name(&self) -> String {
+        match &self.schema_type {
+            OutputSchema::Preset(name) if !name.is_empty() => name.clone(),
+            _ => "return".to_string(),
+        }
+    }
 }
 
 /// Snapshot of a recipe at execution time
@@ -374,7 +398,7 @@ mod tests {
                 session: DelegatedSessionStrategy::default(),
                 acceptance: vec!["Return findings".to_string()],
                 output_contract: DelegatedOutputContract {
-                    schema_type: "return".to_string(),
+                    schema_type: OutputSchema::Preset("return".to_string()),
                     tool_name: None,
                     description: Some("Submit the task result".to_string()),
                 },
@@ -399,9 +423,31 @@ mod tests {
         assert_eq!(restored.trigger_context.project_id, "project-1");
         assert_eq!(restored.delegated_packets.len(), 1);
         assert_eq!(
-            restored.delegated_packets[0].output_contract.schema_type,
+            restored.delegated_packets[0]
+                .output_contract
+                .artifact_name(),
             "return"
         );
+    }
+
+    #[test]
+    fn output_contract_backcompat_string_and_custom_schema() {
+        // Old snapshots persisted the preset as a bare string under `schemaType`.
+        let preset: DelegatedOutputContract =
+            serde_json::from_str(r#"{"schemaType":"return"}"#).unwrap();
+        assert_eq!(
+            preset.schema_type,
+            OutputSchema::Preset("return".to_string())
+        );
+        // A custom inline schema persists as an object.
+        let custom: DelegatedOutputContract =
+            serde_json::from_str(r#"{"schemaType":{"type":"object","required":["score"]}}"#)
+                .unwrap();
+        assert!(matches!(custom.schema_type, OutputSchema::Custom(_)));
+        assert_eq!(custom.artifact_name(), "return");
+        // A preset round-trips back to a bare string.
+        let reser = serde_json::to_string(&preset).unwrap();
+        assert!(reser.contains(r#""schemaType":"return""#), "{reser}");
     }
 
     /// Old snapshots (pre-event-payload) must deserialize without error.

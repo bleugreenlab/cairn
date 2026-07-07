@@ -382,6 +382,102 @@ pub fn live_run_id_for_job(orch: &Orchestrator, job_id: &str) -> Option<String> 
     .and_then(|ids| ids.into_iter().next())
 }
 
+/// Deliberately stop a running workflow node (CAIRN-2516).
+///
+/// A workflow node's process is a stdin-less `bun <script>`, so the ordinary
+/// interrupt cannot reach it; a Stop must hard-kill it AND cascade to its
+/// in-flight child calls. This marks the workflow's live run as
+/// deliberately-stopped, then reuses [`stop_session`] verbatim: the child cascade
+/// kills orphaned agent sessions, and the workflow run's own interrupt-send fails
+/// (no stdin) and falls through to [`kill_session_with_reason`]. The workflow
+/// supervisor, seeing the marker on its finalize, maps the killed process to a
+/// terminal, non-crashed (Stopped) outcome and KEEPS the re-dispatch record so a
+/// later Restart works — while the terminal status keeps the startup sweep from
+/// resurrecting it (the trap this issue turns on). A no-op when the node has no
+/// live run.
+pub fn stop_workflow(orch: &Orchestrator, workflow_job_id: &str) -> Result<(), String> {
+    let Some(run_id) = live_run_id_for_job(orch, workflow_job_id) else {
+        log::info!("stop_workflow: no live run for job {workflow_job_id}; nothing to stop");
+        return Ok(());
+    };
+    // Set the marker BEFORE the kill so the supervisor's finalize (which races
+    // the kill path's own finalize) observes it and maps to the cancelled,
+    // non-re-dispatched outcome regardless of which finalizer wins the status
+    // race.
+    orch.process_state.mark_workflow_stop_requested(&run_id);
+    stop_session(orch, &run_id)
+}
+
+/// Stop an in-flight workflow child call (CAIRN-2516).
+///
+/// Hard-terminates the call's agent session via [`kill_session_with_reason`]
+/// (`"user_stop"`) — NOT the warm-park [`stop_session`], which would leave the
+/// run non-terminal and hang the workflow's awaiting `agent()`. The killed run
+/// reaches `exited` with no artifact, which `terminal_call_body` maps to the call
+/// failure sentinel so `agent()` resolves `null` (deep-research's salvage paths
+/// handle it). `finalize_run` then journals the call as Failure(null) at its
+/// `(workflow_run_id, ordinal)` and deletes the link — a stopped call is journaled
+/// exactly like any failed call. Rejects a run that is not a workflow child call
+/// or is already terminal.
+pub fn stop_call(orch: &Orchestrator, call_run_id: &str) -> Result<(), String> {
+    match run_status(orch, call_run_id).as_deref() {
+        None => return Err(format!("Call run {call_run_id} not found")),
+        Some(status) if is_terminal_run_status(status) => {
+            log::info!("stop_call: run {call_run_id} already terminal ({status}); nothing to stop");
+            return Ok(());
+        }
+        Some(_) => {}
+    }
+    if !is_workflow_child_run(orch, call_run_id) {
+        return Err(format!(
+            "Run {call_run_id} is not a workflow child call; refusing stop_call"
+        ));
+    }
+    kill_session_with_reason(orch, call_run_id, "user_stop")
+}
+
+/// The stored run statuses that count as terminal (its process has exited).
+/// Mirrors `RunStatus::is_terminal` plus the legacy stored spellings.
+fn is_terminal_run_status(status: &str) -> bool {
+    matches!(
+        status,
+        "exited" | "crashed" | "complete" | "completed" | "failed"
+    )
+}
+
+/// Whether a run is a child call of a workflow node — its parent job carries the
+/// synthetic `agent_config_id = "workflow"`. Gates [`stop_call`] so it acts only
+/// on genuine workflow calls, validated server-side rather than trusting the UI.
+fn is_workflow_child_run(orch: &Orchestrator, run_id: &str) -> bool {
+    let dbs = orch.db.clone();
+    let run_id = run_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.read(|conn| {
+            let run_id = run_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT parent.agent_config_id FROM runs r \
+                         JOIN jobs j ON r.job_id = j.id \
+                         JOIN jobs parent ON j.parent_job_id = parent.id \
+                         WHERE r.id = ?1 LIMIT 1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+    .unwrap_or(None)
+    .as_deref()
+        == Some("workflow")
+}
+
 /// Stop a running backend session, cascading to child runs
 pub fn stop_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     // First, collect child runs to stop

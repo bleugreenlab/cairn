@@ -496,22 +496,28 @@ async fn cascade_failure_skips_running_downstream() {
 }
 
 #[tokio::test]
-async fn cascade_failure_standalone_job_no_execution() {
+async fn cascade_failure_leaf_job_no_downstream() {
+    // A leaf job with no downstream node to cascade into still flips itself to
+    // Failed. Standalone (execution-less) jobs were retired, so every job now
+    // recomputes through its execution sweep; this exercises the minimal case —
+    // a job seeded at the source node with no downstream job to fail.
     let ctx = transition_context().await;
     let project_id = common::create_project(&ctx.db, "TCSJ").await;
+    let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
+    insert_execution_with_snapshot(&ctx.db, "exec-leaf", None, &snapshot).await;
     insert_job(
         &ctx.db,
-        "job-standalone",
+        "job-leaf",
         "running",
         &project_id,
-        None,
-        None,
+        Some("exec-leaf"),
+        Some("node-a"),
     )
     .await;
 
-    apply_failure(&ctx.orch, "job-standalone");
+    apply_failure(&ctx.orch, "job-leaf");
 
-    assert_eq!(status(&ctx.db, "jobs", "job-standalone").await, "failed");
+    assert_eq!(status(&ctx.db, "jobs", "job-leaf").await, "failed");
 }
 
 #[tokio::test]

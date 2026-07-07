@@ -54,15 +54,52 @@ pub(crate) const NODE_MESSAGES_CONTRACT: ResourceContract =
         }],
     };
 
+pub(crate) const NODE_PROGRESS_CONTRACT: ResourceContract =
+    ResourceContract {
+        kind: ResourceKind::NodeProgress,
+        uri_template: "cairn://p/{project}/{number}/{exec}/{node}/progress",
+        name: "Workflow progress",
+        description: "Durable phase/log progress timeline for a workflow node. Append records a typed entry -- a `phase` boundary (text = phase name) or a `log` line (text = message); read returns the chronological timeline with timestamps. The harness phase()/log() verbs write here and the workflow monitoring panel renders it.",
+        read_projections: &[
+            ProjectionSpec {
+                key: "since",
+                values: "EPOCH",
+            },
+            ProjectionSpec {
+                key: "limit",
+                values: "N",
+            },
+        ],
+        related: NODE_PROGRESS_RELATED,
+        cross_actions: NO_CROSS_ACTIONS,
+        mutations: &[MutationSpec {
+            mode: ChangeMode::Append,
+            required: &[PROGRESS_KIND, PROGRESS_TEXT],
+            optional: &[],
+            label: "append a phase or log entry",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE/progress\",mode:\"append\",payload:{kind:\"phase\",text:\"scope\"}}]})",
+        }],
+    };
+
 pub(crate) const NODE_CHAT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::NodeChat,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/chat",
     name: "Node transcript",
     description: "Turn-structured digest of the agent conversation",
-    read_projections: &[ProjectionSpec {
-        key: "latest",
-        values: "true|false (newest turn first; events within a turn stay chronological)",
-    }],
+    read_projections: &[
+        ProjectionSpec {
+            key: "latest",
+            values: "true|false (newest turn first; events within a turn stay chronological)",
+        },
+        ProjectionSpec {
+            key: "messages",
+            values: "full (render user & assistant messages unabridged instead of truncated)",
+        },
+        ProjectionSpec {
+            key: "diffs",
+            values: "true (inline each file write's change body beneath its row)",
+        },
+    ],
     related: &[
         RelatedSpec {
             label: "full turn",

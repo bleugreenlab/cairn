@@ -714,9 +714,9 @@ fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), Str
                 conn.execute(
                     "INSERT INTO executions (
                         id, recipe_id, issue_id, project_id, status, started_at,
-                        completed_at, snapshot, seq, initiator_sub, initiator_auth_mode,
+                        completed_at, snapshot, seq, initiator_sub,
                         initiator_org_id, triggered_by
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         execution.id.as_str(),
                         execution.recipe_id.as_str(),
@@ -728,7 +728,6 @@ fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), Str
                         execution.snapshot.as_deref(),
                         execution.seq,
                         execution.initiator.as_ref().map(|i| i.sub.as_str()),
-                        execution.initiator.as_ref().map(|i| i.auth_mode.as_str()),
                         execution.initiator.as_ref().map(|i| i.org_id.as_str()),
                         execution.triggered_by.as_str(),
                     ],

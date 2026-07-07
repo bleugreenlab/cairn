@@ -11,8 +11,8 @@ use super::common::{
     reject_query_params, resolve_issue_id, visible_job_node_segment, ResourceActionRun,
 };
 use super::transcript::{
-    format_transcript_digest, get_nth_run_id, get_single_event, load_job_events_ordered,
-    load_turn_events, DigestMeta, EventRow,
+    format_transcript_digest_with, get_nth_run_id, get_single_event, load_job_events_ordered,
+    load_turn_events, DigestMeta, DigestOptions, EventRow,
 };
 
 use crate::storage::{LocalDb, RowExt};
@@ -363,6 +363,74 @@ pub(super) async fn read_node_checks(
         None => out.push_str("\nNo turn-end check results yet for the current tree.\n"),
     }
     out
+}
+
+/// Render a node's ephemeral calls (CAIRN-2481): the caller's child jobs that
+/// carry a persisted output contract. Calls share the `parent_job_id` linkage
+/// with delegated tasks but are distinguished by a non-NULL `output_contract`.
+pub(super) async fn read_node_calls(
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+) -> String {
+    let (conn, job) =
+        match connect_and_find_node_job(db, project_key, number, exec_seq, node_name).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error,
+        };
+
+    let mut calls: Vec<(String, Option<String>, Option<String>, String)> = Vec::new();
+    if let Ok(mut rows) = conn
+        .query(
+            "
+            SELECT uri_segment, agent_config_id, task_description, status
+            FROM jobs
+            WHERE parent_job_id = ?1 AND output_contract IS NOT NULL
+            ORDER BY task_index ASC, created_at ASC
+            ",
+            (job.id.as_str(),),
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let (Ok(segment), Ok(agent), Ok(description), Ok(status)) = (
+                row.opt_text(0),
+                row.opt_text(1),
+                row.opt_text(2),
+                row.text(3),
+            ) else {
+                continue;
+            };
+            let segment = segment.unwrap_or_else(|| "call".to_string());
+            calls.push((segment, agent, description, status));
+        }
+    }
+
+    let mut output = format!("# Calls — {}\n\n", node_name);
+    if calls.is_empty() {
+        output.push_str("No ephemeral calls yet.\n\n");
+    } else {
+        output.push_str(&format!("{} call(s)\n\n", calls.len()));
+        for (segment, agent, description, status) in &calls {
+            let icon = match status.as_str() {
+                "complete" => "✓",
+                "running" => "◐",
+                "failed" => "✗",
+                "pending" => "○",
+                _ => "?",
+            };
+            let label = description
+                .clone()
+                .filter(|value| !value.is_empty())
+                .or_else(|| agent.clone())
+                .unwrap_or_else(|| segment.clone());
+            output.push_str(&format!("- {icon} {label} ({segment})\n"));
+        }
+        output.push('\n');
+    }
+    output
 }
 
 pub(super) async fn read_node_tasks(
@@ -1219,9 +1287,19 @@ pub(super) async fn read_node_chat(
         find_query_value(params, "offset").and_then(|value| value.parse::<i64>().ok());
     let turn_limit =
         find_query_value(params, "limit").and_then(|value| value.parse::<usize>().ok());
+    // Opt-in reseed-fidelity knobs: `messages=full` renders messages unabridged;
+    // `diffs=true` inlines each file write's change body beneath its row. Both
+    // default off so the digest stays byte-identical for the common case.
+    let unabridged = matches!(find_query_value(params, "messages"), Some("full"));
+    let inline_diffs = matches!(find_query_value(params, "diffs"), Some("true") | Some("1"));
     let leftover: Vec<QueryParam> = params
         .iter()
-        .filter(|param| param.key != "latest" && param.key != "offset" && param.key != "limit")
+        .filter(|param| {
+            !matches!(
+                param.key.as_str(),
+                "latest" | "offset" | "limit" | "messages" | "diffs"
+            )
+        })
         .cloned()
         .collect();
     if let Some(error) = reject_query_params("node chat", &leftover) {
@@ -1234,24 +1312,12 @@ pub(super) async fn read_node_chat(
             Err(error) => return error,
         };
 
-    let event_rows = load_job_events_ordered(
-        &conn,
-        &job.id,
-        db.content_store().map(|s| s.as_ref()),
-        db.private_route_db().map(|db| db.as_ref()),
-    )
-    .await;
-    if event_rows.is_empty() {
-        return "No runs found for this node.".to_string();
-    }
-
     let base_uri = build_node_chat_uri(
         project_key,
         number,
         exec_seq,
         &visible_job_node_segment(&conn, &job).await,
     );
-    let turn_sequences = load_primary_session_turn_sequences(&conn, &job.id).await;
     let meta = DigestMeta {
         label: node_name,
         project: project_key,
@@ -1259,15 +1325,94 @@ pub(super) async fn read_node_chat(
         exec_seq,
         status: &job.status,
     };
-    format_transcript_digest(
-        &event_rows,
+    render_job_chat_digest(
+        db,
+        &conn,
+        &job.id,
         &base_uri,
         &meta,
-        &turn_sequences,
-        latest,
-        turn_offset,
-        turn_limit,
+        &DigestOptions {
+            latest,
+            turn_offset,
+            turn_limit,
+            unabridged,
+            inline_diffs,
+        },
     )
+    .await
+}
+
+/// Canonical `/chat` digest render for an already-resolved job.
+///
+/// Both the node-chat read resolver and the cold-resume reseed path
+/// (CAIRN-2534) route through this, so the digest is produced by exactly one
+/// code path rather than re-rendered through a parallel one. `base_uri`/`meta`
+/// are caller-built (the cosmetic header line plus truncation drill-down link
+/// scaffolding).
+pub(crate) async fn render_job_chat_digest(
+    db: &LocalDb,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    base_uri: &str,
+    meta: &DigestMeta<'_>,
+    opts: &DigestOptions,
+) -> String {
+    let event_rows = load_job_events_ordered(
+        conn,
+        job_id,
+        db.content_store().map(|s| s.as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
+    if event_rows.is_empty() {
+        return "No runs found for this node.".to_string();
+    }
+    let turn_sequences = load_primary_session_turn_sequences(conn, job_id).await;
+    format_transcript_digest_with(&event_rows, base_uri, meta, &turn_sequences, opts)
+}
+
+/// Render the cold-resume seed digest for a job (CAIRN-2534): its `/chat`
+/// transcript at full reseed fidelity (`messages=full` + `diffs=true`) in
+/// chronological order, framed as the reconstructed prior context.
+///
+/// Reached from the reseed gate in `continue_job_impl`, which holds only the
+/// job — not the node's project/number/exec coordinates. Those are cosmetic
+/// here: under `unabridged` no truncation drill-down links are emitted, so a
+/// best-effort base_uri/meta suffices while the digest *body* stays exact.
+/// Returns the "No runs found" sentinel when the job has no transcript.
+pub(crate) async fn render_reseed_digest(db: &LocalDb, job: &crate::db_records::DbJob) -> String {
+    let conn = match connect_for_read(db).await {
+        Ok(conn) => conn,
+        Err(error) => return error,
+    };
+    let label = job
+        .node_name
+        .as_deref()
+        .or(job.uri_segment.as_deref())
+        .unwrap_or("session");
+    let base_uri = build_node_chat_uri(&job.project_id, 0, 0, label);
+    let meta = DigestMeta {
+        label,
+        project: &job.project_id,
+        number: 0,
+        exec_seq: 0,
+        status: &job.status,
+    };
+    render_job_chat_digest(
+        db,
+        &conn,
+        &job.id,
+        &base_uri,
+        &meta,
+        &DigestOptions {
+            latest: false,
+            turn_offset: None,
+            turn_limit: None,
+            unabridged: true,
+            inline_diffs: true,
+        },
+    )
+    .await
 }
 
 pub(super) async fn read_node_chat_raw(
@@ -1648,9 +1793,17 @@ pub(super) async fn read_task_chat(
         find_query_value(params, "offset").and_then(|value| value.parse::<i64>().ok());
     let turn_limit =
         find_query_value(params, "limit").and_then(|value| value.parse::<usize>().ok());
+    // Opt-in reseed-fidelity knobs, mirrored from the node chat digest.
+    let unabridged = matches!(find_query_value(params, "messages"), Some("full"));
+    let inline_diffs = matches!(find_query_value(params, "diffs"), Some("true") | Some("1"));
     let leftover: Vec<QueryParam> = params
         .iter()
-        .filter(|param| param.key != "latest" && param.key != "offset" && param.key != "limit")
+        .filter(|param| {
+            !matches!(
+                param.key.as_str(),
+                "latest" | "offset" | "limit" | "messages" | "diffs"
+            )
+        })
         .cloned()
         .collect();
     if let Some(error) = reject_query_params("task chat", &leftover) {
@@ -1691,14 +1844,18 @@ pub(super) async fn read_task_chat(
         exec_seq,
         status: &task_job.status,
     };
-    format_transcript_digest(
+    format_transcript_digest_with(
         &event_rows,
         &base_uri,
         &meta,
         &turn_sequences,
-        latest,
-        turn_offset,
-        turn_limit,
+        &DigestOptions {
+            latest,
+            turn_offset,
+            turn_limit,
+            unabridged,
+            inline_diffs,
+        },
     )
 }
 
@@ -1866,6 +2023,134 @@ pub(super) async fn read_task_artifact(
     }
 }
 
+/// Sentinel body a `?wait` read returns when the call is still running past the
+/// long-poll budget. The harness re-issues the read; agents ignore it.
+pub(crate) const CALL_WAIT_PENDING: &str = "__CAIRN_CALL_PENDING__";
+/// Sentinel body a `?wait` read returns when the call finished without a usable
+/// artifact (a failed/crashed run, or a terminal run with no artifact). The
+/// harness maps it to a `null` `agent()` result.
+pub(crate) const CALL_WAIT_FAILED: &str = "__CAIRN_CALL_FAILED__";
+
+/// Long-poll budget for a single `?wait` read, kept under common proxy/gateway
+/// idle timeouts; the harness re-issues on the pending sentinel.
+const CALL_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(290);
+
+/// Block until the delegated call/task behind a task-artifact URI reaches a
+/// terminal run status, then return its raw artifact JSON (the harness parses
+/// it). Returns [`CALL_WAIT_PENDING`] if the budget expires first (the caller
+/// re-issues) and [`CALL_WAIT_FAILED`] on a failed/crashed run or a terminal run
+/// with no artifact. This is the script-facing await behind the harness
+/// `agent()`: spawn a background call, then long-poll its result URI here.
+pub(super) async fn wait_for_task_artifact(
+    orch: &crate::orchestrator::Orchestrator,
+    db: &LocalDb,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    node_name: &str,
+    task_name: &str,
+) -> String {
+    // Resolve the call job once, then DROP the resolution transaction: it opened
+    // with `BEGIN` (a pinned snapshot), so re-reading status through it would
+    // never observe the call's completion. Each terminal check below opens a
+    // fresh read instead.
+    let job_id =
+        match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
+            .await
+        {
+            Ok((_conn, _parent_job, task_job)) => task_job.id,
+            Err(error) => return error,
+        };
+
+    // Subscribe BEFORE the first status read so a completion that fires between
+    // the check and the wait is not missed (subscribe-then-check ordering).
+    let mut rx = orch.run_completions.subscribe();
+    let deadline = tokio::time::Instant::now() + CALL_WAIT_BUDGET;
+
+    loop {
+        if let Some(body) = terminal_call_body(db, &job_id).await {
+            return body;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return CALL_WAIT_PENDING.to_string();
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            // A run finished (this call's or another's); re-check our job status.
+            Ok(Ok(_run_id)) => continue,
+            // Dropped completions under load; re-check unconditionally.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            // The broadcast closed (host shutting down) or the budget expired.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => {
+                return CALL_WAIT_PENDING.to_string()
+            }
+        }
+    }
+}
+
+/// Terminal-status body for a call/task job: `Some(raw artifact JSON)` on a
+/// successful terminal run, `Some(CALL_WAIT_FAILED)` on failure or a terminal
+/// run with no artifact, and `None` while the latest run is still non-terminal.
+/// Reads through `db` (a FRESH connection each call) so it observes the call's
+/// committed status change — a held read transaction would pin a snapshot.
+async fn terminal_call_body(db: &LocalDb, job_id: &str) -> Option<String> {
+    let status = latest_run_status(db, job_id).await?;
+    match status.as_str() {
+        "complete" | "completed" | "exited" => match direct_artifact_data(db, job_id).await {
+            Some(data) => Some(data),
+            None => Some(CALL_WAIT_FAILED.to_string()),
+        },
+        "failed" | "crashed" => Some(CALL_WAIT_FAILED.to_string()),
+        _ => None,
+    }
+}
+
+/// Status of the most recent run for a job, or `None` when no run exists yet.
+async fn latest_run_status(db: &LocalDb, job_id: &str) -> Option<String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    // `rowid DESC` tiebreaks the second-resolution `created_at`
+                    // so the newest-inserted run always wins: a call restart
+                    // that lands in the same second as its predecessor must
+                    // resolve the await against the replacement, not the killed
+                    // old run (CAIRN-2516).
+                    "SELECT status FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Raw `data` of the most recent artifact written for a job, or `None`.
+async fn direct_artifact_data(db: &LocalDb, job_id: &str) -> Option<String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT data FROM artifacts WHERE job_id = ?1 \
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 pub(super) async fn read_node_chat_event(
     db: &LocalDb,
     project_key: &str,
@@ -2000,6 +2285,142 @@ mod artifact_render_tests {
     #[test]
     fn non_object_payload_is_verbatim() {
         assert_eq!(render_artifact_markdown("plain text"), "plain text");
+    }
+}
+
+#[cfg(test)]
+mod wait_artifact_tests {
+    use super::{terminal_call_body, wait_for_task_artifact, CALL_WAIT_FAILED};
+    use crate::db::DbState;
+    use crate::orchestrator::{Orchestrator, OrchestratorBuilder};
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use std::sync::Arc;
+
+    async fn orch_with_db() -> (Orchestrator, Arc<LocalDb>) {
+        let local = Arc::new(
+            LocalDb::open(tempfile::tempdir().unwrap().keep().join("wait.db"))
+                .await
+                .unwrap(),
+        );
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search =
+            Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
+        let db = Arc::new(DbState::new(local.clone(), search));
+        let orch = OrchestratorBuilder::new(
+            db,
+            Arc::new(TestServicesBuilder::new().build()),
+            tempfile::tempdir().unwrap().keep(),
+        )
+        .build();
+        (orch, local)
+    }
+
+    /// Seed a workflow node job (`flow`) with one call sub-job (`c1`) whose
+    /// latest run has `run_status`, optionally with an output artifact.
+    async fn seed_call(db: &LocalDb, run_status: &str, artifact: Option<&str>) {
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',3,'T','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-wf','e','i','p','running','flow','Flow',1,1)",
+            "INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-call','e','j-wf','i','p','complete','c1','Call','Explore',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        db.execute(
+            "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('r-call','j-call','i',?1,1,1)",
+            (run_status,),
+        )
+        .await
+        .unwrap();
+        if let Some(data) = artifact {
+            db.execute(
+                "INSERT INTO artifacts (id, job_id, artifact_type, data, created_at, updated_at) VALUES ('a1','j-call','answer',?1,1,1)",
+                (data,),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_returns_raw_artifact_json_for_terminal_call() {
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "exited", Some(r#"{"answer":"42"}"#)).await;
+        // Terminal on the first check: returns immediately with the raw JSON the
+        // harness parses (no markdown rendering, no affordance).
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        assert_eq!(body, r#"{"answer":"42"}"#);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_failed_sentinel_for_failed_call() {
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "failed", None).await;
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        assert_eq!(body, CALL_WAIT_FAILED);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_failed_sentinel_when_terminal_without_artifact() {
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "exited", None).await;
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        assert_eq!(body, CALL_WAIT_FAILED);
+    }
+
+    /// A fast call restart lands the replacement run in the SAME second as the
+    /// killed predecessor, so their `created_at` ties. The wait path must still
+    /// select the replacement (live) run — not the stopped predecessor — or the
+    /// workflow's `agent()` resolves `null` prematurely (CAIRN-2516). The
+    /// `rowid DESC` tiebreak guarantees the newest-inserted run wins.
+    #[tokio::test]
+    async fn same_second_restart_selects_replacement_run_not_stopped_predecessor() {
+        let (_orch, db) = orch_with_db().await;
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',3,'T','active',1,1)",
+            "INSERT INTO jobs (id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-call','i','p','running','c1','Call',1,1)",
+            // Predecessor first (lower rowid), replacement second (higher rowid),
+            // identical `created_at` (a same-second restart).
+            "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('r-old','j-call','i','exited',5,5)",
+            "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('r-new','j-call','i','live',5,5)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        // The replacement (live) run is the latest, so the await stays parked
+        // (None) instead of resolving against the stopped predecessor's failure.
+        assert_eq!(terminal_call_body(&db, "j-call").await, None);
+    }
+
+    #[tokio::test]
+    async fn wait_resolves_a_call_under_a_child_workflow_node() {
+        let (orch, db) = orch_with_db().await;
+        // A top-level caller node `builder`, a workflow `wf` that is a CHILD of
+        // the caller (agent_config_id='workflow'), and a call `c1` under the
+        // workflow. The call resolves only because a workflow job is
+        // node-addressable by its segment despite having a parent.
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',4,'T','active',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-builder','e','i','p','running','builder','Builder',1,1)",
+            "INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-wf','e','j-builder','i','p','running','wf','WF','workflow',1,1)",
+            "INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-c1','e','j-wf','i','p','complete','c1','Call','Explore',1,1)",
+            "INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('r-c1','j-c1','i','exited',1,1)",
+            "INSERT INTO artifacts (id, job_id, artifact_type, data, created_at, updated_at) VALUES ('a','j-c1','answer','{\"v\":1}',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 4, 1, "wf", "c1").await;
+        assert_eq!(body, r#"{"v":1}"#);
     }
 }
 
