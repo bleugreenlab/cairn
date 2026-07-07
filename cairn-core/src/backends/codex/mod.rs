@@ -11,6 +11,7 @@ mod config;
 mod events;
 mod models;
 mod permissions;
+pub mod pool;
 mod protocol;
 mod runtime;
 mod thread_params;

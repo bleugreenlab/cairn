@@ -1,11 +1,13 @@
-//! The live assistant stream and transcript-event writes: open/append/finalize a
+//! Neutral transcript persistence for the HTTP turn loop: open/append/finalize a
 //! streaming assistant event, and store assistant messages, tool-call events,
-//! tool results, and the terminal success result as transcript events.
+//! tool results, and the terminal success result as transcript events. Every
+//! writer takes the adapter's `backend_key` so the stored `raw` payload carries
+//! the right backend tag (de-wired from the old hardcoded OpenRouter constant).
 
-use super::conversation::render_tool_result;
-use super::wire::{OpenRouterUsage, ToolCall};
+use super::repair;
+use super::tools::render_tool_result;
+use super::{TurnToolCall, TurnUsage};
 use crate::agent_process::stream::{TokenCounts, ToolUseInfo, TranscriptEvent};
-use crate::backends::openrouter::{repair, OPENROUTER_BACKEND_KEY};
 use crate::dispatch::DispatchOutput;
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
@@ -17,29 +19,31 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use uuid::Uuid;
 
-pub(super) struct AssistantStreamState {
+pub(in crate::backends) struct AssistantStreamState {
     stream_id: String,
     version: i32,
     acc: StreamAccumulator,
     run_db: Arc<LocalDb>,
+    backend_key: String,
 }
 
 impl AssistantStreamState {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn open(
+    pub(in crate::backends) fn open(
         orch: &Orchestrator,
         run_db: Arc<LocalDb>,
         run_id: &str,
         session_id: &str,
         turn_id: Option<&str>,
         sequence: i32,
+        backend_key: &str,
     ) -> Result<Self, String> {
         let stream = open_stream(
             run_db.clone(),
             run_id,
             Some(session_id),
             turn_id,
-            OPENROUTER_BACKEND_KEY,
+            backend_key,
             Some(sequence),
         )?;
         let _ = orch.services.emitter.emit(
@@ -56,10 +60,11 @@ impl AssistantStreamState {
             version: stream.version(),
             acc: StreamAccumulator::new(),
             run_db,
+            backend_key: backend_key.to_string(),
         })
     }
 
-    pub(super) fn append(
+    pub(in crate::backends) fn append(
         &mut self,
         orch: &Orchestrator,
         run_id: &str,
@@ -77,7 +82,7 @@ impl AssistantStreamState {
         Ok(())
     }
 
-    pub(super) fn append_thinking(
+    pub(in crate::backends) fn append_thinking(
         &mut self,
         orch: &Orchestrator,
         run_id: &str,
@@ -106,7 +111,7 @@ impl AssistantStreamState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn finalize(
+    pub(in crate::backends) fn finalize(
         mut self,
         orch: &Orchestrator,
         run_id: &str,
@@ -114,7 +119,7 @@ impl AssistantStreamState {
         text: String,
         thinking: String,
         reasoning_details: Vec<Value>,
-        usage: Option<&OpenRouterUsage>,
+        usage: Option<&TurnUsage>,
         generation_id: Option<&str>,
         model: Option<&str>,
     ) -> Result<(), String> {
@@ -139,7 +144,7 @@ impl AssistantStreamState {
             is_error: false,
             thinking_ms: None,
             raw: Some(json!({
-                "backend": OPENROUTER_BACKEND_KEY,
+                "backend": self.backend_key.clone(),
                 "generationId": generation_id,
                 "model": model,
                 "usage": usage,
@@ -154,7 +159,7 @@ impl AssistantStreamState {
             &self.stream_id,
             self.version,
             Some(event),
-            usage.map(OpenRouterUsage::token_counts).unwrap_or_default(),
+            usage.map(TurnUsage::token_counts).unwrap_or_default(),
         )?;
         process_post_commit_outbox(orch, &finalized.outbox_entries);
         Ok(())
@@ -170,17 +175,18 @@ pub(super) fn store_assistant_message(
     turn_id: Option<&str>,
     sequence: i32,
     text: &str,
-    usage: Option<&OpenRouterUsage>,
+    usage: Option<&TurnUsage>,
     generation_id: Option<&str>,
     model: Option<&str>,
     total_cost: Option<f64>,
+    backend_key: &str,
 ) -> Result<(), String> {
     let stream = open_stream(
         run_db.clone(),
         run_id,
         Some(session_id),
         turn_id,
-        OPENROUTER_BACKEND_KEY,
+        backend_key,
         Some(sequence),
     )?;
     let appended = append_chunks(
@@ -203,7 +209,7 @@ pub(super) fn store_assistant_message(
         is_error: false,
         thinking_ms: None,
         raw: Some(json!({
-            "backend": OPENROUTER_BACKEND_KEY,
+            "backend": backend_key,
             "generationId": generation_id,
             "model": model,
             "totalCost": total_cost,
@@ -217,7 +223,7 @@ pub(super) fn store_assistant_message(
         stream.stream_id(),
         appended.version,
         Some(event),
-        usage.map(OpenRouterUsage::token_counts).unwrap_or_default(),
+        usage.map(TurnUsage::token_counts).unwrap_or_default(),
     )?;
     process_post_commit_outbox(orch, &finalized.outbox_entries);
     Ok(())
@@ -238,13 +244,13 @@ fn emit_streaming_delta(orch: &Orchestrator, run_id: &str, event_id: &str, delta
     );
 }
 
-fn tool_use_infos(tool_calls: &[ToolCall]) -> Vec<ToolUseInfo> {
+fn tool_use_infos(tool_calls: &[TurnToolCall]) -> Vec<ToolUseInfo> {
     tool_calls
         .iter()
         .map(|call| ToolUseInfo {
             id: call.id.clone(),
-            name: call.function.name.clone(),
-            input: repair::parse_tool_arguments(&call.function.arguments).value(),
+            name: call.name.clone(),
+            input: repair::parse_tool_arguments(&call.arguments).value(),
         })
         .collect()
 }
@@ -271,8 +277,8 @@ fn single_tool_summary(tool_uses: &[ToolUseInfo]) -> (Option<String>, Option<Val
 /// though the generation's cost is still counted on the cumulative result event.
 pub(super) fn tool_call_usage(
     streamed_text: bool,
-    usage: Option<&OpenRouterUsage>,
-) -> Option<&OpenRouterUsage> {
+    usage: Option<&TurnUsage>,
+) -> Option<&TurnUsage> {
     if streamed_text {
         None
     } else {
@@ -289,11 +295,12 @@ pub(super) fn store_assistant_tool_call(
     turn_id: Option<&str>,
     sequence: i32,
     text: &str,
-    tool_calls: &[ToolCall],
-    usage: Option<&OpenRouterUsage>,
+    tool_calls: &[TurnToolCall],
+    usage: Option<&TurnUsage>,
     generation_id: Option<&str>,
     model: Option<&str>,
     reasoning_details: Option<&Value>,
+    backend_key: &str,
 ) -> Result<(), String> {
     let tool_uses = tool_use_infos(tool_calls);
     let (tool_name, tool_input) = single_tool_summary(&tool_uses);
@@ -322,7 +329,7 @@ pub(super) fn store_assistant_tool_call(
             is_error: false,
             thinking_ms: None,
             raw: Some(json!({
-                "backend": OPENROUTER_BACKEND_KEY,
+                "backend": backend_key,
                 "generationId": generation_id,
                 "model": model,
                 "usage": usage,
@@ -331,7 +338,7 @@ pub(super) fn store_assistant_tool_call(
                 "reasoningDetails": reasoning_details,
             })),
         },
-        usage.map(OpenRouterUsage::token_counts).unwrap_or_default(),
+        usage.map(TurnUsage::token_counts).unwrap_or_default(),
         None,
     )
 }
@@ -346,6 +353,7 @@ pub(super) fn store_tool_result(
     sequence: i32,
     tool_call_id: &str,
     result: &DispatchOutput,
+    backend_key: &str,
 ) -> Result<(), String> {
     insert_transcript_event(
         orch,
@@ -367,7 +375,7 @@ pub(super) fn store_tool_result(
             tool_result: Some(render_tool_result(result.clone())),
             is_error: false,
             thinking_ms: None,
-            raw: Some(json!({"backend": OPENROUTER_BACKEND_KEY, "reminders": result.reminders})),
+            raw: Some(json!({"backend": backend_key, "reminders": result.reminders})),
         },
         TokenCounts::default(),
         None,
@@ -382,10 +390,11 @@ pub(super) fn store_success_result(
     session_id: &str,
     turn_id: Option<&str>,
     sequence: i32,
-    usage: Option<&OpenRouterUsage>,
+    usage: Option<&TurnUsage>,
     generation_id: Option<&str>,
     model: Option<&str>,
     total_cost: Option<f64>,
+    backend_key: &str,
 ) -> Result<(), String> {
     insert_transcript_event(
         orch,
@@ -408,14 +417,14 @@ pub(super) fn store_success_result(
             is_error: false,
             thinking_ms: None,
             raw: Some(json!({
-                "backend": OPENROUTER_BACKEND_KEY,
+                "backend": backend_key,
                 "generationId": generation_id,
                 "model": model,
                 "totalCost": total_cost,
                 "usage": usage,
             })),
         },
-        usage.map(OpenRouterUsage::token_counts).unwrap_or_default(),
+        usage.map(TurnUsage::token_counts).unwrap_or_default(),
         total_cost,
     )
 }

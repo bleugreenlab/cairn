@@ -37,6 +37,7 @@ fn insert_pending_direct(orch: &Orchestrator, recipient: &str, content: &str) ->
 
 fn callback_request(tool: &str, run_id: Option<&str>) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: run_id.map(str::to_string),
         tool: tool.to_string(),
@@ -605,6 +606,7 @@ async fn node_messages_append_routes_like_bare_node() {
     insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
 
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "write".to_string(),
@@ -641,6 +643,7 @@ async fn node_messages_read_returns_directs() {
     let _ = insert_pending_direct(&orch, "run-1", "hello builder");
 
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "read".to_string(),

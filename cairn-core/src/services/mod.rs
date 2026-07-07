@@ -26,6 +26,7 @@ mod http;
 mod process;
 mod pty;
 pub mod pty_osc;
+mod reaper;
 pub mod sandbox;
 pub mod shell_integration;
 
@@ -50,6 +51,7 @@ pub use pty::{
     PHRASE_EXCERPT_MAX,
 };
 pub use pty_osc::{Osc133Event, Osc133Parser};
+pub use reaper::{OsProcessReaper, ProcessReaper};
 pub use sandbox::SandboxPolicy;
 pub use shell_integration::{apply_shell_integration, integration_dir};
 
@@ -69,6 +71,7 @@ pub struct Services {
     pub fs: Arc<dyn FileSystem>,
     pub pty_factory: Arc<dyn PtyFactory>,
     pub completion: Arc<dyn CompletionService>,
+    pub reaper: Arc<dyn ProcessReaper>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -85,6 +88,7 @@ pub mod testing {
     pub use super::http::MockHttpClient;
     pub use super::process::{MockChildProcess, MockProcessSpawner, RecordingProcessSpawner};
     pub use super::pty::MockPtyFactory;
+    pub use super::reaper::RecordingReaper;
 
     use super::*;
 
@@ -121,6 +125,7 @@ pub mod testing {
         process: Option<Arc<dyn ProcessSpawner>>,
         emitter: Option<Arc<dyn EventEmitter>>,
         pty_factory: Option<Arc<dyn PtyFactory>>,
+        reaper: Option<Arc<dyn ProcessReaper>>,
     }
 
     impl TestServicesBuilder {
@@ -134,6 +139,7 @@ pub mod testing {
                 process: None,
                 emitter: None,
                 pty_factory: None,
+                reaper: None,
             }
         }
 
@@ -145,6 +151,7 @@ pub mod testing {
         service_setter!(with_process, process, ProcessSpawner, process);
         service_setter!(with_emitter, emitter, EventEmitter, emitter);
         service_setter!(with_pty_factory, pty_factory, PtyFactory, pty_factory);
+        service_setter!(with_reaper, reaper, ProcessReaper, reaper);
 
         /// Build the Services with mocks for any unspecified services.
         ///
@@ -187,6 +194,9 @@ pub mod testing {
                     let mock = MockPtyFactory::new();
                     Arc::new(mock)
                 }),
+                reaper: self
+                    .reaper
+                    .unwrap_or_else(|| Arc::new(RecordingReaper::new())),
             }
         }
     }

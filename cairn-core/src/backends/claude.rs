@@ -4,6 +4,7 @@
 //! and reading the stream-json event stream into the database.
 
 use crate::agent_process::args::{build_claude_args, ClaudeArgsConfig};
+use crate::agent_process::memory::{MemoryProbe, OsMemoryProbe};
 use crate::agent_process::stream::{
     parse_event, ClaudeEvent, DeltaContent, RateLimitInfo, StreamEventInner, TokenCounts,
     TranscriptEvent, Usage,
@@ -44,6 +45,69 @@ use super::{AgentBackend, DiscoveredModel, ResolvedTools, SessionConfig};
 
 const CLAUDE_BACKEND_NAME: &str = "Claude";
 const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 512;
+
+/// Estimated resident memory of a single ephemeral (`cairn:~/calls`) `claude`
+/// process. Claude is permanently CLI-bound, so each call is a dedicated
+/// `claude --print` process carrying a Node.js runtime; ~450 MB is the
+/// steady-state RSS observed for one (CAIRN-2543, where a per-call fan-out of
+/// dozens of such processes reached tens of GB aggregate and OS-killed the
+/// runner). It is an *estimate*, not a live measurement — the admission ceiling
+/// derived from it only needs the right order of magnitude to bound fan-out
+/// memory, so it is a fixed named constant rather than a per-process probe.
+const CLAUDE_CALL_PROCESS_RSS_ESTIMATE: u64 = 450 * 1024 * 1024;
+
+/// Divisor applied to total physical RAM to get the memory budget the ceiling
+/// may spend on concurrent `claude` processes. `4` == 25% of RAM: ample
+/// headroom for the agent processes, the runner, and the OS, while still letting
+/// a large workstation run a wide fan-out fully parallel.
+const CLAUDE_CALL_RAM_BUDGET_DIVISOR: u64 = 4;
+
+/// Floor on the derived ceiling so even a small machine gets useful call
+/// parallelism (and an unmeasurable system stays protective).
+const CLAUDE_CALL_CONCURRENCY_FLOOR: usize = 4;
+
+/// Cap on the derived ceiling to keep process count and file-descriptor
+/// pressure sane no matter how much RAM the budget would otherwise permit.
+const CLAUDE_CALL_CONCURRENCY_CAP: usize = 64;
+
+/// Pure ceiling formula: `clamp(budget / per-process RSS, FLOOR, CAP)`, where
+/// the budget is a fixed fraction of total physical RAM. Side-effect-free and
+/// keyed only on `total_ram_bytes` so the clamp boundaries are unit-testable
+/// with injected RAM values, never the host's real memory.
+pub(crate) fn claude_call_concurrency_ceiling(total_ram_bytes: u64) -> usize {
+    let budget = total_ram_bytes / CLAUDE_CALL_RAM_BUDGET_DIVISOR;
+    let raw = (budget / CLAUDE_CALL_PROCESS_RSS_ESTIMATE) as usize;
+    raw.clamp(CLAUDE_CALL_CONCURRENCY_FLOOR, CLAUDE_CALL_CONCURRENCY_CAP)
+}
+
+/// Ceiling on simultaneous ephemeral (`cairn:~/calls`) `claude` processes,
+/// derived ONCE at startup from total physical RAM (see
+/// [`claude_call_concurrency_ceiling`]). Admission caps fan-out here so width
+/// stops translating into process count: at the derived ceiling an N-call
+/// fan-out queues onto the slots and Claude call memory stays bounded to
+/// `ceiling × ~450 MB` regardless of N. The cap exists to bound MEMORY, so it is
+/// sized to the machine's RAM rather than a fixed count (CAIRN-2557, superseding
+/// the fixed 6 of CAIRN-2548). When system memory is unmeasurable it falls back
+/// to the protective [`CLAUDE_CALL_CONCURRENCY_FLOOR`]. Computed via `LazyLock`
+/// on first access — the runner/server force and log it at startup.
+pub static CLAUDE_CALL_MAX_CONCURRENCY: std::sync::LazyLock<usize> = std::sync::LazyLock::new(
+    || {
+        let system = OsMemoryProbe.system_memory();
+        let ceiling = match system {
+            Some(mem) => claude_call_concurrency_ceiling(mem.total),
+            None => CLAUDE_CALL_CONCURRENCY_FLOOR,
+        };
+        log::info!(
+            "Claude ephemeral-call concurrency ceiling: {ceiling} (total physical RAM: {}, budget ~{}%, per-process estimate {} MB)",
+            system
+                .map(|m| format!("{} MiB", m.total / (1024 * 1024)))
+                .unwrap_or_else(|| "unmeasurable".to_string()),
+            100 / CLAUDE_CALL_RAM_BUDGET_DIVISOR,
+            CLAUDE_CALL_PROCESS_RSS_ESTIMATE / (1024 * 1024),
+        );
+        ceiling
+    },
+);
 
 /// State for tracking a durable streaming message.
 #[derive(Debug)]
@@ -858,7 +922,7 @@ impl AgentBackend for ClaudeBackend {
         // instruction layer reaches Claude exactly once — through the assembled
         // `project` segment, not also through CC auto-discovery.
         let prompt_segments = assemble_prompt_segments(
-            &crate::system_prompt::cairn_system_prompt(),
+            &crate::system_prompt::cairn_system_prompt(config.ambient),
             workspace_instructions.as_deref(),
             project_instructions.as_deref(),
             config.system_prompt_content.as_deref(),
@@ -1121,6 +1185,17 @@ impl AgentBackend for ClaudeBackend {
 
     fn supports_warm_processes(&self) -> bool {
         true
+    }
+
+    fn call_batch_capability(&self) -> crate::backends::CallBatchCapability {
+        // Claude is permanently CLI-bound: each ephemeral call is a dedicated
+        // `claude --print` process (~450 MB RSS). The admission ceiling is the
+        // only lever on fan-out memory, so cap concurrency here at a bound
+        // derived from physical RAM (CAIRN-2557).
+        crate::backends::CallBatchCapability {
+            shape: crate::backends::CallBatchShape::DedicatedProcess,
+            max_concurrency: Some(*CLAUDE_CALL_MAX_CONCURRENCY),
+        }
     }
 
     fn send_user_message(

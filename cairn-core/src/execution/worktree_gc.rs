@@ -68,7 +68,7 @@ pub(crate) async fn run_worktree_gc(orch: &Orchestrator) {
     // owning store.
     let mut reclaimed = 0usize;
     for db in orch.db.all_dbs().await {
-        match plan_gc_targets(&db, cutoff).await {
+        match plan_gc_targets(&db, &orch.db.local, cutoff).await {
             Ok(targets) => {
                 for target in &targets {
                     execute_target_cleanup(orch, &db, target).await;
@@ -98,8 +98,20 @@ pub(crate) async fn run_worktree_gc(orch: &Orchestrator) {
 /// Manager issue is long-lived and never terminalizes, so without this backstop
 /// an ephemeral task worktree would leak whenever the app died between task
 /// completion and the detached finalize reclaim. The idle cutoff still guards it.
+///
+/// Restartable-workflow exception (mirrors the finalize reclaim guard): a
+/// terminal ephemeral-owner **workflow** job keeps its `workflow_run` record
+/// across every restartable state (stop / fail / crash), and `restart_workflow`
+/// respawns into the worktree's persisted `working_dir` — so its worktree must
+/// survive while that record lives, or GC would strand a still-restartable
+/// workflow (the delayed form of the earlier finalize bug). Records live ONLY in
+/// the private DB (`local_db`) even when the job row is in a team replica, so the
+/// protected set is loaded from `local_db` and candidates are filtered against it
+/// here. Once the record is dropped (clean completion or the redispatch sweep),
+/// GC reclaims the job as the intended stray backstop.
 pub(crate) async fn plan_gc_targets(
     db: &LocalDb,
+    local_db: &LocalDb,
     cutoff: i64,
 ) -> Result<Vec<TeardownTarget>, String> {
     let rows: Vec<(String, String, Option<String>, String)> = db
@@ -130,7 +142,33 @@ pub(crate) async fn plan_gc_targets(
         })
         .await
         .map_err(|e| format!("Failed to load GC candidates: {e}"))?;
+    // A live workflow_run record marks a restartable workflow whose worktree
+    // Restart still needs; hold it back until the record is dropped.
+    let protected = load_restartable_workflow_job_ids(local_db).await?;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|(job_id, ..)| !protected.contains(job_id))
+        .collect();
     Ok(group_into_targets(rows))
+}
+
+/// The set of job ids with a live `workflow_run` re-dispatch record (private DB).
+/// These are restartable workflows whose ephemeral worktree must outlive bare
+/// terminalization — the GC exclusion set. Loaded in one query since the table is
+/// small (runner-transient) and the GC runs infrequently.
+async fn load_restartable_workflow_job_ids(db: &LocalDb) -> Result<HashSet<String>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn.query("SELECT job_id FROM workflow_run", ()).await?;
+            let mut out = HashSet::new();
+            while let Some(row) = rows.next().await? {
+                out.insert(row.text(0)?);
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to load restartable workflow job ids: {e}"))
 }
 
 /// Filesystem pass — remove unreferenced dirs and `*.trash-*` tombstones under the
@@ -750,10 +788,64 @@ mod tests {
         seed_issue(&db, "i-recent", 6, "merged").await;
         seed_job(&db, "j-recent", Some("i-recent"), "/wt/recent", recent).await;
 
-        let targets = plan_gc_targets(&db, cutoff).await.unwrap();
+        let targets = plan_gc_targets(&db, &db, cutoff).await.unwrap();
         assert_eq!(
             planned_paths(&targets),
             vec!["/wt/closed", "/wt/failed", "/wt/merged", "/wt/orphan"],
+        );
+    }
+
+    /// A terminal ephemeral-owner WORKFLOW job with a live `workflow_run` record
+    /// is a restartable workflow: its worktree must survive the GC backstop so
+    /// `restart_workflow` can respawn into the persisted `working_dir`. Once the
+    /// record is gone, GC reclaims it as the intended stray backstop. Mirrors the
+    /// finalize reclaim guard.
+    #[tokio::test]
+    async fn plan_gc_targets_spares_restartable_workflow_worktree_until_record_dropped() {
+        let db = migrated_db().await;
+        seed_project(&db).await;
+        let cutoff = 1000;
+        let old = 500;
+
+        // An ambient Manager issue stays `active` (long-lived), so ONLY the
+        // owns_ephemeral backstop clause can select this workflow job.
+        seed_issue(&db, "i-mgr", 1, "active").await;
+        db.execute(
+            "INSERT INTO jobs (id, status, project_id, issue_id, worktree_path, branch,
+                 owns_ephemeral_worktree, agent_config_id, created_at, updated_at)
+             VALUES ('j-wf', 'failed', 'p-1', 'i-mgr', '/wt/wf', 'agent/task-j-wf',
+                 1, 'workflow', 1, ?1)",
+            params![old],
+        )
+        .await
+        .unwrap();
+        // Its live re-dispatch record (kept because the run is restartable).
+        db.execute(
+            "INSERT INTO workflow_run (run_id, job_id, session_id, workflow_id, script_path,
+                 args_json, working_dir, output_name, node_path, created_at)
+             VALUES ('wf-run', 'j-wf', 'sess', 'repo-reader', '/wf/main.ts', '{}',
+                 '/wt/wf', 'return', NULL, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        // With the record present, the worktree is spared.
+        let targets = plan_gc_targets(&db, &db, cutoff).await.unwrap();
+        assert!(
+            planned_paths(&targets).is_empty(),
+            "a restartable workflow worktree must not be GC-planned while its record lives"
+        );
+
+        // Drop the record: now GC reclaims it as the intended stray backstop.
+        db.execute("DELETE FROM workflow_run WHERE job_id = 'j-wf'", ())
+            .await
+            .unwrap();
+        let targets = plan_gc_targets(&db, &db, cutoff).await.unwrap();
+        assert_eq!(
+            planned_paths(&targets),
+            vec!["/wt/wf"],
+            "once the record is dropped, the stray ephemeral worktree is reclaimed"
         );
     }
 

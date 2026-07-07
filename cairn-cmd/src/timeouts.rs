@@ -122,6 +122,7 @@ mod tests {
 
     fn callback_request(tool: &str, payload: serde_json::Value) -> CallbackRequest {
         CallbackRequest {
+            thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: None,
             tool: tool.to_string(),

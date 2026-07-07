@@ -1,8 +1,10 @@
 //! OpenRouter chat-completions wire types: request/response DTOs, the streaming
-//! chunk shapes, the aggregator that rebuilds a response from SSE deltas, and the
-//! usage payload. Pure data plus (de)serialization; no HTTP or orchestrator state.
+//! chunk shapes, and the aggregator that rebuilds a response from SSE deltas.
+//! Pure data plus (de)serialization; no HTTP or orchestrator state. The usage
+//! payload is the neutral `http_loop::TurnUsage` (its field names/serde match the
+//! OpenAI/OpenRouter wire), so a streamed response deserializes straight into it.
 
-use crate::agent_process::stream::TokenCounts;
+use crate::backends::http_loop::TurnUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -60,7 +62,7 @@ pub(super) struct ChatResponse {
     pub(super) model: Option<String>,
     pub(super) choices: Vec<ChatChoice>,
     #[serde(default)]
-    pub(super) usage: Option<OpenRouterUsage>,
+    pub(super) usage: Option<TurnUsage>,
     #[serde(default)]
     pub(super) streamed_text: bool,
     // The generation's terminal finish_reason (e.g. "tool_calls", "stop",
@@ -102,7 +104,7 @@ pub(super) struct ChatStreamChunk {
     #[serde(default)]
     pub(super) choices: Vec<ChatStreamChoice>,
     #[serde(default)]
-    pub(super) usage: Option<OpenRouterUsage>,
+    pub(super) usage: Option<TurnUsage>,
     #[serde(default)]
     pub(super) error: Option<StreamError>,
 }
@@ -183,7 +185,7 @@ pub(super) struct StreamingAggregate {
     pub(super) reasoning: String,
     pub(super) reasoning_details: Vec<ReasoningDetailBuilder>,
     pub(super) tool_calls: Vec<StreamingToolCallBuilder>,
-    pub(super) usage: Option<OpenRouterUsage>,
+    pub(super) usage: Option<TurnUsage>,
     pub(super) finish_reason: Option<String>,
 }
 
@@ -376,48 +378,6 @@ impl StreamingAggregate {
             usage: self.usage,
             streamed_text,
             finish_reason: self.finish_reason,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct OpenRouterUsage {
-    #[serde(default)]
-    pub(super) prompt_tokens: Option<i32>,
-    #[serde(default)]
-    pub(super) completion_tokens: Option<i32>,
-    #[serde(default)]
-    pub(super) total_tokens: Option<i32>,
-    #[serde(default)]
-    pub(super) reasoning_tokens: Option<i32>,
-    #[serde(default)]
-    pub(super) prompt_tokens_details: Option<Value>,
-    #[serde(default)]
-    pub(super) completion_tokens_details: Option<Value>,
-    #[serde(default)]
-    pub(super) cost: Option<f64>,
-    #[serde(default)]
-    pub(super) cost_details: Option<Value>,
-}
-
-impl OpenRouterUsage {
-    pub(super) fn token_counts(&self) -> TokenCounts {
-        TokenCounts {
-            input: self.prompt_tokens,
-            output: self.completion_tokens,
-            cache_read: self.prompt_tokens_details.as_ref().and_then(|v| {
-                v.get("cached_tokens")
-                    .and_then(Value::as_i64)
-                    .map(|n| n as i32)
-            }),
-            cache_create: None,
-            thinking: self.reasoning_tokens.or_else(|| {
-                self.completion_tokens_details.as_ref().and_then(|v| {
-                    v.get("reasoning_tokens")
-                        .and_then(Value::as_i64)
-                        .map(|n| n as i32)
-                })
-            }),
         }
     }
 }

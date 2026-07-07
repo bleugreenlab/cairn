@@ -7,7 +7,8 @@ use crate::execution::delegation::{
     DelegatedTaskPayload, SpawnCallPacketsInput, SpawnTaskPacketsInput, SpawnWorkflowPacketsInput,
 };
 use crate::execution::jobs::{
-    prepare_call_run, prepare_workflow_run, start_call_run, start_workflow_run, CreateCallRunInput,
+    prepare_call_run, prepare_workflow_run, reclaim_ephemeral_call_worktree,
+    reclaim_ephemeral_workflow_worktree, start_call_run, start_workflow_run, CreateCallRunInput,
     CreateWorkflowRunInput,
 };
 use crate::models::{AgentConfig, DelegatedStatus, Model};
@@ -448,11 +449,15 @@ pub async fn spawn_call_packets(
         .await
         {
             Ok(packet) => packet,
-            Err(e) => err!(e),
+            Err(e) => {
+                reclaim_ephemeral_call_worktree(orch, &prepared).await;
+                err!(e);
+            }
         };
 
         // 3. Start the backend session now that the packet exists.
         if let Err(e) = start_call_run(orch, &prepared) {
+            reclaim_ephemeral_call_worktree(orch, &prepared).await;
             err!(e);
         }
 
@@ -810,11 +815,15 @@ pub async fn spawn_workflow_packets(
     .await
     {
         Ok(packet) => packet,
-        Err(e) => err!(e),
+        Err(e) => {
+            reclaim_ephemeral_workflow_worktree(orch, &prepared).await;
+            err!(e);
+        }
     };
 
     // 3. Spawn the supervised bun process now that the packet exists.
     if let Err(e) = start_workflow_run(orch, &prepared) {
+        reclaim_ephemeral_workflow_worktree(orch, &prepared).await;
         err!(e);
     }
 

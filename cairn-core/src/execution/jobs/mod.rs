@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod call_admission;
 mod calls;
 mod child_tasks;
 mod config_loading;
@@ -54,10 +55,16 @@ mod turns;
 mod workflow;
 mod worktrees;
 
-pub(crate) use calls::{prepare_call_run, start_call_run};
+pub(crate) use call_admission::CallAdmission;
+pub(crate) use calls::{
+    on_call_run_finalized, prepare_call_run, reclaim_ephemeral_call_worktree, start_call_run,
+};
 // The per-call Restart action reaches this via
 // `cairn_core::internal::execution::jobs::restart_call`.
 pub use calls::restart_call;
+// Startup call recovery (CAIRN-2548): the always-on hosts call this via
+// `cairn_core::internal::...` through the Orchestrator method.
+pub(crate) use calls::fail_orphaned_calls_on_startup;
 pub use child_tasks::create_child_task;
 pub(crate) use inputs::{
     find_downstream_artifact_schema_conn, find_downstream_artifact_schema_with_snapshot_conn,
@@ -70,8 +77,9 @@ pub use lifecycle::{continue_job_impl, on_job_complete_impl, prepare_job, Resume
 pub use slash_commands::resolve_skill_slash_command;
 pub use snapshots::store_tool_result_event_with_turn;
 pub(crate) use workflow::{
-    delete_workflow_run_row, prepare_workflow_run, redispatch_crashed_workflows,
-    start_workflow_run, CreateWorkflowRunInput,
+    delete_workflow_run_row, prepare_workflow_run, reclaim_ephemeral_workflow_worktree,
+    redispatch_crashed_workflows, start_workflow_run, workflow_run_record_exists,
+    CreateWorkflowRunInput,
 };
 // The header Restart action reaches this from the host crates via
 // `cairn_core::internal::execution::jobs::restart_workflow`.
@@ -156,6 +164,10 @@ pub struct CreateCallRunInput {
 /// A prepared ephemeral call run: all DB rows and the transcript seed exist, but
 /// the backend session has not started yet (the caller persists the call packet
 /// first, then calls [`start_call_run`]).
+///
+/// `Clone` because the admission seam clones a queued call onto its VecDeque
+/// while the spawn path still reads the borrowed original after `start_call_run`.
+#[derive(Clone)]
 pub struct PreparedCallRun {
     pub job_id: String,
     pub run_id: String,
@@ -167,6 +179,10 @@ pub struct PreparedCallRun {
     pub output_schema: OutputSchemaInfo,
     pub execution_id: Option<String>,
     pub worktree_path: Option<String>,
+    /// True when this call minted its own ephemeral worktree (an Inherit call
+    /// from an ambient, no-worktree parent). Drives the startup-failure reclaim
+    /// in the spawn path so a call that never starts cannot strand a worktree.
+    pub owns_ephemeral_worktree: bool,
 }
 
 /// Everything needed by the host layer to spawn a Claude process for a job.

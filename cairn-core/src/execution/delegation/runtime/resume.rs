@@ -534,6 +534,49 @@ async fn claim_pending_successor(
     .map_err(|e| format!("Failed to claim resume successor: {}", e))
 }
 
+/// Whether `job_id` belongs to a one-shot ephemeral `CallTool` packet.
+///
+/// A call child is created directly with a pre-materialized `CallTool` packet
+/// (CAIRN-2481) whose `result_artifact_job_id` is the call's own job id; it is
+/// never resumed, so once its work completes it should be reaped rather than
+/// left warm (CAIRN-2543). Reuses the same snapshot lookup as
+/// `resume_suspended_parent_after_task_completion` — finds the packet by child
+/// job id and inspects its origin. Returns false on any lookup failure (fail
+/// safe: an unclassifiable job stays warm and is governed by the GC budget).
+pub fn is_call_child(orch: &Orchestrator, job_id: &str) -> bool {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    block_on(async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(execution_id) =
+            select_optional_text(&db, "SELECT execution_id FROM jobs WHERE id = ?1", &job_id)
+                .await
+                .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let Some(snapshot_json) = select_optional_text(
+            &db,
+            "SELECT snapshot FROM executions WHERE id = ?1",
+            &execution_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        let snapshot: ExecutionSnapshot =
+            serde_json::from_str(&snapshot_json).map_err(|e| e.to_string())?;
+        Ok(snapshot.delegated_packets.iter().any(|packet| {
+            packet.result_artifact_job_id.as_deref() == Some(job_id.as_str())
+                && packet.origin == crate::models::DelegationOrigin::CallTool
+        }))
+    })
+    .unwrap_or(false)
+}
+
 pub fn resume_suspended_parent_after_task_completion(
     orch: &Orchestrator,
     child_job_id: &str,
@@ -1337,5 +1380,94 @@ mod background_completion_tests {
         assert_eq!(pushes.len(), 1);
         assert_eq!(pushes[0].key, TASKS_KEY);
         assert_eq!(pushes[0].wake, Wake::Wake);
+    }
+
+    /// Snapshot carrying a CallTool packet (`j-call`) and a TaskTool packet
+    /// (`j-task`), so `is_call_child` can be checked against both origins.
+    fn mixed_origin_snapshot() -> String {
+        let packet = |pid: &str, cjob: &str, origin: &str| {
+            serde_json::json!({
+                "id": pid,
+                "parentJobId": "j-parent",
+                "parentTurnId": ANCHOR,
+                "origin": origin,
+                "title": "Explore",
+                "problemStatement": "x",
+                "agentConfigId": "Explore",
+                "ownership": { "cwd": "/tmp" },
+                "outputContract": { "schemaType": "return" },
+                "status": "materialized",
+                "resultArtifactJobId": cjob,
+                "background": false,
+                "createdAt": 0
+            })
+        };
+        serde_json::json!({
+            "recipe": {"id":"r","name":"R","description":null,"trigger":"manual","nodes":[],"edges":[]},
+            "agents": {},
+            "skills": {},
+            "triggerContext": {"issueId":"i","projectId":"p","triggerType":"manual"},
+            "delegatedPackets": [
+                packet("pkt-call", "j-call", "call_tool"),
+                packet("pkt-task", "j-task", "task_tool"),
+            ],
+            "createdAt": 0
+        })
+        .to_string()
+    }
+
+    /// `is_call_child` is true only for a job materialized from a CallTool
+    /// packet; a TaskTool child and an unknown job are false (so the warm-path
+    /// reaper never kills a resumable task or a job it cannot classify).
+    #[tokio::test]
+    async fn is_call_child_distinguishes_call_from_task() {
+        let db = crate::storage::migrated_test_db("is-call-child.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','PRJ','/tmp/repo',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
+               VALUES('i','p',7,'I','active','active','none',1,1);",
+        )
+        .await
+        .unwrap();
+        let snap = mixed_origin_snapshot();
+        db.write(move |conn| {
+            let snap = snap.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,snapshot)
+                     VALUES('e','r','i','p','running',1,1,?1)",
+                    (snap.as_str(),),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id,execution_id,project_id,issue_id,status,uri_segment,node_name,created_at,updated_at)
+                     VALUES('j-parent','e','p','i','running','builder','builder',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id,execution_id,project_id,issue_id,status,uri_segment,node_name,parent_job_id,created_at,updated_at)
+                     VALUES('j-call','e','p','i','complete','j-call','Explore','j-parent',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO jobs(id,execution_id,project_id,issue_id,status,uri_segment,node_name,parent_job_id,created_at,updated_at)
+                     VALUES('j-task','e','p','i','complete','j-task','Explore','j-parent',1,1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db);
+
+        assert!(super::is_call_child(&orch, "j-call"));
+        assert!(!super::is_call_child(&orch, "j-task"));
+        assert!(!super::is_call_child(&orch, "j-missing"));
     }
 }

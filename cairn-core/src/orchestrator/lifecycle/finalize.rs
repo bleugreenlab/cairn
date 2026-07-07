@@ -104,6 +104,10 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
         //    wait's pending set.
         let _ = orch.run_completions.send(run_id.to_string());
 
+        // A one-shot ephemeral call child is never resumed; once its work is
+        // done, reap it instead of leaving it in the warm pool (CAIRN-2543).
+        maybe_kill_completed_call_child(orch, run_id);
+
         true
     } else {
         log::warn!(
@@ -350,6 +354,65 @@ async fn latest_artifact_data(
     .map_err(|e| e.to_string())
 }
 
+/// Reap a completed one-shot `CallTool` child instead of leaving it warm.
+///
+/// A call child is created for an ephemeral agent call (a `write` to a node's
+/// calls collection); it produces a single result artifact and is never
+/// resumed, so keeping its process warm only holds memory (CAIRN-2543). Runs
+/// after the warm-transition completion tail, guarded so a call still awaiting
+/// its first-artifact memory review stays warm — the GC's own protection covers
+/// that, and this check re-fires and reaps it at the review turn's own warm
+/// transition. The kill is detached so it never blocks the turn from ending.
+fn maybe_kill_completed_call_child(orch: &Orchestrator, run_id: &str) {
+    let Some(job_id) = job_id_for_run(orch, run_id) else {
+        return;
+    };
+    if !crate::execution::delegation::is_call_child(orch, &job_id) {
+        return;
+    }
+    let status = blocking_text_lookup(
+        orch,
+        &job_id,
+        "SELECT status FROM jobs WHERE id = ?1",
+        TextColumn::Optional,
+    );
+    if !matches!(
+        status.as_deref(),
+        Some("complete") | Some("failed") | Some("cancelled")
+    ) {
+        return;
+    }
+    // A pending memory review must complete before the process is reaped; the
+    // review turn's warm transition re-fires this check and kills it then.
+    let review_state = blocking_text_lookup(
+        orch,
+        &job_id,
+        "SELECT memory_review_state FROM jobs WHERE id = ?1",
+        TextColumn::Optional,
+    );
+    if review_state.as_deref() == Some("sent") {
+        return;
+    }
+    log::info!(
+        "Reaping completed call child run {} (call_complete): a one-shot call is never resumed",
+        &run_id[..run_id.len().min(8)]
+    );
+    let orch = orch.clone();
+    let run_id = run_id.to_string();
+    detach_onto_runtime(
+        async move {
+            if let Err(e) = crate::orchestrator::lifecycle::kill_session_with_reason(
+                &orch,
+                &run_id,
+                "call_complete",
+            ) {
+                log::warn!("Failed to reap completed call child {}: {}", run_id, e);
+            }
+        },
+        || {},
+    );
+}
+
 fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
     let Some(job_id) = job_id_for_run(orch, run_id) else {
         return;
@@ -431,19 +494,43 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
 
 /// Reclaim a task's ephemeral worktree the moment its owning job terminalizes.
 ///
-/// A task delegated by an ambient (no-worktree) parent runs in its own throwaway
-/// worktree marked `owns_ephemeral_worktree`; it has no PR machinery, so nothing
-/// else tears it down. When the job reaches a terminal status, discard that one
-/// worktree — detached so it never blocks the turn from ending. A task suspended
-/// waiting on its own sub-tasks is not terminal, so this cannot fire while
-/// inheritors still share the worktree; by the time the task terminalizes they
-/// already have. Both turn-end sites (warm transition and run finalize) call this
-/// after recompute so a clean completion and a crash are covered.
+/// A task (or Inherit-mode call/workflow) delegated by an ambient (no-worktree)
+/// parent runs in its own throwaway worktree marked `owns_ephemeral_worktree`; it
+/// has no PR machinery, so nothing else tears it down. When the job reaches a
+/// terminal status, discard that one worktree — detached so it never blocks the
+/// turn from ending. A task suspended waiting on its own sub-tasks is not
+/// terminal, so this cannot fire while inheritors still share the worktree; by
+/// the time the task terminalizes they already have. Both turn-end sites (warm
+/// transition and run finalize) call this after recompute so a clean completion
+/// and a crash are covered.
+///
+/// Exception for a restartable workflow: a workflow keeps a `workflow_run`
+/// re-dispatch record across every *restartable* terminal state (deliberate
+/// stop / script failure / crash) and drops it only on clean completion, and
+/// `restart_workflow` respawns into the worktree's persisted `working_dir`. So
+/// while that record still exists the worktree must survive — the reclaim is
+/// bound to the record's lifetime, not to bare terminalization. Clean completion
+/// clears the record *before* `finalize_run`, so the reclaim still fires then;
+/// the worktree GC's terminal-`owns_ephemeral_worktree` backstop catches any
+/// stray a never-restarted, record-dropped workflow leaves behind.
 fn maybe_reclaim_ephemeral_task_worktree(orch: &Orchestrator, job_id: &str) {
     let Some((status, owns)) = load_job_status_and_ephemeral(orch, job_id) else {
         return;
     };
     if !owns || !matches!(status.as_str(), "complete" | "failed" | "cancelled") {
+        return;
+    }
+    // A surviving workflow_run record marks a restartable workflow whose worktree
+    // Restart still needs; defer reclaim until the record is dropped.
+    let record_exists = crate::storage::run_db_blocking({
+        let db = orch.db.local.clone();
+        let job_id = job_id.to_string();
+        move || async move {
+            crate::execution::jobs::workflow_run_record_exists(&db, &job_id).await
+        }
+    })
+    .unwrap_or(false);
+    if record_exists {
         return;
     }
     let orch = orch.clone();
@@ -560,6 +647,11 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     if let Err(e) = transition_run(orch, run_id, status.clone()) {
         log::error!("Failed to transition run {}: {}", run_id, e);
     }
+
+    // Release this run's call-admission slot (if it held one) and start the next
+    // queued call. No-op for uncapped/non-call runs; idempotent. Tied to the
+    // finalize choke so a crashed/killed call cannot leak its slot.
+    crate::execution::jobs::on_call_run_finalized(orch, run_id);
 
     let job_id = job_id_for_run(orch, run_id);
 

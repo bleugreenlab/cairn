@@ -45,6 +45,7 @@ async fn set_project_repo_path(db: &LocalDb, repo_path: &std::path::Path) {
 
 async fn change_resource_as_run(orch: &Orchestrator, changes: Value, run_id: &str) -> String {
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: Some(run_id.to_string()),
         tool: "write".to_string(),

@@ -119,7 +119,23 @@ impl CairnCmd {
         rendered
     }
 
+    #[cfg(test)]
     fn resolve_target(&self, target: &str) -> Result<ResolvedTarget, String> {
+        self.resolve_target_with(target, false)
+    }
+
+    /// Resolve a target, optionally suppressing client-side `cairn:~/` expansion.
+    ///
+    /// On the pooled Codex path (CAIRN-2549) one shared `cairn-cmd` serves N call
+    /// threads whose homes differ from this process's `home_uri` env, so a
+    /// `cairn:~/` target MUST NOT be expanded here — it is forwarded RAW (with a
+    /// `thread_id` on the request) for the host to expand from the thread-resolved
+    /// run, exactly as the SDK/harness writers already do. Every other target
+    /// (canonical `cairn://`, `file:`) resolves identically to the non-pooled path.
+    fn resolve_target_with(&self, target: &str, pooled: bool) -> Result<ResolvedTarget, String> {
+        if pooled && (target == "cairn:~" || target.starts_with(CAIRN_HOME_PREFIX)) {
+            return Ok(ResolvedTarget::CairnUri(target.to_string()));
+        }
         if target.starts_with(CAIRN_URI_PREFIX) {
             if parse_cairn_uri(target).is_none() {
                 return Err(format!("Invalid cairn resource URI: {}", target));
@@ -157,9 +173,18 @@ impl CairnCmd {
         Err(invalid_target_message(target))
     }
 
+    #[cfg(test)]
     pub(crate) fn rewrite_change_targets(
         &self,
         input: &ChangeInput,
+    ) -> Result<ChangeInput, String> {
+        self.rewrite_change_targets_with(input, false)
+    }
+
+    pub(crate) fn rewrite_change_targets_with(
+        &self,
+        input: &ChangeInput,
+        pooled: bool,
     ) -> Result<ChangeInput, String> {
         let mut rewritten = input.clone();
         // Targets are guaranteed present by `validate_change_value`, which runs
@@ -167,7 +192,7 @@ impl CairnCmd {
         if let Some(changes) = rewritten.changes.as_mut() {
             for change in changes.iter_mut() {
                 if let Some(target) = change.target.as_ref() {
-                    let resolved = match self.resolve_target(target)? {
+                    let resolved = match self.resolve_target_with(target, pooled)? {
                         ResolvedTarget::CairnUri(uri) | ResolvedTarget::FileUri(uri) => uri,
                     };
                     change.target = Some(resolved);
@@ -177,9 +202,18 @@ impl CairnCmd {
         Ok(rewritten)
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve_read_target(&self, target: &str) -> Result<String, String> {
+        self.resolve_read_target_with(target, false)
+    }
+
+    pub(crate) fn resolve_read_target_with(
+        &self,
+        target: &str,
+        pooled: bool,
+    ) -> Result<String, String> {
         let split = split_target_query(target)?;
-        let resolved = match self.resolve_target(&split.identity)? {
+        let resolved = match self.resolve_target_with(&split.identity, pooled)? {
             ResolvedTarget::CairnUri(uri) | ResolvedTarget::FileUri(uri) => uri,
         };
 
@@ -358,6 +392,58 @@ mod tests {
         assert_eq!(
             mcp.relativize_cairn_uri_for_display("cairn://p/CAIRN/1086/1/builder/chat"),
             "cairn:~/chat"
+        );
+    }
+
+    // Pooled Codex path (CAIRN-2549): `cairn:~/` MUST NOT be expanded against
+    // this process's home_uri (one shared cairn-cmd serves N call threads with
+    // different homes); it is forwarded RAW for the host to expand from the
+    // thread-resolved run. Canonical and file targets resolve identically.
+    #[test]
+    fn pooled_resolve_forwards_home_shorthand_raw() {
+        let mcp = create_test_mcp_with_home_uri(Some("cairn://p/CAIRN/1086/1/builder"));
+
+        // Non-pooled expands against the process home.
+        assert_eq!(
+            mcp.resolve_read_target_with("cairn:~/return", false)
+                .unwrap(),
+            "cairn://p/CAIRN/1086/1/builder/return"
+        );
+        // Pooled forwards raw.
+        assert_eq!(
+            mcp.resolve_read_target_with("cairn:~/return", true)
+                .unwrap(),
+            "cairn:~/return"
+        );
+        assert_eq!(
+            mcp.resolve_read_target_with("cairn:~/return?limit=5", true)
+                .unwrap(),
+            "cairn:~/return?limit=5"
+        );
+        // Canonical + file targets are unchanged on the pooled path.
+        assert_eq!(
+            mcp.resolve_read_target_with("cairn://p/OTHER/9", true)
+                .unwrap(),
+            "cairn://p/OTHER/9"
+        );
+        assert_eq!(
+            mcp.resolve_read_target_with("file:src/lib.rs", true)
+                .unwrap(),
+            "file:src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn pooled_rewrite_change_targets_forwards_home_shorthand_raw() {
+        let mcp = create_test_mcp_with_home_uri(Some("cairn://p/CAIRN/1086/1/builder"));
+        let input: ChangeInput = serde_json::from_value(serde_json::json!({
+            "changes": [{ "target": "cairn:~/return", "mode": "append", "payload": {} }]
+        }))
+        .unwrap();
+        let rewritten = mcp.rewrite_change_targets_with(&input, true).unwrap();
+        assert_eq!(
+            rewritten.changes.unwrap()[0].target.as_deref(),
+            Some("cairn:~/return")
         );
     }
 

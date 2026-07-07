@@ -112,6 +112,13 @@ pub struct Settings {
     /// normal routing.
     #[serde(default)]
     pub openrouter_routing: OpenRouterRouting,
+    /// Route tier-based ephemeral calls through OpenRouter's in-process HTTP loop
+    /// instead of the native backend (Claude/Codex CLI). Opt-in, default false:
+    /// it moves billing from a CLI subscription to OpenRouter API credit, so it
+    /// must be a deliberate user choice. Only tier-based calls are re-routed; a
+    /// call pinned to a concrete native model stays native.
+    #[serde(default, rename = "routeCallsViaOpenRouter")]
+    pub route_calls_via_openrouter: bool,
 }
 
 /// DTO for updating settings.
@@ -158,4 +165,8 @@ pub struct UpdateSettings {
     pub subscription_fees: Option<HashMap<String, f64>>,
     /// OpenRouter provider-routing controls (replaces the whole object).
     pub openrouter_routing: Option<OpenRouterRouting>,
+    /// Opt-in: route tier-based ephemeral calls through OpenRouter's in-process
+    /// loop instead of the native backend. Default false.
+    #[serde(rename = "routeCallsViaOpenRouter")]
+    pub route_calls_via_openrouter: Option<bool>,
 }

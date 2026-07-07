@@ -281,6 +281,7 @@ async fn count_job_chat_turns(db: &LocalDb, job_id: &str) -> i64 {
 /// envelope) or an empty body, so the caller can fall back to a bare pointer.
 async fn resolve_uri_to_markdown(orch: &Orchestrator, uri: &str) -> Option<String> {
     let request = crate::mcp::types::McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "read_batch".to_string(),

@@ -68,6 +68,7 @@ async fn change_target(
     preview: bool,
 ) -> String {
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: std::env::temp_dir().to_string_lossy().to_string(),
         run_id: None,
         tool: "write".to_string(),

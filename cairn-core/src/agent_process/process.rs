@@ -439,6 +439,18 @@ pub type ProcessMap = RunRegistry;
 // AgentProcessState
 // ============================================================================
 
+/// A warm (live + idle) process surfaced for garbage collection: its run id,
+/// OS pid (present while the child handle is still attached), idle duration, and
+/// owning job. The pid lets the memory-aware GC size the warm pool against real
+/// RSS instead of an arbitrary count (CAIRN-2543).
+#[derive(Debug, Clone)]
+pub struct WarmProcess {
+    pub run_id: String,
+    pub pid: Option<u32>,
+    pub seconds_since_activity: u64,
+    pub job_id: Option<String>,
+}
+
 /// State for tracking active agent processes
 pub struct AgentProcessState {
     /// Active processes keyed by run_id
@@ -618,20 +630,34 @@ impl AgentProcessState {
     }
 
     /// Get list of GC-safe (idle) processes, sorted by last activity (oldest first).
-    pub fn warm_processes(&self) -> Vec<(String, u64, Option<String>)> {
+    ///
+    /// The pid is read from the still-attached child handle so the memory-aware
+    /// GC can measure each warm process's RSS; a process whose child handle was
+    /// already taken (e.g. mid-teardown) reports `None` and the GC imputes its
+    /// size from measured siblings.
+    pub fn warm_processes(&self) -> Vec<WarmProcess> {
         let processes = match self.processes.lock() {
             Ok(p) => p,
             Err(_) => return vec![],
         };
 
-        let mut warm: Vec<_> = processes
+        let mut warm: Vec<WarmProcess> = processes
             .iter()
             .filter(|(_, p)| p.is_warm())
-            .map(|(run_id, p)| (run_id.clone(), p.seconds_since_activity(), p.job_id.clone()))
+            .map(|(run_id, p)| WarmProcess {
+                run_id: run_id.clone(),
+                pid: p
+                    .child
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|child| child.id())),
+                seconds_since_activity: p.seconds_since_activity(),
+                job_id: p.job_id.clone(),
+            })
             .collect();
 
         // Sort by seconds since activity (oldest first)
-        warm.sort_by_key(|(_, secs, _)| *secs);
+        warm.sort_by_key(|w| w.seconds_since_activity);
 
         warm
     }

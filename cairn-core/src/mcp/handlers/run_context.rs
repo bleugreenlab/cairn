@@ -313,6 +313,7 @@ mod tests {
 
     fn request_for_run(run_id: &str) -> CallbackRequest {
         CallbackRequest {
+            thread_id: None,
             run_id: Some(run_id.to_string()),
             ..Default::default()
         }

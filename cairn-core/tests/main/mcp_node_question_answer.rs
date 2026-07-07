@@ -60,6 +60,7 @@ async fn insert_question_fixture(db: &LocalDb) {
 
 fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "write".to_string(),
@@ -127,6 +128,7 @@ async fn pending_question_read_shows_answer_action() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
@@ -160,6 +162,7 @@ async fn file_read_returns_structured_text_without_implicit_2000_line_cap() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            thread_id: None,
             cwd: temp.path().display().to_string(),
             run_id: None,
             tool: "read".to_string(),
@@ -188,6 +191,7 @@ async fn file_read_preview_is_bounded_but_reports_true_total() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            thread_id: None,
             cwd: temp.path().display().to_string(),
             run_id: None,
             tool: "read".to_string(),
@@ -217,6 +221,7 @@ async fn file_read_negative_offset_resolves_to_tail_window() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            thread_id: None,
             cwd: temp.path().display().to_string(),
             run_id: None,
             tool: "read".to_string(),

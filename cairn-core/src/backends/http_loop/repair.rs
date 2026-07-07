@@ -1,18 +1,19 @@
-//! Deterministic, model-free repair of tool calls emitted by the OpenRouter
-//! chat-completions loop.
+//! Deterministic, model-free repair of tool calls emitted by the in-process
+//! HTTP chat-completions turn loop.
 //!
-//! OpenRouter is the only backend where Cairn drives the turn loop and parses
-//! raw tool-call JSON itself (Claude and Codex own their own model conversations
-//! through their CLIs), so smaller models occasionally emit a mangled tool name
-//! or truncated/garbled argument JSON. These pure functions repair what is
-//! cheaply repairable and degrade the rest gracefully: an unrepairable name
-//! yields `None` (the caller surfaces "unknown tool") and unrepairable arguments
-//! yield `None` (the caller surfaces a retry message). Nothing here panics or
-//! re-invokes the model, so a single bad tool call can never crash the run.
+//! HTTP-loop backends are the only ones where Cairn drives the turn loop and
+//! parses raw tool-call JSON itself (Claude and Codex own their own model
+//! conversations through their CLIs), so smaller models occasionally emit a
+//! mangled tool name or truncated/garbled argument JSON. These pure functions
+//! repair what is cheaply repairable and degrade the rest gracefully: an
+//! unrepairable name yields `None` (the caller surfaces "unknown tool") and
+//! unrepairable arguments yield `None` (the caller surfaces a retry message).
+//! Nothing here panics or re-invokes the model, so a single bad tool call can
+//! never crash the run. OpenRouter is the only adapter using this today.
 
 use serde_json::Value;
 
-/// The three verbs the OpenRouter backend dispatches.
+/// The three verbs the HTTP-loop backend dispatches.
 const VERBS: [&str; 3] = ["read", "write", "run"];
 
 /// Cutoff for the fuzzy (normalized edit-distance) tool-name match. Mirrors
@@ -27,7 +28,7 @@ const FUZZY_CUTOFF: f64 = 0.7;
 /// exact match, an alias map, and finally a fuzzy edit-distance match. Returns
 /// `None` when nothing matches confidently so the caller can tell the model the
 /// valid names.
-pub(super) fn normalize_tool_name(raw: &str) -> Option<&'static str> {
+pub(in crate::backends) fn normalize_tool_name(raw: &str) -> Option<&'static str> {
     let cleaned = clean_name(raw);
     if cleaned.is_empty() {
         return None;
@@ -109,7 +110,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// load-bearing: a truncated `write`/`run` must NOT be dispatched, because
 /// synthesizing the missing closers fabricates a payload the model never
 /// finished emitting (a file whose content is cut off, a half-formed command).
-pub(super) enum ParsedArguments {
+pub(in crate::backends) enum ParsedArguments {
     /// Parsed as-is or after cosmetic-only repair (Markdown code fences, trailing
     /// commas). The JSON was complete; safe to dispatch. `repaired` records
     /// whether any cosmetic fix was applied.
@@ -125,7 +126,7 @@ pub(super) enum ParsedArguments {
 impl ParsedArguments {
     /// Best-effort value for the stored transcript (never panics). Unrecoverable
     /// arguments surface as JSON null, matching the prior transcript fallback.
-    pub(super) fn value(&self) -> Value {
+    pub(in crate::backends) fn value(&self) -> Value {
         match self {
             ParsedArguments::Ready { value, .. } | ParsedArguments::Truncated { value } => {
                 value.clone()
@@ -140,7 +141,7 @@ impl ParsedArguments {
 /// Cosmetic repairs (fences, trailing commas) keep the result `Ready` because
 /// the JSON was complete; only synthesizing closers (the truncation case) yields
 /// `Truncated`, so the caller can refuse to dispatch a side-effecting partial.
-pub(super) fn parse_tool_arguments(raw: &str) -> ParsedArguments {
+pub(in crate::backends) fn parse_tool_arguments(raw: &str) -> ParsedArguments {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return ParsedArguments::Ready {

@@ -527,6 +527,7 @@ mod snapshot_edit_guard_tests {
 
     fn request(run_id: Option<&str>) -> CallbackRequest {
         CallbackRequest {
+            thread_id: None,
             cwd: "/tmp/no-such-worktree".to_string(),
             run_id: run_id.map(str::to_string),
             tool: "change".to_string(),

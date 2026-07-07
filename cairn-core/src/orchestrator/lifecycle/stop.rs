@@ -704,6 +704,12 @@ pub(crate) fn stop_session_internal(
             if let Err(error) = transition_run(orch, run_id, RunStatus::Exited) {
                 log::warn!("Failed to finalize stopped stale run {}: {}", run_id, error);
             }
+            // This reconcile early-return transitions to Exited WITHOUT reaching
+            // finalize_run, so a queued call killed here (status `starting`, no
+            // process handle) would otherwise be stranded in its admission queue.
+            // Dequeue it explicitly; `release` is idempotent so the finalize hook
+            // covering the normal path stays harmless.
+            crate::execution::jobs::on_call_run_finalized(orch, run_id);
             let _ = orch
                 .services
                 .emitter

@@ -220,6 +220,12 @@ struct SessionDbContext {
     /// living-doc targets for the prompt affordance. `None` for sub-agent task
     /// jobs with no recipe node.
     recipe_node_id: Option<String>,
+    /// The run's job worktree path. `None` for an ambient (no-worktree) job that
+    /// runs directly on the project's live checkout, and also for scratch-dir
+    /// (`CallWorktree::None`) calls/workflows — the two are told apart at the
+    /// orientation-block assembly site by comparing `working_dir` to the repo root
+    /// (see [`is_ambient_run`]).
+    worktree_path: Option<String>,
 }
 
 fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbContext, String> {
@@ -243,7 +249,8 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                                 parent_jobs.uri_segment AS parent_uri_segment,
                                 COALESCE(jobs.base_branch, projects.default_branch) AS effective_base_branch,
                                 runs.job_id,
-                                jobs.recipe_node_id
+                                jobs.recipe_node_id,
+                                jobs.worktree_path
                          FROM runs
                          LEFT JOIN issues ON runs.issue_id = issues.id
                          LEFT JOIN projects ON COALESCE(runs.project_id, issues.project_id) = projects.id
@@ -271,6 +278,7 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                 let effective_base_branch = row.opt_text(8)?;
                 let job_id = row.opt_text(9)?;
                 let recipe_node_id = row.opt_text(10)?;
+                let worktree_path = row.opt_text(11)?;
 
                 // All four components are required. A missing component means the run
                 // record is corrupt or incomplete — fail rather than produce a partial URI.
@@ -308,6 +316,7 @@ fn session_db_context(orch: &Orchestrator, run_id: &str) -> Result<SessionDbCont
                     effective_base_branch,
                     job_id,
                     recipe_node_id,
+                    worktree_path,
                 })
             })
         })
@@ -464,6 +473,7 @@ fn build_ctx_self_section(
 /// from, and the host platform. Folds in the home-URI "Current Location" pointer
 /// that previously stood alone, so an agent no longer has to probe for paths it
 /// can simply be told.
+#[allow(clippy::too_many_arguments)]
 fn build_orientation_block(
     working_dir: &str,
     home_uri: &str,
@@ -472,9 +482,22 @@ fn build_orientation_block(
     base_branch: Option<&str>,
     scratch_dir: Option<&str>,
     model: Option<&str>,
+    // Ambient (no-worktree) run: cwd IS the project's live checkout. The block
+    // relabels the cwd and drops the "NOT your working tree" repo-root line so
+    // the coordinates stay accurate. The Version Control tiering itself lives in
+    // the shared CAIRN segment (`cairn_system_prompt(ambient)`), not here — this
+    // function only adjusts per-run coordinates.
+    ambient: bool,
 ) -> String {
     let mut out = String::from("## Orientation\n\nYour coordinates for this run:\n\n");
-    out.push_str(&format!("- Working directory (cwd): `{}`\n", working_dir));
+    if ambient {
+        out.push_str(&format!(
+            "- Working directory (cwd): `{}` \u{2014} the project's live checkout (shared with the user)\n",
+            working_dir
+        ));
+    } else {
+        out.push_str(&format!("- Working directory (cwd): `{}`\n", working_dir));
+    }
     out.push_str(&format!(
         "- Node (home URI): `{}` \u{2014} `cairn:~/` resolves here\n",
         home_uri
@@ -482,11 +505,16 @@ fn build_orientation_block(
     if let Some(key) = project_key {
         out.push_str(&format!("- Project: `{}`\n", key));
     }
-    if let Some(root) = repo_root {
-        out.push_str(&format!(
-            "- Repository root (the project's primary checkout, on its own branch \u{2014} NOT your working tree; do not `cd` here): `{}`\n",
-            root
-        ));
+    // In ambient mode the repo root IS the cwd, so the standalone
+    // "NOT your working tree; do not `cd` here" repo-root line would contradict
+    // the cwd line above — omit it. A worktree-backed run keeps it.
+    if !ambient {
+        if let Some(root) = repo_root {
+            out.push_str(&format!(
+                "- Repository root (the project's primary checkout, on its own branch \u{2014} NOT your working tree; do not `cd` here): `{}`\n",
+                root
+            ));
+        }
     }
     if let Some(branch) = base_branch {
         out.push_str(&format!("- Base branch: `{}`\n", branch));
@@ -509,6 +537,16 @@ fn build_orientation_block(
         "\nKeep scratch and temp files in the working directory or the scratch dir above (your `$TMPDIR`); other paths outside the worktree are gated by the fence.",
     );
     out
+}
+
+/// Whether this run is an ambient (no-worktree) job that runs directly on the
+/// project's live checkout. True only when the job has NO worktree AND its cwd is
+/// exactly the project repo root. The repo-root equality guard is load-bearing:
+/// a `CallWorktree::None` call or a workflow also has a NULL `worktree_path`, but
+/// runs in a scratch dir under `$TMPDIR` — those must NOT receive the ambient
+/// framing (they cannot even read the project tree).
+fn is_ambient_run(worktree_path: Option<&str>, working_dir: &str, repo_root: Option<&str>) -> bool {
+    worktree_path.is_none() && repo_root == Some(working_dir)
 }
 
 /// Render the `## Project checks` section: the project's configured `checks`
@@ -1482,6 +1520,19 @@ pub fn start_agent_session(
     // Use provided agent config (agents are now always explicitly passed)
     let agent_config = agent_config.cloned();
 
+    // Ambient run: no job worktree AND cwd is the project repo root, so the run
+    // operates directly on the user's live checkout (the Manager recipe's
+    // `worktreeMode: none`). A scratch-dir call/workflow also has no worktree but
+    // is NOT ambient — the repo-root guard tells them apart. Resolved once here,
+    // above the prompt-content block, so it selects both the CAIRN system-prompt
+    // tier (via `SessionConfig.ambient`) and the orientation framing, and stays
+    // in scope at `SessionConfig` construction below.
+    let ambient = is_ambient_run(
+        db_context.worktree_path.as_deref(),
+        working_dir,
+        db_context.project_path.as_deref().and_then(|p| p.to_str()),
+    );
+
     // Resolve tools, model, prompt, permissions, and select backend.
     // All operations that need agent_config + DB access are grouped here.
     let (
@@ -1856,6 +1907,7 @@ pub fn start_agent_session(
                 db_context.effective_base_branch.as_deref(),
                 scratch_dir.as_deref(),
                 resolved_model.as_ref().map(|m| m.as_str()),
+                ambient,
             ));
 
             // The dynamic tail = everything appended from `dynamic_start` (the
@@ -1940,6 +1992,10 @@ pub fn start_agent_session(
         bidirectional: true,
         identity: resolved_identity,
         output_schema: native_output_schema,
+        ambient,
+        // Only the calls path passes `constrain_output_natively = true`, so this
+        // flags a node-less ephemeral call (CAIRN-2549). Codex pools these.
+        is_ephemeral_call: constrain_output_natively,
     };
 
     backend.start_session(session_config, orch)
@@ -1997,6 +2053,7 @@ mod tests {
             Some("main"),
             Some("/tmp/cairn-scratch-job-1"),
             Some("claude-opus-4"),
+            false,
         );
         assert!(block.contains("## Orientation"));
         // The resolved model is surfaced as part of the per-run dynamic tail.
@@ -2015,6 +2072,53 @@ mod tests {
         // Scratch dir is surfaced as the agent's TMPDIR when provided.
         assert!(block.contains("Scratch dir (TMPDIR): `/tmp/cairn-scratch-job-1`"));
         assert!(block.contains("$TMPDIR"));
+        // A worktree-backed run carries no ambient framing.
+        assert!(!block.contains("## Capability tier"));
+    }
+
+    #[test]
+    fn orientation_block_ambient_variant_relabels_coordinates() {
+        // Ambient run: cwd IS the repo root, no worktree.
+        let block = build_orientation_block(
+            "/repos/cairn",
+            "cairn://p/CAIRN/1/1/manager",
+            Some("CAIRN"),
+            Some("/repos/cairn"),
+            Some("main"),
+            Some("/tmp/cairn-scratch-job-1"),
+            Some("claude-opus-4"),
+            true,
+        );
+        // cwd is relabeled as the live checkout.
+        assert!(block.contains("the project's live checkout (shared with the user)"));
+        // The contradictory repo-root "do not cd here" line is omitted.
+        assert!(!block.contains("do not `cd` here"));
+        assert!(!block.contains("NOT your working tree"));
+        // Version-control tiering now lives in the shared CAIRN segment
+        // (`cairn_system_prompt(ambient)`), not an orientation override paragraph.
+        assert!(!block.contains("## Capability tier"));
+        assert!(!block.contains("overrides the Version Control section"));
+    }
+
+    #[test]
+    fn is_ambient_run_only_for_no_worktree_on_repo_root() {
+        // Ambient: no worktree, cwd == repo root.
+        assert!(is_ambient_run(None, "/repos/cairn", Some("/repos/cairn")));
+        // Worktree-backed: cwd is the worktree, not the repo root.
+        assert!(!is_ambient_run(
+            Some("/work/wt"),
+            "/work/wt",
+            Some("/repos/cairn")
+        ));
+        // Scratch-dir call/workflow (CallWorktree::None): no worktree, but cwd is
+        // a scratch dir, not the repo root — NOT ambient.
+        assert!(!is_ambient_run(
+            None,
+            "/tmp/cairn-call-xyz",
+            Some("/repos/cairn")
+        ));
+        // No repo root known — cannot be ambient.
+        assert!(!is_ambient_run(None, "/repos/cairn", None));
     }
 
     #[tokio::test]
@@ -2061,6 +2165,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert!(block.contains("Working directory (cwd): `/work/wt`"));
         assert!(!block.contains("Project:"));

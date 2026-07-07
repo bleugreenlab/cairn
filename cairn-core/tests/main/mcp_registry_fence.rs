@@ -122,6 +122,7 @@ async fn seed_run(
 
 fn create_request() -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: "/wt".to_string(),
         run_id: Some("run-1".to_string()),
         tool: "write".to_string(),

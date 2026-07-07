@@ -271,6 +271,7 @@ async fn produce_web_segment(
     // Peel grep-family params off the URL so they are never forwarded to bmd.
     let clean = strip_query_keys(&clean, GREP_STRIP_KEYS);
     let web_request = McpCallbackRequest {
+        thread_id: None,
         cwd: request.cwd.clone(),
         run_id: request.run_id.clone(),
         tool: "read_web".to_string(),
@@ -438,6 +439,7 @@ async fn produce_terminal_segment(
     let clean = strip_query_keys(&clean, GREP_STRIP_KEYS);
 
     let resource_request = McpCallbackRequest {
+        thread_id: None,
         cwd: request.cwd.clone(),
         run_id: request.run_id.clone(),
         tool: "read_resource".to_string(),
@@ -686,6 +688,7 @@ mod tests {
         .build();
 
         let request = McpCallbackRequest {
+            thread_id: None,
             cwd: worktree.path().display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),
@@ -732,6 +735,7 @@ mod tests {
         paths: serde_json::Value,
     ) -> String {
         let request = McpCallbackRequest {
+            thread_id: None,
             cwd: cwd.display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),
@@ -902,6 +906,7 @@ mod tests {
 
     async fn read_batch_text(orch: &Orchestrator, paths: serde_json::Value) -> String {
         let request = McpCallbackRequest {
+            thread_id: None,
             cwd: tempfile::tempdir().unwrap().keep().display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),
@@ -1194,6 +1199,7 @@ mod tests {
         run_id: Option<&str>,
     ) -> ReadBatchEnvelope {
         let request = McpCallbackRequest {
+            thread_id: None,
             cwd: tempfile::tempdir().unwrap().keep().display().to_string(),
             run_id: run_id.map(str::to_string),
             tool: "read_batch".to_string(),

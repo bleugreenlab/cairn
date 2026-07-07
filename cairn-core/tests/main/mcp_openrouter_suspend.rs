@@ -106,6 +106,7 @@ async fn owned_loop_question_suspends_without_inline_wait() {
     register_owned_loop_run(&orch);
 
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: temp.path().display().to_string(),
         run_id: Some("run-1".to_string()),
         tool: "write".to_string(),

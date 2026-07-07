@@ -288,6 +288,7 @@ impl OrchestratorBuilder {
             warm_gc: self.warm_gc,
             pty_state: self.pty_state,
             worktree_search: Arc::new(crate::worktree_search::WorktreeSearchPool::default()),
+            call_admission: Arc::new(crate::execution::jobs::CallAdmission::default()),
             permission_responses: self.permission_responses,
             run_completions: self.run_completions,
             prompt_responses: self.prompt_responses,
@@ -324,6 +325,7 @@ impl OrchestratorBuilder {
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         }
     }
 }
@@ -374,6 +376,12 @@ pub struct Orchestrator {
     /// re-walking the tree; cold/ineligible queries fall back to the ripgrep
     /// walk. Dropped per worktree at teardown and LRU-evicted at capacity.
     pub worktree_search: Arc<crate::worktree_search::WorktreeSearchPool>,
+
+    /// Generic bounded-admission ledger for ephemeral (call) fan-out. The calls
+    /// path (only) consults it; every real backend reports an unbounded ceiling
+    /// today, so `admit` is a pure passthrough in production. Shared across
+    /// clones behind the `Arc`.
+    pub call_admission: Arc<crate::execution::jobs::CallAdmission>,
 
     // === Broadcast channels for cross-component communication ===
     /// Permission response broadcast: (request_id, response_json)
@@ -447,6 +455,13 @@ pub struct Orchestrator {
     /// signal the PR-node / `/checks` render reads to show a "running" state.
     /// Runtime-only; never persisted.
     pub turn_end_checks_in_flight: Arc<Mutex<HashSet<String>>>,
+    /// Pool of long-lived Codex app-servers for EPHEMERAL CALLS (CAIRN-2549).
+    /// Each pooled call is a `thread/start` on a shared process rather than a
+    /// process of its own. Deliberately owned HERE and NOT in
+    /// `process_state.processes`, so warm-process GC never treats it as an
+    /// evictable per-session process. Empty and inert until the first Codex
+    /// call.
+    pub codex_pool: Arc<crate::backends::codex::pool::CodexAppServerPool>,
     /// Directory containing bundled preset schemas (None if not available)
     pub schema_dir: Option<PathBuf>,
     /// Port for the MCP callback server
@@ -934,6 +949,16 @@ impl Orchestrator {
         crate::execution::jobs::redispatch_crashed_workflows(self).await;
     }
 
+    /// Fail-fast ephemeral calls left in-flight by a host crash (CAIRN-2548) so a
+    /// queued Claude call can never strand `starting` forever once the admission
+    /// ceiling makes queuing reachable. Must run at startup BEFORE
+    /// [`Self::redispatch_crashed_workflows`], so it only touches stale pre-crash
+    /// runs and never a call the workflow replay just re-issued. Owned by the
+    /// always-on hosts (runner, non-inert server).
+    pub async fn fail_orphaned_calls_on_startup(&self) {
+        crate::execution::jobs::fail_orphaned_calls_on_startup(self).await;
+    }
+
     /// Spawn the memory-triage reconciliation sweep: once immediately at
     /// startup, then on a periodic timer. The sweep is driven entirely by DB
     /// state and guarantees every at-threshold pending pool has a triage issue
@@ -1303,42 +1328,59 @@ impl Orchestrator {
         });
     }
 
-    /// Evict a warm process if needed to make room for a new one.
-    /// Returns the run_id of the evicted process, if any.
-    pub fn collect_warm_if_needed(&self) -> Option<String> {
-        let gc = self.warm_gc.as_ref()?.clone();
+    /// Evict warm processes to satisfy the memory budget before a new spawn.
+    /// Returns the run ids evicted.
+    pub fn collect_warm_if_needed(&self) -> Vec<String> {
+        self.collect_warm(true)
+    }
+
+    /// Shared warm-eviction pass. `headroom_for_spawn` additionally reserves
+    /// room for one process about to spawn (true at admission, false on the
+    /// periodic sweep). Kills *every* run in the computed eviction set, so a
+    /// parallel-spawn burst or an over-budget idle pool is trimmed in one pass
+    /// rather than one eviction per call (CAIRN-2543).
+    fn collect_warm(&self, headroom_for_spawn: bool) -> Vec<String> {
+        let Some(gc) = self.warm_gc.as_ref().cloned() else {
+            return Vec::new();
+        };
         let process_state = self.process_state.clone();
         let dbs = self.db.clone();
 
-        let eviction_candidate = {
+        let eviction_set = {
             fn run_lookup(
                 gc: Arc<crate::agent_process::gc::WarmProcessGC>,
                 process_state: Arc<AgentProcessState>,
                 dbs: Arc<crate::db::DbState>,
-            ) -> Option<String> {
-                tokio::runtime::Builder::new_current_thread()
+                headroom_for_spawn: bool,
+            ) -> Vec<String> {
+                match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|error| {
+                {
+                    Ok(rt) => rt.block_on(async move {
+                        gc.find_eviction_set(&process_state, &dbs, headroom_for_spawn)
+                            .await
+                    }),
+                    Err(error) => {
                         log::error!("GC: failed to create database runtime: {}", error);
-                        error
-                    })
-                    .ok()?
-                    .block_on(async move { gc.find_eviction_candidate(&process_state, &dbs).await })
+                        Vec::new()
+                    }
+                }
             }
 
             if tokio::runtime::Handle::try_current().is_ok() {
-                std::thread::spawn(move || run_lookup(gc, process_state, dbs))
+                std::thread::spawn(move || run_lookup(gc, process_state, dbs, headroom_for_spawn))
                     .join()
-                    .map_err(|_| log::error!("GC: database lookup thread panicked"))
-                    .ok()
-                    .flatten()
+                    .unwrap_or_else(|_| {
+                        log::error!("GC: database lookup thread panicked");
+                        Vec::new()
+                    })
             } else {
-                run_lookup(gc, process_state, dbs)
+                run_lookup(gc, process_state, dbs, headroom_for_spawn)
             }
         };
 
-        if let Some(ref run_id) = eviction_candidate {
+        for run_id in &eviction_set {
             log::info!(
                 "GC: evicting warm process {}",
                 &run_id[..run_id.len().min(8)]
@@ -1348,7 +1390,43 @@ impl Orchestrator {
             }
         }
 
-        eviction_candidate
+        eviction_set
+    }
+
+    /// Periodically trim the warm pool to the memory budget (CAIRN-2543). Once
+    /// spawning stops, an over-budget idle pool would otherwise hold its memory
+    /// forever; this sweep re-measures every ~30s and converges (eviction kills
+    /// are async, so a tick can overshoot conservatively and the next tick
+    /// re-measures). Also prunes stale GC view records. A no-op when warm
+    /// retention is disabled. Must be called from within a tokio runtime.
+    pub fn spawn_warm_sweep(&self) {
+        if self.warm_gc.is_none() {
+            return;
+        }
+        const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+        let orch = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+            // Skip the immediate first tick: at startup the pool is empty, and a
+            // spawn's own admission check covers pressure between sweeps.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let orch = orch.clone();
+                // Off the async worker: the eviction lookup and kills block on
+                // DB round-trips, so keep the runtime responsive.
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    orch.collect_warm(false);
+                    if let Some(gc) = orch.warm_gc.as_ref() {
+                        gc.cleanup_stale_views();
+                    }
+                })
+                .await
+                {
+                    log::warn!("GC sweep task failed: {error}");
+                }
+            }
+        });
     }
 
     pub fn get_model_catalog(&self) -> Vec<ProviderModelCatalog> {

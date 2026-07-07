@@ -169,6 +169,7 @@ async fn setup(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
 
 fn request(cwd: &str, run_id: Option<&str>, payload: Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.to_string(),
         run_id: run_id.map(ToOwned::to_owned),
         tool: "run".to_string(),

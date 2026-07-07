@@ -22,6 +22,7 @@ pub mod claude;
 pub mod claude_usage;
 pub mod codex;
 pub mod context_window;
+mod http_loop;
 pub mod openrouter;
 mod run_state;
 pub mod stdin;
@@ -261,6 +262,19 @@ pub struct SessionConfig {
     /// `--json-schema`, OpenRouter `response_format`, Codex per-turn
     /// `outputSchema`). `None` for ordinary agent sessions, which are unchanged.
     pub output_schema: Option<serde_json::Value>,
+    /// Ambient (no-worktree) run: selects the ambient tier variant of the shared
+    /// CAIRN system-prompt segment (`cairn_system_prompt(ambient)`) rather than
+    /// the authoring one. Set from `is_ambient_run` at session assembly.
+    pub ambient: bool,
+    /// True only for a node-less EPHEMERAL CALL (CAIRN-2549). The calls path is
+    /// the single source of truth: `start_agent_session` derives this from
+    /// `constrain_output_natively`, which ONLY the calls path passes `true`.
+    /// Backends that pool ephemeral calls (Codex) branch on this to run the call
+    /// as a lightweight thread on a shared app-server; ordinary node/task
+    /// sessions leave it `false` and keep the process-per-session shape. A future
+    /// non-call constrained session must NOT set this without owning the pooled
+    /// lifecycle.
+    pub is_ephemeral_call: bool,
 }
 
 impl SessionConfig {}
@@ -270,6 +284,31 @@ impl SessionConfig {}
 /// Backends are responsible for spawning the agent process, registering it
 /// in process state, and starting the reader thread that streams events
 /// into the database.
+/// Which process-minimization shape a backend offers for ephemeral (call)
+/// fan-out. This is descriptive metadata the per-backend enforcement branches
+/// on; the generic admission machinery only reads [`CallBatchCapability::max_concurrency`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallBatchShape {
+    /// Whole agentic loop runs inside the runner; no child process per call
+    /// (OpenRouter's async HTTP turn loop).
+    InProcess,
+    /// One long-lived pooled process; each call is a lightweight session on it
+    /// (Codex app-server `thread/start` per call).
+    PooledSessions,
+    /// Each call is a dedicated backend process, admitted under a concurrency cap
+    /// (Claude CLI, permanently CLI-bound).
+    DedicatedProcess,
+}
+
+/// A backend's ephemeral-call batching capability: the shape it offers plus the
+/// max number of concurrent ephemeral calls it will admit at once. `None` =
+/// unbounded (pure passthrough — no admission bookkeeping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallBatchCapability {
+    pub shape: CallBatchShape,
+    pub max_concurrency: Option<usize>,
+}
+
 pub trait AgentBackend: Send + Sync {
     /// Human-readable name (e.g. "Claude", "Codex")
     fn name(&self) -> &str;
@@ -298,6 +337,16 @@ pub trait AgentBackend: Send + Sync {
 
     /// Whether this backend supports warm process retention
     fn supports_warm_processes(&self) -> bool;
+
+    /// Ephemeral-call batching capability. Default is the behavior-preserving
+    /// dedicated-process, unbounded shape. The calls path (only) consults this;
+    /// ordinary node/task sessions never reach it.
+    fn call_batch_capability(&self) -> CallBatchCapability {
+        CallBatchCapability {
+            shape: CallBatchShape::DedicatedProcess,
+            max_concurrency: None,
+        }
+    }
 
     /// Send a user message to a running process via stdin.
     fn send_user_message(
@@ -406,6 +455,46 @@ pub(crate) mod tests {
         assert_eq!(backend.name(), "Claude");
         assert!(backend.supports_resume());
         assert!(backend.supports_warm_processes());
+        // Claude enforces a bounded ephemeral-call ceiling (CAIRN-2557): each
+        // call is a dedicated ~450 MB `claude` process, so fan-out is capped at
+        // a RAM-derived bound. The descriptor reports exactly the computed
+        // startup value.
+        assert_eq!(
+            backend.call_batch_capability(),
+            CallBatchCapability {
+                shape: CallBatchShape::DedicatedProcess,
+                max_concurrency: Some(*claude::CLAUDE_CALL_MAX_CONCURRENCY),
+            }
+        );
+    }
+
+    /// The RAM-derived ceiling formula (CAIRN-2557) clamps at its documented
+    /// boundaries and scales proportionally between them. Exercised against
+    /// injected RAM values — never the host's real memory — so the boundaries
+    /// are deterministic. Budget is 25% of RAM, per-process estimate 450 MB,
+    /// clamped into [4, 64].
+    #[test]
+    fn claude_call_ceiling_clamps_at_boundaries() {
+        use claude::claude_call_concurrency_ceiling as ceiling;
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // Tiny RAM → FLOOR: 1 GB budgets 256 MB / 450 MB ≈ 0, clamped up to 4;
+        // 8 GB budgets 2 GB / 450 MB ≈ 4, already at the floor.
+        assert_eq!(ceiling(GIB), 4);
+        assert_eq!(ceiling(8 * GIB), 4);
+
+        // Huge RAM → CAP: 128 GB budgets 32 GB / 450 MB ≈ 72, clamped to 64.
+        assert_eq!(ceiling(128 * GIB), 64);
+        assert_eq!(ceiling(1024 * GIB), 64);
+
+        // Mid RAM → proportional: 32 GB budgets 8 GB / 450 MB ≈ 18.
+        assert_eq!(ceiling(32 * GIB), 18);
+
+        // Acceptance anchors (CAIRN-2557): a 128 GB machine runs a 40-call
+        // fan-out fully parallel, and an 8–16 GB machine stays single-digit.
+        assert!(ceiling(128 * GIB) >= 40);
+        assert!(ceiling(8 * GIB) < 10);
+        assert!(ceiling(16 * GIB) < 10);
     }
 
     #[test]
@@ -414,6 +503,151 @@ pub(crate) mod tests {
         assert_eq!(backend.name(), "Codex");
         assert!(backend.supports_resume());
         assert!(backend.supports_warm_processes());
+        assert_eq!(
+            backend.call_batch_capability(),
+            CallBatchCapability {
+                shape: CallBatchShape::PooledSessions,
+                max_concurrency: None,
+            }
+        );
+    }
+
+    #[test]
+    fn openrouter_backend_call_batch_capability() {
+        let backend = openrouter::OpenRouterBackend;
+        assert_eq!(
+            backend.call_batch_capability(),
+            CallBatchCapability {
+                shape: CallBatchShape::InProcess,
+                max_concurrency: None,
+            }
+        );
+    }
+
+    /// The trait default surfaces the behavior-preserving unbounded shape, and a
+    /// backend that overrides `max_concurrency` surfaces its ceiling through the
+    /// same descriptor the admission machinery reads.
+    #[test]
+    fn call_batch_capability_default_and_override_surface() {
+        struct DefaultBackend;
+        impl AgentBackend for DefaultBackend {
+            fn name(&self) -> &str {
+                "Default"
+            }
+            fn is_available(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
+                Ok(Vec::new())
+            }
+            fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
+                ResolvedTools {
+                    allowed: Vec::new(),
+                    disallowed: Vec::new(),
+                }
+            }
+            fn start_session(&self, _: SessionConfig, _: &Orchestrator) -> Result<(), String> {
+                Ok(())
+            }
+            fn supports_resume(&self) -> bool {
+                false
+            }
+            fn supports_warm_processes(&self) -> bool {
+                false
+            }
+            fn send_user_message(
+                &self,
+                _: &mut dyn BackendStdin,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn send_interrupt(&self, _: &mut dyn BackendStdin) -> Result<(), String> {
+                Ok(())
+            }
+            fn send_set_model(&self, _: &mut dyn BackendStdin, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn send_set_permission_mode(
+                &self,
+                _: &mut dyn BackendStdin,
+                _: &str,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        // Default: unbounded dedicated-process passthrough.
+        assert_eq!(
+            DefaultBackend.call_batch_capability(),
+            CallBatchCapability {
+                shape: CallBatchShape::DedicatedProcess,
+                max_concurrency: None,
+            }
+        );
+
+        struct CappedBackend;
+        impl AgentBackend for CappedBackend {
+            fn name(&self) -> &str {
+                "Capped"
+            }
+            fn is_available(&self) -> Result<(), String> {
+                Ok(())
+            }
+            fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
+                Ok(Vec::new())
+            }
+            fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
+                ResolvedTools {
+                    allowed: Vec::new(),
+                    disallowed: Vec::new(),
+                }
+            }
+            fn start_session(&self, _: SessionConfig, _: &Orchestrator) -> Result<(), String> {
+                Ok(())
+            }
+            fn supports_resume(&self) -> bool {
+                false
+            }
+            fn supports_warm_processes(&self) -> bool {
+                false
+            }
+            fn call_batch_capability(&self) -> CallBatchCapability {
+                CallBatchCapability {
+                    shape: CallBatchShape::DedicatedProcess,
+                    max_concurrency: Some(1),
+                }
+            }
+            fn send_user_message(
+                &self,
+                _: &mut dyn BackendStdin,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn send_interrupt(&self, _: &mut dyn BackendStdin) -> Result<(), String> {
+                Ok(())
+            }
+            fn send_set_model(&self, _: &mut dyn BackendStdin, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn send_set_permission_mode(
+                &self,
+                _: &mut dyn BackendStdin,
+                _: &str,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            CappedBackend.call_batch_capability().max_concurrency,
+            Some(1)
+        );
     }
 
     // =========================================================================

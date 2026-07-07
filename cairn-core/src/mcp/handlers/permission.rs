@@ -434,6 +434,7 @@ async fn emit_permission_attention(
     perm_segment: Option<&str>,
 ) {
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: Some(run_id.to_string()),
         tool: String::new(),

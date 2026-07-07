@@ -1,11 +1,13 @@
 //! The streaming chat-completions POST and its SSE reader: build the request
-//! body, stream deltas into the live assistant stream and the response
-//! aggregator, observe cancel at line boundaries, and detect in-band errors.
+//! body (tools, provider routing, structured-output schema), stream deltas into
+//! the live assistant stream and the response aggregator, observe cancel at line
+//! boundaries, and detect in-band errors.
 
-use super::persist::AssistantStreamState;
-use super::tools::tool_schemas;
 use super::wire::{ChatMessage, ChatResponse, ChatStreamChunk, StreamingAggregate};
+use super::OPENROUTER_BACKEND_KEY;
+use crate::backends::http_loop::AssistantStreamState;
 use crate::backends::SessionConfig;
+use crate::models::{OpenRouterRouting, OpenRouterSort};
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -24,6 +26,81 @@ const CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 // waited indefinitely). Sized generously so a high-effort reasoning generation
 // is never mistaken for a hang.
 const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Build the OpenRouter `provider` object from routing settings.
+///
+/// `require_parameters` is always sent: tool schemas are unconditional, so this
+/// only formalizes the existing effective behavior (route only to tool-capable
+/// providers). `zdr`/`sort` are added only when the user opts in.
+pub(super) fn build_provider_object(routing: &OpenRouterRouting) -> Value {
+    let mut provider = json!({ "require_parameters": true });
+    if routing.zero_data_retention {
+        provider["zdr"] = json!(true);
+    }
+    if let Some(sort) = routing.sort {
+        provider["sort"] = json!(match sort {
+            OpenRouterSort::Price => "price",
+            OpenRouterSort::Throughput => "throughput",
+            OpenRouterSort::Latency => "latency",
+        });
+    }
+    provider
+}
+
+pub(super) fn tool_schemas() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read one or more file, Cairn resource, web, or PDF targets. Prefer paths[] for batch reads.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                        "path": { "type": "string" },
+                        "offset": { "type": "integer" },
+                        "limit": { "type": "integer" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "write",
+                "description": "Apply ordered file/resource mutations. Include commit_msg when touching files.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["changes"],
+                    "properties": {
+                        "changes": { "type": "array", "items": { "type": "object" }, "minItems": 1 },
+                        "commit_msg": { "type": "string" },
+                        "preview": { "type": "boolean" },
+                        "atomic": { "type": "boolean" }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "run",
+                "description": "Execute shell commands or skill scripts in the worktree.",
+                "parameters": {
+                    "type": "object",
+                    "required": ["commands"],
+                    "properties": {
+                        "commands": { "type": "array", "items": { "type": "object" }, "minItems": 1 },
+                        "commit_msg": { "type": "string" },
+                        "sequential": { "type": "boolean" },
+                        "stop_on_error": { "type": "boolean" }
+                    }
+                }
+            }
+        }),
+    ]
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn post_chat_completion(
@@ -250,6 +327,7 @@ fn open_stream_state<'a>(
             session_id,
             turn_id,
             sequence,
+            OPENROUTER_BACKEND_KEY,
         )?);
     }
     Ok(state.as_mut().expect("stream state just initialized"))

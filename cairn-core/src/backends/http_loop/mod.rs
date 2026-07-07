@@ -1,24 +1,41 @@
-//! Session entry and the tool-iteration driver: spawn the owned turn loop, POST
-//! each generation, execute tool calls, persist every event, and finalize the run
-//! (success, cancel, suspend, budget, or fatal failure). Pushes a context-token
-//! snapshot to the frontend gauge each generation.
+//! Provider-agnostic in-process HTTP turn/tool loop.
+//!
+//! Cairn owns the turn/tool loop for HTTP chat-completions backends so models
+//! receive Cairn's direct read/write/run tools instead of a CLI's host tools.
+//! This module is the neutral driver: it spawns the owned turn loop, asks a
+//! [`WireAdapter`] to build the conversation and POST each generation, executes
+//! the returned tool calls, persists every transcript event, pushes a
+//! context-token snapshot to the frontend gauge, and finalizes the run (success,
+//! cancel, suspend, budget, or fatal failure).
+//!
+//! The adapter owns every wire concern — the request/response DTOs, the streaming
+//! reader, transcript↔message mapping, context trimming, the api key, and the
+//! backend identity — and converts its wire types to the neutral
+//! [`Generation`]/[`TurnToolCall`]/[`TurnUsage`] at its boundary, so no wire DTO
+//! ever reaches this loop. OpenRouter is the first and today the ONLY adapter
+//! (`backends/openrouter/adapter.rs`); the seam is structural readiness, not a
+//! second implementation.
 
-use super::context::fit_conversation;
-use super::conversation::{build_conversation_messages, render_tool_result};
-use super::http::post_chat_completion;
-use super::persist::{
+mod persist;
+pub(in crate::backends) mod repair;
+mod tools;
+
+#[cfg(test)]
+mod tests;
+
+pub(in crate::backends) use persist::AssistantStreamState;
+pub(in crate::backends) use tools::render_tool_result;
+
+use persist::{
     store_assistant_message, store_assistant_tool_call, store_success_result, store_tool_result,
     tool_call_usage,
 };
-use super::tools::{build_provider_object, execute_tool_call};
-use super::wire::{ChatMessage, OpenRouterUsage};
-use crate::agent_process::process::{RunHandle, SuspendKind};
-use crate::backends::openrouter::{
-    openrouter_api_key, repair, NoopOpenRouterStdin, OPENROUTER_BACKEND_KEY,
-    OPENROUTER_BACKEND_NAME,
-};
+use tools::execute_tool_call;
+
+use crate::agent_process::process::{BackendStdin, RunHandle, SuspendKind};
+use crate::agent_process::stream::TokenCounts;
 use crate::backends::run_state::{
-    resolve_run_db, run_job_id, set_session_backend_id, transition_run_to_live,
+    resolve_run_db, run_backend_db, run_job_id, set_session_backend_id, transition_run_to_live,
 };
 use crate::backends::{SessionConfig, SessionStart};
 use crate::dispatch::DispatchOutput;
@@ -30,6 +47,11 @@ use crate::orchestrator::session::{
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use crate::transcripts::stream_store::get_next_sequence;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::any::Any;
+use std::borrow::Cow;
+use std::io::{Result as IoResult, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -38,18 +60,203 @@ use std::sync::{Arc, Mutex};
 // turn finalizes gracefully on reaching it rather than crashing the run.
 const MAX_TOOL_ITERATIONS: usize = 200;
 
-pub(crate) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+/// A model-emitted tool call, neutralized from the adapter's wire type: the
+/// dispatch id, the (already tool-name-normalized) verb, and the raw JSON
+/// argument string the tool dispatch / repair path parses.
+pub(in crate::backends) struct TurnToolCall {
+    pub(in crate::backends) id: String,
+    pub(in crate::backends) name: String,
+    pub(in crate::backends) arguments: String,
+}
+
+/// OpenAI-style usage payload — the neutral HTTP-loop usage shape. Its field
+/// names and serde attributes MUST stay byte-identical to what the stored
+/// transcript's `raw.usage` has always embedded (the frontend's two-event token
+/// rollup and the radial context dial read these keys), so this is deliberately
+/// the OpenAI/OpenRouter usage shape rather than a reinvented one. Every field
+/// is `#[serde(default)]` with NO `skip_serializing_if`, so serialization always
+/// emits all eight keys (nulls included), exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::backends) struct TurnUsage {
+    #[serde(default)]
+    pub(in crate::backends) prompt_tokens: Option<i32>,
+    #[serde(default)]
+    pub(in crate::backends) completion_tokens: Option<i32>,
+    #[serde(default)]
+    pub(in crate::backends) total_tokens: Option<i32>,
+    #[serde(default)]
+    pub(in crate::backends) reasoning_tokens: Option<i32>,
+    #[serde(default)]
+    pub(in crate::backends) prompt_tokens_details: Option<Value>,
+    #[serde(default)]
+    pub(in crate::backends) completion_tokens_details: Option<Value>,
+    #[serde(default)]
+    pub(in crate::backends) cost: Option<f64>,
+    #[serde(default)]
+    pub(in crate::backends) cost_details: Option<Value>,
+}
+
+impl TurnUsage {
+    pub(in crate::backends) fn token_counts(&self) -> TokenCounts {
+        TokenCounts {
+            input: self.prompt_tokens,
+            output: self.completion_tokens,
+            cache_read: self.prompt_tokens_details.as_ref().and_then(|v| {
+                v.get("cached_tokens")
+                    .and_then(Value::as_i64)
+                    .map(|n| n as i32)
+            }),
+            cache_create: None,
+            thinking: self.reasoning_tokens.or_else(|| {
+                self.completion_tokens_details.as_ref().and_then(|v| {
+                    v.get("reasoning_tokens")
+                        .and_then(Value::as_i64)
+                        .map(|n| n as i32)
+                })
+            }),
+        }
+    }
+}
+
+/// One assistant generation, neutralized from the adapter's wire response. The
+/// loop owns this and never sees a wire DTO: `assistant_message` (the adapter's
+/// own message type) is pushed back onto the running conversation verbatim,
+/// while the neutral fields drive execution, persistence, and the context
+/// snapshot.
+pub(in crate::backends) struct Generation<M> {
+    pub(in crate::backends) assistant_message: M,
+    pub(in crate::backends) assistant_text: String,
+    pub(in crate::backends) tool_calls: Vec<TurnToolCall>,
+    pub(in crate::backends) reasoning_details: Option<Value>,
+    pub(in crate::backends) usage: Option<TurnUsage>,
+    pub(in crate::backends) finish_reason: Option<String>,
+    pub(in crate::backends) generation_id: Option<String>,
+    pub(in crate::backends) response_model: Option<String>,
+    pub(in crate::backends) streamed_text: bool,
+}
+
+/// The wire seam behind the neutral HTTP turn loop. An adapter owns a single
+/// provider's chat-completions format: how to build the outgoing conversation,
+/// look up and trim to the model's context window, POST one streaming
+/// generation, and render a tool result back into a message. The loop is
+/// monomorphized over the adapter (no `dyn`), and the adapter converts its wire
+/// types to the neutral [`Generation`]/[`TurnToolCall`]/[`TurnUsage`] at this
+/// boundary so no wire DTO ever reaches the loop.
+pub(in crate::backends) trait WireAdapter {
+    /// The adapter's own conversation-message type (OpenRouter: `ChatMessage`).
+    type Message: Clone + Send;
+
+    /// Stable backend key stored in transcript `raw` payloads and used to route
+    /// the run to its owning DB (OpenRouter: `"openrouter"`).
+    fn backend_key(&self) -> &'static str;
+
+    /// Human-readable backend name for logs and transcript error text.
+    fn backend_name(&self) -> &'static str;
+
+    /// Fallback model id when the session carries none.
+    fn default_model(&self) -> &'static str;
+
+    /// The configured API key, or `None` when the provider is unauthenticated.
+    fn api_key(&self, orch: &Orchestrator) -> Option<String>;
+
+    /// Build the outgoing message array (system + prior transcript + new user).
+    fn build_conversation(
+        &self,
+        orch: &Orchestrator,
+        config: &SessionConfig,
+        session_id: &str,
+        system_prompt: &str,
+    ) -> Result<Vec<Self::Message>, String>;
+
+    /// The model's real context window, or `None` to disable outgoing trimming.
+    fn context_window(&self, orch: &Orchestrator, model: &str) -> Option<i64>;
+
+    /// Trim the OUTGOING request to fit the window; borrows when it already fits.
+    fn fit_conversation<'a>(
+        &self,
+        messages: &'a [Self::Message],
+        context_window: Option<i64>,
+    ) -> Cow<'a, [Self::Message]>;
+
+    /// POST one streaming generation and return it neutralized. Normalizing tool
+    /// names on the returned `assistant_message` (so the stored/replayed history
+    /// references the dispatched verb) is the adapter's responsibility.
+    #[allow(clippy::too_many_arguments)]
+    fn post_generation(
+        &self,
+        orch: &Orchestrator,
+        run_db: &Arc<LocalDb>,
+        api_key: &str,
+        model: &str,
+        session_id: &str,
+        outgoing: &[Self::Message],
+        config: &SessionConfig,
+        run_id: &str,
+        turn_id: Option<&str>,
+        sequence: i32,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Generation<Self::Message>, String>;
+
+    /// Render a dispatch result into a tool-result message for the conversation.
+    fn render_tool_result_message(
+        &self,
+        tool_call_id: &str,
+        output: DispatchOutput,
+    ) -> Self::Message;
+}
+
+/// The stdin registered for an owned-loop run. It writes nowhere; its only job
+/// is to carry the cancel flag the streaming turn polls at SSE line boundaries.
+/// A backend's `send_interrupt` downcasts to this and flips `cancel`, which
+/// breaks the SSE reader and drops the connection (stopping billing).
+pub(in crate::backends) struct HttpTurnStdin {
+    pub(in crate::backends) cancel: Arc<AtomicBool>,
+}
+
+impl Write for HttpTurnStdin {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> IoResult<()> {
+        Ok(())
+    }
+}
+
+impl BackendStdin for HttpTurnStdin {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Start an owned-loop session: resolve the api key and owning DB, persist the
+/// system prompt, register the run handle (with its cancel stdin), then spawn the
+/// turn loop on a dedicated thread with a panic guard. Generic over the wire
+/// adapter; OpenRouter passes `OpenRouterAdapter`.
+pub(in crate::backends) fn start_session<A>(
+    config: SessionConfig,
+    orch: &Orchestrator,
+    adapter: A,
+) -> Result<(), String>
+where
+    A: WireAdapter + Send + 'static,
+    A::Message: Send + 'static,
+{
     let session_id = config.session_start.session_id().to_string();
-    let api_key = match openrouter_api_key(orch) {
+    let backend_key = adapter.backend_key();
+    let backend_name = adapter.backend_name();
+    let api_key = match adapter.api_key(orch) {
         Some(key) => key,
         None => {
             insert_error_event(
                 orch,
                 &config.run_id,
                 Some(&session_id),
-                "OpenRouter API key not configured. Add an OpenRouter API key in Settings → Providers.",
+                &format!(
+                    "{backend_name} API key not configured. Add an {backend_name} API key in Settings → Providers."
+                ),
             );
-            return Err("Missing OpenRouter API key".to_string());
+            return Err(format!("Missing {backend_name} API key"));
         }
     };
 
@@ -58,7 +265,7 @@ pub(crate) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
         std::path::Path::new(&config.working_dir),
     );
     let prompt_segments = assemble_prompt_segments(
-        &crate::system_prompt::cairn_system_prompt(),
+        &crate::system_prompt::cairn_system_prompt(config.ambient),
         workspace_instructions.as_deref(),
         project_instructions.as_deref(),
         config.system_prompt_content.as_deref(),
@@ -68,7 +275,7 @@ pub(crate) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
     // run-state and streaming-transcript writes below. A team run lives wholly in
     // its synced replica; targeting the private DB would fail the
     // message_streams→runs foreign key. Fail-closed.
-    let run_db = match resolve_run_db(OPENROUTER_BACKEND_NAME, orch, &config.run_id) {
+    let run_db = match resolve_run_db(backend_name, orch, &config.run_id) {
         Ok(db) => db,
         Err(error) => {
             insert_error_event(orch, &config.run_id, Some(&session_id), &error);
@@ -84,45 +291,41 @@ pub(crate) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
             orch,
             &config.run_id,
             Some(&session_id),
-            OPENROUTER_BACKEND_KEY,
+            backend_key,
             &prompt_segments,
         )
     } else {
         get_next_sequence(run_db.clone(), &config.run_id).unwrap_or(0)
     };
-    // Flatten the same segments that were (or would be) persisted. Each OpenRouter
-    // HTTP turn re-sends the whole message array with no server-side system-prompt
+    // Flatten the same segments that were (or would be) persisted. Each HTTP turn
+    // re-sends the whole message array with no server-side system-prompt
     // retention, so the full harness contract (Cairn prompt + workspace + agent +
     // orientation tail) must lead the system message on New and Resume alike.
     let system_prompt = flatten_prompt_segments(&prompt_segments);
 
-    if let Err(error) =
-        set_session_backend_id(OPENROUTER_BACKEND_NAME, &run_db, &session_id, &session_id)
-    {
-        log::warn!("Failed to set OpenRouter backend id: {error}");
+    if let Err(error) = set_session_backend_id(backend_name, &run_db, &session_id, &session_id) {
+        log::warn!("Failed to set {backend_name} backend id: {error}");
     }
-    if let Err(error) =
-        transition_run_to_live(OPENROUTER_BACKEND_NAME, orch, &run_db, &config.run_id)
-    {
-        log::warn!("Failed to transition OpenRouter run to live: {error}");
+    if let Err(error) = transition_run_to_live(backend_name, orch, &run_db, &config.run_id) {
+        log::warn!("Failed to transition {backend_name} run to live: {error}");
     }
 
-    let process_job_id = run_job_id(OPENROUTER_BACKEND_NAME, &run_db, &config.run_id);
+    let process_job_id = run_job_id(backend_name, &run_db, &config.run_id);
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut handle = RunHandle::new(
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(Some(Box::new(NoopOpenRouterStdin {
+            Arc::new(Mutex::new(Some(Box::new(HttpTurnStdin {
                 cancel: cancel.clone(),
             })))),
             Some(session_id.clone()),
             process_job_id,
         );
-        handle.backend = Some(OPENROUTER_BACKEND_KEY.to_string());
+        handle.backend = Some(backend_key.to_string());
         handle.model = config.model.as_ref().map(|model| model.to_string());
-        // OpenRouter owns its turn/tool loop in-process and has no warm process,
-        // so foreground questions and inline delegated tasks suspend the turn
-        // rather than inline-waiting. The blocking handlers key off this flag.
+        // An HTTP-loop backend owns its turn/tool loop in-process and has no warm
+        // process, so foreground questions and inline delegated tasks suspend the
+        // turn rather than inline-waiting. The blocking handlers key off this flag.
         handle.owns_turn_loop = true;
         if let Ok(mut processes) = orch.process_state.processes.lock() {
             processes.register(config.run_id.clone(), handle);
@@ -150,28 +353,29 @@ pub(crate) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
                 None,
                 cancel,
                 system_prompt,
+                adapter,
             )
         }));
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                log::error!("OpenRouter turn failed: {error}");
+                log::error!("{backend_name} turn failed: {error}");
                 insert_error_event(
                     &orch_clone,
                     &run_id,
                     Some(&error_session_id),
-                    &format!("OpenRouter turn failed: {error}"),
+                    &format!("{backend_name} turn failed: {error}"),
                 );
                 finish_run_failed(&orch_clone, &run_id, "turn_failed");
             }
             Err(panic) => {
                 let detail = panic_message(panic.as_ref());
-                log::error!("OpenRouter turn panicked: {detail}");
+                log::error!("{backend_name} turn panicked: {detail}");
                 insert_error_event(
                     &orch_clone,
                     &run_id,
                     Some(&error_session_id),
-                    &format!("OpenRouter turn panicked: {detail}"),
+                    &format!("{backend_name} turn panicked: {detail}"),
                 );
                 finish_run_failed(&orch_clone, &run_id, "turn_panicked");
             }
@@ -182,7 +386,7 @@ pub(crate) fn start_session(config: SessionConfig, orch: &Orchestrator) -> Resul
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_http_turn(
+fn run_http_turn<A: WireAdapter>(
     orch: &Orchestrator,
     run_db: Arc<LocalDb>,
     config: SessionConfig,
@@ -192,24 +396,23 @@ fn run_http_turn(
     turn_id: Option<String>,
     cancel: Arc<AtomicBool>,
     system_prompt: String,
+    adapter: A,
 ) -> Result<(), String> {
+    let backend_key = adapter.backend_key();
+    let backend_name = adapter.backend_name();
     let model = config
         .model
         .as_ref()
         .map(|model| model.to_string())
-        .unwrap_or_else(|| "openrouter/auto".to_string());
-    let mut conversation = build_conversation_messages(orch, &config, &session_id, &system_prompt)?;
+        .unwrap_or_else(|| adapter.default_model().to_string());
+    let mut conversation =
+        adapter.build_conversation(orch, &config, &session_id, &system_prompt)?;
 
-    // The selected model's real context window, sourced from the discovered
-    // OpenRouter catalog (not a hardcoded assumption). Used to trim the outgoing
+    // The selected model's real context window, sourced from the adapter's
+    // discovered catalog (not a hardcoded assumption). Used to trim the outgoing
     // request to fit; `None` (catalog miss / unknown window) disables trimming
     // and the read timeout remains the backstop against an over-limit hang.
-    let context_window =
-        orch.context_window_for_context_tokens(OPENROUTER_BACKEND_KEY, Some(&model));
-
-    // Resolve provider-routing once per turn (it reads settings.yaml); the same
-    // object rides every tool-iteration POST.
-    let provider = build_provider_object(&orch.get_settings().openrouter_routing);
+    let context_window = adapter.context_window(orch, &model);
 
     let mut exact_cost = None;
 
@@ -218,12 +421,12 @@ fn run_http_turn(
             return finalize_cancelled(orch, &config.run_id);
         }
         // Trim the OUTGOING request only (never the stored transcript or the
-        // running `conversation`): collapse the oldest aged tool outputs so the
-        // request fits under the model's real window. `outgoing` borrows
-        // `conversation` when no trim is needed; it is dropped before the
+        // running `conversation`): the adapter collapses the oldest aged tool
+        // outputs so the request fits under the model's real window. `outgoing`
+        // borrows `conversation` when no trim is needed; it is dropped before the
         // post-response mutations below.
-        let outgoing = fit_conversation(&conversation, context_window);
-        let response = post_chat_completion(
+        let outgoing = adapter.fit_conversation(&conversation, context_window);
+        let generation = adapter.post_generation(
             orch,
             &run_db,
             &api_key,
@@ -234,7 +437,6 @@ fn run_http_turn(
             &config.run_id,
             turn_id.as_deref(),
             sequence,
-            &provider,
             &cancel,
         )?;
         drop(outgoing);
@@ -244,63 +446,47 @@ fn run_http_turn(
         if cancel.load(Ordering::SeqCst) {
             return finalize_cancelled(orch, &config.run_id);
         }
-        let response_usage = response.usage.clone();
-        let response_id = response.id.clone();
-        let response_model = response.model.clone();
+
+        let Generation {
+            assistant_message,
+            assistant_text,
+            tool_calls,
+            reasoning_details,
+            usage,
+            finish_reason,
+            generation_id,
+            response_model,
+            streamed_text,
+        } = generation;
+
         // A generation that ends with finish_reason "length" was cut off at the
         // output-token cap, so its last tool call may be truncated even when the
         // JSON happens to parse. Used below to refuse partial side-effecting calls.
-        let generation_truncated = response.finish_reason.as_deref() == Some("length");
+        let generation_truncated = finish_reason.as_deref() == Some("length");
 
         // Cost ships inline in every generation's usage. Accumulate across the
         // turn so a multi-tool turn captures cost on each POST, not only the
-        // terminal generation (the old /generation lookup under-counted by
-        // capturing just the final one).
-        if let Some(generation_cost) = response_usage.as_ref().and_then(|usage| usage.cost) {
+        // terminal generation.
+        if let Some(generation_cost) = usage.as_ref().and_then(|usage| usage.cost) {
             exact_cost = Some(exact_cost.unwrap_or(0.0) + generation_cost);
         }
 
         // Push live context occupancy to the frontend gauge (mirrors Claude/Codex).
-        // Without this the radial context dial never renders for OpenRouter: the
-        // hook's one-shot query is never invalidated, so the real per-model window
-        // sourced here only reaches the UI via this event.
-        if let Some(usage) = response_usage.as_ref() {
-            emit_openrouter_context_snapshot(
+        // Without this the radial context dial never renders: the hook's one-shot
+        // query is never invalidated, so the real per-model window sourced here
+        // only reaches the UI via this event.
+        if let Some(usage) = usage.as_ref() {
+            emit_context_snapshot(
                 orch,
                 &config.run_id,
                 &session_id,
+                backend_key,
                 &model,
                 context_window,
                 usage,
             );
         }
 
-        let Some(choice) = response.choices.into_iter().next() else {
-            return Err("OpenRouter response did not include choices".to_string());
-        };
-        let mut assistant_message = choice.message;
-        // Canonicalize tool names in place BEFORE the call is stored, pushed into
-        // the conversation, and executed, so execution, the stored transcript,
-        // and any replay/resume all reference the dispatched verb. Otherwise a
-        // successful call replays under an invalid name like `Write_File` or
-        // `mcp__cairn__run` and reinforces it in the model-facing history.
-        if let Some(calls) = assistant_message.tool_calls.as_mut() {
-            for call in calls.iter_mut() {
-                if let Some(verb) = repair::normalize_tool_name(&call.function.name) {
-                    if verb != call.function.name {
-                        log::warn!(
-                            "OpenRouter normalized tool name {:?} -> {:?}",
-                            call.function.name,
-                            verb
-                        );
-                        call.function.name = verb.to_string();
-                    }
-                }
-            }
-        }
-        let assistant_text = assistant_message.content.clone().unwrap_or_default();
-        let tool_calls = assistant_message.tool_calls.clone().unwrap_or_default();
-        let reasoning_details = assistant_message.reasoning_details.clone();
         conversation.push(assistant_message);
 
         // Observability: surface output-token truncation per model so its
@@ -309,10 +495,10 @@ fn run_http_turn(
         if generation_truncated {
             let truncated_tool = tool_calls
                 .last()
-                .map(|call| call.function.name.as_str())
+                .map(|call| call.name.as_str())
                 .unwrap_or("<none>");
             log::warn!(
-                "OpenRouter generation truncated (finish_reason=length) model={} tool={}",
+                "{backend_name} generation truncated (finish_reason=length) model={} tool={}",
                 model,
                 truncated_tool
             );
@@ -320,7 +506,7 @@ fn run_http_turn(
 
         if tool_calls.is_empty() {
             if !assistant_text.is_empty() {
-                if response.streamed_text {
+                if streamed_text {
                     sequence += 1;
                 } else {
                     store_assistant_message(
@@ -331,10 +517,11 @@ fn run_http_turn(
                         turn_id.as_deref(),
                         sequence,
                         &assistant_text,
-                        response_usage.as_ref(),
-                        response_id.as_deref(),
+                        usage.as_ref(),
+                        generation_id.as_deref(),
                         response_model.as_deref(),
                         exact_cost,
+                        backend_key,
                     )?;
                     sequence += 1;
                 }
@@ -346,10 +533,11 @@ fn run_http_turn(
                 &session_id,
                 turn_id.as_deref(),
                 sequence,
-                response_usage.as_ref(),
-                response_id.as_deref(),
+                usage.as_ref(),
+                generation_id.as_deref(),
                 response_model.as_deref(),
                 exact_cost,
+                backend_key,
             )?;
             // Schema-constrained call: capture the model's final structured
             // content as the return artifact server-side (CAIRN-2505), validated
@@ -361,26 +549,23 @@ fn run_http_turn(
                     Ok(value) => {
                         let orch_capture = orch.clone();
                         let run_id_capture = config.run_id.clone();
-                        if let Err(e) = crate::backends::run_state::run_backend_db(
-                            OPENROUTER_BACKEND_KEY,
-                            async move {
-                                crate::mcp::handlers::comments_artifacts::capture_call_structured_output(
-                                    &orch_capture,
-                                    &run_id_capture,
-                                    value,
-                                )
-                                .await
-                            },
-                        ) {
+                        if let Err(e) = run_backend_db(backend_key, async move {
+                            crate::mcp::handlers::comments_artifacts::capture_call_structured_output(
+                                &orch_capture,
+                                &run_id_capture,
+                                value,
+                            )
+                            .await
+                        }) {
                             log::warn!(
-                                "Failed to capture OpenRouter structured output for run {}: {}",
+                                "Failed to capture {backend_name} structured output for run {}: {}",
                                 config.run_id,
                                 e
                             );
                         }
                     }
                     Err(e) => log::warn!(
-                        "OpenRouter schema-constrained call produced non-JSON content for run {}: {}",
+                        "{backend_name} schema-constrained call produced non-JSON content for run {}: {}",
                         config.run_id,
                         e
                     ),
@@ -390,7 +575,7 @@ fn run_http_turn(
             return Ok(());
         }
 
-        let tool_call_text = if response.streamed_text {
+        let tool_call_text = if streamed_text {
             sequence += 1;
             ""
         } else {
@@ -405,10 +590,11 @@ fn run_http_turn(
             sequence,
             tool_call_text,
             &tool_calls,
-            tool_call_usage(response.streamed_text, response_usage.as_ref()),
-            response_id.as_deref(),
+            tool_call_usage(streamed_text, usage.as_ref()),
+            generation_id.as_deref(),
             response_model.as_deref(),
             reasoning_details.as_ref(),
+            backend_key,
         )?;
         sequence += 1;
 
@@ -436,12 +622,10 @@ fn run_http_turn(
                 sequence,
                 &tool_call.id,
                 &result,
+                backend_key,
             )?;
             sequence += 1;
-            conversation.push(ChatMessage::tool(
-                tool_call.id.clone(),
-                render_tool_result(result),
-            ));
+            conversation.push(adapter.render_tool_result_message(&tool_call.id, result));
         }
 
         // A suspend takes precedence over the cancel path: it is a resumable
@@ -464,6 +648,7 @@ fn run_http_turn(
                     sequence,
                     &tool_call.id,
                     &placeholder,
+                    backend_key,
                 )?;
                 sequence += 1;
             }
@@ -486,10 +671,11 @@ fn run_http_turn(
                 &session_id,
                 turn_id.as_deref(),
                 sequence,
-                response_usage.as_ref(),
-                response_id.as_deref(),
+                usage.as_ref(),
+                generation_id.as_deref(),
                 response_model.as_deref(),
                 exact_cost,
+                backend_key,
             )?;
             finish_run(orch, &config.run_id, RunStatus::Exited);
             return Ok(());
@@ -510,11 +696,14 @@ fn run_http_turn(
         &session_id,
         turn_id.as_deref(),
         sequence,
-        &format!("Reached the per-turn tool-iteration budget ({MAX_TOOL_ITERATIONS}); finalizing this turn."),
+        &format!(
+            "Reached the per-turn tool-iteration budget ({MAX_TOOL_ITERATIONS}); finalizing this turn."
+        ),
         None,
         None,
         None,
         exact_cost,
+        backend_key,
     )?;
     sequence += 1;
     store_success_result(
@@ -528,6 +717,7 @@ fn run_http_turn(
         None,
         None,
         exact_cost,
+        backend_key,
     )?;
     finish_run(orch, &config.run_id, RunStatus::Exited);
     Ok(())
@@ -587,13 +777,14 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 /// Codex backends. Fires once per generation when usage is reported, keyed on the
 /// durable session id and carrying the model's real catalog window so the dial
 /// renders its ring rather than a bare token count.
-fn emit_openrouter_context_snapshot(
+fn emit_context_snapshot(
     orch: &Orchestrator,
     run_id: &str,
     session_id: &str,
+    backend_key: &str,
     model: &str,
     context_window: Option<i64>,
-    usage: &OpenRouterUsage,
+    usage: &TurnUsage,
 ) {
     let counts = usage.token_counts();
     let input = counts.input.unwrap_or(0) as i64;
@@ -601,7 +792,7 @@ fn emit_openrouter_context_snapshot(
     orch.store_context_token_snapshot(ContextTokenState {
         run_id: run_id.to_string(),
         session_id: Some(session_id.to_string()),
-        backend: OPENROUTER_BACKEND_KEY.to_string(),
+        backend: backend_key.to_string(),
         model: Some(model.to_string()),
         // OpenAI-style usage: prompt_tokens already includes any cached input, so
         // full input plus output is the occupancy (adding cache_read double counts).

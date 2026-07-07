@@ -81,6 +81,7 @@ pub async fn project_resource_fixture(
 
 pub async fn read_resource(orch: &Orchestrator, uri: impl AsRef<str>) -> String {
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "read_issue_resource".to_string(),
@@ -92,6 +93,7 @@ pub async fn read_resource(orch: &Orchestrator, uri: impl AsRef<str>) -> String 
 
 pub async fn change_resource(orch: &Orchestrator, changes: Value) -> String {
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "write".to_string(),

@@ -273,6 +273,7 @@ pub(crate) async fn query_db(
 
     let inner_uri = build_db_uri(sql, offset, limit);
     let request = CallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "read_batch".to_string(),
@@ -344,6 +345,7 @@ pub(crate) async fn query_pid(instance: &DevInstance) -> Result<u32, String> {
     })?;
 
     let request = CallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "process_info".to_string(),

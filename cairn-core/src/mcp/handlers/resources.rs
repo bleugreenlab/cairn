@@ -1079,6 +1079,7 @@ mod tests {
 
     async fn read_terminal(orch: &Orchestrator, uri: &str) -> TerminalReadResult {
         let request = McpCallbackRequest {
+            thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: None,
             tool: "read_resource".to_string(),

@@ -743,6 +743,7 @@ pub async fn handle_read_file(orch: &Orchestrator, request: &McpCallbackRequest)
             None => return format!("Invalid cairn resource URI: {}", split.identity),
         };
         let resource_request = McpCallbackRequest {
+            thread_id: None,
             cwd: request.cwd.clone(),
             run_id: request.run_id.clone(),
             tool: request.tool.clone(),
@@ -899,6 +900,7 @@ pub(crate) async fn produce_file_segment(
                     (None, resolved_target.full_path.clone())
                 };
             let glob_request = McpCallbackRequest {
+                thread_id: None,
                 cwd: request.cwd.clone(),
                 run_id: request.run_id.clone(),
                 tool: "read".to_string(),
@@ -991,6 +993,7 @@ pub(crate) async fn produce_file_segment(
                     };
                 grep_payload.path = Some(grep_path.display().to_string());
                 let grep_request = McpCallbackRequest {
+                    thread_id: None,
                     cwd: request.cwd.clone(),
                     run_id: request.run_id.clone(),
                     tool: "read".to_string(),
@@ -1643,6 +1646,7 @@ mod tests {
 
     fn grep_request(cwd: &std::path::Path) -> McpCallbackRequest {
         McpCallbackRequest {
+            thread_id: None,
             cwd: cwd.display().to_string(),
             run_id: None,
             tool: "read_batch".to_string(),

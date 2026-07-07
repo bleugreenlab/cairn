@@ -198,8 +198,15 @@ impl CodexBackend {
         initial_sequence: i32,
         backend_key: String,
         run_db: Arc<LocalDb>,
+        // Some(_) for a pooled ephemeral call (CAIRN-2549): the reader consumes a
+        // per-call channel fed by the pool dispatcher (not the shared
+        // `client.notifications()`), finalizes its one-shot turn explicitly, must
+        // never signal the shared app-server, and deregisters its routing entries
+        // on exit. None for the legacy process-per-session path.
+        ephemeral_cleanup: Option<super::pool::PooledCall>,
     ) {
         log::debug!("codex_app_server: reader started");
+        let ephemeral = ephemeral_cleanup.is_some();
         let mut sequence: i32 = initial_sequence;
         let mut streaming_state: Option<StreamingState> = None;
         let mut pending_usage: Option<Usage> = None;
@@ -222,6 +229,7 @@ impl CodexBackend {
             let orch = orch.clone();
             let run_id = run_id.to_string();
             let client = client.clone();
+            let ephemeral_wd = ephemeral;
             thread::spawn(move || {
                 while alive.load(Ordering::Acquire) {
                     thread::sleep(CODEX_TURN_WATCHDOG_POLL);
@@ -250,7 +258,13 @@ impl CodexBackend {
                             CODEX_TURN_NO_PROGRESS_TIMEOUT.as_secs()
                         ),
                     );
-                    client.shutdown();
+                    // A pooled call shares the app-server with other live calls,
+                    // so NEVER shut the transport down here; `kill_session_with_reason`
+                    // interrupts only this call's turn (turn/interrupt) and, with a
+                    // null child, leaves the shared process running.
+                    if !ephemeral_wd {
+                        client.shutdown();
+                    }
                     let _ = crate::orchestrator::lifecycle::kill_session_with_reason(
                         &orch, &run_id, "crash",
                     );
@@ -947,12 +961,18 @@ impl CodexBackend {
                         &mut sequence,
                         status,
                         pending_usage.take(),
+                        ephemeral,
                     );
                     if let Ok(mut guard) = current_turn_id.lock() {
                         *guard = None;
                     }
                     if let Ok(mut watchdog) = progress_watchdog.lock() {
                         watchdog.clear_turn();
+                    }
+                    // A pooled call is a single one-shot turn: its turn/completed
+                    // is terminal, so stop consuming and let the thread exit.
+                    if ephemeral {
+                        break;
                     }
                 }
                 Some("turn/aborted") => {
@@ -994,6 +1014,11 @@ impl CodexBackend {
                     if let Ok(mut watchdog) = progress_watchdog.lock() {
                         watchdog.clear_turn();
                     }
+                    // A pooled call's aborted turn is terminal (killed or
+                    // failed): stop consuming and exit the thread.
+                    if ephemeral {
+                        break;
+                    }
                 }
                 Some("error") => {
                     let message = msg
@@ -1025,6 +1050,10 @@ impl CodexBackend {
                         // Non-retryable fatal error: finalize task-aware so a
                         // delegated child fails terminally and resumes its parent.
                         crate::orchestrator::lifecycle::fail_run(orch, run_id, "turn_failed");
+                        // A pooled call's fatal error is terminal: exit the thread.
+                        if ephemeral {
+                            break;
+                        }
                     }
                 }
                 Some("thread/tokenUsage/updated") => {
@@ -1094,6 +1123,14 @@ impl CodexBackend {
             session_id.as_deref(),
             &mut sequence,
         );
+
+        // Pooled ephemeral call: drop this call's routing entries so the pool no
+        // longer maps its threadId. Idempotent with crash teardown (which fails
+        // in-flight calls and drops the whole pool). Reached whether the reader
+        // broke on a terminal turn or the channel closed under it.
+        if let Some(cleanup) = ephemeral_cleanup {
+            cleanup.deregister();
+        }
     }
 }
 

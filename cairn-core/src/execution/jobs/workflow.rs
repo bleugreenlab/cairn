@@ -50,6 +50,10 @@ pub(crate) struct PreparedWorkflowRun {
     /// The declared output artifact name (`CAIRN_WORKFLOW_OUTPUT`); the harness
     /// `output()` writes `cairn:~/{name}` to complete the run.
     pub output_name: String,
+    /// True when this workflow minted its own ephemeral worktree (an Inherit
+    /// workflow from an ambient, no-worktree parent). Drives the startup-failure
+    /// reclaim so a workflow that never starts cannot strand a worktree.
+    pub owns_ephemeral_worktree: bool,
 }
 
 /// Mint the job+session+run rows and the initial turn for a workflow run, seed
@@ -83,6 +87,7 @@ pub(crate) fn prepare_workflow_run(
         .execution_id
         .clone()
         .or_else(|| parent_job.execution_id.clone());
+    let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
     let node_path = run_db({
         let db = db.clone();
         let project_id = project_id.clone();
@@ -97,22 +102,50 @@ pub(crate) fn prepare_workflow_run(
 
     // Worktree mode mirrors a call: `inherit` shares the caller's tree; `none`
     // runs in a fresh scratch dir with no project-tree binding.
-    let (worktree_path, working_dir, base_commit) = match input.worktree {
-        CallWorktree::Inherit => {
-            let path = parent_job
-                .worktree_path
-                .clone()
-                .ok_or("Parent job has no worktree - cannot inherit for a workflow")?;
-            let base = worktree_head_commit(orch, Path::new(&path));
-            (Some(path.clone()), path, base)
-        }
-        CallWorktree::None => {
-            let scratch = std::env::temp_dir().join(format!("cairn-workflow-{run_id}"));
-            std::fs::create_dir_all(&scratch)
-                .map_err(|e| format!("Failed to create workflow scratch dir: {e}"))?;
-            (None, scratch.to_string_lossy().into_owned(), None)
-        }
-    };
+    let (worktree_path, working_dir, base_commit, ephemeral_branch, owns_ephemeral_worktree) =
+        match super::worktrees::resolve_call_worktree_plan(
+            input.worktree,
+            parent_job.worktree_path.as_deref(),
+            parent_job.base_branch.as_deref(),
+        ) {
+            // A worktree-backed parent shares its tree with the workflow.
+            super::worktrees::CallWorktreePlan::Share { path } => {
+                let base = worktree_head_commit(orch, Path::new(&path));
+                (Some(path.clone()), path, base, None, false)
+            }
+            // An ambient (no-worktree) parent has none to inherit, so the workflow
+            // gets its own ephemeral worktree off the parent's base branch —
+            // reclaimed when the workflow job terminalizes. Mirrors the
+            // child-task / call precedent exactly.
+            super::worktrees::CallWorktreePlan::MintEphemeral { base_ref } => {
+                let repo_path = project_path
+                    .as_ref()
+                    .ok_or("Project has no repo path for ephemeral workflow worktree")?
+                    .to_string_lossy()
+                    .to_string();
+                let (path, branch) = super::worktrees::ensure_ephemeral_task_worktree(
+                    orch,
+                    &repo_path,
+                    &job_id,
+                    issue_id.clone(),
+                    &base_ref,
+                )?;
+                let base = worktree_head_commit(orch, Path::new(&path));
+                (Some(path.clone()), path, base, Some(branch), true)
+            }
+            super::worktrees::CallWorktreePlan::Scratch => {
+                let scratch = std::env::temp_dir().join(format!("cairn-workflow-{run_id}"));
+                std::fs::create_dir_all(&scratch)
+                    .map_err(|e| format!("Failed to create workflow scratch dir: {e}"))?;
+                (
+                    None,
+                    scratch.to_string_lossy().into_owned(),
+                    None,
+                    None,
+                    false,
+                )
+            }
+        };
 
     let output_name = input.output_contract.artifact_name();
     let output_contract_json = serde_json::to_string(&input.output_contract)
@@ -126,7 +159,10 @@ pub(crate) fn prepare_workflow_run(
             session_id: session_id.clone(),
             parent_job_id: input.parent_job_id.clone(),
             worktree_path: worktree_path.clone(),
-            branch: None,
+            // Shares the parent's worktree / runs in a scratch dir (branch None),
+            // or owns an ephemeral worktree minted off the parent's base (inherit
+            // from an ambient parent) — recorded so teardown can forget the branch.
+            branch: ephemeral_branch,
             // A workflow has no agent; the synthetic id marks the job as a workflow
             // node without loading an agent config.
             agent_config_id: "workflow".to_string(),
@@ -136,7 +172,7 @@ pub(crate) fn prepare_workflow_run(
             description: input.description.clone(),
             model: None,
             base_commit,
-            owns_ephemeral_worktree: false,
+            owns_ephemeral_worktree,
             output_contract: Some(output_contract_json),
             label: input.label.clone(),
             phase: input.phase.clone(),
@@ -206,7 +242,32 @@ pub(crate) fn prepare_workflow_run(
         turn_id,
         workflow_id: input.workflow_id,
         output_name,
+        owns_ephemeral_worktree,
     })
+}
+
+/// Reclaim the ephemeral worktree an Inherit workflow from an ambient parent
+/// minted in [`prepare_workflow_run`], when the workflow fails to fully start
+/// (packet persist or process spawn). The workflow job never terminalizes on such
+/// a failure, so neither the finalize reclaim nor the terminal-status GC fires —
+/// discard it here so a failed spawn cannot strand a worktree + branch. No-op for
+/// a shared/inherited or scratch-dir workflow.
+pub(crate) async fn reclaim_ephemeral_workflow_worktree(
+    orch: &Orchestrator,
+    prepared: &PreparedWorkflowRun,
+) {
+    if !prepared.owns_ephemeral_worktree {
+        return;
+    }
+    if let Err(e) = crate::execution::teardown::teardown_worktrees(
+        orch,
+        crate::execution::teardown::TeardownScope::Job(prepared.job_id.clone()),
+        crate::execution::teardown::TeardownReason::Discarded,
+    )
+    .await
+    {
+        log::warn!("failed to reclaim ephemeral workflow worktree after start failure: {e}");
+    }
 }
 
 /// The durable spawn parameters of a workflow run, recorded in `workflow_run`
@@ -554,6 +615,30 @@ pub(crate) async fn load_workflow_run_row_by_job(
     .map_err(|e| e.to_string())
 }
 
+/// Whether a `workflow_run` re-dispatch record still exists for a job (private,
+/// runner-transient DB). The record survives exactly the restartable terminal
+/// states (deliberate stop / script failure / crash) and is dropped only on
+/// clean completion — so this is the liveness signal that gates ephemeral
+/// workflow-worktree reclaim: while the record lives, the worktree must survive
+/// so `restart_workflow` can respawn into its persisted `working_dir`.
+pub(crate) async fn workflow_run_record_exists(db: &LocalDb, job_id: &str) -> Result<bool, String> {
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM workflow_run WHERE job_id = ?1 LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// The `exit_reason` of a run row, or `None` when unset or the row is gone.
 async fn current_run_exit_reason(db: &LocalDb, run_id: &str) -> Result<Option<String>, String> {
     let run_id = run_id.to_string();
@@ -861,6 +946,19 @@ mod redispatch_tests {
         assert_eq!(rows[0].node_path.as_deref(), Some("/repo/node_modules"));
         delete_workflow_run_row(&db, "wf-run").await.unwrap();
         assert!(load_all_workflow_run_rows(&db).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_run_record_exists_tracks_the_row_by_job() {
+        // The reclaim guard keys on this: a live record (restartable workflow)
+        // keeps the ephemeral worktree; once dropped, reclaim proceeds.
+        let db = migrated_db().await;
+        assert!(!workflow_run_record_exists(&db, "j-wf").await.unwrap());
+        persist_workflow_run_row(&db, &sample_row()).await.unwrap();
+        assert!(workflow_run_record_exists(&db, "j-wf").await.unwrap());
+        assert!(!workflow_run_record_exists(&db, "j-other").await.unwrap());
+        delete_workflow_run_row(&db, "wf-run").await.unwrap();
+        assert!(!workflow_run_record_exists(&db, "j-wf").await.unwrap());
     }
 
     #[tokio::test]

@@ -70,6 +70,9 @@ impl Orchestrator {
         if let Some(routing) = input.openrouter_routing {
             current.openrouter_routing = routing;
         }
+        if let Some(route) = input.route_calls_via_openrouter {
+            current.route_calls_via_openrouter = route;
+        }
         if let Some(fees) = input.subscription_fees {
             // Drop non-positive / non-finite entries so a cleared input means
             // "metered" rather than a 0-fee ratio.

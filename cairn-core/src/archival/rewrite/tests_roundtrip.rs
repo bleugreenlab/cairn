@@ -455,6 +455,7 @@ async fn live_read_batch_round_trips_through_archival() {
         let clone = clone.clone();
         async move {
             let request = McpCallbackRequest {
+                thread_id: None,
                 cwd: clone.display().to_string(),
                 run_id: None,
                 tool: "read_batch".to_string(),

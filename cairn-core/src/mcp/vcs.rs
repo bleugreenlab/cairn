@@ -1173,6 +1173,7 @@ mod tests {
         .await;
 
         let request = CallbackRequest {
+            thread_id: None,
             cwd: ws_path,
             run_id: None,
             tool: "run".to_string(),
@@ -1268,6 +1269,7 @@ mod tests {
 
         let orch = orch_with_config("vcs_store_lock_non_worktree.db", config_dir).await;
         let request = CallbackRequest {
+            thread_id: None,
             cwd: plain.to_string_lossy().into_owned(),
             run_id: None,
             tool: "run".to_string(),

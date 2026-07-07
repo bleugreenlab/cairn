@@ -2433,6 +2433,7 @@ line2', X'0001020AFF', 2.5),
         });
 
         let request = McpCallbackRequest {
+            thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),

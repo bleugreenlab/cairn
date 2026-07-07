@@ -312,6 +312,10 @@ pub(super) fn handle_turn_completed(
     sequence: &mut i32,
     status: &str,
     usage: Option<Usage>,
+    // Pooled ephemeral call (CAIRN-2549): a call thread is one-shot and abandoned
+    // after its turn, so on success it finalizes explicitly (never warm). Ordinary
+    // node/task sessions pass `false` and keep the warm/task branching.
+    ephemeral_call: bool,
 ) {
     finalize_streaming(orch, run_db, emitter, streaming_state, session_id, sequence);
     let counts = TokenCounts::from_optional_usage(usage.as_ref());
@@ -346,6 +350,15 @@ pub(super) fn handle_turn_completed(
                 counts,
             );
             *sequence += 1;
+
+            if ephemeral_call {
+                // The pooled thread is abandoned after this turn. Finalize
+                // explicitly — driving `on_call_run_finalized` (slot release,
+                // workflow journal, parent resume) — rather than warming a
+                // process that no longer maps 1:1 to this run.
+                crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Exited);
+                return;
+            }
 
             let is_task = is_task_spawned_run(CODEX_BACKEND_NAME, run_db, run_id);
             if is_task {

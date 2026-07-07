@@ -68,6 +68,28 @@ pub(crate) fn remove_worktree_robust(
     wt_path: &Path,
     branch: Option<&str>,
 ) -> Result<(), String> {
+    // Reap any process still rooted (by cwd) in this worktree BEFORE removal. A
+    // dev instance launched from a worktree detaches its runner/tauri/vite into
+    // their own process groups (see `scripts/dev-instance.ts`), so neither the
+    // PTY terminal kill nor `git worktree remove` reaches them — only a cwd scan
+    // does (CAIRN-2390). Guarded to the managed worktrees base so a production
+    // process (cwd = main checkout, never under `~/.cairn/worktrees`) is never
+    // touched; this mirrors `remove_dir_tombstoned`'s guard and is the
+    // load-bearing safety boundary. Reaping before the delete also frees the
+    // directory, reducing the ENOTEMPTY/EBUSY races the tombstone retry fights.
+    if let Some(base) = worktrees_base_dir() {
+        if wt_path.starts_with(&base) {
+            let reaped = orch.services.reaper.reap_under(wt_path);
+            if !reaped.is_empty() {
+                log::info!(
+                    "Teardown: reaped {} process(es) rooted in {}",
+                    reaped.len(),
+                    wt_path.display()
+                );
+            }
+        }
+    }
+
     if let Some(b) = branch {
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
         if crate::jj::is_jj_dir(&store) {
@@ -250,6 +272,17 @@ pub(crate) async fn execute_target_cleanup(
     db: &LocalDb,
     target: &TeardownTarget,
 ) {
+    // Clear tracked terminal/browser rows and best-effort-kill their PTY
+    // children for every job referencing this worktree. This is the per-target
+    // home of the job-scoped kill, so the worktree GC path — which reaches
+    // cleanup only through here — now clears stale `job_terminals` /
+    // `job_browsers` rows and sends the browser Close command, which it never
+    // did before. It overlaps harmlessly with the path-scoped reaper in
+    // `remove_worktree_robust` (both idempotent, best-effort) while each reaches
+    // something the other cannot: detached grandchildren vs. DB rows and the
+    // browser channel.
+    kill_terminals_for_jobs(orch, db, &target.job_ids).await;
+
     // Archive the execution's at-risk events to git coordinates (with a zstd
     // backstop) before the worktree and branch disappear, the immutability
     // boundary. Strictly best-effort: any failure logs a warning and rolls back
@@ -487,13 +520,6 @@ pub async fn teardown_worktrees(
     if targets.is_empty() {
         return Ok(());
     }
-
-    // Kill terminals owned by any job referencing a torn-down worktree.
-    let job_ids: Vec<String> = targets
-        .iter()
-        .flat_map(|target| target.job_ids.iter().cloned())
-        .collect();
-    kill_terminals_for_jobs(orch, &db, &job_ids).await;
 
     // Remove worktrees (archive at-risk events, drop the warm search index,
     // delete the dir robustly, reclaim scratch dirs) then delete local branches;
@@ -1384,5 +1410,92 @@ mod tests {
             &porcelain,
             &dir.path().join("other")
         ));
+    }
+
+    /// The shared per-target cleanup (used by both teardown and the worktree GC)
+    /// reaps processes rooted in the worktree AND clears tracked terminal rows.
+    /// The GC path reaches cleanup only through `execute_target_cleanup`, so this
+    /// guards both behaviours it lacked before CAIRN-2390.
+    #[tokio::test]
+    async fn execute_target_cleanup_reaps_and_clears_terminals() {
+        use crate::db::DbState;
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::{MockGitClient, RecordingReaper, TestServicesBuilder};
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        // A worktree path under the managed base so the reaper guard admits it.
+        // The dir is never created, so removal is a no-op and the RecordingReaper
+        // never touches a real process — nothing here has filesystem side effects.
+        let Some(base) = worktrees_base_dir() else {
+            return; // no resolvable home dir in this environment; skip.
+        };
+        let wt = base.join("CAIRN-2390-cleanup-test-0");
+        let wt_path = wt.to_string_lossy().into_owned();
+
+        let db = migrated_db().await;
+        seed_project(&db, "p-1", "CAIRN").await;
+        seed_issue(&db, "p-1", "i-1", 1).await;
+        seed_job(
+            &db,
+            "j1",
+            "p-1",
+            Some("i-1"),
+            None,
+            Some(&wt_path),
+            Some("agent/x"),
+            "complete",
+        )
+        .await;
+        // A running terminal row the GC path must delete.
+        db.execute(
+            "INSERT INTO job_terminals (id, job_id, session_id, command, status, created_at, slug)
+             VALUES ('t1', 'j1', 's1', 'bun dev', 'running', 1, 'dev')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let reaper = RecordingReaper::returning(vec![4242]);
+        // The only external service call in this path is `git worktree prune`.
+        let mut git = MockGitClient::new();
+        git.expect_worktree_prune().returning(|_| Ok(()));
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index =
+            Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(
+            TestServicesBuilder::new()
+                .with_reaper(reaper.clone())
+                .with_git(git)
+                .build(),
+        );
+        let orch = OrchestratorBuilder::new(db_state.clone(), services, config_dir).build();
+
+        let target = TeardownTarget {
+            worktree_path: wt_path.clone(),
+            branch: Some("agent/x".into()),
+            repo_path: "/tmp/CAIRN".into(),
+            job_ids: vec!["j1".into()],
+        };
+        execute_target_cleanup(&orch, &db_state.local, &target).await;
+
+        // The reaper was invoked with the worktree path (the base guard admitted
+        // it), proving the GC path now reaps rooted processes.
+        assert_eq!(reaper.calls(), vec![wt]);
+
+        // The running terminal row was cleared, proving the GC path now runs the
+        // job-scoped terminal cleanup it previously skipped.
+        let running = load_running_terminals_for_jobs(&db_state.local, &["j1".to_string()])
+            .await
+            .unwrap();
+        assert!(
+            running.is_empty(),
+            "GC path must clear tracked terminal rows, found {running:?}"
+        );
     }
 }

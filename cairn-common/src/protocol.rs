@@ -24,6 +24,15 @@ pub struct CallbackRequest {
     /// Tool use ID from MCP protocol - tracks parent for batch_tasks children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
+    /// Codex pooled-app-server thread id (CAIRN-2549). Set by `cairn-cmd` from
+    /// the `tools/call` request's `_meta.threadId` when Codex injects it (one
+    /// shared app-server hosts N ephemeral call threads). The host maps this
+    /// thread id back to the owning run, overriding the process-global
+    /// `CAIRN_RUN_ID`/`cwd`, so each pooled call's tool results and `cairn:~/`
+    /// targets attribute to the right run. `None` for every non-pooled caller
+    /// (Claude, CLI, SDK, and Codex node/task sessions), which is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
 }
 
 /// Response from Tauri backend to MCP server.

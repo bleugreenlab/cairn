@@ -1042,6 +1042,7 @@ fn orchestrator_over(dbs: Arc<DbState>, config_dir: &Path) -> Orchestrator {
 /// the job/run-keyed execution side effects that stay private (CAIRN-2181).
 fn external_request(cwd: &Path) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.to_string_lossy().to_string(),
         run_id: None,
         tool: "write".to_string(),
@@ -2112,6 +2113,7 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
     //    yielding). Before the fix this returned the live `No run found` error
     //    because lookup_run hit the empty private DB.
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: dir.path().join("repo").to_string_lossy().to_string(),
         run_id: Some(run.to_string()),
         tool: "write".to_string(),
@@ -2219,6 +2221,7 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
     )
     .await;
     let local_request = McpCallbackRequest {
+        thread_id: None,
         cwd: dir.path().join("l").to_string_lossy().to_string(),
         run_id: Some("run-local-q".to_string()),
         tool: "write".to_string(),

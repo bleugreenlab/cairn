@@ -159,7 +159,10 @@ pub(crate) async fn run_cli_read(
     }
     let client = build_cli_client(callback_url);
     let input = ReadFileInput { paths };
-    match client.read(Parameters(input)).await {
+    match client
+        .read(Parameters(input), rmcp::model::Meta::default())
+        .await
+    {
         Ok(result) => emit_tool_result(&result),
         Err(e) => {
             eprintln!("cairn read failed: {e}");
@@ -217,6 +220,7 @@ pub(crate) async fn run_cli_watch(issue_uri: String, since: Option<i64>) -> bool
             None => serde_json::json!({ "issue_uri": issue_uri }),
         };
         let request = CallbackRequest {
+            thread_id: None,
             cwd: client.cwd.to_string(),
             run_id: client.run_id.as_ref().map(|r| r.to_string()),
             tool: "watch".to_string(),
@@ -300,7 +304,10 @@ pub(crate) async fn run_cli_change(json: Option<String>, commit_msg: Option<Stri
         return false;
     }
     let client = build_cli_client(callback_url);
-    match client.write(Parameters(input)).await {
+    match client
+        .write(Parameters(input), rmcp::model::Meta::default())
+        .await
+    {
         Ok(result) => emit_tool_result(&result),
         Err(e) => {
             eprintln!("cairn write failed: {e}");

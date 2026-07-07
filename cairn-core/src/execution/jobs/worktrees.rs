@@ -332,6 +332,49 @@ pub(crate) fn prepare_worktree_for_job(
     Ok(())
 }
 
+/// The resolved worktree plan for an ephemeral call or workflow run — the pure
+/// decision, split from the I/O that carries it out.
+///
+/// An Inherit call/workflow shares a worktree-backed parent's tree, but an
+/// ambient (no-worktree) parent has none to inherit, so it mints its own
+/// ephemeral worktree off the parent's base branch — the same trade the
+/// child-task path already makes (CAIRN-2476). Both `calls.rs` and `workflow.rs`
+/// resolve through this one function so the two paths cannot drift; the caller
+/// performs the scratch mkdir / `jj workspace add` against the returned plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallWorktreePlan {
+    /// Inherit from a worktree-backed parent: share its worktree path.
+    Share { path: String },
+    /// Inherit from an ambient (no-worktree) parent: mint an ephemeral worktree
+    /// off `base_ref`, owned by this job and reclaimed at terminalization.
+    MintEphemeral { base_ref: String },
+    /// `none`: a fresh scratch dir with no project-tree binding.
+    Scratch,
+}
+
+/// Resolve the worktree plan for an ephemeral call/workflow from its mode and the
+/// parent job's worktree/base. Pure and unit-testable; the mint I/O lives in the
+/// caller. An ambient parent (NULL `worktree_path`) under Inherit mints off the
+/// parent's base branch, falling back to `HEAD`.
+pub(crate) fn resolve_call_worktree_plan(
+    worktree: crate::execution::jobs::CallWorktree,
+    parent_worktree_path: Option<&str>,
+    parent_base_branch: Option<&str>,
+) -> CallWorktreePlan {
+    use crate::execution::jobs::CallWorktree;
+    match worktree {
+        CallWorktree::Inherit => match parent_worktree_path {
+            Some(path) => CallWorktreePlan::Share {
+                path: path.to_string(),
+            },
+            None => CallWorktreePlan::MintEphemeral {
+                base_ref: parent_base_branch.unwrap_or("HEAD").to_string(),
+            },
+        },
+        CallWorktree::None => CallWorktreePlan::Scratch,
+    }
+}
+
 /// Mint a throwaway worktree for a task delegated by an ambient (no-worktree)
 /// parent, off `base_ref`.
 ///
@@ -386,4 +429,62 @@ pub(crate) fn ensure_ephemeral_task_worktree(
     .map_err(|e| e.to_string())?;
 
     Ok((wt_path.to_string_lossy().to_string(), branch))
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::execution::jobs::CallWorktree;
+
+    #[test]
+    fn inherit_from_worktree_backed_parent_shares() {
+        // A worktree-backed parent shares its tree — no mint, no scratch.
+        let plan = resolve_call_worktree_plan(
+            CallWorktree::Inherit,
+            Some("/work/parent-wt"),
+            Some("agent/parent"),
+        );
+        assert_eq!(
+            plan,
+            CallWorktreePlan::Share {
+                path: "/work/parent-wt".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn inherit_from_ambient_parent_mints_off_base_branch() {
+        // An ambient (no-worktree) parent mints an ephemeral worktree off its base.
+        let plan = resolve_call_worktree_plan(CallWorktree::Inherit, None, Some("main"));
+        assert_eq!(
+            plan,
+            CallWorktreePlan::MintEphemeral {
+                base_ref: "main".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn inherit_from_ambient_parent_without_base_falls_back_to_head() {
+        let plan = resolve_call_worktree_plan(CallWorktree::Inherit, None, None);
+        assert_eq!(
+            plan,
+            CallWorktreePlan::MintEphemeral {
+                base_ref: "HEAD".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn none_mode_is_scratch_regardless_of_parent() {
+        // `none` never binds to the project tree, ambient parent or not.
+        assert_eq!(
+            resolve_call_worktree_plan(CallWorktree::None, None, Some("main")),
+            CallWorktreePlan::Scratch
+        );
+        assert_eq!(
+            resolve_call_worktree_plan(CallWorktree::None, Some("/work/parent-wt"), None),
+            CallWorktreePlan::Scratch
+        );
+    }
 }

@@ -98,6 +98,7 @@ async fn table_and_dispatch_match_for_every_kind_and_mode() {
                 item["payload"] = payload_for(spec);
             }
             let request = McpCallbackRequest {
+                thread_id: None,
                 cwd: cwd.clone(),
                 run_id: None,
                 tool: "write".to_string(),

@@ -740,6 +740,7 @@ mod tests {
 
     fn request_for_run(run_id: &str) -> McpCallbackRequest {
         McpCallbackRequest {
+            thread_id: None,
             cwd: "/unused".to_string(),
             run_id: Some(run_id.to_string()),
             tool: "read_resource".to_string(),

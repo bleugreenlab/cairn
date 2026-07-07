@@ -142,6 +142,15 @@ pub struct SettingsFile {
     /// normal routing; omitted from YAML when all-default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openrouter_routing: Option<OpenRouterRouting>,
+    /// Opt-in: route tier-based ephemeral calls through OpenRouter's in-process
+    /// HTTP loop instead of the native backend. Absent/false = native routing;
+    /// omitted from YAML when unset.
+    #[serde(
+        default,
+        rename = "routeCallsViaOpenRouter",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub route_calls_via_openrouter: Option<bool>,
     /// Per-project commands the user has accepted as worktree-fence crossers
     /// (`projectId -> [command, ...]`). A project terminal command's `write`
     /// carveout (or coarse fence crossing) is honored only when its command is
@@ -290,6 +299,7 @@ impl SettingsFile {
             log_level: self.log_level.unwrap_or(LogLevel::Standard),
             subscription_fees: self.subscription_fees.clone().unwrap_or_default(),
             openrouter_routing: self.openrouter_routing.clone().unwrap_or_default(),
+            route_calls_via_openrouter: self.route_calls_via_openrouter.unwrap_or(false),
         }
     }
 
@@ -325,6 +335,8 @@ impl SettingsFile {
             } else {
                 Some(settings.openrouter_routing.clone())
             },
+            // Omit when false so an all-default settings file stays clean.
+            route_calls_via_openrouter: settings.route_calls_via_openrouter.then_some(true),
             // Config-only (YAML, not in the DTO); preserved across saves.
             sandbox_deny_read: None,
             build_services: None,
@@ -937,6 +949,30 @@ externalReplies: disabled
         assert!(empty.openrouter_routing.is_none());
         let empty_yaml = serde_yaml::to_string(&empty).unwrap();
         assert!(!empty_yaml.contains("openrouterRouting"));
+    }
+
+    #[test]
+    fn test_route_calls_via_openrouter_roundtrip() {
+        // Default is false, and a false value is omitted from YAML entirely.
+        assert!(!test_settings().route_calls_via_openrouter);
+        let empty = SettingsFile::from_settings(&test_settings());
+        assert!(empty.route_calls_via_openrouter.is_none());
+        assert!(!serde_yaml::to_string(&empty)
+            .unwrap()
+            .contains("routeCallsViaOpenRouter"));
+
+        // Opt-in survives DTO -> file -> DTO and YAML load/save.
+        let settings = Settings {
+            route_calls_via_openrouter: true,
+            ..test_settings()
+        };
+        let file = SettingsFile::from_settings(&settings);
+        assert_eq!(file.route_calls_via_openrouter, Some(true));
+        assert!(file.to_settings().route_calls_via_openrouter);
+        let yaml = serde_yaml::to_string(&file).unwrap();
+        assert!(yaml.contains("routeCallsViaOpenRouter"));
+        let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
+        assert!(parsed.to_settings().route_calls_via_openrouter);
     }
 
     #[test]

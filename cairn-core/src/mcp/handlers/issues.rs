@@ -918,6 +918,7 @@ mod tests {
 
     fn request(run_id: Option<&str>) -> McpCallbackRequest {
         McpCallbackRequest {
+            thread_id: None,
             cwd: "/tmp/repo".to_string(),
             run_id: run_id.map(ToString::to_string),
             tool: "write".to_string(),

@@ -36,6 +36,26 @@ pub const DEFAULT_SCRIPT: &str = "main.ts";
 /// The manifest filename inside a workflow package directory.
 pub const MANIFEST_FILE: &str = "workflow.yaml";
 
+/// Whether a workflow binds to the project tree. Declared in `workflow.yaml` as
+/// `worktree: none|inherit`; defaults to `none`.
+///
+/// The worktree decision belongs to the workflow, not the caller: a workflow
+/// script knows whether it (and the agent calls it fans out, which inherit its
+/// cwd) needs to read the repo. `none` runs the script in a scratch dir; the
+/// invocation surface maps this onto `CallWorktree` (see `mcp/handlers/workflows`),
+/// where `inherit` shares a worktree-backed caller's tree or mints an ephemeral
+/// one under an ambient (no-worktree) caller.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowWorktreeMode {
+    /// Scratch dir, no project-tree binding — the default; right for research /
+    /// orchestration workflows that never read the repo.
+    #[default]
+    None,
+    /// Give the workflow the project worktree.
+    Inherit,
+}
+
 /// Raw `workflow.yaml` manifest, deserialized from YAML.
 #[derive(Debug, Clone, Deserialize)]
 struct WorkflowManifest {
@@ -54,6 +74,9 @@ struct WorkflowManifest {
     /// default `return` contract at invocation.
     #[serde(default)]
     output: Option<OutputSchema>,
+    /// Whether the workflow binds to the project tree. Defaults to `none`.
+    #[serde(default)]
+    worktree: WorkflowWorktreeMode,
 }
 
 /// A workflow package loaded from a directory.
@@ -68,6 +91,8 @@ pub struct FileWorkflow {
     pub args_schema: Option<serde_json::Value>,
     /// The workflow's output schema, if declared.
     pub output: Option<OutputSchema>,
+    /// Whether the workflow binds to the project tree (default `none`/scratch).
+    pub worktree: WorkflowWorktreeMode,
     pub is_project_scoped: bool,
     /// Path to the package directory.
     pub dir_path: PathBuf,
@@ -191,6 +216,7 @@ fn load_workflow_dir(dir_path: &Path, is_project_scoped: bool) -> ConfigResult<F
         script,
         args_schema: manifest.args,
         output: manifest.output,
+        worktree: manifest.worktree,
         is_project_scoped,
         dir_path: dir_path.to_path_buf(),
         script_path,
@@ -224,6 +250,28 @@ mod tests {
                 assert!(w.args_schema.is_none());
                 assert!(w.output.is_none());
             }
+            ConfigResult::Err { error, .. } => panic!("{error}"),
+        }
+    }
+
+    #[test]
+    fn worktree_defaults_to_none_and_parses_inherit() {
+        let temp = tempdir().unwrap();
+        // Default when omitted.
+        let none_dir = temp.path().join("workflows").join("research");
+        write_workflow(&none_dir, "name: Research\ndescription: d\n");
+        match load_workflow_dir(&none_dir, false) {
+            ConfigResult::Ok(w) => assert_eq!(w.worktree, WorkflowWorktreeMode::None),
+            ConfigResult::Err { error, .. } => panic!("{error}"),
+        }
+        // Explicit inherit.
+        let inherit_dir = temp.path().join("workflows").join("repo-reader");
+        write_workflow(
+            &inherit_dir,
+            "name: Repo Reader\ndescription: d\nworktree: inherit\n",
+        );
+        match load_workflow_dir(&inherit_dir, false) {
+            ConfigResult::Ok(w) => assert_eq!(w.worktree, WorkflowWorktreeMode::Inherit),
             ConfigResult::Err { error, .. } => panic!("{error}"),
         }
     }

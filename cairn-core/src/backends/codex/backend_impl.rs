@@ -93,6 +93,14 @@ impl AgentBackend for CodexBackend {
     }
 
     fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+        // Pooled ephemeral call (CAIRN-2549): run this call as a lightweight
+        // `thread/start` on a shared app-server rather than spawning a process
+        // for it. Node/task sessions fall through to the process-per-session
+        // path below, unchanged.
+        if config.is_ephemeral_call {
+            return start_pooled_call(config, orch);
+        }
+
         let start_time = std::time::Instant::now();
         let session_id = Some(config.session_start.session_id().to_string());
 
@@ -228,7 +236,7 @@ impl AgentBackend for CodexBackend {
         // developerInstructions = agent + orientation. Sent and persisted bytes
         // are then equal by construction.
         let prompt_segments = assemble_prompt_segments(
-            &crate::system_prompt::cairn_system_prompt(),
+            &crate::system_prompt::cairn_system_prompt(config.ambient),
             workspace_instructions.as_deref(),
             project_instructions.as_deref(),
             config.system_prompt_content.as_deref(),
@@ -495,6 +503,7 @@ impl AgentBackend for CodexBackend {
                 initial_sequence,
                 "codex".to_string(),
                 run_db,
+                None,
             );
         });
 
@@ -511,6 +520,15 @@ impl AgentBackend for CodexBackend {
 
     fn supports_warm_processes(&self) -> bool {
         true // app-server stays alive after turn completion and accepts more user_input
+    }
+
+    fn call_batch_capability(&self) -> crate::backends::CallBatchCapability {
+        // Codex app-server is one long-lived pooled process; each call is a
+        // lightweight `thread/start` session on it. Unbounded today.
+        crate::backends::CallBatchCapability {
+            shape: crate::backends::CallBatchShape::PooledSessions,
+            max_concurrency: None,
+        }
     }
 
     fn send_user_message(
@@ -690,7 +708,7 @@ pub(crate) fn start_app_server_session(
     // developerInstructions = agent + orientation. Sent and persisted bytes are
     // then equal by construction.
     let prompt_segments = assemble_prompt_segments(
-        &crate::system_prompt::cairn_system_prompt(),
+        &crate::system_prompt::cairn_system_prompt(config.ambient),
         workspace_instructions.as_deref(),
         project_instructions.as_deref(),
         config.system_prompt_content.as_deref(),
@@ -957,11 +975,347 @@ pub(crate) fn start_app_server_session(
             initial_sequence,
             profile.backend_key.to_string(),
             run_db,
+            None,
         );
     });
 
     log::info!(
         "[PROFILE] CodexBackend(app-server)::start_session returning: {:?}",
+        start_time.elapsed()
+    );
+    Ok(())
+}
+
+/// Auth-identity fingerprint for the Codex app-server pool key (CAIRN-2549).
+///
+/// Distinct identities must never share an app-server (auth is process-global),
+/// but worktree/model/fence are deliberately excluded so scratch-dir fan-out
+/// under one identity collapses to a single pooled process.
+fn pool_key_for_auth(auth: &CodexAuth, oauth_state: Option<&Arc<Mutex<CodexAuthState>>>) -> String {
+    match auth {
+        CodexAuth::OAuthToken(_) => {
+            let account = oauth_state
+                .and_then(|s| s.lock().ok())
+                .and_then(|guard| guard.chatgpt_account_id())
+                .unwrap_or_default();
+            format!("codex-oauth:{account}")
+        }
+        CodexAuth::ApiKey(key) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut hasher);
+            format!("codex-apikey:{:x}", hasher.finish())
+        }
+    }
+}
+
+/// Perform the one-time `account/login/start` for a pooled app-server, mirroring
+/// the dedicated-session login so both auth paths stay identical.
+fn codex_login(
+    client: &AppServerClient,
+    auth: &CodexAuth,
+    oauth_state: Option<&Arc<Mutex<CodexAuthState>>>,
+) -> Result<(), String> {
+    match (auth, oauth_state) {
+        (CodexAuth::OAuthToken(_), Some(state)) => {
+            let guard = state
+                .lock()
+                .map_err(|_| "Codex auth state lock poisoned".to_string())?;
+            let (id_token, access_token) = guard.id_access_pair();
+            let account_id = guard
+                .chatgpt_account_id()
+                .ok_or_else(|| "Missing ChatGPT account id in Codex auth tokens".to_string())?;
+            drop(guard);
+            client.send_request(
+                "account/login/start",
+                serde_json::json!({
+                    "type": "chatgptAuthTokens",
+                    "idToken": id_token,
+                    "accessToken": access_token,
+                    "chatgptAccountId": account_id,
+                }),
+            )?;
+        }
+        (CodexAuth::ApiKey(key), _) => {
+            client.send_request(
+                "account/login/start",
+                serde_json::json!({
+                    "type": "apiKey",
+                    "apiKey": key,
+                }),
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Start an ephemeral CALL as a thread on the shared pooled Codex app-server
+/// (CAIRN-2549). One process hosts N call threads; each call finalizes its
+/// one-shot turn and abandons its thread. Isolation: the per-call `RunHandle`
+/// carries a NULL child so kill/stop/finalize never signal the shared process.
+pub(crate) fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+    let start_time = std::time::Instant::now();
+    let session_id = Some(config.session_start.session_id().to_string());
+    let run_db = resolve_run_db(CODEX_BACKEND_NAME, orch, &config.run_id)?;
+
+    let codex_path = crate::env::find_binary("codex").map_err(|e| {
+        insert_error_event(
+            orch,
+            &config.run_id,
+            session_id.as_deref(),
+            &format!("Codex CLI not found: {}", e),
+        );
+        e
+    })?;
+    if let Err(e) = check_codex_version(&codex_path) {
+        insert_error_event(orch, &config.run_id, session_id.as_deref(), &e);
+        return Err(e);
+    }
+
+    let mcp_secret = orch
+        .mcp_auth
+        .get_secret_for_mcp()
+        .map_err(|e| format!("Failed to get MCP auth secret: {}", e))?;
+    let codex_home = write_codex_config(
+        &orch.mcp_binary_path,
+        orch.mcp_callback_port,
+        &config.mcp_config_json,
+    )?;
+
+    let identity = config
+        .identity
+        .as_ref()
+        .cloned()
+        .or_else(|| orch.get_identity());
+    let Some(codex_auth) = identity.as_ref().and_then(|i| i.codex_auth.clone()) else {
+        insert_error_event(
+            orch,
+            &config.run_id,
+            session_id.as_deref(),
+            "Codex credentials not configured. Run `connect_codex_auth`.",
+        );
+        return Err("Missing Codex credentials".to_string());
+    };
+
+    let oauth_state = match &codex_auth {
+        CodexAuth::OAuthToken(json) => {
+            let account_id = find_codex_oauth_account_id(orch, json);
+            Some(Arc::new(Mutex::new(
+                CodexAuthState::new_for_account(json, account_id).map_err(|e| {
+                    insert_error_event(
+                        orch,
+                        &config.run_id,
+                        session_id.as_deref(),
+                        &format!("Invalid Codex OAuth tokens: {}", e),
+                    );
+                    e
+                })?,
+            )))
+        }
+        _ => None,
+    };
+
+    // Env for the SHARED app-server process. `CAIRN_RUN_ID`/`CAIRN_HOME_URI` are
+    // NON-authoritative here: per-call attribution rides on the tool call's
+    // `_meta.threadId`, which the host maps back to the owning run. The sentinel
+    // run id makes a (never-expected) threadId-less tool call fail LOUD in run
+    // lookup rather than silently attributing to another thread's run.
+    let mut env = HashMap::new();
+    env.insert("CODEX_HOME".to_string(), codex_home.clone());
+    env.insert(
+        "CAIRN_RUN_ID".to_string(),
+        "codex-pooled-app-server".to_string(),
+    );
+    env.insert("CAIRN_MCP_SECRET".to_string(), mcp_secret.clone());
+    env.insert("CAIRN_HOME_URI".to_string(), config.home_uri.clone());
+
+    let pool_key = pool_key_for_auth(&codex_auth, oauth_state.as_ref());
+
+    orch.collect_warm_if_needed();
+
+    // Get-or-spawn the shared app-server (spawn + initialize + login run ONCE per
+    // key, serialized by the pool's per-key init lock).
+    let working_dir = config.working_dir.clone();
+    let codex_path_for_build = codex_path.clone();
+    let auth_for_build = codex_auth.clone();
+    let oauth_for_build = oauth_state.clone();
+    let server = orch
+        .codex_pool
+        .ensure(&pool_key, orch, move || {
+            let client = Arc::new(AppServerClient::spawn(
+                orch.services.process.as_ref(),
+                &codex_path_for_build,
+                &env,
+                &working_dir,
+            )?);
+            client.send_request(
+                "initialize",
+                serde_json::json!({
+                    "clientInfo": {
+                        "name": "cairn",
+                        "title": "Cairn",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": { "experimentalApi": true }
+                }),
+            )?;
+            client.send_notification("initialized", serde_json::json!({}))?;
+            codex_login(client.as_ref(), &auth_for_build, oauth_for_build.as_ref())?;
+            Ok((client, oauth_for_build))
+        })
+        .map_err(|e| {
+            insert_error_event(
+                orch,
+                &config.run_id,
+                session_id.as_deref(),
+                &format!("Failed to start Codex app-server pool: {}", e),
+            );
+            e
+        })?;
+    let client = server.client();
+
+    let approval_policy = match config.permissions.fence {
+        crate::models::Fence::Allow => "never",
+        _ => "on-request",
+    };
+    let sandbox_mode = codex_sandbox_mode(config.permissions.fence);
+    let model_str = config.model.as_ref().map(|m| m.to_string());
+    let workspace_instructions = crate::workspace::instructions::read_workspace_instructions();
+    let project_instructions = crate::workspace::instructions::read_project_instructions(
+        std::path::Path::new(&config.working_dir),
+    );
+    let prompt_segments = assemble_prompt_segments(
+        &crate::system_prompt::cairn_system_prompt(config.ambient),
+        workspace_instructions.as_deref(),
+        project_instructions.as_deref(),
+        config.system_prompt_content.as_deref(),
+        config.system_prompt_dynamic_tail.as_deref(),
+    );
+    let base_instructions = base_instructions_from_segments(&prompt_segments);
+    let developer_instructions = developer_instructions_from_segments(&prompt_segments);
+
+    // A call is always a fresh thread.
+    let thread_resp = client.send_request(
+        "thread/start",
+        build_thread_start_params(
+            &config.working_dir,
+            approval_policy,
+            sandbox_mode,
+            model_str.as_deref(),
+            config.reasoning_effort.as_deref(),
+            config.service_tier.as_deref(),
+            &base_instructions,
+            developer_instructions.as_deref(),
+        ),
+    )?;
+    let thread_id = thread_resp
+        .get("thread")
+        .and_then(|t| t.get("id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "thread/start response missing thread id".to_string())?
+        .to_string();
+
+    if let Some(ref sid) = session_id {
+        let _ = set_session_backend_id(CODEX_BACKEND_NAME, &run_db, sid, &thread_id);
+    }
+
+    // Register `threadId -> run` and the per-call notification channel BEFORE
+    // `turn/start`, so the first tool call routes to this run (demux #2) and the
+    // dispatcher can deliver this thread's notifications (demux #1).
+    let notification_rx = server.register_call(&thread_id, &config.run_id, &config.working_dir);
+
+    let initial_sequence = persist_system_prompt_event(
+        orch,
+        &config.run_id,
+        session_id.as_deref(),
+        "codex",
+        &prompt_segments,
+    );
+
+    let mut turn_params = serde_json::json!({
+        "threadId": thread_id.clone(),
+        "cwd": config.working_dir,
+        "input": [{ "type": "text", "text": config.prompt }]
+    });
+    if let Some(ref model) = model_str {
+        turn_params["model"] = serde_json::json!(model);
+    }
+    if let Some(ref schema) = config.output_schema {
+        turn_params["outputSchema"] = schema.clone();
+    }
+    let turn_resp = client.send_request("turn/start", turn_params)?;
+    let current_turn_id = Arc::new(Mutex::new(
+        turn_resp
+            .get("turn")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    ));
+
+    if let Err(e) = transition_run_to_live(CODEX_BACKEND_NAME, orch, &run_db, &config.run_id) {
+        log::warn!("Failed to transition codex pooled call to running: {}", e);
+    }
+
+    // A NULL child is the isolation lever: `kill_session_with_reason` /
+    // `stop_and_remove` resolve `child.lock().take()` to None and skip
+    // `graceful_stop`, so the shared app-server is never signalled. Interrupt
+    // still reaches this call through `CodexStdin` -> `turn/interrupt`.
+    let null_child: Arc<Mutex<Option<Box<dyn crate::services::ChildProcess>>>> =
+        Arc::new(Mutex::new(None));
+    let stdin_arc: Arc<Mutex<Option<Box<dyn BackendStdin>>>> =
+        Arc::new(Mutex::new(Some(Box::new(CodexStdin::new(
+            client.clone(),
+            thread_id.clone(),
+            config.working_dir.clone(),
+            model_str.clone(),
+            config.reasoning_effort.clone(),
+            config.service_tier.clone(),
+            current_turn_id.clone(),
+        )) as Box<dyn BackendStdin>)));
+
+    let process_job_id: Option<String> = run_job_id(CODEX_BACKEND_NAME, &run_db, &config.run_id);
+    {
+        let mut processes = orch
+            .process_state
+            .processes
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let mut active_process =
+            ActiveProcess::new(null_child, stdin_arc, session_id.clone(), process_job_id);
+        active_process.backend = Some("codex".to_string());
+        active_process.model = config.model.as_ref().map(|m| m.as_str().to_string());
+        processes.register(config.run_id.clone(), active_process);
+    }
+    // `transition_to_active` (CAIRN-2526) is applied by the calls path
+    // (`start_call_run_now`) after this returns, exactly like the process path.
+
+    let run_id = config.run_id.clone();
+    let orch_clone = orch.clone();
+    let emitter = orch.services.emitter.clone();
+    let event_session_id = session_id;
+    let cleanup = super::pool::PooledCall::new(server.clone(), thread_id.clone());
+    thread::spawn(move || {
+        CodexBackend::reader_thread_app_server(
+            &orch_clone,
+            &emitter,
+            &run_id,
+            event_session_id,
+            notification_rx,
+            client,
+            current_turn_id,
+            // Pool-scoped auth-token refresh is answered by the pool dispatcher
+            // (it carries no threadId), so the per-call reader needs no oauth state.
+            None,
+            initial_sequence,
+            "codex".to_string(),
+            run_db,
+            Some(cleanup),
+        );
+    });
+
+    log::info!(
+        "[PROFILE] CodexBackend pooled call started: {:?}",
         start_time.elapsed()
     );
     Ok(())

@@ -1,16 +1,17 @@
-//! Classify and execute model-emitted tool calls, and build the request's tool /
-//! provider fields. Repairs tool names and truncated JSON arguments, refuses
-//! partial side-effecting calls, dispatches through the Cairn MCP callback, and
-//! normalizes home-relative (`cairn:~/`) targets to absolute node URIs.
+//! Provider-agnostic tool dispatch for the HTTP turn loop: classify and execute
+//! model-emitted tool calls, normalize home-relative (`cairn:~/`) targets to
+//! absolute node URIs, collapse batch envelopes to text on the text-only tool
+//! edge, and render a dispatch result (with reminders) into tool-message text.
+//! Repairs tool names and truncated JSON arguments, refuses partial
+//! side-effecting calls, and dispatches through the Cairn MCP callback.
 
-use super::wire::ToolCall;
-use crate::backends::openrouter::repair;
+use super::repair;
+use super::TurnToolCall;
 use crate::backends::SessionConfig;
 use crate::dispatch::DispatchOutput;
-use crate::models::{OpenRouterRouting, OpenRouterSort};
 use crate::orchestrator::Orchestrator;
 use crate::storage::run_db_blocking;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -51,8 +52,11 @@ fn truncated_args_message(verb: &str) -> DispatchOutput {
 /// suspected — by the finish signal or by balancing having to close the JSON —
 /// so a partial mutation never reaches disk or the shell. `read` is
 /// non-destructive, so a recovered partial is allowed through.
-pub(super) fn prepare_tool_call(tool_call: &ToolCall, suspected_truncated: bool) -> PreparedCall {
-    let raw_name = tool_call.function.name.as_str();
+pub(super) fn prepare_tool_call(
+    tool_call: &TurnToolCall,
+    suspected_truncated: bool,
+) -> PreparedCall {
+    let raw_name = tool_call.name.as_str();
     let Some(verb) = repair::normalize_tool_name(raw_name) else {
         return PreparedCall::Reject(DispatchOutput {
             content: format!(
@@ -63,8 +67,7 @@ pub(super) fn prepare_tool_call(tool_call: &ToolCall, suspected_truncated: bool)
     };
     let side_effecting = matches!(verb, "write" | "run");
 
-    let (payload, repaired_args) = match repair::parse_tool_arguments(&tool_call.function.arguments)
-    {
+    let (payload, repaired_args) = match repair::parse_tool_arguments(&tool_call.arguments) {
         repair::ParsedArguments::Ready { value, repaired } => {
             // Even cleanly-parsed JSON can be a cut-off payload when the
             // generation hit the output-token cap right after a complete
@@ -111,7 +114,7 @@ pub(super) fn prepare_tool_call(tool_call: &ToolCall, suspected_truncated: bool)
 pub(super) fn execute_tool_call(
     orch: &Orchestrator,
     config: &SessionConfig,
-    tool_call: &ToolCall,
+    tool_call: &TurnToolCall,
     suspected_truncated: bool,
 ) -> Result<DispatchOutput, String> {
     let (tool_name, mut payload) = match prepare_tool_call(tool_call, suspected_truncated) {
@@ -123,7 +126,7 @@ pub(super) fn execute_tool_call(
             if repaired_args {
                 log::warn!(
                     "OpenRouter repaired malformed JSON arguments for tool {verb:?} ({} bytes)",
-                    tool_call.function.arguments.len()
+                    tool_call.arguments.len()
                 );
             }
             (verb, payload)
@@ -136,6 +139,7 @@ pub(super) fn execute_tool_call(
     };
     normalize_tool_payload(tool_name, &mut payload, &config.home_uri);
     let request = crate::mcp::types::McpCallbackRequest {
+        thread_id: None,
         cwd: config.working_dir.clone(),
         run_id: Some(config.run_id.clone()),
         tool: if tool_name == "read" && payload.get("paths").is_some() {
@@ -240,77 +244,19 @@ pub(super) fn resolve_home_target(target: &str, home_uri: &str) -> String {
     resolved
 }
 
-/// Build the OpenRouter `provider` object from routing settings.
-///
-/// `require_parameters` is always sent: tool schemas are unconditional, so this
-/// only formalizes the existing effective behavior (route only to tool-capable
-/// providers). `zdr`/`sort` are added only when the user opts in.
-pub(super) fn build_provider_object(routing: &OpenRouterRouting) -> Value {
-    let mut provider = json!({ "require_parameters": true });
-    if routing.zero_data_retention {
-        provider["zdr"] = json!(true);
+/// Render a dispatch result into tool-message text, appending any reminders as
+/// `<system-reminder>` blocks after the content. Provider-neutral: both the
+/// stored `tool_result` transcript event and the adapter's conversation tool
+/// message render through this so the two stay byte-identical.
+pub(in crate::backends) fn render_tool_result(output: DispatchOutput) -> String {
+    if output.reminders.is_empty() {
+        return output.content;
     }
-    if let Some(sort) = routing.sort {
-        provider["sort"] = json!(match sort {
-            OpenRouterSort::Price => "price",
-            OpenRouterSort::Throughput => "throughput",
-            OpenRouterSort::Latency => "latency",
-        });
+    let mut rendered = output.content;
+    for reminder in output.reminders {
+        rendered.push_str("\n\n<system-reminder>\n");
+        rendered.push_str(&reminder);
+        rendered.push_str("\n</system-reminder>");
     }
-    provider
-}
-
-pub(super) fn tool_schemas() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "read",
-                "description": "Read one or more file, Cairn resource, web, or PDF targets. Prefer paths[] for batch reads.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "paths": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-                        "path": { "type": "string" },
-                        "offset": { "type": "integer" },
-                        "limit": { "type": "integer" }
-                    }
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "write",
-                "description": "Apply ordered file/resource mutations. Include commit_msg when touching files.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["changes"],
-                    "properties": {
-                        "changes": { "type": "array", "items": { "type": "object" }, "minItems": 1 },
-                        "commit_msg": { "type": "string" },
-                        "preview": { "type": "boolean" },
-                        "atomic": { "type": "boolean" }
-                    }
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "run",
-                "description": "Execute shell commands or skill scripts in the worktree.",
-                "parameters": {
-                    "type": "object",
-                    "required": ["commands"],
-                    "properties": {
-                        "commands": { "type": "array", "items": { "type": "object" }, "minItems": 1 },
-                        "commit_msg": { "type": "string" },
-                        "sequential": { "type": "boolean" },
-                        "stop_on_error": { "type": "boolean" }
-                    }
-                }
-            }
-        }),
-    ]
+    rendered
 }

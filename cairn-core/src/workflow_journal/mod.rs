@@ -233,6 +233,26 @@ pub async fn delete_call_link(db: &LocalDb, call_run_id: &str) -> Result<(), Str
     .map_err(|error| error.to_string())
 }
 
+/// Every call run id that still holds a `workflow_call` link — the in-flight /
+/// undelivered workflow calls. Read from the private db (the link table never
+/// replicates) at host startup to fail-fast any that a crash left mid-flight
+/// (CAIRN-2548), so a queued Claude call cannot strand `starting` forever once a
+/// real admission ceiling makes queuing reachable.
+pub async fn list_undelivered_call_run_ids(db: &LocalDb) -> Result<Vec<String>, String> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn.query("SELECT run_id FROM workflow_call", ()).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push(row.text(0)?);
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

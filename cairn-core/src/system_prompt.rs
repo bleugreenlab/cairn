@@ -11,6 +11,25 @@
 /// receives the same global harness contract.
 pub const CAIRN_SYSTEM_PROMPT: &str = include_str!("agent_process/system_prompt.md");
 
+/// Sentinel line in `system_prompt.md` marking where the capability-tier Version
+/// Control section is substituted in. The trailing newline is part of the marker
+/// so the substituted snippet (which ends in exactly one newline) reproduces the
+/// surrounding bytes precisely. The base file carries only this marker in place
+/// of the section body.
+const VERSION_CONTROL_MARKER: &str = "<!--TIER:VERSION_CONTROL-->\n";
+
+/// Authoring-tier Version Control section: a worktree-backed job that authors
+/// commits on its own branch. Byte-identical to the section that lived inline in
+/// `system_prompt.md` before tiering, so substituting it for the marker
+/// reproduces the pre-tiering prompt exactly and keeps its prompt-cache lineage.
+const VERSION_CONTROL_AUTHORING: &str = include_str!("agent_process/version_control_authoring.md");
+
+/// Ambient-tier Version Control section: a no-worktree job that runs on the
+/// project's live checkout, observing and orchestrating rather than authoring.
+/// Substituted in when the run is ambient; routes code changes through child
+/// issues since it has no branch of its own to land on.
+const VERSION_CONTROL_AMBIENT: &str = include_str!("agent_process/version_control_ambient.md");
+
 /// The default provider-agnostic workspace character prompt (compiled into the
 /// binary). Seeded once to `~/.cairn/AGENTS.md` on a fresh install; from there
 /// it is assembled as the `workspace` segment for every backend, carrying the
@@ -174,13 +193,66 @@ pub fn cairn_help() -> String {
 /// The Cairn system prompt: static guardrails, verb orientation, and compact
 /// URI-shape guidance. The complete generated reference stays available via
 /// `cairn://help`.
-pub fn cairn_system_prompt() -> String {
-    CAIRN_SYSTEM_PROMPT.to_string()
+///
+/// Composed by capability tier: the `<!--TIER:VERSION_CONTROL-->` marker in
+/// `system_prompt.md` is substituted with the authoring Version Control section
+/// (worktree-backed job) or the ambient one (no worktree, runs on the project's
+/// live checkout). `ambient == false` reproduces the pre-tiering bytes exactly,
+/// so the authoring variant stays byte-identical for provider prompt-cache
+/// reuse; the ambient variant is a second content-addressable variant that
+/// dedups cleanly within its tier.
+pub fn cairn_system_prompt(ambient: bool) -> String {
+    let version_control = if ambient {
+        VERSION_CONTROL_AMBIENT
+    } else {
+        VERSION_CONTROL_AUTHORING
+    };
+    CAIRN_SYSTEM_PROMPT.replace(VERSION_CONTROL_MARKER, version_control)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authoring_tier_carries_worktree_doctrine() {
+        let prompt = cairn_system_prompt(false);
+        // The authoring doctrine is present.
+        assert!(prompt.contains("the workspace always equals HEAD"));
+        assert!(prompt.contains("must carry a `commit_msg`"));
+        // No ambient phrasing leaks into the authoring variant.
+        assert!(!prompt.contains("do not author"));
+        assert!(!prompt.contains("rejected by design"));
+        // No marker residue survives substitution.
+        assert!(!prompt.contains("<!--"));
+        assert!(!prompt.contains("TIER:VERSION_CONTROL"));
+    }
+
+    #[test]
+    fn ambient_tier_carries_no_author_doctrine_exactly_once() {
+        let prompt = cairn_system_prompt(true);
+        assert!(prompt.contains("do not author"));
+        assert!(prompt.contains("child issue"));
+        assert!(prompt.contains("rejected by design"));
+        // The Version Control section appears exactly once (replaced, not appended).
+        assert_eq!(prompt.matches("## Version Control").count(), 1);
+        // The authoring doctrine is fully gone, not stacked underneath.
+        assert!(!prompt.contains("the workspace always equals HEAD"));
+        assert!(!prompt.contains("<!--"));
+    }
+
+    #[test]
+    fn tiers_are_two_deterministic_variants() {
+        // Exactly two variants, each deterministic (content-addressable) per call.
+        assert_ne!(cairn_system_prompt(false), cairn_system_prompt(true));
+        assert_eq!(cairn_system_prompt(false), cairn_system_prompt(false));
+        assert_eq!(cairn_system_prompt(true), cairn_system_prompt(true));
+        // Authoring byte-identity guard: the marker is fully consumed and the
+        // section heading appears exactly once.
+        let authoring = cairn_system_prompt(false);
+        assert!(!authoring.contains(VERSION_CONTROL_MARKER));
+        assert_eq!(authoring.matches("## Version Control").count(), 1);
+    }
 
     #[test]
     fn help_lists_every_resource_uri_template() {

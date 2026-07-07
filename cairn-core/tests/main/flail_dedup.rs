@@ -46,6 +46,7 @@ async fn active_turn_fixture() -> (
 
 fn read_request(run_id: &str, path: &str) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(run_id.to_string()),
         tool: "read".to_string(),
@@ -104,6 +105,7 @@ async fn dispatch_never_dedups_write() {
     let (_temp, orch, cursors) = active_turn_fixture().await;
 
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some("run-1".to_string()),
         tool: "write".to_string(),
@@ -167,6 +169,7 @@ async fn dispatch_never_dedups_read_resource_terminal_poll() {
     // still reach the handler (and observe new cursor output) rather than a stub.
     let (_temp, orch, cursors) = active_turn_fixture().await;
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some("run-1".to_string()),
         tool: "read_resource".to_string(),

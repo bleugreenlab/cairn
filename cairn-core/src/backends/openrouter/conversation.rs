@@ -1,12 +1,10 @@
 //! Rebuild the OpenAI-style message array the OpenRouter turn sends: assemble the
 //! system + prior transcript + new user message, reorder tool results to match
-//! their assistant call order, map stored transcript events to chat messages, and
-//! render a dispatch result (with reminders) into tool-message text.
+//! their assistant call order, and map stored transcript events to chat messages.
 
 use super::wire::{default_function_type, ChatMessage, ToolCall, ToolFunction};
 use crate::agent_process::stream::TranscriptEvent;
 use crate::backends::{SessionConfig, SessionStart};
-use crate::dispatch::DispatchOutput;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{run_db_blocking, RowExt};
 use serde_json::Value;
@@ -170,17 +168,4 @@ pub(super) fn transcript_event_to_chat_message(
             .map(|(tool_call_id, content)| ChatMessage::tool(tool_call_id, content)),
         _ => None,
     }
-}
-
-pub(super) fn render_tool_result(output: DispatchOutput) -> String {
-    if output.reminders.is_empty() {
-        return output.content;
-    }
-    let mut rendered = output.content;
-    for reminder in output.reminders {
-        rendered.push_str("\n\n<system-reminder>\n");
-        rendered.push_str(&reminder);
-        rendered.push_str("\n</system-reminder>");
-    }
-    rendered
 }

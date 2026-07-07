@@ -2072,6 +2072,7 @@ fn handle_terminal_fence_prompt(
     };
     let request_id = match block_on_background_db(async {
         let request = McpCallbackRequest {
+            thread_id: None,
             cwd: target.cwd.clone(),
             run_id: Some(run_id.clone()),
             tool: "run".to_string(),

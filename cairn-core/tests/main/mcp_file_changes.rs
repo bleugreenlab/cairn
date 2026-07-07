@@ -21,6 +21,7 @@ use serde_json::json;
 
 fn make_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.to_string(),
         run_id: None,
         tool: "write".to_string(),
@@ -31,6 +32,7 @@ fn make_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
 
 fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.to_string(),
         run_id: Some("run-preview".to_string()),
         tool: "write".to_string(),

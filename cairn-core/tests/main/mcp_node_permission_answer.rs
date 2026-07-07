@@ -87,6 +87,7 @@ async fn insert_permission_fixture(db: &LocalDb) {
 
 fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "write".to_string(),
@@ -212,6 +213,7 @@ async fn pending_permission_read_shows_answer_action() {
     let output = handle_read_file(
         &orch,
         &McpCallbackRequest {
+            thread_id: None,
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
@@ -236,6 +238,7 @@ async fn raise_fence_honors_policy_and_session_grant() {
     let (_temp, db, orch) = resource_orchestrator_fixture().await;
 
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: "/wt".to_string(),
         run_id: Some("run-x".to_string()),
         tool: "read".to_string(),
@@ -301,6 +304,7 @@ async fn shell_path_crossing_session_grant_generalizes_across_commands() {
     let (_temp, db, orch) = resource_orchestrator_fixture().await;
 
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: "/wt".to_string(),
         run_id: Some("run-x".to_string()),
         tool: "run".to_string(),

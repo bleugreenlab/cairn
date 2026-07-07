@@ -6,7 +6,7 @@
 //! off to [`crate::execution::delegation::spawn_workflow_packets`], which starts
 //! the workflow node under the caller and suspends the caller until it finalizes.
 
-use crate::config::workflows::get_workflow;
+use crate::config::workflows::{get_workflow, WorkflowWorktreeMode};
 use crate::execution::delegation::{spawn_workflow_packets, SpawnWorkflowPacketsInput};
 use crate::execution::jobs::CallWorktree;
 use crate::mcp::handlers::comments_artifacts::validate_against_schema;
@@ -92,8 +92,14 @@ pub(crate) async fn invoke_workflow(
             script_path: workflow.script_path.clone(),
             output_schema: workflow.output.clone(),
             args_json,
-            // A workflow runs in its own scratch dir with no caller-tree binding.
-            worktree: CallWorktree::None,
+            // The workflow's own manifest declares whether it needs the project
+            // tree. `none` (default) runs the script in a scratch dir; `inherit`
+            // shares a worktree-backed caller's tree, or mints an ephemeral one
+            // under an ambient (no-worktree) caller (`prepare_workflow_run`).
+            worktree: match workflow.worktree {
+                WorkflowWorktreeMode::None => CallWorktree::None,
+                WorkflowWorktreeMode::Inherit => CallWorktree::Inherit,
+            },
             group_id: &group_id,
             parent_tool_use_id: request.tool_use_id.as_deref(),
             background,

@@ -68,6 +68,7 @@ async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
 
 fn request() -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "change".to_string(),
@@ -241,6 +242,7 @@ async fn apply_as_run(
     run_id: &str,
 ) -> ResourceMutationResult<String> {
     let req = McpCallbackRequest {
+        thread_id: None,
         cwd: "/tmp".to_string(),
         run_id: Some(run_id.to_string()),
         tool: "change".to_string(),

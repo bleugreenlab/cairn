@@ -99,6 +99,15 @@ keyring = { version = "3", features = ["windows-native"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 landlock = "0.4"
 
+# Process enumeration for the worktree process reaper (execution::teardown /
+# worktree_gc): resolve each pid's cwd to SIGKILL detached process trees rooted
+# in a worktree being torn down (macOS: proc_pidinfo(PROC_PIDVNODEPATHINFO) +
+# proc_listallpids; Linux: /proc/<pid>/cwd). libproc was evaluated first but its
+# pidcwd is hardcoded to error on macOS, so it cannot resolve a cwd on the
+# platform this targets; libc is already in the tree transitively via nix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 async-trait = "0.1"
 filetime = "0.2"

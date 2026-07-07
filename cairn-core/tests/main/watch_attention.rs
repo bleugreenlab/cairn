@@ -68,6 +68,7 @@ fn watch_request(issue_uri: &str, since: Option<i64>) -> McpCallbackRequest {
         None => json!({ "issue_uri": issue_uri }),
     };
     McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: None,
         tool: "watch".to_string(),
@@ -593,6 +594,7 @@ async fn ask_questions_handler_emits_typed_question_event() {
         }],
     };
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: String::new(),
         run_id: Some(run_id.clone()),
         tool: "ask_user".to_string(),

@@ -299,6 +299,7 @@ async fn setup_nested_with_origin(
 
 fn sequential_run_request(cwd: &str, run_id: &str, commands: Vec<&str>) -> McpCallbackRequest {
     McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.to_string(),
         run_id: Some(run_id.to_string()),
         tool: "run".to_string(),
@@ -326,6 +327,7 @@ fn run_request(
         payload["commit_msg"] = json!(commit_msg);
     }
     McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.to_string(),
         run_id: Some(run_id.to_string()),
         tool: "run".to_string(),
@@ -427,6 +429,7 @@ async fn run_with_commit_msg_in_non_worktree_cwd_is_rejected_before_spawning() {
     let cwd = dir.path().display().to_string();
 
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.clone(),
         run_id: None,
         tool: "run".to_string(),
@@ -587,6 +590,7 @@ fn code_run_request(
         payload["commit_msg"] = json!(commit_msg);
     }
     McpCallbackRequest {
+        thread_id: None,
         cwd: cwd.to_string(),
         run_id: Some(run_id.to_string()),
         tool: "run".to_string(),
@@ -678,6 +682,7 @@ async fn dirty_worktree_notice_skips_non_worktree_request() {
     let (_temp, orch) = common::test_orchestrator().await;
     let cursors = Mutex::new(HashMap::new());
     let request = McpCallbackRequest {
+        thread_id: None,
         cwd: dir.path().display().to_string(),
         run_id: None,
         tool: "read".to_string(),

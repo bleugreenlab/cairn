@@ -28,12 +28,49 @@ pub async fn dispatch_tool(
     request: &crate::mcp::types::McpCallbackRequest,
     read_cursors: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
 ) -> DispatchOutput {
+    // Pooled Codex call (CAIRN-2549): one app-server hosts N call threads sharing
+    // ONE `cairn-cmd` MCP subprocess, so the process-global `CAIRN_RUN_ID`/`cwd`
+    // it was spawned with cannot attribute a tool call to the right run — nor run
+    // its `file:`/`run` operations in the right directory. Codex injects the
+    // originating thread as `_meta.threadId`, which `cairn-cmd` forwards as
+    // `thread_id`. Resolve it back to the owning run AND working directory HERE,
+    // before any handler reads `run_id`/`cwd` — so tool-result persistence,
+    // `cairn:~/` home expansion, reminder augmentation, and every `file:`/`run`/
+    // write handler (which resolve against `request.cwd`) all attribute to the
+    // right run's own worktree. Absent `thread_id` (every non-pooled caller)
+    // leaves the request untouched.
+    let resolved = resolve_pooled_thread_request(orch, request);
+    let request = resolved.as_ref().unwrap_or(request);
+
     let content = dispatch_with_dedup(orch, request, read_cursors).await;
     let mut reminders = Vec::new();
     augment_with_queued_dms(orch, request, &mut reminders).await;
     augment_with_dirty_worktree_notice(orch, request, &mut reminders).await;
     augment_with_terminal_poll_nudge(orch, request, &mut reminders).await;
     DispatchOutput { content, reminders }
+}
+
+/// Override a pooled Codex call's `run_id` from its `thread_id` (CAIRN-2549).
+///
+/// Returns an owned request with `run_id` set to the pool-resolved run when the
+/// request carries a `thread_id` that maps to a live pooled call; returns `None`
+/// otherwise (the caller keeps the borrowed request unchanged). Fail-loud by
+/// design: a `thread_id` that resolves REPLACES any stale env `run_id`; a
+/// `thread_id` with no mapping is left as-is so the run lookup errors visibly
+/// rather than silently attributing to the pool-spawner's run.
+fn resolve_pooled_thread_request(
+    orch: &crate::orchestrator::Orchestrator,
+    request: &crate::mcp::types::McpCallbackRequest,
+) -> Option<crate::mcp::types::McpCallbackRequest> {
+    let thread_id = request.thread_id.as_deref()?;
+    let binding = orch.codex_pool.binding_for_thread(thread_id)?;
+    let mut resolved = request.clone();
+    resolved.run_id = Some(binding.run_id);
+    // Override cwd too: the shared app-server (and its one cairn-cmd) was spawned
+    // in the first call's directory, but this call's `file:`/`run`/write ops must
+    // resolve against ITS OWN worktree.
+    resolved.cwd = binding.cwd;
+    Some(resolved)
 }
 
 /// Execute a read-family call with content-aware dedup, or execute any other
@@ -831,6 +868,7 @@ mod tests {
 
     fn terminal_read_request(run_id: &str, paths: serde_json::Value) -> McpCallbackRequest {
         McpCallbackRequest {
+            thread_id: None,
             cwd: "/tmp".to_string(),
             run_id: Some(run_id.to_string()),
             tool: "read_batch".to_string(),

@@ -102,8 +102,15 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
     pub(crate) async fn write(
         &self,
         params: Parameters<ChangeInput>,
+        meta: rmcp::model::Meta,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
+        // Pooled Codex call (CAIRN-2549): Codex injects the originating thread as
+        // `_meta.threadId`. When present, forward it as `thread_id` and forward
+        // `cairn:~/` targets RAW (the host expands them from the thread-resolved
+        // run). Absent — every non-pooled caller — behaviour is unchanged.
+        let thread_id = Self::thread_id_from_meta(&meta);
+        let pooled = thread_id.is_some();
 
         // Validate the raw input ourselves, in one pass, before any rewrite or
         // forward. This owns the error text the model sees (the rmcp-facing
@@ -127,7 +134,7 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
             return Ok(CallToolResult::success(vec![Content::text(text)]));
         }
 
-        let rewritten = match self.rewrite_change_targets(&input) {
+        let rewritten = match self.rewrite_change_targets_with(&input, pooled) {
             Ok(rewritten) => rewritten,
             Err(message) => return Ok(CallToolResult::success(vec![Content::text(message)])),
         };
@@ -138,6 +145,7 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
             tool: "write".to_string(),
             payload: serde_json::to_value(&rewritten).unwrap_or_default(),
             tool_use_id: None,
+            thread_id,
         };
 
         let outcome = self.call_tauri_full(&request).await;
@@ -173,8 +181,11 @@ Partial failures never abort: a target that errors shows its message inline as t
     pub(crate) async fn read(
         &self,
         params: Parameters<ReadFileInput>,
+        meta: rmcp::model::Meta,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
+        let thread_id = Self::thread_id_from_meta(&meta);
+        let pooled = thread_id.is_some();
         if input.paths.is_empty() {
             return Ok(CallToolResult::error(vec![Content::text(
                 "read requires a non-empty `paths` array (one or more target URIs).".to_string(),
@@ -193,7 +204,7 @@ Partial failures never abort: a target that errors shows its message inline as t
                 if path.starts_with("http://") || path.starts_with("https://") {
                     path.clone()
                 } else {
-                    self.resolve_read_target(path)
+                    self.resolve_read_target_with(path, pooled)
                         .unwrap_or_else(|_| path.clone())
                 }
             })
@@ -205,6 +216,7 @@ Partial failures never abort: a target that errors shows its message inline as t
             tool: "read_batch".to_string(),
             payload: serde_json::json!({ "paths": resolved }),
             tool_use_id: None,
+            thread_id,
         };
 
         let outcome = self.call_tauri_full(&request).await;
@@ -237,8 +249,13 @@ Partial failures never abort: a target that errors shows its message inline as t
     #[tool(
         description = "Execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (e.g. `{code:\"console.log(1)\", interpreter:\"typescript\"}`). Inline interpreters: `typescript`/`ts` and `javascript`/`js` run via bun, `python`/`py` runs via python3 — code is passed as a single argv arg (`bun -e` / `python3 -c`), no shell quoting. Inline TypeScript gets zero-config `@cairn/sdk` from the worktree; Python is currently stdlib-only. Inline code is for LIGHT synchronous compute (dedup, ranking, small data transforms, quick SDK batches) — keep it small and deterministic; long-running or background code belongs to terminal resources (and durable workflow scripts). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <header> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. `branch` runs the whole batch in the live checkout holding that branch/ref (for example `main` or `agent/CAIRN-123-builder-0`); it rejects `commit_msg`, refuses to run if the target checkout has uncommitted tracked changes, leaves untracked build output as warm cache, warns and leaves tracked changes in place if any appear during the run so concurrent edits are not discarded, and errors if no live checkout exists. Not for long-lived/background processes — use a terminal resource via `write` for those. Each item's `timeout` (ms, default 120000, max 600000) is honored by the host: when an item exceeds it, that item is terminated and its result block reports the timeout with whatever output it produced so far — the batch is never aborted with no output. Outer layers (the callback transport and the agent's own tool timeout) are sized strictly above the host budget, so a legal batch always runs to completion: sequential batches get the sum of per-item timeouts, parallel batches the max."
     )]
-    async fn run(&self, params: Parameters<RunInput>) -> Result<CallToolResult, rmcp::ErrorData> {
+    async fn run(
+        &self,
+        params: Parameters<RunInput>,
+        meta: rmcp::model::Meta,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
+        let thread_id = Self::thread_id_from_meta(&meta);
 
         if let Err(msg) = validate_run_input(&input) {
             return Ok(CallToolResult::error(vec![Content::text(msg)]));
@@ -262,6 +279,7 @@ Partial failures never abort: a target that errors shows its message inline as t
             tool: "run".to_string(),
             payload: serde_json::to_value(&input).unwrap_or_default(),
             tool_use_id: None,
+            thread_id,
         };
 
         let outcome = self.call_tauri_full(&request).await;
@@ -288,6 +306,16 @@ Partial failures never abort: a target that errors shows its message inline as t
 }
 
 impl CairnCmd {
+    /// Extract Codex's per-call thread id from a `tools/call` request's `_meta`
+    /// (CAIRN-2549). Codex injects it under the `"threadId"` key for every tool
+    /// call from a pooled app-server thread; other callers send no such meta and
+    /// this returns `None`.
+    fn thread_id_from_meta(meta: &rmcp::model::Meta) -> Option<String> {
+        meta.get("threadId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
     /// Call the Tauri callback server and return the full outcome (handler
     /// result plus augmentation reminders). Verbs assemble reminders into the
     /// model-visible text at the edge, after parsing any structured result.
@@ -455,9 +483,10 @@ impl ServerHandler for CairnCmd {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParam,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, rmcp::ErrorData> {
         let uri = &request.uri;
+        let thread_id = Self::thread_id_from_meta(&context.meta);
         tracing::info!("read_resource called: uri={}", uri);
 
         // Determine which callback to use based on URI scheme
@@ -494,6 +523,7 @@ impl ServerHandler for CairnCmd {
             tool: tool_name.to_string(),
             payload: serde_json::json!({ "uri": uri }),
             tool_use_id: None,
+            thread_id,
         };
 
         let response = self.call_tauri_full(&callback_request).await;
@@ -658,11 +688,30 @@ mod tests {
             "update_issue tool should not exist after replacement"
         );
     }
+    #[test]
+    fn thread_id_from_meta_reads_thread_id_key() {
+        // Codex injects `_meta.threadId` on every pooled tool call (CAIRN-2549);
+        // other callers send no such key.
+        let mut meta = rmcp::model::Meta::default();
+        assert_eq!(CairnCmd::thread_id_from_meta(&meta), None);
+        meta.insert(
+            "threadId".to_string(),
+            serde_json::Value::String("thread-xyz".to_string()),
+        );
+        assert_eq!(
+            CairnCmd::thread_id_from_meta(&meta).as_deref(),
+            Some("thread-xyz")
+        );
+    }
+
     #[tokio::test]
     async fn read_rejects_empty_paths() {
         let mcp = create_test_mcp_with_home_uri(None);
         let result = mcp
-            .read(Parameters(ReadFileInput { paths: vec![] }))
+            .read(
+                Parameters(ReadFileInput { paths: vec![] }),
+                rmcp::model::Meta::default(),
+            )
             .await
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
