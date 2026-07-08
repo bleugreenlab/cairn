@@ -256,7 +256,7 @@ pub(crate) const NODE_REPL_CONTRACT: ResourceContract =
         kind: ResourceKind::NodeRepl,
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/repl/{slug}",
         name: "Node REPL",
-        description: "A stateful interpreter session that keeps variables, imports, and definitions alive across run calls. create spawns the eval-server (interpreter required; python deps optional); delete stops it. Send code by adding the `repl` key to a run item — run({commands:[{code:\"x+1\",interpreter:\"python\",repl:\"SLUG\"}]}) — NOT a resource append. Read returns liveness (interpreter, running/exited, uptime). The session is node-scoped and in-memory only: it survives turn-to-turn suspends but not a host restart, and its state is lost if the process dies.",
+        description: "A stateful interpreter session that keeps variables, imports, and definitions alive across run calls. create spawns the eval-server (interpreter python or typescript required; python-only deps optional); delete stops it. Send code by adding the `repl` key to a run item — run({commands:[{code:\"x+1\",interpreter:\"python\",repl:\"SLUG\"}]}) — NOT a resource append. Read returns liveness (interpreter, running/exited, uptime). The session is node-scoped and in-memory only: it survives turn-to-turn suspends but not a host restart, and its state is lost if the process dies.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,

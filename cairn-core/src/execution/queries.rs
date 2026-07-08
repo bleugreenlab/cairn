@@ -19,7 +19,7 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 const EXECUTION_COLUMNS: &str = "id, recipe_id, issue_id, project_id, status, started_at,
     completed_at, snapshot, seq, initiator_sub, initiator_org_id,
-    triggered_by";
+    triggered_by, runner_device_id";
 
 const ACTION_RUN_COLUMNS: &str = "id, execution_id, recipe_node_id, action_config_id,
     issue_id, project_id, status, inputs, output, error_message, started_at, completed_at,
@@ -283,12 +283,13 @@ async fn list_all_executions_async(
             |row| {
                 // The three joined columns (i.number, i.project_id, p.name) follow
                 // the EXECUTION_COLUMNS block, so their indices track its width:
-                // 12 execution columns (0..=11) put the joins at 12, 13, 14.
+                // 13 execution columns (0..=12, incl. runner_device_id) put the
+                // joins at 13, 14, 15.
                 Ok((
                     db_execution_from_row(row)?,
-                    row.opt_i64(12)?.map(|value| value as i32),
-                    row.opt_text(13)?,
+                    row.opt_i64(13)?.map(|value| value as i32),
                     row.opt_text(14)?,
+                    row.opt_text(15)?,
                 ))
             },
         )
@@ -317,6 +318,7 @@ async fn list_all_executions_async(
             jobs_total,
             jobs_complete,
             seq: db_exec.seq,
+            runner_device_id: db_exec.runner_device_id,
         });
     }
 
@@ -839,6 +841,7 @@ fn db_execution_from_row(row: &cairn_db::turso::Row) -> DbResult<DbExecution> {
         initiator_sub: row.opt_text(9)?,
         initiator_org_id: row.opt_text(10)?,
         triggered_by: row.text(11)?,
+        runner_device_id: row.opt_text(12)?,
     })
 }
 

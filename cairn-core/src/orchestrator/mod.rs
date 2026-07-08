@@ -12,6 +12,7 @@ pub mod attention_push;
 pub mod base_advance;
 pub mod build_services;
 pub mod config_resource;
+pub mod device_presence;
 pub mod docs;
 pub mod identity;
 pub mod lifecycle;

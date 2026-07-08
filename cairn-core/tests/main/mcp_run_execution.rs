@@ -777,3 +777,128 @@ async fn repl_state_persists_across_handle_run_calls() {
         session.kill();
     }
 }
+
+// A typescript REPL rejects `deps` (a uv-only affordance) with a clear message.
+// The deps guard fires before the bun probe, so this is deterministic without
+// bun installed.
+#[tokio::test]
+async fn repl_typescript_rejects_deps() {
+    use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
+    use cairn_core::internal::mcp::handlers::RunContext;
+
+    let run_id = "run-repl-ts-deps";
+    let (_temp, _db, orch, cwd) = setup(run_id).await;
+    let ctx = RunContext {
+        run_id: run_id.to_string(),
+        job_id: format!("job-{run_id}"),
+        exec_seq: Some(1),
+        issue_id: Some(format!("issue-{run_id}")),
+        issue_number: Some(1),
+        project_id: String::new(),
+        project_key: "RHG".to_string(),
+        job_name: Some("builder".to_string()),
+        worktree_path: Some(cwd.clone()),
+    };
+    let result = repl::spawn_session(
+        &orch,
+        &ctx,
+        &cwd,
+        ReplLang::Typescript,
+        "ts",
+        &["react".to_string()],
+    )
+    .await;
+    let err = match result {
+        Ok(session) => {
+            session.kill();
+            panic!("typescript deps must be rejected");
+        }
+        Err(err) => err,
+    };
+    assert!(err.contains("python-only"), "got: {err}");
+}
+
+// The typescript/bun eval-server persists state across separate `handle_run`
+// calls exactly like python: `x = 41` then `x + 1` returns `42`. Skips if bun is
+// unavailable to spawn the eval-server.
+#[tokio::test]
+async fn repl_typescript_state_persists_across_handle_run_calls() {
+    use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
+    use cairn_core::internal::mcp::handlers::RunContext;
+
+    let run_id = "run-repl-ts-state";
+    let (_temp, _db, orch, cwd) = setup(run_id).await;
+    let ctx = RunContext {
+        run_id: run_id.to_string(),
+        job_id: format!("job-{run_id}"),
+        exec_seq: Some(1),
+        issue_id: Some(format!("issue-{run_id}")),
+        issue_number: Some(1),
+        project_id: String::new(),
+        project_key: "RHG".to_string(),
+        job_name: Some("builder".to_string()),
+        worktree_path: Some(cwd.clone()),
+    };
+
+    let Ok(session) = repl::spawn_session(&orch, &ctx, &cwd, ReplLang::Typescript, "ts", &[]).await
+    else {
+        eprintln!(
+            "skipping repl_typescript_state_persists: no bun available to spawn the eval-server"
+        );
+        return;
+    };
+    orch.repl_state
+        .insert(ctx.job_id.clone(), "ts".to_string(), session);
+
+    let first = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "x = 41", "interpreter": "typescript", "repl": "ts" }] }),
+        ),
+    )
+    .await;
+    assert!(
+        !first.contains("No REPL named"),
+        "first send lost the session: {first}"
+    );
+    assert!(
+        !first.contains("died"),
+        "first send reported a dead REPL: {first}"
+    );
+
+    let second = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "x + 1", "interpreter": "typescript", "repl": "ts" }] }),
+        ),
+    )
+    .await;
+    assert!(
+        second.contains("42"),
+        "typescript REPL state must persist across handle_run calls: {second}"
+    );
+
+    // A language-mismatched send (python item into a typescript session) is
+    // rejected without touching the live session.
+    let mismatch = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "x + 1", "interpreter": "python", "repl": "ts" }] }),
+        ),
+    )
+    .await;
+    assert!(
+        mismatch.contains("typescript") && mismatch.contains("python"),
+        "mismatched-language send must be rejected naming both languages: {mismatch}"
+    );
+
+    if let Some(session) = orch.repl_state.remove(&ctx.job_id, "ts") {
+        session.kill();
+    }
+}

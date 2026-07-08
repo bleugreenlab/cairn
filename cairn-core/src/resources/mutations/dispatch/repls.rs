@@ -37,14 +37,18 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "mode=create requires payload"))?;
             let interpreter_raw = payload_trimmed_non_empty_str(payload, "interpreter", &[])
                 .ok_or_else(|| {
-                    build_failure(index, item, "payload.interpreter is required (python)")
+                    build_failure(
+                        index,
+                        item,
+                        "payload.interpreter is required (python | typescript)",
+                    )
                 })?;
             let interpreter = ReplLang::parse(interpreter_raw).ok_or_else(|| {
                 build_failure(
                     index,
                     item,
                     format!(
-                        "payload.interpreter '{interpreter_raw}' is not supported; use python (py)"
+                        "payload.interpreter '{interpreter_raw}' is not supported; use python (py) | typescript (ts)"
                     ),
                 )
             })?;

@@ -529,21 +529,80 @@ fn truncate_digest(text: impl AsRef<str>, len: usize) -> String {
     text.chars().take(len).collect::<String>() + "…"
 }
 
+/// Resolve the in-place rotation lineage of a session: the session ids from the
+/// lineage root to `session_id` (oldest → newest), inclusive.
+///
+/// A session continues its `parent_session_id` *in place* only when that parent
+/// was rotated into it — `parent.replaced_by_id == child` and the same `job_id`.
+/// That is the exact predicate the resume path uses (see
+/// `resolve_prepare_session_start_conn`) to tell a cold-resume reseed / backend /
+/// prompt rotation apart from a cross-job fork: a delegated child job also stamps
+/// `parent_session_id`, but the parent keeps serving its own job and is never
+/// marked `replaced_by` that child. Following only genuine rotation predecessors
+/// keeps a child task's transcript from absorbing its parent agent's history,
+/// while letting a rotated session's transcript span every predecessor session
+/// (CAIRN-2630: a cold-resume reseed must preserve the prior events, not wipe
+/// them, since the fresh session it rotates to carries none of the old runs).
+async fn load_session_lineage_ids(
+    db: &LocalDb,
+    session_id: &str,
+) -> Result<Vec<String>, CairnError> {
+    let mut chain = vec![session_id.to_string()];
+    let mut current = session_id.to_string();
+    loop {
+        let parent = db
+            .query_opt(
+                "SELECT parent.id
+                 FROM sessions child
+                 JOIN sessions parent ON parent.id = child.parent_session_id
+                 WHERE child.id = ?1
+                   AND parent.replaced_by_id = child.id
+                   AND parent.job_id IS child.job_id",
+                params![current.as_str()],
+                |row| row.opt_text(0),
+            )
+            .await
+            .map_err(CairnError::from)?
+            .flatten();
+        match parent {
+            // Cycle guard: a corrupt parent/replaced_by loop must not spin forever.
+            Some(parent_id) if !chain.contains(&parent_id) => {
+                current = parent_id.clone();
+                chain.push(parent_id);
+            }
+            _ => break,
+        }
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
 async fn load_events_for_session(
     db: &LocalDb,
     session_id: String,
 ) -> Result<(Vec<Event>, std::collections::HashMap<String, usize>), CairnError> {
-    let ordered_run_ids = db
-        .query_all(
-            "SELECT id
-             FROM runs
-             WHERE session_id = ?1
-             ORDER BY created_at ASC",
-            params![session_id.as_str()],
-            |row| row.text(0),
-        )
-        .await
-        .map_err(CairnError::from)?;
+    let lineage = load_session_lineage_ids(db, &session_id).await?;
+
+    // Runs across the whole rotation lineage, in creation order. Sessions rotate
+    // strictly sequentially, so per-session `created_at` order concatenated across
+    // the lineage is global chronological order — the position map the event sort
+    // below keys on. For an un-rotated session the lineage is `[session_id]`, so
+    // this is identical to a single-session load.
+    let mut ordered_run_ids: Vec<String> = Vec::new();
+    for sid in &lineage {
+        let ids = db
+            .query_all(
+                "SELECT id
+                 FROM runs
+                 WHERE session_id = ?1
+                 ORDER BY created_at ASC",
+                params![sid.as_str()],
+                |row| row.text(0),
+            )
+            .await
+            .map_err(CairnError::from)?;
+        ordered_run_ids.extend(ids);
+    }
 
     let run_position: std::collections::HashMap<String, usize> = ordered_run_ids
         .iter()
@@ -551,19 +610,23 @@ async fn load_events_for_session(
         .map(|(i, id)| (id.clone(), i))
         .collect();
 
-    let db_events = db
-        .query_all(
-            format!(
-                "SELECT {EVENT_COLUMNS}
-                 FROM events
-                 WHERE session_id = ?1
-                 ORDER BY rowid"
-            ),
-            params![session_id.as_str()],
-            event_from_row,
-        )
-        .await
-        .map_err(CairnError::from)?;
+    let mut db_events: Vec<Event> = Vec::new();
+    for sid in &lineage {
+        let events = db
+            .query_all(
+                format!(
+                    "SELECT {EVENT_COLUMNS}
+                     FROM events
+                     WHERE session_id = ?1
+                     ORDER BY rowid"
+                ),
+                params![sid.as_str()],
+                event_from_row,
+            )
+            .await
+            .map_err(CairnError::from)?;
+        db_events.extend(events);
+    }
     let mut indexed: Vec<(usize, Event)> = db_events.into_iter().enumerate().collect();
 
     indexed.sort_by(|(idx_a, a), (idx_b, b)| {
@@ -581,24 +644,28 @@ async fn load_events_for_session(
     ))
 }
 
+/// The session ids in a session's rotation lineage (root → current). Exposed for
+/// callers outside the run-db context (e.g. the skyline watermark) that scope
+/// their own session-keyed reads and must cover the same continuous transcript
+/// the event loaders return.
+pub fn session_lineage_ids(db: Arc<LocalDb>, session_id: &str) -> Result<Vec<String>, CairnError> {
+    let session_id = session_id.to_string();
+    run_query_db(async move { load_session_lineage_ids(&db, &session_id).await })
+}
+
 async fn load_events_for_session_after_count(
     db: &LocalDb,
     session_id: String,
     offset: i64,
 ) -> Result<Vec<Event>, CairnError> {
-    db.query_all(
-        format!(
-            "SELECT {EVENT_COLUMNS}
-             FROM events
-             WHERE session_id = ?1
-             ORDER BY rowid ASC
-             LIMIT -1 OFFSET ?2"
-        ),
-        params![session_id.as_str(), offset],
-        event_from_row,
-    )
-    .await
-    .map_err(CairnError::from)
+    // Reuse the lineage-ordered stream the transcript renders so skyline bars stay
+    // 1:1 with transcript rows across a cold-resume reseed rotation; `offset` skips
+    // the prefix the skyline cache has already processed. New events only ever
+    // append to the current (last) session in the lineage, so this prefix is
+    // stable and the incremental append stays sound.
+    let (events, _run_position) = load_events_for_session(db, session_id).await?;
+    let skip = usize::try_from(offset.max(0)).unwrap_or(usize::MAX);
+    Ok(events.into_iter().skip(skip).collect())
 }
 
 async fn load_events_for_turn(db: &LocalDb, turn_id: String) -> Result<Vec<Event>, CairnError> {

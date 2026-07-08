@@ -76,6 +76,7 @@ pub fn start_recipe_execution_and_advance(
         backend,
         None,
         initiated_via,
+        None,
         trigger_type,
     )?;
     let _jobs = create_jobs_for_execution(orch, &execution.id)?;
@@ -111,15 +112,46 @@ pub fn start_recipe_execution_impl(
     backend: Option<&str>,
     initiator: Option<Initiator>,
     initiated_via: Option<&str>,
+    // CAIRN-2629: the machine that should OWN this execution. `None` (or the local
+    // id) stamps this machine; a peer id from the runner picker stamps that peer,
+    // whose owner-side sweep then claims and runs the jobs. The picker enforces
+    // that the chosen device has a clone; core stamps the resolved id.
+    runner_device_id: Option<String>,
     trigger_type: TriggerType,
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
+    let this_device = orch.anon_device_manager.device_id();
+    let owner_device = runner_device_id.unwrap_or_else(|| this_device.clone());
 
     // Resolve the owning database ONCE (fail-closed): a team project's rows live
     // wholly in its synced replica, so the execution and its jobs must be created
     // there, not in the private DB. The id-keyed resolvers cannot be used yet —
     // the execution row does not exist — so resolve by project id.
     let db = resolve_owning_db_for_project(orch, project_id)?;
+
+    // CAIRN-2629: if a PEER device was chosen as the runner, enforce that it has a
+    // local clone of this project before stamping ownership on it — otherwise its
+    // sweep would claim the job and fail in prepare_job with no clone. This is the
+    // authoritative guard (the picker filters as a convenience). This machine is
+    // trusted (the launch flow already blocks starting without a clone).
+    if owner_device != this_device {
+        let db_check = db.clone();
+        let owner = owner_device.clone();
+        let project_id_owned = project_id.to_string();
+        let can_run = run_recipe_db(async move {
+            let key = crate::execution::ownership::project_key(&db_check, &project_id_owned)
+                .await
+                .ok_or_else(|| "Project not found".to_string())?;
+            Ok::<bool, String>(
+                crate::execution::ownership::device_has_clone(&db_check, &owner, &key).await,
+            )
+        })?;
+        if !can_run {
+            return Err(format!(
+                "Selected runner device {owner_device} has no local clone of this project"
+            ));
+        }
+    }
 
     // Get project path for file-based recipe loading
     let project_path = project_path_for_recipe(db.clone(), project_id.to_string())?;
@@ -239,6 +271,7 @@ pub fn start_recipe_execution_impl(
             seq: Some(next_seq),
             initiator: initiator.clone(),
             triggered_by: trigger_type.to_string(),
+            runner_device_id: owner_device.clone(),
         },
     )?;
 
@@ -253,6 +286,7 @@ pub fn start_recipe_execution_impl(
         seq: Some(next_seq),
         initiator: initiator.clone(),
         triggered_by: trigger_type,
+        runner_device_id: Some(owner_device),
     })
 }
 
@@ -305,6 +339,7 @@ pub fn start_manual_execution_impl(
             seq: None,
             initiator: initiator.clone(),
             triggered_by: "manual".to_string(),
+            runner_device_id: orch.anon_device_manager.device_id(),
         },
     )?;
 
@@ -319,6 +354,7 @@ pub fn start_manual_execution_impl(
         seq: None,
         initiator: initiator.clone(),
         triggered_by: TriggerType::Manual,
+        runner_device_id: Some(orch.anon_device_manager.device_id()),
     })
 }
 
@@ -383,6 +419,7 @@ pub fn start_event_triggered_execution(
             seq: next_seq,
             initiator: initiator.clone(),
             triggered_by: trigger_type_str.clone(),
+            runner_device_id: orch.anon_device_manager.device_id(),
         },
     )?;
 
@@ -401,6 +438,7 @@ pub fn start_event_triggered_execution(
         seq: next_seq,
         initiator: initiator.clone(),
         triggered_by: trigger_type_str.parse().unwrap_or_default(),
+        runner_device_id: Some(orch.anon_device_manager.device_id()),
     })
 }
 
@@ -693,6 +731,7 @@ struct NewExecution {
     seq: Option<i32>,
     initiator: Option<Initiator>,
     triggered_by: String,
+    runner_device_id: String,
 }
 
 fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), String> {
@@ -710,14 +749,15 @@ fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), Str
                 seq: execution.seq,
                 initiator: execution.initiator.clone(),
                 triggered_by: execution.triggered_by.clone(),
+                runner_device_id: execution.runner_device_id.clone(),
             };
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO executions (
                         id, recipe_id, issue_id, project_id, status, started_at,
                         completed_at, snapshot, seq, initiator_sub,
-                        initiator_org_id, triggered_by
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        initiator_org_id, triggered_by, runner_device_id
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         execution.id.as_str(),
                         execution.recipe_id.as_str(),
@@ -731,6 +771,7 @@ fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), Str
                         execution.initiator.as_ref().map(|i| i.sub.as_str()),
                         execution.initiator.as_ref().map(|i| i.org_id.as_str()),
                         execution.triggered_by.as_str(),
+                        execution.runner_device_id.as_str(),
                     ],
                 )
                 .await?;

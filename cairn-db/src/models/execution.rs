@@ -83,6 +83,11 @@ pub struct Execution {
     pub initiator: Option<Initiator>,
     /// How this execution was triggered (manual, schedule, job_ended, skill_called).
     pub triggered_by: TriggerType,
+    /// Stable per-machine device id that OWNS this execution (CAIRN-2629). Only
+    /// the owning machine claims and runs its jobs; the UI shows it as the runner
+    /// and renders "waiting for <device>" when it is a peer. `None` for legacy
+    /// executions, which the ownership guard treats as "anyone may run".
+    pub runner_device_id: Option<String>,
 }
 
 /// Convert DbExecution to Execution
@@ -114,6 +119,7 @@ impl TryFrom<crate::db_records::DbExecution> for Execution {
             seq: db.seq,
             initiator,
             triggered_by,
+            runner_device_id: db.runner_device_id,
         })
     }
 }
@@ -202,6 +208,8 @@ pub struct ExecutionListItem {
     /// 1-indexed sequence number within an issue (1, 2, 3...).
     /// None for executions not associated with an issue.
     pub seq: Option<i32>,
+    /// Owning machine's device id (CAIRN-2629); drives the owner/waiting badge.
+    pub runner_device_id: Option<String>,
 }
 
 /// A lightweight execution record for the triggered-execution indicator on job rows.
@@ -267,6 +275,7 @@ mod tests {
             initiator_sub: None,
             initiator_org_id: None,
             triggered_by: "manual".to_string(),
+            runner_device_id: None,
         }
     }
 

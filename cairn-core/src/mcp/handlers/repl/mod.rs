@@ -32,20 +32,27 @@ use crate::services::ChildProcess;
 /// protocol, so the server cannot also arrive on stdin).
 pub(crate) const PYTHON_EVAL_SERVER: &str = include_str!("eval_server.py");
 
+/// The embedded typescript eval-server, run by `bun` with the same agent
+/// PATH/env/sandbox as an inline typescript `run` item.
+pub(crate) const TYPESCRIPT_EVAL_SERVER: &str = include_str!("eval_server.ts");
+
 /// The interpreter backing a REPL session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplLang {
     Python,
+    Typescript,
 }
 
 impl ReplLang {
     /// Parse the create-payload `interpreter` string. Mirrors the inline-code
-    /// interpreter aliases so `{interpreter:"py"}` and `{interpreter:"python"}`
-    /// both resolve. Returns `None` for an unknown or (in this version)
-    /// unsupported interpreter, so the caller can name the accepted set.
+    /// interpreter aliases: `python`/`py` → Python, and `typescript`/`ts`/
+    /// `javascript`/`js` → Typescript (bun runs both identically, and a session
+    /// created as `typescript` must accept a send tagged `javascript`). Returns
+    /// `None` for an unknown interpreter so the caller can name the accepted set.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "python" | "py" => Some(Self::Python),
+            "typescript" | "ts" | "javascript" | "js" => Some(Self::Typescript),
             _ => None,
         }
     }
@@ -53,6 +60,7 @@ impl ReplLang {
     pub fn label(self) -> &'static str {
         match self {
             Self::Python => "python",
+            Self::Typescript => "typescript",
         }
     }
 }
@@ -74,6 +82,11 @@ pub(crate) struct ReplResponse {
     pub stdout: String,
     #[serde(default)]
     pub stderr: String,
+    /// Advisory guidance from the eval-server (typescript only; python never sets
+    /// it, so serde default keeps it `None`). Currently: a top-level-await send
+    /// was auto-wrapped, so its `const`/`let` declarations did not persist.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl ReplResponse {
@@ -200,6 +213,7 @@ pub async fn spawn_session(
     let scratch = crate::scratch::ensure_job_scratch_dir(&run_context.job_id);
     let (script_name, body) = match interpreter {
         ReplLang::Python => (format!("repl-{slug}.py"), PYTHON_EVAL_SERVER),
+        ReplLang::Typescript => (format!("repl-{slug}.ts"), TYPESCRIPT_EVAL_SERVER),
     };
     let script_path = scratch.join(&script_name);
     std::fs::write(&script_path, body)
@@ -227,6 +241,25 @@ pub async fn spawn_session(
                 }
                 ("python3".to_string(), vec![script])
             }
+        }
+        ReplLang::Typescript => {
+            // `deps` is a uv-only affordance; typescript packages resolve from
+            // the worktree node_modules, so a non-empty list is a mistake to name.
+            if !deps.is_empty() {
+                return Err(
+                    "REPL `deps` are python-only (preloaded via uv); a typescript REPL resolves \
+                     packages from the worktree node_modules, so omit `deps`."
+                        .to_string(),
+                );
+            }
+            // Same agent-PATH resolution as an inline typescript `run` item.
+            if crate::env::find_binary_on_agent_path("bun").is_err() {
+                return Err(
+                    "A typescript REPL requires `bun` on the agent PATH, which was not found."
+                        .to_string(),
+                );
+            }
+            ("bun".to_string(), vec![script])
         }
     };
 
@@ -360,7 +393,7 @@ pub(crate) fn render_status(slug: &str, session: Option<&Arc<ReplSession>>) -> S
     match session {
         None => format!(
             "[repl {slug}: not found] No REPL named '{slug}' for this node. \
-             Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"}}"
+             Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"|\"typescript\"}}"
         ),
         Some(session) => {
             let alive = session.is_alive();
@@ -425,6 +458,31 @@ pub(crate) async fn resolve_node_repl_job_id(
 }
 
 #[cfg(test)]
+mod lang_tests {
+    use super::ReplLang;
+
+    #[test]
+    fn parse_aliases_map_to_the_two_languages() {
+        for raw in ["python", "py", "PYTHON", " Py "] {
+            assert_eq!(ReplLang::parse(raw), Some(ReplLang::Python), "{raw}");
+        }
+        // typescript, javascript, and their short aliases all resolve to one
+        // Typescript session kind (bun runs them identically).
+        for raw in ["typescript", "ts", "javascript", "js", "TypeScript", " JS "] {
+            assert_eq!(ReplLang::parse(raw), Some(ReplLang::Typescript), "{raw}");
+        }
+        assert_eq!(ReplLang::parse("ruby"), None);
+        assert_eq!(ReplLang::parse(""), None);
+    }
+
+    #[test]
+    fn label_round_trips_the_canonical_name() {
+        assert_eq!(ReplLang::Python.label(), "python");
+        assert_eq!(ReplLang::Typescript.label(), "typescript");
+    }
+}
+
+#[cfg(test)]
 mod eval_server_tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
@@ -439,13 +497,13 @@ mod eval_server_tests {
     }
 
     impl EvalServer {
-        /// Spawn `python3 <materialized eval_server.py>`, or `None` if python3 is
-        /// not available in the test environment.
-        fn start() -> Option<Self> {
+        /// Spawn `<program> <materialized script>`, or `None` if the interpreter
+        /// is not available in the test environment (so the caller can skip).
+        fn start_with(program: &str, filename: &str, body: &str) -> Option<Self> {
             let dir = tempfile::tempdir().ok()?;
-            let script = dir.path().join("eval_server.py");
-            std::fs::write(&script, PYTHON_EVAL_SERVER).ok()?;
-            let mut child = Command::new("python3")
+            let script = dir.path().join(filename);
+            std::fs::write(&script, body).ok()?;
+            let mut child = Command::new(program)
                 .arg(&script)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -462,9 +520,26 @@ mod eval_server_tests {
             })
         }
 
+        /// Spawn `python3 <materialized eval_server.py>`, or `None` if python3 is
+        /// not available in the test environment.
+        fn start() -> Option<Self> {
+            Self::start_with("python3", "eval_server.py", PYTHON_EVAL_SERVER)
+        }
+
+        /// Spawn `bun <materialized eval_server.ts>`, or `None` if bun is not
+        /// available in the test environment.
+        fn start_ts() -> Option<Self> {
+            Self::start_with("bun", "eval_server.ts", TYPESCRIPT_EVAL_SERVER)
+        }
+
         fn eval(&mut self, code: &str) -> ReplResponse {
-            let request = serde_json::json!({ "code": code }).to_string();
-            self.stdin.write_all(request.as_bytes()).unwrap();
+            self.send_raw(&serde_json::json!({ "code": code }).to_string())
+        }
+
+        /// Write one raw framed line and read one framed response — used to drive
+        /// a deliberately malformed request past the `eval` JSON wrapper.
+        fn send_raw(&mut self, raw: &str) -> ReplResponse {
+            self.stdin.write_all(raw.as_bytes()).unwrap();
             self.stdin.write_all(b"\n").unwrap();
             self.stdin.flush().unwrap();
             let mut line = String::new();
@@ -593,5 +668,141 @@ mod eval_server_tests {
         assert!(err.stderr.contains("oops"), "stderr: {:?}", err.stderr);
         // Two subprocess sends later, framing is still aligned.
         assert_eq!(server.eval("7 * 6").value.as_deref(), Some("42"));
+    }
+
+    // --- typescript / bun eval-server (parity + deltas). Each skips when `bun`
+    // is absent, mirroring the python3 guard. ---
+
+    #[test]
+    fn ts_state_and_defs_persist_across_requests() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            eprintln!("skipping: bun not available");
+            return;
+        };
+        // bare, const, function, and class declarations all carry over.
+        assert!(server.eval("x = 40").succeeded());
+        assert!(server.eval("const y = 2").succeeded());
+        assert_eq!(server.eval("x + y").value.as_deref(), Some("42"));
+        assert!(server.eval("function dbl(n){ return n * 2 }").succeeded());
+        assert_eq!(server.eval("dbl(21)").value.as_deref(), Some("42"));
+        assert!(server.eval("class C { get v(){ return 7 } }").succeeded());
+        assert_eq!(server.eval("new C().v").value.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn ts_trailing_expression_yields_value_statement_does_not() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        // Object/array/null literals survive (deadCodeElimination disabled).
+        assert_eq!(server.eval("1 + 2").value.as_deref(), Some("3"));
+        assert!(server.eval("({a:1})").value.is_some());
+        assert_eq!(server.eval("null").value.as_deref(), Some("null"));
+        assert_eq!(server.eval("let z = 5").value, None);
+    }
+
+    #[test]
+    fn ts_console_and_subprocess_captured_without_breaking_framing() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        let r = server.eval("console.log('hello'); console.log('world')");
+        assert!(r.succeeded(), "got: {r:?}");
+        assert_eq!(r.stdout, "hello\nworld\n");
+        assert_eq!(server.eval("console.error('oops')").stderr, "oops\n");
+        // A subprocess inheriting the eval-server's fds lands in the capture, not
+        // the protocol stream.
+        let sub = server.eval("Bun.spawnSync(['printf', 'rawsub'], { stdout: 'inherit' })");
+        assert!(sub.succeeded(), "got: {sub:?}");
+        assert!(sub.stdout.contains("rawsub"), "stdout: {:?}", sub.stdout);
+        // Framing intact several sends later.
+        assert_eq!(server.eval("6 * 7").value.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn ts_error_returns_stack() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        let r = server.eval("throw new Error('boom')");
+        assert!(!r.succeeded());
+        assert_eq!(r.kind, "error");
+        assert!(r.error.unwrap_or_default().contains("boom"));
+    }
+
+    #[test]
+    fn ts_typescript_annotations_are_stripped() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        assert_eq!(
+            server.eval("const n: number = 9; n").value.as_deref(),
+            Some("9")
+        );
+    }
+
+    #[test]
+    fn ts_top_level_await_bare_assignment_persists_and_notes_declarations() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        // Bare assignment in an awaiting (auto-wrapped) send persists.
+        assert!(server.eval("g = await Promise.resolve(100)").succeeded());
+        assert_eq!(server.eval("g").value.as_deref(), Some("100"));
+        // A `const`/`let`/etc. in an awaiting send does NOT persist, and the
+        // response carries a `note` telling the agent to use bare assignment.
+        let decl = server.eval("const h = await Promise.resolve(1)");
+        assert!(decl.succeeded(), "got: {decl:?}");
+        assert!(decl.note.is_some(), "expected a note, got: {decl:?}");
+    }
+
+    #[test]
+    fn ts_top_level_return_yields_value() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        // Bare top-level return (no await) is retried through the async wrap.
+        assert_eq!(server.eval("return 5 + 5").value.as_deref(), Some("10"));
+        // Top-level await plus return also yields the returned value.
+        let r = server.eval("const os = await import('node:os'); return typeof os.tmpdir");
+        assert_eq!(r.value.as_deref(), Some("\"function\""));
+    }
+
+    #[test]
+    fn ts_static_import_returns_clear_error() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        let r = server.eval("import x from 'node:os'");
+        assert!(!r.succeeded());
+        let err = r.error.unwrap_or_default();
+        assert!(err.contains("require"), "got: {err}");
+        // The server survives the rejected import and keeps framing.
+        assert_eq!(server.eval("1 + 1").value.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn ts_user_thrown_syntaxerror_does_not_double_execute() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        assert!(server.eval("count = 0").succeeded());
+        // A user-thrown SyntaxError must NOT be mistaken for a top-level-return
+        // parse error and retried (which would run the side effect twice).
+        let r = server.eval("count++; throw new SyntaxError('nope')");
+        assert!(!r.succeeded());
+        assert_eq!(server.eval("count").value.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn ts_malformed_request_is_framed_error() {
+        let Some(mut server) = EvalServer::start_ts() else {
+            return;
+        };
+        let r = server.send_raw("not json at all");
+        assert!(!r.succeeded());
+        assert!(r.error.unwrap_or_default().contains("malformed"));
+        // Still alive and framing correctly.
+        assert_eq!(server.eval("2 + 2").value.as_deref(), Some("4"));
     }
 }

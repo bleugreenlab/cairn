@@ -634,7 +634,7 @@ async fn run_repl_send(
         return ItemOutcome::failed(
             header,
             format!(
-                "No REPL named '{slug}' for this node. Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"}}"
+                "No REPL named '{slug}' for this node. Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"|\"typescript\"}}"
             ),
         );
     };
@@ -671,6 +671,9 @@ async fn run_repl_send(
                     "stderr:\n{}",
                     response.stderr.trim_end_matches('\n')
                 ));
+            }
+            if let Some(note) = response.note.as_deref() {
+                push(&format!("note: {}", note.trim()));
             }
             if let Some(error) = response.error.as_deref() {
                 push(error.trim_end_matches('\n'));

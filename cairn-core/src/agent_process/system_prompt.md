@@ -197,7 +197,7 @@ For an exploration that builds up state across several `run` calls — load a da
     run({commands:[{interpreter:"python", repl:"analysis", code:"import pandas as pd; df = pd.read_csv('data.csv')"}]})
     run({commands:[{interpreter:"python", repl:"analysis", code:"df['amount'].sum()"}]})
 
-The trailing expression's value comes back as the result. A REPL is python-only for now and lives as long as your node; its state is lost if it dies (recreate and replay). Read `cairn:~/repl/<slug>` for its status, `delete` it to stop it. This is not for large or one-shot work — a fresh inline item is simpler when nothing needs to carry over.
+The trailing expression's value comes back as the result. A REPL is python or typescript and lives as long as your node; its state is lost if it dies (recreate and replay). Read `cairn:~/repl/<slug>` for its status, `delete` it to stop it. This is not for large or one-shot work — a fresh inline item is simpler when nothing needs to carry over.
 
 ## Utilities
 

@@ -307,6 +307,12 @@ impl DbState {
         // replica fails `no column named workspace_id`. Same runtime-repair shape
         // and rationale as `is_workspace` above.
         ensure_action_configs_workspace_id_column(&db).await;
+        // Repair legacy replicas whose team schema predates the CAIRN-2629
+        // `device_presence` table (device-runner presence for team execution
+        // ownership). Naturally idempotent via CREATE TABLE IF NOT EXISTS, and a
+        // backstop for the migration-vs-sync race even though the tracked team
+        // migration also uses IF NOT EXISTS.
+        ensure_device_presence_table(&db).await;
         // Seed the team's OWN root row into the synced `teams` table — the NOT
         // NULL FK parent that every team `projects.team_id` references after the
         // CAIRN-2129 re-rooting. Nothing else ever seeds it, so without this the
@@ -682,6 +688,26 @@ async fn ensure_action_configs_workspace_id_column(team_db: &LocalDb) {
         {
             log::warn!("ensuring action_configs.workspace_id on team replica failed: {error}");
         }
+    }
+}
+
+/// Idempotently ensure a team replica carries the `device_presence` table
+/// (CAIRN-2629). See the call site in [`DbState::open_team`]. Best-effort:
+/// `CREATE TABLE IF NOT EXISTS` is naturally idempotent, so any error here is a
+/// genuine failure worth logging rather than a benign already-exists.
+async fn ensure_device_presence_table(team_db: &LocalDb) {
+    if let Err(error) = team_db
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS device_presence (\
+                device_id TEXT PRIMARY KEY NOT NULL, \
+                device_name TEXT NOT NULL, \
+                last_seen INTEGER NOT NULL, \
+                project_keys TEXT NOT NULL DEFAULT '[]', \
+                updated_at INTEGER NOT NULL)",
+        )
+        .await
+    {
+        log::warn!("ensuring device_presence on team replica failed: {error}");
     }
 }
 
@@ -1071,6 +1097,40 @@ mod tests {
         // Idempotent: repeating swallows the duplicate-column error.
         ensure_projects_is_workspace_column(&db).await;
         assert_eq!(has_is_workspace(&db).await, 1);
+    }
+
+    /// A team replica missing the CAIRN-2629 `device_presence` table gets it
+    /// created, and repeating the repair converges on exactly one table (the
+    /// `CREATE TABLE IF NOT EXISTS` is naturally idempotent).
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_device_presence_table_repairs_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("legacy-presence-team.db"))
+            .await
+            .unwrap();
+
+        async fn presence_table_count(db: &LocalDb) -> i64 {
+            db.read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='device_presence'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await?.unwrap().i64(0)
+                })
+            })
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(presence_table_count(&db).await, 0);
+        ensure_device_presence_table(&db).await;
+        assert_eq!(presence_table_count(&db).await, 1, "table created");
+        // Idempotent: repeating is a no-op via IF NOT EXISTS.
+        ensure_device_presence_table(&db).await;
+        assert_eq!(presence_table_count(&db).await, 1);
     }
 
     /// Forgetting a team removes its registry row, its project routes, and its

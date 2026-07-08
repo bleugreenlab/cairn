@@ -35,6 +35,10 @@
 //! purely internal to `cairn-core` (their submodules are private, with no host
 //! caller) are intentionally omitted.
 
+pub mod account {
+    pub use crate::account::*;
+}
+
 pub mod agent_process {
     pub use crate::agent_process::*;
 }

@@ -259,7 +259,26 @@ pub fn default_sccache_service() -> BuildServiceConfig {
             round_trip: Some(vec!["sccache".to_string(), "--show-stats".to_string()]),
         }),
         state_dir: Some("{home}/.cache/sccache".to_string()),
-        write: vec!["{worktrees}/**/target/**".to_string()],
+        // Writable grant for the confined shared daemon. A cache-MISS compile is
+        // run by the server (not the unconfined client), so the server's spawned
+        // rustc must be allowed to write the artifact + dep-info into the target
+        // dir it is building. Three roots need it:
+        //   1. `{worktrees}/**/target/**` — ordinary fenced agent builds.
+        //   2/3. the two COW-clone roots the project-check isolation compiles in
+        //        (`check_isolation::{clone_root_for_job, turn_end_clone_root_for_job}`
+        //        → `{cairnHome}/check-clones`, `{cairnHome}/turn-check-clones`).
+        // The clone roots are SIBLINGS of `{worktrees}`, so the worktrees glob
+        // does not cover them; without these two grants a turn-end `rust-full` /
+        // `rust-lint` compile that misses cache is denied writing into its clone's
+        // `target/` (a raw EPERM that false-reds an otherwise-green diff). The
+        // clone `target/` trees are gitignored disposable build output — the
+        // write-cadence fold skips them and the review cadence discards the whole
+        // clone — so this widens exposure no further than the worktrees grant.
+        write: vec![
+            "{worktrees}/**/target/**".to_string(),
+            "{cairnHome}/check-clones/**/target/**".to_string(),
+            "{cairnHome}/turn-check-clones/**/target/**".to_string(),
+        ],
         env,
         launch_env,
     }
@@ -357,7 +376,13 @@ env:
         assert_eq!(svc.expanded_start(&t), vec!["sccache"]);
         assert_eq!(
             svc.expanded_write(&t),
-            vec!["/home/u/.cairn/worktrees/**/target/**"]
+            vec![
+                "/home/u/.cairn/worktrees/**/target/**",
+                // The two COW-clone roots the check-isolation compiles run in;
+                // siblings of {worktrees}, so they need their own grants.
+                "/home/u/.cairn/check-clones/**/target/**",
+                "/home/u/.cairn/turn-check-clones/**/target/**",
+            ]
         );
         assert_eq!(
             svc.expanded_state_dir(&t),

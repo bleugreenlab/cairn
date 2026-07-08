@@ -24,7 +24,6 @@ use futures_util::future::join_all;
 
 use cairn_common::paths;
 use cairn_common::protocol::{CallbackRequest, CallbackResponse};
-use cairn_common::query::{encode_query_params, QueryParam};
 use cairn_common::read::ReadBatchEnvelope;
 
 /// Ceiling on a dev instance's callback response. A running instance answers a
@@ -215,25 +214,14 @@ async fn is_running(port: u16) -> bool {
     )
 }
 
-/// The inner `cairn://db` URI to run on the instance. Every component is
-/// percent-encoded, so a `sql` value containing `&`/`=`/spaces round-trips
-/// through the instance's query parser unambiguously.
+/// The inner `cairn://db` URI to run on the instance. `offset`/`limit` are plain
+/// integers; `sql` rides raw (verbatim, not percent-encoded) and last, because
+/// the receiving `cairn://db` parser takes the `sql` value literally (`sql` is a
+/// `RAW_VALUE_KEYS` member) — encoding it here would double-escape a `%`. A
+/// literal `&`/`=`/space inside SQL stays inside the value: a query-value `&`
+/// only separates when a known key follows it, and `=`/space are literal.
 fn build_db_uri(sql: &str, offset: usize, limit: usize) -> String {
-    let params = vec![
-        QueryParam {
-            key: "offset".to_string(),
-            value: offset.to_string(),
-        },
-        QueryParam {
-            key: "limit".to_string(),
-            value: limit.to_string(),
-        },
-        QueryParam {
-            key: "sql".to_string(),
-            value: sql.to_string(),
-        },
-    ];
-    format!("cairn://db?{}", encode_query_params(&params))
+    format!("cairn://db?offset={offset}&limit={limit}&sql={sql}")
 }
 
 /// Pull the row body out of a single-target `read_batch` envelope for
@@ -615,14 +603,25 @@ mod tests {
     }
 
     #[test]
-    fn build_db_uri_percent_encodes_sql() {
-        let uri = build_db_uri("SELECT * FROM issues WHERE a & b", 5, 10);
-        assert!(uri.starts_with("cairn://db?offset=5&limit=10&sql="));
-        // Space and ampersand are encoded, not left literal, so the inner parser
-        // keeps them inside the sql value.
-        assert!(uri.contains("%20"));
-        assert!(uri.contains("%26"));
-        assert!(!uri.contains("a & b"));
+    fn build_db_uri_keeps_sql_raw_and_round_trips() {
+        // SQL rides verbatim: a `%` LIKE wildcard and a `&` both survive, and the
+        // receiving parser recovers the exact original sql. `& b` is not before a
+        // known key so it stays inside the value; `&limit=`/`&offset=` do split.
+        let sql = "SELECT * FROM issues WHERE title LIKE '%bug%' AND a & b";
+        let uri = build_db_uri(sql, 5, 10);
+        assert_eq!(
+            uri,
+            "cairn://db?offset=5&limit=10&sql=SELECT * FROM issues WHERE title LIKE '%bug%' AND a & b"
+        );
+        let split = cairn_common::query::split_target_query(&uri).unwrap();
+        assert_eq!(
+            split
+                .params
+                .iter()
+                .find(|param| param.key == "sql")
+                .map(|param| param.value.as_str()),
+            Some(sql)
+        );
     }
 
     #[test]

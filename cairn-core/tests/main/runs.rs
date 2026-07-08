@@ -490,6 +490,243 @@ async fn list_events_for_session_orders_by_run_creation_then_insertion() {
     );
 }
 
+// Insert a bare session row on `job_id` (the sessions CHECK requires exactly one
+// of job_id / chat_id, and chat_id's parent table is gone). Lineage links are
+// wired afterward with `link_session_rotation` / `set_session_parent` so no
+// insert forward-references a not-yet-existing session row.
+async fn insert_session(db: &LocalDb, id: &str, job_id: &str, sequence: i64) {
+    let id = id.to_string();
+    let job_id = job_id.to_string();
+    db.execute(
+        "INSERT INTO sessions(
+            id, job_id, chat_id, backend, status, parent_session_id, replaced_by_id,
+            terminal_reason, sequence, created_at, closed_at, updated_at, backend_id
+         )
+         VALUES (?1, ?2, NULL, 'claude', 'open', NULL, NULL, NULL, ?3, 1, NULL, 1, NULL)",
+        params![id.as_str(), job_id.as_str(), sequence],
+    )
+    .await
+    .unwrap();
+}
+
+// Wire an in-place rotation: `new` continues `old` (new.parent = old, old marked
+// replaced_by new) — the shape the resume path produces on a cold-resume reseed.
+async fn link_session_rotation(db: &LocalDb, old: &str, new: &str) {
+    let old = old.to_string();
+    let new = new.to_string();
+    db.execute(
+        "UPDATE sessions SET parent_session_id = ?1 WHERE id = ?2",
+        params![old.as_str(), new.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE sessions SET replaced_by_id = ?1 WHERE id = ?2",
+        params![new.as_str(), old.as_str()],
+    )
+    .await
+    .unwrap();
+}
+
+// Point a session at a parent WITHOUT marking the parent replaced_by it — the
+// shape a delegated child job's forked session has.
+async fn set_session_parent(db: &LocalDb, id: &str, parent: &str) {
+    let id = id.to_string();
+    let parent = parent.to_string();
+    db.execute(
+        "UPDATE sessions SET parent_session_id = ?1 WHERE id = ?2",
+        params![parent.as_str(), id.as_str()],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn list_events_for_session_spans_reseed_rotation_lineage() {
+    // A cold-resume reseed rotates a job onto a fresh session that carries none
+    // of the prior runs. The transcript must still span the predecessor session
+    // so prior events are preserved rather than wiped (CAIRN-2630).
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+
+    let project_id = common::create_project(&db, "RESEED").await;
+    insert_job(&db, "job-1", &project_id, None).await;
+
+    // session-old (root) was rotated in place into session-new; both on job-1.
+    insert_session(&db, "session-old", "job-1", 1).await;
+    insert_session(&db, "session-new", "job-1", 2).await;
+    link_session_rotation(&db, "session-old", "session-new").await;
+
+    insert_run(
+        &db,
+        "run-old",
+        None,
+        None,
+        None,
+        None,
+        "complete",
+        Some("session-old"),
+        100,
+    )
+    .await;
+    insert_run(
+        &db,
+        "run-new",
+        None,
+        None,
+        None,
+        None,
+        "running",
+        Some("session-new"),
+        200,
+    )
+    .await;
+
+    for (id, run, session, seq, kind) in [
+        ("old-user", "run-old", "session-old", 1, "user"),
+        ("old-assistant", "run-old", "session-old", 2, "assistant"),
+        ("new-seed", "run-new", "session-new", 1, "user:seed"),
+        ("new-user", "run-new", "session-new", 2, "user"),
+    ] {
+        insert_event(
+            &db,
+            id,
+            run,
+            Some(session),
+            None,
+            seq,
+            kind,
+            100,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
+
+    // Loading the fresh session returns the full lineage, prior events first.
+    let events = queries::list_events_for_session(db.clone(), "session-new").unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["old-user", "old-assistant", "new-seed", "new-user"]
+    );
+
+    // The initial delta load carries the same full lineage.
+    let delta = queries::list_events_for_session_delta(db.clone(), "session-new", None).unwrap();
+    assert_eq!(
+        delta
+            .events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["old-user", "old-assistant", "new-seed", "new-user"]
+    );
+
+    // Loading the predecessor directly stays scoped to its own events — the walk
+    // only follows genuine in-place rotation predecessors, never successors.
+    let old_only = queries::list_events_for_session(db.clone(), "session-old").unwrap();
+    assert_eq!(
+        old_only
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["old-user", "old-assistant"]
+    );
+}
+
+#[tokio::test]
+async fn list_events_for_session_excludes_cross_job_fork_parent() {
+    // A delegated child job forks the parent's session: it stamps
+    // parent_session_id but the parent is NOT marked replaced_by the child (it
+    // keeps serving its own job). The child transcript must not absorb the
+    // parent agent's history (CAIRN-2630).
+    let (_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+
+    let project_id = common::create_project(&db, "FORK").await;
+    insert_job(&db, "job-parent", &project_id, None).await;
+    insert_job(&db, "job-child", &project_id, None).await;
+
+    // parent-session was NOT replaced by the fork (it keeps serving its own job).
+    insert_session(&db, "parent-session", "job-parent", 1).await;
+    insert_session(&db, "fork-session", "job-child", 2).await;
+    // The fork points back at the parent, but the parent's replaced_by_id stays
+    // NULL — the exact shape that must NOT chain.
+    set_session_parent(&db, "fork-session", "parent-session").await;
+
+    insert_run(
+        &db,
+        "run-parent",
+        None,
+        None,
+        None,
+        None,
+        "complete",
+        Some("parent-session"),
+        100,
+    )
+    .await;
+    insert_run(
+        &db,
+        "run-fork",
+        None,
+        None,
+        None,
+        None,
+        "running",
+        Some("fork-session"),
+        200,
+    )
+    .await;
+
+    insert_event(
+        &db,
+        "parent-ev",
+        "run-parent",
+        Some("parent-session"),
+        None,
+        1,
+        "user",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    insert_event(
+        &db,
+        "fork-ev",
+        "run-fork",
+        Some("fork-session"),
+        None,
+        1,
+        "user",
+        100,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let events = queries::list_events_for_session(db.clone(), "fork-session").unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["fork-ev"]
+    );
+}
+
 #[tokio::test]
 async fn list_events_for_turn_preserves_same_second_insertion_order() {
     let (_temp, db) = common::migrated_db().await;

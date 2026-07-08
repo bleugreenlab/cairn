@@ -25,11 +25,60 @@ const DEFAULT_TTL_SECS: i64 = 30 * 24 * 3600; // 30 days
 pub struct AnonDeviceManager {
     db: Arc<DbState>,
     api_config: ApiConfig,
+    /// Process cache of the resolved stable machine `device_id`, so the
+    /// team-ownership guard/sweep don't hit the DB on every claim and so the id
+    /// stays fixed for the life of the process even if the row were disturbed.
+    device_id_cache: std::sync::Mutex<Option<String>>,
 }
 
 impl AnonDeviceManager {
     pub fn new(db: Arc<DbState>, api_config: ApiConfig) -> Self {
-        Self { db, api_config }
+        Self {
+            db,
+            api_config,
+            device_id_cache: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The stable per-machine `device_id` used as the team-execution OWNERSHIP
+    /// key (CAIRN-2629).
+    ///
+    /// This is the same UUID `ensure_registered` persists for the `/embed`
+    /// gateway: generated once on first run, kept across sign-in/out and account
+    /// switches (no code path clears or regenerates it). Unlike the account/cloud
+    /// device id — which the server caps at one per USER and so cannot tell two
+    /// machines apart — this id distinguishes any two machines, exactly what
+    /// runner ownership needs.
+    ///
+    /// Sync, and self-healing: if the row does not exist yet (called before
+    /// `ensure_registered`), it generates and persists one so ownership is never
+    /// keyed on an empty id. Cached after first resolution.
+    pub fn device_id(&self) -> String {
+        {
+            let guard = self.device_id_cache.lock().unwrap();
+            if let Some(id) = guard.as_ref() {
+                return id.clone();
+            }
+        }
+        let db = self.db.clone();
+        let resolved = block_on_anon_db(async move {
+            if let Some(row) = get_anon_device(&db).await? {
+                return Ok(row.device_id);
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            insert_anon_device(&db, &id).await?;
+            Ok(id)
+        })
+        .unwrap_or_else(|e| {
+            log::warn!("resolving machine device_id failed, using a process-local id: {e}");
+            uuid::Uuid::new_v4().to_string()
+        });
+        // get_or_insert makes concurrent first-callers converge on one value.
+        self.device_id_cache
+            .lock()
+            .unwrap()
+            .get_or_insert(resolved)
+            .clone()
     }
 
     /// Ensure an anonymous device JWT is registered and fresh.
@@ -126,6 +175,18 @@ impl AnonDeviceManager {
             decrypt_jwt_from_storage(&encrypted).map(Some)
         })
     }
+}
+
+/// Human-readable presence name for this machine: hostname + platform. The
+/// display label the runner picker and owner UI show for a device; v1 has no
+/// user-editable override.
+pub fn machine_device_name() -> String {
+    let host = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_string());
+    format!("{host} ({})", std::env::consts::OS)
 }
 
 struct AnonDeviceRow {

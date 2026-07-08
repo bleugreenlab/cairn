@@ -629,8 +629,11 @@ mod tests {
         // Daemon pipes are not held open.
         assert!(!config.capture_stdout);
         assert!(!config.capture_stderr);
-        // On a sandbox-capable host the service sandbox is applied with the
-        // worktrees-target regex grant and the state dir writable.
+        // On a sandbox-capable host the service sandbox is applied with the state
+        // dir writable and one regex grant per configured `write` glob: the
+        // worktrees target tree plus the two check-isolation COW-clone roots (so a
+        // cache-miss compile the confined daemon runs can write into a clone's
+        // target/ instead of EPERMing).
         if sandbox::is_available() {
             let policy = config.sandbox.expect("service sandbox should be applied");
             assert!(policy
@@ -638,7 +641,11 @@ mod tests {
                 .contains(&PathBuf::from("/home/u/.cache/sccache")));
             assert_eq!(
                 policy.writable_regex,
-                vec!["^/home/u/\\.cairn/worktrees/.*/target/.*".to_string()]
+                vec![
+                    "^/home/u/\\.cairn/worktrees/.*/target/.*".to_string(),
+                    "^/home/u/\\.cairn/check-clones/.*/target/.*".to_string(),
+                    "^/home/u/\\.cairn/turn-check-clones/.*/target/.*".to_string(),
+                ]
             );
         }
     }

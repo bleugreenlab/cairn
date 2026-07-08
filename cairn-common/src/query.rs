@@ -89,6 +89,17 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "kind",
 ];
 
+/// Keys whose value is a free-text payload taken verbatim: the value is NOT
+/// percent-decoded, so a literal `%` — a SQL `LIKE '%x%'` wildcard, a
+/// `%`-carrying search query — rides through as-is instead of tripping the
+/// percent-escape validation (`Invalid percent escape in query component`).
+/// Segment splitting on `&`-before-known-key still applies to these values, so
+/// `?sql=...&limit=N` continues to separate in either order; only the decode
+/// step is skipped. These keys are unique to `cairn://db` / `cairn://dev/db`
+/// (`sql`) and `cairn://websearch` (`q`), so treating them as raw wherever they
+/// appear is unambiguous.
+pub const RAW_VALUE_KEYS: &[&str] = &["sql", "q"];
+
 /// Return true when the start of `rest` (the text immediately after a `&`) is a
 /// recognized query key — i.e. the chars up to the next `=`, `&`, or end form a
 /// member of `KNOWN_QUERY_KEYS`. This is the test that decides whether a `&`
@@ -122,10 +133,15 @@ pub fn parse_query_params(query: &str) -> Result<Vec<QueryParam>, String> {
         .filter(|pair| !pair.is_empty())
         .map(|pair| {
             let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
-            Ok(QueryParam {
-                key: decode_query_component(raw_key)?,
-                value: decode_query_component(raw_value)?,
-            })
+            let key = decode_query_component(raw_key)?;
+            // Free-text payloads (sql/q) are taken verbatim so a literal `%`
+            // survives; every other value is percent-decoded as usual.
+            let value = if RAW_VALUE_KEYS.contains(&key.as_str()) {
+                raw_value.to_string()
+            } else {
+                decode_query_component(raw_value)?
+            };
+            Ok(QueryParam { key, value })
         })
         .collect()
 }
@@ -379,6 +395,51 @@ mod tests {
     fn split_target_query_rejects_invalid_percent_encoding() {
         let err = split_target_query("src?grep=%ZZ").unwrap_err();
         assert!(err.contains("Invalid percent escape"));
+    }
+
+    #[test]
+    fn raw_value_keys_skip_percent_decoding() {
+        // A SQL LIKE wildcard carries a literal `%` that is NOT a valid percent
+        // escape. For `sql` (a raw-value key) it rides through verbatim rather
+        // than failing with "Invalid percent escape", and `&limit=` still splits.
+        let split =
+            split_target_query("cairn://db?sql=SELECT * FROM issues WHERE t LIKE '%bug%'&limit=5")
+                .unwrap();
+        assert_eq!(
+            split.params,
+            vec![
+                QueryParam {
+                    key: "sql".to_string(),
+                    value: "SELECT * FROM issues WHERE t LIKE '%bug%'".to_string(),
+                },
+                QueryParam {
+                    key: "limit".to_string(),
+                    value: "5".to_string(),
+                },
+            ]
+        );
+
+        // Web search `q` is a raw-value key too: `100%` no longer breaks parsing.
+        let split = split_target_query("cairn://websearch?q=100% uptime claims").unwrap();
+        assert_eq!(
+            split.params,
+            vec![QueryParam {
+                key: "q".to_string(),
+                value: "100% uptime claims".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn non_raw_value_keys_still_reject_bad_percent_escapes() {
+        // Only sql/q are raw; a stray `%` in an ordinary value (grep) still fails
+        // fast rather than corrupting the pattern.
+        assert!(split_target_query("file:lib.rs?grep=100%25done")
+            .unwrap()
+            .params
+            .iter()
+            .any(|p| p.key == "grep" && p.value == "100%done"));
+        assert!(split_target_query("file:lib.rs?grep=100%done").is_err());
     }
 
     #[test]

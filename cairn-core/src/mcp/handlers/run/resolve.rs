@@ -135,7 +135,7 @@ fn resolve_repl_send(item: &RunItem, slug: &str) -> (String, Result<RunSpec, Str
         None => return (
             header,
             Err(
-                "Run item has `repl` but no `interpreter`; set it to the REPL's language (python)"
+                "Run item has `repl` but no `interpreter`; set it to the REPL's language (python | typescript)"
                     .to_string(),
             ),
         ),
@@ -153,7 +153,7 @@ fn resolve_repl_send(item: &RunItem, slug: &str) -> (String, Result<RunSpec, Str
         None => (
             header,
             Err(format!(
-                "Run item `repl` interpreter '{interpreter}' is not a supported REPL language; use python (py)"
+                "Run item `repl` interpreter '{interpreter}' is not a supported REPL language; use python (py) | typescript (ts)"
             )),
         ),
     }

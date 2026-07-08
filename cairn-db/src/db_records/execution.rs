@@ -14,6 +14,9 @@ pub struct DbExecution {
     pub initiator_sub: Option<String>,
     pub initiator_org_id: Option<String>,
     pub triggered_by: String,
+    /// Stable per-machine device id that OWNS this execution (CAIRN-2629); only
+    /// the owning machine claims and runs its jobs. NULL for legacy rows.
+    pub runner_device_id: Option<String>,
 }
 
 #[derive(Debug)]

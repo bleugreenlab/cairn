@@ -199,6 +199,22 @@ macro_rules! shared_tail_check_result_failure_kind {
         )
     };
 }
+
+/// CAIRN-2629: stamp the owning machine on an execution. `executions` is a
+/// project-scoped SHARED table, so this append-only ADD COLUMN lands in both
+/// lineages, written once here and appended after 0102. The synced migration
+/// ledger handles a legacy replica (it simply runs 0103 on next open), so unlike
+/// the head-snapshot columns (is_workspace) this shared-tail column needs no
+/// bespoke runtime repair.
+macro_rules! shared_tail_executions_runner_device_id {
+    () => {
+        Migration::new(
+            "0103",
+            "executions_runner_device_id",
+            include_str!("../../../../turso_migrations/0103_executions_runner_device_id.sql"),
+        )
+    };
+}
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -215,6 +231,7 @@ macro_rules! team_lineage {
             shared_tail_call_output_contract!(),
             shared_tail_workflow_progress!(),
             shared_tail_check_result_failure_kind!(),
+            shared_tail_executions_runner_device_id!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -297,6 +314,7 @@ macro_rules! private_lineage {
             shared_tail_call_output_contract!(),
             shared_tail_workflow_progress!(),
             shared_tail_check_result_failure_kind!(),
+            shared_tail_executions_runner_device_id!(),
             // CAIRN-2487: durable journal for the workflow harness's agent()
             // calls. A per-machine runner-transient replay cache (never synced),
             // so it lives ONLY in the private lineage's tail -- absent from
@@ -785,6 +803,16 @@ pub const TEAM_MIGRATIONS: &[Migration] = team_lineage![
         "0002",
         "labels_read_completeness",
         include_str!("../../../../turso_migrations_team/0002_labels_read_completeness.sql"),
+    ),
+    // CAIRN-2629: per-machine device presence for team runner selection. Team-only
+    // (no private counterpart): the runner picker, clone validation, and
+    // "waiting for <device>" UX all read it. `CREATE TABLE IF NOT EXISTS` makes it
+    // self-sufficient against the migration-vs-sync race; the idempotent
+    // `ensure_device_presence_table` repair at team-open backstops it.
+    Migration::new(
+        "0003",
+        "device_presence",
+        include_str!("../../../../turso_migrations_team/0003_device_presence.sql"),
     ),
 ];
 
@@ -1432,6 +1460,7 @@ mod tests {
                 "0098_call_output_contract_and_run_tags".to_string(),
                 "0101_workflow_progress".to_string(),
                 "0102_check_result_cache_failure_kind".to_string(),
+                "0103_executions_runner_device_id".to_string(),
                 "0099_workflow_journal".to_string(),
                 "0100_workflow_restart_durability".to_string(),
             ]
@@ -2736,6 +2765,8 @@ mod tests {
             vec![
                 "0001_team_initial_schema".to_string(),
                 "0002_labels_read_completeness".to_string(),
+                // CAIRN-2629: team-only device_presence table (head migration).
+                "0003_device_presence".to_string(),
                 // Shared-tail migrations land in the team lineage after the team
                 // head, preserving one shared SQL source for project-scoped tables.
                 "0084_archival_pack_hash".to_string(),
@@ -2752,6 +2783,8 @@ mod tests {
                 "0098_call_output_contract_and_run_tags".to_string(),
                 "0101_workflow_progress".to_string(),
                 "0102_check_result_cache_failure_kind".to_string(),
+                // CAIRN-2629: executions.runner_device_id is a shared column.
+                "0103_executions_runner_device_id".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.
@@ -2846,8 +2879,11 @@ mod tests {
             );
         }
 
+        // `device_presence` is team-only (CAIRN-2629): no private counterpart, so
+        // it is skipped here exactly as `teams` is, and re-added to the expected
+        // team projection below.
         for (name, sql) in &team_tables {
-            if name == "teams" || rerooted.contains(&name.as_str()) {
+            if name == "teams" || name == "device_presence" || rerooted.contains(&name.as_str()) {
                 continue;
             }
             let p = priv_tables.get(name).unwrap_or_else(|| {
@@ -2935,6 +2971,7 @@ mod tests {
             .map(|(name, _)| *name)
             .collect();
         expected_team.insert("teams"); // present in both; classified specially
+        expected_team.insert("device_presence"); // team-only (CAIRN-2629)
         let actual_team: std::collections::BTreeSet<&str> = team_tables
             .keys()
             .map(String::as_str)

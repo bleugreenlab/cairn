@@ -28,6 +28,7 @@ pub mod dag;
 pub mod delegation;
 pub mod dispatch;
 pub mod jobs;
+pub mod ownership;
 pub mod queries;
 pub mod recipe;
 pub mod routing;

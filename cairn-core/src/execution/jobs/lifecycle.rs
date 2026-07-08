@@ -559,6 +559,28 @@ pub fn continue_job_impl(
         job_id.to_string(),
     ))?;
 
+    // CAIRN-2629: same device-ownership guard as the start/claim path — refuse to
+    // resume an execution owned by another machine (its runner owns the lifecycle).
+    // Fail-open on a read hiccup (deferred_owner returns None), and treat a NULL /
+    // this-machine owner as "may proceed".
+    if let Some(exec_id) = job.execution_id.clone() {
+        let this_device = orch.anon_device_manager.device_id();
+        let deferred = run_db({
+            let owning_db = owning_db.clone();
+            async move {
+                Ok::<_, String>(
+                    crate::execution::ownership::deferred_owner(&owning_db, &exec_id, &this_device)
+                        .await,
+                )
+            }
+        })?;
+        if let Some(owner) = deferred {
+            return Err(format!(
+                "This execution is owned by device {owner}, not this machine; resume it there."
+            ));
+        }
+    }
+
     let current_session_id = job.current_session_id.as_ref().ok_or_else(|| {
         if job.status == "blocked" {
             "This job has no agent session to resume. A command checkpoint is resolved by confirming it (an override that continues the workflow).".to_string()
