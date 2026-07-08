@@ -155,7 +155,7 @@ pub(super) async fn lookup_project_by_key(
         .ok_or_else(|| format!("No project found with key '{}'", key))
 }
 
-async fn issue_id_for_number(
+pub(super) async fn issue_id_for_number(
     conn: &cairn_db::turso::Connection,
     project_id: &str,
     number: i32,
@@ -270,6 +270,46 @@ pub(super) fn affordance_for_kind(kind: ResourceKind) -> String {
     }
 
     format!("## {}\n\n{}", contract.name, sections)
+}
+
+/// Collapse an already-shown affordance block to a one-line session pointer,
+/// or `None` when the block cannot be faithfully re-rendered from the help
+/// projection (leave it full).
+///
+/// The full block was rendered earlier this session (CAIRN-2592 session-scoped
+/// affordance dedup); every later occurrence of identical block content that
+/// *round-trips* collapses to this pointer, which targets the on-demand per-kind
+/// help projection (`cairn://help?kind=<slug>`) that re-renders the exact block
+/// from the same single source ([`affordance_for_kind`]). The full reference
+/// thus stays one cheap read away for the rest of the run, including right after
+/// context compaction.
+///
+/// Returns `None` (block stays full) when the first line is not a resolvable
+/// `## {contract name}`, OR when `affordance_for_kind(kind)` does not reproduce
+/// the block byte-for-byte. The round-trip guard is what keeps schema-derived
+/// node/task artifact affordances full: they share the generic artifact contract
+/// title but carry schema-specific create-payload keys the static block lacks,
+/// so collapsing them to `help?kind=node-artifact` would advertise the generic
+/// `{title, content}` example and reintroduce CAIRN #170. Kept a single short
+/// stable line so it itself dedupes cleanly under the batch assembler's
+/// `(kind, block)` collapse.
+pub(crate) fn pointer_affordance_block(block: &str) -> Option<String> {
+    let name = block
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("## "))
+        .map(str::trim)?;
+    let kind = cairn_common::contract::RESOURCE_CONTRACTS
+        .iter()
+        .find(|contract| contract.name == name)
+        .map(|contract| contract.kind)?;
+    // Only collapse when the help projection re-renders this exact block; a
+    // schema-derived artifact block diverges from the static contract block and
+    // is therefore left full (see doc comment / CAIRN #170).
+    if affordance_for_kind(kind) != block {
+        return None;
+    }
+    Some(format!("\u{2014} ref: cairn://help?kind={}", kind.slug()))
 }
 
 fn push_links_section(sections: &mut String, contract: &ResourceContract) {
@@ -953,6 +993,59 @@ mod tests {
         assert!(output.contains("- [changed](cairn://p/{project}/{number}/changed)"));
         assert!(output.contains("- [append comment](cairn://p/{project}/{number}):"));
         assert!(output.contains("- [append message](cairn://p/{project}/{number}/messages):"));
+    }
+
+    #[test]
+    fn pointer_collapses_full_block_to_help_slug() {
+        // Built against a real `affordance_for_kind` output so the first-line
+        // parse can't silently drift from the block format it consumes, and so
+        // the round-trip guard sees an identical block and collapses it.
+        let full = affordance_for_kind(ResourceKind::Issue);
+        assert!(full.starts_with("## Issue details\n"));
+        let pointer =
+            pointer_affordance_block(&full).expect("static block round-trips and collapses");
+        // One short line, pointing at the per-kind help projection, body dropped.
+        assert_eq!(pointer.lines().count(), 1, "{pointer}");
+        assert!(pointer.contains("cairn://help?kind=issue"), "{pointer}");
+        assert!(!pointer.contains("### actions"), "{pointer}");
+    }
+
+    #[test]
+    fn pointer_passes_through_unresolvable_block() {
+        // A first line that isn't a `## {contract name}` can't resolve to a kind,
+        // so there is no faithful pointer target and the block stays full.
+        let block = "## Not A Real Contract Name\n\n### actions\n- do thing\n";
+        assert!(pointer_affordance_block(block).is_none());
+    }
+
+    #[test]
+    fn pointer_does_not_collapse_schema_aware_artifact() {
+        // A schema-derived artifact block carries the same `## {contract name}`
+        // title as the static block but a schema-specific create payload.
+        // Collapsing it to `help?kind=node-artifact` (which only re-renders the
+        // static contract block) would strip the schema keys and reintroduce
+        // CAIRN #170, so the round-trip guard must leave it full even though its
+        // title resolves to a kind.
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+                "title": { "type": "string" },
+                "scratch": { "type": "string" }
+            }
+        });
+        let schema_block =
+            artifact_affordance_with_schema(ResourceKind::NodeArtifact, Some("board"), &schema)
+                .expect("schema with properties yields a block");
+        assert!(
+            pointer_affordance_block(&schema_block).is_none(),
+            "schema-aware artifact block must not collapse: {schema_block}"
+        );
+
+        // The static contract block for the same kind round-trips and does
+        // collapse, confirming the guard discriminates on block content, not kind.
+        let static_block = affordance_for_kind(ResourceKind::NodeArtifact);
+        assert!(pointer_affordance_block(&static_block).is_some());
     }
 
     #[test]

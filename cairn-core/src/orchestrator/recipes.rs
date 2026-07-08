@@ -245,6 +245,7 @@ struct RecipeChangeEvent<'a> {
 impl Orchestrator {
     fn save_recipe_change(
         &self,
+        config_root: &Path,
         recipe: Recipe,
         is_project_scoped: bool,
         file_path: PathBuf,
@@ -256,15 +257,21 @@ impl Orchestrator {
             is_project_scoped,
             file_path,
         };
-        let saved_path = config_recipes::save_recipe(&self.config_dir, &file_recipe, project_path)?;
+        let saved_path = config_recipes::save_recipe(config_root, &file_recipe, project_path)?;
         let action = if event.config_action == "created" {
             "create"
         } else {
             "update"
         };
-        crate::config::commit_config_paths(
+        // Mirror create/update/delete: offer the resolved workspace root as the
+        // push target so a team-workspace duplicate/import pushes the shared
+        // config repo, while personal-workspace and project writes stay
+        // commit-only. commit_and_maybe_push pushes only if that repo committed
+        // AND has a remote.
+        crate::config::commit_and_maybe_push(
             std::slice::from_ref(&saved_path),
             &format!("cairn: {action} recipe {}", event.event_id),
+            Some(config_root),
         );
 
         config_resource::emit_config_change::<RecipeResource>(
@@ -306,13 +313,25 @@ impl Orchestrator {
         recipe_id: &str,
         input: UpdateRecipe,
         project_id: Option<&str>,
+        workspace_id: Option<&str>,
     ) -> Result<Recipe, String> {
-        config_resource::update_config::<RecipeResource>(self, recipe_id, input, project_id)
+        config_resource::update_config::<RecipeResource>(
+            self,
+            recipe_id,
+            input,
+            project_id,
+            workspace_id,
+        )
     }
 
     /// Delete a recipe.
-    pub fn delete_recipe(&self, recipe_id: &str, project_id: Option<&str>) -> Result<(), String> {
-        config_resource::delete_config::<RecipeResource>(self, recipe_id, project_id)
+    pub fn delete_recipe(
+        &self,
+        recipe_id: &str,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<(), String> {
+        config_resource::delete_config::<RecipeResource>(self, recipe_id, project_id, workspace_id)
     }
 
     /// List recipes for a project context with workspace→project shadowing.
@@ -341,6 +360,7 @@ impl Orchestrator {
         source_project_id: Option<&str>,
         target_id: &str,
         target_project_id: Option<&str>,
+        target_workspace_id: Option<&str>,
     ) -> Result<Recipe, String> {
         config_resource::copy_config::<RecipeResource>(
             self,
@@ -348,29 +368,52 @@ impl Orchestrator {
             source_project_id,
             target_id,
             target_project_id,
+            target_workspace_id,
         )
     }
 
-    /// Archive a recipe (in file-only mode, same as delete).
-    pub fn archive_recipe(&self, recipe_id: &str, project_id: Option<&str>) -> Result<(), String> {
-        self.delete_recipe(recipe_id, project_id)
+    /// Archive a recipe (in file-only mode, same as delete). `workspace_id`
+    /// resolves the same fail-closed root as delete, so archiving a
+    /// team-workspace recipe targets that team's clone, never the personal home.
+    pub fn archive_recipe(
+        &self,
+        recipe_id: &str,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.delete_recipe(recipe_id, project_id, workspace_id)
     }
 
-    /// Duplicate a recipe with a new name.
+    /// Duplicate a recipe with a new name. `workspace_id` resolves the read/write
+    /// root fail-closed (personal `~/.cairn` for "default"/None, a team clone for
+    /// a team-workspace id), so duplicating a team-workspace recipe reads the
+    /// source from and writes the copy into that team's clone.
     pub fn duplicate_recipe(
         &self,
         recipe_id: &str,
         new_name: &str,
         project_id: Option<&str>,
+        workspace_id: Option<&str>,
     ) -> Result<Recipe, String> {
         let project_path: Option<PathBuf> = if let Some(pid) = project_id {
             Some(self.project_path(pid)?)
         } else {
             None
         };
+        // Project-scoped duplicates keep `config_dir` as the base (project_path
+        // drives the location); a workspace-scoped duplicate resolves the team
+        // clone, fail-closed.
+        let config_root: PathBuf = if project_path.is_some() {
+            self.config_dir.clone()
+        } else {
+            match workspace_id {
+                Some(ws) => self.workspace_write_root(ws)?,
+                None => self.config_dir.clone(),
+            }
+        };
 
         let existing =
-            config_recipes::get_recipe(&self.config_dir, recipe_id, project_path.as_deref())?
+            config_recipes::get_recipe(&config_root, recipe_id, project_path.as_deref())?
                 .ok_or_else(|| format!("Recipe not found: {}", recipe_id))?;
 
         let new_id = slugify(new_name);
@@ -392,6 +435,7 @@ impl Orchestrator {
             .ok_or_else(|| "Invalid source recipe path".to_string())?;
 
         self.save_recipe_change(
+            &config_root,
             new_recipe,
             existing.is_project_scoped,
             file_path,
@@ -414,10 +458,29 @@ impl Orchestrator {
         }]
     }
 
-    /// Export a recipe to YAML or JSON.
-    pub fn export_recipe(&self, recipe_id: &str, format: &str) -> Result<String, String> {
-        let file_recipe = config_recipes::get_recipe(&self.config_dir, recipe_id, None)?
-            .ok_or_else(|| format!("Recipe '{}' not found", recipe_id))?;
+    /// Export a recipe to YAML or JSON. `workspace_id`/`project_id` resolve the
+    /// same root the write paths use, so a team-workspace recipe exports from
+    /// that team's clone rather than the personal `~/.cairn`.
+    pub fn export_recipe(
+        &self,
+        recipe_id: &str,
+        format: &str,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<String, String> {
+        let project_path: Option<PathBuf> =
+            project_id.map(|pid| self.project_path(pid)).transpose()?;
+        let read_root: PathBuf = if project_path.is_some() {
+            self.config_dir.clone()
+        } else {
+            match workspace_id {
+                Some(ws) => self.workspace_write_root(ws)?,
+                None => self.config_dir.clone(),
+            }
+        };
+        let file_recipe =
+            config_recipes::get_recipe(&read_root, recipe_id, project_path.as_deref())?
+                .ok_or_else(|| format!("Recipe '{}' not found", recipe_id))?;
 
         let file: RecipeFile = file_recipe.recipe.into();
         match format.to_lowercase().as_str() {
@@ -451,6 +514,18 @@ impl Orchestrator {
         } else {
             None
         };
+        // The workspace root the import writes into, fail-closed: personal
+        // `~/.cairn` for "default"/None, a team clone for a team-workspace id.
+        // Project-scoped imports keep config_dir as the base (project_path drives
+        // the location).
+        let config_root: PathBuf = if project_path.is_some() {
+            self.config_dir.clone()
+        } else {
+            match workspace_id.as_deref() {
+                Some(ws) => self.workspace_write_root(ws)?,
+                None => self.config_dir.clone(),
+            }
+        };
 
         let mut recipe = recipe_file.into_recipe(workspace_id.clone(), project_id.clone());
         let id = slugify(&recipe.name);
@@ -463,13 +538,14 @@ impl Orchestrator {
                 .map_err(|e| format!("Failed to create project recipes directory: {}", e))?;
             recipes_dir.join(format!("{}.yaml", id))
         } else {
-            let recipes_dir = self.config_dir.join("recipes");
+            let recipes_dir = config_root.join("recipes");
             std::fs::create_dir_all(&recipes_dir)
                 .map_err(|e| format!("Failed to create recipes directory: {}", e))?;
             recipes_dir.join(format!("{}.yaml", id))
         };
 
         self.save_recipe_change(
+            &config_root,
             recipe,
             is_project_scoped,
             file_path,

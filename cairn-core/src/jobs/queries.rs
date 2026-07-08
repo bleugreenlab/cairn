@@ -754,6 +754,310 @@ pub async fn node_status_indicators(
     .map_err(CairnError::from)
 }
 
+// ============================================================================
+// Issue-level status indicators (project sidebar status dots)
+// ============================================================================
+
+/// Which agent is live on one of an issue's jobs. The consumer renders the
+/// agent's icon, so the config id plus the node name is all it needs here.
+/// `activity` is this single job's classification (`derive_node_activity`); the
+/// issue's rolled-up activity lives on `IssueStatusIndicator`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueAgentRef {
+    pub job_id: String,
+    pub node_name: Option<String>,
+    pub agent_config_id: Option<String>,
+    pub activity: NodeActivity,
+}
+
+/// The cached pull-request facts for an issue's current execution, mirrored
+/// straight from the owning `merge_requests` row: the Cairn-owned `status`
+/// (open/merged/closed) plus the last-synced GitHub columns. These are exactly
+/// the fields `merge_requests::queries::PR_COLUMNS` caches; nothing here is
+/// fetched live.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuePrIndicator {
+    pub pr_number: Option<i64>,
+    pub pr_url: Option<String>,
+    /// Cairn-owned lifecycle: `open` | `merged` | `closed`.
+    pub status: String,
+    pub github_state: Option<String>,
+    pub review_decision: Option<String>,
+    pub mergeable: Option<String>,
+    pub checks_status: Option<String>,
+    pub is_local: bool,
+}
+
+/// Live status rollup for one in-progress (active/waiting) issue — the unit the
+/// project sidebar renders per issue row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueStatusIndicator {
+    pub issue_id: String,
+    /// Rolled up across the issue's current-execution jobs with
+    /// `AwaitingInput > Running > Idle` precedence: awaiting-input is the
+    /// actionable state, so it wins over a merely-running sibling job.
+    pub activity: NodeActivity,
+    /// The live (non-idle) jobs' agents, so the sidebar can show which agent is
+    /// working. Empty when the issue is idle.
+    pub agents: Vec<IssueAgentRef>,
+    /// The issue's current pull request, if any.
+    pub pr: Option<IssuePrIndicator>,
+    /// Current-execution job ids. Not itself a rendered field: the transport
+    /// command tests these against the orchestrator's in-memory turn-end-checks
+    /// set to fill `checks_running`, which no SQL column records.
+    pub job_ids: Vec<String>,
+    /// Whether turn-end review checks are currently in flight for the issue.
+    /// This is NOT persisted anywhere — it is an in-memory runtime fact on the
+    /// orchestrator (`Orchestrator::turn_end_checks_in_flight`), so the pure SQL
+    /// query here always leaves it `false`; the transport command decorates it
+    /// from `job_ids`. Kept on this struct (rather than layered on later) so the
+    /// serialized payload is whole.
+    pub checks_running: bool,
+}
+
+/// Roll several jobs' activities into one issue-level signal with
+/// `AwaitingInput > Running > Idle` precedence.
+fn rollup_activity(activities: impl IntoIterator<Item = NodeActivity>) -> NodeActivity {
+    let mut rolled = NodeActivity::Idle;
+    for activity in activities {
+        match activity {
+            NodeActivity::AwaitingInput => return NodeActivity::AwaitingInput,
+            NodeActivity::Running => rolled = NodeActivity::Running,
+            NodeActivity::Idle => {}
+        }
+    }
+    rolled
+}
+
+/// Batched, project-scoped live status indicators for every in-progress
+/// (active/waiting) issue in a project, one row per issue. A small constant
+/// number of SQL statements — never a per-issue fan-out — computes, per issue:
+/// the rolled-up agent activity (running/awaiting-input/idle) and the live
+/// agents behind it, plus the cached PR facts.
+///
+/// Activity + agents are derived over the issue's CURRENT execution (highest
+/// `executions.seq`) using the same three facts as `node_status_indicators`
+/// (head-turn state, pending prompt, pending permission) via the shared
+/// `derive_node_activity`. The PR is the issue's most relevant `merge_requests`
+/// row scoped to that same current execution (an open one preferred, else the
+/// most recently updated), matched through BOTH supported ownership shapes:
+/// a row whose `job_id` is a current-execution job, or — the legacy first-class
+/// PR-node shape (migration 0019) — a row whose `job_id` is an `action_runs.id`
+/// whose `parent_job_id` is a current-execution job. This mirrors the
+/// parent-job/action-run fallback the other PR readers use
+/// (`merge_requests::queries::get_summaries_for_action_runs`).
+///
+/// `checks_running` is intentionally left `false` here: whether turn-end review
+/// checks are in flight is an in-memory orchestrator fact with no DB column, so
+/// the transport command fills it from `Orchestrator::turn_end_checks_in_flight`
+/// using the returned `job_ids`.
+pub async fn issue_status_indicators(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<Vec<IssueStatusIndicator>, CairnError> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            // (1) Base set: every in-progress issue in the project. Included even
+            // with zero jobs, so a freshly-activated issue still gets a row.
+            let mut issue_ids: Vec<String> = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT id FROM issues
+                      WHERE project_id = ?1
+                        AND status IN ('active', 'waiting')
+                      ORDER BY id",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                issue_ids.push(row.text(0)?);
+            }
+
+            // (2) Current-execution jobs for those issues, each with the three
+            // activity facts and the agent columns, in ONE statement. Includes
+            // task jobs (a running sub-agent means the issue is running), exactly
+            // like `node_status_indicators`.
+            struct JobRow {
+                issue_id: String,
+                job_id: String,
+                node_name: Option<String>,
+                agent_config_id: Option<String>,
+                activity: NodeActivity,
+            }
+            let mut job_rows: Vec<JobRow> = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT
+                        i.id AS issue_id,
+                        j.id AS job_id,
+                        j.node_name,
+                        j.agent_config_id,
+                        (SELECT t.state
+                           FROM turns t
+                          WHERE t.job_id = j.id
+                          ORDER BY t.sequence DESC
+                          LIMIT 1) AS head_turn_state,
+                        EXISTS (
+                            SELECT 1 FROM prompts p
+                             WHERE p.turn_id = j.current_turn_id
+                               AND p.response IS NULL
+                        ) AS has_pending_prompt,
+                        EXISTS (
+                            SELECT 1 FROM permission_requests pr
+                             LEFT JOIN runs r ON pr.run_id = r.id
+                             WHERE COALESCE(pr.job_id, r.job_id) = j.id
+                               AND pr.status = 'pending'
+                        ) AS has_pending_permission
+                     FROM issues i
+                     JOIN jobs j ON j.issue_id = i.id
+                     WHERE i.project_id = ?1
+                       AND i.status IN ('active', 'waiting')
+                       AND j.execution_id = (
+                           SELECT e.id FROM executions e
+                            WHERE e.issue_id = i.id
+                            ORDER BY e.seq DESC
+                            LIMIT 1
+                       )",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let issue_id = row.text(0)?;
+                let job_id = row.text(1)?;
+                let node_name = row.opt_text(2)?;
+                let agent_config_id = row.opt_text(3)?;
+                let head_turn_state = row.opt_text(4)?;
+                let has_pending_prompt = row.i64(5)? != 0;
+                let has_pending_permission = row.i64(6)? != 0;
+                job_rows.push(JobRow {
+                    issue_id,
+                    job_id,
+                    node_name,
+                    agent_config_id,
+                    activity: derive_node_activity(
+                        head_turn_state.as_deref(),
+                        has_pending_prompt,
+                        has_pending_permission,
+                    ),
+                });
+            }
+
+            // (3) The most relevant PR for each issue's CURRENT execution: open
+            // preferred, else the most recently updated. Scoped to the same
+            // highest-`seq` execution as the activity above (keying by `issue_id`
+            // alone would leak a stale open PR from an OLDER execution onto an
+            // issue whose current execution has none yet), and matched through
+            // BOTH `merge_requests` ownership shapes: `job_id` is either a
+            // current-execution job directly, or an `action_runs.id` whose
+            // `parent_job_id` is a current-execution job (migration 0019's
+            // first-class PR-node shape, which the other PR readers resolve via
+            // the same action-run parent fallback).
+            struct PrRow {
+                issue_id: String,
+                pr: IssuePrIndicator,
+            }
+            let mut pr_rows: Vec<PrRow> = Vec::new();
+            let mut rows = conn
+                .query(
+                    "SELECT
+                        i.id AS issue_id,
+                        m.github_pr_number,
+                        m.github_pr_url,
+                        m.status,
+                        m.github_state,
+                        m.github_review,
+                        m.github_mergeable,
+                        m.checks_status,
+                        m.is_local
+                     FROM issues i
+                     JOIN jobs j ON j.issue_id = i.id
+                       AND j.execution_id = (
+                           SELECT e.id FROM executions e
+                            WHERE e.issue_id = i.id
+                            ORDER BY e.seq DESC
+                            LIMIT 1
+                       )
+                     JOIN merge_requests m
+                       ON m.job_id = j.id
+                          OR m.job_id IN (
+                              SELECT ar.id FROM action_runs ar
+                               WHERE ar.parent_job_id = j.id
+                          )
+                     WHERE i.project_id = ?1
+                       AND i.status IN ('active', 'waiting')
+                     ORDER BY i.id,
+                        CASE m.status WHEN 'open' THEN 0 ELSE 1 END,
+                        m.updated_at DESC",
+                    params![project_id.as_str()],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                pr_rows.push(PrRow {
+                    issue_id: row.text(0)?,
+                    pr: IssuePrIndicator {
+                        pr_number: row.opt_i64(1)?,
+                        pr_url: row.opt_text(2)?,
+                        status: row.text(3)?,
+                        github_state: row.opt_text(4)?,
+                        review_decision: row.opt_text(5)?,
+                        mergeable: row.opt_text(6)?,
+                        checks_status: row.opt_text(7)?,
+                        is_local: row.opt_i64(8)?.unwrap_or(0) != 0,
+                    },
+                });
+            }
+
+            // Group jobs and PRs by issue in Rust, then assemble in the base
+            // order. First PR row per issue wins (the ORDER BY already prefers an
+            // open/most-recent one).
+            let mut jobs_by_issue: HashMap<String, Vec<JobRow>> = HashMap::new();
+            for job in job_rows {
+                jobs_by_issue
+                    .entry(job.issue_id.clone())
+                    .or_default()
+                    .push(job);
+            }
+            let mut pr_by_issue: HashMap<String, IssuePrIndicator> = HashMap::new();
+            for pr_row in pr_rows {
+                pr_by_issue.entry(pr_row.issue_id).or_insert(pr_row.pr);
+            }
+
+            let mut out = Vec::with_capacity(issue_ids.len());
+            for issue_id in issue_ids {
+                let jobs = jobs_by_issue.remove(&issue_id).unwrap_or_default();
+                let activity = rollup_activity(jobs.iter().map(|job| job.activity));
+                let agents = jobs
+                    .iter()
+                    .filter(|job| job.activity != NodeActivity::Idle)
+                    .map(|job| IssueAgentRef {
+                        job_id: job.job_id.clone(),
+                        node_name: job.node_name.clone(),
+                        agent_config_id: job.agent_config_id.clone(),
+                        activity: job.activity,
+                    })
+                    .collect();
+                let job_ids = jobs.iter().map(|job| job.job_id.clone()).collect();
+                out.push(IssueStatusIndicator {
+                    issue_id: issue_id.clone(),
+                    activity,
+                    agents,
+                    pr: pr_by_issue.remove(&issue_id),
+                    job_ids,
+                    checks_running: false,
+                });
+            }
+            Ok::<Vec<IssueStatusIndicator>, DbError>(out)
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
 fn node_type_from_snapshot(snapshot_json: &str, node_id: &str) -> Option<String> {
     let snapshot: ExecutionSnapshot = serde_json::from_str(snapshot_json).ok()?;
     find_node_in_snapshot(&snapshot, node_id).map(|node| node.node_type.to_string())
@@ -792,7 +1096,9 @@ fn has_single_downstream_action(snapshot_json: &str, node_id: &str) -> Result<bo
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_node_activity, node_status_indicators, NodeActivity};
+    use super::{
+        derive_node_activity, issue_status_indicators, node_status_indicators, NodeActivity,
+    };
     use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
     use std::collections::HashMap;
 
@@ -1020,5 +1326,353 @@ mod tests {
         let db = test_db().await;
         let indicators = node_status_indicators(&db, "missing").await.unwrap();
         assert!(indicators.is_empty());
+    }
+
+    // ── Issue-level (project-scoped) status indicators ──────────────────────
+
+    /// Seeds project `p`, an `active` issue `i`, and its running execution `e`
+    /// (seq 1). Individual tests add the jobs/turns/PR they exercise.
+    async fn seed_active_issue(db: &LocalDb) {
+        exec(
+            db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'T', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i', 'p', 1, 'T', 'active', 1, 1)",
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('e', 'r', 'i', 'p', 'running', 1, 1)",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_with_running_job_rolls_up_running_with_its_agent() {
+        let db = test_db().await;
+        seed_active_issue(&db).await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-run', 's-run', 'j-run', 1, 'running', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment)
+             VALUES ('j-run', 'e', 'i', 'p', 'Builder', 'agent-1', 'running', 1, 1, 'run')",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert_eq!(indicators.len(), 1);
+        let ind = &indicators[0];
+        assert_eq!(ind.issue_id, "i");
+        assert_eq!(ind.activity, NodeActivity::Running);
+        assert!(
+            !ind.checks_running,
+            "pure SQL query leaves checks_running false"
+        );
+        assert!(ind.pr.is_none());
+        assert_eq!(ind.job_ids, vec!["j-run".to_string()]);
+        assert_eq!(ind.agents.len(), 1);
+        assert_eq!(ind.agents[0].job_id, "j-run");
+        assert_eq!(ind.agents[0].node_name.as_deref(), Some("Builder"));
+        assert_eq!(ind.agents[0].agent_config_id.as_deref(), Some("agent-1"));
+        assert_eq!(ind.agents[0].activity, NodeActivity::Running);
+    }
+
+    #[tokio::test]
+    async fn issue_awaiting_input_outranks_a_running_sibling_job() {
+        let db = test_db().await;
+        seed_active_issue(&db).await;
+        // A running sibling job.
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-run', 's-run', 'j-run', 1, 'running', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j-run', 'e', 'i', 'p', 'Run', 'running', 1, 1, 'run')",
+        )
+        .await;
+        // A job whose head turn yielded on a pending prompt (the durable wait).
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at)
+             VALUES ('t-prompt', 's-prompt', 'j-prompt', 1, 'yielded', 'user_input', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, current_turn_id)
+             VALUES ('j-prompt', 'e', 'i', 'p', 'Prompt', 'running', 1, 1, 'prompt', 't-prompt')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO runs(id, job_id, issue_id, created_at, updated_at)
+             VALUES ('run-prompt', 'j-prompt', 'i', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO prompts(id, run_id, turn_id, questions, response, created_at)
+             VALUES ('pr-1', 'run-prompt', 't-prompt', '[]', NULL, 1)",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert_eq!(indicators.len(), 1);
+        let ind = &indicators[0];
+        assert_eq!(ind.activity, NodeActivity::AwaitingInput);
+        // Both live jobs surface as agents (neither is idle).
+        assert_eq!(ind.agents.len(), 2);
+        assert_eq!(ind.job_ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn issue_with_open_pr_reports_cached_pr_state() {
+        let db = test_db().await;
+        seed_active_issue(&db).await;
+        // The builder job's head turn is complete → the issue itself reads idle.
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-pr', 's-pr', 'j-pr', 1, 'complete', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j-pr', 'e', 'i', 'p', 'Builder', 'complete', 1, 1, 'pr')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, github_pr_number, github_pr_url, github_state, github_review, github_mergeable, checks_status, is_local, opened_at, updated_at)
+             VALUES ('mr-1', 'j-pr', 'p', 'i', 'PR', 'feature', 'main', 'open', 42, 'https://x/42', 'OPEN', 'APPROVED', 'MERGEABLE', 'passing', 0, 1, 5)",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert_eq!(indicators.len(), 1);
+        let ind = &indicators[0];
+        assert_eq!(ind.activity, NodeActivity::Idle);
+        let pr = ind.pr.as_ref().expect("open PR reported");
+        assert_eq!(pr.status, "open");
+        assert_eq!(pr.pr_number, Some(42));
+        assert_eq!(pr.pr_url.as_deref(), Some("https://x/42"));
+        assert_eq!(pr.github_state.as_deref(), Some("OPEN"));
+        assert_eq!(pr.review_decision.as_deref(), Some("APPROVED"));
+        assert_eq!(pr.mergeable.as_deref(), Some("MERGEABLE"));
+        assert_eq!(pr.checks_status.as_deref(), Some("passing"));
+        assert!(!pr.is_local);
+    }
+
+    #[tokio::test]
+    async fn pr_is_scoped_to_the_current_execution_not_an_older_one() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'T', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i', 'p', 1, 'T', 'active', 1, 1)",
+        )
+        .await;
+        // e1 (older) produced an OPEN PR; e2 (highest seq = current) has none yet.
+        exec(
+            &db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('e1', 'r', 'i', 'p', 'complete', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('e2', 'r', 'i', 'p', 'running', 1, 2)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t1', 's1', 'j1', 1, 'complete', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j1', 'e1', 'i', 'p', 'Builder', 'complete', 1, 1, 'j1')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, github_pr_number, github_state, is_local, opened_at, updated_at)
+             VALUES ('mr-old', 'j1', 'p', 'i', 'Old PR', 'feature-1', 'main', 'open', 7, 'OPEN', 0, 1, 1)",
+        )
+        .await;
+        // Current execution's job, no PR row.
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t2', 's2', 'j2', 1, 'complete', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j2', 'e2', 'i', 'p', 'Builder', 'complete', 1, 1, 'j2')",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert_eq!(indicators.len(), 1);
+        let ind = &indicators[0];
+        // Activity/agents come from the current execution (e2), and its job has no
+        // PR — the older execution's open PR must NOT leak onto the issue row.
+        assert_eq!(ind.job_ids, vec!["j2".to_string()]);
+        assert_eq!(ind.activity, NodeActivity::Idle);
+        assert!(
+            ind.pr.is_none(),
+            "a stale open PR from an older execution must not be reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_run_owned_current_pr_is_reported() {
+        // The legacy first-class PR-node shape (migration 0019): the
+        // `merge_requests.job_id` holds an `action_runs.id`, not a `jobs.id`. The
+        // action run's `parent_job_id` is the current-execution builder job, so
+        // the PR still belongs to the current execution and must be reported.
+        let db = test_db().await;
+        seed_active_issue(&db).await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-current', 's-current', 'j-current', 1, 'complete', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j-current', 'e', 'i', 'p', 'Builder', 'complete', 1, 1, 'current')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, project_id, status, parent_job_id, created_at)
+             VALUES ('ar-pr', 'e', 'pr-node', 'pr-cfg', 'p', 'complete', 'j-current', 1)",
+        )
+        .await;
+        // PR row owned by the ACTION RUN id, not the job id.
+        exec(
+            &db,
+            "INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, github_pr_number, github_state, is_local, opened_at, updated_at)
+             VALUES ('mr-ar', 'ar-pr', 'p', 'i', 'AR PR', 'feature', 'main', 'open', 99, 'OPEN', 0, 1, 1)",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert_eq!(indicators.len(), 1);
+        let ind = &indicators[0];
+        let pr = ind
+            .pr
+            .as_ref()
+            .expect("action-run-owned current PR must be reported");
+        assert_eq!(pr.status, "open");
+        assert_eq!(pr.pr_number, Some(99));
+        assert_eq!(pr.github_state.as_deref(), Some("OPEN"));
+    }
+
+    #[tokio::test]
+    async fn active_issue_with_no_jobs_is_present_and_idle() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'T', '/tmp/r', 1, 1)",
+        )
+        .await;
+        // Active issue, but no execution and no jobs at all.
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i', 'p', 1, 'T', 'active', 1, 1)",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert_eq!(indicators.len(), 1);
+        let ind = &indicators[0];
+        assert_eq!(ind.issue_id, "i");
+        assert_eq!(ind.activity, NodeActivity::Idle);
+        assert!(ind.agents.is_empty());
+        assert!(ind.job_ids.is_empty());
+        assert!(ind.pr.is_none());
+        assert!(!ind.checks_running);
+    }
+
+    #[tokio::test]
+    async fn only_active_and_waiting_issues_of_the_project_are_included() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'T', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p2', 'default', 'U', 'U', '/tmp/r2', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i-active', 'p', 1, 'A', 'active', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i-waiting', 'p', 2, 'W', 'waiting', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i-backlog', 'p', 3, 'B', 'backlog', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i-other', 'p2', 1, 'O', 'active', 1, 1)",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        let ids: HashMap<String, ()> = indicators
+            .iter()
+            .map(|ind| (ind.issue_id.clone(), ()))
+            .collect();
+        assert_eq!(ids.len(), 2, "only the project's active + waiting issues");
+        assert!(ids.contains_key("i-active"));
+        assert!(ids.contains_key("i-waiting"));
     }
 }

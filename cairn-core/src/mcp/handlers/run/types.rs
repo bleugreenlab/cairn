@@ -49,8 +49,10 @@ pub struct RunItem {
     #[serde(default)]
     pub payload: Option<RunItemPayload>,
     /// Inline source code to execute. Mutually exclusive with `command`/`target`;
-    /// requires `interpreter`. Resolved to `bun -e <code>` (typescript/javascript)
-    /// or `python3 -c <code>` (python) — a direct argv exec, no shell, no temp file.
+    /// requires `interpreter`. Resolved to `bun -e <code>` (typescript/javascript),
+    /// or python via `uv run -` (the script arrives on stdin so uv honors PEP 723
+    /// inline deps and project deps), falling back to `python3 -c <code>` when uv
+    /// is absent — a direct argv/stdin exec, no shell, no temp file.
     #[serde(default)]
     pub code: Option<String>,
     /// Fire-and-forget flag for a workflow run target (CAIRN-2487): `true`
@@ -59,10 +61,17 @@ pub struct RunItem {
     #[serde(default)]
     pub background: Option<bool>,
     /// Language for an inline `code` item: `typescript`/`ts`, `javascript`/`js`
-    /// (both via `bun`), or `python`/`py` (via `python3`). Required iff `code` is
-    /// present; forbidden otherwise.
+    /// (both via `bun`), or `python`/`py` (via `uv run -` when uv resolves, else
+    /// `python3`). Required iff `code` is present; forbidden otherwise.
     #[serde(default)]
     pub interpreter: Option<String>,
+    /// Route this item's inline `code` into a stateful REPL session (by slug)
+    /// instead of a fresh process, so variables/imports/defs persist across
+    /// `run` calls. Requires `code` + `interpreter` (which must match the REPL's
+    /// language); rejects `command`/`target`/`payload`. An item without `repl`
+    /// is unchanged.
+    #[serde(default)]
+    pub repl: Option<String>,
 }
 
 /// Structured args for a run item's target.
@@ -91,11 +100,26 @@ pub(super) enum RunSpec {
         program: String,
         args: Vec<String>,
         timeout: Option<u32>,
+        /// Bytes to feed on the child's stdin, then close (EOF). `Some(code)`
+        /// only for inline python's `uv run -` (uv reads the script from stdin
+        /// so it can parse PEP 723 inline metadata that `-c` would skip); `None`
+        /// for every other Script (skill scripts, `bun -e`, the `python3 -c`
+        /// fallback), which leave stdin inherited.
+        stdin: Option<String>,
     },
     /// A proxied external MCP `tools/call` (`cairn://mcp/<server>/<tool>`).
     /// Not a process exec — dispatched through the host `McpGateway`. Boxed
     /// because its config payload is far larger than the other variants.
     McpCall(Box<McpCallSpec>),
+    /// Inline `code` routed into a live stateful REPL session by slug, rather
+    /// than a fresh process. Not a process exec — the code is written to the
+    /// eval-server's persistent stdin and one framed response is awaited.
+    ReplSend {
+        slug: String,
+        code: String,
+        timeout: Option<u32>,
+        lang: crate::mcp::handlers::repl::ReplLang,
+    },
 }
 
 /// Resolved payload for a proxied MCP `tools/call`.

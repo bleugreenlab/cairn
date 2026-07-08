@@ -12,6 +12,7 @@ use crate::pr_data::helpers::{
 use crate::storage::LocalDb;
 use cairn_db::turso::params;
 use std::path::Path;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use super::conflict::{conflict_recovery_hint, format_conflicted_commits, source_conflict_report};
@@ -51,10 +52,10 @@ async fn resolve_file_change_job_id(
 /// Store file changes from a merged PR for issue history tracking.
 async fn store_file_changes(
     orch: &Orchestrator,
+    db: &LocalDb,
     job_id: &str,
     files: &[api::PrFile],
 ) -> Result<(), String> {
-    let db = orch.db.local.clone();
     let job_id = job_id.to_string();
     let files = files.to_vec();
     let now = chrono::Utc::now().timestamp();
@@ -164,6 +165,7 @@ fn should_reconcile_main_checkout_after_merge(
 
 pub async fn reconcile_after_merge(
     orch: Orchestrator,
+    db: Arc<LocalDb>,
     ctx: MergeMrContext,
     force_checkout_pull: bool,
 ) {
@@ -181,7 +183,7 @@ pub async fn reconcile_after_merge(
         target_branch
     );
 
-    let file_change_job_id = match resolve_file_change_job_id(&orch.db.local, &owner_id).await {
+    let file_change_job_id = match resolve_file_change_job_id(&db, &owner_id).await {
         Ok(job_id) => job_id,
         Err(e) => {
             log::warn!(
@@ -210,7 +212,7 @@ pub async fn reconcile_after_merge(
                             if let Some(file_change_job_id) = file_change_job_id.as_deref() {
                                 let count = files.len();
                                 if let Err(e) =
-                                    store_file_changes(&orch, file_change_job_id, &files).await
+                                    store_file_changes(&orch, &db, file_change_job_id, &files).await
                                 {
                                     log::warn!("Failed to store file changes: {}", e);
                                 } else {
@@ -239,7 +241,8 @@ pub async fn reconcile_after_merge(
         ) {
             Ok(files) => {
                 if let Some(file_change_job_id) = file_change_job_id.as_deref() {
-                    if let Err(e) = store_file_changes(&orch, file_change_job_id, &files).await {
+                    if let Err(e) = store_file_changes(&orch, &db, file_change_job_id, &files).await
+                    {
                         log::warn!("Failed to store local file changes: {}", e);
                     } else {
                         log::info!(
@@ -402,6 +405,7 @@ fn map_github_merge_error(source_branch: &str, target_branch: &str, error: Strin
 /// guards in `base_advance` make the double-fire a no-op.
 async fn merge_remote_pr_via_github(
     orch: &Orchestrator,
+    db: Arc<LocalDb>,
     job_id: &str,
     merge_context: MergeMrContext,
     merge_method: Option<String>,
@@ -487,7 +491,7 @@ async fn merge_remote_pr_via_github(
         }
         // File capture, user-checkout fast-forward pull (forced — no local fold
         // moved it), worktree teardown, PR refresh.
-        reconcile_after_merge(orch_clone, reconcile_ctx, true).await;
+        reconcile_after_merge(orch_clone, db, reconcile_ctx, true).await;
     });
 
     log::info!(
@@ -505,7 +509,13 @@ pub async fn merge_pr_for_job(
     job_id: &str,
     merge_method: Option<String>,
 ) -> Result<String, String> {
-    let merge_context = resolve_merge_mr_context_for_job(&orch.db.local, job_id).await?;
+    // Route to the owning database (team replica or private DB). The merge
+    // request, its issue, and the producing job for a team execution all live in
+    // the team replica; GitHub credentials stay on the private DB.
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let merge_context = resolve_merge_mr_context_for_job(&db, job_id).await?;
     let repo_path = merge_context.mr.repo_path.clone();
     let issue_id = merge_context.issue_id.clone();
 
@@ -596,6 +606,7 @@ pub async fn merge_pr_for_job(
     if should_merge_via_github(&merge_context) {
         return merge_remote_pr_via_github(
             orch,
+            db,
             job_id,
             merge_context,
             merge_method,
@@ -624,7 +635,7 @@ pub async fn merge_pr_for_job(
         let _store_guard = merge_store_lock.lock().await;
         store_merge_child(orch, &merge_context, &method).await?
     };
-    persist_merged_commit(&orch.db.local, &merge_context.mr.mr_id, &merged_commit).await?;
+    persist_merged_commit(&db, &merge_context.mr.mr_id, &merged_commit).await?;
     log::info!(
         "merge_pr_for_job[{job_id}]: store_merge_child (fold + origin) took {:?}",
         fold_started.elapsed()
@@ -683,7 +694,12 @@ pub async fn merge_pr_for_job(
     // Background reconciliation, shared with the GitHub webhook merge path. The
     // local fold already re-attached and fast-forwarded the checkout, so the pull
     // is governed by `pull_on_merge` (not forced).
-    tokio::spawn(reconcile_after_merge(orch.clone(), merge_context, false));
+    tokio::spawn(reconcile_after_merge(
+        orch.clone(),
+        db,
+        merge_context,
+        false,
+    ));
 
     log::info!(
         "merge_pr_for_job[{job_id}]: synchronous merge path took {:?} (downstream reconcile deferred)",

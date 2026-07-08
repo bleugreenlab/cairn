@@ -1554,55 +1554,158 @@ pub(super) async fn read_node_chat_turn(
 ///
 /// Artifacts are stored as a JSON object of typed fields, but an agent reading
 /// one wants the prose, not the envelope. Introspect the payload directly (no
-/// schema lookup): a single string field unwraps to its raw multi-line value; a
+/// schema lookup): a lone string field unwraps to its raw multi-line value; a
 /// `title` + body pair (e.g. create-pr) renders as `# {title}` then the body;
-/// any non-object or non-textual payload falls back to the raw JSON.
+/// a non-object or field-less-of-prose payload falls back to the raw JSON.
+/// Otherwise every field is surfaced as a titled section — string fields as
+/// prose, and non-string fields (arrays, objects) via `render_json_md` — so a
+/// structured report never loses its findings, sources, or stats (CAIRN-2560).
 pub(super) fn render_artifact_markdown(data: &str) -> String {
     let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(data) else {
         return data.to_string();
     };
 
-    // serde_json::Map is a sorted BTreeMap (no `preserve_order` feature), so
-    // field iteration is deterministic and alphabetical.
-    let string_fields: Vec<(&String, &str)> = map
-        .iter()
-        .filter_map(|(key, value)| value.as_str().map(|text| (key, text)))
-        .collect();
-
-    match string_fields.len() {
-        // No textual content: surface the raw payload rather than an empty body.
-        0 => data.to_string(),
-        // A single string field (any name) is the document itself, unwrapped to
-        // its real lines.
-        1 => string_fields[0].1.to_string(),
-        _ => {
-            let mut out = String::new();
-            if let Some(title) = map.get("title").and_then(|value| value.as_str()) {
-                out.push_str(&format!("# {title}\n\n"));
-            }
-            // Remaining string fields as titled sections, alphabetical, with the
-            // primary body field (content, else body) emitted last as prose.
-            let body_key = if map.contains_key("content") {
-                Some("content")
-            } else if map.contains_key("body") {
-                Some("body")
-            } else {
-                None
-            };
-            for (key, value) in &string_fields {
-                if key.as_str() == "title" || Some(key.as_str()) == body_key {
-                    continue;
-                }
-                out.push_str(&format!("## {key}\n\n{value}\n\n"));
-            }
-            if let Some(key) = body_key {
-                if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
-                    out.push_str(value);
-                }
-            }
-            out.trim_end_matches('\n').to_string()
+    // A lone single field that is a string is the document itself, unwrapped to
+    // its real multi-line value (the plan / single-body convention).
+    if map.len() == 1 {
+        if let Some(text) = map.values().next().and_then(|value| value.as_str()) {
+            return text.to_string();
         }
     }
+
+    // A payload with no textual fields at all (e.g. a pure stats object) has no
+    // prose to anchor titled sections; surface the raw JSON, which is
+    // deterministic and loses nothing.
+    if !map.values().any(|value| value.is_string()) {
+        return data.to_string();
+    }
+
+    // Multi-field render. serde_json::Map is a sorted BTreeMap (no
+    // `preserve_order` feature), so field iteration is deterministic and
+    // alphabetical. Every field is surfaced: the `title` string becomes the
+    // document heading, the primary body field (content, else body) is emitted
+    // last as trailing prose, and every other field — string OR structured —
+    // renders as its own titled section. Non-string fields (arrays, objects)
+    // are rendered legibly rather than dropped, so a structured report's
+    // findings, sources, and stats survive the render (CAIRN-2560).
+    let title_heading = map.get("title").and_then(|value| value.as_str());
+    // Only treat content/body as trailing prose when it is actually a string;
+    // otherwise it renders as a normal structured section like any other field.
+    let body_key = if map
+        .get("content")
+        .and_then(|value| value.as_str())
+        .is_some()
+    {
+        Some("content")
+    } else if map.get("body").and_then(|value| value.as_str()).is_some() {
+        Some("body")
+    } else {
+        None
+    };
+
+    let mut out = String::new();
+    if let Some(title) = title_heading {
+        out.push_str(&format!("# {title}\n\n"));
+    }
+    for (key, value) in &map {
+        // Skip the fields rendered elsewhere: the title heading (only when it
+        // was consumed as the heading) and the trailing body field.
+        if (key.as_str() == "title" && title_heading.is_some()) || Some(key.as_str()) == body_key {
+            continue;
+        }
+        let rendered = match value.as_str() {
+            Some(text) => text.to_string(),
+            None => render_json_md(value, 0),
+        };
+        out.push_str(&format!("## {key}\n\n{rendered}\n\n"));
+    }
+    if let Some(key) = body_key {
+        if let Some(value) = map.get(key).and_then(|value| value.as_str()) {
+            out.push_str(value);
+        }
+    }
+    out.trim_end_matches('\n').to_string()
+}
+
+/// How deep `render_json_md` recurses before falling back to a fenced JSON
+/// block. Deep-research reports nest at most a couple of levels
+/// (report → findings[] → sources[]); the budget only guards pathological or
+/// unrecognizable shapes so nothing is ever silently dropped.
+const MAX_JSON_MD_DEPTH: usize = 8;
+
+/// Legibly render a non-string JSON value (array, object, or scalar) as
+/// deterministic markdown for an artifact section body, so structured fields
+/// like a deep-research report's `findings`/`sources` are surfaced instead of
+/// dropped. Scalars become inline text; objects render as `**key**: value`
+/// lines with nested containers indented beneath a `**key**:` header; arrays
+/// render as bullet lists, with an array of objects nesting each object's
+/// fields under its bullet. Anything nested past `MAX_JSON_MD_DEPTH` falls back
+/// to a fenced JSON block, which is verbose but still lossless.
+fn render_json_md(value: &serde_json::Value, depth: usize) -> String {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(items) => {
+            if items.is_empty() {
+                return "_(none)_".to_string();
+            }
+            if depth >= MAX_JSON_MD_DEPTH {
+                return fenced_json(value);
+            }
+            items
+                .iter()
+                .map(|item| bullet(&render_json_md(item, depth + 1)))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        Value::Object(fields) => {
+            if fields.is_empty() {
+                return "_(none)_".to_string();
+            }
+            if depth >= MAX_JSON_MD_DEPTH {
+                return fenced_json(value);
+            }
+            let mut lines = Vec::new();
+            for (key, field) in fields {
+                if field.is_string() || field.is_number() || field.is_boolean() || field.is_null() {
+                    lines.push(format!("**{key}**: {}", render_json_md(field, depth + 1)));
+                } else {
+                    // Container value: header line, then the nested block
+                    // indented two spaces so it reads as belonging to this key.
+                    lines.push(format!("**{key}**:"));
+                    for line in render_json_md(field, depth + 1).lines() {
+                        lines.push(format!("  {line}"));
+                    }
+                }
+            }
+            lines.join("\n")
+        }
+    }
+}
+
+/// Prefix the first line of a rendered block with a `- ` bullet and indent every
+/// continuation line two spaces so a multi-line item stays visually grouped
+/// under its bullet.
+fn bullet(rendered: &str) -> String {
+    let mut out = String::new();
+    for (index, line) in rendered.lines().enumerate() {
+        if index == 0 {
+            out.push_str(&format!("- {line}"));
+        } else {
+            out.push_str(&format!("\n  {line}"));
+        }
+    }
+    out
+}
+
+/// Render a JSON value as a fenced ```json block — the lossless fallback for
+/// shapes too deep or irregular to render as prose.
+fn fenced_json(value: &serde_json::Value) -> String {
+    let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    format!("```json\n{pretty}\n```")
 }
 
 /// Build the schema-aware affordance block for a node/task artifact, deriving
@@ -2285,6 +2388,106 @@ mod artifact_render_tests {
     #[test]
     fn non_object_payload_is_verbatim() {
         assert_eq!(render_artifact_markdown("plain text"), "plain text");
+    }
+
+    #[test]
+    fn deep_research_report_surfaces_findings_and_source_urls() {
+        // The CAIRN-2560 regression: a report with several string fields plus
+        // structured arrays/objects. The array-of-objects `findings` (each
+        // carrying a nested `sources` URL array) and the `stats` object used to
+        // be silently dropped once >=2 string fields were present.
+        let data = r#"{
+            "summary": "The sky is blue from Rayleigh scattering.",
+            "question": "Why is the sky blue?",
+            "caveats": "A simplified account.",
+            "findings": [
+                {
+                    "claim": "Rayleigh scattering dominates",
+                    "confidence": "high",
+                    "evidence": "Shorter wavelengths scatter more strongly",
+                    "sources": ["https://example.com/rayleigh", "https://example.com/optics"]
+                },
+                {
+                    "claim": "Sunset reddening is the same effect",
+                    "confidence": "medium",
+                    "evidence": "Longer atmospheric path length",
+                    "sources": ["https://example.com/sunset"]
+                }
+            ],
+            "stats": { "sourcesConsulted": 12, "verified": 8 }
+        }"#;
+        let rendered = render_artifact_markdown(data);
+
+        // Every string field is still present with its section heading.
+        assert!(rendered.contains("## summary"), "{rendered}");
+        assert!(rendered.contains("The sky is blue from Rayleigh scattering."));
+        assert!(rendered.contains("## question"));
+        assert!(rendered.contains("## caveats"));
+
+        // The structured findings are surfaced: claim, confidence, evidence.
+        assert!(rendered.contains("## findings"), "{rendered}");
+        assert!(rendered.contains("Rayleigh scattering dominates"));
+        assert!(rendered.contains("**confidence**: high"));
+        assert!(rendered.contains("Longer atmospheric path length"));
+
+        // The citations — the whole point — appear in the rendered output.
+        assert!(
+            rendered.contains("https://example.com/rayleigh"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("https://example.com/optics"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("https://example.com/sunset"),
+            "{rendered}"
+        );
+
+        // The stats object is surfaced too.
+        assert!(rendered.contains("## stats"));
+        assert!(rendered.contains("**sourcesConsulted**: 12"));
+        assert!(rendered.contains("**verified**: 8"));
+    }
+
+    #[test]
+    fn single_string_plus_structured_field_keeps_the_structured_field() {
+        // Exactly one string field alongside a structured field used to drop the
+        // array (the old 1-string-field branch returned only the string).
+        let rendered =
+            render_artifact_markdown(r#"{"summary":"S","sources":["https://a","https://b"]}"#);
+        assert!(rendered.contains("## summary"), "{rendered}");
+        assert!(rendered.contains("S"));
+        assert!(rendered.contains("## sources"), "{rendered}");
+        assert!(rendered.contains("- https://a"), "{rendered}");
+        assert!(rendered.contains("- https://b"), "{rendered}");
+    }
+
+    #[test]
+    fn array_of_scalars_renders_as_bullet_list() {
+        let rendered =
+            render_artifact_markdown(r#"{"summary":"S","tags":["alpha","beta","gamma"]}"#);
+        assert_eq!(
+            rendered,
+            "## summary\n\nS\n\n## tags\n\n- alpha\n- beta\n- gamma"
+        );
+    }
+
+    #[test]
+    fn nested_object_field_renders_key_value_lines() {
+        let rendered =
+            render_artifact_markdown(r#"{"summary":"S","meta":{"model":"opus","turns":3}}"#);
+        assert_eq!(
+            rendered,
+            "## meta\n\n**model**: opus\n**turns**: 3\n\n## summary\n\nS"
+        );
+    }
+
+    #[test]
+    fn empty_containers_are_marked_not_dropped() {
+        let rendered = render_artifact_markdown(r#"{"summary":"S","items":[],"meta":{}}"#);
+        assert!(rendered.contains("## items\n\n_(none)_"), "{rendered}");
+        assert!(rendered.contains("## meta\n\n_(none)_"), "{rendered}");
     }
 }
 

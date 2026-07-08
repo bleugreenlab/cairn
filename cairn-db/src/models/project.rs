@@ -106,7 +106,6 @@ pub struct MoveProject {
 ///
 /// Paths matching `copy` patterns are copied from the main repo (isolated per worktree).
 /// Paths matching `symlink` patterns are symlinked to the main repo.
-/// `seed` entries copy-on-write clone external directories into worktree-relative destinations.
 /// Unmatched paths are skipped — new worktrees start clean by default.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -117,23 +116,11 @@ pub struct PopulateConfig {
     /// Patterns whose matching paths are symlinked to the main repo.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symlink: Vec<String>,
-    /// External directories to copy-on-write seed into worktree-relative destinations.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub seed: Vec<SeedEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SeedEntry {
-    pub from: String,
-    pub to: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude: Vec<String>,
 }
 
 impl PopulateConfig {
     pub fn is_empty(&self) -> bool {
-        self.copy.is_empty() && self.symlink.is_empty() && self.seed.is_empty()
+        self.copy.is_empty() && self.symlink.is_empty()
     }
 }
 
@@ -159,6 +146,12 @@ pub struct CheckCommand {
         skip_serializing_if = "is_default_check_when"
     )]
     pub when: CheckWhen,
+    /// Maximum wall-clock SECONDS this check may run before it is killed at its
+    /// budget and recorded AS a timeout (not an opaque failure). `None` uses the
+    /// cadence default — 10 min for `write`, 30 min for `review`. Clamped to a
+    /// 60-minute hard ceiling. See docs/checks.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

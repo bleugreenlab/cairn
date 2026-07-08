@@ -25,6 +25,7 @@ mod progress;
 mod projects;
 mod prompts;
 mod recipes;
+mod repls;
 mod settings;
 mod skills;
 mod terminals;
@@ -174,6 +175,10 @@ pub(crate) async fn dispatch_resource_change(
         summary
     } else if let Some(summary) =
         terminals::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        repls::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else if let Some(summary) =

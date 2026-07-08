@@ -63,6 +63,9 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "full",
     "label",
     "content_types",
+    // Project ?search= facets: author role + issue-scoped history search.
+    "role",
+    "issue",
     "branch",
     // Live-database (cairn://db) read-only SQL projection key.
     "sql",
@@ -81,6 +84,9 @@ pub const KNOWN_QUERY_KEYS: &[&str] = &[
     "latest",
     "messages",
     "diffs",
+    // Per-kind affordance help projection selector (cairn://help?kind=<slug>):
+    // the target of the session-scoped affordance-collapse pointer line.
+    "kind",
 ];
 
 /// Return true when the start of `rest` (the text immediately after a `&`) is a

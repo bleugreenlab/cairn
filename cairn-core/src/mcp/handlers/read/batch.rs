@@ -90,6 +90,49 @@ pub async fn handle_read_batch(
         }
     }
 
+    // Session-scoped affordance collapse (CAIRN-2592): the full affordance block
+    // for a resource kind renders once per session. A later read whose block was
+    // already shown collapses to a one-line `cairn://help?kind=<slug>` pointer,
+    // keeping the full reference one cheap read away without re-paying the whole
+    // block. Runs on the post-flail segment list (error stubs carry no
+    // affordance, so the two passes never fight). Keyed by block-content hash so
+    // schema-distinct artifact blocks never collapse into one another. Skipped
+    // without a run id (tests / external runs keep full blocks), matching the
+    // flail-dedup gate above.
+    if let Some(run_id) = request.run_id.as_deref() {
+        // Distinct affordance blocks still present. Deciding per distinct hash
+        // (not per segment) keeps a kind uniformly full-or-pointer within one
+        // batch, so `assemble`'s batch-local `(kind, block)` dedup never emits a
+        // full block and a pointer for the same kind in the same call.
+        let mut hashes: Vec<u64> = Vec::new();
+        for segment in &segments {
+            if let Some(affordance) = &segment.affordance {
+                let hash = crate::dispatch::hash_content(&affordance.block);
+                if !hashes.contains(&hash) {
+                    hashes.push(hash);
+                }
+            }
+        }
+        if !hashes.is_empty() {
+            let already_seen = orch.process_state.mark_affordances_seen(run_id, &hashes);
+            for segment in &mut segments {
+                if let Some(affordance) = &mut segment.affordance {
+                    let hash = crate::dispatch::hash_content(&affordance.block);
+                    // Collapse only blocks that faithfully round-trip through the
+                    // help projection; `pointer_affordance_block` returns None for
+                    // schema-derived artifact blocks, which stay full.
+                    if already_seen.contains(&hash) {
+                        if let Some(pointer) =
+                            crate::resources::pointer_affordance_block(&affordance.block)
+                        {
+                            affordance.block = pointer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let envelope = view::assemble(segments);
     serde_json::to_string(&envelope)
         .unwrap_or_else(|error| format!("Failed to serialize read batch: {error}"))
@@ -1250,6 +1293,78 @@ mod tests {
         )
         .await;
         assert!(second.text.contains("[duplicate call]"), "{}", second.text);
+    }
+
+    #[tokio::test]
+    async fn read_batch_collapses_repeated_affordance_to_pointer() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-af-1', 'proj-rb', 1, 'First', 'active', 1, 1),
+                    ('issue-af-2', 'proj-rb', 2, 'Second', 'active', 1, 1)",
+        )
+        .await;
+        register_turn(&orch, "run-af", "turn-af");
+
+        // Batch 1: first read of the Issue kind shows the full affordance block.
+        let first = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1"]),
+            Some("run-af"),
+        )
+        .await;
+        assert!(first.text.contains("## Issue details"), "{}", first.text);
+        assert!(first.text.contains("### actions"), "{}", first.text);
+        assert!(
+            !first.text.contains("cairn://help?kind=issue"),
+            "{}",
+            first.text
+        );
+
+        // Batch 2: a different Issue instance is the same affordance block, so it
+        // collapses to the one-line pointer, not the full block. A distinct URI
+        // means flail dedup does not stub the read itself.
+        let second = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn://p/RB/2"]),
+            Some("run-af"),
+        )
+        .await;
+        assert!(
+            second.text.contains("cairn://help?kind=issue"),
+            "{}",
+            second.text
+        );
+        assert!(!second.text.contains("### actions"), "{}", second.text);
+    }
+
+    #[tokio::test]
+    async fn read_batch_tracks_distinct_affordances_independently() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-af2-1', 'proj-rb', 1, 'First', 'active', 1, 1)",
+        )
+        .await;
+        register_turn(&orch, "run-af2", "turn-af2");
+
+        // One batch, two distinct kinds is two distinct affordance blocks. Both
+        // are first-seen this session, so both full blocks survive. Hash keying
+        // is what keeps them apart: a raw `ResourceKind` key would be fine here
+        // but would wrongly collapse the two schema-distinct artifact blocks the
+        // hash key protects.
+        let batch = read_batch_envelope_for_run(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1", "cairn://p/RB/1/messages"]),
+            Some("run-af2"),
+        )
+        .await;
+        assert!(batch.text.contains("## Issue details"), "{}", batch.text);
+        assert!(batch.text.contains("## Issue messages"), "{}", batch.text);
     }
 
     #[tokio::test]

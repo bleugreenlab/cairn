@@ -14,6 +14,7 @@ use crate::models::{
     ExecutionSnapshot, RecipeEdge, RecipeNode,
 };
 use crate::orchestrator::Orchestrator;
+use crate::services::GitClient;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_common::ids;
 use cairn_db::turso::params;
@@ -323,6 +324,16 @@ pub async fn handle_pr_node(
         .unwrap_or_default();
     let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
     let has_remote = vcs.has_remote();
+    let effective_base = resolve_effective_pr_base(
+        &db,
+        orch.services.git.as_ref(),
+        &vcs,
+        &action_run.project_id,
+        has_remote,
+        base_branch.as_deref(),
+    )
+    .await?;
+    let body = pr_body_with_effective_base_note(body.as_deref(), &effective_base);
 
     commit_triage_ledger_if_needed(orch, action_run, &worktree_path, &repo_path).await?;
     let producing_job_id = action_run
@@ -346,7 +357,7 @@ pub async fn handle_pr_node(
         &title,
         body.as_deref(),
         &branch_name,
-        base_branch.as_deref(),
+        Some(effective_base.branch.as_str()),
         None,
         !has_remote,
         chrono::Utc::now().timestamp() as i32,
@@ -362,7 +373,7 @@ pub async fn handle_pr_node(
             &vcs,
             &worktree_path,
             &branch_name,
-            base_branch.as_deref(),
+            Some(effective_base.branch.as_str()),
             &title,
             body.as_deref(),
         )
@@ -386,7 +397,7 @@ pub async fn handle_pr_node(
         &title,
         body.as_deref(),
         &branch_name,
-        base_branch.as_deref(),
+        Some(effective_base.branch.as_str()),
         github.as_ref().map(|(url, number)| (url.as_str(), *number)),
         !has_remote,
         now,
@@ -759,6 +770,155 @@ async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<Stri
     .map_err(|e| format!("Failed to load project repo_path: {e}"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EffectivePrBase {
+    branch: String,
+    original: Option<String>,
+    substituted: bool,
+}
+
+async fn project_default_branch(db: &LocalDb, project_id: &str) -> Result<String, String> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT default_branch FROM projects WHERE id = ?1",
+                    (project_id.as_str(),),
+                )
+                .await?;
+            Ok(rows
+                .next()
+                .await?
+                .and_then(|row| row.opt_text(0).ok().flatten())
+                .filter(|branch| !branch.trim().is_empty())
+                .unwrap_or_else(|| "main".to_string()))
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to load project default_branch: {e}"))
+}
+
+async fn resolve_effective_pr_base(
+    db: &LocalDb,
+    git: &dyn GitClient,
+    vcs: &PrVcs,
+    project_id: &str,
+    has_remote: bool,
+    recorded_base: Option<&str>,
+) -> Result<EffectivePrBase, String> {
+    let default_branch = project_default_branch(db, project_id).await?;
+    let Some(recorded_base) = recorded_base.map(str::trim).filter(|base| !base.is_empty()) else {
+        return Ok(EffectivePrBase {
+            branch: default_branch,
+            original: None,
+            substituted: false,
+        });
+    };
+
+    if recorded_base == "HEAD" || recorded_base.starts_with("origin/") || !has_remote {
+        return Ok(EffectivePrBase {
+            branch: recorded_base.to_string(),
+            original: Some(recorded_base.to_string()),
+            substituted: false,
+        });
+    }
+
+    // A coordinator integration branch lives as a bookmark in the shared jj
+    // store, and `open_or_update_github_pr` publishes it to origin on demand
+    // right before opening the PR (see `ensure_base_branch_on_origin`). So a base
+    // that still resolves in the store is live even when it has not been pushed
+    // yet — the case of a brand-new Feature coordinator that has not landed (or
+    // pushed) any commits when its first child opens a PR. The store, not origin,
+    // is the source of truth: probing origin alone would find no ref and wrongly
+    // rewrite the base to the project default branch, collapsing the child onto
+    // `main`. The origin probe below still handles a base that no longer resolves
+    // in the store (the parent coordinator was reclaimed).
+    let store = crate::jj::project_store_dir(&vcs.config_dir, vcs.gh_cwd.as_path());
+    if crate::jj::bookmark_commit(&vcs.jj, &store, recorded_base).is_some() {
+        return Ok(EffectivePrBase {
+            branch: recorded_base.to_string(),
+            original: Some(recorded_base.to_string()),
+            substituted: false,
+        });
+    }
+
+    match live_origin_branch_exists(git, vcs.gh_cwd.as_path(), recorded_base) {
+        Ok(true) => Ok(EffectivePrBase {
+            branch: recorded_base.to_string(),
+            original: Some(recorded_base.to_string()),
+            substituted: false,
+        }),
+        Ok(false) => {
+            log::warn!(
+                "Recorded PR base branch `{}` no longer exists on origin; targeting project default branch `{}` instead.",
+                recorded_base,
+                default_branch
+            );
+            Ok(EffectivePrBase {
+                branch: default_branch,
+                original: Some(recorded_base.to_string()),
+                substituted: true,
+            })
+        }
+        Err(error) => Err(format!(
+            "Failed to check whether PR base branch `{recorded_base}` exists on origin: {error}"
+        )),
+    }
+}
+
+fn live_origin_branch_exists(
+    git: &dyn GitClient,
+    repo: &Path,
+    branch_name: &str,
+) -> Result<bool, String> {
+    let output = git.run(
+        repo,
+        vec![
+            "ls-remote".to_string(),
+            "--exit-code".to_string(),
+            "--heads".to_string(),
+            "origin".to_string(),
+            branch_name.to_string(),
+        ],
+    )?;
+    if output.success {
+        return Ok(true);
+    }
+    if output.stdout.trim().is_empty() && output.stderr.trim().is_empty() {
+        return Ok(false);
+    }
+    Err(format!("git ls-remote failed: {}", output.stderr.trim()))
+}
+
+fn pr_base_substitution_note(original: &str, effective: &str) -> String {
+    format!(
+        "Note: The recorded base branch `{original}` no longer exists, so Cairn targeted `{effective}` instead."
+    )
+}
+
+fn pr_body_with_effective_base_note(
+    body: Option<&str>,
+    effective_base: &EffectivePrBase,
+) -> Option<String> {
+    if !effective_base.substituted {
+        return body.map(ToOwned::to_owned);
+    }
+
+    let original = effective_base.original.as_deref()?;
+    let note = pr_base_substitution_note(original, &effective_base.branch);
+    let body = body.unwrap_or("").trim_end();
+    if body.contains(&note) {
+        return Some(body.to_string());
+    }
+    if body.is_empty() {
+        Some(note)
+    } else {
+        Some(format!("{body}\n\n{note}"))
+    }
+}
+
 /// Record the branch HEAD as the merge_request's `head_sha` and fire the
 /// in-process PR-open review edge. The single shared tail of both in-process
 /// PR-opening paths — the legacy `create_pr` action ([`handle_create_pr`]) and
@@ -820,12 +980,22 @@ async fn handle_create_pr(
         .unwrap_or_default();
     let vcs = PrVcs::resolve(orch, &worktree_path, &repo_path, &branch_name);
     let has_remote = vcs.has_remote();
+    let effective_base = resolve_effective_pr_base(
+        &db,
+        orch.services.git.as_ref(),
+        &vcs,
+        &action_run.project_id,
+        has_remote,
+        base_branch.as_deref(),
+    )
+    .await?;
+    let body = pr_body_with_effective_base_note(body.as_deref(), &effective_base);
     let github = if has_remote {
         let pr_url = open_or_update_github_pr(
             &vcs,
             &worktree_path,
             &branch_name,
-            base_branch.as_deref(),
+            Some(effective_base.branch.as_str()),
             &title,
             body.as_deref(),
         )
@@ -854,7 +1024,7 @@ async fn handle_create_pr(
         &title,
         body.as_deref(),
         &branch_name,
-        base_branch.as_deref(),
+        Some(effective_base.branch.as_str()),
         github.as_ref().map(|(url, number)| (url.as_str(), *number)),
         !has_remote,
         now,
@@ -2082,7 +2252,9 @@ fn artifact_from_row(row: &cairn_db::turso::Row) -> Result<Artifact, DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::{testing::MockGitClient, GitOutput, RealGitClient};
     use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+    use std::process::Command as StdCommand;
 
     async fn test_db() -> LocalDb {
         let temp = tempfile::tempdir().unwrap();
@@ -2094,6 +2266,393 @@ mod tests {
         // Leak the tempdir so the file outlives the test body.
         std::mem::forget(temp);
         db
+    }
+
+    async fn seed_project_with_default_branch(
+        db: &LocalDb,
+        project_id: &str,
+        default_branch: &str,
+    ) {
+        let project_id = project_id.to_string();
+        let default_branch = default_branch.to_string();
+        db.write(|conn| {
+            let project_id = project_id.clone();
+            let default_branch = default_branch.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES (?1, 'default', 'P', 'P', '/tmp/p', ?2, 1, 1)",
+                    params![project_id.as_str(), default_branch.as_str()],
+                )
+                .await?;
+                Ok::<_, DbError>(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    fn test_pr_vcs() -> PrVcs {
+        test_pr_vcs_with_repo(Path::new("/tmp/p"))
+    }
+
+    fn test_pr_vcs_with_repo(repo: &Path) -> PrVcs {
+        PrVcs {
+            gh_cwd: repo.to_path_buf(),
+            jj: crate::jj::JjEnv::resolve("jj", Path::new("/tmp/cairn")),
+            branch: "agent/P-1-builder".to_string(),
+            config_dir: PathBuf::from("/tmp/cairn"),
+        }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn expect_live_origin_probe(git: &mut MockGitClient, branch: &'static str, exists: bool) {
+        git.expect_run()
+            .withf(move |repo, args| {
+                repo == Path::new("/tmp/p")
+                    && args
+                        == &vec![
+                            "ls-remote".to_string(),
+                            "--exit-code".to_string(),
+                            "--heads".to_string(),
+                            "origin".to_string(),
+                            branch.to_string(),
+                        ]
+            })
+            .return_once(move |_, _| {
+                Ok(GitOutput {
+                    success: exists,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            });
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_pr_base_keeps_existing_remote_base() {
+        let db = test_db().await;
+        seed_project_with_default_branch(&db, "p-base-live", "main").await;
+        let vcs = test_pr_vcs();
+        let mut git = MockGitClient::new();
+        expect_live_origin_probe(&mut git, "agent/live-parent", true);
+
+        let effective = resolve_effective_pr_base(
+            &db,
+            &git,
+            &vcs,
+            "p-base-live",
+            true,
+            Some("agent/live-parent"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effective.branch, "agent/live-parent");
+        assert_eq!(effective.original.as_deref(), Some("agent/live-parent"));
+        assert!(!effective.substituted);
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_pr_base_falls_back_when_remote_base_missing() {
+        let db = test_db().await;
+        seed_project_with_default_branch(&db, "p-base-missing", "main").await;
+        let vcs = test_pr_vcs();
+        let mut git = MockGitClient::new();
+        expect_live_origin_probe(&mut git, "agent/deleted-parent", false);
+
+        let effective = resolve_effective_pr_base(
+            &db,
+            &git,
+            &vcs,
+            "p-base-missing",
+            true,
+            Some("agent/deleted-parent"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effective.branch, "main");
+        assert_eq!(effective.original.as_deref(), Some("agent/deleted-parent"));
+        assert!(effective.substituted);
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_pr_base_keeps_local_only_recorded_base_without_note() {
+        let db = test_db().await;
+        seed_project_with_default_branch(&db, "p-local", "main").await;
+        let vcs = test_pr_vcs();
+        let git = MockGitClient::new();
+
+        let effective = resolve_effective_pr_base(
+            &db,
+            &git,
+            &vcs,
+            "p-local",
+            false,
+            Some("agent/local-parent"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effective.branch, "agent/local-parent");
+        assert_eq!(effective.original.as_deref(), Some("agent/local-parent"));
+        assert!(!effective.substituted);
+        assert_eq!(
+            pr_body_with_effective_base_note(Some("Body"), &effective).as_deref(),
+            Some("Body")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(jj)]
+    async fn resolve_effective_pr_base_keeps_unpushed_store_bookmark() {
+        // A brand-new Feature coordinator has sealed its integration bookmark in
+        // the shared jj store but has not pushed it to origin. The recorded child
+        // base must be KEPT: the store is the source of truth, and the branch is
+        // published to origin on demand at PR-create time. The origin-only probe
+        // used to find no ref and wrongly rewrite the base to `main`. The
+        // MockGitClient carries no expectations, so if the origin probe were
+        // reached it would panic — the store short-circuit must win.
+        use crate::jj::JjEnv;
+        use std::path::Path;
+
+        fn jj_bin() -> Option<String> {
+            let bin = std::env::var("CAIRN_JJ_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "jj".to_string());
+            crate::env::command(&bin)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                .then_some(bin)
+        }
+        fn git(repo: &Path, args: &[&str]) {
+            let ok = crate::env::git()
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?} failed");
+        }
+
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping resolve_effective_pr_base_keeps_unpushed_store_bookmark: jj not resolvable");
+            return;
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // A project git repo on `main` with a base commit.
+        let project_repo = temp.path().join("project");
+        std::fs::create_dir_all(&project_repo).unwrap();
+        git(&project_repo, &["init", "-q", "-b", "main"]);
+        git(&project_repo, &["config", "user.email", "a@b.c"]);
+        git(&project_repo, &["config", "user.name", "tester"]);
+        std::fs::write(project_repo.join("README.md"), "base\n").unwrap();
+        git(&project_repo, &["add", "-A"]);
+        git(&project_repo, &["commit", "-qm", "init"]);
+
+        // Shared jj store + a coordinator workspace whose bookmark is sealed in
+        // the store but never pushed to any origin.
+        let jj = JjEnv::resolve(&bin, &config_dir);
+        let store_dir = crate::jj::project_store_dir(&config_dir, &project_repo);
+        crate::jj::ensure_project_store(&jj, &store_dir, &project_repo).unwrap();
+        let ws_path = temp.path().join("wt");
+        crate::jj::add_workspace(
+            &jj,
+            &store_dir,
+            &ws_path,
+            "agent/coord-integration",
+            "main",
+            None,
+        )
+        .unwrap();
+
+        let db = test_db().await;
+        seed_project_with_default_branch(&db, "p-store", "main").await;
+        let vcs = PrVcs {
+            gh_cwd: project_repo.clone(),
+            jj: JjEnv::resolve(&bin, &config_dir),
+            branch: "agent/coord-integration".to_string(),
+            config_dir: config_dir.clone(),
+        };
+        let git_client = MockGitClient::new();
+
+        let effective = resolve_effective_pr_base(
+            &db,
+            &git_client,
+            &vcs,
+            "p-store",
+            true,
+            Some("agent/coord-integration"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effective.branch, "agent/coord-integration");
+        assert_eq!(
+            effective.original.as_deref(),
+            Some("agent/coord-integration")
+        );
+        assert!(!effective.substituted);
+    }
+
+    #[tokio::test]
+    async fn resolve_effective_pr_base_uses_live_origin_not_local_tracking_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let origin = temp.path().join("origin.git");
+        let source = temp.path().join("source");
+        let checkout = temp.path().join("checkout");
+        std::fs::create_dir(&source).unwrap();
+
+        run_git(temp.path(), &["init", "--bare", origin.to_str().unwrap()]);
+        run_git(&source, &["init"]);
+        run_git(&source, &["config", "user.email", "agent@example.com"]);
+        run_git(&source, &["config", "user.name", "Cairn Agent"]);
+        std::fs::write(source.join("README.md"), "base\n").unwrap();
+        run_git(&source, &["add", "README.md"]);
+        run_git(&source, &["commit", "-m", "base"]);
+        run_git(&source, &["branch", "-M", "main"]);
+        run_git(
+            &source,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        run_git(&source, &["push", "origin", "main"]);
+        run_git(&source, &["checkout", "-b", "agent/live-parent"]);
+        std::fs::write(source.join("README.md"), "base\nlive parent\n").unwrap();
+        run_git(&source, &["commit", "-am", "live parent"]);
+        run_git(&source, &["push", "origin", "agent/live-parent"]);
+        run_git(
+            temp.path(),
+            &[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                origin.to_str().unwrap(),
+                checkout.to_str().unwrap(),
+            ],
+        );
+
+        let local_tracking = StdCommand::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "refs/remotes/origin/agent/live-parent",
+            ])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        assert!(
+            !local_tracking.status.success(),
+            "test setup should leave the live branch absent from local tracking refs"
+        );
+
+        let db = test_db().await;
+        seed_project_with_default_branch(&db, "p-live-origin", "main").await;
+        let vcs = test_pr_vcs_with_repo(&checkout);
+        let git = RealGitClient;
+
+        let effective = resolve_effective_pr_base(
+            &db,
+            &git,
+            &vcs,
+            "p-live-origin",
+            true,
+            Some("agent/live-parent"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effective.branch, "agent/live-parent");
+        assert!(!effective.substituted);
+    }
+
+    #[tokio::test]
+    async fn upsert_merge_request_uses_effective_fallback_base() {
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-effective','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-effective','p-effective',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-effective','recipe','i-effective','p-effective','running',1,1,'{}')", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-effective','e-effective','builder','i-effective','p-effective','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+        let effective = EffectivePrBase {
+            branch: "main".to_string(),
+            original: Some("agent/deleted-parent".to_string()),
+            substituted: true,
+        };
+
+        upsert_merge_request_for_pr(
+            &db,
+            "job-effective",
+            "p-effective",
+            Some("i-effective"),
+            "Title",
+            Some("Body"),
+            "agent/P-1-builder",
+            Some(effective.branch.as_str()),
+            None,
+            true,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let target_branch = db
+            .query_text(
+                "SELECT target_branch FROM merge_requests WHERE job_id = 'job-effective'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(target_branch, "main");
+    }
+
+    #[test]
+    fn pr_body_with_effective_base_note_adds_note_once_only_on_substitution() {
+        let unchanged = EffectivePrBase {
+            branch: "agent/live-parent".to_string(),
+            original: Some("agent/live-parent".to_string()),
+            substituted: false,
+        };
+        assert_eq!(
+            pr_body_with_effective_base_note(Some("Body"), &unchanged).as_deref(),
+            Some("Body")
+        );
+
+        let substituted = EffectivePrBase {
+            branch: "main".to_string(),
+            original: Some("agent/deleted-parent".to_string()),
+            substituted: true,
+        };
+        let body = pr_body_with_effective_base_note(Some("Body"), &substituted).unwrap();
+        let note = pr_base_substitution_note("agent/deleted-parent", "main");
+        assert_eq!(body, format!("Body\n\n{note}"));
+
+        let retried = pr_body_with_effective_base_note(Some(body.as_str()), &substituted).unwrap();
+        assert_eq!(retried, body);
+        assert_eq!(retried.matches(&note).count(), 1);
     }
 
     /// A coordinator/pr-shaped job that wrote BOTH a `create-pr` terminal
@@ -2194,6 +2753,51 @@ mod tests {
             .unwrap()
             .expect("merge_request joins to jobs");
         assert_eq!(stored, "job-mr");
+    }
+
+    #[tokio::test]
+    async fn upsert_merge_request_persists_inherited_integration_target() {
+        // A Feature coordinator child opens its PR against the coordinator's
+        // integration branch (its inherited `base_branch`). PR creation must
+        // persist that as `merge_requests.target_branch`, not the project
+        // default, because `resolve_merge_mr_context_for_job` and
+        // `merge_pr_for_job` trust the stored target for routing.
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-int','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-int','p-int',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-int','recipe','i-int','p-int','running',1,1,'{}')", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-int','e-int','builder','i-int','p-int','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+
+        upsert_merge_request_for_pr(
+            &db,
+            "job-int",
+            "p-int",
+            Some("i-int"),
+            "Title",
+            Some("Body"),
+            "agent/P-1-builder",
+            Some("agent/coord-integration"),
+            None,
+            true,
+            10,
+        )
+        .await
+        .unwrap();
+
+        let stored = db
+            .query_text(
+                "SELECT target_branch FROM merge_requests WHERE job_id = 'job-int' LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap()
+            .expect("merge_request row exists");
+        assert_eq!(stored, "agent/coord-integration");
     }
 
     #[tokio::test]

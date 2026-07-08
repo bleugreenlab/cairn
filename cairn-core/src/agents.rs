@@ -49,6 +49,10 @@ pub struct AgentFrontmatter {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<String>,
+    /// Optional lucide icon name (kebab-case, e.g. `hammer`) giving the agent a
+    /// compact visual identity. Absent means no icon (a `Bot` fallback renders).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// Custom deserializer that handles both comma-separated string and YAML array
@@ -113,6 +117,7 @@ pub struct ParsedAgent {
     pub disallowed_tools: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub backend_preference: Option<String>,
+    pub icon: Option<String>,
 }
 
 /// Generate a slug from a name (for ID generation)
@@ -199,6 +204,7 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         disallowed_tools: frontmatter.disallowed_tools,
         skills: frontmatter.skills,
         backend_preference: frontmatter.backend_preference,
+        icon: frontmatter.icon,
     })
 }
 
@@ -216,6 +222,8 @@ pub struct AgentExportData<'a> {
     pub skills: Option<&'a [String]>,
     pub hooks: Option<&'a serde_json::Value>,
     pub backend_preference: Option<&'a str>,
+    /// Optional lucide icon name; an `icon:` line is emitted only when set.
+    pub icon: Option<&'a str>,
 }
 
 /// Convert agent to Claude Code-compatible markdown format for export
@@ -232,6 +240,7 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         skills,
         hooks,
         backend_preference,
+        icon,
     } = data;
 
     let mut frontmatter = format!("---\nname: {}\ndescription: {}\n", name, description);
@@ -250,6 +259,12 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
 
     if let Some(b) = backend_preference {
         frontmatter.push_str(&format!("backend: {}\n", b));
+    }
+
+    // Only emit an `icon:` line when set, so agents without an icon round-trip
+    // through the optional, defaulted `icon` frontmatter field unchanged.
+    if let Some(icon) = icon {
+        frontmatter.push_str(&format!("icon: {}\n", icon));
     }
 
     // Write fence only when non-default (default is Ask)
@@ -326,6 +341,7 @@ mod tests {
             skills: None,
             hooks: None,
             backend_preference: None,
+            icon: None,
         });
         assert!(
             !markdown.contains("tools:"),
@@ -469,6 +485,7 @@ Prompt
             skills: None,
             hooks: None,
             backend_preference: None,
+            icon: None,
         });
 
         assert!(markdown.contains("name: Test Agent"));
@@ -496,6 +513,7 @@ Prompt
             skills: Some(&skills),
             hooks: None,
             backend_preference: None,
+            icon: None,
         });
 
         assert!(markdown.contains("disallowedTools:"));
@@ -652,6 +670,7 @@ Build stuff.
             skills: None,
             hooks: agent.hooks.as_ref(),
             backend_preference: None,
+            icon: None,
         });
 
         assert!(markdown.contains("hooks:"));
@@ -686,6 +705,7 @@ Build with Codex.
             skills: None,
             hooks: None,
             backend_preference: agent.backend_preference.as_deref(),
+            icon: None,
         });
 
         assert!(markdown.contains("backend: codex"));
@@ -705,9 +725,70 @@ Build with Codex.
             skills: None,
             hooks: None,
             backend_preference: None,
+            icon: None,
         });
 
         assert!(!markdown.contains("backendPreference"));
         assert!(!markdown.contains("backend:"));
+    }
+
+    #[test]
+    fn test_icon_roundtrip() {
+        let content = r#"---
+name: Builder
+description: Builds things
+tools: Read, Write
+icon: hammer
+---
+
+Build stuff.
+"#;
+
+        let agent = parse_agent_markdown(content).unwrap();
+        assert_eq!(agent.icon.as_deref(), Some("hammer"));
+
+        // Export and verify the icon line is preserved, then re-parse.
+        let markdown = agent_to_markdown(AgentExportData {
+            id: "builder",
+            name: &agent.name,
+            description: &agent.description,
+            tools: &agent.tools,
+            tier: None,
+            prompt: &agent.prompt,
+            fence: None,
+            disallowed_tools: None,
+            skills: None,
+            hooks: None,
+            backend_preference: None,
+            icon: agent.icon.as_deref(),
+        });
+
+        assert!(markdown.contains("icon: hammer"));
+        let reparsed = parse_agent_markdown(&markdown).unwrap();
+        assert_eq!(reparsed.icon.as_deref(), Some("hammer"));
+    }
+
+    #[test]
+    fn test_icon_omitted_when_absent() {
+        // An agent with no icon must not emit an `icon:` line and must reload
+        // with `icon == None` — no save/load asymmetry for the optional field.
+        let markdown = agent_to_markdown(AgentExportData {
+            id: "plain",
+            name: "Plain",
+            description: "No icon",
+            tools: &["Read".to_string()],
+            tier: None,
+            prompt: "Do stuff.",
+            fence: None,
+            disallowed_tools: None,
+            skills: None,
+            hooks: None,
+            backend_preference: None,
+            icon: None,
+        });
+
+        assert!(!markdown.contains("icon:"));
+        let parsed = parse_agent_markdown(&markdown).unwrap();
+        assert!(parsed.icon.is_none());
     }
 }

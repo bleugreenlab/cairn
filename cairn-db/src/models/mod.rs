@@ -49,7 +49,7 @@ pub use workspace::{
 // Project types
 pub use project::{
     CheckCommand, CheckPolicy, CheckWhen, CreateProject, MoveProject, PopulateConfig, Project,
-    ProjectRemoteStatus, SeedEntry, TerminalCommand, UpdateProject,
+    ProjectRemoteStatus, TerminalCommand, UpdateProject,
 };
 
 // Context token snapshot types

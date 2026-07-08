@@ -260,6 +260,30 @@ static NEXTEST_FAIL: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+static NEXTEST_SLOW: LazyLock<Regex> = LazyLock::new(|| {
+    // `SLOW [>  60.000s] <crate> <test::path>` — nextest's marker for a test
+    // still running past its slow-timeout threshold. When a suite is KILLED at
+    // its budget these name the tests that were mid-flight at the kill.
+    Regex::new(r"(?m)^\s*SLOW\s+\[[^\]]*\]\s+(?:\(\d+/\d+\)\s+)?(\S+)\s+(\S+)\s*$").unwrap()
+});
+
+/// Extract the nextest tests still running when a suite was killed — its
+/// `SLOW […]` lines — from a check's captured output. Deduped, first-seen order.
+/// Empty for any other runner or output with no SLOW lines. Enrichment only:
+/// surfaced beside a `timed_out` verdict so the first agent question ("what was
+/// it doing when it died?") is answerable without re-running the suite.
+pub fn extract_running_tests(output: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for cap in NEXTEST_SLOW.captures_iter(output) {
+        let name = format!("{} {}", &cap[1], &cap[2]);
+        if seen.insert(name.clone()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 static COUNT_PASSED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+passed").unwrap());
 static COUNT_FAILED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+failed").unwrap());
 static COUNT_SKIPPED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d+)\s+skipped").unwrap());
@@ -437,6 +461,32 @@ fn cap_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_running_tests_names_nextest_slow_lines() {
+        // A killed-at-budget nextest run leaves `SLOW [...]` lines for the tests
+        // still in flight; those are exactly what to surface beside a timeout.
+        let output = "\
+   Compiling cairn-core v0.1.0
+        SLOW [>  60.000s] cairn-core jj::tests::big_clone
+        SLOW [> 120.000s] (2/9) cairn-core sync::tests::slow_roundtrip
+        SLOW [>  60.000s] cairn-core jj::tests::big_clone
+running 1900 tests";
+        let running = extract_running_tests(output);
+        assert_eq!(
+            running,
+            vec![
+                "cairn-core jj::tests::big_clone".to_string(),
+                "cairn-core sync::tests::slow_roundtrip".to_string(),
+            ],
+            "SLOW lines dedupe by identifier, keeping first-seen order"
+        );
+    }
+
+    #[test]
+    fn extract_running_tests_empty_without_slow_lines() {
+        assert!(extract_running_tests("all quiet; no slow lines here").is_empty());
+    }
 
     // Fixtures harvested from real deliberately-failing runs (see CAIRN-2282).
 

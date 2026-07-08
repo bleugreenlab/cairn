@@ -60,6 +60,7 @@ pub fn transition_to_warm_state(orch: &Orchestrator, run_id: &str) -> bool {
                     e
                 );
             }
+            reduce_nodeless_delegated_child(orch, &job_id);
             finish_memory_review_if_due(orch, &job_id, run_id);
             // Turn-end: the agent went idle. Emit a fact-driven event so any
             // in-flight `watch` learns the issue is actionable (or resolved)
@@ -413,6 +414,31 @@ fn maybe_kill_completed_call_child(orch: &Orchestrator, run_id: &str) {
     );
 }
 
+/// Terminalize a node-less delegated child (an ephemeral call or a workflow)
+/// whose status the execution sweep can't derive, so the `try_resume_delegated_parent`
+/// that follows resolves its packet and wakes the suspended caller in this same
+/// finalize pass.
+///
+/// `recompute_job` reduces only recipe-node-backed jobs; a pre-materialized
+/// node-less child (`recipe_node_id IS NULL`) is invisible to the sweep, so
+/// without this its job stays `running` after its run finalizes and a durably
+/// suspended caller hangs forever (CAIRN-2559). Fail-closed: a failure here
+/// would silently strand the caller, so it is logged at `error`, not `warn`.
+fn reduce_nodeless_delegated_child(orch: &Orchestrator, job_id: &str) {
+    match crate::execution::advancement::reduce_delegated_child_job(orch, job_id) {
+        Ok(Some(status)) => log::info!(
+            "Terminalized node-less delegated child job {} as {} (sweep-unreachable)",
+            &job_id[..job_id.len().min(8)],
+            status
+        ),
+        Ok(None) => {}
+        Err(e) => log::error!(
+            "Failed to terminalize node-less delegated child job {job_id}: {e} — \
+             a suspended caller may be stranded"
+        ),
+    }
+}
+
 fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
     let Some(job_id) = job_id_for_run(orch, run_id) else {
         return;
@@ -688,6 +714,7 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
                     e
                 );
             }
+            reduce_nodeless_delegated_child(orch, &job_id);
             finish_memory_review_if_due(orch, &job_id, run_id);
             // Turn-end on any terminal run outcome (clean exit or crash): the
             // agent is idle now. The recompute above may have flipped status

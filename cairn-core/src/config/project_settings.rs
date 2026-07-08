@@ -25,7 +25,7 @@ pub struct WorktreeSettings {
 // The check/worktree-populate config value types now live in `models::project`
 // (pure serde data, no upward dependency on config). Re-exported here so every
 // `project_settings::CheckCommand`-style path keeps resolving.
-pub use crate::models::{CheckCommand, CheckPolicy, CheckWhen, PopulateConfig, SeedEntry};
+pub use crate::models::{CheckCommand, CheckPolicy, CheckWhen, PopulateConfig};
 
 /// Project settings as stored in YAML file.
 /// All fields are optional - missing fields use defaults.
@@ -360,7 +360,6 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 # Worktree population: control which gitignored content is pre-populated.
 # Paths matching 'copy' patterns are copied from the main repo (isolated per worktree).
 # Paths matching 'symlink' patterns are symlinked to the main repo.
-# 'seed' entries copy-on-write clone external warm caches into the worktree.
 # Unmatched paths are skipped — setup commands handle the rest.
 #
 # worktree:
@@ -369,12 +368,7 @@ pub fn create_default_project_config(project_path: &Path) -> Result<(), String> 
 #       - ".env"
 #       - ".env.*"
 #     symlink:
-#       - "target/"
 #       - ".cache/"
-#     seed:
-#       - from: "~/.my-project-cache/target"
-#         to: "target"
-#         exclude: ["*/incremental"]
 
 # Commands to run when setting up a new worktree
 # setupCommands:
@@ -484,6 +478,32 @@ checks:
         assert_eq!(typecheck.policy, CheckPolicy::Advisory);
         assert_eq!(typecheck.when, CheckWhen::Write);
 
+        let serialized = serde_yaml::to_string(&settings).unwrap();
+        let reparsed: ProjectSettingsFile = serde_yaml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.checks, settings.checks);
+    }
+
+    #[test]
+    fn test_check_timeout_parses_and_round_trips() {
+        // A per-check `timeout` (seconds) parses, defaults to `None` when absent,
+        // and survives serialization. `timeout` has no `skip_serializing_if`
+        // default guard, so a plain non-zero value round-trips faithfully.
+        let yaml = r#"
+checks:
+  rust-full:
+    command: bun run test:rust
+    when: review
+    timeout: 2400
+  frontend:
+    command: vitest run
+"#;
+        let settings: ProjectSettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let checks = settings.checks.as_ref().unwrap();
+        assert_eq!(checks.get("rust-full").unwrap().timeout, Some(2400));
+        // A check that omits `timeout` deserializes to `None` (cadence default).
+        assert_eq!(checks.get("frontend").unwrap().timeout, None);
+
+        // Round-trip: the configured timeout survives a serialize/parse cycle.
         let serialized = serde_yaml::to_string(&settings).unwrap();
         let reparsed: ProjectSettingsFile = serde_yaml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.checks, settings.checks);
@@ -848,11 +868,6 @@ copyFiles:
                 populate: PopulateConfig {
                     copy: vec![".env".to_string(), ".env.*".to_string()],
                     symlink: vec!["target/".to_string()],
-                    seed: vec![SeedEntry {
-                        from: "~/.cache/project-target".to_string(),
-                        to: "target".to_string(),
-                        exclude: vec!["*/incremental".to_string()],
-                    }],
                 },
             }),
             ..Default::default()
@@ -864,10 +879,6 @@ copyFiles:
         let config = loaded.populate_config();
         assert_eq!(config.copy, vec![".env", ".env.*"]);
         assert_eq!(config.symlink, vec!["target/"]);
-        assert_eq!(config.seed.len(), 1);
-        assert_eq!(config.seed[0].from, "~/.cache/project-target");
-        assert_eq!(config.seed[0].to, "target");
-        assert_eq!(config.seed[0].exclude, vec!["*/incremental"]);
 
         // Verify the serialized YAML contains expected structure
         let config_path = get_project_config_path(project_path);
@@ -875,33 +886,23 @@ copyFiles:
         assert!(raw.contains("populate"));
         assert!(raw.contains(".env"));
         assert!(raw.contains("target/"));
-        assert!(raw.contains("seed"));
-        assert!(raw.contains("~/.cache/project-target"));
-        assert!(raw.contains("*/incremental"));
         // seedIgnored should never appear in new files
         assert!(!raw.contains("seedIgnored"));
     }
 
     #[test]
-    fn test_seed_only_populate_config_is_not_empty() {
-        let config = PopulateConfig {
-            copy: vec![],
-            symlink: vec![],
-            seed: vec![SeedEntry {
-                from: "~/warm/target".to_string(),
-                to: "target".to_string(),
-                exclude: vec![],
-            }],
-        };
-
-        assert!(!config.is_empty());
-    }
-
-    #[test]
-    fn test_populate_config_deserializes_seed() {
+    fn test_legacy_seed_populate_config_is_ignored() {
+        // The `seed` worktree-populate mechanism was removed (CAIRN-2622): the
+        // clone source was a live dev-instance target dir and could capture a
+        // torn snapshot; sccache is the canonical cross-worktree compile cache.
+        // A pre-existing config that still carries a `seed:` block must keep
+        // deserializing — the key is now an ignored unknown field, and the
+        // surviving copy/symlink rules are honored.
         let raw = r#"
 worktree:
   populate:
+    copy:
+      - ".env"
     seed:
       - from: "~/.warm/target"
         to: "src-tauri/target"
@@ -910,10 +911,8 @@ worktree:
 
         let settings: ProjectSettingsFile = serde_yaml::from_str(raw).unwrap();
         let config = settings.populate_config();
-        assert_eq!(config.seed.len(), 1);
-        assert_eq!(config.seed[0].from, "~/.warm/target");
-        assert_eq!(config.seed[0].to, "src-tauri/target");
-        assert_eq!(config.seed[0].exclude, vec!["*/incremental"]);
+        assert_eq!(config.copy, vec![".env"]);
+        assert!(config.symlink.is_empty());
     }
 
     #[test]

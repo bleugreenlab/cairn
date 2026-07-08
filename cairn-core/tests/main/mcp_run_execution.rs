@@ -214,11 +214,21 @@ async fn parallel_items_do_not_block_each_other() {
     );
 }
 
+/// Timeout (ms) for the promote-on-timeout tests that assert the item's PARTIAL
+/// stdout (`started`) is captured before the timeout fires. The capture normally
+/// lands in tens of milliseconds, so this is deliberately generous: a tight
+/// timeout races the subprocess spawn + output pump against the timer and flakes
+/// under heavy CI / turn-end load (the review check cadence now runs its heavy
+/// suites concurrently, so the machine can be saturated when these run). It stays
+/// far below the commands' 30s sleep, so the timeout still fires first and the
+/// promote-to-terminal behavior under test is unchanged.
+const PARTIAL_OUTPUT_TIMEOUT_MS: u32 = 3000;
+
 #[tokio::test]
 async fn timed_out_item_with_run_context_promotes_to_terminal() {
     let (_temp, db, orch, cwd) = setup("run-promote").await;
     let payload = json!({
-        "commands": [{ "command": "echo started; sleep 30", "timeout": 800 }],
+        "commands": [{ "command": "echo started; sleep 30", "timeout": PARTIAL_OUTPUT_TIMEOUT_MS }],
     });
     let result = handle_run(&orch, &request(&cwd, Some("run-promote"), payload)).await;
 
@@ -343,7 +353,7 @@ async fn timed_out_item_in_subtask_job_kills_instead_of_promoting() {
     .unwrap();
 
     let payload = json!({
-        "commands": [{ "command": "echo started; sleep 30", "timeout": 800 }],
+        "commands": [{ "command": "echo started; sleep 30", "timeout": PARTIAL_OUTPUT_TIMEOUT_MS }],
     });
     let result = handle_run(&orch, &request(&cwd, Some("run-subtask-sub"), payload)).await;
 
@@ -494,10 +504,14 @@ async fn typescript_code_item_executes_via_bun() {
     );
 }
 
+// Inline python routes through `uv run -` when uv resolves and falls back to
+// `python3 -c` otherwise. This end-to-end check is path-agnostic: both
+// uv-managed CPython and system python3 print `py3` for the major version, so it
+// passes whichever rung of the ladder the host takes.
 #[tokio::test]
-async fn python_code_item_executes_via_python3() {
-    if !binary_available("python3") {
-        eprintln!("skipping python_code_item_executes_via_python3: python3 not resolvable");
+async fn python_code_item_executes() {
+    if !binary_available("uv") && !binary_available("python3") {
+        eprintln!("skipping python_code_item_executes: neither uv nor python3 resolvable");
         return;
     }
     let (_temp, _db, orch, cwd) = setup("run-code-py").await;
@@ -510,7 +524,35 @@ async fn python_code_item_executes_via_python3() {
     let result = handle_run(&orch, &request(&cwd, Some("run-code-py"), payload)).await;
     assert!(
         result.contains("py3"),
-        "a python code item must run via `python3 -c` and return its stdout: {result}"
+        "a python code item must run (via `uv run -` or the `python3 -c` fallback) and return its stdout: {result}"
+    );
+}
+
+/// With `uv` resolvable, an inline python item routes through `uv run -` and its
+/// PEP 723 inline `# /// script` dependency block is honored: uv parses the
+/// metadata from the stdin-delivered script, installs the dep into an ephemeral
+/// env, and the import succeeds — proving both the uv rung of the ladder and that
+/// the code actually arrives on stdin (a `-c` delivery would skip the metadata
+/// and fail to import). Gated on `uv` (and, on a cold cache, network); a machine
+/// without uv self-skips, mirroring the python3/bun `binary_available` idiom.
+#[tokio::test]
+async fn python_code_item_honors_pep723_inline_deps_via_uv() {
+    if !binary_available("uv") {
+        eprintln!("skipping python_code_item_honors_pep723_inline_deps_via_uv: uv not resolvable");
+        return;
+    }
+    let (_temp, _db, orch, cwd) = setup("run-code-uv-pep723").await;
+    // `packaging` is a tiny, pure-python dependency with no transitive build
+    // step, so the ephemeral install is fast and reliable (and commonly warm in
+    // uv's cache). The inline metadata block is what `-c` would never parse.
+    let code = "# /// script\n# dependencies = [\"packaging\"]\n# ///\nfrom packaging.version import Version\nprint(f\"pep723-ok:{Version('1.2.3') < Version('1.10')}\")\n";
+    let payload = json!({
+        "commands": [{ "code": code, "interpreter": "python" }],
+    });
+    let result = handle_run(&orch, &request(&cwd, Some("run-code-uv-pep723"), payload)).await;
+    assert!(
+        result.contains("pep723-ok:True"),
+        "`uv run -` must parse PEP 723 inline deps from the stdin script and import them: {result}"
     );
 }
 
@@ -590,7 +632,7 @@ async fn timed_out_code_item_promotes_to_terminal_with_partial_output() {
         "commands": [{
             "code": "import time,sys; print('started'); sys.stdout.flush(); time.sleep(30)",
             "interpreter": "python",
-            "timeout": 800
+            "timeout": PARTIAL_OUTPUT_TIMEOUT_MS
         }],
     });
     let result = handle_run(&orch, &request(&cwd, Some("run-code-timeout"), payload)).await;
@@ -646,4 +688,92 @@ async fn chained_commands_surface_all_segments() {
         and_chain.contains("SEG_ONE") && and_chain.contains("SEG_TWO"),
         "&& chain dropped a segment: {and_chain}"
     );
+}
+
+// A `repl` send to a slug with no live session fails closed with the create
+// hint (Behaviors #4a) rather than silently spawning a fresh process. Fully
+// deterministic — no interpreter required.
+#[tokio::test]
+async fn repl_unknown_slug_send_fails_closed() {
+    let run_id = "run-repl-unknown";
+    let (_temp, _db, orch, cwd) = setup(run_id).await;
+    let out = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "1 + 1", "interpreter": "python", "repl": "ghost" }] }),
+        ),
+    )
+    .await;
+    assert!(out.contains("No REPL named 'ghost'"), "got: {out}");
+    assert!(out.contains("cairn:~/repl/ghost"), "got: {out}");
+}
+
+// State persists across two separate `handle_run` calls routed into the same
+// live REPL session: `x = 41` then `x + 1` returns `42`. Guarded to skip if no
+// interpreter is available to spawn the eval-server.
+#[tokio::test]
+async fn repl_state_persists_across_handle_run_calls() {
+    use cairn_core::internal::mcp::handlers::repl::{self, ReplLang};
+    use cairn_core::internal::mcp::handlers::RunContext;
+
+    let run_id = "run-repl-state";
+    let (_temp, _db, orch, cwd) = setup(run_id).await;
+    let ctx = RunContext {
+        run_id: run_id.to_string(),
+        job_id: format!("job-{run_id}"),
+        exec_seq: Some(1),
+        issue_id: Some(format!("issue-{run_id}")),
+        issue_number: Some(1),
+        project_id: String::new(),
+        project_key: "RHG".to_string(),
+        job_name: Some("builder".to_string()),
+        worktree_path: Some(cwd.clone()),
+    };
+
+    let Ok(session) =
+        repl::spawn_session(&orch, &ctx, &cwd, ReplLang::Python, "analysis", &[]).await
+    else {
+        eprintln!("skipping repl_state_persists: no python/uv available to spawn the eval-server");
+        return;
+    };
+    orch.repl_state
+        .insert(ctx.job_id.clone(), "analysis".to_string(), session);
+
+    let first = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "x = 41", "interpreter": "python", "repl": "analysis" }] }),
+        ),
+    )
+    .await;
+    assert!(
+        !first.contains("No REPL named"),
+        "first send lost the session: {first}"
+    );
+    assert!(
+        !first.contains("died"),
+        "first send reported a dead REPL: {first}"
+    );
+
+    let second = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some(run_id),
+            json!({ "commands": [{ "code": "x + 1", "interpreter": "python", "repl": "analysis" }] }),
+        ),
+    )
+    .await;
+    assert!(
+        second.contains("42"),
+        "REPL state must persist across handle_run calls: {second}"
+    );
+
+    if let Some(session) = orch.repl_state.remove(&ctx.job_id, "analysis") {
+        session.kill();
+    }
 }

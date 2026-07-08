@@ -273,13 +273,25 @@ impl Orchestrator {
         id: &str,
         input: UpdateSkillConfig,
         target_project_id: Option<&str>,
+        workspace_id: Option<&str>,
     ) -> Result<SkillConfig, String> {
-        config_resource::update_config::<SkillResource>(self, id, input, target_project_id)
+        config_resource::update_config::<SkillResource>(
+            self,
+            id,
+            input,
+            target_project_id,
+            workspace_id,
+        )
     }
 
     /// Delete a skill configuration.
-    pub fn delete_skill_config(&self, id: &str, project_id: Option<&str>) -> Result<(), String> {
-        config_resource::delete_config::<SkillResource>(self, id, project_id)
+    pub fn delete_skill_config(
+        &self,
+        id: &str,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<(), String> {
+        config_resource::delete_config::<SkillResource>(self, id, project_id, workspace_id)
     }
 
     /// Fetch a skill from a URL and return a preview for the UI.
@@ -354,6 +366,7 @@ impl Orchestrator {
         source_project_id: Option<&str>,
         target_id: &str,
         target_project_id: Option<&str>,
+        target_workspace_id: Option<&str>,
     ) -> Result<SkillConfig, String> {
         config_resource::copy_config::<SkillResource>(
             self,
@@ -361,6 +374,7 @@ impl Orchestrator {
             source_project_id,
             target_id,
             target_project_id,
+            target_workspace_id,
         )
     }
 

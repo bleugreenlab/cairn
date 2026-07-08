@@ -429,6 +429,27 @@ async fn reconcile_base_advance(
     let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
 
+    // Store-truth precheck BEFORE any per-sibling jj work. `load_sibling_jobs`
+    // returns rows straight from the DB, including long-dead `agent/…` siblings
+    // whose worktrees were reclaimed but whose `jobs` / `merge_requests` rows
+    // linger. List every existing bookmark ONCE and drop the siblings whose
+    // bookmark is gone, so the divergence-collapse, before-snapshot, and rebase
+    // loops below never spawn a `jj` subprocess per dead branch — the
+    // startup/base-advance subprocess storm. A failed list disables the filter
+    // (proceed with all): liveness over strictness, matching the reconcile
+    // primitives.
+    let existing_bookmarks = crate::jj::list_local_bookmarks(&jj, &store).ok();
+    let (specs, skipped_missing) = retain_present_siblings(specs, existing_bookmarks.as_ref());
+    if skipped_missing > 0 {
+        log::info!(
+            "jj base advance ({label}): skipped {skipped_missing} sibling(s) with missing bookmarks before reconcile"
+        );
+    }
+    if specs.is_empty() {
+        log::debug!("jj base advance ({label}): all in-flight siblings had missing bookmarks");
+        return Ok(());
+    }
+
     // Heal any PRE-EXISTING divergent twin on a sibling bookmark BEFORE the
     // sibling rebase. New divergence is already prevented upstream (the per-store
     // mutex + the idempotent `reconcile_siblings` skip); this collapses a twin
@@ -567,6 +588,30 @@ fn siblings_rewritten(
         )
         .cloned()
         .collect()
+}
+
+/// Drop siblings whose branch bookmark no longer exists in `existing`, returning
+/// the retained specs and how many were dropped (for one summary log line). This
+/// is the store-truth guard on the DB-sourced sibling set: `load_sibling_jobs`
+/// yields stale rows for long-dead `agent/…` branches, and filtering them here —
+/// before the divergence-collapse and before-snapshot loops — keeps a base advance
+/// from spawning a `jj` subprocess per dead sibling. `None` (the store-wide
+/// bookmark list failed) disables the filter: proceed with all, liveness over
+/// strictness.
+fn retain_present_siblings(
+    specs: Vec<(String, std::path::PathBuf)>,
+    existing: Option<&std::collections::HashSet<String>>,
+) -> (Vec<(String, std::path::PathBuf)>, usize) {
+    let Some(existing) = existing else {
+        return (specs, 0);
+    };
+    let total = specs.len();
+    let retained: Vec<_> = specs
+        .into_iter()
+        .filter(|(branch, _)| existing.contains(branch))
+        .collect();
+    let dropped = total - retained.len();
+    (retained, dropped)
 }
 
 /// The sibling's jj bookmark: the job row's `branch`, or the workspace marker.
@@ -1422,6 +1467,36 @@ async fn load_issue_info(db: &LocalDb, issue_id: &str) -> Result<Option<IssueInf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The store-truth sibling filter drops branches whose bookmark is gone (the
+    /// stale-`jobs`-row case) and counts them, but a `None` bookmark set (the
+    /// store-wide list failed) disables the filter and proceeds with all.
+    #[test]
+    fn retain_present_siblings_drops_missing_and_honors_none() {
+        let live = (
+            "agent/CAIRN-1-builder-0".to_string(),
+            std::path::PathBuf::from("/w/live"),
+        );
+        let ghost = (
+            "agent/CAIRN-1-ghost-0".to_string(),
+            std::path::PathBuf::from("/w/ghost"),
+        );
+        let existing: std::collections::HashSet<String> = [live.0.clone()].into_iter().collect();
+
+        let (retained, dropped) =
+            retain_present_siblings(vec![live.clone(), ghost.clone()], Some(&existing));
+        assert_eq!(
+            retained,
+            vec![live.clone()],
+            "the missing-bookmark sibling is dropped before any per-sibling jj work"
+        );
+        assert_eq!(dropped, 1);
+
+        // A failed store list (None) disables the filter: proceed with all.
+        let (all, none_dropped) = retain_present_siblings(vec![live.clone(), ghost.clone()], None);
+        assert_eq!(all, vec![live, ghost]);
+        assert_eq!(none_dropped, 0);
+    }
     use crate::db::DbState;
     use crate::services::testing::{MockGitClient, TestServicesBuilder};
     use crate::storage::{LocalDb, SearchIndex};

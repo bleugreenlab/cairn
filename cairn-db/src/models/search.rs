@@ -84,6 +84,12 @@ pub struct SearchFilters {
     pub issue_id: Option<String>,
     /// Filter to specific content types
     pub content_types: Option<Vec<String>>,
+    /// Filter to an author-role facet: `assistant`/`user`/`tool` for events,
+    /// `user`/`agent` for comments. Empty for issues/artifacts/messages.
+    pub role: Option<String>,
+    /// Match the query against the title field only (the `in=title` axis).
+    #[serde(default)]
+    pub title_only: bool,
     /// Only include results after this timestamp
     pub since: Option<i64>,
     /// Maximum results to return (default: 50, max: 100)

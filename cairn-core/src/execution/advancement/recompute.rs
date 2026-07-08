@@ -808,6 +808,250 @@ pub fn recompute_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
     recompute_execution_jobs(orch, &execution_id)
 }
 
+/// Terminalize a node-less delegated child job (an ephemeral call or a workflow)
+/// directly from its turn + artifact facts.
+///
+/// The execution sweep ([`recompute_execution_jobs_conn`]) only reduces jobs
+/// bound to a recipe node; it iterates the snapshot's recipe nodes and touches a
+/// job only through its `recipe_node_id`. A delegated child that carries a
+/// *pre-materialized* packet (`create_call_packet` — an ephemeral call or a
+/// workflow) has `recipe_node_id IS NULL` and is never lowered into a synthetic
+/// node, so it never appears in the sweep and [`recompute_job`] is a silent
+/// no-op for it. Without this its job status stays `running` after its run
+/// finalizes; its delegated packet (which resolves off the child's JOB status in
+/// `refresh_packet_state`) then never reaches a terminal state, and a durably
+/// suspended caller blocked on the resume gate hangs forever (CAIRN-2559).
+///
+/// This closes that gap: run it at the same turn-end sites as `recompute_job`,
+/// immediately before `try_resume_delegated_parent`, so the resolved packet
+/// wakes the caller in the same finalize pass. Returns the terminal status it
+/// wrote, or `None` when there was nothing to do — a node-backed job (the
+/// sweep's responsibility), a top-level job, an already-terminal child, or a
+/// non-terminal outcome (a live turn, or a crash whose interrupted turn must
+/// stay resumable so re-dispatch can replay).
+pub(crate) async fn reduce_delegated_child_job_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<Option<JobStatus>> {
+    let row = {
+        let mut rows = conn
+            .query(
+                "SELECT recipe_node_id, parent_job_id, status, execution_id
+                 FROM jobs WHERE id = ?1",
+                (job_id,),
+            )
+            .await?;
+        rows.next()
+            .await?
+            .map(|r| Ok::<_, DbError>((r.opt_text(0)?, r.opt_text(1)?, r.text(2)?, r.opt_text(3)?)))
+            .transpose()?
+    };
+    let Some((recipe_node_id, parent_job_id, status_str, execution_id)) = row else {
+        return Ok(None);
+    };
+    // Node-backed jobs (including the synthetic `delegated-*-agent` nodes the DAG
+    // expander mints for Task-tool delegations) and top-level jobs are the
+    // execution sweep's responsibility. Only a pre-materialized node-less child
+    // needs this direct reduction.
+    if recipe_node_id.is_some() || parent_job_id.is_none() {
+        return Ok(None);
+    }
+    let current: JobStatus = status_str.parse().map_err(DbError::internal)?;
+    if matches!(
+        current,
+        JobStatus::Complete | JobStatus::Failed | JobStatus::Cancelled
+    ) {
+        return Ok(None);
+    }
+
+    // Reduce only a child that IS the result target of a pre-materialized
+    // delegated packet (an ephemeral call or a workflow) — the exact set whose
+    // resume gate keys on this job's status. A packet-less node-less child (a
+    // `create_child_task` sub-agent) is left alone: it persists no output
+    // contract yet is still owed a fixed `result` artifact, so reducing it off an
+    // absent contract would derive `Complete` even when it never wrote `result`.
+    // Reading the required artifact name from the packet's own contract keeps the
+    // completion gate from ever drifting from the artifact the child must produce.
+    let Some(execution_id) = execution_id else {
+        return Ok(None);
+    };
+    let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
+    let Some(packet) = snapshot
+        .delegated_packets
+        .iter()
+        .find(|packet| packet.result_artifact_job_id.as_deref() == Some(job_id))
+    else {
+        return Ok(None);
+    };
+    let required_name = packet.output_contract.artifact_name();
+    let requires_output = true;
+    let artifact_present = artifact_present_for(conn, job_id, Some(&required_name)).await?;
+    let turn = latest_turn_state(conn, job_id).await?;
+    let facts = JobFacts {
+        dag_ready: true,
+        upstream_failed: false,
+        live_turn: latest_turn_is_live(conn, job_id).await?,
+        turn_failed: matches!(turn, Some(TurnState::Failed)),
+        turn_complete: matches!(turn, Some(TurnState::Complete)),
+        checkpoint: CheckpointGate::None,
+        resolution: Resolution::Pending,
+        requires_output,
+        artifact_present,
+        long_running: false,
+    };
+    let derived = derive_job_status(&facts);
+    // Only write a packet-resolving terminal. A live turn (still running) or a
+    // crash whose turn is interrupted derives non-terminal — leave the job
+    // resumable so re-dispatch can replay, exactly as the sweep leaves a
+    // node-backed crash resumable. `Blocked` (a completed turn owing an
+    // unwritten output) is likewise left in place: the run had no artifact, so
+    // the failure branches route through `fail_run` (turn Failed) instead.
+    if !matches!(derived, JobStatus::Complete | JobStatus::Failed) || derived == current {
+        return Ok(None);
+    }
+    check_reachable(&current, &derived, job_id);
+    write_job_status(conn, job_id, &current, &derived).await?;
+    Ok(Some(derived))
+}
+
+/// Owning-db wrapper around [`reduce_delegated_child_job_conn`] for the turn-end
+/// callers that hold an `Orchestrator` + `job_id`. Emits a coarse `jobs`/
+/// `executions` change on a write so the workflow monitoring panel's spinner
+/// clears. Node-backed / non-terminal cases are a cheap no-op.
+pub fn reduce_delegated_child_job(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<Option<JobStatus>, String> {
+    let db = run_advancement_db({
+        let dbs = orch.db.clone();
+        let job_id = job_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let job_id_owned = job_id.to_string();
+    let derived = run_advancement_db(async move {
+        db.write(|conn| {
+            let job_id = job_id_owned.clone();
+            Box::pin(async move { reduce_delegated_child_job_conn(conn, &job_id).await })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    if derived.is_some() {
+        for table in ["jobs", "executions"] {
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": table, "action": "update"}),
+            );
+        }
+    }
+    Ok(derived)
+}
+
+/// Startup safety net for the CAIRN-2559 stuck shape: a node-less delegated
+/// child (call/workflow) that finalized its run but whose job status was never
+/// terminalized — run terminal, job `running`, caller `blocked`. The forward fix
+/// (reduce at finalize) prevents this going forward, but a host that crashed
+/// under the old code is left holding it, and `redispatch_crashed_workflows`
+/// only re-spawns workflows whose latest run is NON-terminal, so it never
+/// revisits this shape. For each stuck child, reduce its status from its
+/// turn+artifact and — if that terminalized it — fire the resume gate so the
+/// durably suspended caller wakes. Idempotent and self-gating: reduce no-ops
+/// once terminal, and resume no-ops when there is no suspended parent to wake.
+/// Best-effort over EVERY open database (local + team replicas): a team-owned
+/// workflow/call writes its job, run, turns, artifacts, and execution snapshot
+/// into the team's replica (the forward paths route through
+/// `owning_db_for_job(parent_job_id)`), so a local-only scan would miss a stuck
+/// team child entirely. `reduce`/`resume` already route by job id, so only the
+/// candidate discovery has to fan out across databases. Errors are logged, never
+/// fatal.
+pub async fn heal_stuck_delegated_children(orch: &Orchestrator) {
+    // A job lives in exactly one database, so fan the candidate scan out across
+    // every open replica and route the repair per job id.
+    let mut stuck: Vec<String> = Vec::new();
+    for db in orch.db.all_dbs().await {
+        match db
+            .read(|conn| {
+                Box::pin(async move {
+                    // Scope to the genuine hang: a node-less child whose latest
+                    // run is terminal AND whose parent is durably suspended on
+                    // the resume gate — its `current_turn_id` points at a
+                    // still-`pending` successor turn (the shape
+                    // `prepare_parent_for_delegated_wait` leaves). This
+                    // deliberately excludes children whose caller already moved on
+                    // (e.g. a fast call resolved inline, parent `running` with no
+                    // pending successor), which need no wake.
+                    let mut rows = conn
+                        .query(
+                            "SELECT j.id FROM jobs j
+                             WHERE j.parent_job_id IS NOT NULL
+                               AND j.recipe_node_id IS NULL
+                               AND j.status IN ('running', 'pending', 'blocked')
+                               AND EXISTS (
+                                   SELECT 1 FROM runs r
+                                   WHERE r.job_id = j.id
+                                     AND r.status IN ('exited', 'failed', 'crashed')
+                                     AND r.id = (
+                                         SELECT id FROM runs
+                                         WHERE job_id = j.id
+                                         ORDER BY created_at DESC, rowid DESC LIMIT 1
+                                     )
+                               )
+                               AND EXISTS (
+                                   SELECT 1 FROM jobs pj
+                                   JOIN turns pt ON pt.id = pj.current_turn_id
+                                   WHERE pj.id = j.parent_job_id AND pt.state = 'pending'
+                               )",
+                            (),
+                        )
+                        .await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push(row.text(0)?);
+                    }
+                    Ok(out)
+                })
+            })
+            .await
+        {
+            Ok(mut ids) => stuck.append(&mut ids),
+            Err(e) => {
+                log::warn!(
+                    "heal_stuck_delegated_children: candidate scan failed on a database: {e}"
+                )
+            }
+        }
+    }
+    if stuck.is_empty() {
+        return;
+    }
+    let mut healed = 0usize;
+    for job_id in stuck {
+        match reduce_delegated_child_job(orch, &job_id) {
+            Ok(Some(status)) => {
+                healed += 1;
+                if let Err(e) =
+                    crate::execution::delegation::resume_suspended_parent_after_task_completion(
+                        orch, &job_id,
+                    )
+                {
+                    log::warn!(
+                        "heal: resume after terminalizing stuck child {job_id} as {status} failed: {e}"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => log::warn!("heal: reduce of stuck delegated child {job_id} failed: {e}"),
+        }
+    }
+    if healed > 0 {
+        log::info!("Healed {healed} stuck node-less delegated child job(s) on startup");
+    }
+}
+
 /// The single entry point every former decider calls: run the execution sweep in
 /// a write transaction, then emit the follow-on effects keyed by each derived edge.
 pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Result<(), String> {

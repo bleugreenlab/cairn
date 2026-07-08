@@ -2020,6 +2020,7 @@ mod tests {
                     impact: Some(vec!["src-tauri/**".to_string()]),
                     policy: crate::config::project_settings::CheckPolicy::Gate,
                     when: crate::config::project_settings::CheckWhen::Review,
+                    timeout: None,
                 },
             ),
             (
@@ -2029,6 +2030,7 @@ mod tests {
                     impact: None,
                     policy: crate::config::project_settings::CheckPolicy::Advisory,
                     when: crate::config::project_settings::CheckWhen::Write,
+                    timeout: None,
                 },
             ),
         ]);

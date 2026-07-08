@@ -190,6 +190,16 @@ pub fn build_node_terminal_uri(
     build_node_segmented_resource_uri(project, number, exec_seq, node_id, "terminal", slug)
 }
 
+pub fn build_node_repl_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    slug: &str,
+) -> String {
+    build_node_segmented_resource_uri(project, number, exec_seq, node_id, "repl", slug)
+}
+
 pub fn build_task_terminal_uri(
     project: &str,
     number: i32,
@@ -602,6 +612,13 @@ impl CairnResource {
                 node_id,
                 slug,
             } => build_node_terminal_uri(project, *number, *exec_seq, node_id, slug),
+            Self::NodeRepl {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                slug,
+            } => build_node_repl_uri(project, *number, *exec_seq, node_id, slug),
             Self::TaskTerminal {
                 project,
                 number,

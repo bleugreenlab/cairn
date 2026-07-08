@@ -14,7 +14,23 @@ pub(crate) const PROJECT_CONTRACT: ResourceContract = ResourceContract {
     read_projections: &[
         ProjectionSpec {
             key: "search",
-            values: "QUERY (full-text across the project)",
+            values: "QUERY (full-text; AND across words, prefix-fuzzy last word, title-boosted, recency-tiebroken)",
+        },
+        ProjectionSpec {
+            key: "content_types",
+            values: "issue,comment,artifact,event,message (comma-separated)",
+        },
+        ProjectionSpec {
+            key: "role",
+            values: "assistant|user|tool (events) | user|agent (comments)",
+        },
+        ProjectionSpec {
+            key: "in",
+            values: "title (match the title field only)",
+        },
+        ProjectionSpec {
+            key: "issue",
+            values: "NUMBER (search within one issue's history)",
         },
         ProjectionSpec {
             key: "limit",

@@ -558,6 +558,9 @@ pub fn reconcile_siblings(
         return Ok(report);
     }
 
+    // Missing-bookmark siblings are filtered upstream in `reconcile_base_advance`
+    // (one store-wide bookmark list before ANY per-sibling jj work), so every
+    // sibling reaching this loop has a live bookmark. See `retain_present_siblings`.
     for (branch, ws_path) in siblings {
         // Idempotent skip: when the sibling already descends from the exact dest
         // commit, a re-rebase would re-rewrite its (clean or conflicted) commit
@@ -674,6 +677,17 @@ pub fn advance_workspace_onto(
     ws_branch: &str,
     dest: &str,
 ) -> Result<bool, String> {
+    // Skip a workspace whose directory is gone: the rebase drives from the store,
+    // but `update_stale` (and the conflict check below) operate inside `ws_path`,
+    // so a missing workspace can only fail. A base advance that still lists a
+    // long-reclaimed on-branch workspace would otherwise spawn a doomed rebase.
+    if !ws_path.exists() {
+        log::debug!(
+            "jj advance: workspace {} no longer exists; skipping",
+            ws_path.display()
+        );
+        return Ok(false);
+    }
     let source = format!("{}@", workspace_name_for_branch(ws_branch));
     // Idempotent skip: when `@` already descends from `dest`, a re-rebase would
     // re-rewrite the working-copy commit (and could mint a divergent copy under

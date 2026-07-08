@@ -9,183 +9,8 @@ pub struct PopulateResult {
     pub failed: usize,
 }
 
-#[derive(Debug, Default)]
-pub struct SeedResult {
-    pub cloned: usize,
-    pub skipped: usize,
-    pub failed: usize,
-}
-
-fn expand_seed_from(from: &str) -> PathBuf {
-    if from == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
-    } else if let Some(rest) = from.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(from)
-}
-
-fn slash_path(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-fn prune_seed_excludes(
-    fs: &dyn FileSystem,
-    root: &Path,
-    exclude_set: &globset::GlobSet,
-) -> (usize, usize) {
-    let mut removed = 0;
-    let mut failed = 0;
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(path) = stack.pop() {
-        let rel = match path.strip_prefix(root) {
-            Ok(rel) => rel,
-            Err(e) => {
-                log::warn!(
-                    "Seed path {} was not under destination {}: {}",
-                    path.display(),
-                    root.display(),
-                    e
-                );
-                failed += 1;
-                continue;
-            }
-        };
-
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(e) => {
-                log::warn!(
-                    "Failed to inspect cloned seed path {}: {}",
-                    path.display(),
-                    e
-                );
-                failed += 1;
-                continue;
-            }
-        };
-
-        if !rel.as_os_str().is_empty() && exclude_set.is_match(slash_path(rel)) {
-            let removed_path = if metadata.is_dir() {
-                fs.remove_dir_all(&path)
-            } else {
-                fs.remove_file(&path)
-            };
-            match removed_path {
-                Ok(()) => removed += 1,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to prune excluded seed path {}: {}",
-                        path.display(),
-                        e
-                    );
-                    failed += 1;
-                }
-            }
-            continue;
-        }
-
-        if metadata.is_dir() {
-            let entries = match std::fs::read_dir(&path) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to read cloned seed directory {}: {}",
-                        path.display(),
-                        e
-                    );
-                    failed += 1;
-                    continue;
-                }
-            };
-            for entry in entries {
-                match entry {
-                    Ok(entry) => stack.push(entry.path()),
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to read cloned seed directory entry under {}: {}",
-                            path.display(),
-                            e
-                        );
-                        failed += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    (removed, failed)
-}
-
-pub fn seed_worktree(
-    fs: &dyn FileSystem,
-    worktree_path: &Path,
-    seeds: &[SeedEntry],
-) -> Result<SeedResult, String> {
-    let mut result = SeedResult::default();
-
-    let started = std::time::Instant::now();
-
-    for seed in seeds {
-        let from = expand_seed_from(&seed.from);
-        if !fs.exists(&from) {
-            log::info!("Seed source {} is absent; skipping", from.display());
-            result.skipped += 1;
-            continue;
-        }
-
-        let exclude_set = build_glob_set(&seed.exclude)?;
-        let to = worktree_path.join(seed.to.trim_matches('/'));
-        if fs.exists(&to) || fs.is_symlink(&to) {
-            log::info!(
-                "Seed destination {} already exists; skipping {}",
-                to.display(),
-                from.display()
-            );
-            result.skipped += 1;
-            continue;
-        }
-
-        match fs.reflink_dir(&from, &to) {
-            Ok(()) => {
-                result.cloned += 1;
-                let (skipped, failed) = prune_seed_excludes(fs, &to, &exclude_set);
-                result.skipped += skipped;
-                result.failed += failed;
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to seed {} to {}: {}",
-                    from.display(),
-                    to.display(),
-                    e
-                );
-                result.failed += 1;
-            }
-        }
-    }
-
-    log::info!(
-        "Seeded external worktree content ({} cloned, {} skipped, {} failed) in {:?}",
-        result.cloned,
-        result.skipped,
-        result.failed,
-        started.elapsed()
-    );
-
-    Ok(result)
-}
-
-use crate::config::project_settings::{PopulateConfig, SeedEntry};
-use std::path::{Path, PathBuf};
+use crate::config::project_settings::PopulateConfig;
+use std::path::Path;
 
 /// Determine the population strategy for a given path.
 ///
@@ -376,7 +201,6 @@ mod tests {
     use super::*;
     use crate::services::testing::{MockFileSystem, MockGitClient};
     use crate::services::GitOutput;
-    use crate::services::RealFileSystem;
     // Tests for populate_worktree
 
     fn git_ls_files_output(entries: &[&str]) -> GitOutput {
@@ -442,7 +266,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -460,7 +283,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![],
             symlink: vec![".cairn/".to_string()],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -478,7 +300,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec!["target/".to_string()],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -518,7 +339,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -544,7 +364,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env*".to_string()],
             symlink: vec![".env*".to_string()],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -568,7 +387,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -585,7 +403,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -611,7 +428,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec!["node_modules/".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -642,7 +458,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec!["[invalid".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         let result = populate_with(&git, &fs, &config);
@@ -657,7 +472,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run().returning(|_, _| {
@@ -680,7 +494,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![".env*".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -714,7 +527,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec![],
             symlink: vec!["node_modules/".to_string()],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -745,7 +557,6 @@ mod tests {
         let config = PopulateConfig {
             copy: vec!["build/".to_string()],
             symlink: vec![],
-            seed: vec![],
         };
 
         git.expect_run()
@@ -761,134 +572,5 @@ mod tests {
         let r = populate_ok(&git, &fs, &config);
         assert_eq!(r.copied, 0);
         assert_eq!(r.failed, 1);
-    }
-    #[test]
-    fn test_seed_worktree_clones_directory_tree() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let source = temp.path().join("source");
-        let worktree = temp.path().join("worktree");
-        std::fs::create_dir_all(source.join("debug")).unwrap();
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(source.join("debug").join("dep.rlib"), "dep").unwrap();
-
-        let result = seed_worktree(
-            &RealFileSystem,
-            &worktree,
-            &[SeedEntry {
-                from: source.display().to_string(),
-                to: "target".to_string(),
-                exclude: vec![],
-            }],
-        )
-        .unwrap();
-
-        assert_eq!(result.cloned, 1);
-        assert_eq!(result.skipped, 0);
-        assert_eq!(result.failed, 0);
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("target/debug/dep.rlib")).unwrap(),
-            "dep"
-        );
-    }
-
-    #[test]
-    fn test_seed_worktree_prunes_excluded_subtree() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let source = temp.path().join("source");
-        let worktree = temp.path().join("worktree");
-        std::fs::create_dir_all(source.join("debug").join("incremental")).unwrap();
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(source.join("debug").join("dep.rlib"), "dep").unwrap();
-        std::fs::write(
-            source.join("debug").join("incremental").join("session.o"),
-            "incremental",
-        )
-        .unwrap();
-
-        let result = seed_worktree(
-            &RealFileSystem,
-            &worktree,
-            &[SeedEntry {
-                from: source.display().to_string(),
-                to: "target".to_string(),
-                exclude: vec!["*/incremental".to_string()],
-            }],
-        )
-        .unwrap();
-
-        assert_eq!(result.cloned, 1);
-        assert_eq!(result.skipped, 1);
-        assert_eq!(result.failed, 0);
-        assert!(worktree.join("target/debug/dep.rlib").exists());
-        assert!(!worktree.join("target/debug/incremental").exists());
-    }
-
-    #[test]
-    fn test_seed_worktree_skips_missing_source() {
-        let mut fs = MockFileSystem::new();
-        fs.expect_exists().returning(|_| false);
-
-        let result = seed_worktree(
-            &fs,
-            Path::new("/worktree"),
-            &[SeedEntry {
-                from: "/missing/source".to_string(),
-                to: "target".to_string(),
-                exclude: vec![],
-            }],
-        )
-        .unwrap();
-
-        assert_eq!(result.cloned, 0);
-        assert_eq!(result.skipped, 1);
-        assert_eq!(result.failed, 0);
-    }
-
-    #[test]
-    fn test_seed_worktree_continues_after_directory_failure() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let source_a = temp.path().join("source-a");
-        let source_b = temp.path().join("source-b");
-        let worktree = temp.path().join("worktree");
-        std::fs::create_dir_all(&source_a).unwrap();
-        std::fs::create_dir_all(&source_b).unwrap();
-        std::fs::create_dir_all(&worktree).unwrap();
-        std::fs::write(source_a.join("a.rlib"), "a").unwrap();
-        std::fs::write(source_b.join("b.rlib"), "b").unwrap();
-        std::fs::write(worktree.join("blocked"), "not a directory").unwrap();
-
-        let result = seed_worktree(
-            &RealFileSystem,
-            &worktree,
-            &[
-                SeedEntry {
-                    from: source_a.display().to_string(),
-                    to: "blocked/target-a".to_string(),
-                    exclude: vec![],
-                },
-                SeedEntry {
-                    from: source_b.display().to_string(),
-                    to: "target-b".to_string(),
-                    exclude: vec![],
-                },
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(result.cloned, 1);
-        assert_eq!(result.failed, 1);
-        assert_eq!(
-            std::fs::read_to_string(worktree.join("target-b/b.rlib")).unwrap(),
-            "b"
-        );
-    }
-
-    #[test]
-    fn test_seed_tilde_expansion_resolves_home() {
-        let Some(home) = dirs::home_dir() else {
-            return;
-        };
-
-        assert_eq!(expand_seed_from("~/warm/target"), home.join("warm/target"));
     }
 }

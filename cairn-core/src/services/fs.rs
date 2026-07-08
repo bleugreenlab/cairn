@@ -46,10 +46,15 @@ pub trait FileSystem: Send + Sync {
     /// destination if they don't exist.
     fn reflink_file(&self, from: &Path, to: &Path) -> Result<(), String>;
 
-    /// Copy-on-write clone a directory tree when the filesystem supports it,
-    /// falling back to recursive file reflinks/copies otherwise. The destination
-    /// must not already exist.
-    fn reflink_dir(&self, from: &Path, to: &Path) -> Result<(), String>;
+    /// STRICTLY copy-on-write clone a directory tree, with NO byte-copy fallback.
+    /// Returns `Err` whenever a cheap COW clone is unavailable (a non-APFS volume,
+    /// a cross-volume destination, or a clone failure) so the caller can route to a
+    /// non-cloning path instead of silently deep-copying a multi-GB build tree
+    /// (`src-tauri/target`, `node_modules`). The destination must not already
+    /// exist. macOS-only for now; other platforms always `Err` (a Linux
+    /// reflink-per-file variant can come later — the sequential fallback covers
+    /// those hosts).
+    fn try_clone_dir_cow(&self, from: &Path, to: &Path) -> Result<(), String>;
 
     /// Create a symbolic link at `link` pointing to `target`.
     /// On Windows, uses a directory junction for directories.
@@ -155,10 +160,10 @@ impl FileSystem for RealFileSystem {
         }
     }
 
-    fn reflink_dir(&self, from: &Path, to: &Path) -> Result<(), String> {
+    fn try_clone_dir_cow(&self, from: &Path, to: &Path) -> Result<(), String> {
         if to.exists() || self.is_symlink(to) {
             return Err(format!(
-                "Destination already exists and cannot be directory-cloned: {:?}",
+                "Destination already exists and cannot be COW-cloned: {:?}",
                 to
             ));
         }
@@ -169,22 +174,13 @@ impl FileSystem for RealFileSystem {
 
         #[cfg(target_os = "macos")]
         {
-            if from.is_dir() {
-                match clonefile_dir(from, to) {
-                    Ok(()) => return Ok(()),
-                    Err(error) => {
-                        log::debug!(
-                            "clonefile failed for {} to {}; falling back to recursive reflink/copy: {}",
-                            from.display(),
-                            to.display(),
-                            error
-                        );
-                    }
-                }
-            }
+            clonefile_dir(from, to)
         }
-
-        self.copy_dir_recursive(from, to)
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = from;
+            Err("COW directory clone not supported on this platform".to_string())
+        }
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> Result<(), String> {

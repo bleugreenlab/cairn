@@ -106,6 +106,53 @@ fn path_set(paths: Vec<PathBuf>) -> HashSet<String> {
         .collect()
 }
 
+/// A non-binary file above the mmap-safe cap makes the warm index bail
+/// (CAIRN-2574 crash-proofing), so the ripgrep walk the caller falls through to
+/// must still find every match the warm path declines to serve. Proves the
+/// completeness contract holds across the bail boundary.
+#[test]
+fn oversized_file_bails_warm_but_cold_walk_still_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    write_file(root, "small.rs", "needle small\n");
+    let big = format!("needle big\n{}\n", "abcd ".repeat(80_000));
+    write_file(root, "big.rs", &big);
+
+    let search = WorktreeSearch::new(root).unwrap();
+    assert!(search.wait_for_scan(Duration::from_secs(15)));
+
+    // Warm path: the oversized in-scope file forces a bail to the fallback.
+    assert!(
+        search
+            .try_grep(
+                &WorktreeGrepParams {
+                    pattern: "needle".to_string(),
+                    subdir: None,
+                    globs: Vec::new(),
+                    max_per_file: None,
+                    output_mode: "files_with_matches".to_string(),
+                    case_insensitive: None,
+                    before_context: 0,
+                    after_context: 0,
+                    show_line_numbers: true,
+                },
+                &[],
+            )
+            .is_none(),
+        "oversized in-scope file bails the warm index to the ripgrep fallback"
+    );
+
+    // Cold walk (the fallback the caller uses on None) still finds both files.
+    let cold = cold_grep(root, None, "files_with_matches", 0, 0, Vec::new());
+    let files: HashSet<&str> = cold.lines().collect();
+    assert!(
+        files.contains("small.rs"),
+        "cold walk finds small: {cold:?}"
+    );
+    assert!(files.contains("big.rs"), "cold walk finds big: {cold:?}");
+}
+
 #[test]
 fn index_grep_glob_filter_matches_walk_override_semantics() {
     let dir = tempfile::tempdir().unwrap();

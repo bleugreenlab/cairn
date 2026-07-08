@@ -539,6 +539,242 @@ async fn fail_run_on_top_level_job_stays_resumable() {
     );
 }
 
+/// Seed a parent durably suspended on a delegated wait (anchor turn + pending
+/// `dependency_unblock` successor) and a NODE-LESS delegated child — a workflow
+/// (or ephemeral call) whose pre-materialized packet gives it no recipe node, so
+/// the execution sweep never reduces its status. The child has run its turn and
+/// written its output artifact; its `run` is still `live` and its job is still
+/// `running`. `finalize_run(Exited)` must complete the turn, terminalize the
+/// node-less job, and fire the resume gate. This is the exact CAIRN-2559 shape.
+async fn seed_suspended_parent_with_completed_nodeless_child(db: &LocalDb, snapshot: String) {
+    db.write(|conn| {
+            let snapshot = snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-wf','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-wf','p-wf',1,'T','active','none',1,1)", ()).await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-wf','recipe','i-wf','p-wf','running',1,1,?1)",
+                    (snapshot.as_str(),),
+                ).await?;
+                // Suspended parent: yielded anchor + the pending successor it points at.
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('anchor','s-parent','j-parent',1,'yielded','dependency_wait','initial',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at) VALUES ('succ','s-parent','j-parent',2,'anchor','pending','dependency_unblock',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, current_turn_id, created_at, updated_at) VALUES ('j-parent','e-wf','i-wf','p-wf','running','succ',1,1)", ()).await?;
+                // Node-less workflow child: recipe_node_id NULL, an output
+                // contract on the job, a running turn (finalize completes it),
+                // and its written `return` artifact.
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, output_contract, agent_config_id, created_at, updated_at) VALUES ('j-child','e-wf','j-parent','i-wf','p-wf','running','{\"schemaType\":{\"type\":\"object\"},\"description\":\"Submit\"}','workflow',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','live',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('child-turn','s-child','run-child','j-child',1,'running','initial',1,1)", ()).await?;
+                conn.execute("UPDATE jobs SET current_turn_id='child-turn' WHERE id='j-child'", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-child','j-child','return',1,'{\"question\":\"q\",\"summary\":\"s\"}',1,'return',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+}
+
+fn completed_nodeless_child_snapshot(packet_status: &str) -> String {
+    serde_json::json!({
+            "recipe": {"id": "r", "name": "R", "description": null, "trigger": "manual", "nodes": [], "edges": []},
+            "agents": {},
+            "skills": {},
+            "triggerContext": {"issueId": "i-wf", "projectId": "p-wf", "triggerType": "manual"},
+            "delegatedPackets": [{
+                "id": "pkt-1",
+                "parentJobId": "j-parent",
+                "parentTurnId": "anchor",
+                "parentToolUseId": "tool-1",
+                "origin": "call_tool",
+                "title": "deep-research",
+                "problemStatement": "x",
+                "agentConfigId": "workflow",
+                "ownership": {"cwd": "/tmp"},
+                "outputContract": {"schemaType": {"type": "object"}, "description": "Submit"},
+                "resultArtifactJobId": "j-child",
+                "status": packet_status,
+                "taskIndex": 0,
+                "createdAt": 0
+            }],
+            "createdAt": 0
+        })
+        .to_string()
+}
+
+/// The CAIRN-2559 clean path: a node-less workflow child that exits 0 with its
+/// output artifact written must be terminalized `complete` on `finalize_run`
+/// (the execution sweep can't reach a node-less job), so its delegated packet
+/// resolves and the durably-suspended caller's resume gate fires. Before the fix
+/// the child job stayed `running`, the packet stayed `running`, and the parent
+/// hung `blocked` forever.
+#[tokio::test]
+async fn finalize_exit_terminalizes_nodeless_workflow_child_and_resumes_parent() {
+    let db = test_db().await;
+    seed_suspended_parent_with_completed_nodeless_child(
+        &db,
+        completed_nodeless_child_snapshot("running"),
+    )
+    .await;
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-child", Some("j-child"));
+    orch.process_state
+        .set_current_turn_id("run-child", Some("child-turn"));
+
+    assert_eq!(turn_state(&orch, "succ").await, "pending");
+
+    finalize_run(&orch, "run-child", RunStatus::Exited);
+
+    // The child's running turn completed on clean exit.
+    assert_eq!(turn_state(&orch, "child-turn").await, "complete");
+    // The node-less workflow job is terminalized `complete` (the fix — the
+    // sweep leaves it `running`).
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+            .await
+            .as_deref(),
+        Some("complete"),
+    );
+    // The resume gate fired: the parent's pending successor was claimed.
+    assert_eq!(turn_state(&orch, "succ").await, "complete");
+}
+
+/// The failure branch of the same shape: a node-less workflow child whose turn
+/// genuinely fails (exit-without-artifact / non-zero exit routes through
+/// `fail_run`) must terminalize `failed`, so its packet resolves `Failed` and
+/// the suspended caller resumes with the failure instead of hanging.
+#[tokio::test]
+async fn fail_run_terminalizes_nodeless_workflow_child_and_resumes_parent() {
+    let db = test_db().await;
+    // No artifact seeded: this child ran but never satisfied its output contract.
+    db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-wf','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-wf','p-wf',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-wf','recipe','i-wf','p-wf','running',1,1,?1)", (completed_nodeless_child_snapshot("running").as_str(),)).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('anchor','s-parent','j-parent',1,'yielded','dependency_wait','initial',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at) VALUES ('succ','s-parent','j-parent',2,'anchor','pending','dependency_unblock',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, current_turn_id, created_at, updated_at) VALUES ('j-parent','e-wf','i-wf','p-wf','running','succ',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, output_contract, agent_config_id, created_at, updated_at) VALUES ('j-child','e-wf','j-parent','i-wf','p-wf','running','{\"schemaType\":{\"type\":\"object\"},\"description\":\"Submit\"}','workflow',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','live',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('child-turn','s-child','run-child','j-child',1,'running','initial',1,1)", ()).await?;
+                conn.execute("UPDATE jobs SET current_turn_id='child-turn' WHERE id='j-child'", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-child", Some("j-child"));
+    orch.process_state
+        .set_current_turn_id("run-child", Some("child-turn"));
+
+    assert_eq!(turn_state(&orch, "succ").await, "pending");
+
+    super::fail_run(&orch, "run-child", "workflow exited without output");
+
+    assert_eq!(turn_state(&orch, "child-turn").await, "failed");
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+            .await
+            .as_deref(),
+        Some("failed"),
+    );
+    assert_eq!(turn_state(&orch, "succ").await, "complete");
+}
+
+/// Startup safety net: an *already-stuck* node-less child — run terminal
+/// (`exited`), turn already `complete`, artifact written, but job still
+/// `running` and caller `blocked` — is the shape a host crash under the old code
+/// leaves behind. `heal_stuck_delegated_children` must terminalize it and fire
+/// the resume gate, since `redispatch_crashed_workflows` (non-terminal runs
+/// only) never revisits it.
+#[tokio::test]
+async fn startup_heal_recovers_stuck_nodeless_child_and_resumes_parent() {
+    let db = test_db().await;
+    db.write(|conn| {
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-wf','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-wf','p-wf',1,'T','waiting','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-wf','recipe','i-wf','p-wf','running',1,1,?1)", (completed_nodeless_child_snapshot("running").as_str(),)).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('anchor','s-parent','j-parent',1,'yielded','dependency_wait','initial',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, predecessor_id, state, start_reason, created_at, updated_at) VALUES ('succ','s-parent','j-parent',2,'anchor','pending','dependency_unblock',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, current_turn_id, created_at, updated_at) VALUES ('j-parent','e-wf','i-wf','p-wf','running','succ',1,1)", ()).await?;
+                // The stuck shape: run exited, turn already complete, artifact
+                // written, but job never terminalized.
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, output_contract, agent_config_id, created_at, updated_at) VALUES ('j-child','e-wf','j-parent','i-wf','p-wf','running','{\"schemaType\":{\"type\":\"object\"},\"description\":\"Submit\"}','workflow',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES ('run-child','j-child','exited',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('child-turn','s-child','run-child','j-child',1,'complete','initial',1,1)", ()).await?;
+                conn.execute("UPDATE jobs SET current_turn_id='child-turn' WHERE id='j-child'", ()).await?;
+                conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a-child','j-child','return',1,'{\"question\":\"q\",\"summary\":\"s\"}',1,'return',1,1)", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    let orch = test_orchestrator(db);
+
+    assert_eq!(turn_state(&orch, "succ").await, "pending");
+
+    crate::execution::advancement::heal_stuck_delegated_children(&orch).await;
+
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-child")
+            .await
+            .as_deref(),
+        Some("complete"),
+    );
+    assert_eq!(turn_state(&orch, "succ").await, "complete");
+}
+
+/// Regression: the node-less reducer must NOT touch a packet-less child — a
+/// `create_child_task` sub-agent has `parent_job_id` set and `recipe_node_id`
+/// NULL just like a call/workflow, but persists no output contract and has no
+/// pre-materialized delegated packet, while still being owed a `result`
+/// artifact. Reducing it off its absent contract would derive `Complete` even
+/// though it never wrote `result`. It must stay `running`.
+#[tokio::test]
+async fn reduce_leaves_packetless_child_task_untouched() {
+    let empty_snapshot = serde_json::json!({
+        "recipe": {"id": "r", "name": "R", "description": null, "trigger": "manual", "nodes": [], "edges": []},
+        "agents": {},
+        "skills": {},
+        "triggerContext": {"issueId": "i-ct", "projectId": "p-ct", "triggerType": "manual"},
+        "delegatedPackets": [],
+        "createdAt": 0
+    })
+    .to_string();
+    let db = test_db().await;
+    db.write(|conn| {
+            let s = empty_snapshot.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-ct','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-ct','w-ct','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-ct','p-ct',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-ct','recipe','i-ct','p-ct','running',1,1,?1)", (s.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, created_at, updated_at) VALUES ('j-ct-parent','e-ct','i-ct','p-ct','running',1,1)", ()).await?;
+                // A create_child_task child: node-less, NO output_contract, NO
+                // packet, a completed turn, and no `result` artifact written.
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, agent_config_id, created_at, updated_at) VALUES ('j-ct-child','e-ct','j-ct-parent','i-ct','p-ct','running','Explore',1,1)", ()).await?;
+                conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('ct-turn','s-ct','j-ct-child',1,'complete','initial',1,1)", ()).await?;
+                conn.execute("UPDATE jobs SET current_turn_id='ct-turn' WHERE id='j-ct-child'", ()).await?;
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    let orch = test_orchestrator(db);
+
+    let outcome =
+        crate::execution::advancement::reduce_delegated_child_job(&orch, "j-ct-child").unwrap();
+    assert!(
+        outcome.is_none(),
+        "a packet-less child task must not be reduced by the node-less reducer"
+    );
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "j-ct-child")
+            .await
+            .as_deref(),
+        Some("running"),
+        "a child task that never wrote its result must not be marked complete",
+    );
+}
+
 async fn scalar_text(orch: &Orchestrator, sql: &'static str, id: &str) -> Option<String> {
     let id = id.to_string();
     orch.db

@@ -28,6 +28,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "questions",
     "question",
     "terminal",
+    "repl",
     "browser",
     "task",
     "messages",
@@ -125,6 +126,17 @@ pub enum CairnResource {
         symbol: Option<String>,
     },
     NodeTerminal {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        slug: String,
+    },
+    /// A node's stateful REPL session (`.../{node}/repl/{slug}`). The live
+    /// eval-server process is held in the orchestrator's in-memory
+    /// `ReplState`; there is no durable row, so it is node-scoped only and does
+    /// not survive a host restart.
+    NodeRepl {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -569,6 +581,7 @@ impl CairnResource {
             Self::NodeArtifact { .. } => ResourceKind::NodeArtifact,
             Self::NodeChanged { .. } => ResourceKind::NodeChanged,
             Self::NodeTerminal { .. } => ResourceKind::NodeTerminal,
+            Self::NodeRepl { .. } => ResourceKind::NodeRepl,
             Self::TaskTerminal { .. } => ResourceKind::TaskTerminal,
             Self::NodeBrowser { .. } => ResourceKind::NodeBrowser,
             Self::TaskBrowser { .. } => ResourceKind::TaskBrowser,

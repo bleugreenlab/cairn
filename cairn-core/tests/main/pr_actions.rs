@@ -897,7 +897,7 @@ async fn reconcile_after_merge_for_action_run_owner_stores_files_under_parent_jo
         .await
         .unwrap();
 
-    actions::reconcile_after_merge(orch.clone(), ctx, false).await;
+    actions::reconcile_after_merge(orch.clone(), orch.db.local.clone(), ctx, false).await;
 
     assert_eq!(
         file_change_count_for_job(&orch.db.local, &parent_job).await,

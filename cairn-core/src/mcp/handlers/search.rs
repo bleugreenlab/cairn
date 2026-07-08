@@ -19,6 +19,12 @@ use std::time::Duration;
 pub struct SearchPayload {
     pub query: String,
     pub content_types: Option<Vec<String>>,
+    /// Author-role facet: `assistant`/`user`/`tool` for events, `user`/`agent`
+    /// for comments.
+    pub role: Option<String>,
+    /// Match the query against the title field only (the `in=title` axis).
+    #[serde(default)]
+    pub title_only: bool,
     pub project_id: Option<String>,
     pub issue_id: Option<String>,
     pub since: Option<i64>,
@@ -35,6 +41,8 @@ pub async fn handle_search(orch: &Orchestrator, request: &McpCallbackRequest) ->
     let SearchPayload {
         query,
         content_types,
+        role,
+        title_only,
         project_id,
         issue_id,
         since,
@@ -53,6 +61,8 @@ pub async fn handle_search(orch: &Orchestrator, request: &McpCallbackRequest) ->
         project_id,
         issue_id,
         content_types,
+        role,
+        title_only,
         since,
         limit,
     };

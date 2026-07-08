@@ -77,6 +77,9 @@ fn apply_fields(agent: &mut FileAgent, payload: &serde_json::Value) -> Result<()
     if let Some(backend) = super::payload_str(payload, "backend", &[]) {
         agent.backend_preference = Some(backend.to_string());
     }
+    if let Some(icon) = super::payload_str(payload, "icon", &[]) {
+        agent.icon = Some(icon.to_string());
+    }
     if let Some(fence) = parse_enum::<Fence>(payload, "fence", None)? {
         agent.fence = Some(fence);
     } else {
@@ -117,6 +120,7 @@ fn validate_roundtrip(agent: &FileAgent) -> Result<(), String> {
         skills: agent.skills.as_deref(),
         hooks: agent.hooks.as_ref(),
         backend_preference: agent.backend_preference.as_deref(),
+        icon: agent.icon.as_deref(),
     });
     parse_agent_markdown(&markdown).map(|_| ())
 }
@@ -172,6 +176,7 @@ pub(super) async fn apply_agent_create(
         skills: None,
         hooks: None,
         backend_preference: None,
+        icon: None,
         is_project_scoped,
         file_path: PathBuf::new(),
     };

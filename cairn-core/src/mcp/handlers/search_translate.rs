@@ -11,11 +11,41 @@ pub(crate) enum TranslatedSearch {
         after_context: usize,
         show_line_numbers: bool,
         max_per_file: Option<usize>,
-        path: Option<String>,
+        /// Zero or more search-path arguments within the run worktree. Empty =
+        /// whole-worktree search (`path = None` in the old single-path shape).
+        paths: Vec<String>,
     },
     Files {
         globs: Vec<String>,
         path: Option<String>,
+    },
+}
+
+/// A translated head-stage search plus its ordered tail of post-filter stages.
+/// `post` is empty for a bare `rg`/`grep`; a non-empty `post` is a whitelisted
+/// pipeline (`| head`, `| tail`, `| grep -v`, ...) applied to the head stage's
+/// output in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TranslatedSearchPipeline {
+    pub search: TranslatedSearch,
+    pub post: Vec<PostFilter>,
+}
+
+/// A pure line-transform tail stage of a translated search pipeline. Every
+/// variant is a whitelisted transform the run() layer can reproduce faithfully
+/// on the head stage's output stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PostFilter {
+    /// `head -N` / `head -n N` / bare `head` (coreutils default 10).
+    Head(usize),
+    /// `tail -N` / `tail -n N` / bare `tail` (coreutils default 10).
+    Tail(usize),
+    /// `grep [-v] [-i] [-F] PATTERN` as a line filter (no `-r`/paths). `pattern`
+    /// is already BRE-converted (or `-F`-escaped) to the index dialect.
+    Grep {
+        pattern: String,
+        invert: bool,
+        case_insensitive: bool,
     },
 }
 
@@ -25,14 +55,228 @@ struct Token {
     has_unquoted_expansion: bool,
 }
 
-pub(crate) fn translate_search_command(command: &str) -> Option<TranslatedSearch> {
-    let tokens = tokenize(command)?;
+pub(crate) fn translate_search_command(command: &str) -> Option<TranslatedSearchPipeline> {
+    let stages = split_pipeline(command)?;
+    let (head, tail) = stages.split_first()?;
+    let search = translate_head_stage(head)?;
+    let mut post = Vec::with_capacity(tail.len());
+    for stage in tail {
+        let tokens = tokenize(stage)?;
+        post.push(parse_post_filter(&tokens)?);
+    }
+    Some(TranslatedSearchPipeline { search, post })
+}
+
+fn translate_head_stage(stage: &str) -> Option<TranslatedSearch> {
+    let tokens = tokenize(stage)?;
     let first = tokens.first()?;
     match first.text.as_str() {
         "rg" => translate_rg(&tokens[1..]),
         "grep" => translate_grep(&tokens[1..]),
         _ => None,
     }
+}
+
+/// Split a command on top-level unquoted pipes, preserving each stage's original
+/// quoting so `tokenize` can re-parse it. Rejects `||` (logical-or we cannot
+/// emulate) and empty stages (a leading, trailing, or doubled pipe). Other shell
+/// operators (`;`, `&`, `>`, `<`, `` ` ``, `$`) stay inside their stage and still
+/// hard-reject the whole command when `tokenize` sees them.
+fn split_pipeline(command: &str) -> Option<Vec<String>> {
+    let mut stages = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_single {
+            current.push(ch);
+            if ch == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '\\' {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+                continue;
+            }
+            current.push(ch);
+            if ch == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => {
+                in_single = true;
+                current.push(ch);
+            }
+            '"' => {
+                in_double = true;
+                current.push(ch);
+            }
+            '\\' => {
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '|' => {
+                if chars.peek() == Some(&'|') {
+                    return None;
+                }
+                let stage = current.trim().to_string();
+                if stage.is_empty() {
+                    return None;
+                }
+                stages.push(stage);
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if in_single || in_double {
+        return None;
+    }
+    let last = current.trim().to_string();
+    if last.is_empty() {
+        return None;
+    }
+    stages.push(last);
+    Some(stages)
+}
+
+/// Parse one tail stage into a whitelisted [`PostFilter`]. Anything outside the
+/// whitelist (`cat`, `sort`, a recursive `grep`, an unknown flag) returns `None`,
+/// which fails the whole pipeline translation so the command falls through to a
+/// real subprocess unchanged.
+fn parse_post_filter(tokens: &[Token]) -> Option<PostFilter> {
+    let first = tokens.first()?;
+    match first.text.as_str() {
+        "head" => parse_head_tail(&tokens[1..], true),
+        "tail" => parse_head_tail(&tokens[1..], false),
+        "grep" => parse_post_grep(&tokens[1..]),
+        _ => None,
+    }
+}
+
+/// `head`/`tail` accept `-N`, `-n N`, `-nN`, `--lines=N`, `--lines N`; a bare
+/// invocation defaults to 10 (coreutils). A positional (reading from a file, not
+/// the piped stream) or any other flag returns `None`.
+fn parse_head_tail(tokens: &[Token], is_head: bool) -> Option<PostFilter> {
+    let mut count: Option<usize> = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        reject_expansion(&tokens[index])?;
+        let text = &tokens[index].text;
+        if let Some(value) = text.strip_prefix("--lines=") {
+            count = Some(parse_usize(value)?);
+            index += 1;
+            continue;
+        }
+        if text == "--lines" || text == "-n" {
+            let value = take_value(tokens, &mut index)?;
+            count = Some(parse_usize(&value)?);
+            continue;
+        }
+        if let Some(value) = text.strip_prefix("-n") {
+            count = Some(parse_usize(value)?);
+            index += 1;
+            continue;
+        }
+        if let Some(value) = text.strip_prefix('-') {
+            if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
+                count = Some(parse_usize(value)?);
+                index += 1;
+                continue;
+            }
+        }
+        return None;
+    }
+    let count = count.unwrap_or(10);
+    Some(if is_head {
+        PostFilter::Head(count)
+    } else {
+        PostFilter::Tail(count)
+    })
+}
+
+/// A tail `grep` used as a pure line filter: `-v` (invert), `-i` (case), `-F`
+/// (fixed) and exactly one pattern. A recursive `-r`, an output-mode flag, a
+/// glob, a path arg, or any other flag returns `None` (a second recursive grep
+/// is not a line filter). The pattern is BRE-converted like the head grep unless
+/// `-F`.
+fn parse_post_grep(tokens: &[Token]) -> Option<PostFilter> {
+    let mut invert = false;
+    let mut case_insensitive = false;
+    let mut fixed = false;
+    let mut positionals = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        reject_expansion(&tokens[index])?;
+        let text = &tokens[index].text;
+        if text == "--" {
+            index += 1;
+            while index < tokens.len() {
+                reject_expansion(&tokens[index])?;
+                positionals.push(tokens[index].text.clone());
+                index += 1;
+            }
+            break;
+        }
+        if text == "-v" {
+            invert = true;
+            index += 1;
+            continue;
+        }
+        if text == "-i" {
+            case_insensitive = true;
+            index += 1;
+            continue;
+        }
+        if text == "-F" {
+            fixed = true;
+            index += 1;
+            continue;
+        }
+        if text.starts_with('-') && text.len() > 2 && !text.starts_with("--") {
+            for ch in text[1..].chars() {
+                match ch {
+                    'v' => invert = true,
+                    'i' => case_insensitive = true,
+                    'F' => fixed = true,
+                    _ => return None,
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if text.starts_with('-') {
+            return None;
+        }
+        positionals.push(text.clone());
+        index += 1;
+    }
+    if positionals.len() != 1 {
+        return None;
+    }
+    let raw = positionals.pop()?;
+    let pattern = if fixed {
+        escape(&raw)
+    } else {
+        bre_to_ere(&raw)?
+    };
+    Some(PostFilter::Grep {
+        pattern,
+        invert,
+        case_insensitive,
+    })
 }
 
 fn tokenize(command: &str) -> Option<Vec<Token>> {
@@ -150,7 +394,6 @@ struct ParsedGrepLike {
     show_line_numbers: bool,
     max_per_file: Option<usize>,
     fixed_strings: bool,
-    path: Option<String>,
 }
 
 impl Default for ParsedGrepLike {
@@ -165,7 +408,6 @@ impl Default for ParsedGrepLike {
             show_line_numbers: false,
             max_per_file: None,
             fixed_strings: false,
-            path: None,
         }
     }
 }
@@ -390,20 +632,21 @@ fn translate_grep(tokens: &[Token]) -> Option<TranslatedSearch> {
         index += 1;
     }
 
-    if !recursive || positionals.is_empty() || positionals.len() > 2 {
+    if !recursive || positionals.is_empty() {
         return None;
     }
-    parsed.pattern = Some(positionals.remove(0));
-    if let Some(path) = positionals.pop() {
-        parsed.path = Some(path);
-    }
+    // First positional is the pattern; every remaining positional is a search
+    // path (multi-path is supported). Basic-grep (BRE) patterns are converted to
+    // the index's ERE dialect unless `-E` (already ERE) or `-F` (literal).
+    let raw_pattern = positionals.remove(0);
+    let pattern = if extended || parsed.fixed_strings {
+        raw_pattern
+    } else {
+        bre_to_ere(&raw_pattern)?
+    };
+    parsed.pattern = Some(pattern);
 
-    let pattern = parsed.pattern.as_ref()?;
-    if !extended && !parsed.fixed_strings && contains_regex_metachar(pattern) {
-        return None;
-    }
-
-    finish_grep(parsed, Vec::new())
+    finish_grep(parsed, positionals)
 }
 
 fn finish_grep(
@@ -416,12 +659,8 @@ fn finish_grep(
         }
         parsed.pattern = Some(positionals.remove(0));
     }
-    if positionals.len() > 1 || (parsed.path.is_some() && !positionals.is_empty()) {
-        return None;
-    }
-    if parsed.path.is_none() {
-        parsed.path = positionals.pop();
-    }
+    // Whatever positionals remain after the pattern are search paths (empty =
+    // whole worktree). Multi-path is supported.
     let mut pattern = parsed.pattern?;
     if parsed.fixed_strings {
         pattern = escape(&pattern);
@@ -435,7 +674,7 @@ fn finish_grep(
         after_context: parsed.after_context,
         show_line_numbers: parsed.show_line_numbers,
         max_per_file: parsed.max_per_file,
-        path: parsed.path,
+        paths: positionals,
     })
 }
 
@@ -478,13 +717,70 @@ fn apply_context(parsed: &mut ParsedGrepLike, flag: &str, value: usize) {
     }
 }
 
-fn contains_regex_metachar(pattern: &str) -> bool {
-    pattern.chars().any(|ch| {
-        matches!(
-            ch,
-            '.' | '^' | '$' | '*' | '[' | ']' | '\\' | '+' | '?' | '|' | '(' | ')' | '{' | '}'
-        )
-    })
+/// Convert a POSIX basic-regex (BRE) pattern to the ERE/RE2 dialect the warm
+/// index uses. BRE gives `\|`/`\(`/`\)`/`\{`/`\}`/`\+`/`\?` their special meaning
+/// and treats the bare forms as literals — the exact inverse of ERE — so toggle
+/// each. `.`/`*`/`^`/`$` and bracket expressions mean the same in both and pass
+/// through untouched. Returns `None` for constructs RE2 cannot faithfully model
+/// (backreferences, and the GNU word-boundary / character-class letter escapes
+/// whose semantics diverge) so the caller falls through to a real grep rather
+/// than silently changing the match set.
+fn bre_to_ere(pattern: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '[' => {
+                // A bracket expression means the same in BRE and ERE; copy it
+                // verbatim, honoring the POSIX rule that a `]` immediately after
+                // `[` or `[^` is a literal member rather than the close.
+                out.push('[');
+                if chars.peek() == Some(&'^') {
+                    out.push(chars.next().unwrap());
+                }
+                if chars.peek() == Some(&']') {
+                    out.push(chars.next().unwrap());
+                }
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if c == ']' {
+                        break;
+                    }
+                }
+            }
+            '\\' => {
+                let next = chars.next()?;
+                match next {
+                    '|' => out.push('|'),
+                    '(' => out.push('('),
+                    ')' => out.push(')'),
+                    '{' => out.push('{'),
+                    '}' => out.push('}'),
+                    '+' => out.push('+'),
+                    '?' => out.push('?'),
+                    // Backreferences (`\1`..`\9`), GNU word-boundary escapes
+                    // (`\<`/`\>`), and letter escapes (`\b`/`\w`/`\s`/...) mean
+                    // something different — or nothing — in RE2 than in GNU BRE.
+                    // Bail rather than guess.
+                    c if c.is_ascii_alphanumeric() || c == '<' || c == '>' => return None,
+                    // Any other escaped punctuation (`\.`, `\*`, `\\`, ...) is a
+                    // literal in both dialects; copy it through verbatim.
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+            }
+            // Bare ERE metacharacters that are literals in BRE → escape.
+            '|' | '(' | ')' | '{' | '}' | '+' | '?' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            // `.`, `*`, `^`, `$`, and everything else pass through.
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -492,6 +788,10 @@ mod tests {
     use super::*;
 
     fn grep(command: &str) -> TranslatedSearch {
+        translate_search_command(command).unwrap().search
+    }
+
+    fn pipeline(command: &str) -> TranslatedSearchPipeline {
         translate_search_command(command).unwrap()
     }
 
@@ -508,7 +808,7 @@ mod tests {
                 after_context: 0,
                 show_line_numbers: false,
                 max_per_file: None,
-                path: None,
+                paths: vec![],
             }
         );
     }
@@ -526,7 +826,7 @@ mod tests {
                 after_context: 2,
                 show_line_numbers: true,
                 max_per_file: Some(4),
-                path: Some("src".to_string()),
+                paths: vec!["src".to_string()],
             }
         );
     }
@@ -575,18 +875,157 @@ mod tests {
                 after_context: 0,
                 show_line_numbers: true,
                 max_per_file: None,
-                path: Some("src".to_string()),
+                paths: vec!["src".to_string()],
             }
         );
         assert!(matches!(
             grep("grep -rEc 'a+b' ."),
-            TranslatedSearch::Grep { output_mode, pattern, path, .. }
-                if output_mode == "count" && pattern == "a+b" && path.as_deref() == Some(".")
+            TranslatedSearch::Grep { output_mode, pattern, paths, .. }
+                if output_mode == "count" && pattern == "a+b" && paths == vec![".".to_string()]
         ));
         assert!(matches!(
             grep("grep -rF 'a+b?' src"),
             TranslatedSearch::Grep { pattern, .. } if pattern == "a\\+b\\?"
         ));
+    }
+
+    #[test]
+    fn grep_and_rg_accept_multiple_search_paths() {
+        assert!(matches!(
+            grep("rg needle src tests"),
+            TranslatedSearch::Grep { paths, .. }
+                if paths == vec!["src".to_string(), "tests".to_string()]
+        ));
+        assert!(matches!(
+            grep("grep -r needle src tests"),
+            TranslatedSearch::Grep { paths, .. }
+                if paths == vec!["src".to_string(), "tests".to_string()]
+        ));
+    }
+
+    #[test]
+    fn basic_grep_patterns_convert_bre_metacharacters() {
+        // Bare ERE metacharacters are literals in BRE.
+        for (command, expected) in [
+            ("grep -r 'a+b' src", "a\\+b"),
+            ("grep -r 'a?b' src", "a\\?b"),
+            ("grep -r 'a|b' src", "a\\|b"),
+            ("grep -r '(a)' src", "\\(a\\)"),
+            // `.` is any-char in both dialects.
+            ("grep -r 'a.b' src", "a.b"),
+            // BRE escapes toggle to their ERE special meaning.
+            ("grep -r 'a\\|b' src", "a|b"),
+        ] {
+            assert!(
+                matches!(
+                    grep(command),
+                    TranslatedSearch::Grep { ref pattern, .. } if pattern == expected
+                ),
+                "{command} -> {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn bre_to_ere_round_trips_and_bails_on_unfaithful_constructs() {
+        assert_eq!(bre_to_ere("a\\(b\\)c").as_deref(), Some("a(b)c"));
+        assert_eq!(bre_to_ere("a+b?").as_deref(), Some("a\\+b\\?"));
+        assert_eq!(bre_to_ere("a.b*").as_deref(), Some("a.b*"));
+        assert_eq!(bre_to_ere("[a|b]+").as_deref(), Some("[a|b]\\+"));
+        assert_eq!(bre_to_ere("\\.").as_deref(), Some("\\."));
+        // Backreferences and word-boundary / letter escapes cannot be served.
+        assert_eq!(bre_to_ere("\\(a\\)\\1"), None);
+        assert_eq!(bre_to_ere("\\<word\\>"), None);
+        assert_eq!(bre_to_ere("\\bword"), None);
+    }
+
+    #[test]
+    fn splits_and_parses_post_filter_pipelines() {
+        // The full reported command translates head + tail stages.
+        let p = pipeline(
+            "grep -rn 'chat.stop\\|chat.newSession\\|isBrowserTab\\|isTerminalTab' \
+             src/ packages/ui/src/ | grep -v test | head -40",
+        );
+        assert!(matches!(
+            p.search,
+            TranslatedSearch::Grep { ref pattern, ref paths, show_line_numbers: true, .. }
+                if pattern == "chat.stop|chat.newSession|isBrowserTab|isTerminalTab"
+                    && *paths == vec!["src/".to_string(), "packages/ui/src/".to_string()]
+        ));
+        assert_eq!(
+            p.post,
+            vec![
+                PostFilter::Grep {
+                    pattern: "test".to_string(),
+                    invert: true,
+                    case_insensitive: false,
+                },
+                PostFilter::Head(40),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_each_post_filter_shape() {
+        assert_eq!(pipeline("rg x | head -40").post, vec![PostFilter::Head(40)]);
+        assert_eq!(
+            pipeline("rg x | head -n 40").post,
+            vec![PostFilter::Head(40)]
+        );
+        assert_eq!(pipeline("rg x | head").post, vec![PostFilter::Head(10)]);
+        assert_eq!(pipeline("rg x | tail -5").post, vec![PostFilter::Tail(5)]);
+        assert_eq!(
+            pipeline("rg x | grep -v test").post,
+            vec![PostFilter::Grep {
+                pattern: "test".to_string(),
+                invert: true,
+                case_insensitive: false,
+            }]
+        );
+        assert_eq!(
+            pipeline("rg x | grep -iv Y").post,
+            vec![PostFilter::Grep {
+                pattern: "Y".to_string(),
+                invert: true,
+                case_insensitive: true,
+            }]
+        );
+        assert_eq!(
+            pipeline("rg x | grep -F 'a.b'").post,
+            vec![PostFilter::Grep {
+                pattern: "a\\.b".to_string(),
+                invert: false,
+                case_insensitive: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_or_malformed_pipelines() {
+        for command in [
+            // Non-whitelisted tail stages.
+            "rg x | sort",
+            "rg x | cat",
+            "rg x | uniq",
+            // `wc -l` is not translated: BSD `wc` (macOS) right-justifies the
+            // count in a padded field while GNU `wc` does not, so a faithful
+            // byte-identical reproduction is not portable. It falls through.
+            "rg x | wc -l",
+            "rg x | wc",
+            "rg x | wc -w",
+            // A recursive grep is not a line filter.
+            "rg x | grep -r y src",
+            "rg x | grep -l y",
+            // Malformed pipelines.
+            "rg x || rg y",
+            "rg x |",
+            "| rg x",
+            "rg x | | head",
+            // Head-stage is not a search command.
+            "ls | grep x",
+        ] {
+            assert_eq!(translate_search_command(command), None, "{command}");
+        }
     }
 
     #[test]
@@ -613,20 +1052,20 @@ mod tests {
         for command in [
             "git grep needle",
             "bash -lc 'rg needle'",
-            "rg needle src tests",
             "rg -e one -e two",
             "rg -t rust needle",
             "rg --type rust needle",
             "rg --smart-case needle",
             "rg --unknown needle",
             "grep needle src",
-            "grep -r 'a+b' src",
-            "grep -r 'a?b' src",
-            "grep -r 'a|b' src",
-            "grep -r '(a)' src",
-            "grep -r 'a.b' src",
-            "grep -r needle src tests",
             "grep -r --exclude='*.rs' needle src",
+            // `grep -e PATTERN` is not translated (a basic-grep `-e` pattern
+            // would need BRE conversion the `-e` path does not apply); it falls
+            // through to a real subprocess. Only rg's `-e` (ERE) is accepted.
+            "grep -r -e 'a+b' src",
+            "grep -re needle src",
+            // Backreference cannot be faithfully converted from BRE.
+            "grep -r '\\(a\\)\\1' src",
         ] {
             assert_eq!(translate_search_command(command), None, "{command}");
         }

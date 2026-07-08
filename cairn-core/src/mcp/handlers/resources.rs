@@ -196,6 +196,15 @@ pub async fn handle_read_resource(
         }
     };
 
+    // A job-scoped agent terminal tees its full output to this scratch log; a
+    // project terminal (job_id None) has none. Post-exit reads prefer it over the
+    // truncated `output_tail`, and the banner exposes its path so an agent can
+    // grep it directly as a `file:` target.
+    let log_path = info
+        .job_id
+        .as_deref()
+        .map(|job_id| crate::scratch::terminal_log_path(job_id, &parsed.slug));
+
     let (output, new_bytes, total_bytes, idle_secs) = get_buffer_content(
         orch,
         read_cursors,
@@ -203,6 +212,7 @@ pub async fn handle_read_resource(
         &info.status,
         consume,
         info.output_tail.as_deref(),
+        log_path.as_deref(),
     );
 
     let runtime_secs = {
@@ -217,6 +227,7 @@ pub async fn handle_read_resource(
         runtime_secs,
         idle_secs,
         total_bytes,
+        log_path.as_deref(),
     );
     let mut body = format!("{banner}\n\n{output}");
 
@@ -266,6 +277,7 @@ fn format_status_banner(
     runtime_secs: Option<i64>,
     idle_secs: Option<i64>,
     total_bytes: usize,
+    log_path: Option<&std::path::Path>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if status == "running" {
@@ -286,6 +298,12 @@ fn format_status_banner(
         if let Some(rt) = runtime_secs {
             parts.push(format!("ran {}", fmt_duration(rt)));
         }
+    }
+    // Surface the persisted log path only when the file actually exists, so a
+    // non-teed terminal (project terminal, or a desktop node terminal) never
+    // advertises a path that isn't there.
+    if let Some(path) = log_path.filter(|p| p.exists()) {
+        parts.push(format!("log: {}", path.display()));
     }
     format!("[terminal {slug}: {}]", parts.join(", "))
 }
@@ -326,6 +344,9 @@ struct TerminalInfo {
     /// Retained tail of the buffer for an exited terminal whose live PTY session
     /// is gone, so a post-exit read still returns its final output.
     output_tail: Option<String>,
+    /// Owning job id, used to locate the persisted scratch log for a job-scoped
+    /// agent terminal. `None` for a project terminal (no log file).
+    job_id: Option<String>,
 }
 
 async fn lookup_terminal_info(
@@ -350,7 +371,7 @@ async fn lookup_terminal_info(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail
+                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail, jt.job_id
                         FROM job_terminals jt
                         JOIN projects p ON jt.project_id = p.id
                         WHERE p.key = ?1
@@ -388,7 +409,7 @@ async fn lookup_terminal_info(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail
+                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail, job_id
                         FROM job_terminals
                         WHERE job_id = ?1 AND slug = ?2
                         LIMIT 1
@@ -407,6 +428,7 @@ async fn lookup_terminal_info(
                     created_at: row.i64(3)?,
                     exited_at: row.opt_i64(4)?,
                     output_tail: row.opt_text(5)?,
+                    job_id: row.opt_text(6)?,
                 })
             })
             .transpose()
@@ -663,6 +685,7 @@ async fn append_inline_annotations(_orch: &Orchestrator, _output: &mut String, _
 /// (`consume == false`) return the whole buffer and leave the cursor untouched;
 /// incremental reads (`consume == true`) return bytes since the cursor and
 /// advance it.
+#[allow(clippy::too_many_arguments)]
 fn get_buffer_content(
     orch: &Orchestrator,
     read_cursors: &ReadCursorState,
@@ -670,6 +693,7 @@ fn get_buffer_content(
     status: &str,
     consume: bool,
     fallback_tail: Option<&str>,
+    log_path: Option<&std::path::Path>,
 ) -> (String, usize, usize, Option<i64>) {
     let snapshot = (|| {
         let sessions = orch.pty_state.sessions.lock().ok()?;
@@ -689,9 +713,15 @@ fn get_buffer_content(
     let (bytes, idle) = match snapshot {
         Some(value) => value,
         None => {
-            // No live PTY session. For an exited terminal, fall back to the
-            // retained output tail so a post-exit read still shows final output.
+            // No live PTY session. For an exited terminal, serve the full
+            // persisted log if present; the retained `output_tail` is only the
+            // last-resort fallback for when the scratch file is gone (e.g. a
+            // reboot reaped the OS temp root).
             if status != "running" {
+                if let Some(rendered) = log_path.and_then(read_terminal_log) {
+                    let len = rendered.len();
+                    return (rendered, len, len, None);
+                }
                 if let Some(tail) = fallback_tail.filter(|t| !t.is_empty()) {
                     let len = tail.len();
                     return (tail.to_string(), len, len, None);
@@ -721,6 +751,17 @@ fn get_buffer_content(
 
     let idle_secs = if total_bytes == 0 { None } else { idle };
     (output, new_bytes, total_bytes, idle_secs)
+}
+
+/// Read a terminal's persisted scratch log and render it the same way a live
+/// read does (strip raw ANSI). Returns `None` when the file is absent or empty,
+/// so the caller falls back to the retained `output_tail`.
+fn read_terminal_log(path: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(strip_ansi_sequences(&String::from_utf8_lossy(&raw)))
 }
 
 /// Pure cursor/render core, isolated for testing. `consume == false` reads the
@@ -1016,17 +1057,84 @@ mod tests {
 
     #[test]
     fn banner_distinguishes_running_quiet_from_exited() {
-        let running_quiet = format_status_banner("ci", "running", None, Some(70), Some(40), 1024);
+        let running_quiet =
+            format_status_banner("ci", "running", None, Some(70), Some(40), 1024, None);
         assert!(running_quiet.contains("running"));
         assert!(running_quiet.contains("elapsed"));
         assert!(running_quiet.contains("last output"));
 
-        let running_no_output = format_status_banner("ci", "running", None, Some(5), None, 0);
+        let running_no_output = format_status_banner("ci", "running", None, Some(5), None, 0, None);
         assert!(running_no_output.contains("no output yet"));
 
-        let exited = format_status_banner("ci", "exited", Some(0), Some(83), None, 2048);
+        let exited = format_status_banner("ci", "exited", Some(0), Some(83), None, 2048, None);
         assert!(exited.contains("exited code 0"));
         assert!(exited.contains("ran"));
+    }
+
+    #[test]
+    fn banner_shows_log_path_only_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("dev.log");
+        std::fs::write(&existing, b"x").unwrap();
+        let with_log =
+            format_status_banner("dev", "exited", Some(0), Some(10), None, 1, Some(&existing));
+        assert!(
+            with_log.contains(&format!("log: {}", existing.display())),
+            "{with_log}"
+        );
+
+        let missing = dir.path().join("gone.log");
+        let without_log =
+            format_status_banner("dev", "exited", Some(0), Some(10), None, 1, Some(&missing));
+        assert!(!without_log.contains("log:"), "{without_log}");
+    }
+
+    #[tokio::test]
+    async fn post_exit_read_prefers_full_log_over_tail() {
+        let orch = seeded_orch().await;
+        let cursors = StdMutex::new(HashMap::new());
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("dev.log");
+        // More than the 64KB ring window, with a marker only the full log holds.
+        let mut content = "A".repeat(70_000);
+        content.push_str("UNIQUE_TAIL_MARKER\n");
+        std::fs::write(&log, content.as_bytes()).unwrap();
+
+        let (output, new_bytes, total_bytes, _idle) = get_buffer_content(
+            &orch,
+            &cursors,
+            "no-such-session",
+            "exited",
+            false,
+            Some("short-retained-tail"),
+            Some(log.as_path()),
+        );
+        assert!(output.contains("UNIQUE_TAIL_MARKER"), "{output}");
+        assert!(!output.contains("short-retained-tail"));
+        assert!(
+            total_bytes > 64_000,
+            "served beyond the ring window: {total_bytes}"
+        );
+        assert_eq!(new_bytes, total_bytes);
+    }
+
+    #[tokio::test]
+    async fn post_exit_read_falls_back_to_tail_when_log_missing() {
+        let orch = seeded_orch().await;
+        let cursors = StdMutex::new(HashMap::new());
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("never-written.log");
+
+        let (output, ..) = get_buffer_content(
+            &orch,
+            &cursors,
+            "no-such-session",
+            "exited",
+            false,
+            Some("retained-tail"),
+            Some(missing.as_path()),
+        );
+        assert!(output.contains("retained-tail"), "{output}");
     }
 
     #[test]

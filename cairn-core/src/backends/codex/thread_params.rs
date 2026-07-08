@@ -173,12 +173,22 @@ pub(super) fn build_resume_fallback_prompt(
     let transcript = crate::transcripts::format_transcript_full(&event_rows);
     let transcript = trim_resume_transcript(&transcript, RESUME_FALLBACK_TRANSCRIPT_CHARS);
 
-    Some(format!(
+    Some(format_resume_fallback_prompt(
+        &transcript,
+        latest_user_message,
+    ))
+}
+
+/// Wrap a prior-session transcript and the latest reply into the fresh-thread
+/// fallback prompt. Pure so the ordering invariant (prior context precedes the
+/// latest message) is unit-testable without a database.
+pub(super) fn format_resume_fallback_prompt(transcript: &str, latest_user_message: &str) -> String {
+    format!(
         "The previous Codex thread could not be resumed, so you are continuing from a transcript snapshot instead.\n\n\
 ## Prior Transcript\n\n{}\n\n\
 ## Latest User Message\n\n{}",
         transcript, latest_user_message
-    ))
+    )
 }
 
 pub(super) fn trim_resume_transcript(transcript: &str, max_chars: usize) -> String {
@@ -235,6 +245,35 @@ mod tests {
 
         assert_eq!(params["baseInstructions"], "BASE");
         assert_eq!(params["developerInstructions"], "agent content");
+    }
+
+    #[test]
+    fn resume_fallback_prompt_includes_prior_context_and_latest_reply() {
+        // The fresh-thread fallback must carry prior user and assistant context
+        // plus the latest reply, in that order — not just system instructions
+        // (CAIRN-2598).
+        let transcript = "User: earlier question\nAssistant: earlier answer";
+        let prompt = format_resume_fallback_prompt(transcript, "the new reply");
+        assert!(prompt.contains("earlier question"));
+        assert!(prompt.contains("earlier answer"));
+        assert!(prompt.contains("the new reply"));
+        assert!(prompt.contains("## Prior Transcript"));
+        assert!(prompt.contains("## Latest User Message"));
+        // Prior transcript precedes the latest reply.
+        assert!(prompt.find("earlier answer").unwrap() < prompt.find("the new reply").unwrap());
+    }
+
+    #[test]
+    fn trim_resume_transcript_keeps_tail_when_over_limit() {
+        let trimmed = trim_resume_transcript("AAAABBBBCCCC", 4);
+        assert!(trimmed.starts_with("[Earlier transcript omitted]"));
+        assert!(trimmed.contains("CCCC"));
+        assert!(!trimmed.contains("AAAA"));
+    }
+
+    #[test]
+    fn trim_resume_transcript_untouched_within_limit() {
+        assert_eq!(trim_resume_transcript("short", 100), "short");
     }
 
     #[test]

@@ -38,12 +38,21 @@ pub(crate) async fn read_actions_collection(
     explicit_project: Option<&str>,
 ) -> String {
     let (project_id, project_key): (Option<String>, Option<String>) = match explicit_project {
-        Some(project) => match run_context::project_id_by_key(&orch.db.local, project).await {
-            Ok(id) => (Some(id), Some(project.to_uppercase())),
-            Err(e) => return e,
-        },
-        None => match run_context::lookup_run(&orch.db.local, request).await {
-            Ok(ctx) => (Some(ctx.project_id), Some(ctx.project_key)),
+        Some(project) => {
+            // A team project's `projects` row lives in its replica; resolve the
+            // owning db by key first so the id (and its team prefix) is found.
+            let project_db = orch.db.for_project(project).await;
+            match run_context::project_id_by_key(&project_db, project).await {
+                Ok(id) => (Some(id), Some(project.to_uppercase())),
+                Err(e) => return e,
+            }
+        }
+        None => match run_context::lookup_run_routed(&orch.db, request).await {
+            // A team run's row lives in its replica, so resolve the run context
+            // through the routed lookup (mirroring recipes/agents' current_run_project)
+            // rather than the private DB — otherwise a team run falls back to the
+            // workspace-only list instead of its project-context action set.
+            Ok((ctx, _db)) => (Some(ctx.project_id), Some(ctx.project_key)),
             Err(_) => (None, None),
         },
     };
@@ -53,8 +62,19 @@ pub(crate) async fn read_actions_collection(
     // context, only workspace actions are visible.
     let actions: Vec<ActionConfig> = match project_id.as_deref() {
         Some(project_id) => {
-            match action_queries::list_action_configs_for_context(&orch.db.local, project_id, false)
-                .await
+            // A team project's own actions live in its replica; workspace actions
+            // and disable overrides stay private (see list_action_configs_for_context).
+            let project_db = match crate::projects::crud::owning_db(&orch.db, project_id).await {
+                Ok(db) => db,
+                Err(e) => return format!("Error listing actions: {e}"),
+            };
+            match action_queries::list_action_configs_for_context(
+                &orch.db.local,
+                &project_db,
+                project_id,
+                false,
+            )
+            .await
             {
                 Ok(list) => list,
                 Err(e) => return format!("Error listing actions: {e}"),
@@ -104,7 +124,13 @@ pub(crate) async fn read_action(
     action_id: &str,
     explicit_project: Option<&str>,
 ) -> String {
-    let action = match action_queries::get_action_config(&orch.db.local, action_id).await {
+    // Route by the action id (team-prefixed for a team project's action); a bare
+    // id is a strict no-op onto the private DB.
+    let db = match crate::projects::crud::owning_db(&orch.db, action_id).await {
+        Ok(db) => db,
+        Err(e) => return format!("Error loading action: {e}"),
+    };
+    let action = match action_queries::get_action_config(&db, action_id).await {
         Ok(Some(action)) => action,
         Ok(None) => return not_found(action_id, explicit_project),
         Err(e) => return format!("Error loading action: {e}"),

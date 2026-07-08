@@ -128,6 +128,26 @@ pub(crate) fn validate_run_input(input: &RunInput) -> Result<(), String> {
         return Err("`commands` must contain at least one item".to_string());
     }
     for (i, item) in input.commands.iter().enumerate() {
+        // A `repl` key routes inline `code` into a live REPL session; it requires
+        // `code` + `interpreter` and rejects `command`/`target`. Kept in lockstep
+        // with cairn-core's `resolve_repl_send`.
+        if item.repl.is_some() {
+            if item.command.is_some() || item.target.is_some() {
+                return Err(format!(
+                    "commands[{i}] has `repl` with `command` or `target`; a REPL send takes inline `code` only"
+                ));
+            }
+            if item.code.is_none() {
+                return Err(format!(
+                    "commands[{i}] has `repl` but no `code`; a REPL send evaluates inline `code`"
+                ));
+            }
+            if item.interpreter.is_none() {
+                return Err(format!(
+                    "commands[{i}] has `repl` but no `interpreter`; set it to the REPL's language (python)"
+                ));
+            }
+        }
         // Exactly one of `command` / `target` / `code`. Kept in lockstep with
         // cairn-core's `resolve_run_item` so a headless caller that bypasses
         // cairn-cmd gets the same three-way exclusivity message.
@@ -178,8 +198,9 @@ pub(crate) fn validate_run_input(input: &RunInput) -> Result<(), String> {
 /// Input for run tool: an ordered batch of invocations.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct RunInput {
-    /// Ordered list of invocations. Each item is either a shell `command` or a
-    /// `target` skill-script URI. Must contain at least one item.
+    /// Ordered list of invocations. Each item is exactly one of three shapes: a
+    /// shell `command`, inline `code` (with an `interpreter`), or a `target`
+    /// skill-script/MCP URI. Must contain at least one item.
     pub(crate) commands: Vec<RunItemInput>,
     /// Run items in input order instead of concurrently (default: false = parallel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,10 +225,11 @@ pub(crate) struct RunInput {
     branch: Option<String>,
 }
 
-/// A single run item: exactly one of `command` (shell) or `target` (skill script).
+/// A single run item: exactly one of `command` (shell), inline `code` (with an
+/// `interpreter`), or `target` (skill script / MCP tool URI).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct RunItemInput {
-    /// Shell command to execute. Mutually exclusive with `target`.
+    /// Shell command to execute. Mutually exclusive with `code` and `target`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) command: Option<String>,
     /// Short description of what this command does (5-10 words).
@@ -216,23 +238,32 @@ pub(crate) struct RunItemInput {
     /// Timeout in milliseconds (default: 120000, max: 600000).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) timeout: Option<u32>,
-    /// A `cairn://skills/<id>/scripts/<name>` target. Mutually exclusive with `command`.
+    /// A `cairn://skills/<id>/scripts/<name>` target. Mutually exclusive with `command` and `code`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target: Option<String>,
     /// Structured args for a `target` skill script.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload: Option<RunItemPayloadInput>,
-    /// Inline source to execute (light, synchronous compute). Mutually exclusive
-    /// with `command`/`target`; requires `interpreter`. Runs as `bun -e <code>`
-    /// (typescript/javascript) or `python3 -c <code>` (python) — direct argv, no
-    /// shell. Inline TypeScript gets zero-config `@cairn/sdk` from the worktree.
+    /// Inline source to execute, the default way to run code that isn't a CLI
+    /// invocation. Mutually exclusive with `command`/`target`; requires
+    /// `interpreter`. The interpreter execs the source directly (no shell, no
+    /// quoting): typescript/javascript via bun with the worktree `node_modules`
+    /// and zero-config `@cairn/sdk`, python via the bundled `uv` with PEP 723
+    /// dependency blocks and automatic project-env pickup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) code: Option<String>,
     /// Language for an inline `code` item: `typescript`/`ts` or `javascript`/`js`
-    /// (both via bun), or `python`/`py` (via python3, currently stdlib-only).
-    /// Required iff `code` is present.
+    /// (both via bun), or `python`/`py` (via the bundled `uv`, with PEP 723 deps
+    /// and project-env pickup). Required iff `code` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) interpreter: Option<String>,
+    /// Route this item's inline `code` into a live stateful REPL session (by
+    /// slug) instead of a fresh process, so variables/imports/defs persist
+    /// across `run` calls. Requires `code` + `interpreter` (matching the REPL's
+    /// language); rejects `command`/`target`/`payload`. Create the REPL first
+    /// with `write cairn:~/repl/<slug> {interpreter:"python"}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repl: Option<String>,
 }
 
 /// Structured args for a `target`: positional `args` for a skill script, or a

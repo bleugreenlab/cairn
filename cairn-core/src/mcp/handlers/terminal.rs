@@ -1704,6 +1704,9 @@ async fn spawn_terminal_session(
         "CAIRN_CALLBACK_URL",
         format!("http://127.0.0.1:{}/api/mcp", orch.mcp_callback_port),
     );
+    // Shared per-home uv package cache (`<cairn_home>/uv-cache`); same rationale
+    // as the inline `run` path (warm shared cache in a fence-permitted location).
+    cmd.env("UV_CACHE_DIR", crate::env::uv_cache_dir());
     if let Ok(secret) = orch.mcp_auth.get_secret_for_mcp() {
         cmd.env("CAIRN_MCP_SECRET", secret);
     }
@@ -1836,6 +1839,21 @@ async fn spawn_terminal_session(
     let fence_handled_thread = fence_handled.clone();
     let suppress_cleanup_thread = suppress_cleanup.clone();
 
+    // Tee terminal output to a per-job scratch log so the full history survives
+    // past the 64KB in-memory ring buffer, both live and after exit. Shared so
+    // every writer of terminal output lands in it: the reader thread's PTY chunks
+    // AND the fence-prompt thread's synthetic Cairn messages. Because the tee
+    // lives inside `emit_terminal_data`, the log stays an exact mirror of the ring
+    // buffer (and thus `output_tail`), so a post-exit read shows what a live read
+    // displayed — fence denials and restart notices included, not just raw PTY
+    // bytes. Job-scoped agent terminals only; a project terminal (job_id None) has
+    // no log. Keyed by slug, so a fence respawn appends into one file separated by
+    // a session marker.
+    let terminal_log =
+        Arc::new(Mutex::new(target.job_id.as_deref().and_then(|job_id| {
+            crate::scratch::TerminalLog::open(job_id, &target.slug)
+        })));
+
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -1861,7 +1879,7 @@ async fn spawn_terminal_session(
                 }
                 Ok(n) => {
                     let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    emit_terminal_data(&*emitter, &sid, &data, &buffer);
+                    emit_terminal_data(&*emitter, &sid, &data, &buffer, &terminal_log);
                     if let Ok(mut last) = last_output_thread.lock() {
                         *last = SystemTime::now();
                     }
@@ -1885,6 +1903,7 @@ async fn spawn_terminal_session(
                                         crossing.summary
                                     ),
                                     &buffer,
+                                    &terminal_log,
                                 );
                                 suppress_cleanup_thread.store(true, Ordering::SeqCst);
                                 // Kill the denied process, then converge on
@@ -1913,6 +1932,7 @@ async fn spawn_terminal_session(
                                     &sid,
                                     "\r\nTerminal is waiting for worktree-fence approval. The command will restart if allowed for the session.\r\n",
                                     &buffer,
+                                    &terminal_log,
                                 );
                                 suppress_cleanup_thread.store(true, Ordering::SeqCst);
                                 let orch_bg = orch_t.clone();
@@ -1922,6 +1942,7 @@ async fn spawn_terminal_session(
                                 let resource_bg = resource_for_thread.clone();
                                 let command_bg = command_for_thread.clone();
                                 let description_bg = description_for_thread.clone();
+                                let log_bg = terminal_log.clone();
                                 thread::spawn(move || {
                                     handle_terminal_fence_prompt(
                                         orch_bg,
@@ -1932,6 +1953,7 @@ async fn spawn_terminal_session(
                                         command_bg,
                                         description_bg,
                                         crossing,
+                                        log_bg,
                                     );
                                 });
                                 terminate_pty_session(&orch_t, &sid);
@@ -1965,6 +1987,13 @@ async fn spawn_terminal_session(
                 }
             }
         }
+        // Flush on every end-of-life path (EOF, error, fence deny/ask) before the
+        // exit callback fires.
+        if let Ok(mut guard) = terminal_log.lock() {
+            if let Some(log) = guard.as_mut() {
+                log.flush();
+            }
+        }
     });
 
     // Wrap so the shell exits with the command: EOF (which drives
@@ -1995,6 +2024,7 @@ fn emit_terminal_data(
     session_id: &str,
     data: &str,
     buffer: &Arc<Mutex<VecDeque<u8>>>,
+    log: &Arc<Mutex<Option<crate::scratch::TerminalLog>>>,
 ) {
     let _ = emitter.emit(
         "pty-data",
@@ -2008,6 +2038,16 @@ fn emit_terminal_data(
         buf_guard.extend(data.as_bytes());
         while buf_guard.len() > MAX_BUFFER_SIZE {
             buf_guard.pop_front();
+        }
+    }
+    // Tee the same bytes the ring buffer received to the persisted log, so a
+    // post-exit read shows exactly what a live read displayed — including
+    // synthetic Cairn messages (fence denials, restart notices), not just raw PTY
+    // output. No-op when the terminal has no log (project terminal, or the file
+    // could not be opened).
+    if let Ok(mut guard) = log.lock() {
+        if let Some(terminal_log) = guard.as_mut() {
+            terminal_log.append(data.as_bytes());
         }
     }
 }
@@ -2066,6 +2106,7 @@ fn handle_terminal_fence_prompt(
     command: String,
     description: Option<String>,
     crossing: crate::mcp::handlers::fence::Crossing,
+    log: Arc<Mutex<Option<crate::scratch::TerminalLog>>>,
 ) {
     let Some(run_id) = target.run_id.clone() else {
         return;
@@ -2104,6 +2145,7 @@ fn handle_terminal_fence_prompt(
                 &old_session_id,
                 &format!("\r\nFailed to create worktree-fence permission request: {e}\r\n"),
                 &buffer,
+                &log,
             );
             return;
         }
@@ -2133,6 +2175,7 @@ fn handle_terminal_fence_prompt(
                 &old_session_id,
                 &format!("\r\nWorktree-fence permission wait failed: {e}\r\n"),
                 &buffer,
+                &log,
             );
             return;
         }
@@ -2154,6 +2197,7 @@ fn handle_terminal_fence_prompt(
             &old_session_id,
             &format!("\r\nDenied by worktree fence: {}\r\n", crossing.summary),
             &buffer,
+            &log,
         );
         // Converge on finalize: mark the row exited (denied → exit code unknown)
         // and route the wake, retaining the row. The session was already removed
@@ -2185,6 +2229,7 @@ fn handle_terminal_fence_prompt(
             &old_session_id,
             "\r\nTerminal worktree-fence approvals must be allowed for the session; not restarting.\r\n",
             &buffer,
+            &log,
         );
         // Converge on finalize: mark the row exited (denied → exit code unknown)
         // and route the wake, retaining the row. The session was already removed
@@ -2210,6 +2255,7 @@ fn handle_terminal_fence_prompt(
         &old_session_id,
         "\r\nWorktree-fence approval granted for this session; restarting terminal.\r\n",
         &buffer,
+        &log,
     );
     let respawn = block_on_background_db(async {
         spawn_terminal_session(
@@ -2229,6 +2275,7 @@ fn handle_terminal_fence_prompt(
             &old_session_id,
             &format!("\r\nFailed to restart terminal after worktree-fence approval: {e}\r\n"),
             &buffer,
+            &log,
         );
     }
 }
@@ -2643,5 +2690,43 @@ mod terminal_finalize_tests {
         let (status2, code2, _) = block_on(read_terminal(&orch.db.local, "s1"));
         assert_eq!(status2, "exited");
         assert_eq!(code2, Some(KILLED_EXIT_CODE));
+    }
+
+    /// Regression: synthetic Cairn messages (fence denials, restart notices) are
+    /// emitted through `emit_terminal_data`, which must tee them into the
+    /// persisted log too — otherwise a post-exit read, which prefers the log over
+    /// `output_tail`, would drop exactly the diagnostic output that explains a
+    /// fence denial.
+    #[test]
+    fn emit_terminal_data_tees_into_the_log() {
+        use crate::services::testing::CapturingEmitter;
+        use std::collections::VecDeque;
+
+        let job_id = format!("test-{}", uuid::Uuid::new_v4());
+        let emitter = CapturingEmitter::new();
+        let buffer = Arc::new(Mutex::new(VecDeque::new()));
+        let log = Arc::new(Mutex::new(crate::scratch::TerminalLog::open(
+            &job_id, "dev",
+        )));
+
+        let denial = "\r\nDenied by agent fence policy (fence: deny): touch /etc/x\r\n";
+        emit_terminal_data(&emitter, "sess", denial, &buffer, &log);
+        if let Ok(mut guard) = log.lock() {
+            if let Some(l) = guard.as_mut() {
+                l.flush();
+            }
+        }
+
+        // Landed in the ring buffer (and hence `output_tail`)...
+        let buffered: Vec<u8> = buffer.lock().unwrap().iter().copied().collect();
+        assert!(String::from_utf8_lossy(&buffered).contains("Denied by agent fence policy"));
+        // ...and in the persisted log, so a post-exit read still shows it.
+        let logged = std::fs::read(crate::scratch::terminal_log_path(&job_id, "dev")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&logged).contains("Denied by agent fence policy"),
+            "synthetic fence message must persist to the log"
+        );
+
+        crate::scratch::remove_job_scratch_dir(&job_id);
     }
 }

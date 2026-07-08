@@ -6,26 +6,49 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use crate::mcp::handlers::issues::{create_issue_in_project, CreateExecutionSpec};
 use crate::memories::canon::{resolve_role_canon_home, RoleCanonHome};
 use crate::models::Memory;
 use crate::orchestrator::Orchestrator;
+use crate::storage::LocalDb;
 
 const MEMORY_TRIAGE_RECIPE: &str = "memory-triage";
 const TRIAGE_NEIGHBOR_MIN_SIMILARITY: f32 = 0.72;
 const TRIAGE_NEIGHBOR_LIMIT: usize = 5;
 
-async fn record_batch_or_revert(
+/// The database that owns a triage pool.
+///
+/// PROJECT scope self-routes by its `scope_value` (a routable `project_id`):
+/// a team project's pool lives wholly in that team's synced replica, a local
+/// project's in the private DB. ROLE and WORKSPACE scopes are cross-project,
+/// cross-database pools; aggregating them across the private DB and every open
+/// replica needs a team-orchestration decision that does not exist yet, so by
+/// explicit contract they remain PRIVATE-DB pools (CAIRN-2587).
+async fn pool_db(
     orch: &Orchestrator,
+    scope: &str,
+    scope_value: &str,
+) -> Result<Arc<LocalDb>, String> {
+    match scope {
+        "project" => crate::execution::routing::routing_db_for_id(&orch.db, scope_value)
+            .await
+            .map_err(|e| e.to_string()),
+        _ => Ok(orch.db.local.clone()),
+    }
+}
+
+async fn record_batch_or_revert(
+    db: &LocalDb,
     issue_id: &str,
     memories: &[Memory],
 ) -> Result<(), String> {
     let ids: Vec<String> = memories.iter().map(|memory| memory.id.clone()).collect();
-    match crate::memories::db::record_triage_issue_batch(&orch.db.local, issue_id, &ids).await {
+    match crate::memories::db::record_triage_issue_batch(db, issue_id, &ids).await {
         Ok(()) => Ok(()),
         Err(error) => {
-            revert_claimed(orch, memories).await;
+            revert_claimed(db, memories).await;
             Err(error.to_string())
         }
     }
@@ -53,6 +76,7 @@ pub(crate) fn role_home_project_id(orch: &Orchestrator, role: &str) -> Result<St
 
 async fn scope_target(
     orch: &Orchestrator,
+    db: &LocalDb,
     scope: &str,
     scope_value: &str,
 ) -> Result<ScopeTarget, String> {
@@ -62,10 +86,10 @@ async fn scope_target(
         "workspace" => "workspace".to_string(),
         _ => "workspace".to_string(),
     };
-    let project_key = crate::memories::db::project_key_by_id(&orch.db.local, &project_id)
+    let project_key = crate::memories::db::project_key_by_id(db, &project_id)
         .await
         .map_err(|error| error.to_string())?;
-    let project_name = crate::memories::db::project_name_by_id(&orch.db.local, &project_id)
+    let project_name = crate::memories::db::project_name_by_id(db, &project_id)
         .await
         .map_err(|error| error.to_string())?;
     Ok(ScopeTarget {
@@ -130,6 +154,7 @@ fn role_prompt_under_triage(orch: &Orchestrator, target: &ScopeTarget) -> Option
 
 async fn seed_description(
     orch: &Orchestrator,
+    db: &LocalDb,
     target: &ScopeTarget,
     memories: &[Memory],
 ) -> String {
@@ -143,12 +168,12 @@ async fn seed_description(
     out.push_str("## Seeded memories\n\n");
     let batch_ids: Vec<String> = memories.iter().map(|memory| memory.id.clone()).collect();
     for memory in memories {
-        let uri = crate::memories::db::build_node_memory_uri_for_memory(&orch.db.local, memory)
+        let uri = crate::memories::db::build_node_memory_uri_for_memory(db, memory)
             .await
             .unwrap_or_else(|_| "unavailable".to_string());
         let _ = writeln!(out, "- [{}]({})", markdown_link_text(&memory.content), uri);
         match crate::memories::db::similar_memory_neighbors(
-            &orch.db.local,
+            db,
             memory,
             &uri,
             &batch_ids,
@@ -183,11 +208,9 @@ fn triage_issue_title(target: &ScopeTarget, pending_count: usize) -> String {
     )
 }
 
-async fn revert_claimed(orch: &Orchestrator, memories: &[Memory]) {
+async fn revert_claimed(db: &LocalDb, memories: &[Memory]) {
     let ids: Vec<String> = memories.iter().map(|memory| memory.id.clone()).collect();
-    if let Err(error) =
-        crate::memories::db::set_memories_status(&orch.db.local, &ids, "pending").await
-    {
+    if let Err(error) = crate::memories::db::set_memories_status(db, &ids, "pending").await {
         log::warn!("failed to revert claimed memory triage rows: {error}");
     }
 }
@@ -223,22 +246,19 @@ async fn spawn_triage_for_scope(
     scope_value: &str,
     threshold: i64,
 ) -> Result<Vec<String>, String> {
+    let db = pool_db(orch, scope, scope_value).await?;
     let mut spawned = Vec::new();
     loop {
-        let count = crate::memories::db::count_pending_memories_for_scope(
-            &orch.db.local,
-            scope,
-            scope_value,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let count = crate::memories::db::count_pending_memories_for_scope(&db, scope, scope_value)
+            .await
+            .map_err(|error| error.to_string())?;
         if count < threshold {
             break;
         }
 
-        let target = scope_target(orch, scope, scope_value).await?;
+        let target = scope_target(orch, &db, scope, scope_value).await?;
         let claimed = crate::memories::db::claim_pending_memories_for_scope(
-            &orch.db.local,
+            &db,
             scope,
             scope_value,
             threshold,
@@ -251,7 +271,7 @@ async fn spawn_triage_for_scope(
         if claimed.is_empty() {
             break;
         }
-        let description = seed_description(orch, &target, &claimed).await;
+        let description = seed_description(orch, &db, &target, &claimed).await;
         let title = triage_issue_title(&target, claimed.len());
         let outcome = create_issue_in_project(
             orch,
@@ -270,11 +290,11 @@ async fn spawn_triage_for_scope(
 
         match outcome {
             Ok(outcome) => {
-                record_batch_or_revert(orch, &outcome.issue_id, &claimed).await?;
+                record_batch_or_revert(&db, &outcome.issue_id, &claimed).await?;
                 spawned.push(outcome.uri);
             }
             Err(error) => {
-                revert_claimed(orch, &claimed).await;
+                revert_claimed(&db, &claimed).await;
                 return Err(error);
             }
         }
@@ -306,18 +326,36 @@ pub async fn maybe_spawn_triage(
 /// pool discovered directly from DB state, one issue per full batch. Idempotent —
 /// already-claimed batches are no longer pending, so a re-run only spawns for
 /// backlog that has accumulated since.
+///
+/// Multi-database: pools are discovered from EVERY open database (the private DB
+/// plus each open team replica). The private DB processes every scope; a team
+/// replica processes only `project` scope, because ROLE and WORKSPACE pools are
+/// cross-project, cross-database aggregates that remain private-DB by explicit
+/// contract (see [`pool_db`], CAIRN-2587). There is no double-processing:
+/// [`spawn_triage_for_scope`] self-routes a project pool back to its owning
+/// replica via [`pool_db`], and a team project's memories never appear in the
+/// private scan nor a local project's in a replica scan.
 pub async fn reconcile_pending_triage(orch: &Orchestrator) -> Result<Vec<String>, String> {
     let settings = orch.get_settings();
     if !settings.memory_review_enabled {
         return Ok(Vec::new());
     }
     let threshold = settings.pending_memory_threshold.max(1) as i64;
-    let scopes = crate::memories::db::distinct_pending_scopes(&orch.db.local)
-        .await
-        .map_err(|error| error.to_string())?;
+    let private = orch.db.local.clone();
     let mut spawned = Vec::new();
-    for (scope, scope_value) in scopes {
-        spawned.extend(spawn_triage_for_scope(orch, &scope, &scope_value, threshold).await?);
+    for db in orch.db.all_dbs().await {
+        let is_private = Arc::ptr_eq(&db, &private);
+        let scopes = crate::memories::db::distinct_pending_scopes(&db)
+            .await
+            .map_err(|error| error.to_string())?;
+        for (scope, scope_value) in scopes {
+            // Contract split: a team replica triages only its project-scope
+            // pools; role/workspace pools stay private-only (CAIRN-2587).
+            if !is_private && scope != "project" {
+                continue;
+            }
+            spawned.extend(spawn_triage_for_scope(orch, &scope, &scope_value, threshold).await?);
+        }
     }
     Ok(spawned)
 }
@@ -338,48 +376,54 @@ pub async fn reconcile_memory_triage(orch: Orchestrator) -> Result<(), String> {
         log::info!("memory triage reconcile: confirmed {confirmed} orphaned draft memories");
     }
 
-    let discarded = crate::memories::db::discard_draft_memories_for_closed_issues(&orch.db.local)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !discarded.is_empty() {
-        log::info!(
-            "memory triage reconcile: discarded {} draft memories for closed issues",
-            discarded.len()
-        );
-    }
+    // The per-DB integrity steps run against EVERY open database. Each is a
+    // per-DB idempotent sweep with no cross-DB atomicity; on a team replica they
+    // naturally touch only its project-scope triage batches (the only triage
+    // batches a replica ever holds). Counts are summed across DBs for logging.
+    let mut discarded_total = 0usize;
+    let mut reverted_total = 0usize;
+    let mut recovered_total = 0usize;
+    let mut finalized = 0usize;
+    for db in orch.db.all_dbs().await {
+        discarded_total += crate::memories::db::discard_draft_memories_for_closed_issues(&db)
+            .await
+            .map_err(|error| error.to_string())?
+            .len();
 
-    let reverted = crate::memories::db::revert_orphaned_claimed_memories(&orch.db.local)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !reverted.is_empty() {
-        log::info!(
-            "memory triage reconcile: re-homed {} orphaned claimed memories",
-            reverted.len()
-        );
-    }
+        reverted_total += crate::memories::db::revert_orphaned_claimed_memories(&db)
+            .await
+            .map_err(|error| error.to_string())?
+            .len();
 
-    let recovered = crate::memories::db::revert_claimed_for_failed_triage_issues(&orch.db.local)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !recovered.is_empty() {
-        log::info!(
-            "memory triage reconcile: recovered {} memories stranded on failed triage issues",
-            recovered.len()
-        );
-    }
+        recovered_total += crate::memories::db::revert_claimed_for_failed_triage_issues(&db)
+            .await
+            .map_err(|error| error.to_string())?
+            .len();
 
-    let merged_issues =
-        crate::memories::db::merged_triage_issues_with_claimed_memories(&orch.db.local)
+        let merged_issues = crate::memories::db::merged_triage_issues_with_claimed_memories(&db)
             .await
             .map_err(|error| error.to_string())?;
-    let mut finalized = 0usize;
-    for issue_id in &merged_issues {
-        match crate::memories::db::resolve_triage_batch_on_merge(&orch.db.local, issue_id).await {
-            Ok(ids) => finalized += ids.len(),
-            Err(error) => log::warn!(
-                "memory triage reconcile: failed to finalize merged triage batch for issue {issue_id}: {error}"
-            ),
+        for issue_id in &merged_issues {
+            match crate::memories::db::resolve_triage_batch_on_merge(&db, issue_id).await {
+                Ok(ids) => finalized += ids.len(),
+                Err(error) => log::warn!(
+                    "memory triage reconcile: failed to finalize merged triage batch for issue {issue_id}: {error}"
+                ),
+            }
         }
+    }
+    if discarded_total > 0 {
+        log::info!(
+            "memory triage reconcile: discarded {discarded_total} draft memories for closed issues"
+        );
+    }
+    if reverted_total > 0 {
+        log::info!("memory triage reconcile: re-homed {reverted_total} orphaned claimed memories");
+    }
+    if recovered_total > 0 {
+        log::info!(
+            "memory triage reconcile: recovered {recovered_total} memories stranded on failed triage issues"
+        );
     }
     if finalized > 0 {
         log::info!(
@@ -927,7 +971,8 @@ mod tests {
             project_name: "Project".to_string(),
         };
 
-        let description = super::seed_description(&test.orch, &target, &[memory]).await;
+        let description =
+            super::seed_description(&test.orch, &test.orch.db.local, &target, &[memory]).await;
 
         assert!(description.contains("## Role prompt under triage"));
         assert!(description.contains("Role `builder`:"));
@@ -967,7 +1012,8 @@ mod tests {
             project_name: "Project".to_string(),
         };
 
-        let description = super::seed_description(&test.orch, &target, &[memory]).await;
+        let description =
+            super::seed_description(&test.orch, &test.orch.db.local, &target, &[memory]).await;
 
         assert!(description
             .contains("- [durable behavior note](cairn://p/PRJ/42/1/builder/memories/4)"));
@@ -1614,5 +1660,331 @@ mod tests {
             1
         );
         assert_eq!(triage_issue_count(&test).await, 1);
+    }
+
+    async fn migrated_team_db(temp: &TempDir) -> Arc<LocalDb> {
+        let db = Arc::new(
+            LocalDb::open(temp.path().join("triage-team-test.db"))
+                .await
+                .unwrap(),
+        );
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db
+    }
+
+    // Seed a complete team-replica pool: a team project (key `TP`), a merged
+    // issue, its execution + a terminal job, and `count` memories at the given
+    // scope/status. Team ids carry the `{team}~{uuid}` prefix so they self-route
+    // to the replica through `routing_db_for_id`.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_team_pool(
+        db: &LocalDb,
+        team_id: &str,
+        project_id: &str,
+        issue_id: &str,
+        job_id: &str,
+        repo_path: &str,
+        scope: &str,
+        scope_value: &str,
+        status: &str,
+        count: usize,
+    ) {
+        let execution_id = format!("{team_id}~00000000-0000-4000-8000-100000000003");
+        db.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'TP', ?2, 1, 1)",
+            params![project_id, repo_path],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO issues (id, project_id, number, title, status, merged_at, created_at, updated_at) VALUES (?1, ?2, 7, 'Team Issue', 'merged', 2, 1, 2)",
+            params![issue_id, project_id],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES (?1, 'recipe', ?2, ?3, 'running', 1, 1)",
+            params![execution_id.as_str(), issue_id, project_id],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+             VALUES (?1, ?2, 'agent', ?3, ?4, 'complete', 'builder', 'builder', 1, 1)",
+            params![job_id, execution_id.as_str(), issue_id, project_id],
+        )
+        .await
+        .unwrap();
+        for idx in 0..count {
+            let mid = format!("{job_id}-mem-{idx}");
+            let seq = (idx as i64) + 1;
+            db.execute(
+                "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
+                 VALUES (?1, ?1, ?2, 'a durable team fact', ?3, ?4, ?5, ?6, ?7, 'cairn://p/TP/7/1/builder/chat/turn/2', ?7, ?7)",
+                params![mid.as_str(), project_id, status, scope, scope_value, job_id, seq],
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn triage_issue_count_in(db: &LocalDb) -> i64 {
+        db.query_one(
+            "SELECT COUNT(*) FROM issues WHERE title LIKE 'Memory triage:%'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn memory_status_count_in(
+        db: &LocalDb,
+        status: &str,
+        scope: &str,
+        scope_value: &str,
+    ) -> i64 {
+        db.query_one(
+            "SELECT COUNT(*) FROM memories WHERE status = ?1 AND scope = ?2 AND scope_value = ?3",
+            params![status, scope, scope_value],
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn triage_batch_link_count_in(db: &LocalDb) -> i64 {
+        db.query_one(
+            "SELECT COUNT(*) FROM memory_triage_issue_memories",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn execution_count_in(db: &LocalDb) -> i64 {
+        db.query_one("SELECT COUNT(*) FROM executions", (), |row| row.i64(0))
+            .await
+            .unwrap()
+    }
+
+    /// The event path for a merged TEAM issue: a project-scoped pool that reaches
+    /// threshold in a team replica both confirms its drafts AND spawns a triage
+    /// issue — wholly in that replica, with nothing split-brained to the private
+    /// DB (CAIRN-2587).
+    #[tokio::test]
+    async fn team_merged_issue_draft_confirmation_spawns_triage_issue_in_replica() {
+        let test = test_orch().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teamtri";
+        let project_id = format!("{team_id}~00000000-0000-4000-8000-100000000001");
+        let issue_id = format!("{team_id}~00000000-0000-4000-8000-100000000002");
+        let job_id = format!("{team_id}~00000000-0000-4000-8000-100000000010");
+        let repo_path = test.project_dir.to_string_lossy().to_string();
+        let team_db = migrated_team_db(&team_temp).await;
+        seed_team_pool(
+            &team_db,
+            team_id,
+            &project_id,
+            &issue_id,
+            &job_id,
+            &repo_path,
+            "project",
+            &project_id,
+            "draft",
+            5,
+        )
+        .await;
+        test.orch
+            .db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+        // `create_issue_in_project` resolves its DB by project KEY via
+        // `for_project`; register the route so the triage issue is created in the
+        // replica rather than the private DB.
+        test.orch
+            .db
+            .set_route("TP", Some(team_id.to_string()))
+            .await;
+
+        let spawned = crate::memories::commands::confirm_and_spawn_drafts_for_merged_issue(
+            test.orch.clone(),
+            &issue_id,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(spawned.len(), 1, "one triage issue for the full team pool");
+        // Triage issue, batch-link rows, and claimed memories all land in the replica.
+        assert_eq!(triage_issue_count_in(&team_db).await, 1);
+        assert_eq!(triage_batch_link_count_in(&team_db).await, 5);
+        assert_eq!(
+            memory_status_count_in(&team_db, "claimed", "project", &project_id).await,
+            5
+        );
+        // The triage issue's execution actually STARTED in the replica (locks the
+        // start_execution_from_collection routing fix): one seeded execution plus
+        // the new triage execution.
+        assert_eq!(
+            execution_count_in(&team_db).await,
+            2,
+            "the triage issue's execution must start in the replica, not fail on a private-DB lookup"
+        );
+        // Split-brain guard: NOTHING was written to the private DB.
+        assert_eq!(triage_issue_count_in(&test.orch.db.local).await, 0);
+        assert_eq!(triage_batch_link_count_in(&test.orch.db.local).await, 0);
+        assert_eq!(
+            memory_status_count_in(&test.orch.db.local, "claimed", "project", &project_id).await,
+            0
+        );
+    }
+
+    /// The reconcile sweep discovers pending pools across every open database, so
+    /// a team replica's at-threshold project pool spawns a triage issue in that
+    /// replica even with no confirming event.
+    #[tokio::test]
+    async fn reconcile_spawns_team_project_pool_in_replica() {
+        let test = test_orch().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teamrec";
+        let project_id = format!("{team_id}~00000000-0000-4000-8000-100000000001");
+        let issue_id = format!("{team_id}~00000000-0000-4000-8000-100000000002");
+        let job_id = format!("{team_id}~00000000-0000-4000-8000-100000000010");
+        let repo_path = test.project_dir.to_string_lossy().to_string();
+        let team_db = migrated_team_db(&team_temp).await;
+        seed_team_pool(
+            &team_db,
+            team_id,
+            &project_id,
+            &issue_id,
+            &job_id,
+            &repo_path,
+            "project",
+            &project_id,
+            "pending",
+            5,
+        )
+        .await;
+        test.orch
+            .db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+        test.orch
+            .db
+            .set_route("TP", Some(team_id.to_string()))
+            .await;
+
+        super::reconcile_memory_triage(test.orch.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(triage_issue_count_in(&team_db).await, 1);
+        assert_eq!(
+            memory_status_count_in(&team_db, "claimed", "project", &project_id).await,
+            5
+        );
+        assert_eq!(triage_issue_count_in(&test.orch.db.local).await, 0);
+    }
+
+    /// Contract split: role/workspace pools stay private-only, so a team
+    /// replica's full workspace-scope pending pool is NOT triaged by reconcile.
+    #[tokio::test]
+    async fn reconcile_skips_team_workspace_pool_by_contract() {
+        let test = test_orch().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teamws";
+        let project_id = format!("{team_id}~00000000-0000-4000-8000-100000000001");
+        let issue_id = format!("{team_id}~00000000-0000-4000-8000-100000000002");
+        let job_id = format!("{team_id}~00000000-0000-4000-8000-100000000010");
+        let repo_path = test.project_dir.to_string_lossy().to_string();
+        let team_db = migrated_team_db(&team_temp).await;
+        seed_team_pool(
+            &team_db,
+            team_id,
+            &project_id,
+            &issue_id,
+            &job_id,
+            &repo_path,
+            "workspace",
+            "workspace",
+            "pending",
+            5,
+        )
+        .await;
+        test.orch
+            .db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+        test.orch
+            .db
+            .set_route("TP", Some(team_id.to_string()))
+            .await;
+
+        let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();
+
+        assert!(spawned.is_empty());
+        assert_eq!(triage_issue_count_in(&team_db).await, 0);
+        assert_eq!(
+            memory_status_count_in(&team_db, "pending", "workspace", "workspace").await,
+            5
+        );
+    }
+
+    /// The periodic orphan-draft SWEEP enumerates terminal jobs across every open
+    /// database (CAIRN-2242): a team run's stranded drafts — ones no merged-issue
+    /// event ever confirmed — are advanced to `pending` in the replica, with
+    /// nothing written to the private DB. `confirm_orphaned_drafts` re-routes each
+    /// per-job confirm by job id, so the only new logic under test is the
+    /// all-databases discovery scan.
+    #[tokio::test]
+    async fn confirm_orphaned_drafts_sweeps_team_terminal_job_in_replica() {
+        let test = test_orch().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teamorph";
+        let project_id = format!("{team_id}~00000000-0000-4000-8000-100000000001");
+        let issue_id = format!("{team_id}~00000000-0000-4000-8000-100000000002");
+        let job_id = format!("{team_id}~00000000-0000-4000-8000-100000000010");
+        let repo_path = test.project_dir.to_string_lossy().to_string();
+        let team_db = migrated_team_db(&team_temp).await;
+        // A terminal (`complete`) job carrying drafts, with NO merged-issue event
+        // driving confirmation — only the sweep can advance these.
+        seed_team_pool(
+            &team_db,
+            team_id,
+            &project_id,
+            &issue_id,
+            &job_id,
+            &repo_path,
+            "project",
+            &project_id,
+            "draft",
+            3,
+        )
+        .await;
+        test.orch
+            .db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+
+        let confirmed = crate::memories::commands::confirm_orphaned_drafts(&test.orch).unwrap();
+
+        assert_eq!(confirmed, 3, "the sweep must confirm the team job's drafts");
+        assert_eq!(
+            memory_status_count_in(&team_db, "pending", "project", &project_id).await,
+            3
+        );
+        assert_eq!(
+            memory_status_count_in(&team_db, "draft", "project", &project_id).await,
+            0
+        );
+        // Split-brain guard: nothing was written to the private DB.
+        assert_eq!(
+            memory_status_count_in(&test.orch.db.local, "pending", "project", &project_id).await,
+            0
+        );
     }
 }

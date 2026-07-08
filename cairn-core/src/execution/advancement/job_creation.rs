@@ -588,6 +588,111 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn base_branch_inherits_parent_job_branch_via_parent_job_id() {
+        // A Feature coordinator child records its exact spawner in
+        // `issues.parent_job_id`. The child inherits the coordinator's
+        // worktree-backed integration branch even when that coordinator job is
+        // no longer live — here it is 'complete', which the parent-issue
+        // fallback (non-terminal only) would reject.
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+                     VALUES ('parent', 'proj-1', 1, 'Parent', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-1', 'recipe-default', 'parent', 'proj-1', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                // Terminal ('complete') coordinator job that the parent-issue
+                // fallback would skip, but which the exact `parent_job_id`
+                // lookup still honors because it is worktree-backed. Inserted
+                // before the child issue, which references it via a
+                // `parent_job_id` foreign key.
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, created_at, updated_at)
+                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'complete', '/wt/coord', 'agent/coord-integration', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, parent_issue_id, parent_job_id, created_at, updated_at)
+                     VALUES ('child', 'proj-1', 2, 'Child', 'parent', 'job-parent', 1, 1)",
+                    (),
+                )
+                .await?;
+                let branch = base_branch_for_issue_job(conn, "proj-1", "child").await?;
+                assert_eq!(branch.as_deref(), Some("agent/coord-integration"));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_branch_falls_back_to_default_when_parent_job_is_ambient() {
+        // A Manager coordinator is ambient: its recorded spawner job has no
+        // worktree (`worktree_path = NULL`, `branch = NULL`). Even though the
+        // child records that job in `parent_job_id`, the worktree guard means
+        // no integration branch is inherited and the child targets 'main'.
+        let db = migrated_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
+                     VALUES ('parent', 'proj-1', 1, 'Parent', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('exec-1', 'recipe-default', 'parent', 'proj-1', 'running', 1, 1)",
+                    (),
+                )
+                .await?;
+                // Ambient (Manager) coordinator job: no worktree, no branch.
+                // Inserted before the child that references it via a
+                // `parent_job_id` foreign key.
+                conn.execute(
+                    "INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, worktree_path, branch, created_at, updated_at)
+                     VALUES ('job-parent', 'exec-1', 'node', 'parent', 'proj-1', 'running', NULL, NULL, 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, parent_issue_id, parent_job_id, created_at, updated_at)
+                     VALUES ('child', 'proj-1', 2, 'Child', 'parent', 'job-parent', 1, 1)",
+                    (),
+                )
+                .await?;
+                let branch = base_branch_for_issue_job(conn, "proj-1", "child").await?;
+                assert_eq!(branch.as_deref(), Some("main"));
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn base_branch_honors_project_config_override() {
         // Repo with a `.cairn/config.yaml` that overrides the default branch.
         let repo = tempfile::tempdir().unwrap();

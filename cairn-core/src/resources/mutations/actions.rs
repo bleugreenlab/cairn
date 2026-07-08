@@ -52,12 +52,15 @@ pub(super) async fn apply_action_create(
     let input_schema = parse_schema(payload, "inputSchema", "input_schema")?;
     let output_schema = parse_schema(payload, "outputSchema", "output_schema")?;
 
-    let (workspace_id, project_id) = match explicit_project {
-        Some(project) => (
-            None,
-            Some(run_context::project_id_by_key(&orch.db.local, project).await?),
-        ),
-        None => (Some(WORKSPACE_ID.to_string()), None),
+    // A team project's rows live in its replica; resolve the owning db by key and
+    // write there so the create lands in the same database its id will route to.
+    let (workspace_id, project_id, db) = match explicit_project {
+        Some(project) => {
+            let db = orch.db.for_project(project).await;
+            let pid = run_context::project_id_by_key(&db, project).await?;
+            (None, Some(pid), db)
+        }
+        None => (Some(WORKSPACE_ID.to_string()), None, orch.db.local.clone()),
     };
 
     let input = CreateActionConfig {
@@ -69,17 +72,17 @@ pub(super) async fn apply_action_create(
         workspace_id,
         project_id,
     };
-    let action = action_queries::create_action_config(&orch.db.local, input).await?;
+    let action = action_queries::create_action_config(&db, input).await?;
     emit_change(orch, "insert");
     Ok(format!("Created action '{}' ({})", action.name, action.id))
 }
 
 async fn require_scoped(
-    orch: &Orchestrator,
+    db: &crate::storage::LocalDb,
     action_id: &str,
     explicit_project: Option<&str>,
 ) -> Result<(), String> {
-    let action = action_queries::get_action_config(&orch.db.local, action_id)
+    let action = action_queries::get_action_config(db, action_id)
         .await?
         .ok_or_else(|| not_found(action_id, explicit_project))?;
     let in_scope = match explicit_project {
@@ -98,7 +101,11 @@ pub(super) async fn apply_action_patch(
     action_id: &str,
     explicit_project: Option<&str>,
 ) -> Result<String, String> {
-    require_scoped(orch, action_id, explicit_project).await?;
+    // Route by the action id so a team project's action edits land in its replica.
+    let db = crate::projects::crud::owning_db(&orch.db, action_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    require_scoped(&db, action_id, explicit_project).await?;
 
     let input = UpdateActionConfig {
         name: super::payload_str(payload, "name", &[]).map(ToOwned::to_owned),
@@ -108,7 +115,7 @@ pub(super) async fn apply_action_patch(
         input_schema: parse_schema(payload, "inputSchema", "input_schema")?,
         output_schema: parse_schema(payload, "outputSchema", "output_schema")?,
     };
-    action_queries::update_action_config(&orch.db.local, action_id, input).await?;
+    action_queries::update_action_config(&db, action_id, input).await?;
     emit_change(orch, "update");
     Ok(format!("Updated action '{action_id}'"))
 }
@@ -118,8 +125,11 @@ pub(super) async fn apply_action_delete(
     action_id: &str,
     explicit_project: Option<&str>,
 ) -> Result<String, String> {
-    require_scoped(orch, action_id, explicit_project).await?;
-    action_queries::delete_action_config(&orch.db.local, action_id).await?;
+    let db = crate::projects::crud::owning_db(&orch.db, action_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    require_scoped(&db, action_id, explicit_project).await?;
+    action_queries::delete_action_config(&db, action_id).await?;
     emit_change(orch, "delete");
     Ok(format!("Deleted action '{action_id}'"))
 }

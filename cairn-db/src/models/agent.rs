@@ -60,6 +60,10 @@ pub struct AgentConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<String>,
+    /// Optional lucide icon name (kebab-case) giving the agent a compact visual
+    /// identity. `None`/absent means no icon (a `Bot` fallback renders in the UI).
+    #[serde(default)]
+    pub icon: Option<String>,
     /// Resolved atomic backend+model selection carried from the execution
     /// snapshot to session start. When set, the runtime uses it verbatim and
     /// never re-resolves a tier. `None` only for authoring/display configs that
@@ -94,6 +98,8 @@ pub struct CreateAgentConfig {
     pub on_escape: Option<LegacyOnEscape>,
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 /// Input for updating an agent config
@@ -115,4 +121,5 @@ pub struct UpdateAgentConfig {
     pub fence: Option<Option<Fence>>,
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<Option<String>>,
+    pub icon: Option<Option<String>>,
 }

@@ -212,6 +212,7 @@ mod tests {
                 skills: None,
                 fence: None,
                 backend_preference: None,
+                icon: None,
                 selection: None,
                 extras: None,
             },

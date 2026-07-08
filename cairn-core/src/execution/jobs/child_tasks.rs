@@ -83,6 +83,7 @@ pub fn create_child_task(
             disallowed_tools: file_agent.disallowed_tools,
             skills: file_agent.skills,
             fence: file_agent.fence,
+            icon: file_agent.icon,
             backend_preference: file_agent.backend_preference,
             selection: None,
             extras: None,

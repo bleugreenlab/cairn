@@ -33,6 +33,20 @@
 //! not fixers; a verify that dirties tracked files would leave the worktree != HEAD
 //! and is out of contract for this cadence.
 //!
+//! ## Concurrency and isolation
+//!
+//! The cache-miss checks run CONCURRENTLY, each in its own copy-on-write clone of
+//! the sealed worktree ([`crate::execution::check_isolation`]) — the same engine
+//! ([`crate::execution::checks::run_planned_checks`]) and isolation machinery the
+//! write cadence uses. Because the review suites are heavy and each is internally
+//! multi-threaded (two full Rust compiles among them, each cloning its own
+//! `target`), the parallelism is BOUNDED by [`review_max_concurrency`] rather than
+//! unbounded like the thin write cadence. When a cheap clone is unavailable the
+//! whole batch falls back to SEQUENTIAL in-place execution in the one shared
+//! checkout ([`check_isolation::decide_exec_mode`]). Isolation is fold-free here:
+//! a stray tracked write lands in a disposable clone and is discarded, so it can
+//! never dirty `@` and wedge the next write's seal.
+//!
 //! ## Two guards keep it from looping
 //!
 //! - Single-flight (`Orchestrator::try_begin_turn_end_checks`): a rapid re-idle
@@ -45,24 +59,25 @@
 //!   most ONCE per failing tree.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 use cairn_common::uri::build_node_checks_uri;
 
 use crate::execution::cache::{get_check_result, store_check_result, CheckResultCacheWrite};
-use crate::execution::check_parsers::parse_check_output;
+use crate::execution::check_isolation;
 use crate::execution::checks::{
-    applicable_turn_end_checks, input_hash_for, load_live_project_checks,
+    applicable_turn_end_checks, input_hash_for, load_live_project_checks, resolve_check_timeout_ms,
+    run_planned_checks, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::selection::CheckPlan;
 use crate::jj::{node_changed_files, sealed_tree_entries, sealed_tree_hash, JjEnv};
 use crate::orchestrator::{attention_push, Orchestrator};
 use crate::storage::{LocalDb, RowExt};
 
-/// Per-check time cap — mirrors the write cadence's generous ceiling.
-const CHECK_TIMEOUT_MS: u32 = 600_000;
-/// Chars of combined output retained per check in the cache row's `output_tail`.
-const OUTPUT_TAIL_CHARS: usize = 4_000;
+/// Env var handed to an isolated review check naming a file of newline-delimited
+/// changed paths, so `scripts/lib/check-base.ts` can attribute findings to the
+/// agent's diff without any VCS metadata in the `.jj`-stripped clone. Must match
+/// `CHANGED_FILES_ENV` in that script.
+const CHANGED_FILES_ENV: &str = "CAIRN_CHECK_CHANGED_FILES";
 /// Chars of the live log file surfaced in the "running" render.
 const LOG_TAIL_CHARS: usize = 2_000;
 
@@ -228,6 +243,7 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
                         target_results_json: entry.target_results_json,
                         job_id: Some(job_id.to_string()),
                         cached: Some(true),
+                        failure_kind: entry.failure_kind,
                     },
                 );
             }
@@ -264,71 +280,132 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
     );
 
-    // 9. Run each remaining check UNSANDBOXED, capturing to the cache and log.
-    let mut any_failed = false;
-    let mut verdicts: Vec<String> = Vec::with_capacity(to_run.len());
-    for (index, (plan, input_hash)) in to_run.iter().enumerate() {
-        let stream_id = format!("turn-checks:{job_id}:{index}");
-        let log_path = turn_end_log_path(orch, job_id, &plan.name);
-        // Create this check's log file BEFORE it runs so the status model reads it
-        // as RUNNING (file exists) the instant we announce it — even a check that
-        // is silent before its first line. Then emit a `db-change` so any live view
-        // refetches, sees this check flip to running, and (re)starts its poll of the
-        // growing tail. Without the up-front create the check would read as pending
-        // until its first byte; without the emit the poll would not restart in the
-        // gap after the previous check finished (no running check → poll stops).
-        let _ = std::fs::write(&log_path, b"");
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "check_result_cache", "action": "update"}),
-        );
-        let started = Instant::now();
-        let (exit_code, passed, output) =
-            match crate::mcp::handlers::run::run_check_command_unsandboxed(
-                orch,
-                &worktree_path,
-                &stream_id,
-                &plan.command,
-                CHECK_TIMEOUT_MS,
-                &log_path,
-            )
-            .await
-            {
-                Ok((code, combined)) => (code, code == Some(0), combined),
-                // A spawn error is a clear failure, never a silent pass.
-                Err(err) => (None, false, err),
-            };
-        let duration_ms = started.elapsed().as_millis() as i64;
+    // 9. Decide the execution mode: give every cache-miss check its own COW clone
+    // of the sealed worktree so the review suite runs concurrently in isolation,
+    // BOUNDED (the suites are heavy). A clone failure routes the whole batch to
+    // sequential in-place execution in the shared worktree. The guard removes the
+    // review clone root on every exit path — including the fallback. Review is
+    // FOLD-FREE by contract: the clones are discarded, never copied back, so a
+    // stray tracked write lands in a disposable clone rather than dirtying `@`.
+    let clone_root = check_isolation::turn_end_clone_root_for_job(&orch.config_dir, job_id);
+    let _clone_guard = check_isolation::CloneGuard::new(clone_root.clone());
+    let (mode, clones) = {
+        let misses: Vec<(usize, &str)> = to_run
+            .iter()
+            .enumerate()
+            .map(|(index, (plan, _))| (index, plan.name.as_str()))
+            .collect();
+        check_isolation::decide_exec_mode(&*orch.services.fs, repo_root, &clone_root, &misses)
+    };
 
-        // Enrich with structured per-test results (fail-closed: `passed` above is
-        // exit-code-driven and unaffected by whether the parse succeeds).
-        let target_results_json =
-            parse_check_output(&plan.command, &output).and_then(|p| serde_json::to_string(&p).ok());
-        let _ = store_check_result(
-            db.clone(),
-            CheckResultCacheWrite {
-                project_id: coords.project_id.clone(),
-                tree_hash: tree_hash.clone(),
-                input_hash: input_hash.clone(),
-                check_name: plan.name.clone(),
-                exit_code: exit_code.unwrap_or(-1),
-                passed,
-                output_tail: tail(&output, OUTPUT_TAIL_CHARS),
-                duration_ms,
-                target_results_json,
-                job_id: Some(job_id.to_string()),
-                cached: Some(false),
-            },
-        );
-        if !passed {
-            any_failed = true;
+    // Isolated checks run in `.jj`-stripped clones, so a diff-scoped check
+    // (rust-lint, dead-code) can't resolve its own changed-file set from the
+    // clone's VCS and would fall back to full-strict, gating on pre-existing base
+    // findings. Hand them the already-computed set via a file + env override so
+    // attribution stays diff-scoped without the clone ever shelling jj. The Shared
+    // fallback runs in the real worktree, where jj resolution works, so it needs
+    // no override (empty env, unchanged behavior).
+    let extra_env: Vec<(String, String)> = if mode == check_isolation::CheckExecMode::Isolated {
+        let path = log_dir.join("changed-files.txt");
+        let body = changed
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        match std::fs::write(&path, body) {
+            Ok(()) => vec![(
+                CHANGED_FILES_ENV.to_string(),
+                path.to_string_lossy().into_owned(),
+            )],
+            Err(e) => {
+                log::warn!(
+                    "turn-end checks for job {}: failed to write changed-files override ({e}); \
+                     isolated diff-scoped checks will run full-strict",
+                    short_id(job_id)
+                );
+                Vec::new()
+            }
         }
-        verdicts.push(format!(
-            "{}={} ({duration_ms}ms)",
-            plan.name,
-            if passed { "pass" } else { "fail" }
-        ));
-    }
+    } else {
+        Vec::new()
+    };
+
+    // 10. Run the misses through the shared engine, concurrently and bounded.
+    // `to_run` is already miss-only, so the engine's cache-hit branch never fires:
+    // it runs every plan, stores each verdict (`cached: false`, `job_id`), and
+    // parses per-test detail exactly as the old inline loop did. `notify` is a
+    // no-op — review has no `check-status` frontend consumer; its live surface is
+    // the per-check log tail plus the bracketing `db-change`s.
+    let cap = review_max_concurrency().min(to_run.len());
+    let clones_ref = &clones;
+    let to_run_ref = &to_run;
+    // Per-check effective timeout, aligned to plan index. A check's schema
+    // `timeout` overrides the review cadence default (sized for a cold, uncached
+    // full Rust build; a healthy-but-slow suite is no longer killed at 10 min).
+    let timeouts: Vec<u32> = to_run
+        .iter()
+        .map(|(plan, _)| {
+            resolve_check_timeout_ms(checks.get(&plan.name), DEFAULT_REVIEW_CHECK_TIMEOUT_MS)
+        })
+        .collect();
+    let timeouts_ref = &timeouts;
+    let extra_env_ref = &extra_env;
+    let worktree = worktree_path.clone();
+    let outcomes = run_planned_checks(
+        db.clone(),
+        &coords.project_id,
+        &tree_hash,
+        job_id,
+        &to_run,
+        &format!("turn-checks:{job_id}"),
+        mode,
+        move |index, command, stream_id| {
+            let worktree = worktree.clone();
+            async move {
+                // Isolated: run in this check's clone; Shared fallback: the real
+                // worktree. Review always runs UNSANDBOXED (an idle agent can't
+                // answer a fence prompt), so the sandbox flag is ignored.
+                let (cwd, _sandbox) =
+                    check_isolation::resolve_check_exec(clones_ref, index, &worktree);
+                let name = to_run_ref[index].0.name.clone();
+                let log_path = turn_end_log_path(orch, job_id, &name);
+                // Mark this check started the instant it begins (file-exists =
+                // running, even before its first line), then nudge any live
+                // `/checks` view to (re)start its tail poll.
+                let _ = std::fs::write(&log_path, b"");
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    serde_json::json!({"table": "check_result_cache", "action": "update"}),
+                );
+                crate::mcp::handlers::run::run_check_command_unsandboxed(
+                    orch,
+                    &cwd,
+                    &stream_id,
+                    &command,
+                    timeouts_ref[index],
+                    &log_path,
+                    extra_env_ref,
+                )
+                .await
+            }
+        },
+        |_| {},
+        Some(cap.max(1)),
+    )
+    .await;
+
+    let any_failed = outcomes.iter().any(|o| !o.passed);
+    let verdicts: Vec<String> = outcomes
+        .iter()
+        .map(|o| {
+            format!(
+                "{}={} ({}ms)",
+                o.name,
+                if o.passed { "pass" } else { "fail" },
+                o.duration_ms
+            )
+        })
+        .collect();
 
     // Nudge any live PR-node / `/checks` view to re-render with the fresh verdicts.
     let _ = orch.services.emitter.emit(
@@ -397,6 +474,20 @@ fn delivery_wake(any_failed: bool) -> attention_push::Wake {
     } else {
         attention_push::Wake::Passive
     }
+}
+
+/// A modest cap on how many review checks run concurrently under COW isolation.
+/// The review suite carries heavy, internally-multithreaded compiles (two full
+/// Rust builds among them), each cloning its own `src-tauri/target`, so the real
+/// contention is a handful of concurrent heavy compiles rather than the raw check
+/// count. Derive the cap from the core count (divided by 4, clamped to `[2, 4]`):
+/// an 8-core host runs 2 at a time, a 16-core host runs 4 — enough parallelism to
+/// win wall-clock without oversubscribing CPU/IO. A tunable constant; adjust the
+/// divisor/clamp if the mix of heavy suites changes.
+fn review_max_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 4).clamp(2, 4))
+        .unwrap_or(2)
 }
 
 /// First 8 chars of a job id for log lines (mirrors the ids elsewhere in this
@@ -535,10 +626,11 @@ fn turn_end_log_dir(orch: &Orchestrator, job_id: &str) -> PathBuf {
     orch.config_dir.join("turn-checks").join(job_id)
 }
 
-/// The live log file for a SINGLE check within a job's turn-end run. Turn-end
-/// checks run sequentially and each tees into its own file, so the PR-node /
-/// `/checks` render can tail exactly that check's output instead of a shared blob
-/// that made every running check preview the same interleaved text.
+/// The live log file for a SINGLE check within a job's turn-end run. Each check
+/// tees into its OWN file (created the instant it starts), so the PR-node /
+/// `/checks` render can tail exactly that check's output — several may be running
+/// and tailing at once under concurrent isolation — instead of a shared blob that
+/// made every running check preview the same interleaved text.
 fn turn_end_log_path(orch: &Orchestrator, job_id: &str, check_name: &str) -> PathBuf {
     turn_end_log_dir(orch, job_id).join(format!("{}.log", sanitize_log_name(check_name)))
 }
@@ -628,6 +720,7 @@ mod tests {
             skipped: None,
             failure_names: Vec::new(),
             output_tail: None,
+            failure_kind: None,
         }
     }
 
@@ -729,5 +822,14 @@ mod tests {
     fn short_id_never_panics_on_a_short_string() {
         assert_eq!(short_id("abcd"), "abcd");
         assert_eq!(short_id("0123456789"), "01234567");
+    }
+
+    #[test]
+    fn review_max_concurrency_is_a_sane_bound() {
+        let n = review_max_concurrency();
+        assert!(
+            (2..=4).contains(&n),
+            "review concurrency cap {n} must stay in [2, 4]"
+        );
     }
 }

@@ -60,6 +60,7 @@ pub struct OrchestratorBuilder {
     mcp_auth: Arc<McpAuthState>,
     warm_gc: Option<Arc<crate::agent_process::gc::WarmProcessGC>>,
     pty_state: Arc<PtyState>,
+    repl_state: Arc<crate::mcp::handlers::repl::ReplState>,
     permission_responses: broadcast::Sender<(String, String)>,
     run_completions: broadcast::Sender<String>,
     prompt_responses: broadcast::Sender<(String, String)>,
@@ -91,6 +92,7 @@ impl OrchestratorBuilder {
         let process_state = Arc::new(AgentProcessState::default());
         let mcp_auth = Arc::new(McpAuthState::new(config_dir.clone()));
         let pty_state = Arc::new(PtyState::default());
+        let repl_state = Arc::new(crate::mcp::handlers::repl::ReplState::default());
         let permission_responses = broadcast::channel(16).0;
         let run_completions = broadcast::channel(64).0;
         let prompt_responses = broadcast::channel(16).0;
@@ -111,6 +113,7 @@ impl OrchestratorBuilder {
             mcp_auth,
             warm_gc: None,
             pty_state,
+            repl_state,
             permission_responses,
             run_completions,
             prompt_responses,
@@ -158,6 +161,11 @@ impl OrchestratorBuilder {
 
     pub fn pty_state(mut self, pty_state: Arc<PtyState>) -> Self {
         self.pty_state = pty_state;
+        self
+    }
+
+    pub fn repl_state(mut self, repl_state: Arc<crate::mcp::handlers::repl::ReplState>) -> Self {
+        self.repl_state = repl_state;
         self
     }
 
@@ -287,6 +295,7 @@ impl OrchestratorBuilder {
             mcp_auth: self.mcp_auth,
             warm_gc: self.warm_gc,
             pty_state: self.pty_state,
+            repl_state: self.repl_state,
             worktree_search: Arc::new(crate::worktree_search::WorktreeSearchPool::default()),
             call_admission: Arc::new(crate::execution::jobs::CallAdmission::default()),
             permission_responses: self.permission_responses,
@@ -371,6 +380,7 @@ pub struct Orchestrator {
     pub warm_gc: Option<Arc<crate::agent_process::gc::WarmProcessGC>>,
     /// Active PTY sessions (terminals)
     pub pty_state: Arc<PtyState>,
+    pub repl_state: Arc<crate::mcp::handlers::repl::ReplState>,
     /// Bounded pool of per-worktree warm search indexes (CAIRN-2303). Repeated
     /// `?grep=` reads in a worktree hit a resident fff index instead of
     /// re-walking the tree; cold/ineligible queries fall back to the ripgrep
@@ -561,9 +571,10 @@ pub struct Orchestrator {
     pub setup_registry: Arc<Mutex<HashMap<String, SetupHandle>>>,
 
     /// Launcher handles for supervised Managed Build Service daemons, keyed by
-    /// service name. Held so a foreground daemon can be stopped on shutdown; a
-    /// daemon that detaches (e.g. an sccache server) outlives its launcher,
-    /// which is acceptable for a shared cache. See `orchestrator::build_services`.
+    /// service name. The default sccache daemon runs in the FOREGROUND as Cairn's
+    /// child (`SCCACHE_NO_DAEMON`), so its handle controls the server directly:
+    /// held so the supervisor can kill-then-relaunch a wedged daemon and so the
+    /// server is stopped on shutdown. See `orchestrator::build_services`.
     pub build_service_children: Arc<Mutex<HashMap<String, Box<dyn ChildProcess>>>>,
 
     /// Per-run dedupe for legacy `agent-attention` terminal toasts.
@@ -947,6 +958,17 @@ impl Orchestrator {
     /// by the always-on hosts (runner, non-inert server).
     pub async fn redispatch_crashed_workflows(&self) {
         crate::execution::jobs::redispatch_crashed_workflows(self).await;
+    }
+
+    /// Heal node-less delegated children (calls/workflows) left in the CAIRN-2559
+    /// stuck shape by a host crash under the old code: run terminal, job status
+    /// never terminalized, caller durably blocked. Terminalize each from its
+    /// turn+artifact and fire the resume gate. `redispatch_crashed_workflows`
+    /// only re-spawns workflows whose latest run is NON-terminal, so it never
+    /// revisits this shape; run this once at startup right after it. Idempotent.
+    /// Owned by the always-on hosts (runner, non-inert server).
+    pub async fn heal_stuck_delegated_children(&self) {
+        crate::execution::advancement::heal_stuck_delegated_children(self).await;
     }
 
     /// Fail-fast ephemeral calls left in-flight by a host crash (CAIRN-2548) so a

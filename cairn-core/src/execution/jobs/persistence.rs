@@ -815,12 +815,22 @@ pub(crate) async fn insert_child_job_session_run(
             .await
             .map_err(|e| DbError::internal(format!("Failed to create child job: {e}")))?;
 
+            // The child session records the backend its model resolves to, the
+            // same derivation prepare_job uses for DAG jobs. Hardcoding "claude"
+            // here made every Codex child-task reply see desired "codex" !=
+            // stored "claude" and rotate to a fresh session, wiping history at
+            // the system prompt (CAIRN-2598).
+            let session_backend = input
+                .model
+                .as_deref()
+                .and_then(crate::backends::backend_for_model)
+                .unwrap_or("claude");
             insert_session_conn(
                 conn,
                 &input.session_id,
                 Some(input.job_id.as_str()),
                 None,
-                "claude",
+                session_backend,
                 input.now,
             )
             .await?;

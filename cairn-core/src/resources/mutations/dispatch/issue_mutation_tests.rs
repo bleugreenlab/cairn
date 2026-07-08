@@ -926,6 +926,7 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::NodeProgress => "cairn://p/CAIRN/1/1/builder/progress",
         K::NodeArtifact => "cairn://p/CAIRN/1/1/builder/plan",
         K::NodeTerminal => "cairn://p/CAIRN/1/1/builder/terminal/dev",
+        K::NodeRepl => "cairn://p/CAIRN/1/1/builder/repl/analysis",
         K::TaskTerminal => "cairn://p/CAIRN/1/1/builder/task/sub/terminal/dev",
         K::TaskMessages => "cairn://p/CAIRN/1/1/builder/task/sub/messages",
         K::TaskArtifact => "cairn://p/CAIRN/1/1/builder/task/sub/result",

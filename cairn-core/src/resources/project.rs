@@ -1064,10 +1064,18 @@ pub(super) async fn read_project_search(
         _ => return "Query parameter 'search' is required for projected project reads".to_string(),
     };
 
-    if let Some(unsupported) = params
-        .iter()
-        .find(|param| !["search", "limit", "since", "content_types"].contains(&param.key.as_str()))
-    {
+    if let Some(unsupported) = params.iter().find(|param| {
+        ![
+            "search",
+            "limit",
+            "since",
+            "content_types",
+            "role",
+            "in",
+            "issue",
+        ]
+        .contains(&param.key.as_str())
+    }) {
         return format!(
             "Unsupported query parameter '{}' for project search projection",
             unsupported.key
@@ -1100,10 +1108,46 @@ pub(super) async fn read_project_search(
             .collect::<Vec<_>>()
     });
 
+    let role = find_query_value(params, "role").map(str::to_string);
+
+    // `in=title` is the only supported axis for now (title-only matching).
+    let title_only = match find_query_value(params, "in") {
+        Some("title") => true,
+        None => false,
+        Some(other) => {
+            return format!(
+                "Unsupported 'in' value '{other}' for project search projection (expected 'title')"
+            )
+        }
+    };
+
+    // `issue=NUMBER` scopes the search to one issue's accumulated history
+    // (executions, transcripts, comments) rather than finding the issue itself.
+    let issue_id = match find_query_value(params, "issue") {
+        Some(raw) => match raw.trim().parse::<i32>() {
+            Ok(number) => {
+                match super::common::issue_id_for_number(&conn, &project_ctx.project_id, number)
+                    .await
+                {
+                    Some(id) => Some(id),
+                    None => {
+                        return format!("Issue {}-{} not found", project_ctx.project_key, number)
+                    }
+                }
+            }
+            Err(_) => {
+                return format!("Invalid 'issue' value '{raw}' for project search projection")
+            }
+        },
+        None => None,
+    };
+
     let filters = crate::models::SearchFilters {
         project_id: Some(project_ctx.project_id),
-        issue_id: None,
+        issue_id,
         content_types,
+        role,
+        title_only,
         since,
         limit,
     };

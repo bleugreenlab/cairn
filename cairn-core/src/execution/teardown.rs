@@ -282,6 +282,7 @@ pub(crate) async fn execute_target_cleanup(
     // something the other cannot: detached grandchildren vs. DB rows and the
     // browser channel.
     kill_terminals_for_jobs(orch, db, &target.job_ids).await;
+    kill_repls_for_jobs(orch, &target.job_ids);
 
     // Archive the execution's at-risk events to git coordinates (with a zstd
     // backstop) before the worktree and branch disappear, the immutability
@@ -357,9 +358,14 @@ pub(crate) async fn execute_target_cleanup(
     // Reclaim each referencing job's scratch dir alongside the worktree.
     // Worktrees aren't 1:1 with jobs (inheritance fan-out), so a target may carry
     // several job ids; remove every one's scratch dir. Idempotent and
-    // best-effort (a missing dir is fine).
+    // best-effort (a missing dir is fine). Also remove any `when:write` check-clone
+    // root for the job, so a crash mid-check never outlives the job (the isolated
+    // check runner also removes it per batch via its scope guard).
     for job_id in &target.job_ids {
         crate::scratch::remove_job_scratch_dir(job_id);
+        let clone_root =
+            crate::execution::check_isolation::clone_root_for_job(&orch.config_dir, job_id);
+        let _ = std::fs::remove_dir_all(&clone_root);
     }
 }
 
@@ -809,6 +815,7 @@ pub async fn teardown_removed_node_worktrees(
             .await
             .unwrap_or_else(|_| orch.db.local.clone());
         kill_terminals_for_jobs(orch, &db, cancelled_job_ids).await;
+        kill_repls_for_jobs(orch, cancelled_job_ids);
     }
     if targets.is_empty() {
         return;
@@ -841,6 +848,16 @@ pub async fn teardown_removed_node_worktrees(
         "db-change",
         serde_json::json!({"table": "jobs", "action": "update"}),
     );
+}
+
+/// Kill and drop the in-memory REPL sessions belonging to the given jobs. The
+/// DB-free registry is the single source of truth, so this is the whole story:
+/// drain the matching entries and SIGKILL each eval-server. The orphan-prevention
+/// guarantee for stateful REPLs.
+fn kill_repls_for_jobs(orch: &Orchestrator, job_ids: &[String]) {
+    for session in orch.repl_state.remove_for_jobs(job_ids) {
+        session.kill();
+    }
 }
 
 /// Kill running PTY sessions for the given jobs and delete their terminal rows.

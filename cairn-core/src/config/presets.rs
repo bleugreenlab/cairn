@@ -1309,6 +1309,7 @@ mod tests {
             skills: None,
             hooks: None,
             backend_preference: None,
+            icon: None,
             is_project_scoped: false,
             file_path: std::path::PathBuf::new(),
         }

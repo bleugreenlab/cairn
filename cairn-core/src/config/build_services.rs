@@ -42,6 +42,15 @@ pub struct BuildServiceConfig {
     /// Env injected into fenced agent spawns so client tooling connects here.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Env applied to the daemon **launch only**, never injected into fenced
+    /// client spawns. Daemon-only controls that must not leak into build tooling
+    /// live here — e.g. sccache's `SCCACHE_START_SERVER`/`SCCACHE_NO_DAEMON`
+    /// foreground-server switches (a client carrying `SCCACHE_START_SERVER` would
+    /// try to run a server) and its `SCCACHE_ERROR_LOG`/`SCCACHE_LOG` diagnostics
+    /// (which would otherwise spam build output). `env`, by contrast, is the
+    /// client env that is also passed to the daemon.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub launch_env: HashMap<String, String>,
 }
 
 /// A health/reachability probe for a build service. YAML reads as
@@ -54,9 +63,18 @@ pub struct ReadyProbe {
     /// TCP connect to `host:port` succeeds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp: Option<String>,
-    /// A command exits 0.
+    /// A command exits 0. A cheap liveness check, run with no deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+    /// A request/response health round-trip, run under a hard Rust-enforced
+    /// deadline (see `orchestrator::build_services`). Unlike `command`, a
+    /// deadline-exceeded run is treated as **wedged** (unhealthy) — this is what
+    /// detects a listening-but-hung daemon that a bare TCP connect or an exit-0
+    /// `command` can't distinguish from a healthy one. For sccache this is
+    /// `sccache --show-stats`, a full round-trip that hangs identically against a
+    /// wedged server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_trip: Option<Vec<String>>,
 }
 
 impl ReadyProbe {
@@ -65,6 +83,7 @@ impl ReadyProbe {
         Self {
             tcp: Some(addr.into()),
             command: None,
+            round_trip: None,
         }
     }
 }
@@ -120,6 +139,14 @@ impl BuildServiceConfig {
             .map(|(k, v)| (k.clone(), t.expand(v)))
             .collect()
     }
+
+    /// The daemon-only launch env with templates expanded.
+    pub fn expanded_launch_env(&self, t: &Templates) -> HashMap<String, String> {
+        self.launch_env
+            .iter()
+            .map(|(k, v)| (k.clone(), t.expand(v)))
+            .collect()
+    }
 }
 
 /// The built-in default sccache build service, used when no `buildServices` are
@@ -145,6 +172,20 @@ impl BuildServiceConfig {
 /// compiles until the next runner restart. Like the cache size, the daemon reads
 /// it from this env map at launch; it is inert in client env.
 ///
+/// The daemon runs in the **foreground** as Cairn's supervised child rather than
+/// forking a detached server: `launch_env` sets `SCCACHE_START_SERVER=1` (route
+/// bare `sccache` to its in-process server) and `SCCACHE_NO_DAEMON=1` (skip the
+/// `daemonize()` fork). The launched process then *is* the server and stays in
+/// Cairn's process group, so a wedged server can be killed via its supervised
+/// child handle and relaunched — its port stays occupied and `sccache
+/// --stop-server` hangs against a wedged server, so a direct kill is the only
+/// recovery. `launch_env` also points `SCCACHE_ERROR_LOG` at a file under the
+/// (sandbox-writable) state dir with a `warn`-level `SCCACHE_LOG`, so the next
+/// wedge/crash is diagnosable from disk. These four are daemon-only and never
+/// injected into client spawns. On the client side, `SCCACHE_IGNORE_SERVER_IO_ERROR=1`
+/// degrades a compile that can't reach the daemon (a mid-build death or wedge) to
+/// a direct, uncached compile instead of failing or hanging the build.
+///
 /// Incremental compilation stays **on** for fenced agent builds — an earlier
 /// revision injected `CARGO_INCREMENTAL=0` here so sccache could cache more, and
 /// live measurement reversed it. sccache categorically cannot cache incremental
@@ -167,18 +208,60 @@ pub fn default_sccache_service() -> BuildServiceConfig {
     // Never idle out: the default 600 s idle timeout kills the supervised daemon
     // between builds, and the client wrapper silently degrades to uncached compiles.
     env.insert("SCCACHE_IDLE_TIMEOUT".to_string(), "0".to_string());
+    // Client failover: if a compile can't reach the daemon (it died or wedged
+    // mid-build), degrade THAT compile to a direct, uncached one instead of
+    // failing or hanging the build. Client-side, so it rides in the injected env.
+    env.insert(
+        "SCCACHE_IGNORE_SERVER_IO_ERROR".to_string(),
+        "1".to_string(),
+    );
     if cfg!(unix) {
         let wrapper = "{cairnHome}/bin/cache-wrapper.sh".to_string();
         env.insert("RUSTC_WRAPPER".to_string(), wrapper.clone());
         env.insert("CARGO_BUILD_RUSTC_WRAPPER".to_string(), wrapper);
     }
+
+    // Daemon-only launch env. These MUST NOT leak into client spawns, so they
+    // live in launch_env, not env (see `merge_client_env`).
+    let mut launch_env = HashMap::new();
+    // Run the server in the FOREGROUND as Cairn's supervised child instead of
+    // letting sccache fork a detached daemon: SCCACHE_START_SERVER=1 routes bare
+    // `sccache` to its in-process server, and SCCACHE_NO_DAEMON=1 skips the
+    // daemonize() fork/setsid. The launched process then *is* the server, stays
+    // in Cairn's process group, and is killed reliably via the supervised child
+    // handle — the precondition for recovering a wedged server (whose port stays
+    // occupied and which `sccache --stop-server` can't stop, hanging too).
+    launch_env.insert("SCCACHE_START_SERVER".to_string(), "1".to_string());
+    launch_env.insert("SCCACHE_NO_DAEMON".to_string(), "1".to_string());
+    // Redirect the foreground server's stderr to a file so the next wedge/crash
+    // is diagnosable from disk. create_error_log() runs before the daemonize
+    // no-op, so this applies in foreground mode too. Kept under stateDir because
+    // that is the only path the service sandbox lets the daemon write.
+    launch_env.insert(
+        "SCCACHE_ERROR_LOG".to_string(),
+        "{home}/.cache/sccache/sccache-error.log".to_string(),
+    );
+    launch_env.insert("SCCACHE_LOG".to_string(), "warn".to_string());
+
     BuildServiceConfig {
         enabled: true,
-        start: vec!["sccache".to_string(), "--start-server".to_string()],
-        ready: Some(ReadyProbe::tcp("127.0.0.1:4226")),
+        // Bare `sccache`: SCCACHE_START_SERVER=1 (launch_env) selects the
+        // in-process foreground server; `--start-server` would instead fork a
+        // detached daemon Cairn could not supervise or kill by handle.
+        start: vec!["sccache".to_string()],
+        ready: Some(ReadyProbe {
+            tcp: Some("127.0.0.1:4226".to_string()),
+            command: None,
+            // A wedged sccache server still accepts the TCP connect, then blocks
+            // the client's request read forever (no per-request timeout). The
+            // deadlined round-trip detects that; --show-stats is a full
+            // request/response that hangs identically against a wedged server.
+            round_trip: Some(vec!["sccache".to_string(), "--show-stats".to_string()]),
+        }),
         state_dir: Some("{home}/.cache/sccache".to_string()),
         write: vec!["{worktrees}/**/target/**".to_string()],
         env,
+        launch_env,
     }
 }
 
@@ -268,7 +351,10 @@ env:
     fn default_sccache_service_expands_to_concrete_paths() {
         let t = templates();
         let svc = default_sccache_service();
-        assert_eq!(svc.expanded_start(&t), vec!["sccache", "--start-server"]);
+        // Bare `sccache`: the foreground server is selected via SCCACHE_START_SERVER
+        // in launch_env, not a `--start-server` arg (which would fork a detached
+        // daemon Cairn could not supervise).
+        assert_eq!(svc.expanded_start(&t), vec!["sccache"]);
         assert_eq!(
             svc.expanded_write(&t),
             vec!["/home/u/.cairn/worktrees/**/target/**"]
@@ -318,6 +404,74 @@ env:
         assert_eq!(
             env.get("CARGO_BUILD_RUSTC_WRAPPER").map(String::as_str),
             Some(wrapper)
+        );
+    }
+
+    #[test]
+    fn default_sccache_service_runs_foreground_supervised() {
+        // The daemon launches in the foreground as Cairn's supervised child so its
+        // handle controls (and can kill) the server: SCCACHE_START_SERVER routes
+        // bare `sccache` to its in-process server and SCCACHE_NO_DAEMON skips the
+        // fork. Both are daemon-only launch env, NEVER injected into client spawns
+        // (a client carrying SCCACHE_START_SERVER would try to run a server).
+        let svc = default_sccache_service();
+        let launch = svc.expanded_launch_env(&templates());
+        assert_eq!(
+            launch.get("SCCACHE_START_SERVER").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            launch.get("SCCACHE_NO_DAEMON").map(String::as_str),
+            Some("1")
+        );
+        // Daemon-only launch env must not leak into the client env.
+        let client = svc.expanded_env(&templates());
+        assert!(!client.contains_key("SCCACHE_START_SERVER"));
+        assert!(!client.contains_key("SCCACHE_NO_DAEMON"));
+        assert!(!client.contains_key("SCCACHE_ERROR_LOG"));
+        assert!(!client.contains_key("SCCACHE_LOG"));
+    }
+
+    #[test]
+    fn default_sccache_service_diagnostics_log_under_state_dir() {
+        // The error log must sit under stateDir — the only path the service sandbox
+        // lets the daemon write — so create_error_log() succeeds and the file is
+        // diagnosable from disk. A moderate SCCACHE_LOG level accompanies it.
+        let svc = default_sccache_service();
+        let launch = svc.expanded_launch_env(&templates());
+        assert_eq!(
+            launch.get("SCCACHE_ERROR_LOG").map(String::as_str),
+            Some("/home/u/.cache/sccache/sccache-error.log")
+        );
+        let state = svc.expanded_state_dir(&templates()).unwrap();
+        assert!(launch["SCCACHE_ERROR_LOG"].starts_with(state.to_str().unwrap()));
+        assert_eq!(launch.get("SCCACHE_LOG").map(String::as_str), Some("warn"));
+    }
+
+    #[test]
+    fn default_sccache_service_client_fails_open_on_daemon_loss() {
+        // A mid-compile daemon death/wedge must degrade THAT compile to a direct,
+        // uncached one — never fail or hang the build. This is client-side, so it
+        // rides in the injected client env.
+        let client = default_sccache_service().expanded_env(&templates());
+        assert_eq!(
+            client
+                .get("SCCACHE_IGNORE_SERVER_IO_ERROR")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn default_sccache_service_uses_deadlined_round_trip_probe() {
+        // Wedge detection needs a real request/response round-trip, not just a TCP
+        // connect: a wedged server still accepts the connect. --show-stats is that
+        // round-trip.
+        let probe = default_sccache_service().ready.unwrap();
+        assert_eq!(probe.tcp.as_deref(), Some("127.0.0.1:4226"));
+        assert_eq!(
+            probe.round_trip,
+            Some(vec!["sccache".to_string(), "--show-stats".to_string()])
         );
     }
 

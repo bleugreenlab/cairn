@@ -39,6 +39,16 @@ pub(crate) const FIELD: KeySpec = KeySpec::new(
     "top-level string artifact field to edit; defaults to content then body",
 );
 pub(crate) const COMMAND: KeySpec = KeySpec::new("command", KeyType::Str, "");
+pub(crate) const REPL_INTERPRETER: KeySpec = KeySpec::new(
+    "interpreter",
+    KeyType::Str,
+    "python (py) | typescript (ts) — the language this REPL evaluates",
+);
+pub(crate) const REPL_DEPS: KeySpec = KeySpec::new(
+    "deps",
+    KeyType::Array,
+    "python-only: package names preloaded via uv (uv run --with)",
+);
 pub(crate) const WAKE: KeySpec = KeySpec::new(
     "wake",
     KeyType::Str,

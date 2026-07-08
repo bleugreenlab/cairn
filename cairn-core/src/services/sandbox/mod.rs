@@ -366,6 +366,15 @@ pub(crate) fn has_denial_signature(output: &str) -> bool {
 pub fn default_writable_extra() -> Vec<PathBuf> {
     let mut dirs = temp_dirs();
     dirs.extend(toolchain_writable_dirs());
+    // Cairn-managed shared uv package cache (`<cairn_home>/uv-cache`), pointed at
+    // by `UV_CACHE_DIR` on every agent spawn. Existence-filtered like the
+    // toolchain dirs; the host creates it at startup (`env::ensure_uv_cache_dir`),
+    // so a fenced agent can populate it without tripping an out-of-worktree
+    // write, while uv's default `~/.cache/uv` stays out of the picture.
+    let uv_cache = crate::env::uv_cache_dir();
+    if uv_cache.exists() {
+        dirs.push(uv_cache);
+    }
     dirs
 }
 

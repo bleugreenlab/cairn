@@ -94,9 +94,14 @@ pub fn run_db_change(run: &models::Run, action: &str) -> Value {
 /// manual reload, while the issue-overview job row survives on sibling
 /// invalidations and masks the freeze (CAIRN-1916). So every live/finalize
 /// events insert must emit through this one builder and always carry both
-/// `run_id` and `session_id`. Route durable inserts through
-/// [`crate::transcripts::stream_store::insert_event_emit`] so the scoped emit
-/// can't be forgotten. Both camel- and snake-cased keys are emitted because the
+/// `run_id` and `session_id`. Route inserts through one of the shared emitting
+/// seams so the scoped emit can't be forgotten:
+/// [`crate::transcripts::stream_store::insert_event_emit`] /
+/// [`crate::transcripts::stream_store::finalize_stream_emit`] for the durable
+/// streaming/tool-call path, and the private `messages::transcript`
+/// `insert_system_event` / `insert_system_event_sync` seams (which emit via
+/// [`event_db_change_for_run`]) for boundary-delivered system/user transcript
+/// inserts (CAIRN-2558). Both camel- and snake-cased keys are emitted because the
 /// frontend `parseScopeIds` reads either.
 pub fn event_db_change(run_id: &str, session_id: Option<&str>, action: &str) -> Value {
     event_db_change_scoped(run_id, session_id, None, action)

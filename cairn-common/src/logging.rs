@@ -46,6 +46,13 @@ pub struct LogConfig {
     /// `CAIRN_LOG_LEVEL` env channels; `None` falls back to `CAIRN_LOG_LEVEL`
     /// then the `Standard` default.
     pub level: Option<LogLevel>,
+    /// Cap for the pretty stderr layer, independent of the file layer's `level`
+    /// and still overridable by `RUST_LOG`. `None` keeps the historical `info`
+    /// default. The installed runner service sets this to `Quiet` (warn-only):
+    /// launchd redirects its stderr into an unrotated `runner.err.log`, so
+    /// mirroring the full INFO stream there grew it without bound — the rotated
+    /// JSONL file layer keeps the full stream instead.
+    pub stderr_level: Option<LogLevel>,
 }
 
 /// File-log verbosity level. Each level maps to a concrete `EnvFilter` directive
@@ -141,12 +148,21 @@ fn resolve_file_filter(level: Option<LogLevel>) -> EnvFilter {
     EnvFilter::new(resolved.directives())
 }
 
-fn stderr_filter_from_env() -> EnvFilter {
-    match std::env::var("RUST_LOG") {
-        Ok(value) if !value.trim().is_empty() => value
-            .parse::<EnvFilter>()
-            .unwrap_or_else(|_| default_stderr_filter()),
-        _ => default_stderr_filter(),
+/// Resolve the pretty stderr-layer filter. `RUST_LOG` (the power-user escape
+/// hatch) always wins; otherwise a caller-supplied `stderr_level` caps the layer
+/// (the installed runner service passes `Quiet`), falling back to the historical
+/// `info` default when unset.
+fn resolve_stderr_filter(stderr_level: Option<LogLevel>) -> EnvFilter {
+    if let Ok(value) = std::env::var("RUST_LOG") {
+        if !value.trim().is_empty() {
+            if let Ok(filter) = value.parse::<EnvFilter>() {
+                return filter;
+            }
+        }
+    }
+    match stderr_level {
+        Some(level) => EnvFilter::new(level.directives()),
+        None => default_stderr_filter(),
     }
 }
 
@@ -191,8 +207,9 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
     let registry = tracing_subscriber::registry().with(file_layer.with_filter(file_filter));
 
     if config.stderr {
-        // Stderr layer: pretty, ANSI when TTY, respects RUST_LOG
-        let stderr_filter = stderr_filter_from_env();
+        // Stderr layer: pretty, ANSI when TTY, respects RUST_LOG, capped by any
+        // caller-supplied `stderr_level`.
+        let stderr_filter = resolve_stderr_filter(config.stderr_level);
 
         let stderr_layer = fmt::layer()
             .with_writer(std::io::stderr)

@@ -152,7 +152,7 @@ Write your artifact with create or patch as your turn's last action; it pauses t
 
 ## run
 
-`run` executes shell commands and skill scripts. Items run in parallel by default; `sequential: true` runs them in order.
+`run` executes an ordered batch of invocations — each item is a shell command, inline code (`{code, interpreter}`), or a skill-script/MCP `target`. Items run in parallel by default; `sequential: true` runs them in order.
 
     run({commands:[
       {command:"bun run check:rust"},
@@ -164,6 +164,40 @@ A `run` whose commands change worktree files must carry `commit_msg` on the call
       commands:[{command:"bun run changelog \"Add user roles\""}],
       commit_msg:"changelog: add user roles",
     })
+
+### Interpreters
+
+Inline `{code, interpreter}` is the default way to run code that isn't a CLI invocation. The interpreter execs your source directly, with no shell in between, so there is nothing to quote or escape. Reach for it instead of wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`.
+
+`typescript`/`ts` (and `javascript`/`js`) run via `bun`. The worktree's `node_modules` is importable and `@cairn/sdk` is wired with zero config, so a quick SDK batch or data transform is one item:
+
+    run({commands:[{interpreter:"typescript", code:`
+      import { read } from "@cairn/sdk";
+      const issues = await read("cairn://p/CAIRN/issues?status=active");
+      console.log(issues.length);
+    `}]})
+
+`python`/`py` runs through `uv`, which ships bundled. Declare dependencies in a PEP 723 metadata block and they resolve into an ephemeral, content-cached environment — no venv to manage:
+
+    run({commands:[{interpreter:"python", code:`
+      # /// script
+      # dependencies = ["requests"]
+      # ///
+      import requests
+      print(requests.get("https://example.com").status_code)
+    `}]})
+
+When the worktree has a `pyproject.toml` or `uv.lock`, plain python (no metadata block) runs inside that project environment so project deps import; with neither, it runs against the standard library. If `uv` is ever absent, python falls back to plain `python3`.
+
+Inline code is for synchronous compute that runs to completion — a transform, a check, a scripted batch. Long-running or background work still belongs in a terminal resource (or a durable workflow script), not an inline item.
+
+For an exploration that builds up state across several `run` calls — load a dataframe once, then query it repeatedly — create a stateful REPL and route code into it with the `repl` key. Variables, imports, and definitions persist across calls, so you don't reload each time:
+
+    write({changes:[{target:"cairn:~/repl/analysis", mode:"create", payload:{interpreter:"python"}}]})
+    run({commands:[{interpreter:"python", repl:"analysis", code:"import pandas as pd; df = pd.read_csv('data.csv')"}]})
+    run({commands:[{interpreter:"python", repl:"analysis", code:"df['amount'].sum()"}]})
+
+The trailing expression's value comes back as the result. A REPL is python-only for now and lives as long as your node; its state is lost if it dies (recreate and replay). Read `cairn:~/repl/<slug>` for its status, `delete` it to stop it. This is not for large or one-shot work — a fresh inline item is simpler when nothing needs to carry over.
 
 ## Utilities
 

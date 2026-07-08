@@ -34,6 +34,7 @@ fn file_agent_to_config(
         skills: agent.skills,
         fence: agent.fence,
         backend_preference: agent.backend_preference,
+        icon: agent.icon,
         // Authoring/display config: no resolved selection until a launch resolves it.
         selection: None,
         extras: None,
@@ -131,6 +132,7 @@ impl ConfigResource for AgentResource {
             disallowed_tools: input.disallowed_tools,
             skills: input.skills,
             hooks: None,
+            icon: input.icon,
             is_project_scoped,
             file_path: PathBuf::new(),
         }
@@ -178,6 +180,7 @@ impl ConfigResource for AgentResource {
             disallowed_tools: merge_optional(&existing.disallowed_tools, &input.disallowed_tools),
             skills: merge_optional(&existing.skills, &input.skills),
             hooks: existing.hooks.clone(),
+            icon: merge_optional(&existing.icon, &input.icon),
             is_project_scoped: new_is_project_scoped,
             file_path: if scope_changing {
                 PathBuf::new()
@@ -226,6 +229,7 @@ impl ConfigResource for AgentResource {
             disallowed_tools: source.disallowed_tools.clone(),
             skills: source.skills.clone(),
             hooks: source.hooks.clone(),
+            icon: source.icon.clone(),
             is_project_scoped,
             file_path: PathBuf::new(),
         }
@@ -274,13 +278,25 @@ impl Orchestrator {
         id: &str,
         input: UpdateAgentConfig,
         target_project_id: Option<&str>,
+        workspace_id: Option<&str>,
     ) -> Result<AgentConfig, String> {
-        config_resource::update_config::<AgentResource>(self, id, input, target_project_id)
+        config_resource::update_config::<AgentResource>(
+            self,
+            id,
+            input,
+            target_project_id,
+            workspace_id,
+        )
     }
 
     /// Delete an agent configuration.
-    pub fn delete_agent_config(&self, id: &str, project_id: Option<&str>) -> Result<(), String> {
-        config_resource::delete_config::<AgentResource>(self, id, project_id)
+    pub fn delete_agent_config(
+        &self,
+        id: &str,
+        project_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Result<(), String> {
+        config_resource::delete_config::<AgentResource>(self, id, project_id, workspace_id)
     }
 
     /// List agents for a project context with workspace→project shadowing.
@@ -295,6 +311,7 @@ impl Orchestrator {
         source_project_id: Option<&str>,
         target_id: &str,
         target_project_id: Option<&str>,
+        target_workspace_id: Option<&str>,
     ) -> Result<AgentConfig, String> {
         config_resource::copy_config::<AgentResource>(
             self,
@@ -302,6 +319,7 @@ impl Orchestrator {
             source_project_id,
             target_id,
             target_project_id,
+            target_workspace_id,
         )
     }
 }
@@ -349,7 +367,7 @@ mod tests {
         assert_eq!(valid.len(), 1, "only the valid agent should list");
         assert_eq!(valid[0].id, "good");
 
-        let invalid = orch.list_invalid_configs(None, None).unwrap();
+        let invalid = orch.list_invalid_configs(None, None, None).unwrap();
         assert_eq!(invalid.len(), 1, "the broken agent must surface as invalid");
         assert_eq!(invalid[0].id, "broken");
         assert_eq!(invalid[0].entity_type, "agent");
@@ -385,6 +403,7 @@ mod tests {
             on_escape: None,
             sandbox: None,
             backend_preference: None,
+            icon: None,
         })
         .unwrap();
 
@@ -393,7 +412,7 @@ mod tests {
         assert_eq!(valid[0].id, "my-agent");
         assert!(valid[0].tools.is_empty());
 
-        let invalid = orch.list_invalid_configs(None, None).unwrap();
+        let invalid = orch.list_invalid_configs(None, None, None).unwrap();
         assert!(invalid.is_empty(), "UI-created agent must not be invalid");
     }
 

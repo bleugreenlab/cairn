@@ -175,6 +175,7 @@ pub fn start_recipe_execution_impl(
                             skills: agent_snapshot.skills.clone(),
                             hooks: None,
                             backend_preference: agent_snapshot.backend_preference.clone(),
+                            icon: None,
                             is_project_scoped: true,
                             file_path: std::path::PathBuf::new(),
                         },
@@ -911,6 +912,7 @@ mod tests {
             skills: None,
             hooks: None,
             backend_preference: None,
+            icon: None,
             is_project_scoped: true,
             file_path: std::path::PathBuf::new(),
         }

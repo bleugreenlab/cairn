@@ -40,6 +40,7 @@ pub(super) async fn load_agent_snapshot_data(
                     skills: agent.skills.clone(),
                     fence: agent.fence,
                     backend_preference: agent.backend_preference.clone(),
+                    icon: None,
                     selection: agent.selection.clone(),
                     extras: agent.extras.clone(),
                 });

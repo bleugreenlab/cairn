@@ -31,6 +31,9 @@ pub struct FileAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "backend", alias = "backendPreference")]
     pub backend_preference: Option<String>,
+    /// Optional lucide icon name (kebab-case) for the agent's visual identity.
+    #[serde(default)]
+    pub icon: Option<String>,
     /// Whether this agent is project-scoped (vs workspace-scoped)
     pub is_project_scoped: bool,
     /// Path to the source file
@@ -133,6 +136,7 @@ pub fn save_agent(
         skills: agent.skills.as_deref(),
         hooks: agent.hooks.as_ref(),
         backend_preference: agent.backend_preference.as_deref(),
+        icon: agent.icon.as_deref(),
     });
 
     // Write file
@@ -259,6 +263,7 @@ fn load_agent_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileAge
                 skills: parsed.skills,
                 hooks: parsed.hooks,
                 backend_preference: parsed.backend_preference,
+                icon: parsed.icon,
                 is_project_scoped,
                 file_path: path.to_path_buf(),
             })

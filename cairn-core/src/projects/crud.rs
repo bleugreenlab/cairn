@@ -594,6 +594,85 @@ pub async fn seed_workspace_project_db(
     Ok(())
 }
 
+/// Reserved `projects.key` for every team's workspace project. Unique within a
+/// team replica (the column is UNIQUE), so `INSERT OR IGNORE` on it is the
+/// first-writer-wins guard even when concurrent members mint different ids.
+///
+/// It is **team-scoped**, not a bare constant, because the machine-local router
+/// and clone-path catalog (`project_routes`) are keyed by `project_key` ALONE
+/// across ALL teams on a machine. Two teams sharing a constant `WORKSPACE` key
+/// would collide on that single primary-key row, so the last team to reconcile
+/// would own the one route and `resolve_local_repo_path` could hand team B team
+/// A's clone path. Embedding the team id keeps every team's workspace route and
+/// clone path distinct while staying constant within one team replica (so the
+/// first-writer-wins UNIQUE-key guard still holds there).
+pub fn team_workspace_key(team_id: &str) -> String {
+    format!("WORKSPACE-{team_id}")
+}
+
+/// Seed the team's workspace `projects` row into its replica, first-writer-wins.
+///
+/// The team-scoped twin of [`seed_workspace_project_db`]: a single
+/// `is_workspace = 1` row per team, carrying a `{team}~{uuid}` id and the
+/// team-scoped [`team_workspace_key`]. `INSERT OR IGNORE` on both the id and the
+/// UNIQUE key makes it idempotent across repeated opens and concurrent members —
+/// the first writer's row wins and every later attempt (a fresh minted id, same
+/// reserved key) is ignored. Returns whether THIS call inserted the row (the
+/// first-writer signal).
+///
+/// The row is seeded path-less: the machine-local clone path is per-machine and
+/// recorded separately in the private `project_routes` catalog during
+/// services-aware provisioning (like any team project, CAIRN-2223), so a member
+/// who has not yet materialized the repo simply contributes no config layer.
+pub async fn seed_team_workspace_project_db(
+    team_db: &LocalDb,
+    now: i64,
+    team_id: &str,
+    id: &str,
+    key: &str,
+    repo_path: &str,
+) -> Result<bool, CairnError> {
+    let affected = team_db
+        .execute(
+            "INSERT OR IGNORE INTO projects(
+                id, team_id, name, key, repo_path, context, docs_enabled,
+                default_branch, next_issue_number, created_at, updated_at,
+                hidden, is_workspace
+             )
+             VALUES (?1, ?2, 'Team Workspace', ?3, ?4, '', 1,
+                     'main', 1, ?5, ?5, 0, 1)",
+            (
+                id.to_string(),
+                team_id.to_string(),
+                key.to_string(),
+                repo_path.to_string(),
+                now,
+            ),
+        )
+        .await?;
+    Ok(affected > 0)
+}
+
+/// The team's workspace `projects` row (its single `is_workspace = 1` row), if
+/// seeded. Queried against a team replica; the config resolver uses it to find
+/// the machine-local clone of the team's config home. Returns `None` before the
+/// row is seeded, so callers degrade gracefully rather than erroring.
+pub async fn team_workspace_project(team_db: &LocalDb) -> Result<Option<DbProject>, CairnError> {
+    let sql = projects_select(team_db, "WHERE is_workspace = 1 LIMIT 1");
+    team_db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, ()).await?;
+                rows.next()
+                    .await?
+                    .map(|row| db_project_from_row(&row))
+                    .transpose()
+            })
+        })
+        .await
+        .map_err(CairnError::from)
+}
+
 pub async fn unhide_workspace_project_db(db: &LocalDb) -> Result<(), CairnError> {
     db.write(|conn| {
         Box::pin(async move {
@@ -972,6 +1051,71 @@ mod tests {
         assert_eq!(hidden, 0);
         assert_eq!(is_workspace, 1);
         assert_eq!(default_branch, "main");
+    }
+
+    #[tokio::test]
+    async fn seed_team_workspace_project_is_first_writer_wins() {
+        use crate::storage::TEAM_MIGRATIONS;
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("team.db")).await.unwrap();
+        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        // The team-root FK parent that projects.team_id references.
+        db.execute(
+            "INSERT INTO teams(id, name, created_at, updated_at) VALUES ('team1', 'Team One', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let key = team_workspace_key("team1");
+        let first = seed_team_workspace_project_db(
+            &db,
+            1,
+            "team1",
+            "team1~00000000-0000-4000-8000-0000000000ff",
+            &key,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(first, "the first writer seeds the workspace row");
+
+        // A concurrent member mints a DIFFERENT id; the reserved key collides, so
+        // INSERT OR IGNORE drops it (first-writer-wins).
+        let second = seed_team_workspace_project_db(
+            &db,
+            2,
+            "team1",
+            "team1~00000000-0000-4000-8000-0000000000aa",
+            &key,
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(!second, "a later writer is a no-op, not a clobber");
+        assert_eq!(key, "WORKSPACE-team1");
+
+        let (count, id, is_ws) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*), MAX(id), MAX(is_workspace) FROM projects WHERE is_workspace = 1",
+                            (),
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("workspace row");
+                    Ok((row.i64(0)?, row.text(1)?, row.i64(2)?))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "exactly one workspace row survives");
+        assert_eq!(id, "team1~00000000-0000-4000-8000-0000000000ff");
+        assert_eq!(is_ws, 1);
     }
 
     #[tokio::test]

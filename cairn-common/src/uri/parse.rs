@@ -428,6 +428,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 slug: (*slug).to_string(),
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "repl", slug] => {
+            Some(CairnResource::NodeRepl {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                slug: (*slug).to_string(),
+            })
+        }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "terminal", slug] => {
             Some(CairnResource::TaskTerminal {
                 project: canonical_project(project),

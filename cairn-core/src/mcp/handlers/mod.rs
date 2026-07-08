@@ -17,6 +17,7 @@ pub mod pdf;
 pub mod permission;
 pub mod planning;
 pub mod read;
+pub mod repl;
 pub mod resources;
 pub mod run;
 pub(crate) mod run_context;

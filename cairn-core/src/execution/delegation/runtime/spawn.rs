@@ -111,6 +111,7 @@ async fn resolve_task_agent_config(
         disallowed_tools: file_agent.disallowed_tools,
         skills: file_agent.skills,
         fence: file_agent.fence,
+        icon: file_agent.icon,
         backend_preference: payload
             .backend_preference
             .clone()
@@ -717,6 +718,7 @@ fn workflow_placeholder_agent_config(workflow_id: &str) -> AgentConfig {
         skills: None,
         fence: None,
         backend_preference: None,
+        icon: None,
         selection: None,
         extras: None,
     }

@@ -637,11 +637,13 @@ pub fn continue_job_impl(
                     owning_db.clone(),
                     job_id.to_string(),
                 ))?;
-                match desired_backend
-                    .as_deref()
-                    .filter(|want| *want != session.backend)
-                {
-                    Some(want) => {
+                match decide_continue_action(
+                    &session.backend,
+                    session.backend_id.as_deref(),
+                    desired_backend.as_deref(),
+                    needs_fresh_session,
+                ) {
+                    ContinueSessionAction::RotateToBackend(want) => {
                         // Evict any live process bound to the old session first.
                         if let Some(old_run) =
                             orch.process_state.find_process_by_session(&session.id)
@@ -675,7 +677,7 @@ pub fn continue_job_impl(
                         let run_start_mode = run_start_mode(&session_start).to_string();
                         (new_session.id, session_start, run_start_mode)
                     }
-                    None if needs_fresh_session => {
+                    ContinueSessionAction::RotateFresh => {
                         // Evict any live process bound to the old session, then
                         // rotate to a fresh same-backend session so this turn
                         // rebuilds the edited system prompt.
@@ -707,15 +709,23 @@ pub fn continue_job_impl(
                         let run_start_mode = run_start_mode(&session_start).to_string();
                         (new_session.id, session_start, run_start_mode)
                     }
-                    None => {
-                        // Plain resume of an open session. If the session has
-                        // gone stale (last event older than the staleness
-                        // threshold), a native backend resume would reload a
-                        // prompt cache the provider has likely evicted; reseed
-                        // instead by rotating to a fresh session primed with the
-                        // node's `/chat` digest (CAIRN-2534). Any failure in the
-                        // attempt falls open to native resume with session state
-                        // untouched.
+                    ContinueSessionAction::Resume => {
+                        // Native backend resume of the open session (e.g. a Codex
+                        // session carrying its stored thread id). Reseed is
+                        // bypassed so a reply never restarts at the system prompt
+                        // (CAIRN-2598).
+                        let session_start = resolve_continue_session_start(&session)?;
+                        let run_start_mode = run_start_mode(&session_start).to_string();
+                        (session.id.clone(), session_start, run_start_mode)
+                    }
+                    ContinueSessionAction::MaybeReseed => {
+                        // Reseed-eligible open session. If it has gone stale (last
+                        // event older than the staleness threshold), a native
+                        // backend resume would reload a prompt cache the provider
+                        // has likely evicted; reseed instead by rotating to a
+                        // fresh session primed with the node's `/chat` digest
+                        // (CAIRN-2534). Any failure in the attempt falls open to
+                        // native resume with session state untouched.
                         let now_secs = orch.services.clock.now();
                         match attempt_session_reseed(orch, &owning_db, &job, &session, now_secs) {
                             Some(outcome) => {
@@ -1225,6 +1235,62 @@ fn is_session_stale(now: i64, last_event_at: i64, threshold: i64) -> bool {
     now - last_event_at > threshold
 }
 
+/// The `sessions.backend` value persisted for a Codex session. A Codex session
+/// with a stored `backend_id` (its native thread id) resumes through
+/// `thread/resume`, which has its own stale-thread fallback (a fresh thread with
+/// transcript preload) that only fires after Codex reports the thread missing.
+const CODEX_SESSION_BACKEND: &str = "codex";
+
+/// Whether an open session resumes natively and so must NOT be preempted by the
+/// cold-resume reseed (CAIRN-2534). Codex sessions carrying a native thread id
+/// (`backend_id`) resume via `thread/resume`; rotating them to a fresh
+/// `SessionStart::New` would wipe the Codex thread and restart the reply at the
+/// system prompt (CAIRN-2598). Claude and handle-less sessions stay
+/// reseed-eligible.
+fn session_prefers_native_resume(backend: &str, backend_id: Option<&str>) -> bool {
+    backend.eq_ignore_ascii_case(CODEX_SESSION_BACKEND) && backend_id.is_some()
+}
+
+/// The continuation action for an open session on a user reply. This is the pure
+/// decision; the caller performs the DB rotation / reseed / native-resume work.
+#[derive(Debug, PartialEq, Eq)]
+enum ContinueSessionAction {
+    /// The requested model implies a different backend than the session was
+    /// started on — rotate to a fresh session on that backend (the old backend's
+    /// resume handle is invalid on the new one).
+    RotateToBackend(String),
+    /// A prompt edit since spawn requires a fresh same-backend session so this
+    /// turn rebuilds the edited system prompt.
+    RotateFresh,
+    /// Attempt the stale cold-resume reseed, falling back to native resume.
+    MaybeReseed,
+    /// Native backend resume of the open session.
+    Resume,
+}
+
+/// Decide how an open session continues on a user reply. Ordering matters: a
+/// cross-backend model change rotates first, then a prompt edit forces a fresh
+/// same-backend session, then a session that resumes natively (Codex with a
+/// stored thread id) resumes directly, and only the remaining sessions are
+/// eligible for the cold-resume reseed.
+fn decide_continue_action(
+    session_backend: &str,
+    session_backend_id: Option<&str>,
+    desired_backend: Option<&str>,
+    needs_fresh_session: bool,
+) -> ContinueSessionAction {
+    if let Some(want) = desired_backend.filter(|want| *want != session_backend) {
+        return ContinueSessionAction::RotateToBackend(want.to_string());
+    }
+    if needs_fresh_session {
+        return ContinueSessionAction::RotateFresh;
+    }
+    if session_prefers_native_resume(session_backend, session_backend_id) {
+        return ContinueSessionAction::Resume;
+    }
+    ContinueSessionAction::MaybeReseed
+}
+
 /// The seed content delivered and stored on a reseed: the header framing the
 /// digest, then the digest itself (`header + digest`). The trigger is appended
 /// separately at delivery and stored as its own verbatim `user` event.
@@ -1551,8 +1617,9 @@ pub fn reconcile_stale_active_turn_for_continue_for_test(
 mod tests {
     use super::{
         apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content,
-        ensure_reused_process_model, is_session_stale, staleness_threshold_secs, ReseedOutcome,
-        ReuseDecision, RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
+        decide_continue_action, ensure_reused_process_model, is_session_stale,
+        session_prefers_native_resume, staleness_threshold_secs, ContinueSessionAction,
+        ReseedOutcome, ReuseDecision, RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
     };
     use crate::agent_process::process::{wrap_plain_stdin, AgentProcessState, RunHandle};
     use std::sync::{Arc, Mutex};
@@ -1713,6 +1780,68 @@ mod tests {
         handle.model = model.map(|m| m.to_string());
         handle.backend = backend.map(|b| b.to_string());
         processes.register(run_id.to_string(), handle);
+    }
+
+    #[test]
+    fn codex_reply_with_thread_id_resumes_not_reseeds() {
+        // The CAIRN-2598 regression: an open Codex child-task session whose
+        // backend matches the requested one and whose native thread id is stored
+        // must resume, never rotate to a fresh session (which restarts at the
+        // system prompt and wipes history).
+        assert_eq!(
+            decide_continue_action("codex", Some("thread-existing"), Some("codex"), false),
+            ContinueSessionAction::Resume
+        );
+        // With no desired backend supplied (nothing to compare), a Codex session
+        // with a thread id still resumes rather than reseeding.
+        assert_eq!(
+            decide_continue_action("codex", Some("thread-existing"), None, false),
+            ContinueSessionAction::Resume
+        );
+    }
+
+    #[test]
+    fn matching_backend_without_native_handle_is_reseed_eligible() {
+        // A Claude session (no native-resume policy) still flows through the
+        // cold-resume reseed path.
+        assert_eq!(
+            decide_continue_action("claude", Some("sess-abc"), Some("claude"), false),
+            ContinueSessionAction::MaybeReseed
+        );
+        // A Codex session with no stored thread id can't resume natively, so it
+        // is reseed-eligible too.
+        assert_eq!(
+            decide_continue_action("codex", None, Some("codex"), false),
+            ContinueSessionAction::MaybeReseed
+        );
+    }
+
+    #[test]
+    fn cross_backend_model_change_rotates() {
+        // This is what the hardcoded-"claude" child session bug produced every
+        // reply: desired "codex" vs stored "claude" rotated to a fresh session.
+        assert_eq!(
+            decide_continue_action("claude", Some("sess"), Some("codex"), false),
+            ContinueSessionAction::RotateToBackend("codex".to_string())
+        );
+    }
+
+    #[test]
+    fn prompt_edit_forces_fresh_same_backend_session() {
+        // needs_fresh_session wins over native resume: the edited system prompt
+        // requires a fresh session even for a Codex thread.
+        assert_eq!(
+            decide_continue_action("codex", Some("thread-x"), Some("codex"), true),
+            ContinueSessionAction::RotateFresh
+        );
+    }
+
+    #[test]
+    fn native_resume_predicate_is_codex_with_handle_only() {
+        assert!(session_prefers_native_resume("codex", Some("thread-x")));
+        assert!(session_prefers_native_resume("Codex", Some("thread-x")));
+        assert!(!session_prefers_native_resume("codex", None));
+        assert!(!session_prefers_native_resume("claude", Some("sess")));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::models::{SearchContentType, SearchFilters};
 use serde_json::Value as JsonValue;
 use tantivy::collector::TopDocs;
 use tantivy::query::{
-    BooleanQuery, ConstScoreQuery, FuzzyTermQuery, Occur, Query, RangeQuery, TermQuery,
+    BooleanQuery, BoostQuery, ConstScoreQuery, FuzzyTermQuery, Occur, Query, RangeQuery, TermQuery,
 };
 use tantivy::schema::{
     Field, IndexRecordOption, NumericOptions, Schema, TantivyDocument, Value, STORED, STRING, TEXT,
@@ -22,6 +22,19 @@ use super::{DbError, DbResult, LocalDb, RowExt};
 
 const INDEX_WRITER_MEMORY_BUDGET: usize = 50_000_000;
 
+/// Multiplier applied to title-field matches so a hit in the title outranks the
+/// same term appearing only in the body.
+const TITLE_BOOST: tantivy::Score = 2.0;
+
+/// Ceiling of the additive recency term (in BM25 score points). Kept well below
+/// a single point so relevance differences dominate and recency only breaks
+/// ties between near-equal scores.
+const RECENCY_WEIGHT: f32 = 0.5;
+
+/// Recency half-life in seconds (~30 days): a document this old contributes half
+/// the recency bonus of a brand-new one.
+const RECENCY_HALF_LIFE_SECS: f64 = 60.0 * 60.0 * 24.0 * 30.0;
+
 #[derive(Debug, Clone)]
 pub struct SearchIndexHit {
     pub id: String,
@@ -29,6 +42,8 @@ pub struct SearchIndexHit {
     pub project_id: String,
     pub issue_id: Option<String>,
     pub job_id: Option<String>,
+    /// Author-role facet (see `SearchFilters::role`); empty when not applicable.
+    pub role: String,
     pub title: String,
     pub snippet: String,
     pub rank: f64,
@@ -42,6 +57,7 @@ struct SearchDocument {
     project_id: String,
     issue_id: Option<String>,
     job_id: Option<String>,
+    role: String,
     title: String,
     body: String,
     created_at: i64,
@@ -75,6 +91,7 @@ struct SearchFields {
     project_id: Field,
     issue_id: Field,
     job_id: Field,
+    role: Field,
     title: Field,
     body: Field,
     created_at: Field,
@@ -307,7 +324,14 @@ impl SearchIndex {
             return Ok(Vec::new());
         }
 
-        let Some(text_query) = self.plain_text_query(query)? else {
+        // `in=title` restricts matching to the title field alone; otherwise the
+        // query matches over both title and body.
+        let query_fields: Vec<Field> = if filters.title_only {
+            vec![self.fields.title]
+        } else {
+            vec![self.fields.title, self.fields.body]
+        };
+        let Some(text_query) = self.build_text_query(query, &query_fields)? else {
             return Ok(Vec::new());
         };
         let snippet_query = text_query.box_clone();
@@ -317,10 +341,23 @@ impl SearchIndex {
             SnippetGenerator::create(&searcher, snippet_query.as_ref(), self.fields.body)?;
         snippet_generator.set_max_num_chars(150);
 
-        let top_docs = searcher.search(
-            search_query.as_ref(),
-            &TopDocs::with_limit(limit).order_by_score(),
-        )?;
+        // BM25 relevance dominates; a small recency term (bounded well under a
+        // single point) tips ties toward newer documents without reordering
+        // meaningfully different scores. `created_at` is the existing FAST field.
+        let now_secs = chrono::Utc::now().timestamp();
+        let collector = TopDocs::with_limit(limit).tweak_score(
+            move |segment_reader: &tantivy::SegmentReader| {
+                let created = segment_reader.fast_fields().i64("created_at").ok();
+                move |doc: tantivy::DocId, original_score: tantivy::Score| {
+                    let created_at = created
+                        .as_ref()
+                        .and_then(|column| column.first(doc))
+                        .unwrap_or(0);
+                    original_score + recency_bonus(now_secs, created_at)
+                }
+            },
+        );
+        let top_docs = searcher.search(search_query.as_ref(), &collector)?;
 
         let mut hits = Vec::new();
         for (rank, address) in top_docs {
@@ -337,38 +374,71 @@ impl SearchIndex {
         Ok(hits)
     }
 
-    fn plain_text_query(&self, query: &str) -> DbResult<Option<Box<dyn Query>>> {
+    /// Tokenize the query with the index's default analyzer, dropping empties.
+    fn tokenize(&self, query: &str) -> DbResult<Vec<String>> {
         let mut analyzer = self.index.tokenizers().get("default").ok_or_else(|| {
             DbError::Search("default search tokenizer not registered".to_string())
         })?;
         let mut stream = analyzer.token_stream(query);
-        let mut clauses = Vec::new();
+        let mut tokens = Vec::new();
         while stream.advance() {
             let token = stream.token();
-            if token.text.is_empty() {
-                continue;
+            if !token.text.is_empty() {
+                tokens.push(token.text.clone());
             }
+        }
+        Ok(tokens)
+    }
 
-            for field in [self.fields.title, self.fields.body] {
-                let exact = Box::new(TermQuery::new(
-                    Term::from_field_text(field, &token.text),
-                    IndexRecordOption::WithFreqs,
-                )) as Box<dyn Query>;
-                let prefix = Box::new(FuzzyTermQuery::new_prefix(
-                    Term::from_field_text(field, &token.text),
+    /// Build the scored text query.
+    ///
+    /// Every token becomes a `Must` clause, so a multi-word query requires all
+    /// of its words to match somewhere (AND across tokens) — the fix for the old
+    /// OR-of-everything semantics that made multi-word queries noisier. Within a
+    /// token, each field contributes a forgiving `Should` of an exact term plus
+    /// — only on the trailing token, the word the user is still typing — a
+    /// prefix-fuzzy term. That is classic search-as-you-type without fuzzing
+    /// words the user already finished, the biggest source of fuzz noise.
+    /// Title-field clauses are boosted so title matches outrank body matches.
+    fn build_text_query(&self, query: &str, fields: &[Field]) -> DbResult<Option<Box<dyn Query>>> {
+        let tokens = self.tokenize(query)?;
+        let Some(last_index) = tokens.len().checked_sub(1) else {
+            return Ok(None);
+        };
+        let clauses: Vec<(Occur, Box<dyn Query>)> = tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| {
+                (
+                    Occur::Must,
+                    self.token_clause(token, index == last_index, fields),
+                )
+            })
+            .collect();
+        Ok(Some(Box::new(BooleanQuery::new(clauses))))
+    }
+
+    /// A single token's cross-field `Should` group (see `build_text_query`).
+    fn token_clause(&self, token: &str, is_last: bool, fields: &[Field]) -> Box<dyn Query> {
+        let mut inner: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for &field in fields {
+            let boost_title = field == self.fields.title;
+            let exact: Box<dyn Query> = Box::new(TermQuery::new(
+                Term::from_field_text(field, token),
+                IndexRecordOption::WithFreqs,
+            ));
+            inner.push((Occur::Should, boost_if(exact, boost_title)));
+
+            if is_last {
+                let prefix: Box<dyn Query> = Box::new(FuzzyTermQuery::new_prefix(
+                    Term::from_field_text(field, token),
                     0,
                     true,
-                )) as Box<dyn Query>;
-                clauses.push((Occur::Should, exact));
-                clauses.push((Occur::Should, prefix));
+                ));
+                inner.push((Occur::Should, boost_if(prefix, boost_title)));
             }
         }
-
-        if clauses.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(Box::new(BooleanQuery::new(clauses))))
-        }
+        Box::new(BooleanQuery::new(inner))
     }
 
     fn filtered_query(
@@ -403,6 +473,10 @@ impl SearchIndex {
                 })
                 .collect();
             clauses.push((Occur::Must, Box::new(BooleanQuery::new(type_clauses))));
+        }
+
+        if let Some(ref role) = filters.role {
+            clauses.push((Occur::Must, self.exact_filter_query(self.fields.role, role)));
         }
 
         if let Some(since) = filters.since {
@@ -523,6 +597,7 @@ impl SearchIndex {
         doc.add_text(self.fields.project_id, document.project_id);
         doc.add_text(self.fields.issue_id, document.issue_id.unwrap_or_default());
         doc.add_text(self.fields.job_id, document.job_id.unwrap_or_default());
+        doc.add_text(self.fields.role, document.role);
         doc.add_text(self.fields.title, document.title);
         doc.add_text(self.fields.body, document.body);
         doc.add_i64(self.fields.created_at, document.created_at);
@@ -551,6 +626,7 @@ impl SearchIndex {
             project_id: doc_text(doc, self.fields.project_id)?,
             issue_id: empty_to_none(doc_text(doc, self.fields.issue_id)?),
             job_id: empty_to_none(doc_text(doc, self.fields.job_id)?),
+            role: doc_text(doc, self.fields.role)?,
             title: doc_text(doc, self.fields.title)?,
             snippet: if snippet.is_empty() {
                 fallback.chars().take(150).collect()
@@ -571,7 +647,8 @@ fn search_schema() -> Schema {
     builder.add_text_field("content_type", stored_string.clone());
     builder.add_text_field("project_id", stored_string.clone());
     builder.add_text_field("issue_id", stored_string.clone());
-    builder.add_text_field("job_id", stored_string);
+    builder.add_text_field("job_id", stored_string.clone());
+    builder.add_text_field("role", stored_string);
     builder.add_text_field("title", TEXT | STORED);
     builder.add_text_field("body", TEXT | STORED);
     builder.add_i64_field(
@@ -590,6 +667,7 @@ fn search_fields(schema: &Schema) -> DbResult<SearchFields> {
         project_id: schema.get_field("project_id")?,
         issue_id: schema.get_field("issue_id")?,
         job_id: schema.get_field("job_id")?,
+        role: schema.get_field("role")?,
         title: schema.get_field("title")?,
         body: schema.get_field("body")?,
         created_at: schema.get_field("created_at")?,
@@ -633,7 +711,7 @@ fn source_query(source_table: &str) -> Option<&'static str> {
              FROM events e
              JOIN runs r ON r.id = e.run_id
              WHERE e.id = ?1
-               AND e.event_type IN ('text', 'tool_result', 'user')
+               AND e.event_type IN ('assistant', 'text', 'tool_result', 'user')
                AND json_extract(e.data, '$.content') IS NOT NULL",
         ),
         "messages" => Some(
@@ -698,7 +776,8 @@ fn rebuild_source_queries() -> [&'static str; 4] {
 
 /// Build search documents for indexable events, reconstructing archived rows
 /// from git coordinates first so their text is indexed (not their stub). Loads
-/// all `text`/`tool_result`/`user` events, reconstructs in one pass, then keeps
+/// all `assistant`/`user`/`tool_result` events (plus legacy `text`),
+/// reconstructs in one pass, then keeps
 /// those whose reconstructed `data` carries a `content` string — mirroring the
 /// live `json_extract(data,'$.content') IS NOT NULL` filter.
 async fn load_event_documents(db: &LocalDb) -> DbResult<Vec<SearchDocument>> {
@@ -710,7 +789,7 @@ async fn load_event_documents(db: &LocalDb) -> DbResult<Vec<SearchDocument>> {
     let columns = crate::storage::events::columns::EVENT_COLUMNS;
     let sql = format!(
         "SELECT e.*, r.project_id, r.issue_id, r.job_id
-         FROM (SELECT {columns} FROM events WHERE event_type IN ('text', 'tool_result', 'user')) e
+         FROM (SELECT {columns} FROM events WHERE event_type IN ('assistant', 'text', 'tool_result', 'user')) e
          JOIN runs r ON r.id = e.run_id"
     );
 
@@ -773,12 +852,14 @@ fn event_search_document(
                 .and_then(|content| content.as_str())
                 .map(str::to_string)
         })?;
+    let role = derive_role(&SearchContentType::Event, &event.event_type);
     Some(SearchDocument {
         source_id: event.id,
         content_type: SearchContentType::Event,
         project_id,
         issue_id,
         job_id,
+        role,
         title: event.event_type,
         body: normalize_search_body(&body),
         created_at: event.created_at,
@@ -798,7 +879,7 @@ async fn load_archived_event_document(
     let sql = format!(
         "SELECT e.*, r.project_id, r.issue_id, r.job_id
          FROM (SELECT {columns} FROM events
-               WHERE id = ?1 AND event_type IN ('text', 'tool_result', 'user')) e
+               WHERE id = ?1 AND event_type IN ('assistant', 'text', 'tool_result', 'user')) e
          JOIN runs r ON r.id = e.run_id"
     );
 
@@ -869,16 +950,20 @@ fn row_to_search_document(row: &turso::Row) -> DbResult<Option<SearchDocument>> 
         return Ok(None);
     };
 
+    let content_type = row
+        .text(1)?
+        .parse::<SearchContentType>()
+        .map_err(DbError::Search)?;
+    let title = row.text(5)?;
+    let role = derive_role(&content_type, &title);
     Ok(Some(SearchDocument {
         source_id: row.text(0)?,
-        content_type: row
-            .text(1)?
-            .parse::<SearchContentType>()
-            .map_err(DbError::Search)?,
+        content_type,
         project_id,
         issue_id: row.opt_text(3)?,
         job_id: row.opt_text(4)?,
-        title: row.text(5)?,
+        role,
+        title,
         body: normalize_search_body(&body),
         created_at: row.i64(7)?,
     }))
@@ -925,6 +1010,52 @@ fn source_key(content_type: &SearchContentType, source_id: &str) -> String {
     format!("{content_type}:{source_id}")
 }
 
+/// Wrap a query in a title `BoostQuery` when `apply` is set, else pass it
+/// through unchanged.
+fn boost_if(query: Box<dyn Query>, apply: bool) -> Box<dyn Query> {
+    if apply {
+        Box::new(BoostQuery::new(query, TITLE_BOOST))
+    } else {
+        query
+    }
+}
+
+/// Small additive recency bonus in `(0, RECENCY_WEIGHT]`, decaying with document
+/// age. `created_at` units vary by source table (seconds vs milliseconds), so a
+/// value that is clearly milliseconds is normalized down to seconds first.
+fn recency_bonus(now_secs: i64, created_at: i64) -> f32 {
+    let created_secs = if created_at > 1_000_000_000_000 {
+        created_at / 1000
+    } else {
+        created_at
+    };
+    let age = (now_secs - created_secs).max(0) as f64;
+    (RECENCY_WEIGHT as f64 / (1.0 + age / RECENCY_HALF_LIFE_SECS)) as f32
+}
+
+/// Derive the author-role facet from content type and the document title, which
+/// carries the event type (events) or the author label (comments). Empty for
+/// content types without a meaningful role axis.
+fn derive_role(content_type: &SearchContentType, title: &str) -> String {
+    match content_type {
+        SearchContentType::Event => match title {
+            // Current backends emit assistant text as `assistant`; `text` is the
+            // legacy event type kept for old stored transcripts.
+            "assistant" | "text" => "assistant",
+            "user" => "user",
+            "tool_result" => "tool",
+            _ => "",
+        },
+        SearchContentType::Comment => match title {
+            "User Comment" => "user",
+            "Agent Comment" => "agent",
+            _ => "",
+        },
+        _ => "",
+    }
+    .to_string()
+}
+
 fn empty_to_none(value: String) -> Option<String> {
     if value.is_empty() {
         None
@@ -960,6 +1091,12 @@ fn hit_matches_filters(hit: &SearchIndexHit, filters: &SearchFilters) -> bool {
 
     if let Some(ref content_types) = filters.content_types {
         if !content_types.contains(&hit.content_type.to_string()) {
+            return false;
+        }
+    }
+
+    if let Some(ref role) = filters.role {
+        if &hit.role != role {
             return false;
         }
     }
@@ -1129,6 +1266,8 @@ mod tests {
                     project_id: Some("project-target".to_string()),
                     issue_id: None,
                     content_types: Some(vec!["issue".to_string()]),
+                    role: None,
+                    title_only: false,
                     since: None,
                     limit: Some(1),
                 }),
@@ -1202,6 +1341,8 @@ mod tests {
                     project_id: Some("project-1".to_string()),
                     issue_id: Some("issue-1".to_string()),
                     content_types: Some(vec!["message".to_string()]),
+                    role: None,
+                    title_only: false,
                     since: None,
                     limit: Some(10),
                 }),
@@ -1591,5 +1732,283 @@ mod tests {
             1,
             "second database's already-applied row must survive the rebuild"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_token_query_requires_all_tokens() {
+        let db = migrated_db().await.unwrap();
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-both', 'project-1', 1, 'Retry backoff logic', 'body', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-one', 'project-1', 2, 'Retry only', 'unrelated body', 2, 2)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert_eq!(index.apply_pending(&db).await.unwrap(), 2);
+
+        // Only issue-both contains both words. The old OR-of-everything query
+        // would also return issue-one (it has "retry").
+        let hits = index.search("retry backoff", None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "issue-both");
+    }
+
+    #[tokio::test]
+    async fn title_match_outranks_body_match() {
+        let db = migrated_db().await.unwrap();
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-title', 'project-1', 1, 'Widget calibration', 'unrelated filler text', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-body', 'project-1', 2, 'Unrelated heading', 'the widget appears in the body only', 1, 1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert_eq!(index.apply_pending(&db).await.unwrap(), 2);
+
+        // Equal created_at (recency neutral); the title boost floats the
+        // title match above the body-only match.
+        let hits = index.search("widget", None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "issue-title", "title match must rank first");
+    }
+
+    #[tokio::test]
+    async fn newer_document_outranks_older_on_equal_text_score() {
+        let db = migrated_db().await.unwrap();
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        // Identical title+body → identical BM25. created_at near now so the
+        // recency term separates them (older → smaller bonus).
+        let now = chrono::Utc::now().timestamp();
+        let newer = now;
+        let older = now - 60 * 60 * 24 * 60; // 60 days: older than one half-life
+        db.write(move |conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-older', 'project-1', 1, 'Identical subject', 'identical body text', ?1, ?1)",
+                    params![older],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-newer', 'project-1', 2, 'Identical subject', 'identical body text', ?1, ?1)",
+                    params![newer],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert_eq!(index.apply_pending(&db).await.unwrap(), 2);
+
+        let hits = index.search("identical subject", None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].id, "issue-newer",
+            "newer document must rank first on equal text score"
+        );
+    }
+
+    async fn seed_two_inline_events(db: &LocalDb) {
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                     VALUES ('proj','ws','p','PROJ','/tmp/p',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO runs(id, project_id, status, created_at, updated_at)
+                     VALUES ('run','proj','exited',1,1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES ('ev-assistant','run',1,1,'assistant','{\"content\":\"sharednoun assistant\"}',1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES ('ev-user','run',2,2,'user','{\"content\":\"sharednoun user\"}',2)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn role_filter_narrows_events_by_author() {
+        let db = migrated_db().await.unwrap();
+        seed_two_inline_events(&db).await;
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        index.rebuild(&db).await.unwrap();
+
+        // Unfiltered, both events match.
+        assert_eq!(index.search("sharednoun", None).unwrap().len(), 2);
+
+        // A `text` event derives role=assistant.
+        let assistant = index
+            .search(
+                "sharednoun",
+                Some(SearchFilters {
+                    role: Some("assistant".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].id, "ev-assistant");
+
+        // A `user` event derives role=user.
+        let user = index
+            .search(
+                "sharednoun",
+                Some(SearchFilters {
+                    role: Some("user".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].id, "ev-user");
+    }
+
+    #[tokio::test]
+    async fn title_only_filter_matches_title_field_alone() {
+        let db = migrated_db().await.unwrap();
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-title', 'project-1', 1, 'Parser rewrite', 'unrelated body', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+                     VALUES ('issue-body', 'project-1', 2, 'Unrelated heading', 'the parser lives only in the body', 1, 1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert_eq!(index.apply_pending(&db).await.unwrap(), 2);
+
+        // Default search matches title and body.
+        assert_eq!(index.search("parser", None).unwrap().len(), 2);
+
+        // title_only restricts matching to the title field.
+        let hits = index
+            .search(
+                "parser",
+                Some(SearchFilters {
+                    title_only: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "issue-title");
+    }
+
+    #[tokio::test]
+    async fn rebuild_indexes_role_for_archived_events() {
+        let db = migrated_db().await.unwrap();
+        // Seeds one `user` event archived to zstd (inline row is a stub).
+        seed_archived_zstd_event(&db, "zephyr archived needle").await;
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        index.rebuild(&db).await.unwrap();
+
+        // The reconstructed archived event carries role=user (its event type).
+        let user = index
+            .search(
+                "zephyr",
+                Some(SearchFilters {
+                    role: Some("user".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].id, "ev");
+
+        // It must not surface under a different role.
+        assert!(index
+            .search(
+                "zephyr",
+                Some(SearchFilters {
+                    role: Some("assistant".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap()
+            .is_empty());
     }
 }

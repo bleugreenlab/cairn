@@ -74,6 +74,7 @@ pub enum ResourceKind {
     NodeArtifact,
     NodeChanged,
     NodeTerminal,
+    NodeRepl,
     NodeBrowser,
     NodeMessages,
     NodeProgress,
@@ -162,6 +163,7 @@ impl ResourceKind {
         ResourceKind::NodeArtifact,
         ResourceKind::NodeChanged,
         ResourceKind::NodeTerminal,
+        ResourceKind::NodeRepl,
         ResourceKind::NodeBrowser,
         ResourceKind::NodeMessages,
         ResourceKind::NodeProgress,
@@ -226,6 +228,34 @@ impl ResourceKind {
         ResourceKind::Projects,
         ResourceKind::ProjectSettings,
     ];
+
+    /// Kebab-lowercased variant name (`Issue` -> `issue`, `NodeArtifact` ->
+    /// `node-artifact`). Single-sourced from the `Debug` variant name so it can
+    /// never drift from the enum; used as the `cairn://help?kind=<slug>`
+    /// selector that the session-scoped affordance pointer targets.
+    pub fn slug(self) -> String {
+        let name = format!("{self:?}");
+        let mut out = String::with_capacity(name.len() + 4);
+        for (i, ch) in name.chars().enumerate() {
+            if ch.is_ascii_uppercase() {
+                if i != 0 {
+                    out.push('-');
+                }
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Resolve a [`Self::slug`] back to its kind. `None` for an unknown slug.
+    pub fn from_slug(slug: &str) -> Option<ResourceKind> {
+        ResourceKind::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.slug() == slug)
+    }
 }
 
 /// Rough JSON type of a payload key, for documentation in rejections/affordances.
@@ -380,5 +410,27 @@ impl ResourceContract {
     /// Find the spec for a mode, if this resource supports it.
     pub fn mutation(&self, mode: ChangeMode) -> Option<&'static MutationSpec> {
         self.mutations.iter().find(|spec| spec.mode == mode)
+    }
+}
+
+#[cfg(test)]
+mod kind_slug_tests {
+    use super::ResourceKind;
+
+    #[test]
+    fn slug_is_kebab_lowercase_and_roundtrips() {
+        assert_eq!(ResourceKind::Issue.slug(), "issue");
+        assert_eq!(ResourceKind::NodeArtifact.slug(), "node-artifact");
+        assert_eq!(ResourceKind::ProjectIssues.slug(), "project-issues");
+        // Every kind's slug resolves back to exactly that kind, so slugs are a
+        // total, injective naming of the enum the help projection can rely on.
+        for kind in ResourceKind::ALL {
+            assert_eq!(ResourceKind::from_slug(&kind.slug()), Some(*kind));
+        }
+    }
+
+    #[test]
+    fn from_slug_rejects_unknown() {
+        assert_eq!(ResourceKind::from_slug("not-a-kind"), None);
     }
 }

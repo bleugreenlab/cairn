@@ -16,13 +16,16 @@ mod process;
 mod redact;
 mod resolve;
 mod sandbox_policy;
+mod tip;
 mod types;
 
 pub(crate) use checks::{
     check_stream_id, run_check_command, run_check_command_unsandboxed, run_item_stream_id,
+    CheckExecResult,
 };
 pub(crate) use process::{
-    apply_non_interactive_pager_env_to_pty, scrub_dev_instance_routing_pty, MAX_BUFFER_SIZE,
+    apply_non_interactive_pager_env_to_pty, build_agent_spawn_config,
+    scrub_dev_instance_routing_pty, MAX_BUFFER_SIZE,
 };
 pub use redact::redact_command;
 pub(crate) use sandbox_policy::build_run_sandbox_policy;
@@ -107,6 +110,12 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let commit_present = payload.commit_msg.is_some();
+
+    // Advisory nudge: if any shell item wraps an interpreter one-liner
+    // (`python3 -c`, `bun -e`, a `python <<EOF` heredoc, …), surface a one-line
+    // tip pointing at inline `{code, interpreter}`. Computed once here and
+    // appended to the composed output below; never affects success/exit status.
+    let interpreter_tip = tip::interpreter_tip(&payload.commands);
 
     // Look up streaming/run context once for the whole batch. Prefer the
     // callback's run_id when present: cwd lookups are only a fallback and can
@@ -365,6 +374,12 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             }
             result.push_str(&cd_advisory);
         }
+        if let Some(tip) = interpreter_tip {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(tip);
+        }
         let text = if result.is_empty() {
             "(no output)".to_string()
         } else {
@@ -489,6 +504,12 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
             result.push_str("\n\n");
         }
         result.push_str(&cd_advisory);
+    }
+    if let Some(tip) = interpreter_tip {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(tip);
     }
 
     let text = if result.is_empty() {

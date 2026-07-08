@@ -411,6 +411,7 @@ mod tests {
             impact: impact.map(|globs| globs.iter().map(|s| s.to_string()).collect()),
             policy: crate::config::project_settings::CheckPolicy::Advisory,
             when: crate::config::project_settings::CheckWhen::Write,
+            timeout: None,
         }
     }
 

@@ -1922,6 +1922,30 @@ async fn render_resource_body(
         | CairnResource::ProjectTerminal { .. } => {
             "Terminal URIs are handled by read_resource".to_string()
         }
+        // A REPL read renders a live status banner from the in-memory registry
+        // (interpreter, running/exited, uptime) — no cursor, no buffered output,
+        // so it flows through the generic resource read path, not the terminal
+        // JSON-extraction path.
+        CairnResource::NodeRepl {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            slug,
+        } => {
+            if let Some(error) = reject_query_params("repl", &params) {
+                error
+            } else {
+                let job_id = crate::mcp::handlers::repl::resolve_node_repl_job_id(
+                    db, &project, number, exec_seq, &node_id,
+                )
+                .await;
+                let session = job_id
+                    .as_deref()
+                    .and_then(|jid| orch.repl_state.get(jid, &slug));
+                crate::mcp::handlers::repl::render_status(&slug, session.as_ref())
+            }
+        }
         // Browser reads render the durable job_browsers row (url/title/status)
         // plus, when a webview is live, an extraction of the current page content
         // via the injected content-script bridge. `?format=markdown|text`.
@@ -1953,13 +1977,7 @@ async fn render_resource_body(
         CairnResource::Bug => {
             "cairn://bug is write-only; use change with mode=append to submit reports".to_string()
         }
-        CairnResource::Help => {
-            if let Some(error) = reject_query_params("help", &params) {
-                error
-            } else {
-                crate::system_prompt::cairn_help()
-            }
-        }
+        CairnResource::Help => render_help(&params),
         // Web search: the query rides in `?q=` as literal text (no URL-encoding).
         // Results are normalized to a ranked title · url · snippet list by the
         // active typed provider.
@@ -1983,6 +2001,23 @@ async fn render_resource_body(
     }
 }
 
+/// Render the `cairn://help` resource. With no params, the whole read catalog +
+/// mutation reference (`cairn_help`). With `?kind=<slug>`, a single resource
+/// kind's affordance block from the same single source (`affordance_for_kind`)
+/// as the inline block, so the session-scoped affordance pointer
+/// (`cairn://help?kind=<slug>`) re-renders a collapsed block on demand.
+fn render_help(params: &[QueryParam]) -> String {
+    match find_query_value(params, "kind") {
+        Some(slug) => match cairn_common::contract::ResourceKind::from_slug(slug) {
+            Some(kind) => affordance_for_kind(kind),
+            None => format!(
+                "Unknown resource-kind slug '{slug}' for cairn://help?kind=. Expected a kebab-case resource-kind slug such as `issue`, `node`, or `node-artifact`."
+            ),
+        },
+        None => reject_query_params("help", params).unwrap_or_else(crate::system_prompt::cairn_help),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1991,6 +2026,31 @@ mod tests {
 
     fn db_params(query: &str) -> Vec<QueryParam> {
         parse_query_params(query).unwrap()
+    }
+
+    #[test]
+    fn help_kind_renders_single_affordance_block() {
+        // `?kind=<slug>` renders exactly that kind's affordance block, from the
+        // same source as the inline block the session pointer collapses.
+        let block = render_help(&db_params("kind=issue"));
+        assert!(block.starts_with("## Issue details\n"), "{block}");
+        assert!(block.contains("### actions"), "{block}");
+    }
+
+    #[test]
+    fn help_unknown_kind_errors_clearly() {
+        let err = render_help(&db_params("kind=not-a-kind"));
+        assert!(err.contains("Unknown resource-kind slug"), "{err}");
+        assert!(err.contains("not-a-kind"), "{err}");
+    }
+
+    #[test]
+    fn help_without_kind_returns_full_doc() {
+        // Bare `cairn://help` still returns the whole catalog, not one block.
+        assert_eq!(
+            render_help(&db_params("")),
+            crate::system_prompt::cairn_help()
+        );
     }
 
     #[test]

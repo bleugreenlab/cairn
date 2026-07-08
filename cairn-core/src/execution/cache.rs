@@ -24,6 +24,7 @@ fn row_to_check_result(
         target_results_json: row.opt_text(9)?,
         job_id: row.opt_text(10)?,
         cached: row.opt_i64(11)?.map(|v| v != 0),
+        failure_kind: row.opt_text(12)?,
     })
 }
 
@@ -63,7 +64,7 @@ pub fn get_check_result(
                         "
                         SELECT project_id, tree_hash, input_hash, check_name, exit_code,
                                passed, output_tail, duration_ms, ran_at, target_results_json,
-                               job_id, cached
+                               job_id, cached, failure_kind
                         FROM check_result_cache
                         WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
                         ",
@@ -100,9 +101,10 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                     "
                     INSERT INTO check_result_cache (
                         project_id, tree_hash, input_hash, check_name, exit_code, passed,
-                        output_tail, duration_ms, ran_at, target_results_json, job_id, cached
+                        output_tail, duration_ms, ran_at, target_results_json, job_id, cached,
+                        failure_kind
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                     ON CONFLICT(project_id, check_name, input_hash) DO UPDATE SET
                         tree_hash = excluded.tree_hash,
                         exit_code = excluded.exit_code,
@@ -112,7 +114,8 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         ran_at = excluded.ran_at,
                         target_results_json = excluded.target_results_json,
                         job_id = excluded.job_id,
-                        cached = excluded.cached
+                        cached = excluded.cached,
+                        failure_kind = excluded.failure_kind
                     ",
                     params![
                         result.project_id.as_str(),
@@ -129,6 +132,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         result
                             .cached
                             .map(|cached| if cached { 1_i64 } else { 0_i64 }),
+                        result.failure_kind.as_deref(),
                     ],
                 )
                 .await?;
@@ -160,7 +164,7 @@ pub fn list_check_results(
                         "
                         SELECT project_id, tree_hash, input_hash, check_name, exit_code,
                                passed, output_tail, duration_ms, ran_at, target_results_json,
-                               job_id, cached
+                               job_id, cached, failure_kind
                         FROM check_result_cache
                         WHERE project_id = ?1 AND tree_hash = ?2
                         ORDER BY check_name ASC
@@ -205,7 +209,7 @@ pub fn list_latest_check_results_for_project(
                         "
                         SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
                                c.passed, c.output_tail, c.duration_ms, c.ran_at,
-                               c.target_results_json, c.job_id, c.cached
+                               c.target_results_json, c.job_id, c.cached, c.failure_kind
                         FROM check_result_cache c
                         WHERE c.project_id = ?1
                           AND NOT EXISTS (
@@ -250,7 +254,7 @@ pub fn list_check_results_for_job(
                         "
                         SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
                                c.passed, c.output_tail, c.duration_ms, c.ran_at,
-                               c.target_results_json, c.job_id, c.cached
+                               c.target_results_json, c.job_id, c.cached, c.failure_kind
                         FROM check_result_cache c
                         WHERE c.job_id = ?1
                           AND NOT EXISTS (
@@ -299,6 +303,11 @@ pub struct CheckResultCacheEntry {
     pub target_results_json: Option<String>,
     pub job_id: Option<String>,
     pub cached: Option<bool>,
+    /// Terminal classification of a FAILING check — `"timed_out"`,
+    /// `"spawn_error"`, or `"killed"` — refining the binary `passed` verdict so
+    /// abnormal deaths render as themselves. `None` for a pass, an ordinary
+    /// non-zero exit, and legacy rows. See [`crate::execution::checks::CheckFailureKind`].
+    pub failure_kind: Option<String>,
 }
 
 /// Write payload for a check-result cache row.
@@ -316,6 +325,9 @@ pub struct CheckResultCacheWrite {
     pub target_results_json: Option<String>,
     pub job_id: Option<String>,
     pub cached: Option<bool>,
+    /// Terminal classification of a FAILING check — see
+    /// [`CheckResultCacheEntry::failure_kind`].
+    pub failure_kind: Option<String>,
 }
 
 /// Normalize a shell command string for stable cache key comparison.
@@ -465,6 +477,7 @@ mod tests {
             target_results_json: None,
             job_id: None,
             cached: None,
+            failure_kind: None,
         }
     }
 

@@ -326,6 +326,8 @@ mod tests {
                 project_id: Some("project-1".to_string()),
                 issue_id: Some("issue-1".to_string()),
                 content_types: Some(vec!["comment".to_string()]),
+                role: None,
+                title_only: false,
                 since: None,
                 limit: Some(10),
             }),

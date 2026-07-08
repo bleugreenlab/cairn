@@ -46,8 +46,8 @@ pub use job_creation::create_jobs_for_new_nodes;
 pub(crate) use readiness::issue_settled;
 pub use readiness::{find_ready_action_nodes, find_ready_condition_nodes, is_action_node_ready};
 pub use recompute::{
-    recompute_execution_jobs, recompute_execution_jobs_conn, recompute_job,
-    recompute_job_status_conn, JobStatusChange,
+    heal_stuck_delegated_children, recompute_execution_jobs, recompute_execution_jobs_conn,
+    recompute_job, recompute_job_status_conn, reduce_delegated_child_job, JobStatusChange,
 };
 pub use restart::{restart_node, RestartNodeOutcome};
 pub use snapshot_edit::{reconcile_removed_nodes, RemovedNodesReconcile};

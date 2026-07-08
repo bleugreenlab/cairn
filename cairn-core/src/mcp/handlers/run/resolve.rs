@@ -16,6 +16,13 @@ pub(super) async fn resolve_run_item(
     run_context: Option<&RunContext>,
     item: &RunItem,
 ) -> (String, Result<RunSpec, String>) {
+    // A `repl` key routes inline code into a live REPL session by slug — a
+    // distinct spec from a fresh-process code item. Classify it first so the
+    // exactly-one-of command/target/code check below doesn't misread it.
+    if let Some(slug) = item.repl.as_deref() {
+        return resolve_repl_send(item, slug);
+    }
+
     // `interpreter` is only meaningful for inline `code`; a stray one on a
     // command/target item is a mistake worth naming rather than silently ignoring.
     if item.interpreter.is_some() && item.code.is_none() {
@@ -84,15 +91,85 @@ pub(super) async fn resolve_run_item(
     }
 }
 
+/// Resolve a `repl`-keyed item into a header + `ReplSend` spec. `repl` requires
+/// inline `code` + an `interpreter` matching a supported REPL language, and
+/// rejects `command`/`target`/`payload`. The interpreter is validated to parse
+/// here; the send path fails closed if it does not match the target session's
+/// actual language.
+fn resolve_repl_send(item: &RunItem, slug: &str) -> (String, Result<RunSpec, String>) {
+    let code = item.code.as_deref().unwrap_or_default();
+    let header = item
+        .description
+        .clone()
+        .unwrap_or_else(|| first_line_header(code));
+    let slug = slug.trim();
+    if slug.is_empty() {
+        return (
+            header,
+            Err("Run item `repl` must be a non-empty REPL slug".to_string()),
+        );
+    }
+    if item.command.is_some() || item.target.is_some() {
+        return (
+            header,
+            Err("Run item has `repl` with `command` or `target`; a REPL send takes inline `code` only".to_string()),
+        );
+    }
+    if item.code.is_none() {
+        return (
+            header,
+            Err(
+                "Run item has `repl` but no `code`; a REPL send evaluates inline `code`"
+                    .to_string(),
+            ),
+        );
+    }
+    if item.payload.is_some() {
+        return (
+            header,
+            Err("Run item has `repl` and `payload`; a REPL send takes no payload".to_string()),
+        );
+    }
+    let interpreter = match item.interpreter.as_deref() {
+        Some(i) => i,
+        None => return (
+            header,
+            Err(
+                "Run item has `repl` but no `interpreter`; set it to the REPL's language (python)"
+                    .to_string(),
+            ),
+        ),
+    };
+    match crate::mcp::handlers::repl::ReplLang::parse(interpreter) {
+        Some(lang) => (
+            header,
+            Ok(RunSpec::ReplSend {
+                slug: slug.to_string(),
+                code: code.to_string(),
+                timeout: item.timeout,
+                lang,
+            }),
+        ),
+        None => (
+            header,
+            Err(format!(
+                "Run item `repl` interpreter '{interpreter}' is not a supported REPL language; use python (py)"
+            )),
+        ),
+    }
+}
+
 /// Resolve an inline-code run item into a header + `Script` spec.
 ///
 /// Inline code reuses `RunSpec::Script` so `process.rs` runs it through the exact
 /// same spawn/env/fence/timeout path as a skill script — the only new work is
-/// mapping the language-named interpreter to `(program, eval-flag)` and deriving
-/// a header. The code is passed as a single argv argument (`bun -e <code>` /
-/// `python3 -c <code>`): no shell (so no quoting), no temp file (no lifecycle).
-/// Because `execute_process` injects the callback env, inline TypeScript gets
-/// zero-config `@cairn/sdk` from the worktree `node_modules`.
+/// mapping the language-named interpreter to an executable spec and deriving a
+/// header. TypeScript/JavaScript pass the code as a single argv argument
+/// (`bun -e <code>`); python delegates to [`resolve_python_spec`], which routes
+/// through `uv run -` (code on stdin) when uv resolves and falls back to
+/// `python3 -c <code>` otherwise. No shell (so no quoting), no temp file (no
+/// lifecycle). Because `execute_process` injects the callback env, inline
+/// TypeScript gets zero-config `@cairn/sdk` from the worktree `node_modules`.
 fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
     let code = item.code.as_deref().unwrap_or_default();
     let header = item
@@ -119,11 +196,18 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
         }
     };
 
-    let (program, flag) = match interpreter.trim().to_ascii_lowercase().as_str() {
+    let (program, args, stdin) = match interpreter.trim().to_ascii_lowercase().as_str() {
         // bun runs TypeScript and JavaScript identically; the ts/js split only
         // matters to the presentation-layer syntax highlighter.
-        "typescript" | "ts" | "javascript" | "js" => ("bun", "-e"),
-        "python" | "py" => ("python3", "-c"),
+        "typescript" | "ts" | "javascript" | "js" => (
+            "bun".to_string(),
+            vec!["-e".to_string(), code.to_string()],
+            None,
+        ),
+        // python routes through `uv run -` when uv resolves, else `python3 -c`.
+        // The env probe is isolated from the pure ladder so the decision logic
+        // stays hermetically testable.
+        "python" | "py" => resolve_python_spec(code, uv_on_agent_path()),
         other => {
             return (
                 header,
@@ -137,11 +221,60 @@ fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
     (
         header,
         Ok(RunSpec::Script {
-            program: program.to_string(),
-            args: vec![flag.to_string(), code.to_string()],
+            program,
+            args,
             timeout: item.timeout,
+            stdin,
         }),
     )
+}
+
+/// Choose the `(program, args, stdin)` for an inline python item. Pure: the env
+/// probe is threaded in as `uv_available` so the four-behavior ladder stays
+/// hermetic and env-independent.
+///
+/// When uv resolves, delegate to `uv run -` and hand the code to it on **stdin**.
+/// uv itself does the project detection and PEP 723 inline-metadata parsing, so a
+/// `# /// script` dependency block, a surrounding `pyproject.toml`'s deps, or
+/// plain stdlib code all run correctly with no mode branching here. Stdin is
+/// required, not merely convenient: `uv run -c` never parses PEP 723 metadata,
+/// and feeding stdin keeps `cwd` at the worktree so uv's project detection sees
+/// the real project (a temp script in `$TMPDIR` would sit outside the worktree
+/// and defeat that).
+///
+/// When uv is absent, fall back byte-for-byte to today's `python3 -c <code>`.
+/// This fallback is the ladder's ONLY silent downgrade and is debug-logged at the
+/// [`uv_on_agent_path`] probe; a dependency-resolution failure is NOT a fallback
+/// — uv's nonzero exit surfaces its real error as the item's failed output.
+fn resolve_python_spec(code: &str, uv_available: bool) -> (String, Vec<String>, Option<String>) {
+    if uv_available {
+        (
+            "uv".to_string(),
+            vec!["run".to_string(), "-".to_string()],
+            Some(code.to_string()),
+        )
+    } else {
+        (
+            "python3".to_string(),
+            vec!["-c".to_string(), code.to_string()],
+            None,
+        )
+    }
+}
+
+/// Probe whether `uv` resolves on the agent shell PATH (which prepends the
+/// host-owned `<cairn_home>/bin` shim dir, where a sidecar install may place
+/// `uv` — a location `get_user_path` does not include). Logs at debug when the
+/// probe misses so the `python3 -c` fallback, the ladder's one silent downgrade,
+/// is visible in logs.
+fn uv_on_agent_path() -> bool {
+    match crate::env::find_binary_on_agent_path("uv") {
+        Ok(_) => true,
+        Err(_) => {
+            log::debug!("uv not found on agent PATH; inline python falls back to `python3 -c`");
+            false
+        }
+    }
 }
 
 /// Header for an inline-code item lacking a `description`: its first non-blank
@@ -265,6 +398,7 @@ async fn resolve_script_spec(
         program,
         args,
         timeout: item.timeout,
+        stdin: None,
     })
 }
 
@@ -377,6 +511,7 @@ mod tests {
             code: Some(code.to_string()),
             interpreter: interpreter.map(str::to_string),
             background: None,
+            repl: None,
         }
     }
 
@@ -410,18 +545,31 @@ mod tests {
         }
     }
 
+    // The python ladder is pinned at the pure decision point (`resolve_python_spec`)
+    // rather than through `resolve_code_spec`, which probes the environment for uv.
+    // This keeps the four-behavior contract hermetic and env-independent.
     #[test]
-    fn resolve_code_spec_maps_python_aliases_to_python3_c() {
-        for interp in ["python", "py", "PYTHON"] {
-            let (_h, spec) = resolve_code_spec(&code_item("print(1)", Some(interp)));
-            let (program, args) = script(spec);
-            assert_eq!(program, "python3", "interpreter {interp}");
-            assert_eq!(
-                args,
-                vec!["-c".to_string(), "print(1)".to_string()],
-                "interpreter {interp}"
-            );
-        }
+    fn resolve_python_spec_falls_back_to_python3_c_without_uv() {
+        let (program, args, stdin) = resolve_python_spec("print(1)", false);
+        assert_eq!(program, "python3");
+        assert_eq!(args, vec!["-c".to_string(), "print(1)".to_string()]);
+        assert_eq!(stdin, None, "the python3 fallback feeds no stdin");
+    }
+
+    #[test]
+    fn resolve_python_spec_uses_uv_run_stdin_when_available() {
+        let (program, args, stdin) = resolve_python_spec("print(1)", true);
+        assert_eq!(program, "uv");
+        assert_eq!(
+            args,
+            vec!["run".to_string(), "-".to_string()],
+            "uv reads the script from stdin, not from an argv flag"
+        );
+        assert_eq!(
+            stdin.as_deref(),
+            Some("print(1)"),
+            "the code must be delivered on stdin so uv parses PEP 723 metadata"
+        );
     }
 
     #[test]

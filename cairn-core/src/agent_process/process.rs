@@ -226,6 +226,21 @@ pub struct RunHandle {
     /// Structured suspend request for an owned-loop run, set by a blocking
     /// handler and consumed by the owned loop after the tool dispatch returns.
     pub pending_suspend: Arc<Mutex<Option<SuspendKind>>>,
+    /// Content hashes of affordance blocks already shown in full this session
+    /// (CAIRN-2592 session-scoped affordance dedup). The full block for a
+    /// resource kind renders once per run; a later read whose affordance block
+    /// hashes to an entry here collapses to a one-line `cairn://help?kind=<slug>`
+    /// pointer instead of re-paying the whole block.
+    ///
+    /// Keyed by block-content hash, not `ResourceKind`, so schema-distinct
+    /// artifact blocks (which derive from the artifact's schema, not the static
+    /// contract) never collapse into one another.
+    ///
+    /// Deliberately NOT event-seeded (unlike `consumed_uris`): an empty set
+    /// after a cold host restart correctly re-shows blocks into the freshly
+    /// re-dispatched context. Compaction keeps the live process (and this set)
+    /// up, which is exactly why the pointer must stay reachable one read away.
+    pub seen_affordances: Arc<Mutex<HashSet<u64>>>,
 }
 
 /// Backwards-compatible alias.
@@ -257,6 +272,7 @@ impl RunHandle {
             turn_seen_calls: Arc::new(Mutex::new(TurnSeenCalls::default())),
             owns_turn_loop: false,
             pending_suspend: Arc::new(Mutex::new(None)),
+            seen_affordances: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -718,6 +734,35 @@ impl AgentProcessState {
         let process = processes.get(run_id)?;
         let consumed = process.consumed_uris.lock().ok()?;
         Some(consumed.clone())
+    }
+
+    /// Record which affordance-block content hashes have already been shown this
+    /// session and return the subset of `hashes` that were *already* present
+    /// (those collapse to a pointer). Newly-seen hashes are inserted, so a later
+    /// batch finds them already-present. Doing both in one locked pass gives the
+    /// read batch its keep-vs-collapse decision atomically.
+    ///
+    /// Session-scoped, not turn-scoped: a block shown in an earlier turn stays
+    /// collapsed for the rest of the run. Returns an empty set when the run is
+    /// unknown (external/untracked runs keep full blocks every time).
+    pub fn mark_affordances_seen(&self, run_id: &str, hashes: &[u64]) -> HashSet<u64> {
+        let Ok(processes) = self.processes.lock() else {
+            return HashSet::new();
+        };
+        let Some(process) = processes.get(run_id) else {
+            return HashSet::new();
+        };
+        let Ok(mut seen) = process.seen_affordances.lock() else {
+            return HashSet::new();
+        };
+        let mut already = HashSet::new();
+        for &hash in hashes {
+            // `insert` returns false when the value was already present.
+            if !seen.insert(hash) {
+                already.insert(hash);
+            }
+        }
+        already
     }
 
     /// Bulk-add URIs to a run's consumed-set (used for one-time event seeding).
@@ -1359,6 +1404,40 @@ mod tests {
         assert_eq!(consumed.len(), 2);
         assert!(consumed.contains("cairn://p/CAIRN/1"));
         assert_eq!(state.consumed_uris("ghost"), None);
+    }
+
+    #[test]
+    fn test_mark_affordances_seen_collapses_repeats_per_run() {
+        let state = state_with_run("run-1");
+        // Register a second run in the same state to prove per-run isolation.
+        {
+            let mut processes = state.processes.lock().unwrap();
+            processes.register(
+                "run-2".to_string(),
+                RunHandle::test_handle(Some("sess2"), None),
+            );
+        }
+
+        // First occurrence of each hash: nothing already seen; all recorded.
+        assert_eq!(
+            state.mark_affordances_seen("run-1", &[10, 20]),
+            HashSet::new()
+        );
+        // Repeat pass: the previously-recorded hashes collapse; a never-seen hash
+        // stays new. Distinct hashes are tracked independently, which guards the
+        // artifact case (schema-distinct blocks hash differently, never collapse).
+        assert_eq!(
+            state.mark_affordances_seen("run-1", &[10, 20, 30]),
+            HashSet::from([10, 20])
+        );
+        assert_eq!(
+            state.mark_affordances_seen("run-1", &[30]),
+            HashSet::from([30])
+        );
+        // Per-run isolation: run-2 starts with an empty seen-set.
+        assert_eq!(state.mark_affordances_seen("run-2", &[10]), HashSet::new());
+        // Unknown run: nothing seen, nothing recorded.
+        assert_eq!(state.mark_affordances_seen("ghost", &[10]), HashSet::new());
     }
 
     #[test]

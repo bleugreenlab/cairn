@@ -25,6 +25,7 @@ impl CairnResource {
             | NodeSymbols { project, .. }
             | ProjectSymbols { project, .. }
             | NodeTerminal { project, .. }
+            | NodeRepl { project, .. }
             | TaskTerminal { project, .. }
             | NodeBrowser { project, .. }
             | TaskBrowser { project, .. }
@@ -121,6 +122,8 @@ impl CairnResource {
                 "/p/{}/i/{}/{}/{}?terminalId={}",
                 project, number, exec_seq, node_id, slug
             )),
+            // A REPL is agent-only — no dedicated frontend route.
+            Self::NodeRepl { .. } => None,
             Self::TaskTerminal {
                 number,
                 exec_seq,
@@ -277,6 +280,7 @@ impl CairnResource {
             | Self::NodeChatEvent { project, .. }
             | Self::NodeArtifact { project, .. }
             | Self::NodeTerminal { project, .. }
+            | Self::NodeRepl { project, .. }
             | Self::TaskTerminal { project, .. }
             | Self::NodeBrowser { project, .. }
             | Self::TaskBrowser { project, .. }
@@ -361,6 +365,7 @@ impl CairnResource {
             | Self::NodeChatEvent { number, .. }
             | Self::NodeArtifact { number, .. }
             | Self::NodeTerminal { number, .. }
+            | Self::NodeRepl { number, .. }
             | Self::TaskTerminal { number, .. }
             | Self::NodeBrowser { number, .. }
             | Self::TaskBrowser { number, .. }
@@ -445,6 +450,7 @@ impl CairnResource {
             | Self::NodeChatEvent { node_id, .. }
             | Self::NodeArtifact { node_id, .. }
             | Self::NodeTerminal { node_id, .. }
+            | Self::NodeRepl { node_id, .. }
             | Self::TaskTerminal { node_id, .. }
             | Self::NodeBrowser { node_id, .. }
             | Self::TaskBrowser { node_id, .. }

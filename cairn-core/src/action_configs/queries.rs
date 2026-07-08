@@ -1,7 +1,6 @@
 //! Action configuration database queries.
 
 use cairn_db::turso::params;
-use uuid::Uuid;
 
 use crate::models::{
     generate_input_schema, parse_template, ActionConfig, CreateActionConfig, UpdateActionConfig,
@@ -94,23 +93,35 @@ pub async fn list_action_configs(
 /// This is the action analog of the file-type `list_for_context` shadowing. The
 /// raw [`list_action_configs`] stays a literal per-scope query for the editor;
 /// callers that want the agent-facing effective set use this resolver.
+///
+/// Cross-scope by construction (CAIRN-2573): a team project's own actions live in
+/// its synced replica, but workspace-scoped actions and the per-project disable
+/// overrides never leave the PRIVATE database — workspace `action_configs` are
+/// private-lineage only, and `config_disables` is `Private`/`DeferredShared`
+/// (CAIRN-2210), absent from the team schema. `workspace_db` therefore serves the
+/// inherited workspace actions and the disabled-name set, while `project_db`
+/// serves the project's own actions. For a local project the caller passes the
+/// same handle for both.
 pub async fn list_action_configs_for_context(
-    db: &LocalDb,
+    workspace_db: &LocalDb,
+    project_db: &LocalDb,
     project_id: &str,
     include_builtins: bool,
 ) -> Result<Vec<ActionConfig>, String> {
     use std::collections::HashMap;
 
     let mut by_name: HashMap<String, ActionConfig> = HashMap::new();
-    for action in list_action_configs(db, Some("default"), None, include_builtins).await? {
+    for action in list_action_configs(workspace_db, Some("default"), None, include_builtins).await?
+    {
         by_name.insert(action.name.clone(), action);
     }
     // Project actions shadow workspace actions of the same name.
-    for action in list_action_configs(db, None, Some(project_id), include_builtins).await? {
+    for action in list_action_configs(project_db, None, Some(project_id), include_builtins).await? {
         by_name.insert(action.name.clone(), action);
     }
 
-    let disabled = crate::config_disables::list_disabled_keys(db, project_id, "action").await?;
+    let disabled =
+        crate::config_disables::list_disabled_keys(workspace_db, project_id, "action").await?;
 
     let mut actions: Vec<ActionConfig> = by_name
         .into_values()
@@ -123,18 +134,30 @@ pub async fn list_action_configs_for_context(
 /// Copy an existing action (from any scope) into a target scope under a chosen
 /// name. Same name as an inherited workspace action + project target shadows it;
 /// a new name is additive. Hard copy: a fresh UUID, no link to the source.
+///
+/// Cross-scope by construction (CAIRN-2573): the source may live in one database
+/// (a team project's replica, or the private DB for a workspace/local source) and
+/// the target in another. `source_db` is read; `target_db` receives the copy. For
+/// a same-scope copy the caller passes the same handle for both.
 pub async fn copy_action_config(
-    db: &LocalDb,
+    source_db: &LocalDb,
+    target_db: &LocalDb,
     source_id: &str,
     target_name: &str,
     target_project_id: Option<&str>,
 ) -> Result<ActionConfig, String> {
-    let source = get_action_config(db, source_id)
+    let source = get_action_config(source_db, source_id)
         .await?
         .ok_or_else(|| format!("Action config not found: {source_id}"))?;
 
     let now = chrono::Utc::now().timestamp();
-    let id = Uuid::new_v4().to_string();
+    // A project-scoped copy inherits the target project's route scope so the new
+    // id routes to the same database it is written to (CAIRN-2573); a workspace
+    // copy stays bare/local.
+    let id = match target_project_id {
+        Some(pid) => cairn_common::ids::mint_child(pid),
+        None => cairn_common::ids::mint_local().into_string(),
+    };
     let (workspace_id, project_id) = match target_project_id {
         Some(pid) => (None, Some(pid.to_string())),
         None => (Some("default".to_string()), None),
@@ -154,20 +177,21 @@ pub async fn copy_action_config(
         .map_err(|e| format!("Failed to serialize output_schema: {e}"))?;
 
     let target_name = target_name.to_string();
-    db.write(|conn| {
-        let id = id.clone();
-        let target_name = target_name.clone();
-        let description = source.description.clone();
-        let command_template = source.command_template.clone();
-        let input_schema_str = input_schema_str.clone();
-        let output_schema_str = output_schema_str.clone();
-        let tool_name = source.tool_name.clone();
-        let tool_description = source.tool_description.clone();
-        let workspace_id = workspace_id.clone();
-        let project_id = project_id.clone();
-        Box::pin(async move {
-            conn.execute(
-                "
+    target_db
+        .write(|conn| {
+            let id = id.clone();
+            let target_name = target_name.clone();
+            let description = source.description.clone();
+            let command_template = source.command_template.clone();
+            let input_schema_str = input_schema_str.clone();
+            let output_schema_str = output_schema_str.clone();
+            let tool_name = source.tool_name.clone();
+            let tool_description = source.tool_description.clone();
+            let workspace_id = workspace_id.clone();
+            let project_id = project_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "
                 INSERT INTO action_configs (
                     id, name, description, command_template, input_schema, output_schema,
                     is_builtin, workspace_id, project_id, created_at, updated_at,
@@ -175,29 +199,29 @@ pub async fn copy_action_config(
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)
                 ",
-                params![
-                    id.as_str(),
-                    target_name.as_str(),
-                    description.as_str(),
-                    command_template.as_deref(),
-                    input_schema_str.as_deref(),
-                    output_schema_str.as_deref(),
-                    workspace_id.as_deref(),
-                    project_id.as_deref(),
-                    now,
-                    now,
-                    tool_name.as_deref(),
-                    tool_description.as_deref()
-                ],
-            )
-            .await?;
-            load_action_config_conn(conn, &id)
-                .await?
-                .ok_or_else(|| DbError::internal(format!("copied action config missing: {id}")))
+                    params![
+                        id.as_str(),
+                        target_name.as_str(),
+                        description.as_str(),
+                        command_template.as_deref(),
+                        input_schema_str.as_deref(),
+                        output_schema_str.as_deref(),
+                        workspace_id.as_deref(),
+                        project_id.as_deref(),
+                        now,
+                        now,
+                        tool_name.as_deref(),
+                        tool_description.as_deref()
+                    ],
+                )
+                .await?;
+                load_action_config_conn(conn, &id)
+                    .await?
+                    .ok_or_else(|| DbError::internal(format!("copied action config missing: {id}")))
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("Failed to copy action_config: {e}"))
+        .await
+        .map_err(|e| format!("Failed to copy action_config: {e}"))
 }
 
 pub async fn get_action_config(db: &LocalDb, id: &str) -> Result<Option<ActionConfig>, String> {
@@ -216,7 +240,13 @@ pub async fn create_action_config(
     }
 
     let now = chrono::Utc::now().timestamp();
-    let id = Uuid::new_v4().to_string();
+    // A project-scoped action inherits the project's route scope so its id routes
+    // to the database it is written to (CAIRN-2573); a workspace action stays
+    // bare/local.
+    let id = match input.project_id.as_deref() {
+        Some(pid) => cairn_common::ids::mint_child(pid),
+        None => cairn_common::ids::mint_local().into_string(),
+    };
     let input_schema = if input.input_schema.is_some() {
         input.input_schema.clone()
     } else {
@@ -458,7 +488,7 @@ mod tests {
             .await
             .unwrap();
 
-        let ctx = list_action_configs_for_context(&db, "p1", false)
+        let ctx = list_action_configs_for_context(&db, &db, "p1", false)
             .await
             .unwrap();
         // Inherited workspace `build` plus the single shadowed `deploy`.
@@ -478,12 +508,12 @@ mod tests {
             .await
             .unwrap();
 
-        let p1 = list_action_configs_for_context(&db, "p1", false)
+        let p1 = list_action_configs_for_context(&db, &db, "p1", false)
             .await
             .unwrap();
         assert!(!p1.iter().any(|a| a.name == "deploy"));
 
-        let p2 = list_action_configs_for_context(&db, "p2", false)
+        let p2 = list_action_configs_for_context(&db, &db, "p2", false)
             .await
             .unwrap();
         assert!(p2.iter().any(|a| a.name == "deploy"));
@@ -498,7 +528,7 @@ mod tests {
             .unwrap();
 
         // New name in workspace: an independent, additive action with a fresh id.
-        let additive = copy_action_config(&db, &ws.id, "deploy-staging", None)
+        let additive = copy_action_config(&db, &db, &ws.id, "deploy-staging", None)
             .await
             .unwrap();
         assert_eq!(additive.name, "deploy-staging");
@@ -507,13 +537,246 @@ mod tests {
         assert!(!additive.is_builtin);
 
         // Same name into a project: shadows the inherited workspace action.
-        let shadow = copy_action_config(&db, &ws.id, "deploy", Some("p1"))
+        let shadow = copy_action_config(&db, &db, &ws.id, "deploy", Some("p1"))
             .await
             .unwrap();
         assert_eq!(shadow.project_id.as_deref(), Some("p1"));
-        let ctx = list_action_configs_for_context(&db, "p1", false)
+        let ctx = list_action_configs_for_context(&db, &db, "p1", false)
             .await
             .unwrap();
         assert_eq!(ctx.iter().filter(|a| a.name == "deploy").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_composes_across_workspace_and_project_dbs() {
+        // Team split (CAIRN-2573): workspace actions + disable overrides live in
+        // the private DB (workspace_db); the project's own actions live in a
+        // separate DB (project_db). The resolver reads each half from its own
+        // handle.
+        let workspace_db = db().await;
+        let project_db = db().await;
+        seed_project(&project_db, "p1").await;
+
+        create_action_config(&workspace_db, input("deploy", "echo ws", None))
+            .await
+            .unwrap();
+        create_action_config(&workspace_db, input("build", "echo build", None))
+            .await
+            .unwrap();
+        create_action_config(&project_db, input("deploy", "echo proj", Some("p1")))
+            .await
+            .unwrap();
+        // A per-project disable override lives in the private (workspace) DB.
+        crate::config_disables::disable_config(&workspace_db, "p1", "action", "build")
+            .await
+            .unwrap();
+
+        let ctx = list_action_configs_for_context(&workspace_db, &project_db, "p1", false)
+            .await
+            .unwrap();
+        // `build` is disabled; `deploy` is shadowed by the project row.
+        assert_eq!(ctx.len(), 1);
+        assert_eq!(ctx[0].name, "deploy");
+        assert_eq!(ctx[0].command_template.as_deref(), Some("echo proj"));
+    }
+
+    #[tokio::test]
+    async fn copy_reads_source_db_writes_target_db() {
+        // Cross-scope copy (CAIRN-2573): source in one DB, target scope in
+        // another. The copy must land in target_db and never in source_db.
+        let source_db = db().await;
+        let target_db = db().await;
+        seed_project(&target_db, "p1").await;
+        let source = create_action_config(&source_db, input("deploy", "echo ws", None))
+            .await
+            .unwrap();
+
+        let copied = copy_action_config(&source_db, &target_db, &source.id, "deploy", Some("p1"))
+            .await
+            .unwrap();
+        assert_eq!(copied.project_id.as_deref(), Some("p1"));
+        assert_ne!(copied.id, source.id);
+
+        // The copy exists in the target DB only.
+        assert!(get_action_config(&target_db, &copied.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_action_config(&source_db, &copied.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn create_mints_project_scoped_id_inheriting_project_scope() {
+        use cairn_common::ids::{parse_route_scope, RouteScope};
+        // A team project id (team-prefixed) must yield a team-prefixed action id,
+        // so the id-keyed routing sends follow-up reads/writes to the same DB.
+        let db = db().await;
+        let team_project = "teamABC123~00000000-0000-4000-8000-000000000001";
+        seed_project(&db, team_project).await;
+
+        let action = create_action_config(&db, input("deploy", "echo", Some(team_project)))
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_route_scope(&action.id),
+            Ok(RouteScope::Team("teamABC123".to_string()))
+        );
+
+        // A workspace action stays bare/local.
+        let ws = create_action_config(&db, input("build", "echo", None))
+            .await
+            .unwrap();
+        assert_eq!(parse_route_scope(&ws.id), Ok(RouteScope::Local));
+    }
+
+    /// A TEAM_MIGRATIONS replica seeded with a `teams` root and one project row.
+    /// The team schema re-roots `projects.workspace_id` to `team_id`, so a team
+    /// project row is seeded differently from the private `seed_project` helper.
+    async fn team_db_with_project(project_id: &str, is_workspace: i64) -> LocalDb {
+        use crate::storage::TEAM_MIGRATIONS;
+        let tdb = LocalDb::open(tempfile::tempdir().unwrap().keep().join("team-actions.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
+            .run(&tdb)
+            .await
+            .unwrap();
+        tdb.execute(
+            "INSERT INTO teams(id, name, created_at, updated_at) VALUES ('team1', 'T', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let project_id = project_id.to_string();
+        tdb.write(|conn| {
+            let project_id = project_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at, is_workspace)
+                     VALUES (?1, 'team1', ?1, ?1, '', 1, 1, ?2)",
+                    (project_id.as_str(), is_workspace),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        tdb
+    }
+
+    /// Regression (CAIRN-2597): the whole action-config query layer names
+    /// `workspace_id` in every statement, but the team `action_configs` schema
+    /// had DROPPED that column — so CAIRN-2573's routing of action CRUD to a team
+    /// replica errored `no column named workspace_id` for BOTH a team project and
+    /// the team workspace. With the column restored to the team head schema, a
+    /// full create→list→get→update→delete cycle succeeds against the replica.
+    #[tokio::test]
+    async fn action_crud_against_team_replica_team_workspace_scope() {
+        use cairn_common::ids::{parse_route_scope, RouteScope};
+        // The team WORKSPACE project (is_workspace = 1) is the storage anchor for
+        // a team-workspace-scoped action.
+        let ws = "team1~00000000-0000-4000-8000-0000000000ff";
+        let tdb = team_db_with_project(ws, 1).await;
+
+        let created = create_action_config(&tdb, input("deploy", "echo ws", Some(ws)))
+            .await
+            .expect("create team-workspace action into replica");
+        // The id inherits the team prefix, so id-keyed routing sends follow-ups
+        // to the same replica; workspace_id stays NULL (project-anchored).
+        assert_eq!(
+            parse_route_scope(&created.id),
+            Ok(RouteScope::Team("team1".to_string()))
+        );
+        assert_eq!(created.workspace_id, None);
+        assert_eq!(created.project_id.as_deref(), Some(ws));
+
+        let listed = list_action_configs(&tdb, None, Some(ws), false)
+            .await
+            .expect("list team-workspace actions from replica");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.id);
+
+        let fetched = get_action_config(&tdb, &created.id)
+            .await
+            .expect("get from replica")
+            .expect("present");
+        assert_eq!(fetched.name, "deploy");
+
+        let updated = update_action_config(
+            &tdb,
+            &created.id,
+            UpdateActionConfig {
+                name: Some("deploy2".to_string()),
+                description: None,
+                command_template: None,
+                input_schema: None,
+                output_schema: None,
+            },
+        )
+        .await
+        .expect("update on replica");
+        assert_eq!(updated.name, "deploy2");
+
+        delete_action_config(&tdb, &created.id)
+            .await
+            .expect("delete on replica");
+        assert!(get_action_config(&tdb, &created.id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The sibling half of the CAIRN-2573 fix: a team PROJECT action (the case
+    /// 2573 shipped) also creates into the replica now instead of erroring.
+    #[tokio::test]
+    async fn action_create_against_team_replica_team_project_scope() {
+        let proj = "team1~00000000-0000-4000-8000-000000000001";
+        let tdb = team_db_with_project(proj, 0).await;
+        let created = create_action_config(&tdb, input("build", "echo", Some(proj)))
+            .await
+            .expect("create team-project action into replica");
+        assert_eq!(created.project_id.as_deref(), Some(proj));
+        assert_eq!(created.workspace_id, None);
+    }
+
+    /// A copy into the team workspace lands in the replica too (the copy INSERT
+    /// also names workspace_id).
+    #[tokio::test]
+    async fn copy_action_into_team_workspace_replica() {
+        let ws = "team1~00000000-0000-4000-8000-0000000000ff";
+        let tdb = team_db_with_project(ws, 1).await;
+        // Source lives in a private DB; copy reads source, writes target replica.
+        let src_db = db().await;
+        let source = create_action_config(&src_db, input("deploy", "echo ws", None))
+            .await
+            .unwrap();
+        let copied = copy_action_config(&src_db, &tdb, &source.id, "deploy", Some(ws))
+            .await
+            .expect("copy into team workspace replica");
+        assert_eq!(copied.project_id.as_deref(), Some(ws));
+        assert!(get_action_config(&tdb, &copied.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn copy_into_team_project_mints_prefixed_id() {
+        use cairn_common::ids::{parse_route_scope, RouteScope};
+        let db = db().await;
+        let team_project = "teamABC123~00000000-0000-4000-8000-000000000001";
+        seed_project(&db, team_project).await;
+        let ws = create_action_config(&db, input("deploy", "echo ws", None))
+            .await
+            .unwrap();
+
+        let copied = copy_action_config(&db, &db, &ws.id, "deploy", Some(team_project))
+            .await
+            .unwrap();
+        assert_eq!(
+            parse_route_scope(&copied.id),
+            Ok(RouteScope::Team("teamABC123".to_string()))
+        );
     }
 }

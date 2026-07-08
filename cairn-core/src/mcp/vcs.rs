@@ -495,31 +495,12 @@ pub fn worktree_shell_vcs_env(
         "GIT_CEILING_DIRECTORIES".into(),
         ceiling.to_string_lossy().into_owned(),
     ));
-    // Intercept `jj workspace update-stale` from bare `jj` in agent shells: jj's
-    // own stale hint names exactly the command that destroyed a workspace in the
-    // incident (racing the shared store). Prepend a shim dir to PATH and point its
-    // `CAIRN_JJ_BIN` at the real binary managed jj runs, so every other jj command
-    // execs the real jj untouched. With `reconcile_workspace` in place the shim
-    // should never trigger in practice; it exists so the one command jj advertises
-    // can never again race the store from an agent's hands. Unix-only.
-    #[cfg(unix)]
-    match crate::jj::ensure_jj_shim_dir(&orch.config_dir) {
-        Ok(shim_dir) => {
-            // Compose on top of the agent shell PATH (which carries the
-            // host-owned `cairn` shim dir), NOT bare get_user_path(): this entry
-            // overrides the spawn site's own `agent_shell_path()` for a jj
-            // worktree (a later env with the same key wins), so it must itself
-            // keep the cairn bin dir or `cairn` stops resolving in the primary
-            // (worktree) case. Final order: jj shim first (bare-`jj
-            // update-stale` interception), then the cairn bin dir, then the
-            // user PATH.
-            let current_path = crate::env::agent_shell_path();
-            let new_path = format!("{}:{}", shim_dir.display(), current_path);
-            env.push(("PATH".into(), new_path));
-            env.push(("CAIRN_JJ_BIN".into(), jj.binary_path().to_string()));
-        }
-        Err(e) => log::warn!("jj shim setup failed (bare `jj update-stale` not intercepted): {e}"),
-    }
+    // The universal `<cairn_home>/bin/jj` shim (installed at startup and already
+    // on every agent PATH via `agent_shell_path`) intercepts
+    // `jj workspace update-stale` and forwards every other jj to the bundled
+    // binary, so no per-worktree shim dir is composed here anymore and the
+    // interception now reaches Windows too. `shell_env` above already carries the
+    // managed jj config and non-interactive editor.
     env
 }
 
@@ -1052,24 +1033,17 @@ mod tests {
         );
         assert_eq!(env.get("JJ_EDITOR").map(String::as_str), Some("true"));
 
-        let path = env.get("PATH").expect("jj shim PATH injected");
-        let shim_prefix = format!("{}:", config_dir.join("shims").display());
+        // The universal `<cairn_home>/bin/jj` shim (installed at startup) now
+        // provides `update-stale` interception, so the worktree env no longer
+        // overrides PATH or re-exports CAIRN_JJ_BIN — the spawn site's own
+        // `agent_shell_path()` (which already carries the jj shim) is used as-is.
         assert!(
-            path.starts_with(&shim_prefix),
-            "the managed jj shim directory stays first on PATH: {path}"
+            !env.contains_key("PATH"),
+            "worktree vcs env no longer injects PATH; the startup jj shim covers interception"
         );
         assert!(
-            path.contains("/.bun/bin"),
-            "the shim is composed onto env::agent_shell_path(), not the host process PATH: {path}"
-        );
-        // The composition source is agent_shell_path(), so the host-owned cairn
-        // bin dir must survive into the worktree PATH — otherwise this entry
-        // (which overrides the spawn site's PATH) would drop `cairn` in the
-        // primary worktree case.
-        let cairn_bin = crate::env::cairn_bin_dir();
-        assert!(
-            path.contains(cairn_bin.to_string_lossy().as_ref()),
-            "the cairn CLI shim dir is composed into the worktree PATH so `cairn` resolves in agent worktree shells: {path}"
+            !env.contains_key("CAIRN_JJ_BIN"),
+            "worktree vcs env no longer re-exports CAIRN_JJ_BIN"
         );
     }
 

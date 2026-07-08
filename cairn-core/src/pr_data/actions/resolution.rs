@@ -51,13 +51,23 @@ pub async fn resolve_pr_node(
     owner_id: &str,
     resolution: PrNodeResolution,
 ) -> Result<Vec<String>, String> {
-    let merge_context = resolve_merge_mr_context_for_job(&orch.db.local, owner_id).await?;
+    // Route to the database that owns this PR's producing job (team replica or
+    // private DB). Every row this resolution reads or writes — the merge_requests
+    // status transition, the issue resolution, the pr action_run completion, and
+    // the producing-execution advance — lives in that database. This runs AFTER
+    // the merge/close already hit GitHub or the local jj fold, so reading the
+    // private DB for a team job would error with “No merge request found” and
+    // strand the team replica's PR (and its blocked action run) unresolved.
+    let db = crate::execution::routing::routing_db_for_id(&orch.db, owner_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let merge_context = resolve_merge_mr_context_for_job(&db, owner_id).await?;
     let mr_id = merge_context.mr.mr_id.clone();
     let now = chrono::Utc::now().timestamp();
     let closed_sessions = match resolution {
         PrNodeResolution::Merge => {
             mark_merge_request_merged_and_resolve_issue(
-                &orch.db.local,
+                &db,
                 &mr_id,
                 merge_context.issue_id.as_deref(),
                 None,
@@ -67,7 +77,7 @@ pub async fn resolve_pr_node(
         }
         PrNodeResolution::Close => {
             mark_merge_request_closed_and_resolve_issue(
-                &orch.db.local,
+                &db,
                 &mr_id,
                 merge_context.issue_id.as_deref(),
                 now,
@@ -80,12 +90,10 @@ pub async fn resolve_pr_node(
         if merge_context.has_triage_batch {
             let result = match resolution {
                 PrNodeResolution::Merge => {
-                    crate::memories::db::resolve_triage_batch_on_merge(&orch.db.local, issue_id)
-                        .await
+                    crate::memories::db::resolve_triage_batch_on_merge(&db, issue_id).await
                 }
                 PrNodeResolution::Close => {
-                    crate::memories::db::revert_triage_batch_on_close(&orch.db.local, issue_id)
-                        .await
+                    crate::memories::db::revert_triage_batch_on_close(&db, issue_id).await
                 }
             };
             match result {
@@ -106,11 +114,7 @@ pub async fn resolve_pr_node(
         }
 
         if matches!(resolution, PrNodeResolution::Close) {
-            match crate::memories::db::discard_draft_memories_for_closed_issue(
-                &orch.db.local,
-                issue_id,
-            )
-            .await
+            match crate::memories::db::discard_draft_memories_for_closed_issue(&db, issue_id).await
             {
                 Ok(ids) if !ids.is_empty() => log::info!(
                     "Discarded {} draft memory row(s) for closed issue {}",
@@ -135,13 +139,13 @@ pub async fn resolve_pr_node(
         PrNodeResolution::Merge => "merge",
         PrNodeResolution::Close => "close",
     };
-    crate::pr_data::ports::fire_pr_node_port_for_owner(&orch.db.local, owner_id, port).await?;
+    crate::pr_data::ports::fire_pr_node_port_for_owner(&db, owner_id, port).await?;
     // A first-class `pr` action_run was `Blocked` while the PR was open;
     // resolution completes it so the execution can finish. The durable MR owner
     // is the producing job, so the action_run is found by parent_job_id. Legacy
     // `create_pr` PRs have no action_run to flip; a single-job recompute covers
     // that path. See CAIRN-1220.
-    match complete_pr_action_run_if_owner(&orch.db.local, owner_id, now).await? {
+    match complete_pr_action_run_if_owner(&db, owner_id, now).await? {
         Some(execution_id) => {
             crate::execution::advancement::recompute_execution_jobs(orch, &execution_id)?
         }
@@ -292,9 +296,21 @@ pub async fn advance_producing_execution_after_pr_resolution(
     mr_id: &str,
 ) -> Result<(), String> {
     let mr_id_owned = mr_id.to_string();
-    let execution_id = match orch
-        .db
-        .local
+    // Route to the owning database (team replica or private DB); the PR's
+    // producing job/action_run and execution live there. Best-effort: a routing
+    // failure logs and no-ops, matching the swallow-errors contract below.
+    let db = match crate::execution::routing::routing_db_for_id(&orch.db, mr_id).await {
+        Ok(db) => db,
+        Err(e) => {
+            log::warn!(
+                "Failed to route producing-execution lookup for mr {}: {}",
+                mr_id,
+                e
+            );
+            return Ok(());
+        }
+    };
+    let execution_id = match db
         .query_opt_text(
             // The PR's owner (`merge_requests.job_id`) is either a producing
             // job (legacy `create_pr`) or a producing `pr` action_run
@@ -329,7 +345,7 @@ pub async fn advance_producing_execution_after_pr_resolution(
     };
 
     match crate::effects::outbox::insert_pending_with_payload_async(
-        &orch.db.local,
+        &db,
         "advance_dag",
         &execution_id,
         "{}",
@@ -464,5 +480,129 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(status, "complete");
+    }
+
+    /// The merge/close lifecycle transition itself must land in the owning replica.
+    /// A team-prefixed producing job resolves (Close) against its injected replica
+    /// — marking the team MR closed and never touching the empty private DB — the
+    /// state-transition step that runs AFTER the irreversible GitHub/local work.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolve_pr_node_close_routes_to_owning_team_replica() {
+        use crate::models::{
+            ExecutionSnapshot, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
+        };
+        use crate::pr_data::actions::test_support::test_orchestrator;
+        use crate::services::testing::MockGitClient;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        let team = Arc::new(migrated_db().await);
+        orch.db.insert_team_db_for_test("team1", team.clone()).await;
+
+        let exec_id = "team1~00000000-0000-4000-8000-0000000000e0";
+        let job_id = "team1~00000000-0000-4000-8000-0000000000e1";
+        let issue_id = "team1~00000000-0000-4000-8000-0000000000e2";
+        let mr_id = "team1~00000000-0000-4000-8000-0000000000e3";
+        let snapshot = ExecutionSnapshot::new(
+            RecipeSnapshot {
+                id: "recipe-1".into(),
+                name: "R".into(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
+            HashMap::new(),
+            HashMap::new(),
+            TriggerContext {
+                issue_id: Some(issue_id.to_string()),
+                project_id: "proj-t".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+        )
+        .to_json()
+        .unwrap();
+
+        // Seed the full close fixture in the TEAM replica ONLY; the private DB
+        // stays empty, so a resolution that read `orch.db.local` would error.
+        {
+            let exec_id = exec_id.to_string();
+            let job_id = job_id.to_string();
+            let issue_id = issue_id.to_string();
+            let mr_id = mr_id.to_string();
+            team.write(|conn| {
+                let exec_id = exec_id.clone();
+                let job_id = job_id.clone();
+                let issue_id = issue_id.clone();
+                let mr_id = mr_id.clone();
+                let snapshot = snapshot.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                         VALUES ('proj-t', 'default', 'P', 'PROJ', '/repo', 'main', 1, 1)",
+                        (),
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                         VALUES (?1, 'proj-t', 1, 'Issue', 'active', 1, 1)",
+                        params![issue_id.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, snapshot, started_at, seq)
+                         VALUES (?1, 'recipe-1', ?2, 'proj-t', 'running', ?3, 1, 1)",
+                        params![exec_id.as_str(), issue_id.as_str(), snapshot.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'proj-t', 'complete', 'feature', 1, 1)",
+                        params![job_id.as_str(), exec_id.as_str(), issue_id.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+                         VALUES (?1, ?2, 'proj-t', ?3, 'Team PR', 'feature', 'main', 'open', 1, 1)",
+                        params![mr_id.as_str(), job_id.as_str(), issue_id.as_str()],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        }
+
+        resolve_pr_node(&orch, job_id, PrNodeResolution::Close)
+            .await
+            .expect("a team PR resolves its close transition against the injected replica");
+
+        // The transition landed in the TEAM replica, not the (empty) private DB.
+        let team_status = team
+            .query_text(
+                "SELECT status FROM merge_requests WHERE id = ?1",
+                params![mr_id],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(team_status, "closed");
+        let private_status = orch
+            .db
+            .local
+            .query_opt_text(
+                "SELECT status FROM merge_requests WHERE id = ?1",
+                params![mr_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            private_status.is_none(),
+            "the private DB must never receive the team PR's row"
+        );
     }
 }

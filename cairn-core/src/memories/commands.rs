@@ -71,12 +71,32 @@ pub fn confirm_drafts_for_completed_job(
     confirm_drafts_for_completed_job_in_db(orch, db, job_id)
 }
 
+/// Confirm a merged issue's surviving draft memories, then spawn triage issues
+/// for any pool that reaches threshold.
+///
+/// Both halves are team-safe. The confirm half routes to the issue's owning
+/// database (the synced replica for a team issue, below). The spawn half
+/// delegates to [`crate::memories::triage::maybe_spawn_triage`], whose
+/// PROJECT-scope pools self-route to their owning database by `scope_value` (a
+/// routable `project_id`), so a team merge's project-scoped drafts both confirm
+/// to `pending` AND spawn a triage issue in the same replica (CAIRN-2587). ROLE
+/// and WORKSPACE pools are cross-project, cross-database aggregates and remain
+/// PRIVATE-DB by explicit contract pending a team-orchestration decision.
 pub async fn confirm_and_spawn_drafts_for_merged_issue(
     orch: crate::orchestrator::Orchestrator,
     issue_id: &str,
 ) -> Result<Vec<String>, String> {
     let issue_id = issue_id.to_string();
-    let db = orch.db.local.clone();
+    // Route to the database that OWNS this issue: a merged TEAM issue's draft
+    // memories (and the jobs that captured them) live wholly in that team's
+    // synced replica, so reading `orch.db.local` would confirm zero drafts.
+    // Fail-closed — a team issue whose replica is not open errors rather than
+    // silently reading the empty private DB (the CAIRN-2170 split-brain class);
+    // a bare local id short-circuits to the private DB, a strict no-op. The
+    // per-job confirmation below re-routes by job id (the completed-job path).
+    let db = crate::issues::crud::owning_db_for_issue(&orch.db, &issue_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let job_ids = crate::memories::db::draft_memory_job_ids_for_issue(&db, &issue_id)
         .await
         .map_err(|error| error.to_string())?;
@@ -621,11 +641,22 @@ pub fn confirm_drafts_for_completed_job_without_artifact_review(
 /// ended), enqueueing content embeds for the confirmed drafts. Returns the
 /// total confirmed count.
 pub fn confirm_orphaned_drafts(orch: &crate::orchestrator::Orchestrator) -> Result<usize, String> {
-    let db = orch.db.local.clone();
+    // Discovery spans EVERY open database: a team run's stranded terminal-job
+    // drafts live in that team's synced replica, so scanning only the private DB
+    // would never confirm them (the CAIRN-2587 team-triage gap). The per-job
+    // `confirm_drafts_for_completed_job` below re-routes by job id, so each
+    // confirm lands in the job's own owning database.
+    let dbs = orch.db.clone();
     let jobs = crate::execution::advancement::run_advancement_db(async move {
-        crate::memories::db::terminal_jobs_with_draft_memories(&db)
-            .await
-            .map_err(|e| e.to_string())
+        let mut all = Vec::new();
+        for db in dbs.all_dbs().await {
+            all.extend(
+                crate::memories::db::terminal_jobs_with_draft_memories(&db)
+                    .await
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        Ok::<_, String>(all)
     })?;
     let mut confirmed = 0usize;
     for (job_id, review_state) in jobs {
@@ -1031,6 +1062,37 @@ mod tests {
             table_count_by_id(&test.orch.db.local, "jobs", job_id).await,
             0,
             "the review-state update must route to the team replica, not private"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_merged_issue_confirms_drafts_in_team_replica() {
+        let test = test_orch().await;
+        let team_temp = tempfile::tempdir().unwrap();
+        let team_id = "teammerge";
+        let job_id = "teammerge~00000000-0000-4000-8000-100000000010";
+        let memory_id = "teammerge~00000000-0000-4000-8000-100000000011";
+        let issue_id = format!("{team_id}~00000000-0000-4000-8000-100000000002");
+        let team_db = migrated_team_db(&team_temp).await;
+        seed_team_memory_job(&team_db, team_id, job_id, memory_id, None).await;
+        test.orch
+            .db
+            .insert_team_db_for_test(team_id, team_db.clone())
+            .await;
+
+        super::confirm_and_spawn_drafts_for_merged_issue(test.orch.clone(), &issue_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            memory_status(&team_db, memory_id).await.as_deref(),
+            Some("pending"),
+            "a merged TEAM issue's draft must be confirmed in its own replica"
+        );
+        assert_eq!(
+            table_count_by_id(&test.orch.db.local, "memories", memory_id).await,
+            0,
+            "the team draft must not be read from or written into the private database"
         );
     }
 

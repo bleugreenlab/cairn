@@ -28,6 +28,193 @@ use super::super::{
     ProviderOptionKey, ResolvedTools, SessionConfig,
 };
 
+fn codex_strict_output_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let mut schema = schema.clone();
+    normalize_codex_strict_schema_node(&mut schema);
+    schema
+}
+
+fn normalize_codex_strict_schema_node(schema: &mut serde_json::Value) {
+    match schema {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "$defs",
+                "definitions",
+                "properties",
+                "patternProperties",
+                "dependentSchemas",
+            ] {
+                if let Some(serde_json::Value::Object(children)) = map.get_mut(key) {
+                    for child in children.values_mut() {
+                        normalize_codex_strict_schema_node(child);
+                    }
+                }
+            }
+
+            for key in [
+                "items",
+                "additionalItems",
+                "contains",
+                "propertyNames",
+                "not",
+                "if",
+                "then",
+                "else",
+            ] {
+                if let Some(child) = map.get_mut(key) {
+                    normalize_codex_strict_schema_node(child);
+                }
+            }
+
+            for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+                if let Some(serde_json::Value::Array(children)) = map.get_mut(key) {
+                    for child in children {
+                        normalize_codex_strict_schema_node(child);
+                    }
+                }
+            }
+
+            if is_json_object_schema(map) {
+                let property_names = map
+                    .get("properties")
+                    .and_then(|value| value.as_object())
+                    .map(|properties| properties.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+
+                let mut required = map
+                    .get("required")
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_owned))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+
+                let originally_required = required
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>();
+
+                if let Some(serde_json::Value::Object(properties)) = map.get_mut("properties") {
+                    for property_name in &property_names {
+                        if !originally_required.contains(property_name) {
+                            if let Some(property_schema) = properties.get_mut(property_name) {
+                                make_schema_nullable(property_schema);
+                            }
+                        }
+                    }
+                }
+
+                for property_name in property_names {
+                    if !required
+                        .iter()
+                        .any(|required_name| required_name == &property_name)
+                    {
+                        required.push(property_name);
+                    }
+                }
+
+                map.insert(
+                    "required".to_string(),
+                    serde_json::Value::Array(
+                        required
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+                map.insert(
+                    "additionalProperties".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                normalize_codex_strict_schema_node(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_json_object_schema(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    if map.contains_key("properties") {
+        return true;
+    }
+
+    match map.get("type") {
+        Some(serde_json::Value::String(kind)) => kind == "object",
+        Some(serde_json::Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+        _ => false,
+    }
+}
+
+fn make_schema_nullable(schema: &mut serde_json::Value) {
+    normalize_codex_strict_schema_node(schema);
+
+    let serde_json::Value::Object(map) = schema else {
+        return;
+    };
+
+    if let Some(serde_json::Value::Array(any_of)) = map.get_mut("anyOf") {
+        if !any_of.iter().any(is_null_schema) {
+            any_of.push(serde_json::json!({ "type": "null" }));
+        }
+        return;
+    }
+
+    if let Some(serde_json::Value::Array(one_of)) = map.get_mut("oneOf") {
+        if !one_of.iter().any(is_null_schema) {
+            one_of.push(serde_json::json!({ "type": "null" }));
+        }
+        return;
+    }
+
+    if let Some(serde_json::Value::Array(enum_values)) = map.get_mut("enum") {
+        if !enum_values.iter().any(serde_json::Value::is_null) {
+            enum_values.push(serde_json::Value::Null);
+        }
+        return;
+    }
+
+    match map.get_mut("type") {
+        Some(serde_json::Value::String(kind)) if kind != "null" => {
+            let kind = kind.clone();
+            map.insert(
+                "type".to_string(),
+                serde_json::Value::Array(vec![
+                    serde_json::Value::String(kind),
+                    serde_json::Value::String("null".to_string()),
+                ]),
+            );
+        }
+        Some(serde_json::Value::Array(kinds)) => {
+            if !kinds.iter().any(|kind| kind == "null") {
+                kinds.push(serde_json::Value::String("null".to_string()));
+            }
+        }
+        Some(_) => {}
+        None => {
+            let original = serde_json::Value::Object(map.clone());
+            map.clear();
+            map.insert(
+                "anyOf".to_string(),
+                serde_json::Value::Array(vec![original, serde_json::json!({ "type": "null" })]),
+            );
+        }
+    }
+}
+
+fn is_null_schema(schema: &serde_json::Value) -> bool {
+    schema
+        .as_object()
+        .and_then(|map| map.get("type"))
+        .is_some_and(|kind| kind == "null")
+}
+
 impl AgentBackend for CodexBackend {
     fn name(&self) -> &str {
         "Codex"
@@ -400,7 +587,7 @@ impl AgentBackend for CodexBackend {
             .get("thread")
             .and_then(|t| t.get("id"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "thread/start response missing thread id".to_string())?
+            .ok_or_else(|| "Codex thread response missing thread id".to_string())?
             .to_string();
         log::info!(
             "Codex session start received thread_id={} for cairn_session_id={}",
@@ -434,7 +621,7 @@ impl AgentBackend for CodexBackend {
         // `final_output_json_schema`, so the constrained result arrives as the
         // turn's final agent message, captured server-side at turn/completed.
         if let Some(ref schema) = config.output_schema {
-            turn_params["outputSchema"] = schema.clone();
+            turn_params["outputSchema"] = codex_strict_output_schema(schema);
         }
         let turn_resp = client.send_request("turn/start", turn_params)?;
 
@@ -874,7 +1061,7 @@ pub(crate) fn start_app_server_session(
         .get("thread")
         .and_then(|t| t.get("id"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "thread/start response missing thread id".to_string())?
+        .ok_or_else(|| "Codex thread response missing thread id".to_string())?
         .to_string();
     log::info!(
         "Codex session start received thread_id={} for cairn_session_id={}",
@@ -907,7 +1094,7 @@ pub(crate) fn start_app_server_session(
     // mirroring the primary `start_session` turn/start path so the two never
     // drift.
     if let Some(ref schema) = config.output_schema {
-        turn_params["outputSchema"] = schema.clone();
+        turn_params["outputSchema"] = codex_strict_output_schema(schema);
     }
     let turn_resp = client.send_request("turn/start", turn_params)?;
 
@@ -1213,7 +1400,7 @@ pub(crate) fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> R
         .get("thread")
         .and_then(|t| t.get("id"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "thread/start response missing thread id".to_string())?
+        .ok_or_else(|| "Codex thread response missing thread id".to_string())?
         .to_string();
 
     if let Some(ref sid) = session_id {
@@ -1242,7 +1429,7 @@ pub(crate) fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> R
         turn_params["model"] = serde_json::json!(model);
     }
     if let Some(ref schema) = config.output_schema {
-        turn_params["outputSchema"] = schema.clone();
+        turn_params["outputSchema"] = codex_strict_output_schema(schema);
     }
     let turn_resp = client.send_request("turn/start", turn_params)?;
     let current_turn_id = Arc::new(Mutex::new(
@@ -1328,6 +1515,70 @@ mod tests {
 
     /// Codex cannot switch models on a live process. The warm-reuse path relies
     /// on this error to fall back to a restart, so it must stay explicit.
+
+    #[test]
+    fn codex_strict_output_schema_normalizes_deep_research_scope_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["question", "summary", "angles"],
+            "properties": {
+                "question": { "type": "string" },
+                "summary": { "type": "string" },
+                "angles": {
+                    "type": "array",
+                    "minItems": 3,
+                    "maxItems": 6,
+                    "items": {
+                        "type": "object",
+                        "required": ["label", "query"],
+                        "properties": {
+                            "label": { "type": "string" },
+                            "query": { "type": "string" },
+                            "rationale": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        });
+
+        let normalized = codex_strict_output_schema(&schema);
+
+        assert_eq!(
+            normalized["additionalProperties"],
+            serde_json::Value::Bool(false)
+        );
+        assert_required_keys(&normalized, &["question", "summary", "angles"]);
+
+        let angle_schema = &normalized["properties"]["angles"]["items"];
+        assert_eq!(
+            angle_schema["additionalProperties"],
+            serde_json::Value::Bool(false)
+        );
+        assert_required_keys(angle_schema, &["label", "query", "rationale"]);
+        assert_eq!(
+            angle_schema["properties"]["rationale"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            angle_schema["properties"]["label"],
+            serde_json::json!({ "type": "string" })
+        );
+    }
+
+    fn assert_required_keys(schema: &serde_json::Value, expected: &[&str]) {
+        let mut actual = schema["required"]
+            .as_array()
+            .expect("schema required must be an array")
+            .iter()
+            .map(|value| value.as_str().expect("required item must be a string"))
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
+    }
     #[test]
     fn codex_send_set_model_is_unsupported() {
         let backend = CodexBackend;

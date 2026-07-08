@@ -28,10 +28,11 @@ use super::resolution::resolve_pr_node;
 /// `Conflicting` that disables the merge button.
 async fn jj_conflict_mergeable_override(
     orch: &Orchestrator,
+    db: &LocalDb,
     repo_path: &str,
     mr_id: &str,
 ) -> Option<MergeableState> {
-    let (source_branch, target_branch) = load_mr_branches(&orch.db.local, mr_id).await.ok()??;
+    let (source_branch, target_branch) = load_mr_branches(db, mr_id).await.ok()??;
     source_conflict_report(
         &orch.jj_binary_path,
         &orch.config_dir,
@@ -105,13 +106,21 @@ async fn update_merge_request_github_cache(
 }
 
 pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrCache, String> {
-    let mr_context = resolve_mr_context_for_job(&orch.db.local, job_id).await?;
+    // Route to the database that owns this job — the team replica for a team
+    // execution, the private DB for a local one. The `merge_requests` row and its
+    // producing job live wholly in that database; reading `orch.db.local` for a
+    // team job would miss the row. GitHub credentials stay on the private DB
+    // below: `github_credentials` is a private, un-synced table.
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mr_context = resolve_mr_context_for_job(&db, job_id).await?;
     let mr_id = mr_context.mr_id.clone();
     let pr_url = mr_context.pr_url.clone();
     let repo_path = mr_context.repo_path.clone();
 
     if mr_context.github_pr_number.is_none() {
-        return refresh_local_pr_for_job(orch, job_id, &mr_context).await;
+        return refresh_local_pr_for_job(orch, &db, job_id, &mr_context).await;
     }
     let pr_number = mr_context.github_pr_number.expect("checked above");
 
@@ -120,7 +129,7 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
 
     let http = &*orch.services.http;
     let mut pr_details = fetch_pr_via_api(http, &creds, &owner, &repo, pr_number).await?;
-    if let Some(mergeable) = jj_conflict_mergeable_override(orch, &repo_path, &mr_id).await {
+    if let Some(mergeable) = jj_conflict_mergeable_override(orch, &db, &repo_path, &mr_id).await {
         pr_details.mergeable = mergeable;
     }
     let checks = fetch_checks_via_api(http, &creds, &owner, &repo, &pr_details.head_sha)
@@ -152,15 +161,8 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
         target_branch: None,
     };
 
-    update_merge_request_github_cache(
-        &orch.db.local,
-        &mr_id,
-        &pr_details,
-        &checks,
-        &checks_status,
-        now,
-    )
-    .await?;
+    update_merge_request_github_cache(&db, &mr_id, &pr_details, &checks, &checks_status, now)
+        .await?;
 
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -172,14 +174,13 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
 
 async fn refresh_local_pr_for_job(
     orch: &Orchestrator,
+    db: &LocalDb,
     job_id: &str,
     mr_context: &MrContext,
 ) -> Result<PrCache, String> {
     let mr_id = mr_context.mr_id.clone();
     let repo_path = mr_context.repo_path.clone();
-    let (title, body, status, source_branch, target_branch, additions, deletions, updated_at) = orch
-        .db
-        .local
+    let (title, body, status, source_branch, target_branch, additions, deletions, updated_at) = db
         .read(|conn| {
             let mr_id = mr_id.clone();
             Box::pin(async move {
@@ -234,31 +235,29 @@ async fn refresh_local_pr_for_job(
     };
     let now = chrono::Utc::now().timestamp();
     let mergeable_str = mergeable.to_string();
-    orch.db
-        .local
-        .write(|conn| {
-            let mr_id = mr_id.clone();
-            let mergeable_str = mergeable_str.clone();
-            Box::pin(async move {
-                conn.execute(
-                    "UPDATE merge_requests
+    db.write(|conn| {
+        let mr_id = mr_id.clone();
+        let mergeable_str = mergeable_str.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE merge_requests
                      SET github_mergeable = ?1, github_fetched_at = ?2, updated_at = ?2,
                          additions = ?3, deletions = ?4
                      WHERE id = ?5",
-                    params![
-                        mergeable_str.as_str(),
-                        now,
-                        additions,
-                        deletions,
-                        mr_id.as_str()
-                    ],
-                )
-                .await?;
-                Ok(())
-            })
+                params![
+                    mergeable_str.as_str(),
+                    now,
+                    additions,
+                    deletions,
+                    mr_id.as_str()
+                ],
+            )
+            .await?;
+            Ok(())
         })
-        .await
-        .map_err(|e| db_error("Failed to update local PR cache", e))?;
+    })
+    .await
+    .map_err(|e| db_error("Failed to update local PR cache", e))?;
 
     let _ = orch.services.emitter.emit(
         "db-change",
@@ -295,7 +294,12 @@ async fn refresh_local_pr_for_job(
 /// Close a PR without merging, mark the `merge_requests` row closed, and tear
 /// down the issue's worktrees.
 pub async fn close_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<String, String> {
-    let mr_context = resolve_mr_context_for_job(&orch.db.local, job_id).await?;
+    // Route to the owning database (team replica or private DB); the PR's
+    // `merge_requests` row lives there. GitHub credentials stay on the private DB.
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mr_context = resolve_mr_context_for_job(&db, job_id).await?;
     let mr_id = mr_context.mr_id.clone();
     let repo_path = mr_context.repo_path.clone();
 
@@ -313,7 +317,7 @@ pub async fn close_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<Strin
     }
 
     // Tear down worktrees and branches for the issue (issue-wide, unconditional).
-    if let Some(issue_id) = load_mr_issue_id(&orch.db.local, &mr_id).await? {
+    if let Some(issue_id) = load_mr_issue_id(&db, &mr_id).await? {
         let orch_inner = orch.clone();
         tokio::spawn(async move {
             if let Err(e) = teardown_worktrees(
@@ -358,13 +362,20 @@ pub async fn render_live_pr_section(
     artifact_uri: &str,
     diff_full: bool,
 ) -> Option<String> {
-    let mr_context = match try_resolve_mr_context_for_job(&orch.db.local, job_id).await {
+    // Route to the owning database (team replica or private DB). A team node's
+    // `merge_requests` row lives in its replica; a closed replica yields no PR
+    // section rather than a wrong read against the private DB.
+    let db = match crate::execution::routing::routing_db_for_id(&orch.db, job_id).await {
+        Ok(db) => db,
+        Err(_) => return None,
+    };
+    let mr_context = match try_resolve_mr_context_for_job(&db, job_id).await {
         Ok(Some(ctx)) => ctx,
         Ok(None) => return None,
         Err(e) => return Some(format!("## Pull Request\n\n(failed to resolve PR: {e})\n")),
     };
     if mr_context.github_pr_number.is_none() {
-        let cache = match refresh_local_pr_for_job(orch, job_id, &mr_context).await {
+        let cache = match refresh_local_pr_for_job(orch, &db, job_id, &mr_context).await {
             Ok(cache) => cache,
             Err(e) => {
                 return Some(format!(
@@ -419,7 +430,7 @@ pub async fn render_live_pr_section(
     // is rendered (and re-cached) as Conflicting, not GitHub's false mergeable.
     // Keep the full report to enumerate the offending commits/files below so the
     // live artifact and the node summary tell one consistent story.
-    let source_branches = load_mr_branches(&orch.db.local, &mr_context.mr_id)
+    let source_branches = load_mr_branches(&db, &mr_context.mr_id)
         .await
         .ok()
         .flatten();
@@ -446,7 +457,7 @@ pub async fn render_live_pr_section(
     // Refresh-on-read: persist freshly fetched details to the cache.
     let now = chrono::Utc::now().timestamp();
     if let Err(e) = update_merge_request_github_cache(
-        &orch.db.local,
+        &db,
         &mr_context.mr_id,
         &pr_details,
         &checks,
@@ -563,4 +574,95 @@ pub async fn render_live_pr_section(
     }
 
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::PrState;
+    use crate::pr_data::actions::test_support::{migrated_db, test_orchestrator};
+    use crate::services::testing::MockGitClient;
+    use cairn_db::turso::params;
+    use std::sync::Arc;
+
+    /// A closed, local (no-GitHub) merge request keyed by `job_id`. Closed status
+    /// keeps `refresh_local_pr_for_job` off the git client, so the test isolates
+    /// the database routing.
+    async fn seed_closed_local_mr(db: &LocalDb, job_id: &str) {
+        let job_id = job_id.to_string();
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-r', 'default', 'P', 'PROJ', '/repo', 'main', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                     VALUES ('issue-r', 'proj-r', 1, 'Issue', 'active', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+                     VALUES ('mr-r', ?1, 'proj-r', 'issue-r', 'Team PR', 'agent/PROJ-1-builder', 'main', 'closed', 1, 1)",
+                    params![job_id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A team-prefixed job routes to its injected replica: the PR resolves from
+    /// the team DB even though the private DB is empty. Reading `orch.db.local`
+    /// (the pre-fix behavior) would miss the row and error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_pr_for_job_routes_to_owning_team_replica() {
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        let team = Arc::new(migrated_db().await);
+        orch.db.insert_team_db_for_test("teamx", team.clone()).await;
+        let job_id = "teamx~00000000-0000-4000-8000-000000000001";
+        seed_closed_local_mr(&team, job_id).await;
+
+        let cache = refresh_pr_for_job(&orch, job_id)
+            .await
+            .expect("the team-owned PR resolves from the injected replica");
+        assert_eq!(cache.state, PrState::Closed);
+        assert_eq!(cache.title.as_deref(), Some("Team PR"));
+    }
+
+    /// Fail-closed: a team-prefixed job whose replica is not open errors rather
+    /// than silently falling back to the private DB (the CAIRN-2170 split-brain
+    /// class).
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_pr_for_job_fails_closed_without_open_replica() {
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        let job_id = "teamx~00000000-0000-4000-8000-000000000001";
+        let err = refresh_pr_for_job(&orch, job_id)
+            .await
+            .expect_err("a team id with no open replica must fail closed");
+        assert!(
+            err.contains("fail-closed") || err.contains("replica"),
+            "{err}"
+        );
+    }
+
+    /// Local no-op: a bare (non-team) job still routes to the private DB, so
+    /// local-only installs are byte-for-byte unchanged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refresh_pr_for_job_local_is_unchanged() {
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        let job_id = "00000000-0000-4000-8000-000000000009";
+        seed_closed_local_mr(&orch.db.local, job_id).await;
+
+        let cache = refresh_pr_for_job(&orch, job_id)
+            .await
+            .expect("a local PR still resolves against the private DB");
+        assert_eq!(cache.state, PrState::Closed);
+    }
 }

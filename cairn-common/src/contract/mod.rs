@@ -99,6 +99,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     nodes::NODE_ARTIFACT_CONTRACT,
     nodes::NODE_CHANGED_CONTRACT,
     nodes::NODE_TERMINAL_CONTRACT,
+    nodes::NODE_REPL_CONTRACT,
     nodes::NODE_BROWSER_CONTRACT,
     tasks::TASK_TERMINAL_CONTRACT,
     tasks::TASK_BROWSER_CONTRACT,

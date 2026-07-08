@@ -275,6 +275,7 @@ mod tests {
             impact: None,
             policy: CheckPolicy::Advisory,
             when: CheckWhen::Write,
+            timeout: None,
         }
     }
 

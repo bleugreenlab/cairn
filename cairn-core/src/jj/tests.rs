@@ -5049,11 +5049,6 @@ fn populate_auto_track_expr_translates_patterns() {
     let config = PopulateConfig {
         copy: vec![".env".into(), ".env*".into(), "target/".into()],
         symlink: vec!["node_modules/".into()],
-        seed: vec![crate::config::project_settings::SeedEntry {
-            from: "~/warm/target".into(),
-            to: "src-tauri/target".into(),
-            exclude: vec!["*/incremental".into()],
-        }],
     };
     let expr = populate_auto_track_expr(&config, &[]).unwrap();
     assert!(expr.starts_with("all() ~ ("), "got: {expr}");
@@ -5063,11 +5058,6 @@ fn populate_auto_track_expr_translates_patterns() {
     assert!(expr.contains("glob:\"**/target\""), "got: {expr}");
     assert!(expr.contains("glob:\"**/node_modules/**\""), "got: {expr}");
     assert!(expr.contains("glob:\"**/node_modules\""), "got: {expr}");
-    assert!(
-        expr.contains("glob:\"**/src-tauri/target/**\""),
-        "got: {expr}"
-    );
-    assert!(expr.contains("glob:\"**/src-tauri/target\""), "got: {expr}");
 
     assert!(
         populate_auto_track_expr(&PopulateConfig::default(), &[]).is_none(),
@@ -5192,7 +5182,6 @@ fn populate_auto_track_keeps_ignored_content_out_of_snapshot_and_seals() {
     let config = PopulateConfig {
         copy: vec![".env".into()],
         symlink: vec!["node_modules/".into()],
-        seed: vec![],
     };
     // Establish the exclude BEFORE the populated files appear.
     set_populate_auto_track(&jj, &store, &config, &[]).unwrap();
@@ -5269,7 +5258,6 @@ fn untrack_self_heals_a_leaked_populated_path() {
     let config = PopulateConfig {
         copy: vec![".env".into()],
         symlink: vec![],
-        seed: vec![],
     };
     set_populate_auto_track(&jj, &store, &config, &[]).unwrap();
     std::fs::write(ws.join("leaked.secret"), "token\n").unwrap();
@@ -5846,9 +5834,26 @@ fn jj_shim_intercepts_update_stale_and_passes_through() {
         eprintln!("skipping jj_shim_intercepts_update_stale_and_passes_through: jj not resolvable");
         return;
     };
+    // The universal jj shim forwards to an ABSOLUTE bundled path (never a bare
+    // `jj`, which would infinitely re-exec through the on-PATH shim), so resolve
+    // an absolute jj to bake in; skip if only a bare `jj` is available.
+    let abs_jj = if std::path::Path::new(&bin).is_absolute() {
+        bin.clone()
+    } else {
+        match crate::env::find_binary("jj") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!(
+                    "skipping jj_shim_intercepts_update_stale_and_passes_through: no absolute jj"
+                );
+                return;
+            }
+        }
+    };
     let home = TempDir::new().unwrap();
-    let shim_dir = ensure_jj_shim_dir(home.path()).unwrap();
-    let shim = shim_dir.join("jj");
+    let bin_dir = home.path().join("bin");
+    crate::env::ensure_jj_shim_in(&bin_dir, &abs_jj);
+    let shim = bin_dir.join("jj");
     assert!(shim.exists(), "the shim script is generated");
 
     // `workspace update-stale` is intercepted: exit 0, explanatory stderr, and

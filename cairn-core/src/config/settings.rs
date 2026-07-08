@@ -1156,6 +1156,7 @@ buildServices:
             state_dir: Some("{cairnHome}/mycache".into()),
             write: vec!["{worktrees}/**/out/**".into()],
             env,
+            launch_env: HashMap::new(),
         };
         upsert_build_service(dir, "mycache", &cfg).unwrap();
 

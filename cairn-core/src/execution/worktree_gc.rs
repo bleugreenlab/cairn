@@ -67,15 +67,40 @@ pub(crate) async fn run_worktree_gc(orch: &Orchestrator) {
     // executed against the very DB that produced it so archival writes to the
     // owning store.
     let mut reclaimed = 0usize;
+    let mut gone_repos: BTreeSet<PathBuf> = BTreeSet::new();
     for db in orch.db.all_dbs().await {
         match plan_gc_targets(&db, &orch.db.local, cutoff).await {
             Ok(targets) => {
-                for target in &targets {
+                let (live, gone) = partition_targets_by_disk_presence(targets);
+                for target in &live {
                     execute_target_cleanup(orch, &db, target).await;
                 }
-                reclaimed += targets.len();
+                reclaimed += live.len();
+                gone_repos.extend(gone);
             }
             Err(e) => log::warn!("Worktree GC: DB pass planning failed: {e}"),
+        }
+    }
+    // A GC target whose worktree directory is already gone is a no-op for the
+    // per-target cleanup — `archive_target` fails at once resolving its missing
+    // HEAD and there is nothing on disk to remove — yet running the full
+    // `execute_target_cleanup` still spawns a `jj forget` + `git worktree prune`
+    // subprocess pair per target. With hundreds of terminal jobs pointing at
+    // directories reclaimed long ago, every pass became a subprocess storm that
+    // starved the runner's HTTP server. The gone targets are dropped from the
+    // executed set above; here we run ONE `git worktree prune` per distinct repo
+    // so their stale `.git/worktrees/<name>` registrations are still reclaimed, at
+    // per-repo rather than per-target cost.
+    for repo in &gone_repos {
+        match orch.services.git.worktree_prune(repo) {
+            Ok(()) => log::info!(
+                "Worktree GC: pruned stale worktree registrations in {}",
+                repo.display()
+            ),
+            Err(e) => log::warn!(
+                "Worktree GC: git worktree prune failed for {}: {e}",
+                repo.display()
+            ),
         }
     }
     if reclaimed > 0 {
@@ -150,6 +175,34 @@ pub(crate) async fn plan_gc_targets(
         .filter(|(job_id, ..)| !protected.contains(job_id))
         .collect();
     Ok(group_into_targets(rows))
+}
+
+/// Partition planned GC targets by whether their worktree directory still exists
+/// on disk. A gone directory is a no-op for per-target cleanup (nothing to
+/// archive, nothing to remove), so running the full [`execute_target_cleanup`] on
+/// it only burns a `jj forget` + `git worktree prune` subprocess pair. Returns the
+/// live targets (kept for cleanup) and the distinct repos of the gone targets
+/// (pruned ONCE each by the caller so stale registrations are still reclaimed).
+///
+/// `Path::exists` is the load-bearing check: a present directory keeps its target
+/// because removal is real work, and a gone directory's only outstanding concern
+/// — its `.git/worktrees/<name>` registration — is exactly what the per-repo
+/// prune clears. Deliberately leaves the `jobs` rows untouched (no schema or
+/// team-sync churn), so a gone target is re-planned next pass but now costs only a
+/// `stat()` plus its repo's shared prune.
+fn partition_targets_by_disk_presence(
+    targets: Vec<TeardownTarget>,
+) -> (Vec<TeardownTarget>, BTreeSet<PathBuf>) {
+    let mut live = Vec::new();
+    let mut gone_repos = BTreeSet::new();
+    for target in targets {
+        if Path::new(&target.worktree_path).exists() {
+            live.push(target);
+        } else {
+            gone_repos.insert(PathBuf::from(&target.repo_path));
+        }
+    }
+    (live, gone_repos)
 }
 
 /// The set of job ids with a live `workflow_run` re-dispatch record (private DB).
@@ -846,6 +899,42 @@ mod tests {
             planned_paths(&targets),
             vec!["/wt/wf"],
             "once the record is dropped, the stray ephemeral worktree is reclaimed"
+        );
+    }
+
+    /// A GC target whose worktree directory is gone is dropped from the executed
+    /// set (nothing to archive or remove) but its repo is still collected for a
+    /// per-repo `git worktree prune`; a target whose directory exists is kept.
+    #[test]
+    fn partition_drops_gone_dir_targets_and_collects_their_repos_for_prune() {
+        let present = tempfile::tempdir().unwrap();
+        let present_target = TeardownTarget {
+            worktree_path: present.path().display().to_string(),
+            branch: Some("agent/live".to_string()),
+            repo_path: "/repos/live".to_string(),
+            job_ids: vec!["j-live".to_string()],
+        };
+        // A path under the tempdir that was never created — the reclaimed-worktree
+        // case: its `jobs` row still points at a directory long gone from disk.
+        let gone_target = TeardownTarget {
+            worktree_path: present.path().join("gone-child").display().to_string(),
+            branch: Some("agent/gone".to_string()),
+            repo_path: "/repos/gone".to_string(),
+            job_ids: vec!["j-gone".to_string()],
+        };
+
+        let (live, gone_repos) =
+            partition_targets_by_disk_presence(vec![present_target.clone(), gone_target]);
+
+        assert_eq!(
+            live,
+            vec![present_target],
+            "the existing directory stays in the executed set"
+        );
+        assert_eq!(
+            gone_repos.into_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from("/repos/gone")],
+            "the gone directory contributes only its repo for a per-repo prune"
         );
     }
 

@@ -266,11 +266,22 @@ async fn record_issue_side_channel_async(
     exclude_job_id: Option<&str>,
     kind: IssueSideChannelKind,
 ) -> Result<usize, String> {
-    let Some(issue_uri) = issue_uri_for_issue_id(&orch.db.local, issue_id).await? else {
+    // A team issue's rows — the issue/project URI lookup, the active-agent job
+    // scan, and the suppressed-wake ledger this writes — live wholly in its
+    // replica, so resolve the issue's owning database once and use it throughout.
+    // For a local issue this is a strict no-op (the private DB); routing through
+    // `db.local` here would silently return `Ok(0)` for a team issue and skip
+    // notifying its live agents. Fail-closed: an unopened team replica errors
+    // rather than mis-recording against private (the caller logs and continues).
+    let db = crate::issues::crud::owning_db_for_issue(&orch.db, issue_id)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let Some(issue_uri) = issue_uri_for_issue_id(&db, issue_id).await? else {
         return Ok(0);
     };
 
-    let job_ids = crate::jobs::queries::active_agent_job_ids_for_issue(&orch.db.local, issue_id)
+    let job_ids = crate::jobs::queries::active_agent_job_ids_for_issue(&db, issue_id)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -289,7 +300,7 @@ async fn record_issue_side_channel_async(
             created_at: 0,
             delivered_at: None,
         };
-        kind.record(&orch.db.local, &job_id, &issue_uri, &notice.render())
+        kind.record(&db, &job_id, &issue_uri, &notice.render())
             .await?;
         delivered += 1;
     }

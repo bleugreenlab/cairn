@@ -56,8 +56,13 @@ pub async fn start_execution_from_collection(
     recipe: Option<&str>,
     backend: Option<&str>,
 ) -> Result<String, String> {
-    let (project_id, issue_id) =
-        resolve_project_and_issue(&orch.db.local, project_key, number).await?;
+    // Route the issue lookup to the database that OWNS the project: a team
+    // project's issue rows live wholly in its synced replica (CAIRN-2181), so
+    // resolving against the private DB would never find a team issue and the
+    // execution would never start — the create-then-start half of team memory
+    // triage (CAIRN-2587). `for_project` is a strict no-op for a local project.
+    let owning_db = orch.db.for_project(project_key).await;
+    let (project_id, issue_id) = resolve_project_and_issue(&owning_db, project_key, number).await?;
 
     let execution = crate::execution::recipe::start_recipe_execution_and_advance(
         orch,

@@ -62,6 +62,7 @@ pub async fn update_execution_agent(
                 skills: agent_snapshot.skills.clone(),
                 hooks: None,
                 backend_preference: agent_snapshot.backend_preference.clone(),
+                icon: None,
                 is_project_scoped: project_path.is_some(),
                 file_path: PathBuf::new(),
             },

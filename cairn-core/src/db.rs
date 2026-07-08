@@ -293,6 +293,20 @@ impl DbState {
         let applied = MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
             .run(&db)
             .await?;
+        // Repair legacy replicas whose `projects` table predates the
+        // `is_workspace` column (an older binary applied a pre-column team head).
+        // Fresh replicas already have it, so this is idempotent by swallowing the
+        // benign duplicate-column error — turso has no ADD COLUMN IF NOT EXISTS and
+        // the migration runner has no per-statement tolerance, so it cannot be a
+        // tracked ALTER. Without it, the team-workspace row seed can't write.
+        ensure_projects_is_workspace_column(&db).await;
+        // Repair legacy replicas whose `action_configs` table predates the
+        // `workspace_id` column (an older team head dropped the whole workspace
+        // arm). The shared action-config query layer names `workspace_id`
+        // unconditionally, so without the column every action CRUD against the
+        // replica fails `no column named workspace_id`. Same runtime-repair shape
+        // and rationale as `is_workspace` above.
+        ensure_action_configs_workspace_id_column(&db).await;
         // Seed the team's OWN root row into the synced `teams` table — the NOT
         // NULL FK parent that every team `projects.team_id` references after the
         // CAIRN-2129 re-rooting. Nothing else ever seeds it, so without this the
@@ -512,6 +526,13 @@ impl DbState {
         self.teams.write().await.insert(team_id.to_string(), db);
     }
 
+    /// The ids of every currently-open team replica. Drives per-team startup
+    /// passes (e.g. team-workspace materialization) that must touch each open
+    /// team exactly once.
+    pub async fn open_team_ids(&self) -> Vec<String> {
+        self.teams.read().await.keys().cloned().collect()
+    }
+
     /// Every open database: the private one plus each opened team replica. The
     /// search-index drain iterates this so locally-originated writes in any
     /// database get indexed.
@@ -622,12 +643,76 @@ async fn seed_team_root(db: &LocalDb, team_id: &str, name: &str) -> DbResult<boo
 /// left by teammate-created projects that arrived via sync. Used both by the
 /// initial `open_team` and by the per-team pull-task reconciler, so a project
 /// that appears AFTER open becomes routable on the next pull without a restart.
+/// Idempotently ensure a team replica's `projects` table carries the
+/// `is_workspace` column. See the call site in [`DbState::open_team`] for why
+/// this is a runtime repair rather than a tracked migration. Best-effort: a
+/// failure other than the benign duplicate-column signature is logged, and the
+/// workspace-row seed downstream then simply logs and skips.
+async fn ensure_projects_is_workspace_column(team_db: &LocalDb) {
+    if let Err(error) = team_db
+        .execute_batch("ALTER TABLE projects ADD COLUMN is_workspace INTEGER NOT NULL DEFAULT 0")
+        .await
+    {
+        if !error
+            .to_string()
+            .to_lowercase()
+            .contains("duplicate column")
+        {
+            log::warn!("ensuring projects.is_workspace on team replica failed: {error}");
+        }
+    }
+}
+
+/// Idempotently ensure a team replica's `action_configs` table carries the
+/// nullable `workspace_id` column. See the call site in [`DbState::open_team`]
+/// for why this is a runtime repair rather than a tracked migration. Team rows
+/// are always project-anchored (workspace_id NULL), but the one shared
+/// action-config query layer names the column in every statement, so a legacy
+/// replica missing it cannot serve any action CRUD. Best-effort: a failure
+/// other than the benign duplicate-column signature is logged.
+async fn ensure_action_configs_workspace_id_column(team_db: &LocalDb) {
+    if let Err(error) = team_db
+        .execute_batch("ALTER TABLE action_configs ADD COLUMN workspace_id TEXT")
+        .await
+    {
+        if !error
+            .to_string()
+            .to_lowercase()
+            .contains("duplicate column")
+        {
+            log::warn!("ensuring action_configs.workspace_id on team replica failed: {error}");
+        }
+    }
+}
+
 async fn reconcile_team_routes(
     local: &LocalDb,
     team_db: &LocalDb,
     routes: &RwLock<RouteMap>,
     team_id: &TeamId,
 ) -> DbResult<usize> {
+    // Auto-provision the team's workspace project row, first-writer-wins. The
+    // team workspace COMES WITH the team (a twin of the personal ~/.cairn), so
+    // an existing team gains it on next open/pull and a new team has it from the
+    // start; every member's reconcile converges on the same is_workspace row.
+    // Path-less here: the machine-local repo and its `project_routes` clone path
+    // are materialized by the services-aware provisioning step, so an
+    // un-materialized member simply contributes no config layer (graceful).
+    let ws_id =
+        cairn_common::ids::mint(cairn_common::ids::RouteScope::Team(team_id.clone())).into_string();
+    if let Err(error) = crate::projects::crud::seed_team_workspace_project_db(
+        team_db,
+        chrono::Utc::now().timestamp(),
+        team_id,
+        &ws_id,
+        &crate::projects::crud::team_workspace_key(team_id),
+        "",
+    )
+    .await
+    {
+        log::warn!("seeding team workspace project for `{team_id}` failed: {error}");
+    }
+
     let projects = team_db
         .read(|conn| {
             Box::pin(async move {
@@ -905,6 +990,87 @@ mod tests {
             dbs.route_scope_for_project("legacy").await,
             RouteScope::Team("teamABC123".to_string())
         );
+    }
+
+    /// A team replica whose `action_configs` table predates `workspace_id` (an
+    /// older team head that dropped the whole workspace arm) gets the column
+    /// added so the shared action-config query layer works, and repeating the
+    /// repair is a benign no-op.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_action_configs_workspace_id_column_repairs_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("legacy-actions-team.db"))
+            .await
+            .unwrap();
+        // A legacy `action_configs` table WITHOUT workspace_id (older team head).
+        db.execute_batch(
+            "CREATE TABLE action_configs (id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, project_id TEXT NOT NULL)",
+        )
+        .await
+        .unwrap();
+
+        async fn has_workspace_id(db: &LocalDb) -> i64 {
+            db.read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM pragma_table_info('action_configs') WHERE name = 'workspace_id'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await?.unwrap().i64(0)
+                })
+            })
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(has_workspace_id(&db).await, 0);
+        ensure_action_configs_workspace_id_column(&db).await;
+        assert_eq!(has_workspace_id(&db).await, 1, "column added");
+        // Idempotent: repeating swallows the duplicate-column error.
+        ensure_action_configs_workspace_id_column(&db).await;
+        assert_eq!(has_workspace_id(&db).await, 1);
+    }
+
+    /// A team replica whose `projects` table predates `is_workspace` gets the
+    /// column added, and repeating the repair is a benign no-op (the
+    /// duplicate-column error is swallowed).
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_projects_is_workspace_column_repairs_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("legacy-team.db"))
+            .await
+            .unwrap();
+        // A legacy `projects` table WITHOUT the column (older team head).
+        db.execute_batch(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, team_id TEXT NOT NULL, key TEXT)",
+        )
+        .await
+        .unwrap();
+
+        async fn has_is_workspace(db: &LocalDb) -> i64 {
+            db.read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name = 'is_workspace'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await?.unwrap().i64(0)
+                })
+            })
+            .await
+            .unwrap()
+        }
+
+        assert_eq!(has_is_workspace(&db).await, 0);
+        ensure_projects_is_workspace_column(&db).await;
+        assert_eq!(has_is_workspace(&db).await, 1, "column added");
+        // Idempotent: repeating swallows the duplicate-column error.
+        ensure_projects_is_workspace_column(&db).await;
+        assert_eq!(has_is_workspace(&db).await, 1);
     }
 
     /// Forgetting a team removes its registry row, its project routes, and its

@@ -143,18 +143,21 @@ impl ConfigKind {
                 source_project_id,
                 target_id,
                 target_project_id,
+                None,
             )),
             ConfigKind::Skill => normalize_config_result(ctx.orch.copy_skill_config(
                 source_id,
                 source_project_id,
                 target_id,
                 target_project_id,
+                None,
             )),
             ConfigKind::Recipe => normalize_config_result(ctx.orch.copy_recipe_config(
                 source_id,
                 source_project_id,
                 target_id,
                 target_project_id,
+                None,
             )),
         }
     }

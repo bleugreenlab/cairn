@@ -39,12 +39,22 @@
 //! ## Runtime shape
 //!
 //! Frecency and query-history LMDB stores are disabled (default, uninitialized
-//! `SharedFrecency` — no on-disk state). The mmap cache is off. `fff`'s
-//! process-wide SIGSEGV handler installs only through `fff::log::init_tracing`,
-//! which cairn-core never calls, so embedding the library installs no signal
-//! handler. Each instance runs ~2 background threads (scan + watcher) plus a
-//! content index (~360 B/file); the pool caps how many live at once and
-//! teardown drops them per worktree.
+//! `SharedFrecency` — no on-disk state). fff never memory-maps a file on
+//! cairn's behalf, and that is load-bearing for crash-safety. Two distinct
+//! mmap paths exist in fff and both are closed here: the *persistent* mmap
+//! cache is off (`enable_mmap_cache: false`), and the *fresh* per-grep mmap —
+//! which fff otherwise takes for any file at or above `FRESH_MMAP_THRESHOLD`
+//! (256 KiB on Unix, 1 MiB on macOS), independent of that cache flag — is made
+//! unreachable by capping `max_file_size` below the smallest threshold (see
+//! [`MMAP_SAFE_MAX_FILE_SIZE`]). This matters because a file truncated by
+//! another process while it is mapped (jj snapshots, agent writes, worktree
+//! teardown) raises SIGBUS on the next page-in — an uncatchable signal that
+//! kills the whole runner process (CAIRN-2574). `fff`'s process-wide SIGSEGV
+//! handler installs only through `fff::log::init_tracing`, which cairn-core
+//! never calls, so embedding the library installs no signal handler. Each
+//! instance runs ~2 background threads (scan + watcher) plus a content index
+//! (~360 B/file); the pool caps how many live at once and teardown drops them
+//! per worktree.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -108,6 +118,18 @@ const GREP_TIME_BUDGET_MS: u64 = 25_000;
 /// warm or cold. Rare false positives (a genuinely 509–512-byte line) just take
 /// the correct fallback.
 const LINE_TRUNCATION_THRESHOLD: usize = 509;
+/// fff `=0.9.6` memory-maps any grepped file at or above `FRESH_MMAP_THRESHOLD`
+/// (256 KiB on Unix, 1 MiB on macOS — `fff-core/src/constants.rs`). A file
+/// truncated by another process while it is mapped raises SIGBUS on the next
+/// page-in, which no in-process handler can survive and which takes down the
+/// whole runner (CAIRN-2574). Capping `max_file_size` below the smallest
+/// threshold makes the mmap branch unreachable: fff's size prefilter
+/// (`file.size <= max_file_size`) rejects oversized files before
+/// `get_content_for_search` runs, and every file that does reach it is read
+/// into a buffer via `read_exact`, which fails cleanly (→ skip) if the file
+/// shrinks mid-read rather than faulting. Pinned to fff `=0.9.6`'s thresholds
+/// via the exact-version dependency; see the `Cargo.toml` note.
+const MMAP_SAFE_MAX_FILE_SIZE: u64 = 256 * 1024 - 1;
 
 /// One match, copied out of the borrowed [`fff_search::GrepResult`] so the
 /// picker read-guard can be released before formatting.
@@ -243,6 +265,26 @@ impl WorktreeSearch {
             .unwrap_or_else(|| self.worktree.clone());
         let overrides = build_override_filter(&search_root, &params.globs)?;
 
+        // Crash-proofing (CAIRN-2574): `base_options` caps `max_file_size` below
+        // fff's mmap threshold so no grepped file is ever memory-mapped (a file
+        // truncated while mapped raises SIGBUS and kills the runner). The flip
+        // side is that fff then silently skips any in-scope, non-binary file
+        // above that cap — a completeness hole. If such a file exists, bail to
+        // the ripgrep fallback (buffered, uncapped, crash-safe) exactly like the
+        // `LINE_TRUNCATION_THRESHOLD` bail below, so warm and cold routing return
+        // the same matches. The picker read guard is held across the whole query,
+        // so the watcher cannot change indexed sizes between this check and the
+        // search.
+        if has_oversized_in_scope_file(
+            picker,
+            &self.worktree,
+            subdir,
+            overrides.as_ref(),
+            deny_read,
+        ) {
+            return None;
+        }
+
         // Constraints reference `grep_text` / `subdir_prefilter`, which outlive
         // the query built below. User glob filters deliberately stay out of fff:
         // the exact cold-walk override matcher is applied after draining results.
@@ -262,6 +304,9 @@ impl WorktreeSearch {
         };
 
         let base_options = GrepSearchOptions {
+            // Kept below fff's mmap threshold so no grepped file is memory-mapped
+            // (see MMAP_SAFE_MAX_FILE_SIZE / the has_oversized_in_scope_file bail).
+            max_file_size: MMAP_SAFE_MAX_FILE_SIZE,
             max_matches_per_file: params.max_per_file.unwrap_or(MAX_MATCHES_PER_FILE),
             smart_case,
             page_limit: PAGE_LIMIT,
@@ -443,6 +488,51 @@ fn strip_subdir_prefix<'a>(rel: &'a str, subdir: Option<&str>) -> Option<&'a str
 fn contains_glob_metachar(path: &str) -> bool {
     path.bytes()
         .any(|b| matches!(b, b'*' | b'?' | b'[' | b']' | b'{' | b'}'))
+}
+
+/// Does the warm index hold a non-binary file that is in scope for this grep
+/// but larger than [`MMAP_SAFE_MAX_FILE_SIZE`]? The `max_file_size` cap keeps
+/// such a file from being memory-mapped (and so from raising SIGBUS on a
+/// concurrent truncation), but that same cap makes fff silently skip it — so
+/// its presence forces [`WorktreeSearch::try_grep`] to bail to the ripgrep
+/// fallback, preserving warm/cold completeness parity.
+///
+/// Scans both the primary file list and the watcher-discovered overflow list (a
+/// file added/removed mid-session lands in overflow). "In scope" mirrors the
+/// per-match filtering exactly: the worktree-relative path must survive `subdir`
+/// stripping, pass the user glob override filter, and not sit under a
+/// `deny_read` fence root. Binaries are excluded because neither engine
+/// content-searches them and fff never mmaps them, so a large committed binary
+/// (a PNG, say) must not poison every grep in the tree.
+fn has_oversized_in_scope_file(
+    picker: &FilePicker,
+    worktree: &Path,
+    subdir: Option<&str>,
+    overrides: Option<&ignore::overrides::Override>,
+    deny_read: &[PathBuf],
+) -> bool {
+    picker
+        .get_files()
+        .iter()
+        .chain(picker.get_overflow_files())
+        .any(|file| {
+            if file.is_binary() || file.size <= MMAP_SAFE_MAX_FILE_SIZE {
+                return false;
+            }
+            let rel = file.relative_path(picker);
+            let Some(stripped_rel) = strip_subdir_prefix(&rel, subdir) else {
+                return false;
+            };
+            if overrides
+                .is_some_and(|filter| filter.matched(Path::new(stripped_rel), false).is_ignore())
+            {
+                return false;
+            }
+            if !deny_read.is_empty() && path_within_any(&worktree.join(&rel), deny_read) {
+                return false;
+            }
+            true
+        })
 }
 
 /// Format drained matches into the `path:N:text` output contract for the
@@ -857,6 +947,81 @@ mod tests {
             search.try_grep(&needle, &[]).is_none(),
             "a match on an over-cap line bails to the fallback"
         );
+    }
+
+    /// A non-binary file larger than the mmap-safe cap forces the whole grep to
+    /// bail to the ripgrep fallback (`None`) so fff never memory-maps it — the
+    /// SIGBUS crash-proofing (CAIRN-2574). Narrowing scope past the big file
+    /// with a glob restores warm service.
+    #[test]
+    fn index_bails_when_oversized_in_scope_file_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_init(root);
+        write_file(root, "small.rs", "let needle = 1;\n");
+        // A ~400 KiB ASCII text file (non-binary), well above the cap.
+        let big = format!("// needle\n{}\n", "abcd ".repeat(80_000));
+        assert!(big.len() as u64 > MMAP_SAFE_MAX_FILE_SIZE);
+        write_file(root, "big.rs", &big);
+
+        let search = WorktreeSearch::new(root).unwrap();
+        assert!(search.shared.wait_for_scan(Duration::from_secs(15)));
+
+        let needle = WorktreeGrepParams {
+            pattern: "needle".to_string(),
+            ..content_params()
+        };
+        // Scope includes big.rs → bail to the fallback.
+        assert!(
+            search.try_grep(&needle, &[]).is_none(),
+            "a large in-scope non-binary file bails to the ripgrep fallback"
+        );
+
+        // A glob that excludes big.rs takes it out of scope → warm service.
+        let narrowed = WorktreeGrepParams {
+            pattern: "needle".to_string(),
+            globs: vec!["small.rs".to_string()],
+            ..content_params()
+        };
+        let out = search
+            .try_grep(&narrowed, &[])
+            .expect("grep scoped past the big file is served warm");
+        assert!(out.contains("small.rs:1:let needle = 1;"), "{out:?}");
+    }
+
+    /// A large *binary* file must not trigger the oversized bail: neither engine
+    /// content-searches binaries and fff never mmaps them, so an ordinary grep
+    /// alongside a big binary blob is still served warm.
+    #[test]
+    fn index_oversized_binary_file_does_not_bail() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git_init(root);
+        write_file(root, "small.rs", "let needle = 1;\n");
+        // ~300 KiB of NUL bytes → classified binary by fff during the scan.
+        std::fs::write(root.join("blob.bin"), vec![0u8; 300 * 1024]).unwrap();
+
+        let search = WorktreeSearch::new(root).unwrap();
+        assert!(search.shared.wait_for_scan(Duration::from_secs(15)));
+
+        let needle = WorktreeGrepParams {
+            pattern: "needle".to_string(),
+            ..content_params()
+        };
+        let out = search
+            .try_grep(&needle, &[])
+            .expect("a big binary blob does not poison the warm grep");
+        assert!(out.contains("small.rs:1:let needle = 1;"), "{out:?}");
+    }
+
+    /// The cap must stay below fff `=0.9.6`'s smallest `FRESH_MMAP_THRESHOLD`
+    /// (256 KiB on Unix; macOS is 1 MiB). If a future fff bump lowers that
+    /// threshold, this assert and the exact-version pin in `Cargo.toml` must
+    /// move together — the crash-safety guarantee rests on the version pin.
+    #[test]
+    fn mmap_safe_cap_is_below_fff_threshold() {
+        // Compile-time guard: the cap must stay below fff's smallest threshold.
+        const { assert!(MMAP_SAFE_MAX_FILE_SIZE < 256 * 1024) };
     }
 
     fn params_clone(p: &WorktreeGrepParams) -> WorktreeGrepParams {

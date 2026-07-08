@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
         log_dir: None,
         stderr: !is_cli,
         level: None,
+        stderr_level: None,
     })
     .expect("Failed to initialize logging");
 

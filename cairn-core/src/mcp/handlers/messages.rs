@@ -523,9 +523,16 @@ pub async fn append_direct_message_with_urgency(
         ),
     };
 
+    // Direct-message routing (CAIRN-2598): the recipient job, its wake
+    // subscriptions, the message row, and the attention push all live in the
+    // database that owns the target project — a team job lives in its team
+    // replica, so a local-only path would miss it entirely. Sender/run
+    // resolution stays job-keyed against the private DB, as on the project/issue
+    // message path.
+    let owning_db = orch.db.for_project(project_key).await;
     let (sender_run_id, sender_name) = sender_context(&orch.db.local, request).await?;
     let (job_id, recipient_run_id) = find_recipient_job(
-        &orch.db.local,
+        &owning_db,
         project_key,
         issue_number,
         exec_seq,
@@ -535,7 +542,7 @@ pub async fn append_direct_message_with_urgency(
     .await?
     .ok_or_else(|| format!("{} not found ({}).", addressed_uri, scope_hint))?;
 
-    crate::orchestrator::wakes::seed_default_job_subscriptions(&orch.db.local, &job_id).await?;
+    crate::orchestrator::wakes::seed_default_job_subscriptions(&owning_db, &job_id).await?;
 
     let urgency = if escalate {
         crate::messages::queued::DeliveryUrgency::Interrupt
@@ -543,7 +550,7 @@ pub async fn append_direct_message_with_urgency(
         payload_urgency.unwrap_or(crate::messages::queued::DeliveryUrgency::Steer)
     };
     let msg = msg_db::insert_message_with_urgency(
-        &orch.db.local,
+        &owning_db,
         &ChannelType::Direct,
         None,
         sender_run_id.as_deref(),
@@ -583,7 +590,7 @@ pub async fn append_direct_message_with_urgency(
         ("peer", Some(sender_name.as_str()))
     };
     let effective_wake = crate::orchestrator::wakes::mute_downgrade(
-        &orch.db.local,
+        &owning_db,
         &job_id,
         source_kind,
         source_ref,
@@ -592,7 +599,7 @@ pub async fn append_direct_message_with_urgency(
     )
     .await?;
     if let Err(e) = crate::orchestrator::attention_push::push(
-        &orch.db.local,
+        &owning_db,
         &job_id,
         &addressed_uri,
         effective_wake,

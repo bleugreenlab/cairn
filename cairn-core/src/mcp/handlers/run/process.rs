@@ -7,7 +7,9 @@ use super::sandbox_policy::build_run_sandbox_policy;
 use super::types::{
     ItemOutcome, McpCallSpec, PromotedTerminal, RunCompletePayload, RunOutputPayload, RunSpec,
 };
-use crate::mcp::handlers::search_translate::{translate_search_command, TranslatedSearch};
+use crate::mcp::handlers::search_translate::{
+    translate_search_command, PostFilter, TranslatedSearch, TranslatedSearchPipeline,
+};
 use crate::mcp::handlers::{normalize_command, search, terminal, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
@@ -121,10 +123,11 @@ pub(super) async fn run_one(
     // cache, and the displayed header all key on exactly what the agent wrote.
     let mut tail_transform: Option<OutputTail> = None;
 
-    let (program, args, timeout, shell_command): (
+    let (program, args, timeout, shell_command, stdin): (
         String,
         Vec<String>,
         Option<u32>,
+        Option<String>,
         Option<String>,
     ) = match spec {
         RunSpec::Shell { command, timeout } => {
@@ -142,17 +145,29 @@ pub(super) async fn run_one(
                 vec![flag.to_string(), exec_command],
                 timeout,
                 Some(command),
+                None,
             )
         }
         RunSpec::Script {
             program,
             args,
             timeout,
-        } => (program, args, timeout, None),
+            stdin,
+        } => (program, args, timeout, None, stdin),
         // MCP calls are proxied RPC through the host gateway, not process
         // exec — handle and return here.
         RunSpec::McpCall(spec) => {
             return run_mcp_call(orch, run_context, cwd, header, *spec).await;
+        }
+        // A REPL send writes to a live eval-server's persistent stdin and awaits
+        // one framed response — not a process exec.
+        RunSpec::ReplSend {
+            slug,
+            code,
+            timeout,
+            lang,
+        } => {
+            return run_repl_send(orch, run_context, header, slug, code, timeout, lang).await;
         }
     };
 
@@ -177,8 +192,10 @@ pub(super) async fn run_one(
         &args,
         timeout_ms,
         shell_command.as_deref(),
+        stdin.as_deref(),
         true,
         branch_scoped_run,
+        true, // promote_on_timeout: agent run items detach to a terminal
     )
     .await
     {
@@ -224,8 +241,10 @@ pub(super) async fn run_one(
                         &args,
                         timeout_ms,
                         shell_command.as_deref(),
+                        stdin.as_deref(),
                         false,
                         branch_scoped_run,
+                        true, // promote_on_timeout: agent run items detach to a terminal
                     )
                     .await
                     {
@@ -333,10 +352,10 @@ async fn try_run_warm_search(
     header: String,
     command: &str,
 ) -> Option<ItemOutcome> {
-    let translated = translate_search_command(command)?;
+    let TranslatedSearchPipeline { search, post } = translate_search_command(command)?;
     let worktree_raw = PathBuf::from(run_context?.worktree_path.as_ref()?);
     let deny_read = orch.sandbox_deny_read();
-    match translated {
+    match search {
         TranslatedSearch::Grep {
             pattern,
             globs,
@@ -346,29 +365,75 @@ async fn try_run_warm_search(
             after_context,
             show_line_numbers,
             max_per_file,
-            path,
+            paths,
         } => {
-            let search_root = resolve_run_search_root(cwd, path.as_deref());
-            let scope = search::resolve_worktree_scope(orch, &search_root, &worktree_raw)?;
-            let params = crate::worktree_search::WorktreeGrepParams {
-                pattern: pattern.clone(),
-                subdir: scope.subdir,
-                globs,
-                max_per_file,
-                output_mode,
-                case_insensitive,
-                before_context,
-                after_context,
-                show_line_numbers,
+            // Compile the tail-grep post-filters up front. An uncompilable pattern
+            // means we cannot faithfully serve the pipeline, so fall through to a
+            // real subprocess before doing any index work.
+            let compiled_post = compile_post_filters(&post)?;
+
+            // Empty `paths` = one whole-worktree query; otherwise one query per
+            // path argument, in argument order. If ANY path fails to resolve to a
+            // scope inside the run worktree (outside the worktree, a file target,
+            // or a cold index returning `None`), bail the WHOLE command — never
+            // serve a partial result set.
+            let query_paths: Vec<Option<String>> = if paths.is_empty() {
+                vec![None]
+            } else {
+                paths.into_iter().map(Some).collect()
             };
-            let body =
-                tokio::task::spawn_blocking(move || scope.search.try_grep(&params, &deny_read))
-                    .await
-                    .ok()??;
-            let body = search::finalize_grep_output(body, &pattern, 0, None);
+
+            let mut combined = String::new();
+            for path_arg in &query_paths {
+                let search_root = resolve_run_search_root(cwd, path_arg.as_deref());
+                let scope = search::resolve_worktree_scope(orch, &search_root, &worktree_raw)?;
+                let params = crate::worktree_search::WorktreeGrepParams {
+                    pattern: pattern.clone(),
+                    subdir: scope.subdir,
+                    globs: globs.clone(),
+                    max_per_file,
+                    output_mode: output_mode.clone(),
+                    case_insensitive,
+                    before_context,
+                    after_context,
+                    show_line_numbers,
+                };
+                let deny = deny_read.clone();
+                let body =
+                    tokio::task::spawn_blocking(move || scope.search.try_grep(&params, &deny))
+                        .await
+                        .ok()??;
+                let body = reprefix_search_body(&body, path_arg.as_deref());
+                if !body.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push('\n');
+                    }
+                    combined.push_str(&body);
+                }
+            }
+
+            let combined = apply_post_filters(combined, &compiled_post);
+            let body = if compiled_post.is_empty() {
+                // Bare grep/rg: keep the warm read-projection contract of a
+                // friendly "No matches found" line for an empty head search.
+                search::finalize_grep_output(combined, &pattern, 0, None)
+            } else {
+                // A pipeline's stdout is exactly the post-filtered stream: an
+                // empty result — whether a filter emptied it or the head search
+                // matched nothing — is empty stdout, NOT the read-style sentence
+                // (`rg hit src | grep absent`, `... | head -0`). `head`/`tail`/
+                // `grep` already emit their lines in order, so the post-filtered
+                // body is final as-is.
+                combined
+            };
             Some(warm_search_outcome(header, body))
         }
         TranslatedSearch::Files { globs, path } => {
+            // `--files` with post-filters is out of scope; fall through to a real
+            // subprocess rather than serve an unfiltered file list.
+            if !post.is_empty() {
+                return None;
+            }
             let pattern = match globs.as_slice() {
                 [] => "**".to_string(),
                 [glob] if !glob.starts_with('!') => glob.clone(),
@@ -392,6 +457,86 @@ async fn try_run_warm_search(
             Some(warm_search_outcome(header, body))
         }
     }
+}
+
+/// A compiled tail-stage post-filter (its regex prebuilt) applied to warm-search
+/// output in order. See [`PostFilter`] for the parsed shapes.
+enum CompiledPost {
+    Head(usize),
+    Tail(usize),
+    Grep { re: regex::Regex, invert: bool },
+}
+
+/// Pre-compile every tail-grep regex. Returns `None` if any pattern fails to
+/// compile, so the whole warm path falls through to a real subprocess (the head
+/// grep validates its own pattern inside `try_grep`).
+fn compile_post_filters(post: &[PostFilter]) -> Option<Vec<CompiledPost>> {
+    post.iter()
+        .map(|filter| match filter {
+            PostFilter::Head(n) => Some(CompiledPost::Head(*n)),
+            PostFilter::Tail(n) => Some(CompiledPost::Tail(*n)),
+            PostFilter::Grep {
+                pattern,
+                invert,
+                case_insensitive,
+            } => {
+                let re = regex::RegexBuilder::new(pattern)
+                    .case_insensitive(*case_insensitive)
+                    .build()
+                    .ok()?;
+                Some(CompiledPost::Grep {
+                    re,
+                    invert: *invert,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Apply the pipeline's tail transforms to the combined warm-search body in
+/// order, mirroring `head`/`tail`/`grep` semantics on the piped stream.
+fn apply_post_filters(body: String, post: &[CompiledPost]) -> String {
+    let mut lines: Vec<String> = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.lines().map(str::to_string).collect()
+    };
+    for filter in post {
+        match filter {
+            CompiledPost::Head(n) => lines.truncate(*n),
+            CompiledPost::Tail(n) => {
+                if lines.len() > *n {
+                    lines = lines.split_off(lines.len() - *n);
+                }
+            }
+            CompiledPost::Grep { re, invert } => {
+                lines.retain(|line| re.is_match(line) ^ *invert);
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Re-prefix warm-index result lines with the path argument the way real
+/// `grep -rn`/`rg -n` print it. The warm index emits search-root-relative paths;
+/// a real recursive grep prefixes each line with the directory argument as given
+/// (trailing slash normalized). `--` context separators are left untouched.
+/// Whole-worktree queries (no path arg) already match real output, so pass through.
+fn reprefix_search_body(body: &str, path_arg: Option<&str>) -> String {
+    let Some(arg) = path_arg else {
+        return body.to_string();
+    };
+    let prefix = format!("{}/", arg.trim_end_matches('/'));
+    body.lines()
+        .map(|line| {
+            if line == "--" {
+                line.to_string()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn resolve_run_search_root(cwd: &str, path: Option<&str>) -> PathBuf {
@@ -464,6 +609,102 @@ async fn run_mcp_call(
     }
 }
 
+/// Send inline code to a live REPL session and compose its outcome. Fails
+/// closed on every missing precondition (no run context, unknown slug,
+/// dead/timed-out session, language mismatch) rather than silently spawning a
+/// fresh process — the whole value of the REPL is that state persists.
+async fn run_repl_send(
+    orch: &Orchestrator,
+    run_context: Option<&RunContext>,
+    header: String,
+    slug: String,
+    code: String,
+    timeout: Option<u32>,
+    lang: crate::mcp::handlers::repl::ReplLang,
+) -> ItemOutcome {
+    use crate::mcp::handlers::repl::{self, ReplSendResult};
+
+    let Some(ctx) = run_context else {
+        return ItemOutcome::failed(
+            header,
+            "A REPL send needs a node context and cannot run without an execution run context.",
+        );
+    };
+    let Some(session) = orch.repl_state.get(&ctx.job_id, &slug) else {
+        return ItemOutcome::failed(
+            header,
+            format!(
+                "No REPL named '{slug}' for this node. Create it: write cairn:~/repl/{slug} {{interpreter:\"python\"}}"
+            ),
+        );
+    };
+    if session.interpreter != lang {
+        return ItemOutcome::failed(
+            header,
+            format!(
+                "REPL '{slug}' is a {} session; this send used interpreter '{}'. Match the REPL's language.",
+                session.interpreter.label(),
+                lang.label()
+            ),
+        );
+    }
+
+    let timeout_ms = timeout.unwrap_or(120_000).min(600_000);
+    match repl::send(&session, &code, Duration::from_millis(timeout_ms as u64)).await {
+        ReplSendResult::Response(response) => {
+            let mut body = String::new();
+            let mut push = |section: &str| {
+                if section.is_empty() {
+                    return;
+                }
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(section);
+            };
+            if let Some(value) = response.value.as_deref() {
+                push(value);
+            }
+            push(response.stdout.trim_end_matches('\n'));
+            if !response.stderr.is_empty() {
+                push(&format!(
+                    "stderr:\n{}",
+                    response.stderr.trim_end_matches('\n')
+                ));
+            }
+            if let Some(error) = response.error.as_deref() {
+                push(error.trim_end_matches('\n'));
+            }
+            ItemOutcome {
+                header,
+                body,
+                succeeded: response.succeeded(),
+                suspended: false,
+                images: Vec::new(),
+            }
+        }
+        ReplSendResult::Dead => {
+            orch.repl_state.remove(&ctx.job_id, &slug);
+            ItemOutcome::failed(
+                header,
+                format!("REPL '{slug}' died — state lost; recreate it."),
+            )
+        }
+        ReplSendResult::Timeout => {
+            if let Some(session) = orch.repl_state.remove(&ctx.job_id, &slug) {
+                session.kill();
+            }
+            ItemOutcome::failed(
+                header,
+                format!(
+                    "REPL '{slug}' send timed out after {timeout_ms}ms; the REPL was killed and its state lost. Recreate it and break long-running work into smaller sends."
+                ),
+            )
+        }
+        ReplSendResult::Protocol(message) => ItemOutcome::failed(header, message),
+    }
+}
+
 /// Format process output into the human-readable body shown for an item.
 fn format_exec_body(exec: &ExecOutput, timeout_ms: u32) -> String {
     let mut result = String::new();
@@ -491,64 +732,34 @@ fn format_exec_body(exec: &ExecOutput, timeout_ms: u32) -> String {
     result
 }
 
-/// Spawn a process, stream its stdout/stderr, and wait with a timeout.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn execute_process(
+/// Build the agent-facing spawn config shared by inline `run` items and the
+/// stateful REPL eval-server: identical env injection (MCP callback, PATH shim,
+/// uv cache, worktree VCS env, git identity, per-job scratch `TMPDIR`, the
+/// `cairn:~` home URI) plus the optional OS sandbox. The one canonical
+/// env-injection site so the two spawn paths cannot drift.
+///
+/// Callers layer only their own extras on top: `execute_process` adds `.stdin`
+/// for the `uv run -` payload; the REPL spawner always captures stdin (its
+/// request protocol) and takes stdout for its reader thread.
+pub(crate) async fn build_agent_spawn_config(
     orch: &Orchestrator,
     cwd: &str,
-    tool_use_id: &str,
     run_context: Option<&RunContext>,
     program: &str,
     args: &[String],
-    timeout_ms: u32,
-    shell_command: Option<&str>,
-    sandbox_enabled: bool,
-    branch_scoped_run: bool,
-) -> Result<ExecOutput, String> {
-    let services = &orch.services;
-    let tool_use_id = tool_use_id.to_string();
-    let inline_command_id = Uuid::new_v4().to_string();
-
-    // Build the OS filesystem sandbox for this spawn (None for fence allow, no
-    // run context, an already-granted command, or platforms without a sandbox
-    // primitive). `sandbox_enabled` is false on an escalated
-    // re-execution after a fence grant.
-    let sandbox = if sandbox_enabled {
-        // Grant key: the shell command for shell items, else the program for
-        // skill scripts — so a command-scoped session grant generalizes to
-        // scripts too (the only crossing kind Linux produces).
-        build_run_sandbox_policy(
-            orch,
-            cwd,
-            run_context.map(|c| c.run_id.as_str()),
-            run_context.map(|c| c.project_id.as_str()),
-            shell_command.or(Some(program)),
-            branch_scoped_run,
-        )
-        .await
-    } else {
-        None
-    };
-    // Ask agents get a synthetic command-scoped macOS fallback when path recovery
-    // misses; Deny agents preserve their raw fail-fast output. Non-worktree (live
-    // checkout) runs ALSO enable fallback detection regardless of fence: the
-    // checkout is read-only, so a kernel block must be recognized even when macOS
-    // log recovery misses or a shell masks the exit (`... || true`). run_one
-    // routes such a denial to the hard read-only-checkout message, never a fence
-    // prompt — non-worktree is non-grantable, so enabling detection cannot
-    // synthesize a grant.
-    let readonly_non_worktree =
-        !branch_scoped_run && !crate::jj::is_jj_dir(std::path::Path::new(cwd));
-    let command_scoped_fallback = readonly_non_worktree
-        || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
-    let sandbox_policy = sandbox.map(|(policy, _)| policy);
+    sandbox_policy: Option<sandbox::SandboxPolicy>,
+) -> SpawnConfig {
     let sandboxed = sandbox_policy.is_some();
-    let spawn_started = std::time::SystemTime::now();
-
     // Inject the MCP callback env so an in-run `cairn read|change ...` shell
     // invocation can authenticate and forward to this same app (the basis for
     // composability like `cairn read <uri> | rg ...`). The CLI is a thin client;
     // it never opens the DB, it forwards over this callback.
+    // Point uv at the shared, per-home Cairn package cache (`<cairn_home>/uv-cache`)
+    // so every agent shares warm caches and uv never writes to `~/.cache/uv`,
+    // which is outside the fence's writable set. The dir is in the sandbox
+    // writable set (`services::sandbox::default_writable_extra`) and created at
+    // host startup (`env::ensure_uv_cache_dir`).
+    let uv_cache_dir = crate::env::uv_cache_dir().to_string_lossy().into_owned();
     let mut spawn_config = SpawnConfig::new(program);
     for arg in args {
         spawn_config = spawn_config.arg(arg);
@@ -567,6 +778,8 @@ pub(super) async fn execute_process(
             // Put the host-owned `cairn` shim dir ahead of the resolved user
             // PATH so an in-run `cairn read|write|watch …` resolves the CLI.
             .env("PATH", &crate::env::agent_shell_path())
+            // Shared per-home uv package cache; see the binding above.
+            .env("UV_CACHE_DIR", &uv_cache_dir)
             .sandbox(sandbox_policy),
     ));
     // Make bare `git`/`jj` behave correctly inside a jj-only worktree: managed
@@ -614,12 +827,7 @@ pub(super) async fn execute_process(
             .env("TEMP", &scratch);
         // `cairn:~` shorthand resolution needs the job's canonical home URI.
         // For a top-level node that's `.../{seq}/{segment}`; for a sub-task it
-        // nests under its parent as `.../{seq}/{parent}/task/{segment}`. The
-        // previous build_node_uri call passed ctx.job_name (the human-readable
-        // name, not the URI segment) and ignored parent_job_id, so a sub-task's
-        // spawned shell got the broken top-level shape as its home — every
-        // `cairn:~/<name>` resolution from that shell pointed at the wrong
-        // resource namespace.
+        // nests under its parent as `.../{seq}/{parent}/task/{segment}`.
         if let (Some(num), Some(seq)) = (ctx.issue_number, ctx.exec_seq) {
             if let Some(segment) =
                 crate::jobs::queries::node_uri_segment_for_job(&orch.db.local, &ctx.job_id).await
@@ -638,18 +846,97 @@ pub(super) async fn execute_process(
             }
         }
     }
+    spawn_config
+}
+
+/// Spawn a process, stream its stdout/stderr, and wait with a timeout.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn execute_process(
+    orch: &Orchestrator,
+    cwd: &str,
+    tool_use_id: &str,
+    run_context: Option<&RunContext>,
+    program: &str,
+    args: &[String],
+    timeout_ms: u32,
+    shell_command: Option<&str>,
+    stdin: Option<&str>,
+    sandbox_enabled: bool,
+    branch_scoped_run: bool,
+    // When true (agent `run` items), a timed-out process with a run context is
+    // DETACHED to a durable terminal instead of killed, so its work continues.
+    // Project checks pass false: a check that blows its budget must be KILLED at
+    // that budget (the contract is "killed at its budget"), never left running to
+    // dirty the shared worktree or outlive its disposable clone.
+    promote_on_timeout: bool,
+) -> Result<ExecOutput, String> {
+    let services = &orch.services;
+    let tool_use_id = tool_use_id.to_string();
+    let inline_command_id = Uuid::new_v4().to_string();
+
+    // Build the OS filesystem sandbox for this spawn (None for fence allow, no
+    // run context, an already-granted command, or platforms without a sandbox
+    // primitive). `sandbox_enabled` is false on an escalated
+    // re-execution after a fence grant.
+    let sandbox = if sandbox_enabled {
+        // Grant key: the shell command for shell items, else the program for
+        // skill scripts — so a command-scoped session grant generalizes to
+        // scripts too (the only crossing kind Linux produces).
+        build_run_sandbox_policy(
+            orch,
+            cwd,
+            run_context.map(|c| c.run_id.as_str()),
+            run_context.map(|c| c.project_id.as_str()),
+            shell_command.or(Some(program)),
+            branch_scoped_run,
+        )
+        .await
+    } else {
+        None
+    };
+    // Ask agents get a synthetic command-scoped macOS fallback when path recovery
+    // misses; Deny agents preserve their raw fail-fast output. Non-worktree (live
+    // checkout) runs ALSO enable fallback detection regardless of fence: the
+    // checkout is read-only, so a kernel block must be recognized even when macOS
+    // log recovery misses or a shell masks the exit (`... || true`). run_one
+    // routes such a denial to the hard read-only-checkout message, never a fence
+    // prompt — non-worktree is non-grantable, so enabling detection cannot
+    // synthesize a grant.
+    let readonly_non_worktree =
+        !branch_scoped_run && !crate::jj::is_jj_dir(std::path::Path::new(cwd));
+    let command_scoped_fallback = readonly_non_worktree
+        || matches!(sandbox.as_ref().map(|(_, fence)| *fence), Some(Fence::Ask));
+    let sandbox_policy = sandbox.map(|(policy, _)| policy);
+    let sandboxed = sandbox_policy.is_some();
+    let spawn_started = std::time::SystemTime::now();
+
+    let mut spawn_config =
+        build_agent_spawn_config(orch, cwd, run_context, program, args, sandbox_policy).await;
+
+    // Capture stdin only when the spec carries a payload to feed (today only
+    // `uv run -`, whose script must arrive on stdin so uv can parse PEP 723
+    // inline metadata that `-c` would skip). Every other item leaves stdin
+    // inherited, unchanged.
+    if stdin.is_some() {
+        spawn_config = spawn_config.stdin(true);
+    }
 
     let child = match services.process.spawn(spawn_config) {
         Ok(child) => Arc::new(Mutex::new(child)),
         Err(e) => return Err(format!("Failed to spawn command: {}", e)),
     };
 
-    let (stdout, stderr, child_pid) = {
+    let (stdout, stderr, stdin_writer, child_pid) = {
         let mut guard = match child.lock() {
             Ok(guard) => guard,
             Err(e) => return Err(format!("Failed to access command process: {}", e)),
         };
-        (guard.take_stdout(), guard.take_stderr(), Some(guard.id()))
+        (
+            guard.take_stdout(),
+            guard.take_stderr(),
+            guard.take_stdin(),
+            Some(guard.id()),
+        )
     };
 
     if let Some(ctx) = run_context {
@@ -757,6 +1044,23 @@ pub(super) async fn execute_process(
         })
     };
 
+    // Feed the child's stdin from a dedicated thread when the spec carries a
+    // payload (only `uv run -`): write the whole script, flush, then drop the
+    // handle to close the pipe (EOF) so uv stops reading and executes. A
+    // dedicated thread — not an inline write — keeps this robust to large code
+    // and unusual buffering: if the child emitted enough stderr to fill its pipe
+    // before draining stdin, an inline write could deadlock, but the reader
+    // threads above keep draining while this thread keeps writing.
+    let stdin_writer_handle: Option<thread::JoinHandle<()>> = stdin_writer.map(|mut writer| {
+        let payload = stdin.unwrap_or("").to_string();
+        thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = writer.write_all(payload.as_bytes());
+            let _ = writer.flush();
+            // `writer` drops here → stdin EOF.
+        })
+    });
+
     // Wait for the process without pinning a tokio worker: yield between polls.
     // A `KillOnDrop` guard ties process lifetime to this future, so an abandoned
     // request (client disconnect, MCP cancel, handler abort) reaps the whole
@@ -794,11 +1098,13 @@ pub(super) async fn execute_process(
     }
 
     if timed_out {
-        // Timed out with the process still alive. With a run context and no
-        // sandbox denial we PROMOTE it to a durable terminal instead of killing
-        // it; otherwise we kill the group. (A promoted command may keep running
-        // and dirty the worktree after the batch's commit barrier evaluates —
-        // same as any pre-existing terminal; out of scope here, see the issue.)
+        // Timed out with the process still alive. When promotion is allowed (an
+        // agent `run` item) and there is a run context and no sandbox denial, we
+        // PROMOTE it to a durable terminal instead of killing it; otherwise we
+        // kill the group. Project checks pass `promote_on_timeout = false`, so a
+        // timed-out check is always KILLED at its budget — never detached to a
+        // terminal where it would keep running, dirty the shared worktree after
+        // the check flow moved on, or outlive its disposable COW clone.
         let mut promoted: Option<PromotedTerminal> = None;
         let mut denial: Option<sandbox::SandboxDenial> = None;
 
@@ -826,7 +1132,7 @@ pub(super) async fn execute_process(
                 );
             }
 
-            if denial.is_none() {
+            if should_promote_timed_out(promote_on_timeout, denial.is_none()) {
                 let output_buffer = combined_buffer
                     .clone()
                     .expect("combined buffer is created whenever run_context is set");
@@ -868,7 +1174,7 @@ pub(super) async fn execute_process(
                 orch.pty_state
                     .unregister_inline_command(&ctx.run_id, &inline_command_id);
             }
-            reap_readers_bounded(stdout_handle, stderr_handle).await;
+            reap_readers_bounded(stdout_handle, stderr_handle, stdin_writer_handle).await;
         }
 
         if let Some(ctx) = run_context {
@@ -905,7 +1211,7 @@ pub(super) async fn execute_process(
 
     // Bound the reader reaping even on clean exit (cheap once the pipes hit EOF;
     // protects against a lingering escapee that kept a pipe write end open).
-    reap_readers_bounded(stdout_handle, stderr_handle).await;
+    reap_readers_bounded(stdout_handle, stderr_handle, stdin_writer_handle).await;
 
     if let Some(ctx) = run_context {
         let _ = orch.services.emitter.emit(
@@ -952,6 +1258,17 @@ pub(super) async fn execute_process(
     })
 }
 
+/// Whether a timed-out process should be DETACHED to a durable terminal rather
+/// than killed. Only agent `run` items opt in (`promote_on_timeout`), and only
+/// when the kernel sandbox did not deny the command (a denial routes through the
+/// worktree fence instead). Project checks pass `promote_on_timeout = false`, so
+/// a timed-out check is ALWAYS killed at its budget — never left running to
+/// dirty the shared worktree or outlive its disposable clone (CAIRN-2623). Pure,
+/// so the gate is unit-tested.
+fn should_promote_timed_out(promote_on_timeout: bool, no_denial: bool) -> bool {
+    promote_on_timeout && no_denial
+}
+
 /// Append a captured line (plus newline) to the optional combined byte buffer,
 /// keeping it bounded. Both reader threads call this so a promoted terminal's
 /// buffer reflects interleaved stdout/stderr.
@@ -984,12 +1301,19 @@ fn record_combined_output(
 async fn reap_readers_bounded(
     stdout_handle: thread::JoinHandle<()>,
     stderr_handle: thread::JoinHandle<()>,
+    stdin_handle: Option<thread::JoinHandle<()>>,
 ) {
     let _ = tokio::time::timeout(
         Duration::from_secs(2),
         tokio::task::spawn_blocking(move || {
             let _ = stdout_handle.join();
             let _ = stderr_handle.join();
+            // The stdin writer (only present for `uv run -`) has normally long
+            // since written its payload and closed the pipe; join it under the
+            // same ceiling so it is never left dangling.
+            if let Some(h) = stdin_handle {
+                let _ = h.join();
+            }
         }),
     )
     .await;
@@ -1131,6 +1455,73 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 mod tests {
     use super::*;
 
+    fn grep_filter(pattern: &str, invert: bool, case_insensitive: bool) -> CompiledPost {
+        let re = regex::RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .unwrap();
+        CompiledPost::Grep { re, invert }
+    }
+
+    #[test]
+    fn apply_post_filters_applies_grep_then_head_in_order() {
+        // `grep -v test | head -2`: drop the two `_test` lines first, then keep
+        // the first two survivors.
+        let body = [
+            "src/a.rs:1:hit",
+            "src/a_test.rs:2:hit",
+            "src/b.rs:3:hit",
+            "src/c.rs:4:hit",
+            "src/d.rs:5:hit",
+        ]
+        .join("\n");
+        let post = vec![grep_filter("test", true, false), CompiledPost::Head(2)];
+        assert_eq!(
+            apply_post_filters(body, &post),
+            "src/a.rs:1:hit\nsrc/b.rs:3:hit"
+        );
+    }
+
+    #[test]
+    fn apply_post_filters_tail_keeps_last_n() {
+        let body = ["a", "b", "c", "d"].join("\n");
+        assert_eq!(apply_post_filters(body, &[CompiledPost::Tail(2)]), "c\nd");
+    }
+
+    #[test]
+    fn reprefix_search_body_single_and_multi_path_shapes() {
+        // A path argument prefixes each result line, matching real `grep -rn X src`.
+        assert_eq!(
+            reprefix_search_body("a.rs:1:hit", Some("src")),
+            "src/a.rs:1:hit"
+        );
+        // Trailing slash is normalized to a single separator.
+        assert_eq!(
+            reprefix_search_body("ui/x.ts:2:hit", Some("packages/ui/src/")),
+            "packages/ui/src/ui/x.ts:2:hit"
+        );
+        // `--` context separators are never prefixed.
+        assert_eq!(
+            reprefix_search_body("a.rs:4-ctx\n--\na.rs:9:hit", Some("src")),
+            "src/a.rs:4-ctx\n--\nsrc/a.rs:9:hit"
+        );
+        // No path argument (whole-worktree) passes through unchanged.
+        assert_eq!(reprefix_search_body("a.rs:1:hit", None), "a.rs:1:hit");
+        assert_eq!(reprefix_search_body("", Some("src")), "");
+    }
+
+    #[test]
+    fn compile_post_filters_rejects_uncompilable_grep() {
+        // An unbalanced group is not a valid RE2 regex; the whole warm path bails.
+        assert!(compile_post_filters(&[PostFilter::Grep {
+            pattern: "(unbalanced".to_string(),
+            invert: false,
+            case_insensitive: false,
+        }])
+        .is_none());
+        assert!(compile_post_filters(&[PostFilter::Head(5)]).is_some());
+    }
+
     #[test]
     fn warm_search_outcome_marks_header_and_body() {
         let outcome = warm_search_outcome("rg needle".to_string(), "src/lib.rs:needle".to_string());
@@ -1228,5 +1619,18 @@ mod tests {
             crossing.descriptor,
             normalize_command("echo hi > $HOME/probe")
         );
+    }
+
+    #[test]
+    fn timed_out_promotion_gated_on_flag_and_no_denial() {
+        // Agent `run` items (promote=true) detach to a terminal only when there
+        // was no sandbox denial.
+        assert!(should_promote_timed_out(true, true));
+        assert!(!should_promote_timed_out(true, false));
+        // Project checks (promote=false) are ALWAYS killed at their budget, never
+        // detached — regardless of denial. This is the review fix that keeps a
+        // timed-out check from leaking a running process into the worktree/clone.
+        assert!(!should_promote_timed_out(false, true));
+        assert!(!should_promote_timed_out(false, false));
     }
 }

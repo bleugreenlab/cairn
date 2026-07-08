@@ -105,6 +105,7 @@ pub(super) fn load_agent_config(
                     skills: snapshot.skills,
                     fence: snapshot.fence,
                     backend_preference: snapshot.backend_preference,
+                    icon: fa.icon.clone(),
                     selection: snapshot.selection,
                     extras: snapshot.extras,
                 })

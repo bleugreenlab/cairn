@@ -127,6 +127,39 @@ pub fn bookmark_commit(jj: &JjEnv, store: &Path, branch: &str) -> Option<String>
     revset_commit(jj, store, &revset)
 }
 
+/// Every local bookmark name in the shared store, as one set, resolved with a
+/// SINGLE `jj` invocation. The sibling reconcile uses it to precheck which
+/// siblings still have a bookmark before spawning any `jj rebase`: a base advance
+/// that still lists long-dead `agent/…` siblings (worktrees reclaimed, bookmarks
+/// gone) would otherwise spawn one doomed rebase — and log one WARN — per branch.
+/// Templated via `local_bookmarks` (the proven [`local_bookmarks_at`] shape) over
+/// the `bookmarks()` revset, so remote-tracking refs never leak in; a divergent
+/// bookmark's repeated name is folded by the set.
+pub fn list_local_bookmarks(
+    jj: &JjEnv,
+    store: &Path,
+) -> Result<std::collections::HashSet<String>, String> {
+    let out = jj.run(
+        store,
+        &[
+            "log",
+            "-r",
+            "bookmarks()",
+            "--no-graph",
+            "-T",
+            "local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+            "--ignore-working-copy",
+        ],
+        "jj log (all local bookmarks)",
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
 /// Whether the `src` bookmark's tip has already landed in `dst` — its commit is
 /// an ancestor of (or equal to) the `dst` bookmark's tip in the shared store.
 ///

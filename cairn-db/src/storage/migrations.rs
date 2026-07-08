@@ -185,6 +185,20 @@ macro_rules! shared_tail_workflow_progress {
         )
     };
 }
+
+/// CAIRN-2623: classify a FAILING check's terminal outcome (timeout vs spawn
+/// failure vs signal kill) so a slow-but-healthy suite killed at its budget
+/// renders AS a timeout, not an opaque `exit -1`. A project-scoped SHARED table
+/// ADD COLUMN, written once here and appended after 0101 in both lineages.
+macro_rules! shared_tail_check_result_failure_kind {
+    () => {
+        Migration::new(
+            "0102",
+            "check_result_cache_failure_kind",
+            include_str!("../../../../turso_migrations/0102_check_result_cache_failure_kind.sql"),
+        )
+    };
+}
 macro_rules! team_lineage {
     ($($head:expr),* $(,)?) => {
         &[
@@ -200,6 +214,7 @@ macro_rules! team_lineage {
             shared_tail_jobs_owns_ephemeral_worktree!(),
             shared_tail_call_output_contract!(),
             shared_tail_workflow_progress!(),
+            shared_tail_check_result_failure_kind!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -281,6 +296,7 @@ macro_rules! private_lineage {
             shared_tail_jobs_owns_ephemeral_worktree!(),
             shared_tail_call_output_contract!(),
             shared_tail_workflow_progress!(),
+            shared_tail_check_result_failure_kind!(),
             // CAIRN-2487: durable journal for the workflow harness's agent()
             // calls. A per-machine runner-transient replay cache (never synced),
             // so it lives ONLY in the private lineage's tail -- absent from
@@ -1415,6 +1431,7 @@ mod tests {
                 "0097_jobs_owns_ephemeral_worktree".to_string(),
                 "0098_call_output_contract_and_run_tags".to_string(),
                 "0101_workflow_progress".to_string(),
+                "0102_check_result_cache_failure_kind".to_string(),
                 "0099_workflow_journal".to_string(),
                 "0100_workflow_restart_durability".to_string(),
             ]
@@ -2734,6 +2751,7 @@ mod tests {
                 "0097_jobs_owns_ephemeral_worktree".to_string(),
                 "0098_call_output_contract_and_run_tags".to_string(),
                 "0101_workflow_progress".to_string(),
+                "0102_check_result_cache_failure_kind".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.
@@ -2796,7 +2814,16 @@ mod tests {
                 "projects" => p
                     .replace("workspace_id", "team_id")
                     .replace("REFERENCES workspaces(id)", "REFERENCES teams(id)"),
-                "action_configs" | "skill_configs" => p
+                // action_configs is db-backed config CRUD'd by ONE shared query
+                // layer (action_configs::queries) that names workspace_id
+                // unconditionally. So the team projection drops ONLY the
+                // workspaces FK (workspaces is private-scoped) and KEEPS the
+                // nullable workspace_id column + CHECK; a team row is always
+                // project-anchored (workspace_id NULL), enforced by the CHECK.
+                "action_configs" => p.replace(" REFERENCES workspaces(id) ON DELETE CASCADE", ""),
+                // skill_configs has no db-backed CRUD path against a replica, so
+                // its team projection fully drops the workspace arm.
+                "skill_configs" => p
                     .replace(
                         "workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE, ",
                         "",

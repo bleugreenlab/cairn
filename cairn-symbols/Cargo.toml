@@ -34,7 +34,12 @@ ast-grep-outline = { path = "../ast-grep-outline" }
 # features: `zlob` needs Zig at build time (the pure-Rust globset fallback is
 # fine), frecency/history LMDB stores are disabled at runtime (None paths), and
 # the process-wide SIGSEGV handler only installs via fff::log::init_tracing,
-# which this crate never calls.
+# which this crate never calls. The exact-version pin is also load-bearing for
+# crash-safety: 0.9.6 memory-maps any grepped file at/above FRESH_MMAP_THRESHOLD
+# (256 KiB Unix / 1 MiB macOS), and a file truncated while mapped raises an
+# uncatchable SIGBUS that kills the runner (CAIRN-2574). worktree_search caps
+# max_file_size below that threshold to keep fff off mmap; if a future bump
+# changes those thresholds, MMAP_SAFE_MAX_FILE_SIZE must move with them.
 fff-search = { version = "=0.9.6", default-features = false }
 
 [dev-dependencies]
