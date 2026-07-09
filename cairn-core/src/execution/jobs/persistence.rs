@@ -693,7 +693,11 @@ pub(crate) struct ChildInsert {
     pub(crate) job_id: String,
     pub(crate) run_id: String,
     pub(crate) session_id: String,
-    pub(crate) parent_job_id: String,
+    /// The delegating parent job, or `None` for a parent-less **top-level**
+    /// node-less job — a standalone workflow launched from the UI (CAIRN-2651),
+    /// which has no caller to resume. A top-level insert allocates its segment in
+    /// the execution's own namespace and anchors packs on its own `base_commit`.
+    pub(crate) parent_job_id: Option<String>,
     /// The inherited worktree path, or `None` for a worktree-less child (an
     /// ephemeral `worktree: none` call runs in a scratch dir with no project
     /// tree binding).
@@ -762,16 +766,40 @@ pub(crate) async fn insert_child_job_session_run(
                 Some(input.description.as_str()),
                 Some(input.agent_config_id.as_str()),
             );
-            let uri_segment = crate::node_segments::allocate_child_task_segment(
-                conn,
-                &input.parent_job_id,
-                &uri_segment_base,
-            )
-            .await?;
-
-            // Inherited-worktree child: it shares the parent's worktree, so its
-            // pack_anchor follows the parent's lineage rather than its own base.
-            let pack_anchor = parent_pack_anchor_conn(conn, &input.parent_job_id).await?;
+            // A delegated child dedupes its segment under its parent and follows
+            // the parent's pack lineage (it shares the parent's worktree). A
+            // parent-less top-level node-less job (a standalone workflow launched
+            // from the UI, CAIRN-2651) allocates its segment in the execution's own
+            // top-level namespace and anchors packs on its own base commit.
+            let (uri_segment, pack_anchor) = match input.parent_job_id.as_deref() {
+                Some(parent_job_id) => (
+                    crate::node_segments::allocate_child_task_segment(
+                        conn,
+                        parent_job_id,
+                        &uri_segment_base,
+                    )
+                    .await?,
+                    parent_pack_anchor_conn(conn, parent_job_id).await?,
+                ),
+                None => {
+                    let issue_id = input.issue_id.as_deref().ok_or_else(|| {
+                        DbError::internal("top-level child job requires an issue_id")
+                    })?;
+                    let execution_id = input.execution_id.as_deref().ok_or_else(|| {
+                        DbError::internal("top-level child job requires an execution_id")
+                    })?;
+                    (
+                        crate::node_segments::allocate_top_level_segment(
+                            conn,
+                            issue_id,
+                            execution_id,
+                            &uri_segment_base,
+                        )
+                        .await?,
+                        input.base_commit.clone(),
+                    )
+                }
+            };
 
             conn.execute(
                 "INSERT INTO jobs(
@@ -793,7 +821,7 @@ pub(crate) async fn insert_child_job_session_run(
                 params![
                     input.job_id.as_str(),
                     input.execution_id.as_deref(),
-                    input.parent_job_id.as_str(),
+                    input.parent_job_id.as_deref(),
                     input.worktree_path.as_deref(),
                     input.session_id.as_str(),
                     input.agent_config_id.as_str(),

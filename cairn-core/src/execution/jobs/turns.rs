@@ -31,7 +31,19 @@ pub(super) async fn get_head_turn_conn(
 ) -> DbResult<Option<TurnHead>> {
     let mut rows = conn
         .query(
-            "SELECT id, state FROM turns WHERE job_id = ?1 ORDER BY sequence DESC LIMIT 1",
+            "SELECT t.id, t.state
+             FROM jobs j
+             LEFT JOIN turns current ON current.id = j.current_turn_id
+             JOIN turns t ON t.id = COALESCE(
+                 current.id,
+                 (SELECT fallback.id
+                    FROM turns fallback
+                   WHERE fallback.job_id = j.id
+                   ORDER BY fallback.created_at DESC, fallback.sequence DESC
+                   LIMIT 1)
+             )
+             WHERE j.id = ?1
+             LIMIT 1",
             (job_id,),
         )
         .await?;

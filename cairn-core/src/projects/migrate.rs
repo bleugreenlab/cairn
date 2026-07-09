@@ -28,9 +28,58 @@ pub struct BlockingJob {
     pub node_name: Option<String>,
 }
 
+impl BlockingJob {
+    /// A short, user-facing label for one blocking item, e.g. `issue #12 · builder`
+    /// or `job 1a2b3c4d (advancing)` when no issue backs it.
+    fn label(&self) -> String {
+        let mut label = match self.issue_number {
+            Some(number) => format!("issue #{number}"),
+            None => format!("job {}", &self.id[..self.id.len().min(8)]),
+        };
+        if let Some(node) = &self.node_name {
+            label.push_str(" · ");
+            label.push_str(node);
+        }
+        if self.status == ADVANCING_STATUS {
+            label.push_str(" (advancing)");
+        }
+        label
+    }
+}
+
+/// Synthetic `BlockingJob::status` for an execution with undelivered DAG
+/// advancement (an outbox row, not a job). Distinguishes it in the surfaced list.
+const ADVANCING_STATUS: &str = "advancing";
+
+impl std::fmt::Display for MoveProjectGateFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The variant name stays at the head of every message: the frontend
+        // matches on it as a stable token to pick a localized sentence.
+        match self {
+            Self::TeamNotOpen { team_id } => {
+                write!(f, "TeamNotOpen: team {team_id} is not open for syncing")
+            }
+            Self::ProjectNotLocal { project_id } => {
+                write!(f, "ProjectNotLocal: {project_id} is already a team project")
+            }
+            Self::KeyCollision { key, team_id } => write!(
+                f,
+                "KeyCollision: team {team_id} already has a project with key {key}"
+            ),
+            Self::NotQuiesced { blocking_jobs } => {
+                // A bare enumerated list: the frontend owns the surrounding
+                // "can't move until this finishes" sentence, so restating the
+                // remedy here would read redundantly once wrapped.
+                let labels: Vec<String> = blocking_jobs.iter().map(BlockingJob::label).collect();
+                write!(f, "NotQuiesced: {}", labels.join(", "))
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MoveProjectError {
-    #[error("move rejected: {0:?}")]
+    #[error("move rejected: {0}")]
     Gate(MoveProjectGateFailure),
     #[error(transparent)]
     Cairn(#[from] CairnError),
@@ -133,6 +182,7 @@ pub async fn move_project_to_team(
     clock: &dyn Clock,
     project_id: &str,
     team_id: &str,
+    live_job_ids: &HashSet<String>,
 ) -> MoveProjectResult<()> {
     let team_db = dbs.team_db(team_id).await.ok_or_else(|| {
         MoveProjectError::Gate(MoveProjectGateFailure::TeamNotOpen {
@@ -164,7 +214,7 @@ pub async fn move_project_to_team(
             },
         ));
     }
-    let blocking_jobs = blocking_jobs(&dbs.local, project_id).await?;
+    let blocking_jobs = blocking_work(&dbs.local, project_id, live_job_ids).await?;
     if !blocking_jobs.is_empty() {
         return Err(MoveProjectError::Gate(
             MoveProjectGateFailure::NotQuiesced { blocking_jobs },
@@ -194,22 +244,108 @@ async fn team_project_exists(db: &LocalDb, key: &str, expected_id: &str) -> Resu
     .map(|found| found.is_some_and(|id| id != expected_id))
 }
 
-async fn blocking_jobs(db: &LocalDb, project_id: &str) -> Result<Vec<BlockingJob>, DbError> {
-    let project_id = project_id.to_string();
-    db.query_all(
+/// The move-to-team quiesce gate's liveness query. The move re-roots every id in
+/// the project graph with the team prefix (`copy_project_graph`) and then sweeps
+/// the source, so any concurrent writer or in-memory handle still keyed to the
+/// pre-move ids would corrupt or dangle. The gate therefore blocks the move on
+/// GENUINELY live work — never on the durable non-terminal job-row population
+/// (`pending` / `blocked` / `running`) that every real project accumulates and
+/// keeps forever: parked resumable host waits and unstarted recipe nodes are a
+/// designed steady state, not a signal of activity (see
+/// `docs/turn-process-recovery.md`). Gating on those rows made the feature
+/// unusable on any project that had ever done real work.
+///
+/// Two populations are genuinely live and block:
+///
+/// 1. **Jobs with a live in-memory agent process.** `live_job_ids` is threaded
+///    in from the caller's `Orchestrator::process_state`, because in-memory
+///    process liveness — not `job.status` — is the source of truth for "actually
+///    running". EVERY registry entry counts, warm (live + idle) processes
+///    included: a warm process still holds a backend session handle keyed to the
+///    pre-move ids, so letting the move re-key and sweep beneath it would strand
+///    that handle. Blocking on warm processes (rather than evicting them before
+///    the copy) is the deliberate, fail-closed choice — it needs no
+///    evict-then-copy race window, and a warm process idles out of existence on
+///    its own via the warm-process GC, after which the move passes.
+///
+/// 2. **Executions with undelivered DAG advancement** — a non-terminal
+///    (`pending` / `running`) `advance_dag` outbox row. That row is claimed or
+///    queued advancement work between agent processes, and `effect_outbox` is
+///    deliberately absent from `COPY_ORDER`, so proceeding would drop the
+///    advance from the team copy and strand it against a swept-away source
+///    execution. This closes the between-processes window where a DAG worker
+///    advances an execution with no live process attached. A quiesced project
+///    has none: the drain worker carries every advance to `done`, and startup
+///    resets any `running` rows back to `pending` for replay.
+async fn blocking_work(
+    db: &LocalDb,
+    project_id: &str,
+    live_job_ids: &HashSet<String>,
+) -> Result<Vec<BlockingJob>, DbError> {
+    let mut blocking = Vec::new();
+    for job_id in live_job_ids {
+        if let Some(job) = live_process_job(db, project_id, job_id).await? {
+            blocking.push(job);
+        }
+    }
+    blocking.extend(advancing_executions(db, project_id).await?);
+    Ok(blocking)
+}
+
+/// Resolve one live-process job id to a [`BlockingJob`], but only if it belongs
+/// to the project being moved. The membership predicate mirrors the `jobs`
+/// entry in [`COPY_ORDER`]: a job joins the move via its own `project_id`, its
+/// issue, or its execution, so a live process on any of those blocks.
+async fn live_process_job(
+    db: &LocalDb,
+    project_id: &str,
+    job_id: &str,
+) -> Result<Option<BlockingJob>, DbError> {
+    db.query_opt(
         "SELECT j.id, j.status, i.number, j.node_name
          FROM jobs j
          LEFT JOIN issues i ON i.id = j.issue_id
-         WHERE j.project_id = ?1
-           AND j.status NOT IN ('complete', 'failed', 'cancelled')
-         ORDER BY j.updated_at DESC",
-        (project_id,),
+         WHERE j.id = ?2
+           AND (j.project_id = ?1
+                OR j.issue_id IN (SELECT id FROM issues WHERE project_id = ?1)
+                OR j.execution_id IN (
+                    SELECT id FROM executions
+                    WHERE project_id = ?1
+                       OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)))",
+        (project_id.to_string(), job_id.to_string()),
         |row| {
             Ok(BlockingJob {
                 id: row.text(0)?,
                 status: row.text(1)?,
                 issue_number: row.opt_i64(2)?,
                 node_name: row.opt_text(3)?,
+            })
+        },
+    )
+    .await
+}
+
+/// Executions with undelivered DAG advancement queued in the effect outbox
+/// (`advance_dag` rows are keyed by execution id). Reported as [`BlockingJob`]s
+/// with the synthetic [`ADVANCING_STATUS`] so the surfaced list names them.
+async fn advancing_executions(db: &LocalDb, project_id: &str) -> Result<Vec<BlockingJob>, DbError> {
+    let project_id = project_id.to_string();
+    db.query_all(
+        "SELECT DISTINCT eo.dedupe_key, i.number
+         FROM effect_outbox eo
+         JOIN executions e ON e.id = eo.dedupe_key
+         LEFT JOIN issues i ON i.id = e.issue_id
+         WHERE eo.kind = 'advance_dag'
+           AND eo.state IN ('pending', 'running')
+           AND (e.project_id = ?1
+                OR e.issue_id IN (SELECT id FROM issues WHERE project_id = ?1))",
+        (project_id,),
+        |row| {
+            Ok(BlockingJob {
+                id: row.text(0)?,
+                status: ADVANCING_STATUS.to_string(),
+                issue_number: row.opt_i64(1)?,
+                node_name: None,
             })
         },
     )
@@ -751,7 +887,7 @@ mod tests {
         );
         dbs.insert_team_db_for_test(team_id, team.clone()).await;
 
-        move_project_to_team(&dbs, &FixedClock, project_id, team_id)
+        move_project_to_team(&dbs, &FixedClock, project_id, team_id, &HashSet::new())
             .await
             .unwrap();
 
@@ -853,6 +989,191 @@ mod tests {
                 .await
                 .unwrap(),
             Some(team_id.to_string())
+        );
+    }
+
+    // === Quiesce-gate (`blocking_work`) tests ===
+
+    /// A migrated local db seeded with one project (`proj`, key `GATE`).
+    async fn gate_db() -> LocalDb {
+        let db = migrated_db("gate-local.db", TURSO_MIGRATIONS.to_vec()).await;
+        db.execute(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+             VALUES ('ws', 'Workspace', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj', 'ws', 'Gate', 'GATE', '/tmp/gate', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn insert_issue(db: &LocalDb, id: &str, number: i64, status: &str) {
+        db.execute(
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES (?1, 'proj', ?2, 'Issue', ?3, 1, 1)",
+            (id.to_string(), number, status.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_job(db: &LocalDb, id: &str, issue_id: &str, status: &str, node_name: &str) {
+        db.execute(
+            "INSERT INTO jobs(id, issue_id, project_id, status, node_name, created_at, updated_at)
+             VALUES (?1, ?2, 'proj', ?3, ?4, 1, 1)",
+            (
+                id.to_string(),
+                issue_id.to_string(),
+                status.to_string(),
+                node_name.to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_execution(db: &LocalDb, id: &str, issue_id: &str) {
+        db.execute(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES (?1, 'recipe', ?2, 'proj', 'running', 1, 1)",
+            (id.to_string(), issue_id.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_advance_outbox(db: &LocalDb, id: &str, execution_id: &str, state: &str) {
+        db.execute(
+            "INSERT INTO effect_outbox(id, kind, dedupe_key, state, created_at, updated_at)
+             VALUES (?1, 'advance_dag', ?2, ?3, 1, 1)",
+            (id.to_string(), execution_id.to_string(), state.to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn live_set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn gate_passes_on_inert_nonterminal_rows() {
+        // The reported regression: every job row is non-terminal (running /
+        // pending / blocked) but the work is entirely inert — no live process,
+        // no queued advance. A `running` row parked on a resumable wait and a
+        // never-started recipe node are a designed steady state, so the move
+        // must pass regardless of how many such rows exist.
+        let db = gate_db().await;
+        insert_issue(&db, "iss", 1, "merged").await;
+        insert_job(&db, "job-running", "iss", "running", "builder").await;
+        insert_job(&db, "job-pending", "iss", "pending", "planner").await;
+        insert_job(&db, "job-blocked", "iss", "blocked", "reviewer").await;
+
+        let blocking = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
+        assert!(
+            blocking.is_empty(),
+            "inert non-terminal rows must not block, got {blocking:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_blocks_on_live_process_and_names_it() {
+        // A live in-memory process on one job blocks the move; the surfaced
+        // BlockingJob names that job (issue number + node) so the user can act.
+        // The other running job with no live process does not block.
+        let db = gate_db().await;
+        insert_issue(&db, "iss", 7, "active").await;
+        insert_job(&db, "job-live", "iss", "running", "builder").await;
+        insert_job(&db, "job-idle", "iss", "running", "planner").await;
+
+        let blocking = blocking_work(&db, "proj", &live_set(&["job-live"]))
+            .await
+            .unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].id, "job-live");
+        assert_eq!(blocking[0].issue_number, Some(7));
+        assert_eq!(blocking[0].node_name.as_deref(), Some("builder"));
+    }
+
+    #[tokio::test]
+    async fn gate_ignores_live_process_outside_project() {
+        // A live job id that does not belong to the project being moved never
+        // blocks it — liveness is scoped to the project graph, not global.
+        let db = gate_db().await;
+        insert_issue(&db, "iss", 1, "merged").await;
+        insert_job(&db, "job-mine", "iss", "running", "builder").await;
+
+        let blocking = blocking_work(&db, "proj", &live_set(&["job-elsewhere"]))
+            .await
+            .unwrap();
+        assert!(blocking.is_empty(), "got {blocking:?}");
+    }
+
+    #[tokio::test]
+    async fn gate_blocks_on_pending_advance_then_passes_when_drained() {
+        // An undelivered advance_dag outbox row for one of the project's
+        // executions blocks the move: effect_outbox is not copied, so the
+        // advance would be lost against a swept-away source. Once the row
+        // reaches a terminal state, the move passes. Pins the mid-advance-window
+        // decision.
+        let db = gate_db().await;
+        insert_issue(&db, "iss", 3, "active").await;
+        insert_execution(&db, "exec", "iss").await;
+        insert_advance_outbox(&db, "eob-1", "exec", "running").await;
+
+        let blocking = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].id, "exec");
+        assert_eq!(blocking[0].status, ADVANCING_STATUS);
+        assert_eq!(blocking[0].issue_number, Some(3));
+
+        db.execute(
+            "UPDATE effect_outbox SET state = 'done' WHERE id = 'eob-1'",
+            (),
+        )
+        .await
+        .unwrap();
+        let after = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
+        assert!(
+            after.is_empty(),
+            "a drained advance must not block, got {after:?}"
+        );
+    }
+
+    #[test]
+    fn notquiesced_display_names_the_blocking_work() {
+        // The gate failure renders a self-contained, user-facing sentence that
+        // keeps the `NotQuiesced` token (matched by the frontend) and lists the
+        // blocking work.
+        let failure = MoveProjectGateFailure::NotQuiesced {
+            blocking_jobs: vec![
+                BlockingJob {
+                    id: "job-live".to_string(),
+                    status: "running".to_string(),
+                    issue_number: Some(12),
+                    node_name: Some("builder".to_string()),
+                },
+                BlockingJob {
+                    id: "exec-abc12345def".to_string(),
+                    status: ADVANCING_STATUS.to_string(),
+                    issue_number: None,
+                    node_name: None,
+                },
+            ],
+        };
+        let rendered = failure.to_string();
+        assert!(rendered.starts_with("NotQuiesced:"), "got {rendered}");
+        assert!(rendered.contains("issue #12 · builder"), "got {rendered}");
+        assert!(
+            rendered.contains("job exec-abc (advancing)"),
+            "got {rendered}"
         );
     }
 }

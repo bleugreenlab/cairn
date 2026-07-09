@@ -20,6 +20,12 @@ pub struct EffectLoopReport {
 ///
 /// All effects are handled inline using core functions. `EffectResult`s
 /// feed back into `reduce_effect_result` which may produce more effects.
+#[tracing::instrument(
+    target = "profiler",
+    name = "effect_loop",
+    skip_all,
+    fields(effects = effects.len())
+)]
 pub async fn execute_effects(
     orch: &Orchestrator,
     mut effects: Vec<WorkflowEffect>,

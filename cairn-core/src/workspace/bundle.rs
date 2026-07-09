@@ -162,10 +162,12 @@ fn sync_bundle_resources(
             let file_name = entry.file_name();
             let dest = dest_dir.join(&file_name);
 
-            if dir_name == "skills" {
-                // Skill packages are versioned directory trees; in-place update of
-                // a multi-file package is out of scope, so copy only when missing.
-                if source.is_dir() && source.join("SKILL.md").exists() && !fs.exists(&dest) {
+            // Skill and workflow packages are versioned directory trees keyed by
+            // a manifest file. In-place update of a multi-file package is out of
+            // scope, so they are copy-when-missing only — which also means a
+            // user's edited copy is never overwritten on a later sync.
+            if let Some(manifest) = package_manifest_file(dir_name) {
+                if source.is_dir() && source.join(manifest).exists() && !fs.exists(&dest) {
                     fs.copy_dir_recursive(&source, &dest)?;
                     changed = true;
                 }
@@ -237,6 +239,18 @@ fn bundled_file_is_user_owned(
         return Ok(true);
     }
     Ok(!BUNDLE_COMMIT_SUBJECTS.contains(&subject))
+}
+
+/// The manifest filename that marks a bundled directory-package for `dir_name`,
+/// or `None` for a flat (single-file) resource dir. A package dir is copied
+/// whole when missing and never updated in place, so an edited copy is
+/// preserved.
+fn package_manifest_file(dir_name: &str) -> Option<&'static str> {
+    match dir_name {
+        "skills" => Some("SKILL.md"),
+        "workflows" => Some("workflow.yaml"),
+        _ => None,
+    }
 }
 
 fn bundled_file_matches_dir(dir_name: &str, path: &Path) -> bool {
@@ -652,6 +666,63 @@ mod tests {
         // No `runtime/` in the bundle (the dev case): nothing provisioned.
         assert!(!provision_workflow_runtime(&RealFileSystem, &resource_dir, &cairn_home).unwrap());
         assert!(!cairn_home.join("runtime").exists());
+    }
+
+    /// A fresh workspace seeds the bundled `fan-out` workflow package, the loader
+    /// then lists it, and a later sync of a CHANGED bundle preserves the user's
+    /// edit to their copy (directory packages are copy-when-missing, never
+    /// overwritten). This is the loader-level proof that a fresh workspace lists
+    /// `fan-out` out of the box — the built-in workflow's whole provisioning
+    /// contract — without dogfooding through the running host.
+    #[test]
+    fn bundled_workflow_seeds_missing_lists_and_preserves_user_edits() {
+        use crate::services::{RealFileSystem, RealGitClient};
+
+        fn write_workflow_bundle(root: &Path, body: &str) {
+            std::fs::create_dir_all(root.join("workflows/fan-out")).unwrap();
+            std::fs::write(
+                root.join("workflows/fan-out/workflow.yaml"),
+                "name: Fan Out\ndescription: Zero-authoring ad-hoc agent batch.\n",
+            )
+            .unwrap();
+            std::fs::write(root.join("workflows/fan-out/main.ts"), body).unwrap();
+        }
+
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources_a = temp.path().join("resources-a");
+        let resources_b = temp.path().join("resources-b");
+        write_resources_a(&resources_a);
+        write_resources_b(&resources_b);
+        write_workflow_bundle(&resources_a, "// v1\n");
+        write_workflow_bundle(&resources_b, "// v2\n");
+
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+
+        // Fresh workspace: the package is seeded and the loader lists it.
+        sync_workspace_bundle(&git, &fs, &resources_a, &repo, "1.0.0").unwrap();
+        assert!(repo.join("workflows/fan-out/workflow.yaml").exists());
+        let listed = crate::config::workflows::list_workflows(&repo, None).unwrap();
+        assert!(
+            listed.iter().any(|r| matches!(
+                r,
+                crate::config::ConfigResult::Ok(w) if w.id == "fan-out"
+            )),
+            "fresh workspace must list the bundled fan-out workflow"
+        );
+
+        // The user edits their copy, then a CHANGED bundle syncs: the edit stands
+        // (copy-when-missing never overwrites an existing package).
+        std::fs::write(repo.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
+        git.add_all(&repo).unwrap();
+        git.commit(&repo, "User edits fan-out").unwrap();
+        sync_workspace_bundle(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.join("workflows/fan-out/main.ts")).unwrap(),
+            "// user edit\n",
+            "a user's edited workflow copy must never be clobbered by a re-sync"
+        );
     }
 
     fn write_resources_a(root: &Path) {

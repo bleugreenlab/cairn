@@ -70,7 +70,7 @@ use crate::execution::checks::{
 };
 use crate::execution::selection::CheckPlan;
 use crate::jj::{node_changed_files, sealed_tree_entries, sealed_tree_hash, JjEnv};
-use crate::orchestrator::{attention_push, Orchestrator};
+use crate::orchestrator::{attention_push, Orchestrator, TurnEndCancel};
 use crate::storage::{LocalDb, RowExt};
 
 /// Env var handed to an isolated review check naming a file of newline-delimited
@@ -85,12 +85,12 @@ const LOG_TAIL_CHARS: usize = 2_000;
 /// release the single-flight slot. The caller ([`spawn_turn_end_checks`] in
 /// lifecycle) has already claimed the slot via `try_begin_turn_end_checks`; this
 /// function is responsible for releasing it on every path.
-pub async fn run_turn_end_checks(orch: Orchestrator, job_id: String) {
+pub async fn run_turn_end_checks(orch: Orchestrator, job_id: String, cancel: TurnEndCancel) {
     // `fresh_red` is true only when this launch ran a check that freshly failed
     // (a non-cached failing verdict). Early-exit paths (no worktree, no checks, no
     // changed files, all-cached) yield `false`, so a planner writing a plan still
     // yields a prompt parent wake at the completion edge.
-    let fresh_red = match run_turn_end_checks_inner(&orch, &job_id).await {
+    let fresh_red = match run_turn_end_checks_inner(&orch, &job_id, &cancel).await {
         Ok(fresh_red) => fresh_red,
         Err(e) => {
             log::warn!(
@@ -114,6 +114,55 @@ pub async fn run_turn_end_checks(orch: Orchestrator, job_id: String) {
     }
 }
 
+/// Signal every in-flight turn-end (`when:review`) check suite belonging to
+/// `issue_id` to quit. Fired when the issue reaches a terminal (merged/closed)
+/// state: the PR the suite was validating is resolved, so a minutes-long review
+/// run against it is wasted work (CAIRN-2648). Best-effort — enumerates the issue's
+/// jobs from `db` (the issue's owning database) and pulls each one's cancellation
+/// lever, a no-op for any job with no suite in flight.
+pub(crate) async fn cancel_turn_end_checks_for_issue(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    issue_id: &str,
+) {
+    let issue_id_owned = issue_id.to_string();
+    let job_ids = db
+        .read(|conn| {
+            let issue_id = issue_id_owned.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM jobs WHERE issue_id = ?1",
+                        (issue_id.as_str(),),
+                    )
+                    .await?;
+                let mut ids = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    ids.push(row.text(0)?);
+                }
+                Ok(ids)
+            })
+        })
+        .await;
+    match job_ids {
+        Ok(ids) => {
+            for job_id in &ids {
+                orch.cancel_turn_end_checks(job_id);
+            }
+            log::debug!(
+                "cancel_turn_end_checks_for_issue({}): signalled {} job(s)",
+                short_id(issue_id),
+                ids.len()
+            );
+        }
+        Err(e) => log::warn!(
+            "cancel_turn_end_checks_for_issue({}): failed to enumerate jobs: {}",
+            short_id(issue_id),
+            e
+        ),
+    }
+}
+
 /// The issue a job belongs to, or `None` for a project-level job.
 async fn issue_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     db.read(|conn| {
@@ -134,11 +183,28 @@ async fn issue_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
 }
 
 /// Returns `true` when a non-cached check freshly failed (`fresh_red`).
-async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
+async fn run_turn_end_checks_inner(
+    orch: &Orchestrator,
+    job_id: &str,
+    cancel: &TurnEndCancel,
+) -> Result<bool, String> {
     // 1. Resolve the node's coordinates (project, issue, worktree, base anchors).
     let Some(coords) = resolve_job_coords(&orch.db.local, job_id).await? else {
         return Ok(false);
     };
+    // The issue already reached a terminal (merged/closed) state before this suite
+    // launched — its verdicts would validate a tree nobody will review again, so
+    // return before setting up any COW clones. The mid-flight case (the issue
+    // resolving WHILE a check runs) is handled by the `cancel` race around the
+    // suite below (CAIRN-2648).
+    if matches!(coords.issue_status.as_str(), "merged" | "closed") {
+        log::info!(
+            "turn-end checks for job {}: issue already {}; nothing to run",
+            short_id(job_id),
+            coords.issue_status
+        );
+        return Ok(false);
+    }
     let Some(worktree_path) = coords.worktree_path.clone().filter(|p| !p.is_empty()) else {
         log::debug!(
             "turn-end checks for job {}: no worktree; nothing to run",
@@ -351,13 +417,33 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
     let timeouts_ref = &timeouts;
     let extra_env_ref = &extra_env;
     let worktree = worktree_path.clone();
-    let outcomes = run_planned_checks(
+    // Hoisted out of the `select!` below: a `&format!(...)` temporary passed inline
+    // would be dropped at the end of the (macro-expanded) statement while still
+    // borrowed by `run_planned_checks`.
+    let checks_tool_id = format!("turn-checks:{job_id}");
+    // Race the suite against cancellation: if the issue merges/closes while a
+    // review check is running, dropping the `run_planned_checks` future drops each
+    // in-flight check's `execute` future, whose `KillOnDrop` guard SIGKILLs the
+    // check's process group. `biased` polls cancellation first, so a cancel that
+    // arrives before the first check even spawns is honored immediately (CAIRN-2648).
+    let outcomes = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            log::info!(
+                "turn-end checks for job {}: cancelled mid-suite (issue resolved); \
+                 abandoning {} check(s)",
+                short_id(job_id),
+                to_run.len()
+            );
+            return Ok(false);
+        }
+        outcomes = run_planned_checks(
         db.clone(),
         &coords.project_id,
         &tree_hash,
         job_id,
         &to_run,
-        &format!("turn-checks:{job_id}"),
+        &checks_tool_id,
         mode,
         move |index, command, stream_id| {
             let worktree = worktree.clone();
@@ -391,8 +477,8 @@ async fn run_turn_end_checks_inner(orch: &Orchestrator, job_id: &str) -> Result<
         },
         |_| {},
         Some(cap.max(1)),
-    )
-    .await;
+    ) => outcomes,
+    };
 
     let any_failed = outcomes.iter().any(|o| !o.passed);
     let verdicts: Vec<String> = outcomes
@@ -575,6 +661,9 @@ pub(crate) struct JobCoords {
     pub(crate) number: i32,
     pub(crate) exec_seq: i32,
     pub(crate) node_segment: String,
+    /// The issue's stored lifecycle status (`active`, `merged`, `closed`, …). Read
+    /// by the runner to skip a suite whose issue already resolved (CAIRN-2648).
+    pub(crate) issue_status: String,
 }
 
 /// Resolve everything the runner and renderer need from a `job_id`: the project
@@ -591,7 +680,8 @@ pub(crate) async fn resolve_job_coords(
             let mut rows = conn
                 .query(
                     "SELECT j.project_id, j.worktree_path, j.base_branch,
-                            j.base_commit, p.key, i.number, e.seq, j.uri_segment
+                            j.base_commit, p.key, i.number, e.seq, j.uri_segment,
+                            i.status
                      FROM jobs j
                      JOIN projects p ON p.id = j.project_id
                      JOIN issues i ON i.id = j.issue_id
@@ -610,6 +700,7 @@ pub(crate) async fn resolve_job_coords(
                     number: row.i64(5)? as i32,
                     exec_seq: row.i64(6)? as i32,
                     node_segment: row.opt_text(7)?.unwrap_or_default(),
+                    issue_status: row.opt_text(8)?.unwrap_or_default(),
                 })),
                 None => Ok(None),
             }

@@ -281,12 +281,7 @@ fn close_terminal_sessions_after_memory_review(orch: &Orchestrator, job_id: &str
 /// with no spawn); any other outcome journals a failure (replays as `null`). A
 /// call with no journal link (an ordinary call, or a workflow call that hit the
 /// journal) is a no-op. All errors are logged and swallowed.
-fn maybe_journal_call_result(
-    orch: &Orchestrator,
-    run_id: &str,
-    job_id: Option<&str>,
-    status: RunStatus,
-) {
+fn maybe_journal_call_result(orch: &Orchestrator, run_id: &str, job_id: Option<&str>) {
     let Some(job_id) = job_id else { return };
     let outcome = run_db_blocking({
         let dbs = orch.db.clone();
@@ -298,22 +293,28 @@ fn maybe_journal_call_result(
             else {
                 return Ok(false);
             };
-            // Success iff a clean exit produced a result artifact; anything else
-            // (a crash, a terminal run with no artifact) is a journaled failure
-            // that replays as `null`, mirroring the `?wait` terminal mapping.
-            let (result_json, jstatus) = if status == RunStatus::Exited {
-                // The call's artifact lives in the run's owning database (a team
-                // run in its replica); route to it rather than assuming private.
-                let owning = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            // The return artifact IS the call's completion contract: if it was
+            // written, journal Success with that payload regardless of the run's
+            // terminal STATUS. A CLI stream that crashed AFTER the artifact landed
+            // (CAIRN-2677 bug 1) must replay as the result, not `null` — believing
+            // the exit type over the artifact is exactly what lost a finished
+            // call's result. Only a terminal run that produced NO artifact journals
+            // a Failure (replays as `null`), mirroring the `?wait` terminal mapping.
+            // The call's artifact lives in the run's owning database (a team run in
+            // its replica); route to it rather than assuming private.
+            let owning = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                .await
+                .unwrap_or_else(|_| dbs.local.clone());
+            // Scoped to the call's CONTRACTED return artifact (not any artifact
+            // the run wrote), so an unrelated named artifact can never journal a
+            // false Success (CAIRN-2677).
+            let (result_json, jstatus) =
+                match crate::artifacts::queries::contracted_return_artifact_data(&owning, &job_id)
                     .await
-                    .unwrap_or_else(|_| dbs.local.clone());
-                match latest_artifact_data(&owning, &job_id).await? {
+                {
                     Some(data) => (Some(data), crate::workflow_journal::JournalStatus::Success),
                     None => (None, crate::workflow_journal::JournalStatus::Failure),
-                }
-            } else {
-                (None, crate::workflow_journal::JournalStatus::Failure)
-            };
+                };
             crate::workflow_journal::store_entry(
                 &private,
                 &link.workflow_run_id,
@@ -330,29 +331,6 @@ fn maybe_journal_call_result(
     if let Err(e) = outcome {
         log::warn!("Failed to journal workflow call result for run {run_id}: {e}");
     }
-}
-
-/// Raw `data` of the most recent artifact written for a job, or `None`.
-async fn latest_artifact_data(
-    db: &crate::storage::LocalDb,
-    job_id: &str,
-) -> Result<Option<String>, String> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT data FROM artifacts WHERE job_id = ?1 \
-                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                    (job_id.as_str(),),
-                )
-                .await?;
-            Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
 }
 
 /// Reap a completed one-shot `CallTool` child instead of leaving it warm.
@@ -456,20 +434,26 @@ fn try_resume_delegated_parent(orch: &Orchestrator, run_id: &str) {
 
 /// True when the run belongs to a delegated task (its job has a `parent_job_id`).
 ///
-/// Mirrors `is_task_spawned_run` (`backends/run_state.rs`), which is
-/// `pub(in crate::backends)` and so not reachable from `orchestrator`. A
-/// delegated task is the only kind of run with a suspended parent blocked on
-/// the resume gate, so it is the only kind whose genuine turn failure must be
-/// finalized terminally rather than left resumable.
-fn run_is_delegated_task(orch: &Orchestrator, run_id: &str) -> bool {
+/// True when a genuinely fatal turn failure must be finalized TERMINALLY (turn
+/// Failed → job Failed) rather than left as a resumable interruption.
+///
+/// Two kinds qualify. A delegated TASK (its job has a `parent_job_id`) has a
+/// suspended parent blocked on the resume gate that needs a terminal answer. A
+/// WORKFLOW node — delegated OR standalone (CAIRN-2651) — must map an
+/// exit-0-without-artifact / non-zero exit to `Failed`, holding the documented
+/// completion mapping identically; a standalone workflow has NULL
+/// `parent_job_id` yet is a terminal top-level run, not a resumable agent job.
+/// Every other top-level agent job stays resumable (the existing
+/// `finalize_run(Crashed)` interruption).
+fn run_fails_terminally(orch: &Orchestrator, run_id: &str) -> bool {
     blocking_text_lookup(
         orch,
         run_id,
-        "SELECT jobs.parent_job_id
+        "SELECT jobs.id
          FROM runs
          JOIN jobs ON runs.job_id = jobs.id
          WHERE runs.id = ?1
-           AND jobs.parent_job_id IS NOT NULL",
+           AND (jobs.parent_job_id IS NOT NULL OR jobs.agent_config_id = 'workflow')",
         TextColumn::Optional,
     )
     .is_some()
@@ -490,8 +474,8 @@ fn run_is_delegated_task(orch: &Orchestrator, run_id: &str) -> bool {
 /// process death) keep calling `finalize_run(Crashed)` directly and stay
 /// resumable regardless of task-vs-job.
 pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
-    if !run_is_delegated_task(orch, run_id) {
-        // Top-level job: keep the resumable-interrupt behavior unchanged.
+    if !run_fails_terminally(orch, run_id) {
+        // Top-level agent job: keep the resumable-interrupt behavior unchanged.
         finalize_run(orch, run_id, RunStatus::Crashed);
         return;
     }
@@ -686,7 +670,7 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
     // re-running the call. This is the genuine first finalize (the re-entry above
     // already returned), and the link is deleted after storing so it is never
     // double-recorded. Best-effort: a journal failure never affects the run.
-    maybe_journal_call_result(orch, run_id, job_id.as_deref(), status.clone());
+    maybe_journal_call_result(orch, run_id, job_id.as_deref());
 
     if had_active_turn {
         // Finalize todos: mark any in_progress as completed
@@ -730,8 +714,18 @@ pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
             crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
         }
     } else if let Some(ref job_id) = job_id {
+        // A node-less ephemeral CALL establishes no DB turn, so `had_active_turn`
+        // is false and the turn-driven reduction above never runs for it — yet its
+        // job row must still terminalize from its run outcome + return artifact, or
+        // it spins `running` forever and the monitoring panel shows a stuck call
+        // even after the work is done (CAIRN-2677 bug 2). `reduce_delegated_child_job`
+        // keys on the artifact (the call's completion contract) for a turn-less
+        // child, so this is correct on a clean exit and on a crashed stream that
+        // still landed the artifact. `try_resume_delegated_parent` below then wakes
+        // any suspended caller against the now-terminal job.
+        reduce_nodeless_delegated_child(orch, job_id);
         log::info!(
-            "Run {} exited without an active turn; skipping job lifecycle reduction for {}",
+            "Run {} exited without an active turn; reduced node-less child {} from run + artifact",
             &run_id[..run_id.len().min(8)],
             &job_id[..job_id.len().min(8)]
         );

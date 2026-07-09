@@ -777,7 +777,10 @@ pub async fn spawn_workflow_packets(
     let prepared = match prepare_workflow_run(
         orch,
         CreateWorkflowRunInput {
-            parent_job_id: parent_ctx.job_id.clone(),
+            parent_job_id: Some(parent_ctx.job_id.clone()),
+            project_id: None,
+            issue_id: None,
+            base_branch: None,
             execution_id: Some(execution_id.clone()),
             workflow_id: input.workflow_id.to_string(),
             script_path: input.script_path.clone(),

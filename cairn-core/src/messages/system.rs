@@ -57,8 +57,7 @@ pub fn emit_job_event(orch: &Orchestrator, job_id: &str, run_id: Option<&str>, e
         &content,
     );
 
-    if let Ok(msg) = msg {
-        super::delivery::deliver(orch, &msg);
+    if msg.is_ok() {
         let _ = orch.services.emitter.emit(
             "db-change",
             serde_json::json!({"table": "messages", "action": "insert"}),
@@ -211,8 +210,7 @@ pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, titl
         &content,
     );
 
-    if let Ok(msg) = msg {
-        super::delivery::deliver(orch, &msg);
+    if msg.is_ok() {
         let _ = orch.services.emitter.emit(
             "db-change",
             serde_json::json!({"table": "messages", "action": "insert"}),
@@ -249,8 +247,7 @@ pub fn emit_run_continued(orch: &Orchestrator, run_id: &str) {
             &content,
         );
 
-        if let Ok(msg) = msg {
-            super::delivery::deliver(orch, &msg);
+        if msg.is_ok() {
             let _ = orch.services.emitter.emit(
                 "db-change",
                 serde_json::json!({"table": "messages", "action": "insert"}),

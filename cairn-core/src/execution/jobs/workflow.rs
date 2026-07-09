@@ -21,7 +21,18 @@ use super::*;
 use crate::models::DelegatedOutputContract;
 
 pub(crate) struct CreateWorkflowRunInput {
-    pub parent_job_id: String,
+    /// The delegating caller job, or `None` for a standalone launch (CAIRN-2651)
+    /// whose anchor context is provided explicitly below. A standalone workflow
+    /// is a **top-level** node-less job with no caller to resume.
+    pub parent_job_id: Option<String>,
+    /// Standalone anchor: the project the run lives under. Required when
+    /// `parent_job_id` is `None`; derived from the parent job otherwise.
+    pub project_id: Option<String>,
+    /// Standalone anchor: the issue whose execution hosts the run.
+    pub issue_id: Option<String>,
+    /// Standalone worktree base branch — an `inherit` workflow mints its ephemeral
+    /// worktree off this ref (ignored for `none`, which runs in a scratch dir).
+    pub base_branch: Option<String>,
     pub execution_id: Option<String>,
     pub workflow_id: String,
     /// Absolute path to the workflow's resolved script entry.
@@ -66,27 +77,72 @@ pub(crate) fn prepare_workflow_run(
     orch: &Orchestrator,
     input: CreateWorkflowRunInput,
 ) -> Result<PreparedWorkflowRun, String> {
-    let db = run_db({
-        let dbs = orch.db.clone();
-        let parent_job_id = input.parent_job_id.clone();
-        async move {
-            crate::execution::routing::owning_db_for_job(&dbs, &parent_job_id)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    })?;
-
-    let parent_job = run_db(load_job(
-        db.clone(),
-        input.parent_job_id.clone(),
-        "Parent job not found",
-    ))?;
-    let project_id = parent_job.project_id.clone();
-    let issue_id = parent_job.issue_id.clone();
-    let execution_id = input
-        .execution_id
-        .clone()
-        .or_else(|| parent_job.execution_id.clone());
+    // Resolve the anchor context. A delegated workflow derives it from its caller
+    // job (routed DB, project/issue/execution, and the worktree to share). A
+    // standalone launch (CAIRN-2651) carries the anchor explicitly, lives in the
+    // local DB, and has no parent worktree to inherit — so an `inherit` workflow
+    // mints its own ephemeral tree off `base_branch`, exactly the ambient case.
+    let (db, project_id, issue_id, execution_id, parent_worktree_path, parent_base_branch) =
+        match input.parent_job_id.clone() {
+            Some(parent_job_id) => {
+                let db = run_db({
+                    let dbs = orch.db.clone();
+                    let parent_job_id = parent_job_id.clone();
+                    async move {
+                        crate::execution::routing::owning_db_for_job(&dbs, &parent_job_id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                })?;
+                let parent_job = run_db(load_job(
+                    db.clone(),
+                    parent_job_id.clone(),
+                    "Parent job not found",
+                ))?;
+                let execution_id = input
+                    .execution_id
+                    .clone()
+                    .or_else(|| parent_job.execution_id.clone());
+                (
+                    db,
+                    parent_job.project_id.clone(),
+                    parent_job.issue_id.clone(),
+                    execution_id,
+                    parent_job.worktree_path.clone(),
+                    parent_job.base_branch.clone(),
+                )
+            }
+            None => {
+                let project_id = input
+                    .project_id
+                    .clone()
+                    .ok_or("Standalone workflow requires a project_id")?;
+                let execution_id = input
+                    .execution_id
+                    .clone()
+                    .ok_or("Standalone workflow requires an execution_id")?;
+                // Route to the project's owning DB (the team replica for a team
+                // project, the private DB otherwise) so a standalone team-project
+                // launch lands its rows beside that project's issue/execution.
+                let db = run_db({
+                    let dbs = orch.db.clone();
+                    let project_id = project_id.clone();
+                    async move {
+                        crate::projects::crud::owning_db(&dbs, &project_id)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                })?;
+                (
+                    db,
+                    project_id,
+                    input.issue_id.clone(),
+                    Some(execution_id),
+                    None,
+                    input.base_branch.clone(),
+                )
+            }
+        };
     let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
     let node_path = run_db({
         let db = db.clone();
@@ -105,8 +161,8 @@ pub(crate) fn prepare_workflow_run(
     let (worktree_path, working_dir, base_commit, ephemeral_branch, owns_ephemeral_worktree) =
         match super::worktrees::resolve_call_worktree_plan(
             input.worktree,
-            parent_job.worktree_path.as_deref(),
-            parent_job.base_branch.as_deref(),
+            parent_worktree_path.as_deref(),
+            parent_base_branch.as_deref(),
         ) {
             // A worktree-backed parent shares its tree with the workflow.
             super::worktrees::CallWorktreePlan::Share { path } => {
@@ -189,7 +245,7 @@ pub(crate) fn prepare_workflow_run(
             &job_id,
             issue_id.as_deref(),
             execution_id.as_deref(),
-            Some(&input.parent_job_id),
+            input.parent_job_id.as_deref(),
             None,
             &project_id,
         ),
@@ -735,6 +791,263 @@ pub(crate) fn start_workflow_run(
     )
 }
 
+/// The addressing a standalone launch returns so the UI can open the new
+/// workflow node's monitoring panel and re-find it later.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchedWorkflow {
+    pub project_key: String,
+    pub issue_number: i32,
+    pub exec_seq: i32,
+    pub node_segment: String,
+    pub job_id: String,
+    pub run_id: String,
+}
+
+/// Launch a workflow with NO caller (CAIRN-2651): the standalone, UI-driven
+/// entry point, the sibling of the agent-driven `spawn_workflow_packets`.
+///
+/// There is no parent job to suspend/resume, so this mints its own anchor — a
+/// lightweight issue with a single execution — and creates the workflow as a
+/// **top-level** node-less job under it (`parent_job_id IS NULL`). Everything
+/// downstream is the existing workflow machinery: the same monitoring panel data,
+/// stop/restart, journaled replay + startup re-dispatch, and `workflow_run`
+/// record lifetime. Only the caller-less start and the anchor are new; the
+/// process exit → outcome mapping is unchanged (`backends::workflow`), and the
+/// completion tail reduces this node-less top-level job off its own output
+/// contract (`reduce_delegated_child_job`), with the resume step a clean no-op.
+///
+/// The anchor is an **issue** (not a recipe-style issue-less manual execution)
+/// because a workflow's harness resolves `cairn:~/` through `lookup_home_uri`,
+/// which needs an issue NUMBER to build the node URI
+/// (`cairn://p/PROJ/N/EXEC/NODE`). Recipe agent nodes tolerate an issue-less
+/// execution; a workflow's node addressability does not. The tradeoff (a
+/// lightweight issue per ad-hoc run) is the honest cost of reusing the
+/// issue-anchored execution model rather than inventing a parallel surface.
+pub async fn launch_standalone_workflow(
+    orch: &Orchestrator,
+    project_id: &str,
+    workflow_id: &str,
+    args_json: serde_json::Value,
+) -> Result<LaunchedWorkflow, String> {
+    // 1. Resolve project addressing + repo path + default branch.
+    let owning = crate::projects::crud::owning_db(&orch.db, project_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (project_key, repo_path, stored_default_branch) = {
+        let project_id = project_id.to_string();
+        owning
+            .read(move |conn| {
+                let project_id = project_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT key, repo_path, default_branch FROM projects WHERE id = ?1 LIMIT 1",
+                            (project_id.as_str(),),
+                        )
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => Ok((row.text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+                        None => Err(crate::storage::DbError::Row(format!(
+                            "Project not found: {project_id}"
+                        ))),
+                    }
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let project_path = repo_path.map(std::path::PathBuf::from);
+    // Stored default branch (config-file precedence is applied at worktree mint
+    // time); a `worktree: none` workflow — the common ad-hoc case — never uses it.
+    let base_branch = stored_default_branch.unwrap_or_else(|| "main".to_string());
+
+    // 2. Resolve the workflow package + validate args through the SAME validator
+    //    the agent invoke path uses (one validator, not a parallel one).
+    let workflow = crate::config::workflows::get_workflow(
+        &orch.config_dir,
+        workflow_id,
+        project_path.as_deref(),
+    )?
+    .ok_or_else(|| format!("Workflow not found: {workflow_id}"))?;
+    if !args_json.is_object() {
+        return Err("Workflow args must be a JSON object.".to_string());
+    }
+    if let Some(schema) = workflow.args_schema.as_ref() {
+        crate::mcp::handlers::comments_artifacts::validate_against_schema(schema, &args_json)
+            .map_err(|e| format!("Workflow `{workflow_id}` args validation failed.\n\n{e}"))?;
+    }
+    let args_str = args_json.to_string();
+    let contract =
+        crate::execution::delegation::resolve_delegated_output_contract(workflow.output.as_ref())?;
+
+    // 3. Mint the anchor issue.
+    let display_name = if workflow.name.trim().is_empty() {
+        workflow_id
+    } else {
+        workflow.name.as_str()
+    };
+    let issue = crate::issues::crud::create(
+        &owning,
+        &*orch.services.clock,
+        crate::models::CreateIssue {
+            project_id: project_id.to_string(),
+            title: format!("Workflow: {display_name}"),
+            description: Some(format!("Standalone run of the `{workflow_id}` workflow.")),
+            backend_override: None,
+            label_ids: None,
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    orch.notifier.emit_change("issues");
+
+    // 4. Mint the single execution that hosts the workflow node.
+    let now = chrono::Utc::now().timestamp() as i32;
+    let execution_id = ids::mint_child(project_id);
+    let snapshot = crate::models::ExecutionSnapshot {
+        recipe: crate::models::RecipeSnapshot {
+            id: format!("workflow-{workflow_id}"),
+            name: format!("Workflow: {display_name}"),
+            description: Some("Standalone workflow run".to_string()),
+            trigger: crate::models::RecipeTrigger::Manual,
+            nodes: vec![],
+            edges: vec![],
+        },
+        agents: std::collections::HashMap::new(),
+        skills: std::collections::HashMap::new(),
+        trigger_context: crate::models::TriggerContext {
+            issue_id: Some(issue.id.clone()),
+            project_id: project_id.to_string(),
+            trigger_type: crate::models::TriggerType::Manual,
+            event_payload: None,
+            initiated_via: Some("workflow".to_string()),
+        },
+        presets: None,
+        delegated_packets: vec![],
+        created_at: now as i64,
+    };
+    let snapshot_json = snapshot.to_json()?;
+    let device_id = orch.anon_device_manager.device_id();
+    {
+        let execution_id = execution_id.clone();
+        let recipe_id = snapshot.recipe.id.clone();
+        let issue_id = issue.id.clone();
+        let project_id = project_id.to_string();
+        owning
+            .write(move |conn| {
+                let execution_id = execution_id.clone();
+                let recipe_id = recipe_id.clone();
+                let issue_id = issue_id.clone();
+                let project_id = project_id.clone();
+                let snapshot_json = snapshot_json.clone();
+                let device_id = device_id.clone();
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO executions (
+                            id, recipe_id, issue_id, project_id, status, started_at,
+                            completed_at, snapshot, seq, triggered_by, runner_device_id
+                         ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, ?6, 1, 'manual', ?7)",
+                        params![
+                            execution_id.as_str(),
+                            recipe_id.as_str(),
+                            issue_id.as_str(),
+                            project_id.as_str(),
+                            now,
+                            snapshot_json.as_str(),
+                            device_id.as_str(),
+                        ],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    orch.notifier.emit_change("executions");
+
+    // 5. Create the top-level node-less workflow job + turn, then spawn the
+    //    supervised process. No delegated packet is persisted — there is no caller
+    //    to resume.
+    let worktree = match workflow.worktree {
+        crate::config::workflows::WorkflowWorktreeMode::None => super::CallWorktree::None,
+        crate::config::workflows::WorkflowWorktreeMode::Inherit => super::CallWorktree::Inherit,
+    };
+    let prepared = prepare_workflow_run(
+        orch,
+        CreateWorkflowRunInput {
+            parent_job_id: None,
+            project_id: Some(project_id.to_string()),
+            issue_id: Some(issue.id.clone()),
+            base_branch: Some(base_branch),
+            execution_id: Some(execution_id.clone()),
+            workflow_id: workflow_id.to_string(),
+            script_path: workflow.script_path.clone(),
+            description: format!("Workflow: {workflow_id}"),
+            args_json: args_str,
+            output_contract: contract,
+            worktree,
+            label: None,
+            phase: None,
+            parent_tool_use_id: None,
+            task_index: None,
+        },
+    )?;
+
+    if let Err(e) = start_workflow_run(orch, &prepared) {
+        // The anchor (issue + execution + job/run/turn) and the `workflow_run`
+        // re-dispatch record are already persisted. A spawn failure (missing
+        // `bun`, MCP auth, a process-spawn error) must NOT leave a durable issue
+        // with a forever-`starting` workflow that startup re-dispatch would
+        // resurrect and that Restart refuses (not stopped/failed). Reclaim the
+        // ephemeral worktree, drop the re-dispatch record so it is never
+        // respawned, record why in the node's transcript, and terminalize the run
+        // Failed — which reduces the top-level job → execution → issue Failed —
+        // before surfacing the error to the dialog.
+        reclaim_ephemeral_workflow_worktree(orch, &prepared).await;
+        let _ = delete_workflow_run_row(&orch.db.local, &prepared.run_id).await;
+        crate::orchestrator::session::insert_error_event(
+            orch,
+            &prepared.run_id,
+            Some(&prepared.session_id),
+            &format!("Workflow failed to start: {e}"),
+        );
+        crate::orchestrator::lifecycle::fail_run(orch, &prepared.run_id, "workflow spawn failed");
+        return Err(e);
+    }
+
+    // Resolve the node's addressing for the UI to open + re-find it.
+    let node_segment = {
+        let job_id = prepared.job_id.clone();
+        owning
+            .read(move |conn| {
+                let job_id = job_id.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT uri_segment FROM jobs WHERE id = ?1 LIMIT 1",
+                            (job_id.as_str(),),
+                        )
+                        .await?;
+                    Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default()
+    };
+
+    Ok(LaunchedWorkflow {
+        project_key,
+        issue_number: issue.number,
+        exec_seq: 1,
+        node_segment,
+        job_id: prepared.job_id,
+        run_id: prepared.run_id,
+    })
+}
+
 #[cfg(test)]
 mod redispatch_tests {
     use super::*;
@@ -991,5 +1304,208 @@ mod redispatch_tests {
             Some("interrupted")
         );
         assert_eq!(turn_state(&db, "t-pend").await.as_deref(), Some("failed"));
+    }
+
+    // ---- Standalone (caller-less) launch (CAIRN-2651) ----
+
+    async fn job_status(db: &LocalDb, job_id: &str) -> Option<String> {
+        let job_id = job_id.to_string();
+        db.read(move |conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT status FROM jobs WHERE id = ?1", (job_id.as_str(),))
+                    .await?;
+                Ok(rows.next().await?.and_then(|r| r.text(0).ok()))
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn exec_status(db: &LocalDb, exec_id: &str) -> Option<String> {
+        let exec_id = exec_id.to_string();
+        db.read(move |conn| {
+            let exec_id = exec_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT status FROM executions WHERE id = ?1",
+                        (exec_id.as_str(),),
+                    )
+                    .await?;
+                Ok(rows.next().await?.and_then(|r| r.text(0).ok()))
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Seed a standalone workflow anchor: a project/issue/execution plus a
+    /// **top-level** node-less workflow job (no parent), a terminal `turn`, and
+    /// optionally its `return` output artifact.
+    async fn seed_standalone_workflow(db: &LocalDb, turn: &str, with_artifact: bool) {
+        let contract = serde_json::to_string(
+            &crate::execution::delegation::resolve_delegated_output_contract(None).unwrap(),
+        )
+        .unwrap();
+        for sql in [
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i','p',3,'T','active','none',1,1)",
+            "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','workflow-fan-out','i','p','running',1,1)",
+        ] {
+            db.execute(sql, ()).await.unwrap();
+        }
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, output_contract, created_at, updated_at) VALUES ('j-wf','e','i','p','running','fan-out','fan-out','workflow',?1,1,1)",
+            (contract.as_str(),),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO sessions (id, job_id, created_at, updated_at) VALUES ('s','j-wf',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            &format!("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, updated_at) VALUES ('t','s','j-wf',1,'{turn}','initial',1,1)"),
+            (),
+        )
+        .await
+        .unwrap();
+        if with_artifact {
+            db.execute(
+                "INSERT INTO artifacts (id, job_id, artifact_type, data, version, output_name, created_at, updated_at) VALUES ('a','j-wf','return','{}',1,'return',1,1)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A standalone launch mints a TOP-LEVEL, node-less workflow job: no parent to
+    /// resume, no recipe node for the DAG sweep, the synthetic `workflow` agent id,
+    /// an addressable segment, and its OWN output contract for the caller-less
+    /// reduction. No delegated packet is written (there is no caller).
+    #[tokio::test]
+    async fn standalone_prepare_mints_top_level_nodeless_workflow_job() {
+        let (orch, db) = orch_with_db().await;
+        seed_chain(&db).await;
+
+        let contract =
+            crate::execution::delegation::resolve_delegated_output_contract(None).unwrap();
+        let prepared = prepare_workflow_run(
+            &orch,
+            CreateWorkflowRunInput {
+                parent_job_id: None,
+                project_id: Some("p".to_string()),
+                issue_id: Some("i".to_string()),
+                base_branch: Some("main".to_string()),
+                execution_id: Some("e".to_string()),
+                workflow_id: "fan-out".to_string(),
+                script_path: std::path::PathBuf::from("/wf/main.ts"),
+                description: "Workflow: fan-out".to_string(),
+                args_json: "{}".to_string(),
+                output_contract: contract,
+                worktree: CallWorktree::None,
+                label: None,
+                phase: None,
+                parent_tool_use_id: None,
+                task_index: None,
+            },
+        )
+        .unwrap();
+
+        #[allow(clippy::type_complexity)]
+        let (parent, recipe_node, agent_cfg, exec_id, issue_id, has_contract, segment): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            bool,
+            Option<String>,
+        ) = db
+            .read({
+                let job_id = prepared.job_id.clone();
+                move |conn| {
+                    let job_id = job_id.clone();
+                    Box::pin(async move {
+                        let mut rows = conn
+                            .query(
+                                "SELECT parent_job_id, recipe_node_id, agent_config_id, \
+                                 execution_id, issue_id, output_contract, uri_segment \
+                                 FROM jobs WHERE id = ?1",
+                                (job_id.as_str(),),
+                            )
+                            .await?;
+                        let row = rows.next().await?.unwrap();
+                        Ok((
+                            row.opt_text(0)?,
+                            row.opt_text(1)?,
+                            row.opt_text(2)?,
+                            row.opt_text(3)?,
+                            row.opt_text(4)?,
+                            row.opt_text(5)?.is_some(),
+                            row.opt_text(6)?,
+                        ))
+                    })
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(parent, None, "standalone workflow job has no parent");
+        assert_eq!(recipe_node, None, "workflow job is node-less");
+        assert_eq!(agent_cfg.as_deref(), Some("workflow"));
+        assert_eq!(exec_id.as_deref(), Some("e"));
+        assert_eq!(issue_id.as_deref(), Some("i"));
+        assert!(has_contract, "carries its own output contract");
+        assert!(segment.is_some(), "addressable node segment allocated");
+    }
+
+    /// Completion mapping (success): exit 0 with the output artifact → the turn is
+    /// Complete, and the caller-less reduction derives the top-level workflow job
+    /// Complete off its OWN contract, rolling the anchor execution to `complete`.
+    #[tokio::test]
+    async fn standalone_workflow_reduces_complete_with_artifact() {
+        let (orch, db) = orch_with_db().await;
+        seed_standalone_workflow(&db, "complete", true).await;
+        let derived =
+            crate::execution::advancement::reduce_delegated_child_job(&orch, "j-wf").unwrap();
+        assert_eq!(derived, Some(crate::models::JobStatus::Complete));
+        assert_eq!(job_status(&db, "j-wf").await.as_deref(), Some("complete"));
+        assert_eq!(exec_status(&db, "e").await.as_deref(), Some("complete"));
+    }
+
+    /// Completion mapping (failure): a Failed turn (the shape a non-zero exit or
+    /// exit-0-without-artifact produces via `fail_run`) reduces the top-level job
+    /// Failed and rolls the anchor execution to `failed`.
+    #[tokio::test]
+    async fn standalone_workflow_reduces_failed_on_failure() {
+        let (orch, db) = orch_with_db().await;
+        seed_standalone_workflow(&db, "failed", false).await;
+        let derived =
+            crate::execution::advancement::reduce_delegated_child_job(&orch, "j-wf").unwrap();
+        assert_eq!(derived, Some(crate::models::JobStatus::Failed));
+        assert_eq!(job_status(&db, "j-wf").await.as_deref(), Some("failed"));
+        assert_eq!(exec_status(&db, "e").await.as_deref(), Some("failed"));
+    }
+
+    /// A live (running) turn is non-terminal: the reduction is a clean no-op and
+    /// the job/execution stay `running` (an indeterminate crash stays resumable).
+    #[tokio::test]
+    async fn standalone_workflow_reduce_is_a_noop_while_running() {
+        let (orch, db) = orch_with_db().await;
+        seed_standalone_workflow(&db, "running", false).await;
+        let derived =
+            crate::execution::advancement::reduce_delegated_child_job(&orch, "j-wf").unwrap();
+        assert_eq!(derived, None);
+        assert_eq!(job_status(&db, "j-wf").await.as_deref(), Some("running"));
+        assert_eq!(exec_status(&db, "e").await.as_deref(), Some("running"));
     }
 }

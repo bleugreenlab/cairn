@@ -2198,13 +2198,26 @@ pub(super) async fn wait_for_task_artifact(
 /// committed status change — a held read transaction would pin a snapshot.
 async fn terminal_call_body(db: &LocalDb, job_id: &str) -> Option<String> {
     let status = latest_run_status(db, job_id).await?;
-    match status.as_str() {
-        "complete" | "completed" | "exited" => match direct_artifact_data(db, job_id).await {
-            Some(data) => Some(data),
-            None => Some(CALL_WAIT_FAILED.to_string()),
-        },
-        "failed" | "crashed" => Some(CALL_WAIT_FAILED.to_string()),
-        _ => None,
+    if !matches!(
+        status.as_str(),
+        "complete" | "completed" | "exited" | "failed" | "crashed"
+    ) {
+        // Latest run still non-terminal — keep the caller parked.
+        return None;
+    }
+    // The return artifact IS the call's completion contract: once written, the
+    // call is complete with that payload no matter how its run terminated — a
+    // clean exit, a CLI stream that crashed AFTER the artifact landed, or a retry
+    // whose latest run crashed (artifacts are job-scoped, so an earlier run's
+    // result still resolves). Believing the run's exit type over the artifact is
+    // exactly what returned `null` for a finished call and made fan-out look
+    // broken (CAIRN-2677 bug 1). Only a terminal run with NO artifact is a genuine
+    // failure the harness maps to a `null` `agent()` result. Scoped to the call's
+    // CONTRACTED return artifact (not any artifact the run wrote) so an unrelated
+    // named artifact can never masquerade as the call's result (CAIRN-2677).
+    match crate::artifacts::queries::contracted_return_artifact_data(db, job_id).await {
+        Some(data) => Some(data),
+        None => Some(CALL_WAIT_FAILED.to_string()),
     }
 }
 
@@ -2222,27 +2235,6 @@ async fn latest_run_status(db: &LocalDb, job_id: &str) -> Option<String> {
                     // resolve the await against the replacement, not the killed
                     // old run (CAIRN-2516).
                     "SELECT status FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                    (job_id.as_str(),),
-                )
-                .await?;
-            Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
-        })
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Raw `data` of the most recent artifact written for a job, or `None`.
-async fn direct_artifact_data(db: &LocalDb, job_id: &str) -> Option<String> {
-    let job_id = job_id.to_string();
-    db.read(|conn| {
-        let job_id = job_id.clone();
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT data FROM artifacts WHERE job_id = ?1 \
-                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     (job_id.as_str(),),
                 )
                 .await?;
@@ -2573,6 +2565,66 @@ mod wait_artifact_tests {
     async fn wait_returns_failed_sentinel_when_terminal_without_artifact() {
         let (orch, db) = orch_with_db().await;
         seed_call(&db, "exited", None).await;
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        assert_eq!(body, CALL_WAIT_FAILED);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_artifact_for_crashed_call_that_wrote_it() {
+        // The return artifact IS the completion contract: a CLI stream that
+        // crashed AFTER the artifact landed must still resolve the call with that
+        // payload, not `null` (CAIRN-2677 bug 1). Before the fix a `crashed`
+        // latest run short-circuited to CALL_WAIT_FAILED without ever looking at
+        // the artifact — the exact loss that made fan-out's Blue return `null`.
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "crashed", Some(r#"{"answer":"blue"}"#)).await;
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        assert_eq!(body, r#"{"answer":"blue"}"#);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_artifact_for_failed_call_that_wrote_it() {
+        // Same invariant on a `failed` terminal run: the written artifact wins.
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "failed", Some(r#"{"answer":"red"}"#)).await;
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        assert_eq!(body, r#"{"answer":"red"}"#);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_failed_sentinel_for_crashed_call_without_artifact() {
+        // A genuinely failed call (terminal run, no artifact) still resolves to
+        // the failure sentinel — the fix only changes the artifact-present case.
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "crashed", None).await;
+        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        assert_eq!(body, CALL_WAIT_FAILED);
+    }
+
+    #[tokio::test]
+    async fn wait_ignores_a_non_return_artifact_under_a_return_contract() {
+        // A call contracted to write `return` that wrote ONLY a different named
+        // artifact (never `return`) must resolve to the failure sentinel, not the
+        // unrelated artifact — the result read is scoped to the contract, the same
+        // way the reducer and restart paths are (CAIRN-2677 review).
+        let (orch, db) = orch_with_db().await;
+        seed_call(&db, "exited", None).await;
+        let contract =
+            crate::execution::delegation::resolve_delegated_output_contract(None).unwrap();
+        let json = serde_json::to_string(&contract).unwrap();
+        db.execute(
+            "UPDATE jobs SET output_contract = ?1 WHERE id = 'j-call'",
+            (json.as_str(),),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO artifacts (id, job_id, artifact_type, data, output_name, created_at, updated_at) \
+             VALUES ('a1','j-call','plan','{\"x\":1}','plan',1,1)",
+            (),
+        )
+        .await
+        .unwrap();
         let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
         assert_eq!(body, CALL_WAIT_FAILED);
     }

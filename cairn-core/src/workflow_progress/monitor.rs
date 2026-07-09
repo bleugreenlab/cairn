@@ -92,6 +92,20 @@ pub struct WorkflowNodeStatus {
     pub exit_reason: Option<String>,
 }
 
+/// The workflow node's identity: which workflow package it is and the args it
+/// was invoked with. `workflow_id` is durable (parsed from the node job's
+/// `"Workflow: {id}"` description); `args` is the raw invocation `args_json`
+/// read best-effort from the private, runner-transient `workflow_run` record,
+/// which is dropped on clean completion — so `args` reads `None` once a workflow
+/// finishes cleanly. Both are `None` for a job that is not a workflow node.
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowIdentity {
+    pub workflow_id: Option<String>,
+    /// Raw invocation args JSON (verbatim as validated at spawn), or `None`.
+    pub args: Option<String>,
+}
+
 /// The full monitoring picture for a workflow node.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +113,9 @@ pub struct WorkflowMonitor {
     /// The workflow node's own run status — drives the header's stop/restart
     /// affordances (Running -> Stop, Stopped/Failed -> Restart).
     pub workflow: WorkflowNodeStatus,
+    /// What the workflow IS: its package id and invocation args, for the panel's
+    /// identity line (CAIRN-2636).
+    pub identity: WorkflowIdentity,
     pub phases: Vec<WorkflowPhase>,
     pub calls: Vec<WorkflowCall>,
     pub logs: Vec<WorkflowLog>,
@@ -191,6 +208,7 @@ pub async fn get_workflow_monitor(
         call.undelivered = undelivered.contains(&call.run_id);
     }
     let workflow = node_run_status(db, node_job_id).await?;
+    let identity = workflow_identity(db, private_db, node_job_id).await?;
     let entries = list_entries(db, node_job_id).await?;
     let phases = build_phase_spine(&calls, &entries);
     let logs = entries
@@ -203,10 +221,82 @@ pub async fn get_workflow_monitor(
         .collect();
     Ok(WorkflowMonitor {
         workflow,
+        identity,
         phases,
         calls,
         logs,
     })
+}
+
+/// Resolve a workflow node's identity: its package id (durable, from the job's
+/// `"Workflow: {id}"` description) and its invocation args (best-effort, from the
+/// private `workflow_run` record which is dropped on clean completion). A
+/// non-workflow job yields an all-`None` identity.
+async fn workflow_identity(
+    db: &LocalDb,
+    private_db: &LocalDb,
+    node_job_id: &str,
+) -> Result<WorkflowIdentity, String> {
+    let workflow_id = node_workflow_id(db, node_job_id).await?;
+    // Best-effort: the transient record is gone after a clean completion, so a
+    // read error / absent row degrades to `None` rather than failing the panel.
+    let args = workflow_args(private_db, node_job_id).await.ok().flatten();
+    Ok(WorkflowIdentity { workflow_id, args })
+}
+
+/// The workflow package id parsed from the node job's `"Workflow: {id}"`
+/// `task_description` (set at spawn by `prepare_workflow_run`), or `None` when
+/// the job has no such description (not a workflow node).
+async fn node_workflow_id(db: &LocalDb, node_job_id: &str) -> Result<Option<String>, String> {
+    let node_job_id = node_job_id.to_string();
+    db.read(|conn| {
+        let node_job_id = node_job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT task_description FROM jobs WHERE id = ?1 LIMIT 1",
+                    params![node_job_id.as_str()],
+                )
+                .await?;
+            let description = match rows.next().await? {
+                Some(row) => row.opt_text(0)?,
+                None => None,
+            };
+            Ok(description.and_then(|d| {
+                d.strip_prefix("Workflow: ")
+                    .map(|id| id.trim().to_string())
+                    .filter(|id| !id.is_empty())
+            }))
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// The raw invocation `args_json` for a workflow node, read from the private,
+/// runner-transient `workflow_run` record. `None` when no record exists (the
+/// record is dropped on a clean completion), so a finished workflow shows its id
+/// but no args.
+async fn workflow_args(private_db: &LocalDb, node_job_id: &str) -> Result<Option<String>, String> {
+    let node_job_id = node_job_id.to_string();
+    private_db
+        .read(|conn| {
+            let node_job_id = node_job_id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT args_json FROM workflow_run WHERE job_id = ?1 LIMIT 1",
+                        params![node_job_id.as_str()],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(row.opt_text(0)?),
+                    None => Ok(None),
+                }
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The workflow node's own latest run status + exit_reason (by `created_at`), or
@@ -569,5 +659,52 @@ mod tests {
         assert_eq!((mon.phases[0].total, mon.phases[0].done), (2, 1));
         assert_eq!(mon.logs.len(), 1);
         assert_eq!(mon.logs[0].text, "2 angles");
+    }
+
+    /// The panel's identity line: the workflow id is parsed from the node job's
+    /// `"Workflow: {id}"` description (durable), and the invocation args come from
+    /// the private `workflow_run` record while it lives — dropping to `None` once
+    /// the record is deleted on clean completion, while the id survives.
+    #[tokio::test]
+    async fn monitor_surfaces_workflow_identity() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws','ws',0,0)",
+        )
+        .await;
+        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','P','/tmp',0,0)").await;
+        exec(&db, "INSERT INTO jobs (id, project_id, agent_config_id, task_description, status, created_at, updated_at) VALUES ('wf-node','proj','workflow','Workflow: deep-research','live',0,0)").await;
+        exec(&db, "INSERT INTO workflow_run (run_id, job_id, session_id, workflow_id, script_path, args_json, working_dir, output_name, created_at) VALUES ('wf-run','wf-node','sess','deep-research','/wf/main.ts','{\"query\":\"rust async\"}','/tmp/wf','return',0)").await;
+
+        let mon = get_workflow_monitor(&db, &db, "wf-node").await.unwrap();
+        assert_eq!(mon.identity.workflow_id.as_deref(), Some("deep-research"));
+        assert_eq!(
+            mon.identity.args.as_deref(),
+            Some("{\"query\":\"rust async\"}")
+        );
+
+        // Clean completion drops the transient record: the id (durable, from the
+        // job description) survives; the args go `None`.
+        exec(&db, "DELETE FROM workflow_run WHERE job_id = 'wf-node'").await;
+        let mon = get_workflow_monitor(&db, &db, "wf-node").await.unwrap();
+        assert_eq!(mon.identity.workflow_id.as_deref(), Some("deep-research"));
+        assert_eq!(mon.identity.args, None);
+    }
+
+    /// A non-workflow job (no `"Workflow: "` description, no record) yields an
+    /// all-`None` identity rather than mislabeling itself.
+    #[tokio::test]
+    async fn monitor_identity_is_empty_for_non_workflow_job() {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws','ws',0,0)",
+        )
+        .await;
+        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','P','/tmp',0,0)").await;
+        exec(&db, "INSERT INTO jobs (id, project_id, status, created_at, updated_at) VALUES ('plain','proj','live',0,0)").await;
+        let mon = get_workflow_monitor(&db, &db, "plain").await.unwrap();
+        assert_eq!(mon.identity, WorkflowIdentity::default());
     }
 }

@@ -179,6 +179,28 @@ pub(crate) fn format_timeout_budget(duration_ms: i64) -> String {
 /// Chars of combined check output retained in the cache row's `output_tail`.
 const OUTPUT_TAIL_CHARS: usize = 4_000;
 
+/// Cancel any in-flight `when:review` check suite for `job_id` when a commit
+/// seals mid-turn. The branch just advanced, so that suite — launched at the
+/// previous turn-end against the now-superseded tree — is validating a tree
+/// nobody will look at again, while its bounded concurrent full Rust compiles
+/// (each in its own COW clone) saturate CPU and I/O. That starves this commit's
+/// own `when:write` checks (which fire right after the seal via
+/// [`run_write_checks_after_seal`]) and the agent's next manual `bun run
+/// test:rust`. Cancelling frees those resources for the checks that validate the
+/// NEW code; the review cadence relaunches a fresh suite for the advanced tree
+/// at the next turn-end via the normal `spawn_turn_end_checks` path.
+///
+/// This reuses the CAIRN-2648 [`Orchestrator::cancel_turn_end_checks`] lever, so
+/// it is best-effort and idempotent: a no-op when no review suite is in flight
+/// for the job, hence safe on every commit. Keyed by the committing run's own
+/// `job_id` — the dominant path is the builder committing its own fix, which
+/// cancels exactly its suite. A sub-agent/task that commits into the builder's
+/// inherited worktree under a *different* job id would not hit the builder's
+/// suite; that edge case is deliberately left as-is.
+pub fn cancel_stale_review_on_branch_advance(orch: &Orchestrator, job_id: &str) {
+    orch.cancel_turn_end_checks(job_id);
+}
+
 /// Run the affected `when:write` checks after a source-touching commit has been
 /// sealed, streaming their output live and returning a compact inline pass/fail
 /// summary to append to the originating tool result.

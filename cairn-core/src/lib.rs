@@ -20,6 +20,7 @@ pub mod memories;
 pub mod merge_requests;
 pub mod messages;
 pub mod pr_data;
+pub mod pressure;
 pub mod projects;
 pub mod runs;
 pub mod scratch;

@@ -694,6 +694,29 @@ impl AgentProcessState {
             .unwrap_or(0)
     }
 
+    /// Job ids that have a live in-memory process attachment right now,
+    /// regardless of lifecycle or occupancy.
+    ///
+    /// EVERY registry entry counts — serving a turn, awaiting host, warm and
+    /// idle, or still starting — because each holds backend session / job / run
+    /// handles keyed to the job's *current* ids. That makes this the
+    /// authoritative "which jobs are actually live" set for the move-to-team
+    /// quiesce gate: a durable `job.status = 'running'` row can be a parked,
+    /// resumable host wait with no live process (see
+    /// `docs/turn-process-recovery.md`), so job rows cannot answer this — only
+    /// the process registry can.
+    pub fn live_job_ids(&self) -> HashSet<String> {
+        self.processes
+            .lock()
+            .map(|processes| {
+                processes
+                    .values()
+                    .filter_map(|handle| handle.job_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Find a warm process by session_id (for reuse on follow-up).
     #[allow(dead_code)]
     pub fn find_warm_by_session(&self, session_id: &str) -> Option<String> {
@@ -1151,6 +1174,47 @@ mod tests {
         let state = AgentProcessState::default();
         state.request_suspend("ghost", SuspendKind::Prompt);
         assert_eq!(state.take_suspend("ghost"), None);
+    }
+
+    #[test]
+    fn live_job_ids_includes_warm_active_and_starting_handles() {
+        // The move-to-team quiesce gate treats EVERY registry entry as live: a
+        // warm (live + idle) process still holds a session handle keyed to the
+        // job's pre-move ids, so it blocks the move exactly as an active one
+        // does. Handles without a job id (external/untracked runs) contribute
+        // nothing.
+        let state = AgentProcessState::default();
+        {
+            let mut processes = state.processes.lock().unwrap();
+
+            // Warm: live + idle.
+            let mut warm = RunHandle::test_handle(Some("s-warm"), Some("job-warm"));
+            warm.transition_to_warm();
+            processes.register("run-warm".to_string(), warm);
+
+            // Active: serving a turn.
+            let mut active = RunHandle::test_handle(Some("s-active"), Some("job-active"));
+            active.begin_turn("turn-1");
+            processes.register("run-active".to_string(), active);
+
+            // Still starting (default lifecycle) but already keyed to a job.
+            processes.register(
+                "run-starting".to_string(),
+                RunHandle::test_handle(Some("s-start"), Some("job-starting")),
+            );
+
+            // No job id: contributes nothing.
+            processes.register(
+                "run-jobless".to_string(),
+                RunHandle::test_handle(Some("s-jobless"), None),
+            );
+        }
+
+        let live = state.live_job_ids();
+        assert_eq!(live.len(), 3, "got {live:?}");
+        assert!(live.contains("job-warm"));
+        assert!(live.contains("job-active"));
+        assert!(live.contains("job-starting"));
     }
 
     #[test]

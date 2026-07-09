@@ -159,7 +159,7 @@ pub fn create_child_task(
             job_id: job_id.clone(),
             run_id: run_id.clone(),
             session_id: session_id.clone(),
-            parent_job_id: input.parent_job_id.clone(),
+            parent_job_id: Some(input.parent_job_id.clone()),
             worktree_path: Some(worktree_path.clone()),
             branch: ephemeral_branch,
             agent_config_id: agent_config.id.clone(),

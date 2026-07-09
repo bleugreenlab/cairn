@@ -18,6 +18,11 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 tokio = { version = "1", features = ["time", "rt", "macros", "sync", "net", "process"] }
 portable-pty = "0.8"
 log = "0.4"
+# Direct tracing dependency: the backend resource sampler (`pressure`) gates on
+# `tracing::event_enabled!(target: "profiler", ...)` to stay a no-op while the
+# profiler target is off, and instrumented backend work opens `profiler`-target
+# spans (the span-duration layer). Everywhere else cairn-core logs via `log`.
+tracing = "0.1"
 nix = { version = "0.29", features = ["signal"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"

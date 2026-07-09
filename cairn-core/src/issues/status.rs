@@ -95,6 +95,13 @@ pub async fn update_status(
         crate::execution::advancement::release_dependent_executions(orch, id).await?;
     }
 
+    if is_terminal_state {
+        // The issue is resolved — quit any in-flight turn-end review suite so it
+        // does not keep running against a merged/closed issue (CAIRN-2648).
+        crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(orch, &owning_db, id)
+            .await;
+    }
+
     for session_id in &closed_sessions {
         if let Some(run_id) = orch.process_state.remove_by_session(session_id) {
             log::info!(

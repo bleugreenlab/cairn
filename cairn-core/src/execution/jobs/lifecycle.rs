@@ -514,6 +514,81 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 }
 
 // ============================================================================
+// continue_job_or_enqueue
+// ============================================================================
+
+/// User-facing continue: enqueue instead of resuming when a turn is already
+/// active, so a stale composer send never 500s and never drops the message.
+///
+/// The chat composer decides send-vs-queue from a cached head-turn read; when a
+/// turn goes active just after that read was taken, a plain Enter still routes to
+/// the `continue_job` command (this path) rather than the queue. Left unguarded,
+/// that reaches [`continue_job_impl`] with a `running`/`pending` head turn, trips
+/// the active-turn guard, and returns an error the composer surfaces as a 500 —
+/// dropping the typed text (CAIRN-2657).
+///
+/// Mirroring the direct-message guard ([`crate::messages::delivery::head_turn_active`]),
+/// a message-bearing send against an active turn lands in the queue
+/// ([`crate::messages::queued::Delivery::Queue`], delivered at turn end) instead.
+/// The existing turn-end / flush-on-idle machinery already claims and delivers
+/// `queue` rows, so no new delivery code is needed. Guarding here — the
+/// authoritative layer — protects every caller of the command, not just the
+/// composer. Internal Rust callers (prompt/permission answers, wakes, delegation
+/// resume, advancement) keep calling [`continue_job_impl`] directly: they run at
+/// genuine turn boundaries where no turn is active and must not be silently
+/// converted into queued messages.
+pub fn continue_job_or_enqueue(
+    orch: &Orchestrator,
+    job_id: &str,
+    message: Option<&str>,
+    identity_override: Option<crate::identity::UserIdentity>,
+) -> Result<Run, String> {
+    // Only a message-bearing send can be queued; a bare continue has nothing to
+    // enqueue, so it falls straight through to the resume (and its guard).
+    if let Some(text) = message.filter(|m| !m.trim().is_empty()) {
+        // Resolve the owning DB (team job -> its synced replica), mirroring
+        // continue_job_impl's own routing so team turns/queued rows stay correct.
+        let owning_db = run_db({
+            let dbs = orch.db.clone();
+            let job_id = job_id.to_string();
+            async move {
+                crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })?;
+        if crate::messages::delivery::head_turn_active_sync(&owning_db, job_id) {
+            crate::messages::queued::enqueue(
+                &owning_db,
+                job_id,
+                text,
+                crate::messages::queued::Delivery::Queue,
+            )?;
+            // Make the pending-queue chip appear immediately: QueryProvider
+            // invalidates `queuedMessages` on this db-change, the same mechanism
+            // the composer's own enqueue path relies on.
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "queued_messages", "action": "update"}),
+            );
+            // Return the job's latest run to honor the Run return contract; the
+            // frontend ignores the value. `list_runs_for_job` orders newest-first,
+            // matching the frontend's `runs[0]` "latest" convention. Fall through to
+            // the resume only in the pathological case where an active turn has no
+            // run row at all.
+            if let Some(run) = crate::runs::queries::list_runs_for_job(owning_db.clone(), job_id)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+            {
+                return Ok(run);
+            }
+        }
+    }
+    continue_job_impl(orch, job_id, message, identity_override, None)
+}
+
+// ============================================================================
 // continue_job_impl
 // ============================================================================
 

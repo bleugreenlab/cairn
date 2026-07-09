@@ -187,6 +187,31 @@ async fn latest_artifact_confirmed_for(
     }
 }
 
+/// Stored status of the latest run for a job (newest by `created_at`, `rowid`),
+/// or `None` when no run exists yet. The turn-less completion path for an
+/// ephemeral call derives from this (a call establishes no DB turn).
+async fn latest_run_status_conn(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT status FROM runs WHERE job_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (job_id,),
+        )
+        .await?;
+    Ok(rows.next().await?.map(|r| r.text(0)).transpose()?)
+}
+
+/// Terminal stored run statuses (the process has exited). Mirrors
+/// `RunStatus::is_terminal` plus the legacy stored spellings.
+fn is_terminal_run_status_str(status: &str) -> bool {
+    matches!(
+        status,
+        "exited" | "crashed" | "complete" | "completed" | "failed"
+    )
+}
+
 /// Whether any artifact row exists for the job — i.e. the node produced its
 /// declared output. Distinct from `latest_artifact_confirmed`, which conflates
 /// "no artifact" with "artifact awaiting confirmation."
@@ -836,24 +861,50 @@ pub(crate) async fn reduce_delegated_child_job_conn(
     let row = {
         let mut rows = conn
             .query(
-                "SELECT recipe_node_id, parent_job_id, status, execution_id
+                "SELECT recipe_node_id, parent_job_id, status, execution_id, \
+                 agent_config_id, output_contract
                  FROM jobs WHERE id = ?1",
                 (job_id,),
             )
             .await?;
         rows.next()
             .await?
-            .map(|r| Ok::<_, DbError>((r.opt_text(0)?, r.opt_text(1)?, r.text(2)?, r.opt_text(3)?)))
+            .map(|r| {
+                Ok::<_, DbError>((
+                    r.opt_text(0)?,
+                    r.opt_text(1)?,
+                    r.text(2)?,
+                    r.opt_text(3)?,
+                    r.opt_text(4)?,
+                    r.opt_text(5)?,
+                ))
+            })
             .transpose()?
     };
-    let Some((recipe_node_id, parent_job_id, status_str, execution_id)) = row else {
+    let Some((
+        recipe_node_id,
+        parent_job_id,
+        status_str,
+        execution_id,
+        agent_config_id,
+        output_contract_json,
+    )) = row
+    else {
         return Ok(None);
     };
     // Node-backed jobs (including the synthetic `delegated-*-agent` nodes the DAG
-    // expander mints for Task-tool delegations) and top-level jobs are the
-    // execution sweep's responsibility. Only a pre-materialized node-less child
-    // needs this direct reduction.
-    if recipe_node_id.is_some() || parent_job_id.is_none() {
+    // expander mints for Task-tool delegations) are the execution sweep's
+    // responsibility. A pre-materialized node-less delegated CHILD needs this
+    // direct reduction; so does a **standalone workflow** — a top-level node-less
+    // workflow job (`parent_job_id IS NULL`, agent_config_id 'workflow') launched
+    // from the UI with no caller (CAIRN-2651), which the sweep skips just the
+    // same. A parent-less non-workflow top-level job stays the sweep's job.
+    if recipe_node_id.is_some() {
+        return Ok(None);
+    }
+    let is_standalone_workflow =
+        parent_job_id.is_none() && agent_config_id.as_deref() == Some("workflow");
+    if parent_job_id.is_none() && !is_standalone_workflow {
         return Ok(None);
     }
     let current: JobStatus = status_str.parse().map_err(DbError::internal)?;
@@ -875,29 +926,75 @@ pub(crate) async fn reduce_delegated_child_job_conn(
     let Some(execution_id) = execution_id else {
         return Ok(None);
     };
-    let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
-    let Some(packet) = snapshot
-        .delegated_packets
-        .iter()
-        .find(|packet| packet.result_artifact_job_id.as_deref() == Some(job_id))
-    else {
-        return Ok(None);
+    // Resolve the required artifact name from the contract that owns it. A
+    // delegated child reads it off its pre-materialized packet (whose resume gate
+    // keys on this job's status); a standalone workflow reads it off its OWN
+    // persisted `output_contract`, since it carries no packet (no caller to
+    // resume). A packet-less node-less CHILD (a `create_child_task` sub-agent) is
+    // still left alone: it persists no contract yet is owed a fixed `result`, so
+    // reducing it off an absent contract would wrongly derive `Complete`.
+    let required_name = if is_standalone_workflow {
+        let Some(json) = output_contract_json else {
+            return Ok(None);
+        };
+        let contract: crate::models::DelegatedOutputContract =
+            serde_json::from_str(&json).map_err(|e| DbError::internal(e.to_string()))?;
+        contract.artifact_name()
+    } else {
+        let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
+        let Some(packet) = snapshot
+            .delegated_packets
+            .iter()
+            .find(|packet| packet.result_artifact_job_id.as_deref() == Some(job_id))
+        else {
+            return Ok(None);
+        };
+        packet.output_contract.artifact_name()
     };
-    let required_name = packet.output_contract.artifact_name();
     let requires_output = true;
     let artifact_present = artifact_present_for(conn, job_id, Some(&required_name)).await?;
     let turn = latest_turn_state(conn, job_id).await?;
-    let facts = JobFacts {
-        dag_ready: true,
-        upstream_failed: false,
-        live_turn: latest_turn_is_live(conn, job_id).await?,
-        turn_failed: matches!(turn, Some(TurnState::Failed)),
-        turn_complete: matches!(turn, Some(TurnState::Complete)),
-        checkpoint: CheckpointGate::None,
-        resolution: Resolution::Pending,
-        requires_output,
-        artifact_present,
-        long_running: false,
+    // A node-less ephemeral CALL establishes no DB turn (unlike a workflow or a
+    // task, which both run a real turn), so its completion cannot be read from
+    // turn facts — the job would spin `running` forever after its run finalizes,
+    // and the monitoring panel would show a stuck call even when it succeeded
+    // (CAIRN-2677 bug 2). For a turn-less child, derive from the completion
+    // CONTRACT instead: the return artifact IS the call's result, so its presence
+    // means Complete regardless of how the CLI stream ended — a clean exit, a
+    // stream that crashed AFTER the artifact landed, or a warm-parked run that
+    // never formally exited (CAIRN-2677 bug 1, applied to the job projection).
+    // Only a turn-less child that reached a terminal RUN with no artifact is a
+    // Failure; one whose latest run is still live is left running.
+    let facts = if turn.is_none() {
+        let run_terminal = latest_run_status_conn(conn, job_id)
+            .await?
+            .map(|s| is_terminal_run_status_str(&s))
+            .unwrap_or(false);
+        JobFacts {
+            dag_ready: true,
+            upstream_failed: false,
+            live_turn: !artifact_present && !run_terminal,
+            turn_failed: !artifact_present && run_terminal,
+            turn_complete: artifact_present,
+            checkpoint: CheckpointGate::None,
+            resolution: Resolution::Pending,
+            requires_output,
+            artifact_present,
+            long_running: false,
+        }
+    } else {
+        JobFacts {
+            dag_ready: true,
+            upstream_failed: false,
+            live_turn: latest_turn_is_live(conn, job_id).await?,
+            turn_failed: matches!(turn, Some(TurnState::Failed)),
+            turn_complete: matches!(turn, Some(TurnState::Complete)),
+            checkpoint: CheckpointGate::None,
+            resolution: Resolution::Pending,
+            requires_output,
+            artifact_present,
+            long_running: false,
+        }
     };
     let derived = derive_job_status(&facts);
     // Only write a packet-resolving terminal. A live turn (still running) or a
@@ -911,6 +1008,17 @@ pub(crate) async fn reduce_delegated_child_job_conn(
     }
     check_reachable(&current, &derived, job_id);
     write_job_status(conn, job_id, &current, &derived).await?;
+    // A standalone workflow's terminal status must roll up into its OWN execution
+    // + issue anchor. A delegated child's execution is recomputed by the resuming
+    // caller's turn-end sweep instead; a standalone workflow has no caller, so
+    // without this its anchor issue/execution would stay `running` forever after
+    // the node terminalizes.
+    if is_standalone_workflow {
+        recompute_execution_status_conn(conn, &execution_id).await?;
+        if let Some(issue_id) = execution_issue_id_conn(conn, &execution_id).await? {
+            recompute_issue_status_conn(conn, &issue_id).await?;
+        }
+    }
     Ok(Some(derived))
 }
 
@@ -2056,7 +2164,7 @@ mod port_gate_tests {
         NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
         RecipeTrigger, TriggerContext, TriggerType,
     };
-    use crate::storage::{DbError, LocalDb, MigrationRunner, TURSO_MIGRATIONS};
+    use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
     use std::collections::HashMap;
 
     async fn test_db() -> LocalDb {
@@ -2269,5 +2377,139 @@ mod port_gate_tests {
         assert_eq!(confirmed.output_name.as_deref(), Some("plan"));
         // Gate now resolves -> the job completes.
         assert_eq!(planner_status(&db).await, JobStatus::Complete);
+    }
+
+    // ------------------------------------------------------------------
+    // Turn-less ephemeral CALL reduction (CAIRN-2677 bug 2)
+    //
+    // A node-less ephemeral call establishes NO DB turn, so its job status can't
+    // be derived from turn facts and used to spin `running` forever after the run
+    // finalized. `reduce_delegated_child_job_conn` must derive completion from the
+    // run outcome + the return artifact (the call's completion contract) instead.
+    // ------------------------------------------------------------------
+
+    /// Seed an execution snapshot carrying a materialized CallTool packet whose
+    /// result job is `j-call`, plus the node-less call job, a run with
+    /// `run_status`, and optionally its return artifact. NO turn is created — the
+    /// exact turn-less shape the reduction must handle.
+    async fn seed_call_child(db: &LocalDb, run_status: &str, has_artifact: bool) {
+        let contract =
+            crate::execution::delegation::resolve_delegated_output_contract(None).unwrap();
+        let artifact_name = contract.artifact_name();
+        let mut snap = ExecutionSnapshot {
+            recipe: RecipeSnapshot {
+                id: "recipe-1".to_string(),
+                name: "R".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![],
+                edges: vec![],
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: Some("i-1".to_string()),
+                project_id: "p-1".to_string(),
+                trigger_type: TriggerType::Manual,
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 1,
+        };
+        crate::execution::delegation::create_call_packet(
+            &mut snap,
+            crate::execution::delegation::CreateCallPacketInput {
+                parent_job_id: "j-wf",
+                parent_turn_id: None,
+                parent_tool_use_id: None,
+                title: "call",
+                problem_statement: "do it",
+                agent_config_id: "Explore",
+                cwd: "/tmp",
+                output_contract: contract,
+                result_artifact_job_id: "j-call",
+                task_index: Some(0),
+                tier_override: None,
+                backend_preference: None,
+                background: false,
+            },
+        );
+        let snapshot = snap.to_json().unwrap();
+        let run_status = run_status.to_string();
+        db.write(move |conn| {
+            let snapshot = snapshot.clone();
+            let run_status = run_status.clone();
+            let artifact_name = artifact_name.clone();
+            Box::pin(async move {
+                conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
+                conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot.as_str(),)).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-wf','e-1','i-1','p-1','running','flow','Flow',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, parent_job_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-call','e-1','j-wf','i-1','p-1','running','c1','Call','Explore',1,1)", ()).await?;
+                conn.execute("INSERT INTO runs (id, job_id, issue_id, status, created_at, updated_at) VALUES ('r-call','j-call','i-1',?1,1,1)", (run_status.as_str(),)).await?;
+                if has_artifact {
+                    conn.execute("INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at) VALUES ('a1','j-call',?1,1,'{}',1,?1,1,1)", (artifact_name.as_str(),)).await?;
+                }
+                Ok::<_, DbError>(())
+            })
+        }).await.unwrap();
+    }
+
+    async fn reduce_call(db: &LocalDb) -> Option<JobStatus> {
+        db.write(|conn| {
+            Box::pin(async move { super::reduce_delegated_child_job_conn(conn, "j-call").await })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn call_job_status(db: &LocalDb) -> Option<String> {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query("SELECT status FROM jobs WHERE id = 'j-call'", ())
+                    .await?;
+                Ok(rows.next().await?.and_then(|r| r.text(0).ok()))
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn turnless_call_with_artifact_completes_even_when_run_crashed() {
+        // The call wrote its return artifact but its CLI stream crashed. The job
+        // must terminalize Complete — the artifact IS the completion contract — not
+        // spin `running` forever (CAIRN-2677 bug 2 compounding bug 1).
+        let db = test_db().await;
+        seed_call_child(&db, "crashed", true).await;
+        assert_eq!(reduce_call(&db).await, Some(JobStatus::Complete));
+        assert_eq!(call_job_status(&db).await.as_deref(), Some("complete"));
+    }
+
+    #[tokio::test]
+    async fn turnless_call_with_artifact_completes_on_clean_exit() {
+        let db = test_db().await;
+        seed_call_child(&db, "exited", true).await;
+        assert_eq!(reduce_call(&db).await, Some(JobStatus::Complete));
+    }
+
+    #[tokio::test]
+    async fn turnless_call_terminal_without_artifact_fails() {
+        let db = test_db().await;
+        seed_call_child(&db, "exited", false).await;
+        assert_eq!(reduce_call(&db).await, Some(JobStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn turnless_call_with_live_run_stays_running() {
+        // Still working (no artifact, run non-terminal): leave it running.
+        let db = test_db().await;
+        seed_call_child(&db, "live", false).await;
+        assert_eq!(reduce_call(&db).await, None);
+        assert_eq!(call_job_status(&db).await.as_deref(), Some("running"));
     }
 }

@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{interval, sleep, Duration, MissedTickBehavior};
+use tracing::Instrument;
 
 use super::client::{EmbeddingClient, InputType, COHERE_DIMS, COHERE_MODEL};
 use super::position::{EvictionFlush, PositionConfig, PositionEngine, PositionKind, PositionMeta};
@@ -116,7 +117,12 @@ pub fn spawn_embed_worker(
                             }
                         }
                     }
-                    process_batch(&client, &dbs, vibe_state.as_deref(), &emitter, &mut engine, batch).await;
+                    let batch_size = batch.len();
+                    process_batch(&client, &dbs, vibe_state.as_deref(), &emitter, &mut engine, batch)
+                        .instrument(
+                            tracing::info_span!(target: "profiler", "embed_batch", size = batch_size),
+                        )
+                        .await;
                     if closed {
                         apply_flush(&dbs.local, engine.drain_all()).await;
                         break;

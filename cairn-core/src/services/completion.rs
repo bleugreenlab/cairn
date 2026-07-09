@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub struct CompletionRequest {
     /// The prompt text to send.
     pub prompt: String,
-    /// Model identifier (e.g. "haiku", "gpt-5.4-mini").
+    /// Model identifier (e.g. "haiku", "gpt-5.6-luna").
     pub model: Option<String>,
     /// Backend override ("claude", "codex"). Inferred from model if absent.
     pub backend: Option<String>,
@@ -104,7 +104,7 @@ impl DispatchingCompletionService {
 
     fn complete_codex(&self, request: &CompletionRequest) -> Result<CompletionResponse, String> {
         let binary = crate::env::find_binary("codex")?;
-        let model = request.model.as_deref().unwrap_or(Model::GPT_5_4_MINI);
+        let model = request.model.as_deref().unwrap_or(Model::GPT_5_6_LUNA);
 
         let mut config = SpawnConfig::new(&binary).args([
             "exec",
@@ -293,7 +293,7 @@ mod tests {
 
     #[test]
     fn dispatching_routes_codex_models() {
-        assert_eq!(backend_for_model("gpt-5.4-mini"), Some("codex"));
-        assert_eq!(backend_for_model("gpt-5.4"), Some("codex"));
+        assert_eq!(backend_for_model("gpt-5.6-luna"), Some("codex"));
+        assert_eq!(backend_for_model("gpt-5.6-sol"), Some("codex"));
     }
 }

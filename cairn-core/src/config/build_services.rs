@@ -149,14 +149,34 @@ impl BuildServiceConfig {
     }
 }
 
+/// The TCP port Cairn's supervised sccache daemon listens on. Deliberately one
+/// above sccache's own default (4226): an UNFENCED build — the developer's main
+/// checkout or CI — injects no service env and so falls through to sccache's 4226
+/// default, starting its OWN unconfined server, rather than attaching to this
+/// confined daemon and being denied the server-side miss-compile write into a
+/// `target/` the service sandbox doesn't cover. See `default_sccache_service`.
+const CAIRN_SCCACHE_PORT: u16 = 4227;
+
+/// The confined daemon's cache/state dir. Off sccache's default
+/// `$HOME/.cache/sccache` (which an unfenced build's own server keeps) so a
+/// confined and an unconfined server never share one on-disk cache — sccache
+/// assumes a single server per dir.
+const CAIRN_SCCACHE_DIR: &str = "{home}/.cache/sccache-cairn";
+
 /// The built-in default sccache build service, used when no `buildServices` are
 /// configured. The supervisor only launches it when `sccache` is on `PATH`, so
 /// it is a safe, zero-config default that fixes the cross-worktree sccache EPERM
 /// out of the box. Values use templates so they resolve per host.
 ///
-/// Port and cache dir mirror `scripts/cache-wrapper.sh`'s defaults (4226,
-/// `$HOME/.cache/sccache`) so the Cairn-launched daemon and the client wrapper
-/// agree without further configuration.
+/// Port and cache dir deliberately DIVERGE from sccache's own defaults (4226,
+/// `$HOME/.cache/sccache`), which `scripts/cache-wrapper.sh` also falls back to
+/// (see `CAIRN_SCCACHE_PORT` / `CAIRN_SCCACHE_DIR`). This confined daemon listens
+/// on a Cairn-specific port and cache dir and injects them into fenced agent
+/// spawns (and the check-isolation compiles), so their tooling finds it; an
+/// unfenced build injects nothing and keeps sccache's defaults, starting its own
+/// unconfined server. Without that split an unfenced main-checkout build would
+/// attach to this daemon (sccache is one-server-per-port) and EPERM when the
+/// daemon's sandboxed miss-compile tried to write into the checkout's `target/`.
 ///
 /// The `RUSTC_WRAPPER` / `CARGO_BUILD_RUSTC_WRAPPER` env points every fenced
 /// cargo invocation at the wrapper installed at `{cairnHome}/bin/cache-wrapper.sh`
@@ -199,11 +219,11 @@ impl BuildServiceConfig {
 /// [`crate::execution::worktree_gc`]).
 pub fn default_sccache_service() -> BuildServiceConfig {
     let mut env = HashMap::new();
-    env.insert("SCCACHE_SERVER_PORT".to_string(), "4226".to_string());
     env.insert(
-        "SCCACHE_DIR".to_string(),
-        "{home}/.cache/sccache".to_string(),
+        "SCCACHE_SERVER_PORT".to_string(),
+        CAIRN_SCCACHE_PORT.to_string(),
     );
+    env.insert("SCCACHE_DIR".to_string(), CAIRN_SCCACHE_DIR.to_string());
     env.insert("SCCACHE_CACHE_SIZE".to_string(), "50G".to_string());
     // Never idle out: the default 600 s idle timeout kills the supervised daemon
     // between builds, and the client wrapper silently degrades to uncached compiles.
@@ -239,7 +259,7 @@ pub fn default_sccache_service() -> BuildServiceConfig {
     // that is the only path the service sandbox lets the daemon write.
     launch_env.insert(
         "SCCACHE_ERROR_LOG".to_string(),
-        "{home}/.cache/sccache/sccache-error.log".to_string(),
+        format!("{CAIRN_SCCACHE_DIR}/sccache-error.log"),
     );
     launch_env.insert("SCCACHE_LOG".to_string(), "warn".to_string());
 
@@ -250,7 +270,7 @@ pub fn default_sccache_service() -> BuildServiceConfig {
         // detached daemon Cairn could not supervise or kill by handle.
         start: vec!["sccache".to_string()],
         ready: Some(ReadyProbe {
-            tcp: Some("127.0.0.1:4226".to_string()),
+            tcp: Some(format!("127.0.0.1:{CAIRN_SCCACHE_PORT}")),
             command: None,
             // A wedged sccache server still accepts the TCP connect, then blocks
             // the client's request read forever (no per-request timeout). The
@@ -258,7 +278,7 @@ pub fn default_sccache_service() -> BuildServiceConfig {
             // request/response that hangs identically against a wedged server.
             round_trip: Some(vec!["sccache".to_string(), "--show-stats".to_string()]),
         }),
-        state_dir: Some("{home}/.cache/sccache".to_string()),
+        state_dir: Some(CAIRN_SCCACHE_DIR.to_string()),
         // Writable grant for the confined shared daemon. A cache-MISS compile is
         // run by the server (not the unconfined client), so the server's spawned
         // rustc must be allowed to write the artifact + dep-info into the target
@@ -386,11 +406,11 @@ env:
         );
         assert_eq!(
             svc.expanded_state_dir(&t),
-            Some(PathBuf::from("/home/u/.cache/sccache"))
+            Some(PathBuf::from("/home/u/.cache/sccache-cairn"))
         );
         assert_eq!(
             svc.expanded_env(&t).get("SCCACHE_DIR").map(String::as_str),
-            Some("/home/u/.cache/sccache")
+            Some("/home/u/.cache/sccache-cairn")
         );
     }
 
@@ -466,7 +486,7 @@ env:
         let launch = svc.expanded_launch_env(&templates());
         assert_eq!(
             launch.get("SCCACHE_ERROR_LOG").map(String::as_str),
-            Some("/home/u/.cache/sccache/sccache-error.log")
+            Some("/home/u/.cache/sccache-cairn/sccache-error.log")
         );
         let state = svc.expanded_state_dir(&templates()).unwrap();
         assert!(launch["SCCACHE_ERROR_LOG"].starts_with(state.to_str().unwrap()));
@@ -493,7 +513,7 @@ env:
         // connect: a wedged server still accepts the connect. --show-stats is that
         // round-trip.
         let probe = default_sccache_service().ready.unwrap();
-        assert_eq!(probe.tcp.as_deref(), Some("127.0.0.1:4226"));
+        assert_eq!(probe.tcp.as_deref(), Some("127.0.0.1:4227"));
         assert_eq!(
             probe.round_trip,
             Some(vec!["sccache".to_string(), "--show-stats".to_string()])
@@ -508,5 +528,25 @@ env:
         // bounds the resulting incremental-cache disk growth instead.
         let env = default_sccache_service().expanded_env(&templates());
         assert_eq!(env.get("CARGO_INCREMENTAL"), None);
+    }
+
+    #[test]
+    fn default_sccache_service_diverges_from_sccache_defaults() {
+        // The confined daemon MUST NOT sit on sccache's own default port/cache dir
+        // (4226, $HOME/.cache/sccache). An unfenced build — the developer's main
+        // checkout, or CI — injects no service env and falls through to those
+        // defaults, starting its OWN unconfined server. If this daemon shared them,
+        // that build would attach to the confined daemon (one server per port) and
+        // EPERM when its sandboxed miss-compile wrote into a target/ outside the
+        // worktree/check-clone grant. See default_sccache_service.
+        let env = default_sccache_service().expanded_env(&templates());
+        assert_ne!(
+            env.get("SCCACHE_SERVER_PORT").map(String::as_str),
+            Some("4226")
+        );
+        assert_ne!(
+            env.get("SCCACHE_DIR").map(String::as_str),
+            Some("/home/u/.cache/sccache")
+        );
     }
 }

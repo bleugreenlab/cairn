@@ -158,6 +158,61 @@ pub async fn list_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<Artifact
     .map_err(|e| db_error("Failed to list artifacts for issue", e))
 }
 
+/// Raw stored `data` JSON of a node-less call's CONTRACTED return artifact.
+///
+/// The return artifact IS an ephemeral call's completion contract, so the two
+/// result-delivery seams — the synchronous `?wait` behind the harness `agent()`
+/// await (`resources::node::terminal_call_body`) and the replay journal
+/// (`orchestrator::lifecycle::maybe_journal_call_result`) — must read the artifact
+/// the call was contracted to write, keyed on
+/// `output_name = output_contract.artifact_name()`, NOT just any artifact the run
+/// happened to produce. A call that wrote some other named artifact but never its
+/// `return` must resolve to failure, not that unrelated row (CAIRN-2677). Falls
+/// back to the latest artifact overall ONLY when the job carries no
+/// `output_contract` (a legacy/non-call case that never named one).
+pub(crate) async fn contracted_return_artifact_data(db: &LocalDb, job_id: &str) -> Option<String> {
+    let required_name = db
+        .query_opt_text(
+            "SELECT output_contract FROM jobs WHERE id = ?1",
+            (job_id.to_string(),),
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<crate::models::DelegatedOutputContract>(&json).ok())
+        .map(|contract| contract.artifact_name());
+
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        let required_name = required_name.clone();
+        Box::pin(async move {
+            let mut rows = match required_name {
+                Some(name) => {
+                    conn.query(
+                        "SELECT data FROM artifacts WHERE job_id = ?1 AND output_name = ?2 \
+                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        params![job_id.as_str(), name.as_str()],
+                    )
+                    .await?
+                }
+                None => {
+                    conn.query(
+                        "SELECT data FROM artifacts WHERE job_id = ?1 \
+                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        params![job_id.as_str()],
+                    )
+                    .await?
+                }
+            };
+            Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 mod latest_recency_tests {
     use super::*;
@@ -246,6 +301,59 @@ mod latest_recency_tests {
         assert_eq!(pr.version, 1);
 
         assert!(get_named(&db, "j", "missing").await.unwrap().is_none());
+    }
+
+    /// Persist a node-less call's default `return` output contract on job `j` and
+    /// return the contracted artifact name.
+    async fn set_return_contract(db: &LocalDb) -> String {
+        let contract =
+            crate::execution::delegation::resolve_delegated_output_contract(None).unwrap();
+        let name = contract.artifact_name();
+        let json = serde_json::to_string(&contract).unwrap();
+        db.execute(
+            "UPDATE jobs SET output_contract = ?1 WHERE id = 'j'",
+            params![json.as_str()],
+        )
+        .await
+        .unwrap();
+        name
+    }
+
+    #[tokio::test]
+    async fn contracted_read_returns_the_return_artifact() {
+        // A call under its return contract that wrote `return` resolves with it.
+        let db = crate::storage::migrated_test_db("contracted-return.db").await;
+        seed_job(&db).await;
+        let name = set_return_contract(&db).await;
+        insert_artifact(&db, "a1", &name, 1, 1).await;
+        assert_eq!(
+            contracted_return_artifact_data(&db, "j").await.as_deref(),
+            Some("{}")
+        );
+    }
+
+    #[tokio::test]
+    async fn contracted_read_ignores_a_non_return_artifact() {
+        // A call under its return contract that wrote a DIFFERENT named artifact
+        // (e.g. `plan`) but never `return` must resolve to failure (None here),
+        // not that unrelated row — the review gap this closes (CAIRN-2677).
+        let db = crate::storage::migrated_test_db("contracted-non-return.db").await;
+        seed_job(&db).await;
+        set_return_contract(&db).await;
+        insert_artifact(&db, "a1", "plan", 1, 1).await;
+        assert_eq!(contracted_return_artifact_data(&db, "j").await, None);
+    }
+
+    #[tokio::test]
+    async fn contracted_read_falls_back_when_job_has_no_contract() {
+        // A job with no persisted output_contract falls back to any artifact.
+        let db = crate::storage::migrated_test_db("contracted-fallback.db").await;
+        seed_job(&db).await;
+        insert_artifact(&db, "a1", "answer", 1, 1).await;
+        assert_eq!(
+            contracted_return_artifact_data(&db, "j").await.as_deref(),
+            Some("{}")
+        );
     }
 
     #[tokio::test]

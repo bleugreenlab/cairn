@@ -334,6 +334,9 @@ impl Orchestrator {
                 .1,
             );
         }
+        if entity_type.is_none() || entity_type == Some("workflow") {
+            invalid.extend(self.list_invalid_workflow_configs(workspace_id, project_id)?);
+        }
         Ok(invalid)
     }
 }

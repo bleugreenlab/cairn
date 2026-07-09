@@ -86,6 +86,14 @@ pub async fn resolve_pr_node(
         }
     };
 
+    // The PR is now merged/closed — quit any in-flight turn-end review suite for
+    // this issue so a minutes-long run does not keep burning CPU validating a tree
+    // that will never be reviewed again (CAIRN-2648).
+    if let Some(issue_id) = merge_context.issue_id.as_deref() {
+        crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(orch, &db, issue_id)
+            .await;
+    }
+
     if let Some(issue_id) = merge_context.issue_id.as_deref() {
         if merge_context.has_triage_batch {
             let result = match resolution {

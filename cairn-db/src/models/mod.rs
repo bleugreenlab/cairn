@@ -33,6 +33,7 @@ mod toolkit;
 mod trigger_event;
 mod turn;
 pub mod webhook;
+mod workflow;
 mod workspace;
 
 // Common enums
@@ -137,6 +138,9 @@ pub use action::{
 
 // Skill config types
 pub use skill::{CreateSkillConfig, SkillConfig, UpdateSkillConfig};
+
+// Workflow config types (settings surface)
+pub use workflow::{SaveWorkflowConfig, WorkflowConfig, WorkflowConfigDetail};
 
 // Execution snapshot types
 pub use snapshot::{

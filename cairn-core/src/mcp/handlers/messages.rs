@@ -270,7 +270,7 @@ pub async fn append_project_or_issue_message(
         ),
     };
 
-    let msg = msg_db::insert_message(
+    msg_db::insert_message(
         &owning_db,
         &channel_type,
         Some(channel_id.as_str()),
@@ -285,8 +285,6 @@ pub async fn append_project_or_issue_message(
         "db-change",
         serde_json::json!({"table": "messages", "action": "insert"}),
     );
-
-    delivery::deliver(orch, &msg);
 
     if let Some(number) = issue_number {
         let exclude_job_id = super::run_context::lookup_run(&orch.db.local, request)
@@ -407,8 +405,6 @@ async fn append_external_reply(
         "db-change",
         serde_json::json!({"table": "messages", "action": "insert"}),
     );
-
-    delivery::deliver(orch, &msg);
 
     if let Err(error) =
         crate::messages::side_channel::record_issue_message_side_channel_by_issue_number(
@@ -823,7 +819,7 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
                 Ok(channel_id) => channel_id,
                 Err(e) => return e,
             };
-            let msg = match msg_db::insert_message(
+            if let Err(e) = msg_db::insert_message(
                 &orch.db.local,
                 &ChannelType::Project,
                 Some(&project_key),
@@ -832,18 +828,14 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
                 None,
                 &payload.content,
             ) {
-                Ok(m) => m,
-                Err(e) => return format!("Failed to send message: {}", e),
-            };
+                return format!("Failed to send message: {}", e);
+            }
 
             // Emit db-change event
             let _ = orch.services.emitter.emit(
                 "db-change",
                 serde_json::json!({"table": "messages", "action": "insert"}),
             );
-
-            // Deliver to inboxes
-            delivery::deliver(orch, &msg);
 
             "Sent to project channel".to_string()
         }
@@ -856,7 +848,7 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
                     Ok(channel_id) => channel_id,
                     Err(e) => return e,
                 };
-            let msg = match msg_db::insert_message(
+            if let Err(e) = msg_db::insert_message(
                 &orch.db.local,
                 &ChannelType::Issue,
                 Some(&issue_key),
@@ -865,16 +857,13 @@ pub async fn handle_message(orch: &Orchestrator, request: &McpCallbackRequest) -
                 None,
                 &payload.content,
             ) {
-                Ok(m) => m,
-                Err(e) => return format!("Failed to send message: {}", e),
-            };
+                return format!("Failed to send message: {}", e);
+            }
 
             let _ = orch.services.emitter.emit(
                 "db-change",
                 serde_json::json!({"table": "messages", "action": "insert"}),
             );
-
-            delivery::deliver(orch, &msg);
 
             if let Err(error) =
                 crate::messages::side_channel::record_issue_message_side_channel_by_issue_number(

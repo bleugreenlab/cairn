@@ -22,10 +22,11 @@ pub mod session;
 pub mod settings;
 pub mod skills;
 pub mod wakes;
+pub mod workflow_configs;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
@@ -334,8 +335,61 @@ impl OrchestratorBuilder {
             setup_registry: Arc::new(Mutex::new(HashMap::new())),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
-            turn_end_checks_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
+        }
+    }
+}
+
+/// A one-shot cancellation handle for an in-flight turn-end (`when:review`) check
+/// suite. Cloneable so the runner holds one clone while the in-flight registry
+/// holds another; a merge/close pulling [`Orchestrator::cancel_turn_end_checks`]
+/// wakes the runner's `select!`, which drops the suite (killing any running check
+/// through its process's kill-on-drop guard). The `AtomicBool` is the source of
+/// truth — re-checked around the wait — so the `Notify` wakeup can never be lost.
+#[derive(Clone)]
+pub struct TurnEndCancel {
+    inner: Arc<TurnEndCancelInner>,
+}
+
+struct TurnEndCancelInner {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Default for TurnEndCancel {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(TurnEndCancelInner {
+                cancelled: AtomicBool::new(false),
+                notify: tokio::sync::Notify::new(),
+            }),
+        }
+    }
+}
+
+impl TurnEndCancel {
+    /// Signal cancellation. Idempotent.
+    pub fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::SeqCst);
+        // `notify_one` stores a permit when no waiter is parked, so a cancel that
+        // races just ahead of the runner's `cancelled().await` is not lost.
+        self.inner.notify.notify_one();
+    }
+
+    /// Whether cancellation has been signalled.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolve as soon as cancellation is signalled — immediately when already
+    /// cancelled, otherwise when [`Self::cancel`] next fires.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            self.inner.notify.notified().await;
         }
     }
 }
@@ -461,11 +515,13 @@ pub struct Orchestrator {
     pub jj_binary_path: String,
     /// Directory for writing MCP config files
     pub config_dir: PathBuf,
-    /// Job ids with an in-flight turn-end (`when:idle`/`when:review`) check run.
-    /// Single-flight guard so a rapid re-idle does not stack suites, and the
-    /// signal the PR-node / `/checks` render reads to show a "running" state.
+    /// Job ids with an in-flight turn-end (`when:idle`/`when:review`) check run,
+    /// each mapped to its cancellation handle. Single-flight guard so a rapid
+    /// re-idle does not stack suites; the signal the PR-node / `/checks` render
+    /// reads to show a "running" state; and the lever a merge/close pulls to quit a
+    /// minutes-long suite mid-flight ([`Orchestrator::cancel_turn_end_checks`]).
     /// Runtime-only; never persisted.
-    pub turn_end_checks_in_flight: Arc<Mutex<HashSet<String>>>,
+    pub turn_end_checks_in_flight: Arc<Mutex<HashMap<String, TurnEndCancel>>>,
     /// Pool of long-lived Codex app-servers for EPHEMERAL CALLS (CAIRN-2549).
     /// Each pooled call is a `thread/start` on a shared process rather than a
     /// process of its own. Deliberately owned HERE and NOT in
@@ -817,21 +873,25 @@ impl Orchestrator {
         }
     }
 
-    /// Claim the turn-end-check single-flight slot for a job. Returns `true` when
-    /// this call newly claimed it (no run was already in flight), `false` when a
-    /// run is already active for the job — in which case the caller must NOT spawn
-    /// another suite. The claim is released with [`Self::end_turn_end_checks`].
-    pub fn try_begin_turn_end_checks(&self, job_id: &str) -> bool {
-        self.turn_end_checks_in_flight
-            .lock()
-            .map(|mut set| set.insert(job_id.to_string()))
-            .unwrap_or(false)
+    /// Claim the turn-end-check single-flight slot for a job. Returns the job's
+    /// [`TurnEndCancel`] handle when this call newly claimed the slot (no run was
+    /// already in flight), or `None` when a run is already active for the job — in
+    /// which case the caller must NOT spawn another suite. The claim is released
+    /// with [`Self::end_turn_end_checks`].
+    pub fn try_begin_turn_end_checks(&self, job_id: &str) -> Option<TurnEndCancel> {
+        let mut map = self.turn_end_checks_in_flight.lock().ok()?;
+        if map.contains_key(job_id) {
+            return None;
+        }
+        let cancel = TurnEndCancel::default();
+        map.insert(job_id.to_string(), cancel.clone());
+        Some(cancel)
     }
 
     /// Release the turn-end-check single-flight slot for a job. Idempotent.
     pub fn end_turn_end_checks(&self, job_id: &str) {
-        if let Ok(mut set) = self.turn_end_checks_in_flight.lock() {
-            set.remove(job_id);
+        if let Ok(mut map) = self.turn_end_checks_in_flight.lock() {
+            map.remove(job_id);
         }
     }
 
@@ -840,8 +900,21 @@ impl Orchestrator {
     pub fn turn_end_checks_in_flight(&self, job_id: &str) -> bool {
         self.turn_end_checks_in_flight
             .lock()
-            .map(|set| set.contains(job_id))
+            .map(|map| map.contains_key(job_id))
             .unwrap_or(false)
+    }
+
+    /// Signal any in-flight turn-end check suite for `job_id` to quit. Best-effort
+    /// and idempotent: a no-op when no suite is in flight for the job. Fired when
+    /// the job's issue reaches a terminal (merged/closed) state so a minutes-long
+    /// review suite does not keep burning CPU against a tree nobody will look at
+    /// again (CAIRN-2648).
+    pub fn cancel_turn_end_checks(&self, job_id: &str) {
+        if let Ok(map) = self.turn_end_checks_in_flight.lock() {
+            if let Some(cancel) = map.get(job_id) {
+                cancel.cancel();
+            }
+        }
     }
 
     /// Token provider for the `/embed` gateway: prefers the connected account's
@@ -908,9 +981,12 @@ impl Orchestrator {
         const INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
         let orch = self.clone();
         tokio::spawn(async move {
+            use tracing::Instrument as _;
             tokio::time::sleep(STARTUP_DELAY).await;
             loop {
-                crate::execution::worktree_gc::run_worktree_gc(&orch).await;
+                crate::execution::worktree_gc::run_worktree_gc(&orch)
+                    .instrument(tracing::info_span!(target: "profiler", "worktree_gc"))
+                    .await;
                 tokio::time::sleep(INTERVAL).await;
             }
         });
@@ -1439,6 +1515,7 @@ impl Orchestrator {
                 // Off the async worker: the eviction lookup and kills block on
                 // DB round-trips, so keep the runtime responsive.
                 if let Err(error) = tokio::task::spawn_blocking(move || {
+                    let _span = tracing::info_span!(target: "profiler", "warm_sweep").entered();
                     orch.collect_warm(false);
                     if let Some(gc) = orch.warm_gc.as_ref() {
                         gc.cleanup_stale_views();

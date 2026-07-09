@@ -14,6 +14,7 @@ mod action_runs;
 mod artifact_seen;
 mod condition;
 mod config_scope;
+mod continue_job_queue;
 mod ctx_self_lifecycle;
 mod effects_checkpoint;
 mod effects_checkpoint_loop;

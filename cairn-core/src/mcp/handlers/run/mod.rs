@@ -473,6 +473,15 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // compact inline pass/fail line. Gated on an actually-landed commit
     // (`committed` is true only with commit_msg + a successful seal).
     if barrier.committed {
+        // A commit just sealed → the branch advanced. Cancel any in-flight
+        // when:review suite for this job so its heavy concurrent compiles stop
+        // starving this commit's own when:write checks (below) and the agent's
+        // next manual check run; the review cadence relaunches fresh at the next
+        // turn-end. See cancel_stale_review_on_branch_advance for the rationale
+        // and the deliberate job-id scoping.
+        if let Some(ctx) = run_context.as_ref() {
+            crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &ctx.job_id);
+        }
         if let Some(summary) = crate::execution::checks::run_write_checks_after_seal(
             orch,
             run_context.as_ref(),

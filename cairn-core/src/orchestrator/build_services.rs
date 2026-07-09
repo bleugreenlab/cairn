@@ -589,11 +589,11 @@ mod tests {
         let env = merge_client_env(&services, &templates());
         assert_eq!(
             env.get("SCCACHE_SERVER_PORT").map(String::as_str),
-            Some("4226")
+            Some("4227")
         );
         assert_eq!(
             env.get("SCCACHE_DIR").map(String::as_str),
-            Some("/home/u/.cache/sccache")
+            Some("/home/u/.cache/sccache-cairn")
         );
         // A disabled service contributes nothing, even unique keys.
         assert!(!env.contains_key("DISABLED_ONLY"));
@@ -610,7 +610,7 @@ mod tests {
         // The daemon's own env tells it where to listen/cache.
         assert_eq!(
             config.env.get("SCCACHE_DIR").map(String::as_str),
-            Some("/home/u/.cache/sccache")
+            Some("/home/u/.cache/sccache-cairn")
         );
         // Daemon-only launch env is applied to the daemon spawn so it runs the
         // in-process foreground server (killable via its supervised handle).
@@ -624,7 +624,7 @@ mod tests {
         );
         assert_eq!(
             config.env.get("SCCACHE_ERROR_LOG").map(String::as_str),
-            Some("/home/u/.cache/sccache/sccache-error.log")
+            Some("/home/u/.cache/sccache-cairn/sccache-error.log")
         );
         // Daemon pipes are not held open.
         assert!(!config.capture_stdout);
@@ -638,7 +638,7 @@ mod tests {
             let policy = config.sandbox.expect("service sandbox should be applied");
             assert!(policy
                 .writable_paths()
-                .contains(&PathBuf::from("/home/u/.cache/sccache")));
+                .contains(&PathBuf::from("/home/u/.cache/sccache-cairn")));
             assert_eq!(
                 policy.writable_regex,
                 vec![
@@ -659,7 +659,7 @@ mod tests {
                 cfg.program == "sccache"
                     && cfg.args.is_empty()
                     && cfg.env.get("SCCACHE_START_SERVER").map(String::as_str) == Some("1")
-                    && cfg.env.get("SCCACHE_SERVER_PORT").map(String::as_str) == Some("4226")
+                    && cfg.env.get("SCCACHE_SERVER_PORT").map(String::as_str) == Some("4227")
             })
             .returning(|_| Ok(Box::new(MockChildProcess::with_stdout(7, vec![]))));
 

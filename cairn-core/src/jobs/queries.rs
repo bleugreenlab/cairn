@@ -711,11 +711,16 @@ pub async fn node_status_indicators(
                 .query(
                     "SELECT
                         j.id,
-                        (SELECT t.state
-                           FROM turns t
-                          WHERE t.job_id = j.id
-                          ORDER BY t.sequence DESC
-                          LIMIT 1) AS head_turn_state,
+                        COALESCE(
+                            (SELECT ct.state
+                               FROM turns ct
+                              WHERE ct.id = j.current_turn_id),
+                            (SELECT t.state
+                               FROM turns t
+                              WHERE t.job_id = j.id
+                              ORDER BY t.created_at DESC, t.sequence DESC
+                              LIMIT 1)
+                        ) AS head_turn_state,
                         EXISTS (
                             SELECT 1 FROM prompts p
                              WHERE p.turn_id = j.current_turn_id
@@ -841,7 +846,9 @@ fn rollup_activity(activities: impl IntoIterator<Item = NodeActivity>) -> NodeAc
 /// Activity + agents are derived over the issue's CURRENT execution (highest
 /// `executions.seq`) using the same three facts as `node_status_indicators`
 /// (head-turn state, pending prompt, pending permission) via the shared
-/// `derive_node_activity`. The PR is the issue's most relevant `merge_requests`
+/// `derive_node_activity`. The head-turn state is read from `jobs.current_turn_id`
+/// first because turn sequence restarts on cold-resume reseed session rotation.
+/// The PR is the issue's most relevant `merge_requests`
 /// row scoped to that same current execution (an open one preferred, else the
 /// most recently updated), matched through BOTH supported ownership shapes:
 /// a row whose `job_id` is a current-execution job, or — the legacy first-class
@@ -897,11 +904,16 @@ pub async fn issue_status_indicators(
                         j.id AS job_id,
                         j.node_name,
                         j.agent_config_id,
-                        (SELECT t.state
-                           FROM turns t
-                          WHERE t.job_id = j.id
-                          ORDER BY t.sequence DESC
-                          LIMIT 1) AS head_turn_state,
+                        COALESCE(
+                            (SELECT ct.state
+                               FROM turns ct
+                              WHERE ct.id = j.current_turn_id),
+                            (SELECT t.state
+                               FROM turns t
+                              WHERE t.job_id = j.id
+                              ORDER BY t.created_at DESC, t.sequence DESC
+                              LIMIT 1)
+                        ) AS head_turn_state,
                         EXISTS (
                             SELECT 1 FROM prompts p
                              WHERE p.turn_id = j.current_turn_id
@@ -1240,6 +1252,20 @@ mod tests {
              VALUES ('t-task', 's-task', 'task-1', 1, 'running', 'initial', 1, 1)",
         )
         .await;
+        // Cold-resume reseed rotates to a fresh session whose turn sequence starts
+        // at 1 again. The current pointer, not max(sequence), is the durable head.
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-reseed-old', 's-reseed-old', 'j-reseed', 9, 'complete', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-reseed-new', 's-reseed-new', 'j-reseed', 1, 'running', 'follow_up', 2, 2)",
+        )
+        .await;
 
         // Jobs. j-none has no turn at all; task-1 is a child job (still in the strip).
         exec(
@@ -1278,6 +1304,12 @@ mod tests {
              VALUES ('task-1', 'e', 'j-run', 'i', 'p', 'Task', 'running', 1, 1, 'task')",
         )
         .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, current_turn_id)
+             VALUES ('j-reseed', 'e', 'i', 'p', 'Reseed', 'running', 1, 1, 'reseed', 't-reseed-new')",
+        )
+        .await;
 
         // Runs back the prompt (run_id NOT NULL) and the permission (COALESCE
         // falls back to r.job_id when pr.job_id is NULL).
@@ -1312,13 +1344,14 @@ mod tests {
             .map(|indicator| (indicator.job_id, indicator.activity))
             .collect();
 
-        assert_eq!(by_job.len(), 6, "every job in the execution is reported");
+        assert_eq!(by_job.len(), 7, "every job in the execution is reported");
         assert_eq!(by_job["j-run"], NodeActivity::Running);
         assert_eq!(by_job["j-idle"], NodeActivity::Idle);
         assert_eq!(by_job["j-prompt"], NodeActivity::AwaitingInput);
         assert_eq!(by_job["j-perm"], NodeActivity::AwaitingInput);
         assert_eq!(by_job["j-none"], NodeActivity::Idle);
         assert_eq!(by_job["task-1"], NodeActivity::Running);
+        assert_eq!(by_job["j-reseed"], NodeActivity::Running);
     }
 
     #[tokio::test]
@@ -1385,6 +1418,38 @@ mod tests {
         assert_eq!(ind.agents[0].job_id, "j-run");
         assert_eq!(ind.agents[0].node_name.as_deref(), Some("Builder"));
         assert_eq!(ind.agents[0].agent_config_id.as_deref(), Some("agent-1"));
+        assert_eq!(ind.agents[0].activity, NodeActivity::Running);
+    }
+
+    #[tokio::test]
+    async fn issue_reseeded_session_uses_current_turn_not_highest_sequence() {
+        let db = test_db().await;
+        seed_active_issue(&db).await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-old', 's-old', 'j-reseed', 20, 'complete', 'initial', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('t-new', 's-new', 'j-reseed', 1, 'running', 'follow_up', 2, 2)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment, current_turn_id)
+             VALUES ('j-reseed', 'e', 'i', 'p', 'Builder', 'agent-1', 'running', 1, 1, 'reseed', 't-new')",
+        )
+        .await;
+
+        let indicators = issue_status_indicators(&db, "p").await.unwrap();
+        assert_eq!(indicators.len(), 1);
+        let ind = &indicators[0];
+        assert_eq!(ind.activity, NodeActivity::Running);
+        assert_eq!(ind.agents.len(), 1);
+        assert_eq!(ind.agents[0].job_id, "j-reseed");
         assert_eq!(ind.agents[0].activity, NodeActivity::Running);
     }
 

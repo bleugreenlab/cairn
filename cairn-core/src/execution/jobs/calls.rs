@@ -203,7 +203,7 @@ pub(crate) fn prepare_call_run(
             job_id: job_id.clone(),
             run_id: run_id.clone(),
             session_id: session_id.clone(),
-            parent_job_id: input.parent_job_id.clone(),
+            parent_job_id: Some(input.parent_job_id.clone()),
             worktree_path: worktree_path.clone(),
             // A call shares the parent's worktree (inherit from a worktree-backed
             // parent) or runs in a scratch dir (none mode) — branch None; or it
@@ -653,6 +653,41 @@ pub fn restart_call(orch: &Orchestrator, call_job_id: &str) -> Result<(), String
     let output_contract: crate::models::DelegatedOutputContract =
         serde_json::from_str(&contract_json)
             .map_err(|e| format!("Failed to parse call output contract: {e}"))?;
+
+    // Retry must be idempotent on the completion contract: if the call already
+    // wrote its return artifact, its work is DONE. A user-initiated stop must
+    // never resurrect a completed call, and re-running one would waste a model
+    // call and risk overwriting a finished result (CAIRN-2677 bug 3). Deliver the
+    // existing artifact instead of re-prompting: finalize the latest (possibly
+    // warm-parked or hung) run, and the artifact-first completion mapping journals
+    // it Success and resolves the parked `agent()` await.
+    let has_artifact = run_db({
+        let owning = owning.clone();
+        let call_job_id = call_job_id.to_string();
+        let artifact_name = output_contract.artifact_name();
+        async move {
+            owning
+                .query_opt_text(
+                    "SELECT id FROM artifacts WHERE job_id = ?1 AND output_name = ?2 LIMIT 1",
+                    (call_job_id, artifact_name),
+                )
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?
+    .is_some();
+    if has_artifact {
+        log::info!(
+            "restart_call: call {call_job_id} already wrote its return artifact; delivering it \
+             instead of re-running (finalizing run {old_run_id})"
+        );
+        crate::orchestrator::lifecycle::finalize_run(
+            orch,
+            &old_run_id,
+            crate::models::RunStatus::Exited,
+        );
+        return Ok(());
+    }
 
     let project_path = run_db(load_project_path(orch.db.clone(), job.project_id.clone()))?;
     let mut agent_config = load_agent_config(orch, &job, project_path.as_deref())?

@@ -18,7 +18,9 @@ impl Model {
     pub const OPUS: &str = "opus";
     pub const HAIKU: &str = "haiku";
     pub const FABLE: &str = "fable";
-    pub const GPT_5_4_MINI: &str = "gpt-5.4-mini";
+    pub const GPT_5_6_SOL: &str = "gpt-5.6-sol";
+    pub const GPT_5_6_TERRA: &str = "gpt-5.6-terra";
+    pub const GPT_5_6_LUNA: &str = "gpt-5.6-luna";
 
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -342,7 +344,7 @@ mod tests {
 /// A single preset: concrete model + backend-specific options.
 ///
 /// Presets are configured per-backend per-tier in workspace settings.
-/// Example: `codex/md` → `{ model: "gpt-5.3-codex", options: { reasoningEffort: "medium" } }`
+/// Example: `codex/md` → `{ model: "gpt-5.6-terra", options: { reasoningEffort: "medium" } }`
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", from = "PresetFile")]
 pub struct Preset {

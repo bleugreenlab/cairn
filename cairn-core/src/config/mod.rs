@@ -395,7 +395,26 @@ pub fn ensure_config_dirs(config_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) const BUNDLE_RESOURCE_DIRS: [&str; 3] = ["agents", "recipes", "skills"];
+/// Bundled resource subtrees seeded into a workspace on startup by the bundle
+/// sync (`workspace::bundle::sync_bundle_resources`) and folded into its
+/// content-hash marker. Flat dirs (`agents`, `recipes`) are per-file
+/// copy-when-missing with in-place bundle updates; package dirs (`skills`,
+/// `workflows`) are whole-directory copy-when-missing and never overwritten, so
+/// a user's edited package is preserved.
+///
+/// This is the NON-destructive provisioning set. The destructive
+/// "restore bundled defaults" reset uses the narrower [`MIRROR_RESET_DIRS`] —
+/// `workflows` is deliberately absent there so a restore can never wipe
+/// user-authored workflow packages.
+pub(crate) const BUNDLE_RESOURCE_DIRS: [&str; 4] = ["agents", "recipes", "skills", "workflows"];
+
+/// Managed subtrees the destructive "restore bundled defaults" command wipes and
+/// re-mirrors ([`mirror_bundle_resources_with_fs`]). A strict subset of
+/// [`BUNDLE_RESOURCE_DIRS`]: `workflows` is excluded because a workflow package
+/// is user-authorable and copy-when-missing everywhere else, so a wholesale
+/// reset must not delete `<CAIRN_HOME>/workflows`. A deleted built-in workflow
+/// is re-seeded non-destructively by the next startup sync instead.
+pub(crate) const MIRROR_RESET_DIRS: [&str; 3] = ["agents", "recipes", "skills"];
 
 /// Recursively mirror `source_dir` into `dest_dir`, replacing any existing destination tree.
 pub fn mirror_dir(source_dir: &Path, dest_dir: &Path) -> Result<(), String> {
@@ -403,10 +422,14 @@ pub fn mirror_dir(source_dir: &Path, dest_dir: &Path) -> Result<(), String> {
     mirror_dir_with_fs(&fs, source_dir, dest_dir)
 }
 
-/// Mirror bundled agents, recipes, and skills into `target_dir`.
+/// Mirror bundled agents, recipes, and skills into `target_dir`, resetting them
+/// to their shipped defaults.
 ///
-/// Only those three managed subtrees are deleted and replaced; sibling user-local
-/// files such as `.gitignore`, `settings.yaml`, and `AGENTS.md` are left alone.
+/// Only those three managed subtrees ([`MIRROR_RESET_DIRS`]) are deleted and
+/// replaced; sibling user-local files such as `.gitignore`, `settings.yaml`, and
+/// `AGENTS.md` are left alone — and so is `<CAIRN_HOME>/workflows`, since a
+/// wholesale reset must never delete user-authored workflow packages (they are
+/// re-seeded copy-when-missing by the startup sync).
 pub fn mirror_bundle_resources(resource_dir: &Path, target_dir: &Path) -> Result<(), String> {
     let fs = crate::services::RealFileSystem;
     mirror_bundle_resources_with_fs(&fs, resource_dir, target_dir)
@@ -418,7 +441,7 @@ pub(crate) fn mirror_bundle_resources_with_fs(
     target_dir: &Path,
 ) -> Result<(), String> {
     fs.create_dir_all(target_dir)?;
-    for dir_name in BUNDLE_RESOURCE_DIRS {
+    for dir_name in MIRROR_RESET_DIRS {
         let source = resource_dir.join(dir_name);
         let dest = target_dir.join(dir_name);
         if fs.exists(&dest) {
@@ -877,6 +900,56 @@ pub async fn get_recipe_as_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The destructive "restore bundled defaults" reset
+    /// ([`mirror_bundle_resources_with_fs`]) resets agents/recipes/skills to the
+    /// bundle but must NEVER touch `<CAIRN_HOME>/workflows` — a user's authored or
+    /// edited workflow package survives a restore. Guards the decoupling of the
+    /// provisioning set from the destructive reset set.
+    #[test]
+    fn restore_mirror_preserves_user_workflows() {
+        use crate::services::RealFileSystem;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().unwrap();
+        let resource_dir = temp.path().join("resources");
+        let home = temp.path().join("home");
+
+        // Bundle ships an agent and a workflow.
+        std::fs::create_dir_all(resource_dir.join("agents")).unwrap();
+        std::fs::write(resource_dir.join("agents/explore.md"), "bundle\n").unwrap();
+        std::fs::create_dir_all(resource_dir.join("workflows/fan-out")).unwrap();
+        std::fs::write(
+            resource_dir.join("workflows/fan-out/workflow.yaml"),
+            "name: Fan Out\ndescription: d\n",
+        )
+        .unwrap();
+
+        // Workspace has a user-authored workflow and an edited fan-out copy.
+        std::fs::create_dir_all(home.join("workflows/my-flow")).unwrap();
+        std::fs::write(
+            home.join("workflows/my-flow/workflow.yaml"),
+            "name: Mine\ndescription: user\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("workflows/fan-out")).unwrap();
+        std::fs::write(home.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
+
+        mirror_bundle_resources_with_fs(&RealFileSystem, &resource_dir, &home).unwrap();
+
+        // Agents were reset to the bundle…
+        assert_eq!(
+            std::fs::read_to_string(home.join("agents/explore.md")).unwrap(),
+            "bundle\n"
+        );
+        // …but every workflow package is untouched: the user-authored one still
+        // exists and the edited fan-out copy is not clobbered.
+        assert!(home.join("workflows/my-flow/workflow.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("workflows/fan-out/main.ts")).unwrap(),
+            "// user edit\n"
+        );
+    }
 
     #[test]
     fn test_slugify() {

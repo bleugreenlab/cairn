@@ -115,18 +115,28 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
         );
         return;
     }
-    // Claim the single-flight slot; a concurrent run for this job means skip.
-    if !orch.try_begin_turn_end_checks(job_id) {
-        log::debug!("turn-end checks for job {short}: skipped, a run is already in flight");
-        return;
-    }
+    // Claim the single-flight slot; a concurrent run for this job means skip. The
+    // returned handle is the lever a later merge/close pulls to quit this suite
+    // mid-flight (CAIRN-2648).
+    let cancel = match orch.try_begin_turn_end_checks(job_id) {
+        Some(cancel) => cancel,
+        None => {
+            log::debug!("turn-end checks for job {short}: skipped, a run is already in flight");
+            return;
+        }
+    };
     let orch_clone = orch.clone();
     let job_id_owned = job_id.to_string();
     let orch_for_release = orch.clone();
     let job_id_for_release = job_id.to_string();
     detach_onto_runtime(
         async move {
-            crate::execution::checks_turn_end::run_turn_end_checks(orch_clone, job_id_owned).await;
+            crate::execution::checks_turn_end::run_turn_end_checks(
+                orch_clone,
+                job_id_owned,
+                cancel,
+            )
+            .await;
         },
         move || {
             // Runtime construction failed, so the future above never reached

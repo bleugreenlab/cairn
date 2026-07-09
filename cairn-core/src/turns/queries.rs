@@ -110,12 +110,20 @@ pub async fn get_turn(db: &LocalDb, turn_id: &str) -> Result<Turn, String> {
 pub async fn get_head_turn(db: &LocalDb, job_id: &str) -> Result<Option<Turn>, String> {
     load_one_turn_by_query(
         db,
-        "SELECT id, session_id, run_id, job_id, sequence,
-                predecessor_id, state, yield_reason, start_reason, created_at,
-                started_at, ended_at, updated_at
-         FROM turns
-         WHERE job_id = ?1
-         ORDER BY sequence DESC
+        "SELECT t.id, t.session_id, t.run_id, t.job_id, t.sequence,
+                t.predecessor_id, t.state, t.yield_reason, t.start_reason, t.created_at,
+                t.started_at, t.ended_at, t.updated_at
+         FROM jobs j
+         LEFT JOIN turns current ON current.id = j.current_turn_id
+         JOIN turns t ON t.id = COALESCE(
+             current.id,
+             (SELECT fallback.id
+                FROM turns fallback
+               WHERE fallback.job_id = j.id
+               ORDER BY fallback.created_at DESC, fallback.sequence DESC
+               LIMIT 1)
+         )
+         WHERE j.id = ?1
          LIMIT 1",
         job_id,
     )

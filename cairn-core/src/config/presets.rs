@@ -154,22 +154,22 @@ pub fn default_codex_presets() -> HashMap<String, Preset> {
     map.insert(
         "sm".to_string(),
         Preset {
-            model: Model::new(Model::GPT_5_4_MINI),
+            model: Model::new(Model::GPT_5_6_LUNA),
             options: reasoning_options(Some("low")),
         },
     );
     map.insert(
         "md".to_string(),
         Preset {
-            model: Model::new("gpt-5.3-codex"),
+            model: Model::new(Model::GPT_5_6_TERRA),
             options: reasoning_options(Some("medium")),
         },
     );
     map.insert(
         "lg".to_string(),
         Preset {
-            model: Model::new("gpt-5.5"),
-            options: reasoning_options(Some("high")),
+            model: Model::new(Model::GPT_5_6_SOL),
+            options: reasoning_options(Some("ultra")),
         },
     );
     map
@@ -677,9 +677,9 @@ mod tests {
     fn resolve_qualified_tier() {
         let config = test_config();
         let resolved = resolve_preset("codex/lg", &config).unwrap();
-        assert_eq!(resolved.model.as_str(), "gpt-5.5");
+        assert_eq!(resolved.model.as_str(), "gpt-5.6-sol");
         assert_eq!(resolved.backend, "codex");
-        assert_eq!(resolved.extras.reasoning_effort, Some("high".to_string()));
+        assert_eq!(resolved.extras.reasoning_effort, Some("ultra".to_string()));
     }
 
     #[test]
@@ -723,10 +723,10 @@ mod tests {
             .any(|s| s.backend == "claude" && s.model.as_str() == "opus"));
         assert!(avail
             .iter()
-            .any(|s| s.backend == "codex" && s.model.as_str() == "gpt-5.3-codex"));
+            .any(|s| s.backend == "codex" && s.model.as_str() == "gpt-5.6-terra"));
         assert!(avail
             .iter()
-            .any(|s| s.backend == "codex" && s.model.as_str() == "gpt-5.5"));
+            .any(|s| s.backend == "codex" && s.model.as_str() == "gpt-5.6-sol"));
     }
 
     #[test]
@@ -820,7 +820,7 @@ mod tests {
         )
         .unwrap();
         let selection = snapshot.selection.as_ref().unwrap();
-        assert_eq!(selection.model.as_str(), "gpt-5.5");
+        assert_eq!(selection.model.as_str(), "gpt-5.6-sol");
         assert_eq!(selection.backend, "codex");
     }
 
@@ -832,7 +832,7 @@ mod tests {
 
         let snapshot = resolve_agent_snapshot(&file_agent, None, &config).unwrap();
         let selection = snapshot.selection.as_ref().unwrap();
-        assert_eq!(selection.model.as_str(), "gpt-5.3-codex");
+        assert_eq!(selection.model.as_str(), "gpt-5.6-terra");
         assert_eq!(selection.backend, "codex");
     }
 
@@ -844,16 +844,16 @@ mod tests {
 
         let snapshot = resolve_agent_snapshot(
             &file_agent,
-            Some(&LaunchSelectionOverride::Tier("gpt-5.5".to_string())),
+            Some(&LaunchSelectionOverride::Tier("gpt-5.6-sol".to_string())),
             &config,
         )
         .unwrap();
         assert_eq!(
             snapshot.selection.as_ref().unwrap().model.as_str(),
-            "gpt-5.5"
+            "gpt-5.6-sol"
         );
         let extras = snapshot.extras.unwrap();
-        assert_eq!(extras.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(extras.reasoning_effort.as_deref(), Some("ultra"));
         assert_eq!(snapshot.backend_preference.as_deref(), Some("codex"));
     }
 
@@ -901,7 +901,7 @@ mod tests {
         .unwrap();
         assert_eq!(snapshot.backend_preference.as_deref(), Some("codex"));
         let selection = snapshot.selection.as_ref().unwrap();
-        assert_eq!(selection.model.as_str(), "gpt-5.3-codex");
+        assert_eq!(selection.model.as_str(), "gpt-5.6-terra");
         assert_eq!(selection.backend, "codex");
     }
 
@@ -985,7 +985,7 @@ mod tests {
     #[test]
     fn default_codex_presets_have_reasoning_effort() {
         let presets = default_codex_presets();
-        assert_eq!(presets["sm"].model.as_str(), Model::GPT_5_4_MINI);
+        assert_eq!(presets["sm"].model.as_str(), Model::GPT_5_6_LUNA);
         assert_eq!(
             presets["sm"]
                 .options
@@ -1008,7 +1008,7 @@ mod tests {
                 .get("reasoningEffort")
                 .and_then(PresetOptionValue::as_str)
                 .map(str::to_string),
-            Some("high".to_string())
+            Some("ultra".to_string())
         );
     }
 
@@ -1150,11 +1150,11 @@ mod tests {
         );
         assert_eq!(
             resolve_preset("codex/sm", &config).unwrap().model.as_str(),
-            Model::GPT_5_4_MINI
+            Model::GPT_5_6_LUNA
         );
         assert_eq!(
             resolve_preset("codex/lg", &config).unwrap().model.as_str(),
-            "gpt-5.5"
+            "gpt-5.6-sol"
         );
     }
 

@@ -37,7 +37,7 @@ pub(super) fn build_thread_start_params(
     developer_instructions: Option<&str>,
 ) -> Value {
     let mut params = serde_json::json!({
-        "model": model.unwrap_or(Model::GPT_5_4_MINI),
+        "model": model.unwrap_or(Model::GPT_5_6_LUNA),
         "cwd": cwd,
         "approvalPolicy": approval_policy,
         "sandbox": sandbox_mode,

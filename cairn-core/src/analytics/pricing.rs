@@ -4,7 +4,7 @@
 //! time, so treat this table as an estimate. Models are classified from the
 //! stored `jobs.model` value by substring so both short aliases (`opus`,
 //! `sonnet`, `fable`) and dated full names (`claude-sonnet-4-20250514`,
-//! `gpt-5.4`) resolve to a tier. Classification is version-aware where pricing
+//! `gpt-5.6-sol`) resolve to a tier. Classification is version-aware where pricing
 //! changed across versions (legacy Opus 4/4.1 cost 3x the current Opus 4.5+).
 //! Truly unrecognized models return `None` and are reported as unpriced.
 //!
@@ -13,7 +13,7 @@
 //! for codex tiers.
 
 /// Date the price table was last reviewed against public list prices.
-pub const PRICE_SOURCE_DATE: &str = "2026-06-16";
+pub const PRICE_SOURCE_DATE: &str = "2026-07-09";
 
 /// Per-million-token USD prices for one model tier.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,6 +43,9 @@ const SONNET: ModelPrice = ModelPrice::new(3.0, 0.30, 3.75, 15.0);
 const HAIKU: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 5.0); // Haiku 4.5
 
 // GPT-5 / codex tiers (cache_write unused for codex cost).
+const GPT_5_6_SOL: ModelPrice = ModelPrice::new(5.0, 0.50, 6.25, 30.0);
+const GPT_5_6_TERRA: ModelPrice = ModelPrice::new(2.50, 0.25, 3.125, 15.0);
+const GPT_5_6_LUNA: ModelPrice = ModelPrice::new(1.0, 0.10, 1.25, 6.0);
 const GPT_5_5: ModelPrice = ModelPrice::new(5.0, 0.50, 5.0, 30.0);
 const GPT_5_4: ModelPrice = ModelPrice::new(2.50, 0.25, 2.50, 15.0);
 const GPT_5_4_MINI: ModelPrice = ModelPrice::new(0.75, 0.075, 0.75, 4.50);
@@ -65,14 +68,26 @@ pub fn price_for(model: Option<&str>) -> Option<ModelPrice> {
     } else if model.contains("haiku") {
         Some(HAIKU)
     } else if model.contains("gpt") || model.contains("codex") {
-        Some(if model.contains("mini") {
-            GPT_5_4_MINI
-        } else if model.contains("5.5") || model.contains("5-5") {
-            GPT_5_5
-        } else {
-            // Bare `gpt-5` / `gpt-5.4` / codex default to the 5.4 tier.
-            GPT_5_4
-        })
+        Some(
+            if model.contains("5.6-luna") || model.contains("5-6-luna") {
+                GPT_5_6_LUNA
+            } else if model.contains("5.6-terra") || model.contains("5-6-terra") {
+                GPT_5_6_TERRA
+            } else if model.contains("5.6-sol")
+                || model.contains("5-6-sol")
+                || model.contains("5.6")
+                || model.contains("5-6")
+            {
+                GPT_5_6_SOL
+            } else if model.contains("mini") {
+                GPT_5_4_MINI
+            } else if model.contains("5.5") || model.contains("5-5") {
+                GPT_5_5
+            } else {
+                // Bare `gpt-5` / `gpt-5.4` / codex default to the 5.4 tier.
+                GPT_5_4
+            },
+        )
     } else {
         None
     }
@@ -141,6 +156,9 @@ mod tests {
 
     #[test]
     fn gpt_versions_and_mini() {
+        assert_eq!(price_for(Some("gpt-5.6-sol")), Some(GPT_5_6_SOL));
+        assert_eq!(price_for(Some("gpt-5.6-terra")), Some(GPT_5_6_TERRA));
+        assert_eq!(price_for(Some("gpt-5.6-luna")), Some(GPT_5_6_LUNA));
         assert_eq!(price_for(Some("gpt-5.5")), Some(GPT_5_5));
         assert_eq!(price_for(Some("gpt-5.4-mini")), Some(GPT_5_4_MINI));
         assert_eq!(price_for(Some("gpt-5")), Some(GPT_5_4));

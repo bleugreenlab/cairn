@@ -1088,6 +1088,14 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             .tool_use_id
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        // This write sealed a source-touching commit → the branch advanced.
+        // Cancel any in-flight when:review suite for this job so the write-cadence
+        // checks below and the agent's next manual run inherit the freed CPU
+        // rather than competing with a dying suite. See
+        // cancel_stale_review_on_branch_advance for the rationale and job-id scoping.
+        if let Some(ctx) = run_context.as_ref() {
+            crate::execution::checks::cancel_stale_review_on_branch_advance(orch, &ctx.job_id);
+        }
         crate::execution::checks::run_write_checks_after_seal(
             orch,
             run_context.as_ref(),

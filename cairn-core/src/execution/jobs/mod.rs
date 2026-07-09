@@ -73,7 +73,9 @@ pub(crate) use inputs::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use lifecycle::reconcile_stale_active_turn_for_continue_for_test;
-pub use lifecycle::{continue_job_impl, on_job_complete_impl, prepare_job, ResumeContext};
+pub use lifecycle::{
+    continue_job_impl, continue_job_or_enqueue, on_job_complete_impl, prepare_job, ResumeContext,
+};
 pub use slash_commands::resolve_skill_slash_command;
 pub use snapshots::store_tool_result_event_with_turn;
 pub(crate) use workflow::{
@@ -84,6 +86,9 @@ pub(crate) use workflow::{
 // The header Restart action reaches this from the host crates via
 // `cairn_core::internal::execution::jobs::restart_workflow`.
 pub use workflow::restart_workflow;
+// The standalone (UI-driven, caller-less) workflow launch reaches this from the
+// host crates via `cairn_core::internal::execution::jobs::launch_standalone_workflow`.
+pub use workflow::{launch_standalone_workflow, LaunchedWorkflow};
 // The canonical, routing-aware turn-start. Host job-start paths call this
 // instead of hand-rolling the turns UPDATE against the private DB (CAIRN-2206).
 pub use turns::start_turn;

@@ -631,7 +631,7 @@ async fn in_flight_turn_end_checks_defer_the_review() {
     insert_open_pr(&db).await;
     let orch = test_orchestrator(db);
 
-    assert!(orch.try_begin_turn_end_checks("j-prod"));
+    assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
     run_review_push(&orch).await;
     assert!(
         pending(&orch, "j-watch").await.is_empty(),
@@ -707,4 +707,112 @@ async fn render_push_resolved_inlines_referent_content() {
         rendered.len() > header.len(),
         "expected resolved referent content inlined beneath the URI header: {rendered}"
     );
+}
+
+#[tokio::test]
+async fn turn_end_cancel_resolves_immediately_when_already_cancelled() {
+    use crate::orchestrator::TurnEndCancel;
+    let cancel = TurnEndCancel::default();
+    assert!(!cancel.is_cancelled());
+    cancel.cancel();
+    assert!(cancel.is_cancelled());
+    tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
+        .await
+        .expect("an already-cancelled token resolves without blocking");
+}
+
+#[tokio::test]
+async fn turn_end_cancel_wakes_a_parked_waiter() {
+    use crate::orchestrator::TurnEndCancel;
+    let cancel = TurnEndCancel::default();
+    let waiter = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move { cancel.cancelled().await })
+    };
+    // Let the waiter park on `notified()` before signalling.
+    tokio::task::yield_now().await;
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("cancel wakes the parked waiter")
+        .expect("the waiter task joins cleanly");
+}
+
+#[tokio::test]
+async fn cancel_turn_end_checks_signals_the_in_flight_token() {
+    let db = test_db().await;
+    let orch = test_orchestrator(db);
+
+    let cancel = orch
+        .try_begin_turn_end_checks("j-prod")
+        .expect("first claim wins the single-flight slot");
+    assert!(
+        orch.try_begin_turn_end_checks("j-prod").is_none(),
+        "a second claim while one is in flight is refused"
+    );
+    assert!(!cancel.is_cancelled());
+
+    orch.cancel_turn_end_checks("j-prod");
+    assert!(
+        cancel.is_cancelled(),
+        "the cancel lever signals the in-flight suite's token"
+    );
+
+    orch.end_turn_end_checks("j-prod");
+    // After release the slot is free again and a stale cancel is a no-op.
+    orch.cancel_turn_end_checks("j-prod");
+    assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
+}
+
+#[tokio::test]
+async fn branch_advance_cancels_the_in_flight_review_suite() {
+    // A commit sealing mid-turn advances the branch; the branch-advance hook
+    // cancels the job's in-flight when:review suite so its heavy compiles stop
+    // starving the builder's own when:write checks. Idempotent afterward.
+    let db = test_db().await;
+    let orch = test_orchestrator(db);
+
+    let cancel = orch
+        .try_begin_turn_end_checks("j-prod")
+        .expect("claim the job's single-flight slot");
+    assert!(!cancel.is_cancelled());
+
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod");
+    assert!(
+        cancel.is_cancelled(),
+        "a sealed commit cancels the in-flight review suite for the job"
+    );
+
+    orch.end_turn_end_checks("j-prod");
+    // No suite in flight ⇒ the branch-advance cancel is a harmless no-op, and the
+    // single-flight slot remains claimable.
+    crate::execution::checks::cancel_stale_review_on_branch_advance(&orch, "j-prod");
+    assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
+}
+
+#[tokio::test]
+async fn resolving_an_issue_cancels_its_jobs_turn_end_checks() {
+    // The issue-scoped lever the merge/close path pulls: every job of the issue
+    // with an in-flight suite is signalled to quit (CAIRN-2648).
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+
+    let cancel = orch
+        .try_begin_turn_end_checks("j-prod")
+        .expect("claim the builder job's slot");
+    assert!(!cancel.is_cancelled());
+
+    crate::execution::checks_turn_end::cancel_turn_end_checks_for_issue(
+        &orch,
+        &orch.db.local,
+        "i-rev",
+    )
+    .await;
+
+    assert!(
+        cancel.is_cancelled(),
+        "resolving issue i-rev quits its builder job's in-flight suite"
+    );
+    orch.end_turn_end_checks("j-prod");
 }

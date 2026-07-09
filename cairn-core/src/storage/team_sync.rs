@@ -110,6 +110,7 @@ impl Backoff {
 /// Push until it succeeds, backing off on each error. Cancel-safe: an abort while
 /// awaiting `push()` or the backoff sleep simply drops the future, marking nothing
 /// done (fail-closed integrity).
+#[tracing::instrument(target = "profiler", name = "team_sync_push", skip_all)]
 async fn push_until_ok(db: &LocalDb, backoff: &mut Backoff) {
     loop {
         match db.push().await {
@@ -127,6 +128,7 @@ async fn push_until_ok(db: &LocalDb, backoff: &mut Backoff) {
 
 /// Pull until it succeeds, backing off on each error; returns whether any remote
 /// frames were applied. Cancel-safe for the same reason as [`push_until_ok`].
+#[tracing::instrument(target = "profiler", name = "team_sync_pull", skip_all)]
 async fn pull_until_ok(db: &LocalDb, backoff: &mut Backoff) -> bool {
     loop {
         match db.pull().await {
