@@ -21,6 +21,7 @@ mod server;
 #[cfg(test)]
 mod test_support;
 mod timeouts;
+mod warm_search_shim;
 
 use cli::{default_callback_url, run_cli_change, run_cli_read, run_cli_watch};
 use schemas::AgentInfo;
@@ -53,7 +54,8 @@ enum Command {
     /// Read one or more files or Cairn resources and print them to stdout (pipeable).
     Read {
         /// One or more targets: `file:path` (worktree-relative), `file:/abs/path`, `cairn://p/PROJECT/...`, or `cairn:~/...`.
-        /// Append `?key=value` to a target for per-target scoping.
+        /// Node workspace changes are available at `cairn:~/diff` with summary,
+        /// commits, patch, and check views. Append `?key=value` for scoping.
         #[arg(required = true, num_args = 1..)]
         targets: Vec<String>,
         /// Start reading from this line number. Single-target convenience: folded
@@ -90,8 +92,21 @@ enum Command {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Detect executable-shim invocation before constructing Tokio. The shim uses
+    // reqwest's blocking client and may exec the native binary; doing either
+    // inside an async runtime can panic while the blocking client's private
+    // runtime is dropped.
+    if let Some(program) = warm_search_shim::invoked_program() {
+        warm_search_shim::run(program);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args = Args::parse();
 
     // CLI subcommands (read/write) keep stderr clean for piping — logs go to

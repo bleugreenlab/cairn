@@ -53,6 +53,7 @@ mod snapshots;
 mod status;
 mod turns;
 mod workflow;
+pub(crate) mod workspace_identity;
 mod worktrees;
 
 pub(crate) use call_admission::CallAdmission;

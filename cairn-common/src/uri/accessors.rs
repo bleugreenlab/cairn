@@ -56,7 +56,7 @@ impl CairnResource {
             | IssueComments { project, .. }
             | IssueComment { project, .. }
             | IssueExecution { project, .. }
-            | NodeChanged { project, .. }
+            | NodeDiff { project, .. }
             | ProjectTerminal { project, .. }
             | ProjectBrowser { project, .. }
             | ProjectSkills { project, .. }
@@ -227,7 +227,7 @@ impl CairnResource {
             | Self::IssueComments { .. }
             | Self::IssueComment { .. }
             | Self::IssueExecution { .. }
-            | Self::NodeChanged { .. }
+            | Self::NodeDiff { .. }
             | Self::Skills
             | Self::Skill { .. }
             | Self::ProjectSkills { .. }
@@ -311,7 +311,7 @@ impl CairnResource {
             | Self::Changed { project, .. }
             | Self::IssueExecutions { project, .. }
             | Self::IssueExecution { project, .. }
-            | Self::NodeChanged { project, .. }
+            | Self::NodeDiff { project, .. }
             | Self::ProjectTerminal { project, .. }
             | Self::ProjectBrowser { project, .. }
             | Self::ProjectSkills { project }
@@ -395,7 +395,7 @@ impl CairnResource {
             | Self::Changed { number, .. }
             | Self::IssueExecutions { number, .. }
             | Self::IssueExecution { number, .. }
-            | Self::NodeChanged { number, .. }
+            | Self::NodeDiff { number, .. }
             | Self::NodeMemories { number, .. }
             | Self::NodeMemory { number, .. }
             | Self::NodeSymbols { number, .. } => Some(*number),
@@ -472,7 +472,7 @@ impl CairnResource {
             | Self::NodeMessages { node_id, .. }
             | Self::NodeProgress { node_id, .. }
             | Self::TaskMessages { node_id, .. }
-            | Self::NodeChanged { node_id, .. }
+            | Self::NodeDiff { node_id, .. }
             | Self::NodeMemories { node_id, .. }
             | Self::NodeMemory { node_id, .. }
             | Self::NodeSymbols { node_id, .. } => Some(node_id),

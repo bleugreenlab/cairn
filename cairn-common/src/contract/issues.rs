@@ -79,7 +79,11 @@ pub(crate) const CHANGED_CONTRACT: ResourceContract = ResourceContract {
             values: "files_with_matches|content|count",
         },
     ],
-    related: NO_RELATED,
+    related: &[RelatedSpec {
+        label: "node diff",
+        kind: ResourceKind::NodeDiff,
+        actions: false,
+    }],
     cross_actions: NO_CROSS_ACTIONS,
     mutations: NO_MUTATIONS,
 };

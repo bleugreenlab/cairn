@@ -28,6 +28,7 @@ pub mod skills_resources;
 pub mod slug;
 pub(crate) mod target;
 pub mod terminal;
+pub mod warm_search;
 pub mod watch;
 pub mod web;
 pub mod workflows;

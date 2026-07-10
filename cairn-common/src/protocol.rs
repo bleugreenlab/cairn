@@ -57,3 +57,74 @@ pub struct CallbackResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reminders: Vec<String>,
 }
+
+/// Expanded search invocation offered by the `rg`/`grep` PATH shim.
+///
+/// The helper reports only runtime facts. The runner resolves `run_id` to its
+/// authoritative worktree and never trusts a client-supplied worktree path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WarmSearchRequest {
+    pub run_id: String,
+    pub cwd: String,
+    pub program: String,
+    pub argv: Vec<String>,
+    pub stdin: WarmSearchStdin,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarmSearchStdin {
+    Inherited,
+    Terminal,
+    Pipe,
+    File,
+    Other,
+}
+
+/// Bounded reasons a warm search can decline without changing native behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
+pub enum WarmSearchDeclineReason {
+    UnsupportedProgram,
+    UnsupportedFlag(String),
+    UnsupportedInvocation,
+    NonRecursiveGrep,
+    StdinInput,
+    EnvironmentSensitiveConfiguration,
+    NonUtf8Argv,
+    InvalidRegex,
+    RunNotFound,
+    MissingWorktree,
+    ScopeDecline,
+    ColdOrIncompleteIndex,
+    ParityUncertain,
+    TransportFailure,
+}
+
+/// Raw-byte response consumed by the executable shim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "decision")]
+pub enum WarmSearchResponse {
+    Serve {
+        stdout_base64: String,
+        stderr_base64: String,
+        exit_code: i32,
+    },
+    PassThrough {
+        reason: WarmSearchDeclineReason,
+    },
+}
+
+#[cfg(test)]
+mod warm_search_tests {
+    use super::*;
+
+    #[test]
+    fn warm_search_request_uses_stable_snake_case_json() {
+        let json = r#"{"run_id":"run-test","cwd":"/tmp","program":"rg","argv":["needle","."],"stdin":"inherited"}"#;
+        let request: WarmSearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.run_id, "run-test");
+        assert_eq!(request.stdin, WarmSearchStdin::Inherited);
+        assert_eq!(serde_json::to_string(&request).unwrap(), json);
+    }
+}

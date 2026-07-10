@@ -385,21 +385,30 @@ pub(crate) async fn write_artifact_change(
     let confirmed = resolve_confirmed(is_patch, prior_confirmed, policy);
 
     // Before storing a create-pr artifact version: sweep any unsealed work onto the
-    // branch and refuse an empty-delta (+0/-0) PR. Keyed on the written artifact's
-    // own name/type, the same signal `create_pr_artifact_details` syncs on, so a
-    // ctx-self write under a create-pr terminal never triggers it. The reserved
-    // `action:` merge/close/refresh paths return earlier and never reach here.
+    // branch, refuse an empty-delta (+0/-0) PR, and strictly publish the current
+    // bookmark. Keyed on the written artifact's own name/type, the same signal
+    // `create_pr_artifact_details` syncs on, so a ctx-self write under a create-pr
+    // terminal never triggers it. The reserved `action:` merge/close/refresh paths
+    // return earlier and never reach here.
     let is_create_pr_write = artifact_name == Some("create-pr")
         || output_name.as_str() == "create-pr"
         || artifact_type.as_str() == "create-pr";
     if is_create_pr_write {
-        if let Ok(job) = crate::jobs::queries::get_job(&db, &job_id).await {
-            if let (Some(wt), Some(branch)) = (job.worktree_path.as_deref(), job.branch.as_deref())
-            {
-                sweep_and_gate_create_pr_branch(orch, wt, branch, job.base_branch.as_deref())
-                    .await?;
-            }
-        }
+        let job = crate::jobs::queries::get_job(&db, &job_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "create-pr artifact was not written because job `{job_id}` could not be \
+                     loaded for bookmark publication: {e}"
+                )
+            })?;
+        let (worktree, branch) = require_create_pr_branch_metadata(
+            &job_id,
+            job.worktree_path.as_deref(),
+            job.branch.as_deref(),
+        )?;
+        sweep_gate_and_publish_create_pr_branch(orch, worktree, branch, job.base_branch.as_deref())
+            .await?;
     }
 
     let data_json = serde_json::to_string(&effective_payload)
@@ -776,26 +785,25 @@ fn should_arm_output_artifact_interrupt(
     has_output_contract && !is_patch && output_artifact_name_matches(artifact_name, required_name)
 }
 
-/// Sweep any unsealed work onto the PR branch and refuse an empty-delta PR before
-/// a create-pr artifact write is stored. Runs only for a content create/patch of a
-/// create-pr artifact (the `action:` merge/close/refresh paths return earlier).
+/// Sweep unsealed work onto the PR branch, refuse an empty-delta PR, and publish
+/// the current bookmark before a create-pr artifact write is stored. Runs only for
+/// a content create/patch of a create-pr artifact (the `action:`
+/// merge/close/refresh paths return earlier).
 ///
-/// Two moves, serialized on the per-store jj lock like every other Cairn jj store
-/// writer:
+/// Three moves, serialized on the per-store jj lock like every other Cairn jj
+/// store writer:
 /// 1. **Sweep.** If the working copy carries unsealed work, seal it via the normal
-///    [`crate::mcp::vcs::JjBackend::seal_all`] path (advancing the bookmark,
-///    exporting, and pushing exactly like an agent seal). This is the
-///    missing-seal-on-disk recovery the incident needed: a final seal that
-///    half-applied without failing the artifact write left the branch short of the
-///    agent's work.
+///    [`crate::mcp::vcs::JjBackend::seal_all`] path, advancing the bookmark and
+///    preserving the seal path's best-effort publication contract.
 /// 2. **Gate.** Compute the branch's delta versus its base over the store. If it is
 ///    STILL empty after the sweep, refuse the artifact write with a diagnostic
-///    naming the branch and base — the one legitimate refusal, catching the +0/-0
-///    PR at its source instead of at coordinator review.
+///    naming the branch and base, catching a +0/-0 PR at its source.
+/// 3. **Publish.** Unconditionally push the current bookmark to origin and propagate
+///    any failure so artifact storage cannot report success against a stale PR head.
 ///
 /// Skips entirely when the worktree no longer exists on disk (post-merge title
-/// edits and the like): there is nothing to sweep or gate.
-async fn sweep_and_gate_create_pr_branch(
+/// edits and the like): there is nothing to sweep, gate, or publish.
+async fn sweep_gate_and_publish_create_pr_branch(
     orch: &Orchestrator,
     worktree_path: &str,
     branch: &str,
@@ -822,17 +830,45 @@ async fn sweep_and_gate_create_pr_branch(
         None => None,
     };
 
-    // 1. Sweep unsealed work onto the bookmark.
-    if crate::jj::is_working_copy_dirty(&jj, worktree).unwrap_or(false) {
-        crate::mcp::vcs::WorktreeVcs::seal_all(
-            &backend,
-            worktree,
-            "seal pending work for PR",
-            None,
+    sweep_gate_and_publish_create_pr_branch_locked(&jj, &backend, worktree, branch, base_branch)
+}
+
+fn require_create_pr_branch_metadata<'a>(
+    job_id: &str,
+    worktree_path: Option<&'a str>,
+    branch: Option<&'a str>,
+) -> Result<(&'a str, &'a str), String> {
+    let worktree_path = worktree_path.filter(|value| !value.trim().is_empty());
+    let branch = branch.filter(|value| !value.trim().is_empty());
+    match (worktree_path, branch) {
+        (Some(worktree_path), Some(branch)) => Ok((worktree_path, branch)),
+        _ => Err(format!(
+            "create-pr artifact was not written because job `{job_id}` has no live worktree and \
+             branch metadata to publish"
+        )),
+    }
+}
+
+fn sweep_gate_and_publish_create_pr_branch_locked(
+    jj: &crate::jj::JjEnv,
+    backend: &crate::mcp::vcs::JjBackend,
+    worktree: &std::path::Path,
+    branch: &str,
+    base_branch: Option<&str>,
+) -> Result<(), String> {
+    // 1. Sweep unsealed work onto the bookmark. An unreadable working-copy state
+    //    is not clean: fail before publication so unsealed edits cannot be omitted.
+    let is_dirty = crate::jj::is_working_copy_dirty(jj, worktree).map_err(|e| {
+        format!(
+            "create-pr artifact was not written because branch `{branch}` working-copy state \
+             could not be inspected before publication: {e}"
         )
-        .map_err(|e| {
-            format!("create-pr: failed to seal pending work before opening the PR: {e}")
-        })?;
+    })?;
+    if is_dirty {
+        crate::mcp::vcs::WorktreeVcs::seal_all(backend, worktree, "seal pending work for PR", None)
+            .map_err(|e| {
+                format!("create-pr: failed to seal pending work before opening the PR: {e}")
+            })?;
     }
 
     // 2. Gate on a non-empty delta vs base. `node_changed_files` measures the
@@ -843,7 +879,7 @@ async fn sweep_and_gate_create_pr_branch(
         .map(|(_, rev)| rev)
         .filter(|rev| !rev.is_empty());
     if let Some(changes) =
-        crate::jj::node_changed_files(&jj, worktree, base_branch, base_rev.as_deref())
+        crate::jj::node_changed_files(jj, worktree, base_branch, base_rev.as_deref())
     {
         if changes.is_empty() {
             let base_name = base_branch.unwrap_or("the base branch");
@@ -854,7 +890,15 @@ async fn sweep_and_gate_create_pr_branch(
             ));
         }
     }
-    Ok(())
+
+    // 3. Publish even when the workspace was already clean: a rebase or re-anchor
+    //    can advance the shared-store bookmark without leaving anything to seal.
+    crate::jj::push_to_origin(jj, worktree, branch).map_err(|e| {
+        format!(
+            "create-pr artifact was not written because bookmark `{branch}` could not be \
+             published to origin: {e}"
+        )
+    })
 }
 
 fn create_pr_artifact_details(
@@ -1284,11 +1328,247 @@ async fn job_node_execution(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_artifact_patch, merge_artifact_payload, resolve_confirmed,
-        should_arm_output_artifact_interrupt, validate_against_schema,
+        apply_artifact_patch, merge_artifact_payload, require_create_pr_branch_metadata,
+        resolve_confirmed, should_arm_output_artifact_interrupt,
+        sweep_gate_and_publish_create_pr_branch_locked, validate_against_schema,
     };
     use crate::models::ConfirmPolicy;
     use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    fn jj_bin() -> Option<String> {
+        let bin = std::env::var("CAIRN_JJ_BIN")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "jj".to_string());
+        crate::env::command(&bin)
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+            .then_some(bin)
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        assert!(
+            crate::env::git()
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?} failed"
+        );
+    }
+
+    fn git_stdout(repo: &Path, args: &[&str]) -> String {
+        let output = crate::env::git()
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    struct CreatePrJjFixture {
+        _home: TempDir,
+        origin: TempDir,
+        project: TempDir,
+        _worktrees: TempDir,
+        jj: crate::jj::JjEnv,
+        backend: crate::mcp::vcs::JjBackend,
+        store: PathBuf,
+        worktree: PathBuf,
+        branch: &'static str,
+        remote_head_before_advance: String,
+    }
+
+    impl CreatePrJjFixture {
+        fn new(bin: &str) -> Self {
+            let home = TempDir::new().unwrap();
+            let origin = TempDir::new().unwrap();
+            let project = TempDir::new().unwrap();
+            let worktrees = TempDir::new().unwrap();
+
+            git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+            git(project.path(), &["init", "-q", "-b", "main"]);
+            git(project.path(), &["config", "user.email", "p@e.com"]);
+            git(project.path(), &["config", "user.name", "P"]);
+            std::fs::write(project.path().join("shared.rs"), "base\n").unwrap();
+            git(project.path(), &["add", "-A"]);
+            git(project.path(), &["commit", "-q", "-m", "base"]);
+            git(
+                project.path(),
+                &["remote", "add", "origin", &origin.path().to_string_lossy()],
+            );
+            git(project.path(), &["push", "-q", "origin", "main"]);
+
+            let jj = crate::jj::JjEnv::resolve(bin, home.path());
+            let store = home.path().join("jj-stores").join("project");
+            crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
+            let branch = "agent/CAIRN-2679-builder-1";
+            let worktree = worktrees.path().join("builder");
+            crate::jj::add_workspace(&jj, &store, &worktree, branch, "main", None).unwrap();
+
+            std::fs::write(worktree.join("feature.rs"), "first\n").unwrap();
+            crate::jj::seal(&jj, &worktree, "initial feature", None).unwrap();
+            crate::jj::push_to_origin(&jj, &worktree, branch).unwrap();
+            let remote_head_before_advance = git_stdout(origin.path(), &["rev-parse", branch]);
+
+            // Advance the bookmark locally without pushing. `seal` leaves a fresh,
+            // clean working-copy commit while the bare origin remains stale.
+            std::fs::write(worktree.join("feature.rs"), "second\n").unwrap();
+            crate::jj::seal(&jj, &worktree, "rewrite feature", None).unwrap();
+            assert!(!crate::jj::is_working_copy_dirty(&jj, &worktree).unwrap());
+            let local_head = crate::jj::bookmark_commit(&jj, &store, branch).unwrap();
+            assert_ne!(remote_head_before_advance, local_head);
+            assert_eq!(
+                git_stdout(origin.path(), &["rev-parse", branch]),
+                remote_head_before_advance
+            );
+
+            let backend =
+                crate::mcp::vcs::JjBackend::new(crate::jj::JjEnv::resolve(bin, home.path()));
+            Self {
+                _home: home,
+                origin,
+                project,
+                _worktrees: worktrees,
+                jj,
+                backend,
+                store,
+                worktree,
+                branch,
+                remote_head_before_advance,
+            }
+        }
+
+        fn local_head(&self) -> String {
+            crate::jj::bookmark_commit(&self.jj, &self.store, self.branch).unwrap()
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn create_pr_preparation_publishes_clean_locally_advanced_bookmark() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping create_pr_preparation_publishes_clean_locally_advanced_bookmark: jj not resolvable");
+            return;
+        };
+        let fixture = CreatePrJjFixture::new(&bin);
+
+        sweep_gate_and_publish_create_pr_branch_locked(
+            &fixture.jj,
+            &fixture.backend,
+            &fixture.worktree,
+            fixture.branch,
+            Some("main"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            git_stdout(fixture.origin.path(), &["rev-parse", fixture.branch]),
+            fixture.local_head()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn create_pr_preparation_fails_when_clean_bookmark_cannot_be_published() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping create_pr_preparation_fails_when_clean_bookmark_cannot_be_published: jj not resolvable");
+            return;
+        };
+        let fixture = CreatePrJjFixture::new(&bin);
+        let unavailable_origin = fixture.project.path().join("unavailable-origin");
+        git(
+            fixture.project.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &unavailable_origin.to_string_lossy(),
+            ],
+        );
+
+        let error = sweep_gate_and_publish_create_pr_branch_locked(
+            &fixture.jj,
+            &fixture.backend,
+            &fixture.worktree,
+            fixture.branch,
+            Some("main"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("create-pr artifact was not written"),
+            "{error}"
+        );
+        assert!(error.contains(fixture.branch), "{error}");
+        assert!(
+            error.contains("could not be published to origin"),
+            "{error}"
+        );
+        assert_eq!(
+            git_stdout(fixture.origin.path(), &["rev-parse", fixture.branch]),
+            fixture.remote_head_before_advance
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(jj)]
+    fn create_pr_preparation_fails_when_working_copy_state_is_unreadable() {
+        let Some(bin) = jj_bin() else {
+            eprintln!("skipping create_pr_preparation_fails_when_working_copy_state_is_unreadable: jj not resolvable");
+            return;
+        };
+        let fixture = CreatePrJjFixture::new(&bin);
+        crate::jj::forget_workspace(&fixture.jj, &fixture.store, fixture.branch).unwrap();
+
+        let error = sweep_gate_and_publish_create_pr_branch_locked(
+            &fixture.jj,
+            &fixture.backend,
+            &fixture.worktree,
+            fixture.branch,
+            Some("main"),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("working-copy state could not be inspected before publication"),
+            "{error}"
+        );
+        assert_eq!(
+            git_stdout(fixture.origin.path(), &["rev-parse", fixture.branch]),
+            fixture.remote_head_before_advance
+        );
+    }
+
+    #[test]
+    fn create_pr_branch_metadata_is_required_before_storage() {
+        let missing_worktree =
+            require_create_pr_branch_metadata("job-1", None, Some("agent/CAIRN-1-builder-0"))
+                .unwrap_err();
+        assert!(missing_worktree.contains("artifact was not written"));
+        assert!(missing_worktree.contains("job-1"));
+
+        let missing_branch =
+            require_create_pr_branch_metadata("job-2", Some("/tmp/worktree"), None).unwrap_err();
+        assert!(missing_branch.contains("artifact was not written"));
+        assert!(missing_branch.contains("job-2"));
+
+        assert_eq!(
+            require_create_pr_branch_metadata(
+                "job-3",
+                Some("/tmp/worktree"),
+                Some("agent/CAIRN-3-builder-0")
+            )
+            .unwrap(),
+            ("/tmp/worktree", "agent/CAIRN-3-builder-0")
+        );
+    }
 
     #[test]
     fn persisted_output_contract_drives_validation() {

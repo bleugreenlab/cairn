@@ -1,3 +1,4 @@
+use cairn_common::protocol::WarmSearchDeclineReason;
 use regex::escape;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub(crate) enum TranslatedSearch {
 /// `post` is empty for a bare `rg`/`grep`; a non-empty `post` is a whitelisted
 /// pipeline (`| head`, `| tail`, `| grep -v`, ...) applied to the head stage's
 /// output in order.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranslatedSearchPipeline {
     pub search: TranslatedSearch,
@@ -34,6 +36,7 @@ pub(crate) struct TranslatedSearchPipeline {
 /// A pure line-transform tail stage of a translated search pipeline. Every
 /// variant is a whitelisted transform the run() layer can reproduce faithfully
 /// on the head stage's output stream.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PostFilter {
     /// `head -N` / `head -n N` / bare `head` (coreutils default 10).
@@ -55,6 +58,72 @@ struct Token {
     has_unquoted_expansion: bool,
 }
 
+/// Translate one already-expanded executable invocation. Bash remains the sole
+/// parser for shell syntax; this function sees only the program and argv that
+/// would have reached the real executable.
+pub(crate) fn translate_search_invocation(
+    program: &str,
+    argv: &[String],
+) -> Result<TranslatedSearch, WarmSearchDeclineReason> {
+    let program = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    if argv.iter().any(|arg| arg == "-") {
+        return Err(WarmSearchDeclineReason::StdinInput);
+    }
+    if program == "grep" && !grep_argv_is_recursive(argv) {
+        return Err(WarmSearchDeclineReason::NonRecursiveGrep);
+    }
+
+    let tokens: Vec<Token> = argv
+        .iter()
+        .cloned()
+        .map(|text| Token {
+            text,
+            has_unquoted_expansion: false,
+        })
+        .collect();
+    let translated = match program {
+        "rg" => translate_rg(&tokens),
+        "grep" => translate_grep(&tokens),
+        _ => return Err(WarmSearchDeclineReason::UnsupportedProgram),
+    }
+    .ok_or_else(|| classify_invocation_decline(argv))?;
+
+    if let TranslatedSearch::Grep { pattern, paths, .. } = &translated {
+        regex::Regex::new(pattern).map_err(|_| WarmSearchDeclineReason::InvalidRegex)?;
+        // GNU grep's implicit recursive root is spelled `.` in native output;
+        // preserve correctness by declining until that distinct argv contract is
+        // represented explicitly in TranslatedSearch.
+        if program == "grep" && paths.is_empty() {
+            return Err(WarmSearchDeclineReason::UnsupportedInvocation);
+        }
+    }
+    Ok(translated)
+}
+
+fn grep_argv_is_recursive(argv: &[String]) -> bool {
+    argv.iter().any(|arg| {
+        arg == "-r"
+            || arg == "-R"
+            || (arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].chars().any(|ch| ch == 'r' || ch == 'R'))
+    })
+}
+
+fn classify_invocation_decline(argv: &[String]) -> WarmSearchDeclineReason {
+    argv.iter()
+        .find(|arg| arg.starts_with('-') && *arg != "--")
+        .cloned()
+        .map(WarmSearchDeclineReason::UnsupportedFlag)
+        .unwrap_or(WarmSearchDeclineReason::UnsupportedInvocation)
+}
+
+/// Historical whole-command adapter retained for reconstructed-transcript
+/// backtests. Production routing uses [`translate_search_invocation`].
+#[allow(dead_code)]
 pub(crate) fn translate_search_command(command: &str) -> Option<TranslatedSearchPipeline> {
     let stages = split_pipeline(command)?;
     let (head, tail) = stages.split_first()?;
@@ -70,11 +139,11 @@ pub(crate) fn translate_search_command(command: &str) -> Option<TranslatedSearch
 fn translate_head_stage(stage: &str) -> Option<TranslatedSearch> {
     let tokens = tokenize(stage)?;
     let first = tokens.first()?;
-    match first.text.as_str() {
-        "rg" => translate_rg(&tokens[1..]),
-        "grep" => translate_grep(&tokens[1..]),
-        _ => None,
+    let argv: Vec<String> = tokens[1..].iter().map(|token| token.text.clone()).collect();
+    if tokens[1..].iter().any(|token| token.has_unquoted_expansion) {
+        return None;
     }
+    translate_search_invocation(&first.text, &argv).ok()
 }
 
 /// Split a command on top-level unquoted pipes, preserving each stage's original
@@ -551,7 +620,10 @@ fn translate_rg(tokens: &[Token]) -> Option<TranslatedSearch> {
 }
 
 fn translate_grep(tokens: &[Token]) -> Option<TranslatedSearch> {
-    let mut parsed = ParsedGrepLike::default();
+    let mut parsed = ParsedGrepLike {
+        case_insensitive: Some(false),
+        ..ParsedGrepLike::default()
+    };
     let mut recursive = false;
     let mut extended = false;
     let mut positionals = Vec::new();
@@ -789,6 +861,63 @@ mod tests {
 
     fn grep(command: &str) -> TranslatedSearch {
         translate_search_command(command).unwrap().search
+    }
+
+    fn invocation(
+        program: &str,
+        argv: &[&str],
+    ) -> Result<TranslatedSearch, WarmSearchDeclineReason> {
+        translate_search_invocation(
+            program,
+            &argv
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn expanded_invocation_preserves_spaces_and_multiple_roots() {
+        assert!(matches!(
+            invocation("rg", &["-n", "two words", "src one", "src two"]),
+            Ok(TranslatedSearch::Grep { pattern, paths, show_line_numbers: true, .. })
+                if pattern == "two words" && paths == ["src one", "src two"]
+        ));
+    }
+
+    #[test]
+    fn recursive_grep_defaults_to_case_sensitive() {
+        assert!(matches!(
+            invocation("grep", &["-r", "needle", "."]),
+            Ok(TranslatedSearch::Grep {
+                case_insensitive: Some(false),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn expanded_invocation_returns_bounded_declines() {
+        assert_eq!(
+            invocation("grep", &["needle", "."]),
+            Err(WarmSearchDeclineReason::NonRecursiveGrep)
+        );
+        assert_eq!(
+            invocation("grep", &["-r", "needle"]),
+            Err(WarmSearchDeclineReason::UnsupportedInvocation)
+        );
+        assert_eq!(
+            invocation("rg", &["needle", "-"]),
+            Err(WarmSearchDeclineReason::StdinInput)
+        );
+        assert_eq!(
+            invocation("rg", &["(", "."]),
+            Err(WarmSearchDeclineReason::InvalidRegex)
+        );
+        assert!(matches!(
+            invocation("rg", &["--json", "needle", "."]),
+            Err(WarmSearchDeclineReason::UnsupportedFlag(flag)) if flag == "--json"
+        ));
     }
 
     fn pipeline(command: &str) -> TranslatedSearchPipeline {

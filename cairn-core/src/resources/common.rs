@@ -91,8 +91,22 @@ pub(super) async fn resolve_home_relative_resource_uri(
     if suffix.is_empty() {
         Ok(home_uri)
     } else {
-        Ok(format!("{}/{}", home_uri.trim_end_matches('/'), suffix))
+        Ok(resolve_home_suffix(&home_uri, suffix))
     }
+}
+
+fn resolve_home_suffix(home_uri: &str, suffix: &str) -> String {
+    // A delegated task edits its owning node's worktree, so its workspace diff is
+    // the owning node's diff rather than a task-local resource. Project only this
+    // one capability upward; every other home-relative resource remains task-owned.
+    if suffix == "diff" || suffix.starts_with("diff?") {
+        if let Some((node_uri, task_name)) = home_uri.rsplit_once("/task/") {
+            if !task_name.is_empty() && !task_name.contains('/') {
+                return format!("{node_uri}/{suffix}");
+            }
+        }
+    }
+    format!("{}/{}", home_uri.trim_end_matches('/'), suffix)
 }
 
 pub(super) async fn connect_for_read(db: &LocalDb) -> Result<cairn_db::turso::Connection, String> {
@@ -980,6 +994,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn task_home_diff_projects_to_the_owning_node() {
+        let home = "cairn://p/CAIRN/2691/1/builder/task/review";
+        assert_eq!(
+            resolve_home_suffix(home, "diff"),
+            "cairn://p/CAIRN/2691/1/builder/diff"
+        );
+        assert_eq!(
+            resolve_home_suffix(home, "diff?view=check"),
+            "cairn://p/CAIRN/2691/1/builder/diff?view=check"
+        );
+        assert_eq!(
+            resolve_home_suffix(home, "messages"),
+            "cairn://p/CAIRN/2691/1/builder/task/review/messages"
+        );
+    }
+
+    #[test]
+    fn node_home_diff_stays_on_the_node() {
+        assert_eq!(
+            resolve_home_suffix("cairn://p/CAIRN/2691/1/builder", "diff?view=patch"),
+            "cairn://p/CAIRN/2691/1/builder/diff?view=patch"
+        );
+    }
+
+    #[test]
     fn affordance_for_issue_kind_uses_templated_links_and_actions() {
         let output = affordance_for_kind(ResourceKind::Issue);
 
@@ -993,6 +1032,12 @@ mod tests {
         assert!(output.contains("- [changed](cairn://p/{project}/{number}/changed)"));
         assert!(output.contains("- [append comment](cairn://p/{project}/{number}):"));
         assert!(output.contains("- [append message](cairn://p/{project}/{number}/messages):"));
+    }
+
+    #[test]
+    fn issue_changed_affordance_links_to_node_diff() {
+        let output = affordance_for_kind(ResourceKind::Changed);
+        assert!(output.contains("- [node diff](cairn://p/{project}/{number}/{exec}/{node}/diff)"));
     }
 
     #[test]

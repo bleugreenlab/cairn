@@ -474,6 +474,20 @@ impl DbState {
             .await
     }
 
+    /// Resolve the human-readable name for a registered team. The private
+    /// registry is the local canonical join between opaque routing ids and team
+    /// display names; presentation layers should not expose the routing id when
+    /// this value is available.
+    pub async fn registered_team_name(&self, team_id: &str) -> DbResult<Option<String>> {
+        self.local
+            .query_opt(
+                "SELECT name FROM teams WHERE id = ?1",
+                (team_id.to_string(),),
+                |row| row.text(0),
+            )
+            .await
+    }
+
     /// Fully forget a team the account no longer belongs to. Stops its sync loop
     /// and drops its open replica (`close_team`), removes its in-memory route
     /// cache entries, and deletes its durable `project_routes` and `teams`
@@ -1189,5 +1203,19 @@ mod tests {
             .upsert_team_registry("bad/slug", "Team", "http://x", "/p")
             .await
             .is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn team_registry_resolves_display_name() {
+        let dbs = db_state("db-bridge-team-name.db").await;
+        dbs.upsert_team_registry("teamABC123", "Acme", "http://sync", "/tmp/t.db")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dbs.registered_team_name("teamABC123").await.unwrap(),
+            Some("Acme".to_string())
+        );
+        assert_eq!(dbs.registered_team_name("missing").await.unwrap(), None);
     }
 }

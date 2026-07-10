@@ -380,7 +380,9 @@ pub fn fold_worktree_into_seal(jj: &JjEnv, ws: &Path) -> Result<Option<FoldOutco
             log::warn!("fold: bookmark set after squash (best-effort): {e}");
         }
         let _ = jj.run(ws, &["git", "export"], "jj git export (fold)");
-        push_to_origin(jj, ws, &branch);
+        if let Err(e) = push_to_origin(jj, ws, &branch) {
+            log::warn!("jj push failed (fold succeeded locally): {e}");
+        }
     }
     Ok(Some(FoldOutcome { folded_files }))
 }

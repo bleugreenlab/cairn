@@ -37,6 +37,8 @@ pub fn split_target_query(target: &str) -> Result<SplitTargetQuery, String> {
 /// "unsupported parameter" error) rather than silently. The escape for a literal
 /// `&` that immediately precedes a recognized key token is `%26`.
 pub const KNOWN_QUERY_KEYS: &[&str] = &[
+    "view",
+    "file",
     "grep",
     "glob",
     "type",

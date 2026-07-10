@@ -305,6 +305,7 @@ pub(super) enum CommitOutcome {
     Done(Option<CommitReport>),
     StaleRetry { seal_error: String },
     ConflictedBranch { seal_error: String },
+    LineageMismatch { seal_error: String },
 }
 
 pub(super) struct RecordFileChange {
@@ -336,16 +337,225 @@ pub(crate) fn literal_not_found_diagnostic(old: &str, new: &str) -> String {
     msg
 }
 
+const MAX_AMBIGUOUS_MATCH_EXCERPTS: usize = 10;
+const AMBIGUOUS_MATCH_CONTEXT_LINES: usize = 2;
+const AMBIGUOUS_MATCH_CONTINUATION_LINES: usize = 40;
+const MAX_AMBIGUOUS_EXCERPT_LINES: usize = 8;
+const MAX_DIAGNOSTIC_LINE_CHARS: usize = 180;
+
 /// Build a message when a literal (non-wildcard) `old_string` matches more than
 /// one site and `replace_all` was not set. Editing the first match silently
 /// would let the caller believe they edited the unique site they meant, so this
-/// is an explicit, actionable error instead.
-pub(crate) fn non_unique_match_diagnostic(count: usize) -> String {
-    format!(
-        "old_string matched {count} sites in the file; refusing to edit just the first one. \
+/// remains an explicit refusal. The matching excerpts make the safe follow-up
+/// edit possible without a separate discovery read.
+pub(crate) fn non_unique_match_diagnostic(
+    target: &str,
+    content: &str,
+    old_string: &str,
+    count: usize,
+    disk_matches_snapshot: bool,
+) -> String {
+    let path = target.strip_prefix("file:").unwrap_or(target);
+    let line_starts = line_starts(content);
+    let lines: Vec<&str> = content.split('\n').collect();
+    let locations: Vec<usize> = content
+        .match_indices(old_string)
+        .take(MAX_AMBIGUOUS_MATCH_EXCERPTS + 1)
+        .map(|(offset, _)| offset)
+        .collect();
+    let shown = locations.len().min(MAX_AMBIGUOUS_MATCH_EXCERPTS);
+
+    let mut message = format!(
+        "old_string matched {count} sites in {path}; refusing to edit just the first one. \
          Add surrounding context so old_string uniquely identifies the one site you mean, \
-         or pass replace_all:true to rewrite all {count} matches."
-    )
+         or pass replace_all:true to rewrite all {count} matches.\n\nMatching locations \
+         (showing {shown} of {count}):"
+    );
+
+    for (index, &match_start) in locations.iter().take(shown).enumerate() {
+        let start_line = line_index_for_byte(&line_starts, match_start, content.len());
+        let end_probe = old_string
+            .char_indices()
+            .last()
+            .map(|(offset, _)| match_start + offset)
+            .unwrap_or(match_start);
+        let end_line = line_index_for_byte(&line_starts, end_probe, content.len());
+        let start_column = char_column(&line_starts, content, start_line, match_start);
+        let end_column = char_column(&line_starts, content, end_line, end_probe);
+        let excerpt_start = start_line.saturating_sub(AMBIGUOUS_MATCH_CONTEXT_LINES);
+        let excerpt_end = (end_line + AMBIGUOUS_MATCH_CONTEXT_LINES + 1).min(lines.len());
+        let location = if start_line == end_line {
+            format!("{}:{start_column}-{end_column}", start_line + 1)
+        } else {
+            format!(
+                "{}:{start_column}-{}:{end_column}",
+                start_line + 1,
+                end_line + 1
+            )
+        };
+
+        message.push_str(&format!("\n\nMatch {} — {path}:{location}\n", index + 1));
+        let excerpt_lines = bounded_excerpt_lines(excerpt_start, excerpt_end);
+        let mut previous_line = None;
+        for line_index in excerpt_lines {
+            if let Some(previous) = previous_line {
+                if line_index > previous + 1 {
+                    message.push_str(&format!(
+                        "  ..... | … {} lines omitted …\n",
+                        line_index - previous - 1
+                    ));
+                }
+            }
+            let marker = if (start_line..=end_line).contains(&line_index) {
+                '>'
+            } else {
+                ' '
+            };
+            let focus = match line_index {
+                line if line == start_line && line == end_line => {
+                    Some((start_column - 1, end_column))
+                }
+                line if line == start_line => Some((start_column - 1, lines[line].chars().count())),
+                line if line == end_line => Some((0, end_column)),
+                line if (start_line..=end_line).contains(&line) => {
+                    Some((0, lines[line].chars().count()))
+                }
+                _ => None,
+            };
+            let rendered = diagnostic_line_excerpt(
+                lines[line_index],
+                focus,
+                start_line == end_line && line_index == start_line,
+            );
+            message.push_str(&format!(
+                "{marker} {:>5} | {}\n",
+                line_index + 1,
+                rendered.text
+            ));
+            if let Some(focus_marker) = rendered.focus_marker {
+                message.push_str(&format!("        | {focus_marker}\n"));
+            }
+            previous_line = Some(line_index);
+        }
+        message.pop();
+    }
+
+    if count > shown {
+        if disk_matches_snapshot {
+            let next_match_start = locations[shown];
+            let next_line = line_index_for_byte(&line_starts, next_match_start, content.len());
+            let offset = next_line.saturating_sub(AMBIGUOUS_MATCH_CONTEXT_LINES);
+            message.push_str(&format!(
+                "\n\n{} more matches omitted. Continue at the next omitted match with:\n\
+                 `{target}?offset={offset}&limit={AMBIGUOUS_MATCH_CONTINUATION_LINES}`",
+                count - shown
+            ));
+        } else {
+            message.push_str(&format!(
+                "\n\n{} more matches omitted. These locations exist only in the rejected batch's \
+                 in-flight snapshot, so a file read URI would be stale. Apply the preceding changes \
+                 in a separate write, then retry this patch to receive a continuation URI for the \
+                 committed file.",
+                count - shown
+            ));
+        }
+    }
+
+    message
+}
+
+fn line_starts(content: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(index, _)| index + 1))
+        .collect()
+}
+
+fn line_index_for_byte(line_starts: &[usize], byte_offset: usize, content_len: usize) -> usize {
+    let offset = byte_offset.min(content_len);
+    line_starts
+        .partition_point(|&line_start| line_start <= offset)
+        .saturating_sub(1)
+}
+
+fn char_column(
+    line_starts: &[usize],
+    content: &str,
+    line_index: usize,
+    byte_offset: usize,
+) -> usize {
+    content[line_starts[line_index]..byte_offset]
+        .chars()
+        .count()
+        + 1
+}
+
+fn bounded_excerpt_lines(start: usize, end: usize) -> Vec<usize> {
+    let count = end.saturating_sub(start);
+    if count <= MAX_AMBIGUOUS_EXCERPT_LINES {
+        return (start..end).collect();
+    }
+
+    let head = MAX_AMBIGUOUS_EXCERPT_LINES / 2;
+    let tail = MAX_AMBIGUOUS_EXCERPT_LINES - head;
+    (start..start + head).chain(end - tail..end).collect()
+}
+
+struct DiagnosticLineExcerpt {
+    text: String,
+    focus_marker: Option<String>,
+}
+
+fn diagnostic_line_excerpt(
+    line: &str,
+    focus: Option<(usize, usize)>,
+    show_focus_marker: bool,
+) -> DiagnosticLineExcerpt {
+    let chars: Vec<char> = line.chars().collect();
+    let mut start = 0;
+    let mut end = chars.len();
+    if chars.len() > MAX_DIAGNOSTIC_LINE_CHARS {
+        start = focus
+            .map(|(focus_start, focus_end)| {
+                let midpoint = focus_start.saturating_add(focus_end).saturating_div(2);
+                midpoint.saturating_sub(MAX_DIAGNOSTIC_LINE_CHARS / 2)
+            })
+            .unwrap_or(0);
+        start = start.min(chars.len() - MAX_DIAGNOSTIC_LINE_CHARS);
+        if let Some((_, focus_end)) = focus {
+            start = start.max(focus_end.saturating_sub(MAX_DIAGNOSTIC_LINE_CHARS));
+        }
+        end = (start + MAX_DIAGNOSTIC_LINE_CHARS).min(chars.len());
+    }
+
+    let has_prefix_ellipsis = start > 0;
+    let mut text = chars[start..end].iter().collect::<String>();
+    if has_prefix_ellipsis {
+        text.insert(0, '…');
+    }
+    if end < chars.len() {
+        text.push('…');
+    }
+
+    let focus_marker = if show_focus_marker {
+        focus.and_then(|(focus_start, focus_end)| {
+            let visible_start = focus_start.clamp(start, end);
+            let visible_end = focus_end.clamp(start, end);
+            (visible_end > visible_start).then(|| {
+                let marker_start = visible_start - start + usize::from(has_prefix_ellipsis);
+                let visible_len = visible_end - visible_start;
+                let marker_len = visible_len.min(20);
+                let mut marker = format!("{}{}", " ".repeat(marker_start), "^".repeat(marker_len));
+                if visible_len > marker_len {
+                    marker.push('…');
+                }
+                marker
+            })
+        })
+    } else {
+        None
+    };
+
+    DiagnosticLineExcerpt { text, focus_marker }
 }
 
 /// Shorten a hint fragment so diagnostics stay readable.
@@ -772,7 +982,14 @@ pub(super) fn prepare_file_changes(
                             return Err(build_failure(
                                 change.index,
                                 item,
-                                non_unique_match_diagnostic(matches),
+                                non_unique_match_diagnostic(
+                                    &normalized_target,
+                                    &content,
+                                    &literal_old,
+                                    matches,
+                                    std::fs::read_to_string(&full_path)
+                                        .is_ok_and(|disk_content| disk_content == content),
+                                ),
                             ));
                         } else if replace_all {
                             content.replace(literal_old.as_str(), new.as_str())
@@ -1253,7 +1470,23 @@ pub(super) async fn finalize_file_commit(
     // Route worktree mutations through the VCS seam (jj for a worktree). A
     // non-worktree cwd is rejected up front in `handle_write`, so this path
     // always sees a jj workspace.
-    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&request.cwd));
+    let managed_context =
+        match super::super::run_context::lookup_run_routed(&orch.db, request).await {
+            Ok((run, db)) => {
+                crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
+                    db, run.job_id,
+                )
+                .await
+                .ok()
+                .flatten()
+            }
+            Err(_) => None,
+        };
+    let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
+        orch,
+        std::path::Path::new(&request.cwd),
+        managed_context.as_ref(),
+    );
 
     let Some(commit_msg) = commit_msg else {
         // The file edits are already on disk. With no commit_msg, restore the
@@ -1357,6 +1590,9 @@ pub(super) async fn finalize_file_commit(
                 // the target commit is shared with a sibling bookmark.
                 message: result.amend_note,
             })))
+        }
+        Err(e) if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) => {
+            Ok(CommitOutcome::LineageMismatch { seal_error: e })
         }
         Err(e) if crate::jj::is_conflicted_branch_seal_error(&e) => {
             // The branch bookmark tip carries a recorded conflict and `@` has

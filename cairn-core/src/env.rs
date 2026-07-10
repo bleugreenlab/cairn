@@ -129,6 +129,14 @@ pub fn cairn_bin_dir() -> PathBuf {
     cairn_common::paths::cairn_home().join("bin")
 }
 
+/// Dedicated, opt-in PATH directory for executable warm-search interception.
+/// Unlike [`cairn_bin_dir`], this directory is never present in every agent
+/// shell; individual eligible shell items prepend it after resolving native
+/// fallback binaries against the unmodified agent PATH.
+pub fn warm_search_bin_dir() -> PathBuf {
+    cairn_common::paths::cairn_home().join("warm-search-bin")
+}
+
 /// Compose an agent-shell PATH by placing `bin_dir` ahead of `user_path`.
 fn prepend_cairn_bin(bin_dir: &Path, user_path: &str) -> String {
     format!("{}{}{}", bin_dir.display(), PATH_SEP, user_path)
@@ -141,6 +149,12 @@ fn prepend_cairn_bin(bin_dir: &Path, user_path: &str) -> String {
 /// sets `PATH` to this instead of bare [`get_user_path`].
 pub fn agent_shell_path() -> String {
     prepend_cairn_bin(&cairn_bin_dir(), get_user_path())
+}
+
+/// Agent PATH with the opt-in warm-search shim directory ahead of the ordinary
+/// Cairn tools and user binaries.
+pub fn warm_search_shell_path() -> String {
+    prepend_cairn_bin(&warm_search_bin_dir(), &agent_shell_path())
 }
 
 /// Environment variables that route a dev-instance's cargo builds into the one
@@ -183,6 +197,17 @@ pub fn ensure_agent_tool_shims(
     ensure_jj_shim_in(&bin_dir, jj_binary);
     ensure_forwarder_shim_in(&bin_dir, "bun", bun_binary);
     ensure_forwarder_shim_in(&bin_dir, "uv", uv_binary);
+
+    #[cfg(unix)]
+    {
+        let search_dir = warm_search_bin_dir();
+        if find_binary("rg").is_ok() {
+            ensure_forwarder_shim_in(&search_dir, "rg", cli_binary);
+        }
+        if find_binary("grep").is_ok() {
+            ensure_forwarder_shim_in(&search_dir, "grep", cli_binary);
+        }
+    }
 }
 
 /// The shared, per-home uv package cache dir (`<cairn_home>/uv-cache`), injected

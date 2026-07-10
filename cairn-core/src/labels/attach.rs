@@ -1,8 +1,10 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use cairn_db::turso::params;
 
-use crate::labels::crud::{label_from_row, list_labels_conn, DEFAULT_WORKSPACE_ID};
+use crate::labels::crud::{
+    label_from_row, label_from_row_at, list_labels_conn, DEFAULT_WORKSPACE_ID,
+};
 use crate::models::Label;
 use crate::storage::{DbResult, RowExt};
 
@@ -64,6 +66,39 @@ pub async fn list_labels_for_issue(
     let mut labels = Vec::new();
     while let Some(row) = rows.next().await? {
         labels.push(label_from_row(&row)?);
+    }
+    Ok(labels)
+}
+
+pub(crate) async fn list_labels_for_issues(
+    conn: &cairn_db::turso::Connection,
+    issue_ids: &[String],
+) -> DbResult<HashMap<String, Vec<Label>>> {
+    if issue_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let issue_ids_json = serde_json::to_string(issue_ids).map_err(|error| {
+        crate::storage::DbError::internal(format!("failed to serialize issue ids: {error}"))
+    })?;
+    let mut rows = conn
+        .query(
+            "SELECT il.issue_id,
+                    l.id, l.workspace_id, l.name, l.color, l.created_at, l.updated_at
+             FROM issue_labels il
+             JOIN labels l ON l.id = il.label_id
+             WHERE il.issue_id IN (SELECT value FROM json_each(?1))
+             ORDER BY il.issue_id ASC, LOWER(l.name) ASC",
+            params![issue_ids_json],
+        )
+        .await?;
+    let mut labels = HashMap::<String, Vec<Label>>::new();
+    while let Some(row) = rows.next().await? {
+        let issue_id = row.text(0)?;
+        labels
+            .entry(issue_id)
+            .or_default()
+            .push(label_from_row_at(&row, 1)?);
     }
     Ok(labels)
 }

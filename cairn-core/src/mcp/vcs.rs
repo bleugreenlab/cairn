@@ -35,6 +35,19 @@ impl VcsSnapshot {
     }
 }
 
+fn same_workspace_assignment_ignoring_branch(
+    marker: &crate::jj::WorkspaceIdentity,
+    expected: &crate::jj::WorkspaceIdentity,
+) -> bool {
+    marker.lineage_root_job_id == expected.lineage_root_job_id
+        && marker.owner_job_id == expected.owner_job_id
+        && marker.project_id == expected.project_id
+        && marker.project_root == expected.project_root
+        && marker.worktree_path == expected.worktree_path
+        && marker.workspace_name == expected.workspace_name
+        && marker.base_commit == expected.base_commit
+}
+
 /// All worktree-mutating VCS operations on the commit-barrier and write paths.
 pub trait WorktreeVcs: Send + Sync {
     /// Capture pre-batch working-copy state.
@@ -97,13 +110,53 @@ pub trait WorktreeVcs: Send + Sync {
 /// jj backend — seals/discards the workspace `@` over the shared store via
 /// `crate::jj`. One addressable commit per tool call; discard is reversible
 /// through the operation log; no blocking mid-transition state.
+pub(crate) const WORKSPACE_LINEAGE_MISMATCH_PREFIX: &str = "workspace lineage mismatch:";
+
+pub(crate) fn is_workspace_lineage_mismatch(error: &str) -> bool {
+    error.starts_with(WORKSPACE_LINEAGE_MISMATCH_PREFIX)
+}
+
 pub struct JjBackend {
     jj: crate::jj::JjEnv,
+    identity: Option<crate::jj::WorkspaceIdentity>,
 }
 
 impl JjBackend {
     pub fn new(jj: crate::jj::JjEnv) -> Self {
-        Self { jj }
+        Self { jj, identity: None }
+    }
+
+    pub(crate) fn managed(jj: crate::jj::JjEnv, identity: crate::jj::WorkspaceIdentity) -> Self {
+        Self {
+            jj,
+            identity: Some(identity),
+        }
+    }
+
+    fn validate_identity(&self, worktree: &Path) -> Result<(), String> {
+        let Some(expected) = self.identity.as_ref() else {
+            return Ok(());
+        };
+        let actual = crate::jj::read_workspace_identity(worktree).ok_or_else(|| {
+            format!(
+                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} identity marker missing at {}; recovery: cairn:~/workspace-recovery",
+                worktree.display()
+            )
+        })?;
+        let branch_marker = crate::jj::read_branch_marker(worktree);
+        let project_marker = crate::jj::read_project_root_marker(worktree);
+        if actual != *expected
+            || branch_marker.as_deref() != Some(expected.branch.as_str())
+            || project_marker.as_deref() != Some(expected.project_root.as_path())
+            || worktree != expected.worktree_path
+        {
+            return Err(format!(
+                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} callback/database/marker coordinates disagree for job lineage {} at {}; recovery: cairn:~/workspace-recovery",
+                expected.lineage_root_job_id,
+                worktree.display()
+            ));
+        }
+        Ok(())
     }
 
     /// Push the workspace's bookmark to origin after a seal so each `commit_msg`
@@ -120,7 +173,9 @@ impl JjBackend {
             return;
         };
         self.heal_conflicted_intermediates(worktree, &branch);
-        crate::jj::push_to_origin(&self.jj, worktree, &branch);
+        if let Err(e) = crate::jj::push_to_origin(&self.jj, worktree, &branch) {
+            log::warn!("jj push failed (seal succeeded locally): {e}");
+        }
     }
 
     /// After a successful seal, collapse a clean-tip / conflicted-intermediate
@@ -214,6 +269,7 @@ impl WorktreeVcs for JjBackend {
         msg: &str,
         author: Option<&GitAuthor>,
     ) -> Result<CommitResult, String> {
+        self.validate_identity(worktree)?;
         let result = crate::jj::seal(&self.jj, worktree, msg, author)?;
         self.push_after_seal(worktree);
         Ok(result)
@@ -226,6 +282,7 @@ impl WorktreeVcs for JjBackend {
         msg: &str,
         author: Option<&GitAuthor>,
     ) -> Result<CommitResult, String> {
+        self.validate_identity(worktree)?;
         // Path-scope the seal to exactly these paths so unrelated un-sealed dirt
         // in `@` (a prior failed or full-sandbox run's side effects) is NOT
         // folded into this write's commit: a file-scoped write seals only these
@@ -246,6 +303,7 @@ impl WorktreeVcs for JjBackend {
     }
 
     fn reconcile_workspace(&self, worktree: &Path) -> Result<(), String> {
+        self.validate_identity(worktree)?;
         // 1. Heal an on-disk STALE working copy. `jj workspace update-stale` is the
         //    one op staleness does not block; on a fresh (non-stale) workspace it
         //    is a fast no-op (exits 0, "not stale"). This is exactly the heal the
@@ -406,6 +464,319 @@ pub fn resolve_worktree_vcs(
     }
 }
 
+pub(crate) fn resolve_managed_worktree_vcs(
+    orch: &crate::orchestrator::Orchestrator,
+    worktree: &Path,
+    context: Option<&crate::execution::jobs::workspace_identity::ManagedWorkspaceContext>,
+) -> Box<dyn WorktreeVcs> {
+    if crate::jj::is_jj_dir(worktree) {
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        match context {
+            Some(context) => Box::new(JjBackend::managed(jj, context.identity.clone())),
+            None => Box::new(JjBackend::new(jj)),
+        }
+    } else {
+        Box::new(NonWorktreeVcs)
+    }
+}
+
+fn lineage_mismatch_diagnostic(
+    jj: &crate::jj::JjEnv,
+    context: &crate::execution::jobs::workspace_identity::ManagedWorkspaceContext,
+    prior_owner: Option<&str>,
+    reason: &str,
+) -> String {
+    let identity = &context.identity;
+    let current = crate::jj::working_copy_commit(jj, &identity.worktree_path)
+        .unwrap_or_else(|e| format!("unavailable ({e})"));
+    let head = crate::jj::head_commit(jj, &identity.worktree_path)
+        .unwrap_or_else(|e| format!("unavailable ({e})"));
+    let bookmark = crate::jj::bookmark_commit(jj, &identity.worktree_path, &identity.branch)
+        .unwrap_or_else(|| "absent".to_string());
+    let dirty = crate::jj::is_working_copy_dirty(jj, &identity.worktree_path)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|e| format!("unavailable ({e})"));
+    let conflicted = crate::jj::branch_has_conflict(jj, &identity.worktree_path, &identity.branch)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|e| format!("unavailable ({e})"));
+    format!(
+        "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} {reason}; job={}; lineage={}; project={}; path={}; workspace={}; recorded_base={}; current_at={current}; current_head={head}; branch_marker={}; bookmark_tip={bookmark}; prior_owner={}; dirty={dirty}; conflicted={conflicted}; recovery=cairn:~/workspace-recovery action=rebind",
+        context.current_job_id,
+        identity.lineage_root_job_id,
+        identity.project_id,
+        identity.worktree_path.display(),
+        identity.workspace_name,
+        identity.base_commit,
+        crate::jj::read_branch_marker(&identity.worktree_path).unwrap_or_else(|| "absent".into()),
+        prior_owner.unwrap_or("legacy/unmarked"),
+    )
+}
+
+fn deterministic_rebind_branch(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    branch: &str,
+    lineage: &str,
+) -> String {
+    let short: String = lineage
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    for attempt in 0..=100 {
+        let suffix = if attempt == 0 {
+            format!("-j{short}")
+        } else {
+            format!("-j{short}-{attempt}")
+        };
+        let candidate = format!("{branch}{suffix}");
+        if crate::jj::bookmark_commit(jj, store, &candidate).is_none() {
+            return candidate;
+        }
+    }
+    format!("{branch}-j{short}-overflow")
+}
+
+/// Resolve, prove, and when necessary non-destructively rebind a managed
+/// workspace before a write/run executes. The caller holds the per-store lock.
+pub(crate) async fn prepare_managed_workspace(
+    orch: &crate::orchestrator::Orchestrator,
+    request: &cairn_common::protocol::CallbackRequest,
+) -> Result<Option<crate::execution::jobs::workspace_identity::ManagedWorkspaceContext>, String> {
+    let cwd = Path::new(&request.cwd);
+    if !crate::jj::is_jj_dir(cwd) {
+        return Ok(None);
+    }
+    let (run, db) =
+        match crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await {
+            Ok(resolved) => resolved,
+            Err(_) if cfg!(any(test, feature = "test-utils")) && request.run_id.is_none() => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+    let mut context = crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
+        db.clone(),
+        run.job_id.clone(),
+    )
+    .await?
+    .ok_or_else(|| {
+        format!(
+            "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} active run {} has no managed workspace assignment; recovery=cairn:~/workspace-recovery action=rebind",
+            run.run_id
+        )
+    })?;
+    let mut identity = context.identity.clone();
+    if cwd != identity.worktree_path {
+        return Err(lineage_mismatch_diagnostic(
+            &crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir),
+            &context,
+            None,
+            "callback cwd does not equal the database assignment",
+        ));
+    }
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, &identity.project_root);
+    let mut marker = crate::jj::read_workspace_identity(cwd);
+    if let Some(marker) = marker.as_ref() {
+        if !same_workspace_assignment_ignoring_branch(marker, &identity) {
+            return Err(lineage_mismatch_diagnostic(
+                &jj,
+                &context,
+                Some(&marker.lineage_root_job_id),
+                "physical identity marker belongs to another assignment",
+            ));
+        }
+    }
+    let project_marker = crate::jj::read_project_root_marker(cwd);
+    if project_marker.as_deref() != Some(identity.project_root.as_path()) {
+        return Err(lineage_mismatch_diagnostic(
+            &jj,
+            &context,
+            marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
+            "project-root marker disagrees with the database assignment",
+        ));
+    }
+    let head = crate::jj::head_commit(&jj, cwd).map_err(|e| {
+        lineage_mismatch_diagnostic(&jj, &context, None, &format!("cannot resolve @-: {e}"))
+    })?;
+    if !crate::jj::revision_descends_from(&jj, &store, &head, &identity.base_commit) {
+        return Err(lineage_mismatch_diagnostic(
+            &jj,
+            &context,
+            marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
+            "recorded base is not an ancestor of the physical workspace @-",
+        ));
+    }
+
+    let branch_marker = crate::jj::read_branch_marker(cwd);
+    if let Some(actual) = marker.as_ref() {
+        if let Some(pending) = actual.pending_rebind.as_ref() {
+            let pending_tip = crate::jj::bookmark_commit(&jj, &store, &pending.new_branch);
+            let marker_position = branch_marker.as_deref();
+            let valid_common = actual.branch == pending.old_branch
+                && pending.sealed_head == head
+                && pending_tip.as_deref() == Some(head.as_str());
+            let database_at_old = identity.branch == pending.old_branch
+                && marker_position == Some(pending.old_branch.as_str());
+            let database_at_new = identity.branch == pending.new_branch
+                && (marker_position == Some(pending.old_branch.as_str())
+                    || marker_position == Some(pending.new_branch.as_str()));
+            if !valid_common || (!database_at_old && !database_at_new) {
+                return Err(lineage_mismatch_diagnostic(
+                    &jj,
+                    &context,
+                    Some(&actual.lineage_root_job_id),
+                    "pending workspace rebind does not agree with the database, bookmark, markers, and sealed head",
+                ));
+            }
+            if database_at_old {
+                crate::execution::jobs::workspace_identity::compare_and_swap_owner_branch(
+                    db.clone(),
+                    identity.owner_job_id.clone(),
+                    identity.worktree_path.to_string_lossy().to_string(),
+                    pending.old_branch.clone(),
+                    pending.new_branch.clone(),
+                    chrono::Utc::now().timestamp() as i32,
+                )
+                .await?;
+                context.identity.branch = pending.new_branch.clone();
+                identity = context.identity.clone();
+            }
+            crate::jj::write_branch_marker(cwd, &pending.new_branch).map_err(|error| {
+                format!(
+                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} pending database rebind is proven but completing the branch marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
+                )
+            })?;
+            identity.pending_rebind = None;
+            crate::jj::write_workspace_identity(cwd, &identity).map_err(|error| {
+                format!(
+                    "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} pending database rebind is proven but completing the identity marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
+                )
+            })?;
+            context.identity = identity.clone();
+            marker = Some(identity.clone());
+        } else if actual.branch != identity.branch {
+            return Err(lineage_mismatch_diagnostic(
+                &jj,
+                &context,
+                Some(&actual.lineage_root_job_id),
+                "identity marker branch differs from the database assignment without a persisted pending rebind",
+            ));
+        }
+    }
+    if crate::jj::read_branch_marker(cwd).as_deref() != Some(identity.branch.as_str()) {
+        return Err(lineage_mismatch_diagnostic(
+            &jj,
+            &context,
+            marker.as_ref().map(|m| m.lineage_root_job_id.as_str()),
+            "branch marker disagrees with the database assignment",
+        ));
+    }
+
+    let ownership = crate::execution::jobs::workspace_identity::branch_ownership_evidence(
+        db.clone(),
+        identity.project_id.clone(),
+        identity.branch.clone(),
+        identity.lineage_root_job_id.clone(),
+    )
+    .await?;
+    let bookmark_tip = crate::jj::bookmark_commit(&jj, &store, &identity.branch);
+    let owner_conflict = ownership.conflicting_owner.is_some();
+    let unmarked_collision = marker.is_none()
+        && bookmark_tip.as_deref().is_some_and(|tip| tip != head)
+        && !ownership.prior_same_lineage;
+
+    if owner_conflict || unmarked_collision {
+        if marker.is_none() {
+            // Install the old, fully-proven assignment before the database CAS.
+            // If the process stops after the CAS, the next recovery can identify
+            // and complete that exact partial transition without guessing the
+            // persisted JJ workspace registration name.
+            crate::jj::write_workspace_identity(cwd, &identity)?;
+        }
+        let new_branch = deterministic_rebind_branch(
+            &jj,
+            &store,
+            &identity.branch,
+            &identity.lineage_root_job_id,
+        );
+        crate::jj::create_bookmark_at(&jj, &store, &new_branch, &head)?;
+        let mut pending_identity = identity.clone();
+        pending_identity.pending_rebind = Some(crate::jj::WorkspaceRebindTransition {
+            old_branch: identity.branch.clone(),
+            new_branch: new_branch.clone(),
+            sealed_head: head.clone(),
+        });
+        crate::jj::write_workspace_identity(cwd, &pending_identity)?;
+        crate::execution::jobs::workspace_identity::compare_and_swap_owner_branch(
+            db,
+            identity.owner_job_id.clone(),
+            identity.worktree_path.to_string_lossy().to_string(),
+            identity.branch.clone(),
+            new_branch.clone(),
+            chrono::Utc::now().timestamp() as i32,
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} created preserved recovery bookmark {new_branch} at {head}, but database compare-and-swap failed: {e}; old bookmark and working copy were left unchanged; recovery=cairn:~/workspace-recovery action=rebind"
+            )
+        })?;
+        context.identity.branch = new_branch.clone();
+        context.identity.pending_rebind = None;
+        crate::jj::write_branch_marker(cwd, &new_branch).map_err(|error| {
+            format!(
+                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} database rebind to {new_branch} succeeded but writing the branch marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
+            )
+        })?;
+        crate::jj::write_workspace_identity(cwd, &context.identity).map_err(|error| {
+            format!(
+                "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} database rebind to {new_branch} succeeded but writing the identity marker failed: {error}; rerun cairn:~/workspace-recovery action=rebind"
+            )
+        })?;
+    } else if marker.is_none() {
+        crate::jj::write_workspace_identity(cwd, &context.identity)?;
+    }
+
+    Ok(Some(context))
+}
+
+pub(crate) async fn workspace_recovery_status(
+    orch: &crate::orchestrator::Orchestrator,
+    request: &cairn_common::protocol::CallbackRequest,
+) -> String {
+    let Ok((run, db)) =
+        crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request).await
+    else {
+        return format!(
+            "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} no active callback run could be resolved; all state was preserved"
+        );
+    };
+    let Ok(Some(context)) =
+        crate::execution::jobs::workspace_identity::resolve_managed_workspace_context(
+            db, run.job_id,
+        )
+        .await
+    else {
+        return format!(
+            "{WORKSPACE_LINEAGE_MISMATCH_PREFIX} the active job has no provable managed workspace assignment; all state was preserved"
+        );
+    };
+    let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+    let marker_owner = crate::jj::read_workspace_identity(&context.identity.worktree_path)
+        .map(|marker| marker.lineage_root_job_id);
+    let diagnostic = lineage_mismatch_diagnostic(
+        &jj,
+        &context,
+        marker_owner.as_deref(),
+        "recovery inspection",
+    );
+    format!(
+        "# Managed workspace recovery\n\n{diagnostic}\n\n## Safe action\nwrite {{target:\"cairn:~/workspace-recovery\", mode:\"patch\", payload:{{action:\"rebind\"}}}}\n\nThe action only creates a fresh bookmark at the current `@-` after the database assignment, physical path/markers, and recorded-base ancestry are proven. It never resets, moves, or deletes the conflicting bookmark and never changes working-copy files."
+    )
+}
+
 /// Resolve the per-store serialization lock for an agent cwd, keyed identically
 /// to base-advance reconcile and merge-fold
 /// (`project_store_dir(config_dir, repo_path)`), so the agent seal/discard path
@@ -428,13 +799,12 @@ pub async fn resolve_store_lock(
     if !crate::jj::is_jj_dir(cwd) {
         return None; // NonWorktreeVcs — never touches a shared store.
     }
-    let run = crate::mcp::handlers::run_context::lookup_run(&orch.db.local, request)
+    let (run, db) = crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
         .await
         .ok()?;
-    let repo_path =
-        crate::mcp::handlers::run_context::project_path(&orch.db.local, &run.project_id)
-            .await
-            .ok()??;
+    let repo_path = crate::mcp::handlers::run_context::project_path(&db, &run.project_id)
+        .await
+        .ok()??;
     let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
     Some(orch.jj_store_lock(&store))
 }

@@ -38,6 +38,272 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> Orchestrator {
     Orchestrator::builder(db_state, services, temp.path().join("config")).build()
 }
 
+#[tokio::test]
+async fn run_preflight_completes_rebind_interrupted_after_database_cas() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "partial-after-cas";
+    let (temp, db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let original = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    let (new_branch, _) = simulate_partial_rebind(&temp, &db, &cwd, run_id, false).await;
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf resumed > resumed.txt",
+            Some("resume partial rebind"),
+        ),
+    )
+    .await;
+
+    assert!(
+        result.to_ascii_lowercase().contains("committed"),
+        "{result}"
+    );
+    let completed = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    assert_eq!(completed.branch, new_branch);
+    assert_eq!(completed.workspace_name, original.workspace_name);
+    assert_eq!(
+        jj::read_branch_marker(Path::new(&cwd)).as_deref(),
+        Some(new_branch.as_str())
+    );
+}
+
+#[tokio::test]
+async fn run_preflight_completes_rebind_interrupted_between_marker_writes() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "partial-between-markers";
+    let (temp, db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let original = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    let (new_branch, _) = simulate_partial_rebind(&temp, &db, &cwd, run_id, true).await;
+    assert_eq!(
+        jj::read_workspace_identity(Path::new(&cwd)).unwrap().branch,
+        original.branch,
+        "the fixture stops after the branch marker and before the identity marker"
+    );
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf resumed > resumed.txt",
+            Some("resume marker update"),
+        ),
+    )
+    .await;
+
+    assert!(
+        result.to_ascii_lowercase().contains("committed"),
+        "{result}"
+    );
+    let completed = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    assert_eq!(completed.branch, new_branch);
+    assert_eq!(completed.workspace_name, original.workspace_name);
+}
+
+#[tokio::test]
+async fn run_preflight_rejects_arbitrary_database_branch_at_current_head() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "arbitrary-db-branch";
+    let (temp, db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let original = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    let head = jj::head_commit(&jj, Path::new(&cwd)).unwrap();
+    let arbitrary = "agent/arbitrary-database-reassignment";
+    jj::create_bookmark_at(&jj, Path::new(&cwd), arbitrary, &head).unwrap();
+    db.execute(
+        "UPDATE jobs SET branch = ?1 WHERE id = ?2",
+        params![arbitrary, format!("job-{run_id}").as_str()],
+    )
+    .await
+    .unwrap();
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf must-not-run > arbitrary.txt",
+            Some("must not execute"),
+        ),
+    )
+    .await;
+
+    assert!(
+        result.contains("without a persisted pending rebind"),
+        "an arbitrary reassignment at @- must fail closed: {result}"
+    );
+    assert!(!Path::new(&cwd).join("arbitrary.txt").exists());
+    assert_eq!(
+        jj::read_workspace_identity(Path::new(&cwd)),
+        Some(original.clone())
+    );
+    assert_eq!(
+        jj::read_branch_marker(Path::new(&cwd)).as_deref(),
+        Some(original.branch.as_str())
+    );
+}
+
+#[tokio::test]
+async fn run_preflight_rebinds_unowned_legacy_descendant_bookmark() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "legacy-descendant";
+    let (temp, _db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let branch = "agent/RHG-1-builder-0";
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let project_repo = temp.path().join("project");
+    let store = jj::project_store_dir(&temp.path().join("config"), &project_repo);
+    let sibling = temp.path().join("legacy-advance");
+    let sibling_branch = "agent/legacy-descendant-source";
+    jj::add_workspace(&jj, &store, &sibling, sibling_branch, branch, None).unwrap();
+    std::fs::write(sibling.join("legacy.txt"), "unrelated legacy history\n").unwrap();
+    jj::seal(&jj, &sibling, "legacy advance", None).unwrap();
+    let sibling_tip = jj::bookmark_commit(&jj, &store, sibling_branch).unwrap();
+    jj::set_bookmark_at(&jj, &store, branch, &sibling_tip).unwrap();
+    let legacy_tip = jj::bookmark_commit(&jj, &store, branch).unwrap();
+    std::fs::remove_file(Path::new(&cwd).join(".jj").join("cairn-workspace-identity")).unwrap();
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf current > current.txt",
+            Some("seal without legacy adoption"),
+        ),
+    )
+    .await;
+
+    assert!(
+        result.to_ascii_lowercase().contains("committed"),
+        "{result}"
+    );
+    assert_eq!(
+        jj::bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(legacy_tip.as_str()),
+        "the unowned descendant bookmark must remain untouched"
+    );
+    let rebound = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    assert_ne!(rebound.branch, branch);
+    assert!(rebound.branch.starts_with("agent/RHG-1-builder-0-j"));
+}
+
+#[tokio::test]
+async fn sealed_same_job_retry_keeps_recorded_base_and_passes_next_preflight() {
+    let Some(_bin) = common::jj_bin() else {
+        return;
+    };
+    let run_id = "sealed-retry";
+    let (temp, _db, orch, cwd, _) = setup_rebind_fixture(run_id).await;
+    let branch = "agent/RHG-1-builder-0";
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let project_repo = temp.path().join("project");
+    let store = jj::project_store_dir(&temp.path().join("config"), &project_repo);
+    let identity = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    let recorded_base = identity.base_commit.clone();
+
+    std::fs::write(Path::new(&cwd).join("sealed.txt"), "prior sealed work\n").unwrap();
+    jj::seal(&jj, Path::new(&cwd), "prior sealed work", None).unwrap();
+    let sealed_tip = jj::bookmark_commit(&jj, &store, branch).unwrap();
+    assert_ne!(sealed_tip, recorded_base);
+
+    std::fs::remove_dir_all(&cwd).unwrap();
+    jj::cleanup_workspace_retry(&jj, &store, Path::new(&cwd), &identity.workspace_name).unwrap();
+    jj::add_workspace(&jj, &store, Path::new(&cwd), branch, &sealed_tip, None).unwrap();
+    jj::write_base_marker(Path::new(&cwd), "main", &sealed_tip).unwrap();
+    jj::write_project_root_marker(Path::new(&cwd), &project_repo).unwrap();
+    jj::write_workspace_identity(Path::new(&cwd), &identity).unwrap();
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf next > next.txt",
+            Some("seal after retry"),
+        ),
+    )
+    .await;
+
+    assert!(
+        result.to_ascii_lowercase().contains("committed"),
+        "{result}"
+    );
+    let installed = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    assert_eq!(installed.base_commit, recorded_base);
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&cwd).join("sealed.txt")).unwrap(),
+        "prior sealed work\n"
+    );
+}
+
+#[tokio::test]
+async fn run_preflight_rebinds_prior_lineage_before_command_execution() {
+    let Some(_bin) = common::jj_bin() else {
+        eprintln!("skipping run_preflight_rebinds_prior_lineage_before_command_execution: jj not resolvable");
+        return;
+    };
+    let run_id = "run-lineage-rebind";
+    let (temp, db, orch, cwd, project_id) = setup_rebind_fixture(run_id).await;
+    let branch = "agent/RHG-1-builder-0";
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let old_tip = jj::bookmark_commit(&jj, Path::new(&cwd), branch).unwrap();
+
+    db.execute(
+        "INSERT INTO jobs(id, project_id, status, branch, created_at, updated_at)
+         VALUES ('prior-lineage', ?1, 'finished', ?2, 0, 0)",
+        params![project_id.as_str(), branch],
+    )
+    .await
+    .unwrap();
+
+    let result = handle_run(
+        &orch,
+        &run_request(
+            &cwd,
+            run_id,
+            "printf repaired > repaired.txt",
+            Some("seal after lineage rebind"),
+        ),
+    )
+    .await;
+
+    assert!(
+        result.to_ascii_lowercase().contains("committed"),
+        "result: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&cwd).join("repaired.txt")).unwrap(),
+        "repaired"
+    );
+    assert_eq!(
+        jj::bookmark_commit(&jj, Path::new(&cwd), branch).as_deref(),
+        Some(old_tip.as_str()),
+        "the conflicting bookmark must remain unchanged"
+    );
+    let marker = jj::read_workspace_identity(Path::new(&cwd)).unwrap();
+    assert_ne!(marker.branch, branch);
+    assert!(marker.branch.starts_with("agent/RHG-1-builder-0-j"));
+    assert!(jj::bookmark_commit(&jj, Path::new(&cwd), &marker.branch).is_some());
+    let persisted_branch = common::scalar_text_by_id(
+        &db,
+        "SELECT branch FROM jobs WHERE id = ?1",
+        &format!("job-{run_id}"),
+    )
+    .await;
+    assert_eq!(persisted_branch.as_deref(), Some(marker.branch.as_str()));
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
@@ -107,10 +373,13 @@ fn agent_snapshot(sandbox: LegacySandbox, on_escape: LegacyOnEscape) -> AgentSna
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn seed_run(
     db: &LocalDb,
     project_id: &str,
     worktree: &Path,
+    branch: &str,
+    base_commit: &str,
     run_id: &str,
     sandbox: LegacySandbox,
     on_escape: LegacyOnEscape,
@@ -144,6 +413,8 @@ async fn seed_run(
     let exec_id = format!("exec-{run_id}");
     let job_id = format!("job-{run_id}");
     let worktree = worktree.display().to_string();
+    let branch = branch.to_string();
+    let base_commit = base_commit.to_string();
     let run_id = run_id.to_string();
     db.write(move |conn| {
         let project_id = project_id.clone();
@@ -151,6 +422,8 @@ async fn seed_run(
         let exec_id = exec_id.clone();
         let job_id = job_id.clone();
         let worktree = worktree.clone();
+        let branch = branch.clone();
+        let base_commit = base_commit.clone();
         let run_id = run_id.clone();
         let snapshot = snapshot.clone();
         Box::pin(async move {
@@ -167,9 +440,9 @@ async fn seed_run(
             )
             .await?;
             conn.execute(
-                "INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, node_name, status, uri_segment, worktree_path, created_at, updated_at)
-                 VALUES (?1, ?2, 'agent-1', ?3, ?4, 'builder', 'running', 'builder', ?5, 1, 1)",
-                params![job_id.as_str(), exec_id.as_str(), issue_id.as_str(), project_id.as_str(), worktree.as_str()],
+                "INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, node_name, status, uri_segment, worktree_path, branch, base_commit, created_at, updated_at)
+                 VALUES (?1, ?2, 'agent-1', ?3, ?4, 'builder', 'running', 'builder', ?5, ?6, ?7, 1, 1)",
+                params![job_id.as_str(), exec_id.as_str(), issue_id.as_str(), project_id.as_str(), worktree.as_str(), branch.as_str(), base_commit.as_str()],
             )
             .await?;
             conn.execute(
@@ -186,6 +459,28 @@ async fn seed_run(
 }
 
 /// Build an orchestrator whose seeded run owns a real jj workspace at the cwd.
+fn write_managed_identity(
+    project_id: &str,
+    project_repo: &Path,
+    worktree: &Path,
+    branch: &str,
+    base_commit: &str,
+    run_id: &str,
+) {
+    let job_id = format!("job-{run_id}");
+    let identity = jj::WorkspaceIdentity::new(
+        job_id.clone(),
+        job_id,
+        project_id,
+        project_repo.to_path_buf(),
+        worktree.to_path_buf(),
+        branch,
+        jj::workspace_name_for_branch(branch),
+        base_commit,
+    );
+    jj::write_workspace_identity(worktree, &identity).unwrap();
+}
+
 async fn setup_with_sandbox(
     run_id: &str,
     sandbox: LegacySandbox,
@@ -195,22 +490,95 @@ async fn setup_with_sandbox(
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "RHG").await;
+    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
     let ws = temp.path().join("ws");
-    seed_run(&db, &project_id, &ws, run_id, sandbox, on_escape).await;
-    let orch = orchestrator(&temp, db);
-    common::provision_jj_workspace(
-        &temp.path().join("config"),
-        &project_repo,
+    let branch = "agent/RHG-1-builder-0";
+    let base = common::head_sha(&project_repo);
+    seed_run(
+        &db,
+        &project_id,
         &ws,
-        "agent/RHG-1-builder-0",
-    );
+        branch,
+        &base,
+        run_id,
+        sandbox,
+        on_escape,
+    )
+    .await;
+    let orch = orchestrator(&temp, db);
+    common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
+    write_managed_identity(&project_id, &project_repo, &ws, branch, &base, run_id);
     let cwd = ws.display().to_string();
     (temp, orch, cwd)
 }
 
 async fn setup(run_id: &str) -> (TempDir, Orchestrator, String) {
     setup_with_sandbox(run_id, LegacySandbox::Worktree, LegacyOnEscape::Allow).await
+}
+
+async fn setup_rebind_fixture(
+    run_id: &str,
+) -> (TempDir, Arc<LocalDb>, Orchestrator, String, String) {
+    let (temp, db) = common::migrated_db().await;
+    let project_repo = temp.path().join("project");
+    init_git_repo(&project_repo);
+    let db = Arc::new(db);
+    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
+    let ws = temp.path().join("ws");
+    let branch = "agent/RHG-1-builder-0";
+    let base = common::head_sha(&project_repo);
+    seed_run(
+        &db,
+        &project_id,
+        &ws,
+        branch,
+        &base,
+        run_id,
+        LegacySandbox::Worktree,
+        LegacyOnEscape::Allow,
+    )
+    .await;
+    let orch = orchestrator(&temp, db.clone());
+    common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
+    write_managed_identity(&project_id, &project_repo, &ws, branch, &base, run_id);
+    let cwd = ws.display().to_string();
+    (temp, db, orch, cwd, project_id)
+}
+
+async fn simulate_partial_rebind(
+    temp: &TempDir,
+    db: &LocalDb,
+    cwd: &str,
+    run_id: &str,
+    write_new_branch_marker: bool,
+) -> (String, String) {
+    let jj = JjEnv::resolve("jj", &temp.path().join("config"));
+    let head = jj::head_commit(&jj, Path::new(cwd)).unwrap();
+    let lineage = format!("job-{run_id}");
+    let short: String = lineage
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let new_branch = format!("agent/RHG-1-builder-0-j{short}");
+    jj::create_bookmark_at(&jj, Path::new(cwd), &new_branch, &head).unwrap();
+    let mut identity = jj::read_workspace_identity(Path::new(cwd)).unwrap();
+    identity.pending_rebind = Some(jj::WorkspaceRebindTransition {
+        old_branch: identity.branch.clone(),
+        new_branch: new_branch.clone(),
+        sealed_head: head.clone(),
+    });
+    jj::write_workspace_identity(Path::new(cwd), &identity).unwrap();
+    db.execute(
+        "UPDATE jobs SET branch = ?1 WHERE id = ?2",
+        params![new_branch.as_str(), format!("job-{run_id}").as_str()],
+    )
+    .await
+    .unwrap();
+    if write_new_branch_marker {
+        jj::write_branch_marker(Path::new(cwd), &new_branch).unwrap();
+    }
+    (new_branch, head)
 }
 
 /// Like [`setup`], but nests the jj workspace UNDER an outer git repo (mimicking
@@ -230,26 +598,26 @@ async fn setup_nested_under_git_repo(
     let home = temp.path().join("home");
     init_git_repo(&home);
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "RHG").await;
+    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
     let ws = home.join("worktrees").join("ws");
     // `jj workspace add` creates only the final dir, not intermediates.
     std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
+    let branch = "agent/RHG-1-builder-0";
+    let base = common::head_sha(&project_repo);
     seed_run(
         &db,
         &project_id,
         &ws,
+        branch,
+        &base,
         run_id,
         LegacySandbox::Worktree,
         LegacyOnEscape::Allow,
     )
     .await;
     let orch = orchestrator(&temp, db);
-    common::provision_jj_workspace(
-        &temp.path().join("config"),
-        &project_repo,
-        &ws,
-        "agent/RHG-1-builder-0",
-    );
+    common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
+    write_managed_identity(&project_id, &project_repo, &ws, branch, &base, run_id);
     let cwd = ws.display().to_string();
     (temp, orch, cwd, home)
 }
@@ -273,26 +641,26 @@ async fn setup_nested_with_origin(
     let home = temp.path().join("home");
     init_git_repo(&home);
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "RHG").await;
+    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
     let ws = home.join("worktrees").join("ws");
     // `jj workspace add` creates only the final dir, not intermediates.
     std::fs::create_dir_all(ws.parent().unwrap()).unwrap();
+    let branch = "agent/RHG-1-builder-0";
+    let base = common::head_sha(&project_repo);
     seed_run(
         &db,
         &project_id,
         &ws,
+        branch,
+        &base,
         run_id,
         LegacySandbox::Worktree,
         LegacyOnEscape::Allow,
     )
     .await;
     let orch = orchestrator(&temp, db);
-    common::provision_jj_workspace(
-        &temp.path().join("config"),
-        &project_repo,
-        &ws,
-        "agent/RHG-1-builder-0",
-    );
+    common::provision_jj_workspace(&temp.path().join("config"), &project_repo, &ws, branch);
+    write_managed_identity(&project_id, &project_repo, &ws, branch, &base, run_id);
     let cwd = ws.display().to_string();
     (temp, orch, cwd, origin)
 }

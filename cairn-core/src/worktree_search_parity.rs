@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use crate::mcp::handlers::search::{glob_matched_paths_walk, grep_search, GrepPayload};
@@ -314,4 +315,105 @@ fn index_glob_matches_walk_sets_with_exact_refiltering() {
 
     let upper = search.try_glob("src/*.RS", None, &[]).unwrap();
     assert_eq!(upper, vec![PathBuf::from("src/Upper.RS")]);
+}
+
+fn native_search(root: &Path, program: &str, args: &[&str]) -> (Vec<u8>, Vec<u8>, i32) {
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    (
+        output.stdout,
+        output.stderr,
+        output.status.code().unwrap_or(-1),
+    )
+}
+
+fn raw_warm_stdout(body: String) -> Vec<u8> {
+    if body.is_empty() {
+        Vec::new()
+    } else {
+        format!("{body}\n").into_bytes()
+    }
+}
+
+#[test]
+fn warm_content_stdout_and_status_match_native_rg_and_recursive_grep() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git_init(root);
+    write_file(root, "src/a.txt", "Needle upper\nneedle lower\n");
+    write_file(root, "src/b.txt", "absent\n");
+
+    let search = WorktreeSearch::new(root).unwrap();
+    assert!(search.wait_for_scan(Duration::from_secs(15)));
+
+    let rg_body = search
+        .try_grep(
+            &WorktreeGrepParams {
+                pattern: "needle".to_string(),
+                subdir: None,
+                globs: Vec::new(),
+                max_per_file: None,
+                output_mode: "content".to_string(),
+                case_insensitive: Some(false),
+                before_context: 0,
+                after_context: 0,
+                show_line_numbers: true,
+            },
+            &[],
+        )
+        .unwrap();
+    let (stdout, stderr, status) = native_search(root, "rg", &["-n", "needle"]);
+    assert_eq!(raw_warm_stdout(rg_body), stdout);
+    assert!(stderr.is_empty());
+    assert_eq!(status, 0);
+
+    let grep_body = search
+        .try_grep(
+            &WorktreeGrepParams {
+                pattern: "needle".to_string(),
+                subdir: None,
+                globs: Vec::new(),
+                max_per_file: None,
+                output_mode: "content".to_string(),
+                case_insensitive: Some(false),
+                before_context: 0,
+                after_context: 0,
+                show_line_numbers: true,
+            },
+            &[],
+        )
+        .unwrap();
+    let grep_body = grep_body
+        .lines()
+        .map(|line| format!("./{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (stdout, stderr, status) = native_search(root, "grep", &["-rn", "needle", "."]);
+    assert_eq!(raw_warm_stdout(grep_body), stdout);
+    assert!(stderr.is_empty());
+    assert_eq!(status, 0);
+
+    let no_match = search
+        .try_grep(
+            &WorktreeGrepParams {
+                pattern: "missing".to_string(),
+                subdir: None,
+                globs: Vec::new(),
+                max_per_file: None,
+                output_mode: "content".to_string(),
+                case_insensitive: Some(false),
+                before_context: 0,
+                after_context: 0,
+                show_line_numbers: false,
+            },
+            &[],
+        )
+        .unwrap();
+    let (stdout, stderr, status) = native_search(root, "rg", &["missing"]);
+    assert_eq!(raw_warm_stdout(no_match), stdout);
+    assert!(stderr.is_empty());
+    assert_eq!(status, 1);
 }

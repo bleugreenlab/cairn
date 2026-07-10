@@ -71,10 +71,9 @@ pub async fn list_children(db: &LocalDb, parent_issue_id: &str) -> Result<Vec<Is
             let mut rows = conn.query(&sql, params![parent_issue_id.as_str()]).await?;
             let mut issues = Vec::new();
             while let Some(row) = rows.next().await? {
-                let mut issue = issue_from_row(&row)?;
-                hydrate_dependencies(conn, &mut issue).await?;
-                issues.push(issue);
+                issues.push(issue_from_row(&row)?);
             }
+            hydrate_issue_relations(conn, &mut issues).await?;
             Ok(issues)
         })
     })
@@ -108,14 +107,55 @@ fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
     })
 }
 
-async fn hydrate_dependencies(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelationQuery {
+    Dependencies,
+    ResolvedDependencies,
+    Labels,
+}
+
+async fn hydrate_issue_relations(
     conn: &cairn_db::turso::Connection,
-    issue: &mut Issue,
+    issues: &mut [Issue],
 ) -> DbResult<()> {
-    issue.depends_on = relations::list_dependency_uris(conn, &issue.id).await?;
-    issue.unmet_depends_on = relations::filter_unmet_dependencies(conn, &issue.depends_on).await?;
-    issue.unmet_dependency_count = issue.unmet_depends_on.len() as i64;
-    issue.labels = attach::list_labels_for_issue(conn, &issue.id).await?;
+    hydrate_issue_relations_with_observer(conn, issues, &mut |_| {}).await
+}
+
+async fn hydrate_issue_relations_with_observer(
+    conn: &cairn_db::turso::Connection,
+    issues: &mut [Issue],
+    observe_query: &mut impl FnMut(RelationQuery),
+) -> DbResult<()> {
+    if issues.is_empty() {
+        return Ok(());
+    }
+
+    let issue_ids = issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    observe_query(RelationQuery::Dependencies);
+    let mut dependencies = relations::list_dependency_uris_for_issues(conn, &issue_ids).await?;
+    let dependency_uris = dependencies
+        .values()
+        .flat_map(|uris| uris.iter().cloned())
+        .collect::<Vec<_>>();
+    let resolved = if dependency_uris.is_empty() {
+        Default::default()
+    } else {
+        observe_query(RelationQuery::ResolvedDependencies);
+        relations::resolve_issue_uris(conn, &dependency_uris).await?
+    };
+    observe_query(RelationQuery::Labels);
+    let mut labels = attach::list_labels_for_issues(conn, &issue_ids).await?;
+
+    for issue in issues {
+        issue.depends_on = dependencies.remove(&issue.id).unwrap_or_default();
+        issue.unmet_depends_on =
+            relations::filter_unmet_dependencies_from_resolved(&issue.depends_on, &resolved)?;
+        issue.unmet_dependency_count = issue.unmet_depends_on.len() as i64;
+        issue.labels = labels.remove(&issue.id).unwrap_or_default();
+    }
     Ok(())
 }
 
@@ -131,12 +171,12 @@ async fn load_optional_conn(
         .map(|row| issue_from_row(&row))
         .transpose()?;
     if let Some(issue) = &mut issue {
-        hydrate_dependencies(conn, issue).await?;
+        hydrate_issue_relations(conn, std::slice::from_mut(issue)).await?;
     }
     Ok(issue)
 }
 
-async fn load_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Issue> {
+pub(crate) async fn load_conn(conn: &cairn_db::turso::Connection, id: &str) -> DbResult<Issue> {
     load_optional_conn(conn, id)
         .await?
         .ok_or_else(|| db_internal(format!("issue not found: {id}")))
@@ -229,7 +269,7 @@ pub async fn create(
                 unmet_depends_on: Vec::new(),
                 labels: Vec::new(),
             };
-            hydrate_dependencies(conn, &mut issue).await?;
+            hydrate_issue_relations(conn, std::slice::from_mut(&mut issue)).await?;
             Ok(issue)
         })
     })
@@ -269,10 +309,9 @@ pub async fn list(db: &LocalDb, project_id: &str) -> Result<Vec<Issue>, CairnErr
             let mut rows = conn.query(&sql, params![project_id.as_str()]).await?;
             let mut issues = Vec::new();
             while let Some(row) = rows.next().await? {
-                let mut issue = issue_from_row(&row)?;
-                hydrate_dependencies(conn, &mut issue).await?;
-                issues.push(issue);
+                issues.push(issue_from_row(&row)?);
             }
+            hydrate_issue_relations(conn, &mut issues).await?;
             Ok(issues)
         })
     })
@@ -607,6 +646,158 @@ pub async fn delete_db(db: &LocalDb, issue_id: &str) -> Result<(), CairnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn seeded_relation_db() -> LocalDb {
+        let db = crate::storage::migrated_test_db("issue-list-relations.db").await;
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p-one', 'default', 'One', 'ONE', '/tmp/one', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+            VALUES('p-two', 'default', 'Two', 'TWO', '/tmp/two', 1, 1);
+
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('i-one', 'p-one', 1, 'One', 'backlog', 'backlog', 'none', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('i-two', 'p-one', 2, 'Two', 'merged', 'complete', 'none', 2, 2);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('i-three', 'p-one', 3, 'Three', 'closed', 'complete', 'none', 3, 3);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('parent', 'p-one', 4, 'Parent', 'backlog', 'backlog', 'none', 4, 4);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES('x-one', 'p-two', 1, 'External', 'active', 'active', 'none', 5, 5);
+            UPDATE issues SET parent_issue_id = 'parent' WHERE id IN ('i-one', 'i-two');
+
+            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
+            VALUES('i-one', 'cairn://p/ONE/2', 10);
+            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
+            VALUES('i-one', 'cairn://p/TWO/1', 20);
+            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
+            VALUES('i-one', 'cairn://p/MISSING/9', 30);
+            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
+            VALUES('i-two', 'cairn://p/ONE/3', 40);
+
+            INSERT INTO labels(id, workspace_id, name, color, created_at, updated_at)
+            VALUES('label-zulu', 'default', 'zulu', '#111111', 1, 1);
+            INSERT INTO labels(id, workspace_id, name, color, created_at, updated_at)
+            VALUES('label-alpha', 'default', 'Alpha', '#222222', 2, 2);
+            INSERT INTO labels(id, workspace_id, name, color, created_at, updated_at)
+            VALUES('label-beta', 'default', 'Beta', '#333333', 3, 3);
+            INSERT INTO issue_labels(issue_id, label_id, created_at)
+            VALUES('i-one', 'label-zulu', 1);
+            INSERT INTO issue_labels(issue_id, label_id, created_at)
+            VALUES('i-one', 'label-alpha', 2);
+            INSERT INTO issue_labels(issue_id, label_id, created_at)
+            VALUES('i-two', 'label-beta', 3);
+            ",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn list_and_list_children_preserve_relation_semantics_and_ordering() {
+        let db = seeded_relation_db().await;
+
+        let issues = list(&db, "p-one").await.unwrap();
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["parent", "i-three", "i-two", "i-one"]
+        );
+
+        let issue_one = issues.iter().find(|issue| issue.id == "i-one").unwrap();
+        assert_eq!(
+            issue_one.depends_on,
+            vec!["cairn://p/ONE/2", "cairn://p/TWO/1", "cairn://p/MISSING/9"]
+        );
+        assert_eq!(
+            issue_one.unmet_depends_on,
+            vec!["cairn://p/TWO/1", "cairn://p/MISSING/9"]
+        );
+        assert_eq!(issue_one.unmet_dependency_count, 2);
+        assert_eq!(
+            issue_one
+                .labels
+                .iter()
+                .map(|label| label.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Alpha", "zulu"]
+        );
+
+        let issue_two = issues.iter().find(|issue| issue.id == "i-two").unwrap();
+        assert_eq!(issue_two.depends_on, vec!["cairn://p/ONE/3"]);
+        assert!(issue_two.unmet_depends_on.is_empty());
+        assert_eq!(issue_two.unmet_dependency_count, 0);
+        assert_eq!(issue_two.labels[0].name, "Beta");
+
+        let single = get(&db, "i-one").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_string(&single).unwrap(),
+            serde_json::to_string(issue_one).unwrap()
+        );
+
+        let children = list_children(&db, "parent").await.unwrap();
+        assert_eq!(
+            children
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["i-two", "i-one"]
+        );
+        assert_eq!(children[1].depends_on, issue_one.depends_on);
+        assert_eq!(children[1].unmet_depends_on, issue_one.unmet_depends_on);
+        assert_eq!(children[1].labels, issue_one.labels);
+    }
+
+    #[tokio::test]
+    async fn relation_hydration_query_count_is_bounded_by_families() {
+        let db = seeded_relation_db().await;
+
+        let (all_queries, one_query) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let sql = format!(
+                        "SELECT {ISSUE_COLUMNS} FROM issues WHERE project_id = ?1 ORDER BY number DESC"
+                    );
+                    let mut rows = conn.query(&sql, params!["p-one"]).await?;
+                    let mut issues = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        issues.push(issue_from_row(&row)?);
+                    }
+
+                    let mut all_queries = Vec::new();
+                    hydrate_issue_relations_with_observer(conn, &mut issues, &mut |query| {
+                        all_queries.push(query)
+                    })
+                    .await?;
+
+                    let mut one_issue = vec![issues
+                        .into_iter()
+                        .find(|issue| issue.id == "i-one")
+                        .unwrap()];
+                    let mut one_query = Vec::new();
+                    hydrate_issue_relations_with_observer(conn, &mut one_issue, &mut |query| {
+                        one_query.push(query)
+                    })
+                    .await?;
+                    Ok((all_queries, one_query))
+                })
+            })
+            .await
+            .unwrap();
+
+        let expected = vec![
+            RelationQuery::Dependencies,
+            RelationQuery::ResolvedDependencies,
+            RelationQuery::Labels,
+        ];
+        assert_eq!(all_queries, expected);
+        assert_eq!(one_query, expected);
+    }
 
     #[tokio::test]
     async fn delete_db_detaches_memories_before_deleting_jobs() {

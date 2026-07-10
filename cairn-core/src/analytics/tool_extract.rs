@@ -286,6 +286,7 @@ fn cairn_kind(path: &str) -> String {
     const KEYWORDS: &[&str] = &[
         "symbols",
         "chat",
+        "diff",
         "changed",
         "messages",
         "memories",
@@ -505,6 +506,7 @@ mod tests {
     fn cairn_kind_variants() {
         assert_eq!(cairn_kind("cairn://p/CAIRN/1821/1/builder/chat"), "chat");
         assert_eq!(cairn_kind("cairn://p/CAIRN/1821/changed"), "changed");
+        assert_eq!(cairn_kind("cairn://p/CAIRN/1821/1/builder/diff"), "diff");
         assert_eq!(cairn_kind("cairn://db"), "db");
         assert_eq!(cairn_kind("cairn://dev"), "dev");
         assert_eq!(cairn_kind("cairn://dev/db?sql=SELECT 1"), "dev");

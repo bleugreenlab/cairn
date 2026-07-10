@@ -145,8 +145,21 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
     // parent's pair, so N jobs reference ONE path. Teardown
     // (`execution::teardown`) keys on the same pair; it happens once, at
     // issue/PR-terminal time, removing the path unconditionally.
-    if job.worktree_path.is_some() {
-        // Already has a worktree — just emit job-activated
+    let assigned_context = if job.worktree_path.is_some() {
+        run_db(workspace_identity::resolve_managed_workspace_context(
+            owning_db.clone(),
+            job_id.to_string(),
+        ))?
+    } else {
+        None
+    };
+    let assigned_workspace_ready = assigned_context.as_ref().is_some_and(|context| {
+        let path = context.identity.worktree_path.as_path();
+        crate::jj::is_jj_dir(path)
+            && crate::jj::read_workspace_identity(path).as_ref() == Some(&context.identity)
+    });
+    if assigned_workspace_ready {
+        // The durable assignment and physical marker agree — reuse it.
         let _ = orch.services.emitter.emit(
             "job-activated",
             serde_json::json!({
@@ -156,7 +169,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
                 "execSeq": exec_seq,
             }),
         );
-    } else if inherits_worktree {
+    } else if inherits_worktree && job.worktree_path.is_none() {
         // Copy worktree from parent job
         let parent_job_id = job
             .parent_job_id
@@ -232,37 +245,98 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             .join(".cairn")
             .join("worktrees");
 
-        let (branch, wt_dir) = if let Some(ref existing) = job.branch {
-            // Job already has a branch — use it.
-            let dir = existing.replace('/', "-");
-            (existing.clone(), dir)
+        let initial_name = if let Some(ref existing) = job.branch {
+            job.worktree_path
+                .as_deref()
+                .and_then(|path| Path::new(path).file_name())
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| existing.replace('/', "-"))
         } else {
-            let mut candidate_seq = seq;
-            loop {
-                let name = format!(
-                    "{}-{}-{}-{}",
-                    project_key, display_id, safe_step_name, candidate_seq
-                );
-                if !worktrees_dir.join(&name).exists() {
-                    break (format!("agent/{}", name), name);
-                }
-                log::warn!(
-                    "Auto-generated worktree path already exists ({}), trying next sequence",
-                    worktrees_dir.join(&name).display()
-                );
-                candidate_seq += 1;
-                if candidate_seq > seq + 100 {
-                    return Err(format!(
-                        "Could not find an available worktree path for job {} after 100 attempts",
-                        job_id
-                    ));
-                }
-            }
+            format!("{}-{}-{}-{}", project_key, display_id, safe_step_name, seq)
         };
+        let initial_branch = job
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("agent/{initial_name}"));
+
+        let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+        let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+        crate::jj::ensure_project_store(&jj, &store, Path::new(&repo_path))?;
+        let store_lock = orch.jj_store_lock(&store);
+        let _store_guard = run_db(async move { Ok(store_lock.lock_owned().await) })?;
+
+        let short_job: String = job_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(8)
+            .collect();
+        let mut branch = initial_branch.clone();
+        let mut wt_dir = initial_name.clone();
+        let mut allow_retry_cleanup = false;
+        for attempt in 0..=100 {
+            let wt_path = worktrees_dir.join(&wt_dir);
+            let workspace_name = crate::jj::workspace_name_for_branch(&branch);
+            let db_owner = run_db(workspace_identity::coordinate_owner(
+                owning_db.clone(),
+                job.project_id.clone(),
+                branch.clone(),
+                wt_path.to_string_lossy().to_string(),
+            ))?;
+            let exact_retry = db_owner.as_deref() == Some(job_id)
+                && job.branch.as_deref() == Some(branch.as_str())
+                && job.worktree_path.as_deref() == Some(wt_path.to_string_lossy().as_ref());
+            let occupied = wt_path.exists()
+                || crate::jj::workspace_registered(&jj, &store, &workspace_name)
+                || crate::jj::bookmark_commit(&jj, &store, &branch).is_some()
+                || db_owner.is_some();
+            if exact_retry || !occupied {
+                allow_retry_cleanup = exact_retry;
+                break;
+            }
+            if attempt == 100 {
+                return Err(format!(
+                    "Could not allocate an unoccupied managed workspace for job {job_id}"
+                ));
+            }
+            let suffix = if attempt == 0 {
+                format!("-j{short_job}")
+            } else {
+                format!("-j{short_job}-{attempt}")
+            };
+            branch = format!("{}{}", initial_branch, suffix);
+            wt_dir = format!("{}{}", initial_name, suffix);
+        }
 
         let wt_path = worktrees_dir.join(&wt_dir);
-
         let base_ref = job.base_branch.as_deref().unwrap_or("HEAD");
+        let base_rev = crate::jj::resolve_base_rev(&jj, &store, base_ref, |r| {
+            orch.services
+                .git
+                .rev_parse(Path::new(&repo_path), vec![r.to_string()])
+                .ok()
+                .filter(|sha| !sha.is_empty())
+        });
+        let identity = crate::jj::WorkspaceIdentity::new(
+            job_id,
+            job_id,
+            job.project_id.clone(),
+            PathBuf::from(&repo_path),
+            wt_path.clone(),
+            branch.clone(),
+            crate::jj::workspace_name_for_branch(&branch),
+            base_rev,
+        );
+        let now = chrono::Utc::now().timestamp() as i32;
+        run_db(workspace_identity::assign_workspace_if_unset_or_same(
+            owning_db.clone(),
+            job_id.to_string(),
+            job.worktree_path.clone(),
+            job.branch.clone(),
+            wt_path.to_string_lossy().to_string(),
+            branch.clone(),
+            now,
+        ))?;
         let cancel = Arc::new(AtomicBool::new(false));
         let child_slot = Arc::new(Mutex::new(None));
         let sink = setup_progress::make_sink(orch, job_id, job.issue_id.clone());
@@ -296,6 +370,8 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
             &wt_path,
             &branch,
             base_ref,
+            &identity,
+            allow_retry_cleanup,
             job_id,
             job.issue_id.clone(),
             &sink,

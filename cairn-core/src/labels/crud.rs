@@ -10,13 +10,17 @@ pub const PALETTE: &[&str] = &[
 ];
 
 pub(crate) fn label_from_row(row: &cairn_db::turso::Row) -> DbResult<Label> {
+    label_from_row_at(row, 0)
+}
+
+pub(crate) fn label_from_row_at(row: &cairn_db::turso::Row, offset: usize) -> DbResult<Label> {
     Ok(Label {
-        id: row.text(0)?,
-        workspace_id: row.text(1)?,
-        name: row.text(2)?,
-        color: row.text(3)?,
-        created_at: row.i64(4)?,
-        updated_at: row.i64(5)?,
+        id: row.text(offset)?,
+        workspace_id: row.text(offset + 1)?,
+        name: row.text(offset + 2)?,
+        color: row.text(offset + 3)?,
+        created_at: row.i64(offset + 4)?,
+        updated_at: row.i64(offset + 5)?,
     })
 }
 

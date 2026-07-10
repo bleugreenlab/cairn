@@ -409,13 +409,14 @@ fn child_workspace_bases_off_unsealed_coordinator_branch() {
 /// A failed `jj workspace add` registers the workspace name (and writes a
 /// half-created `.jj` dir) before it resolves `-r`, so a retried job would hit
 /// `Workspace named X already exists` / `Destination path exists`.
-/// `add_workspace` forgets the stale registration and clears the dir, so the
-/// retry recovers and provisions cleanly.
+/// Destructive retry cleanup is explicit: the orchestration layer proves the
+/// half-created registration/path belongs to the same assignment, then calls the
+/// cleanup helper before retrying `add_workspace`.
 #[test]
 #[serial_test::serial(jj)]
-fn add_workspace_recovers_from_half_created_workspace() {
+fn proven_half_created_workspace_retry_recovers() {
     let Some(bin) = jj_bin() else {
-        eprintln!("skipping add_workspace_recovers_from_half_created_workspace: jj not resolvable");
+        eprintln!("skipping proven_half_created_workspace_retry_recovers: jj not resolvable");
         return;
     };
     let home = TempDir::new().unwrap();
@@ -450,7 +451,10 @@ fn add_workspace_recovers_from_half_created_workspace() {
         "the failed add still wrote a stale .jj dir"
     );
 
-    // The retry recovers rather than failing on the stale registration/dir.
+    // The owner proof happens above this layer; only the explicit cleanup is
+    // allowed to forget/remove the half-created state.
+    assert!(workspace_retry_is_clean(&jj, &ws));
+    cleanup_workspace_retry(&jj, &store, &ws, &name).unwrap();
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
     assert!(is_jj_dir(&ws), "the retried add provisions the workspace");
     assert!(
@@ -1071,7 +1075,7 @@ fn push_to_origin_lands_bookmark_in_bare_origin() {
     std::fs::write(ws.join("f.rs"), "x\n").unwrap();
     seal(&jj, &ws, "agent work", None).unwrap();
 
-    push_to_origin(&jj, &ws, branch);
+    push_to_origin(&jj, &ws, branch).unwrap();
 
     let refs = git_stdout(
         origin.path(),
@@ -1083,7 +1087,42 @@ fn push_to_origin_lands_bookmark_in_bare_origin() {
     );
 
     // main/master are skipped (the same guard git uses); no panic, no push.
-    push_to_origin(&jj, &ws, "main");
+    push_to_origin(&jj, &ws, "main").unwrap();
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn push_to_origin_reports_publication_failure() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping push_to_origin_reports_publication_failure: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let unavailable_origin = home.path().join("unavailable-origin");
+    git(
+        proj.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            &unavailable_origin.to_string_lossy(),
+        ],
+    );
+
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/CAIRN-2679-builder-1";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("f.rs"), "x\n").unwrap();
+    seal(&jj, &ws, "agent work", None).unwrap();
+
+    let error = push_to_origin(&jj, &ws, branch).unwrap_err();
+    assert!(error.contains("jj git push"), "{error}");
 }
 
 /// `ensure_bookmark_on_origin` publishes a Coordinator integration-branch
@@ -1199,8 +1238,8 @@ fn reconcile_siblings_auto_rebases_with_recorded_conflict() {
     std::fs::write(ws_clean.join("other.rs"), "b-only\n").unwrap();
     seal(&jj, &ws_clean, "clean edits other", None).unwrap();
     // Establish each sibling's PR head on origin (both clean so far).
-    push_to_origin(&jj, &ws_overlap, overlap);
-    push_to_origin(&jj, &ws_clean, clean);
+    push_to_origin(&jj, &ws_overlap, overlap).unwrap();
+    push_to_origin(&jj, &ws_clean, clean).unwrap();
 
     let change_overlap_before = jj
         .run(
@@ -1394,8 +1433,8 @@ fn reconcile_external_advance_via_origin_fetch_is_idempotent() {
     std::fs::write(ws_clean.join("other.rs"), "b-only\n").unwrap();
     seal(&jj, &ws_clean, "clean edits other", None).unwrap();
     // Establish each sibling's PR head on origin (both clean so far).
-    push_to_origin(&jj, &ws_overlap, overlap);
-    push_to_origin(&jj, &ws_clean, clean);
+    push_to_origin(&jj, &ws_overlap, overlap).unwrap();
+    push_to_origin(&jj, &ws_clean, clean).unwrap();
 
     // The default branch advances OUTSIDE Cairn: edit + commit + push to
     // origin/main directly from the project checkout, with a change that
@@ -3311,7 +3350,7 @@ fn reconcile_siblings_flattens_intermediate_only_sibling() {
     add_workspace(&jj, &store, &ws, sibling, int, None).unwrap();
     std::fs::write(ws.join("shared.rs"), "sibling-edit\n").unwrap();
     seal(&jj, &ws, "sibling edits shared", None).unwrap();
-    push_to_origin(&jj, &ws, sibling);
+    push_to_origin(&jj, &ws, sibling).unwrap();
     let origin_before = git_stdout(origin.path(), &["rev-parse", sibling]);
 
     // Advance the integration tip conflictingly and publish it.
@@ -5924,5 +5963,114 @@ fn node_changed_files_empty_over_zero_delta_branch() {
     assert!(
         nonempty.iter().any(|c| c.path == "feature.rs"),
         "a sealed branch carries a real delta: {nonempty:?}"
+    );
+}
+
+#[test]
+fn workspace_identity_round_trips_atomically() {
+    let root = TempDir::new().unwrap();
+    std::fs::create_dir_all(root.path().join(".jj")).unwrap();
+    let identity = WorkspaceIdentity::new(
+        "owner-job",
+        "owner-job",
+        "project-id",
+        PathBuf::from("/project"),
+        root.path().to_path_buf(),
+        "agent/branch",
+        "agent-branch",
+        "deadbeef",
+    );
+    write_workspace_identity(root.path(), &identity).unwrap();
+    assert_eq!(read_workspace_identity(root.path()), Some(identity));
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn add_workspace_never_cleans_an_existing_registration_or_directory() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping add_workspace_never_cleans_an_existing_registration_or_directory");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/prior-lineage";
+    let ws = wts.path().join("occupied");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("sentinel"), "preserve me").unwrap();
+    let tip = bookmark_commit(&jj, &store, branch).unwrap();
+
+    let error = add_workspace(&jj, &store, &ws, branch, "main", None).unwrap_err();
+    assert!(error.contains("already exists") || error.contains("Destination path exists"));
+    assert_eq!(
+        std::fs::read_to_string(ws.join("sentinel")).unwrap(),
+        "preserve me"
+    );
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(tip.as_str())
+    );
+    assert!(workspace_registered(
+        &jj,
+        &store,
+        &workspace_name_for_branch(branch)
+    ));
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn managed_backend_refuses_marker_mismatch_without_touching_dirty_bytes() {
+    use crate::mcp::vcs::WorktreeVcs;
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping managed_backend_refuses_marker_mismatch_without_touching_dirty_bytes");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/current";
+    let ws = wts.path().join("current");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    write_project_root_marker(&ws, proj.path()).unwrap();
+    let base = head_commit(&jj, &ws).unwrap();
+    let identity = WorkspaceIdentity::new(
+        "job-current",
+        "job-current",
+        "project-current",
+        proj.path().to_path_buf(),
+        ws.clone(),
+        branch,
+        workspace_name_for_branch(branch),
+        base,
+    );
+    write_workspace_identity(&ws, &identity).unwrap();
+    std::fs::write(ws.join("tracked.txt"), "dirty bytes\n").unwrap();
+    write_branch_marker(&ws, "agent/unrelated").unwrap();
+
+    let backend = crate::mcp::vcs::JjBackend::managed(JjEnv::resolve(&bin, home.path()), identity);
+    let before_at = working_copy_commit(&jj, &ws).unwrap();
+    let before_head = head_commit(&jj, &ws).unwrap();
+    let before_tip = bookmark_commit(&jj, &store, branch).unwrap();
+    let error = backend
+        .seal_files(&ws, &["tracked.txt"], "must refuse", None)
+        .unwrap_err();
+    assert!(crate::mcp::vcs::is_workspace_lineage_mismatch(&error));
+    assert_eq!(
+        std::fs::read_to_string(ws.join("tracked.txt")).unwrap(),
+        "dirty bytes\n"
+    );
+    assert_eq!(working_copy_commit(&jj, &ws).unwrap(), before_at);
+    assert_eq!(head_commit(&jj, &ws).unwrap(), before_head);
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(before_tip.as_str())
     );
 }

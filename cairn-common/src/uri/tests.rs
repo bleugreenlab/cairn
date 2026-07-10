@@ -838,7 +838,7 @@ fn round_trips_every_resource_family() {
             node_id: "builder".to_string(),
             name: None,
         },
-        CairnResource::NodeChanged {
+        CairnResource::NodeDiff {
             project: "CAIRN".to_string(),
             number: 1,
             exec_seq: 2,

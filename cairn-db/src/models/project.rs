@@ -27,6 +27,9 @@ pub struct Project {
     pub hidden: bool,
     /// Whether this project lives in a team replica.
     pub is_team: bool,
+    /// Human-readable name of the owning team, resolved from the private team
+    /// registry. `None` for local projects or an unregistered team.
+    pub team_name: Option<String>,
     /// Whether this machine has a usable local git repository for the project.
     pub repo_cloned: bool,
     /// Whether this project represents the Cairn workspace config root.

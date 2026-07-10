@@ -21,7 +21,7 @@ Cairn resources use canonical project-scoped URIs under `cairn://p/{PROJECT}`. H
 - `cairn://p/{project}/{number}` — issue overview.
 - `cairn://p/{project}/{number}/changed`, `/executions`, `/messages` — issue collections.
 - `cairn://p/{project}/{number}/{exec}/{node}` — node summary.
-- `cairn://p/{project}/{number}/{exec}/{node}/chat`, `/changed`, `/terminal/{slug}`, `/todos`, `/tasks`, `/questions`, `/permissions` — node collections.
+- `cairn://p/{project}/{number}/{exec}/{node}/chat`, `/diff`, `/terminal/{slug}`, `/todos`, `/tasks`, `/questions`, `/permissions` — node collections.
 - `cairn://p/{project}/{number}/{exec}/{node}/chat/raw`, `/chat/turn/{turn}`, `/chat/{run_seq}/{event_seq}` — node transcript slices (default `/chat` is a turn-structured digest; `?latest=true` orders newest turn first).
 - `cairn://p/{project}/{number}/{exec}/{node}/{artifact}` — node artifact such as `plan` or `create-pr`.
 - `cairn://p/{project}/{number}/{exec}/{node}/task/{task}` — sub-agent task summary.

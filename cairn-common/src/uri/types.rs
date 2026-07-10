@@ -20,6 +20,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "chat",
     "artifact",
     "changed",
+    "diff",
     "todos",
     "memories",
     "tasks",
@@ -377,7 +378,7 @@ pub enum CairnResource {
         number: i32,
         exec_seq: i32,
     },
-    NodeChanged {
+    NodeDiff {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -579,7 +580,7 @@ impl CairnResource {
             Self::NodeChatTurn { .. } => ResourceKind::NodeChatTurn,
             Self::NodeChatEvent { .. } => ResourceKind::NodeChatEvent,
             Self::NodeArtifact { .. } => ResourceKind::NodeArtifact,
-            Self::NodeChanged { .. } => ResourceKind::NodeChanged,
+            Self::NodeDiff { .. } => ResourceKind::NodeDiff,
             Self::NodeTerminal { .. } => ResourceKind::NodeTerminal,
             Self::NodeRepl { .. } => ResourceKind::NodeRepl,
             Self::TaskTerminal { .. } => ResourceKind::TaskTerminal,

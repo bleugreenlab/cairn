@@ -8,6 +8,8 @@ pub(crate) fn prepare_worktree_for_job(
     worktree_path: &Path,
     branch: &str,
     base_ref: &str,
+    identity: &crate::jj::WorkspaceIdentity,
+    allow_retry_cleanup: bool,
     job_id: &str,
     issue_id: Option<String>,
     sink: &setup_progress::SetupSink,
@@ -30,7 +32,7 @@ pub(crate) fn prepare_worktree_for_job(
         // partially-created workspace too) and remove the dir.
         let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
         let store = crate::jj::project_store_dir(&orch.config_dir, repo);
-        let _ = crate::jj::forget_workspace(&jj, &store, branch);
+        let _ = crate::jj::forget_workspace_name(&jj, &store, &identity.workspace_name);
         let _ = std::fs::remove_dir_all(worktree_path);
     };
 
@@ -63,11 +65,54 @@ pub(crate) fn prepare_worktree_for_job(
     // local-only repo whose configured default branch has no matching ref (or an
     // unborn/empty repo) still provisions instead of failing
     // `Revision <x> doesn't exist`. See crate::jj::resolve_base_rev.
-    let base_rev = crate::jj::resolve_base_rev(&jj, &store, base_ref, |r| {
+    let mut base_rev = crate::jj::resolve_base_rev(&jj, &store, base_ref, |r| {
         git.rev_parse(repo, vec![r.to_string()])
             .ok()
             .filter(|s| !s.is_empty())
     });
+
+    let marker_matches = crate::jj::read_workspace_identity(worktree_path)
+        .map(|marker| {
+            marker.lineage_root_job_id == identity.lineage_root_job_id
+                && marker.owner_job_id == identity.owner_job_id
+                && marker.project_id == identity.project_id
+                && marker.project_root == identity.project_root
+                && marker.worktree_path == identity.worktree_path
+                && marker.branch == identity.branch
+                && marker.workspace_name == identity.workspace_name
+        })
+        .unwrap_or(false);
+    let registration_exists =
+        crate::jj::workspace_registered(&jj, &store, &identity.workspace_name);
+    let bookmark_tip = crate::jj::bookmark_commit(&jj, &store, branch);
+    let any_existing = worktree_path.exists() || registration_exists || bookmark_tip.is_some();
+    if any_existing {
+        let safe_retry = allow_retry_cleanup
+            && crate::jj::workspace_retry_is_clean(&jj, worktree_path)
+            && (marker_matches || registration_exists);
+        if !safe_retry {
+            return Err(crate::git::worktree::SetupError::Spawn {
+                command: "managed workspace ownership check".to_string(),
+                message: format!(
+                    "workspace slot is occupied by another or unproven lineage: path={}, branch={}, workspace={}",
+                    worktree_path.display(),
+                    branch,
+                    identity.workspace_name
+                ),
+            });
+        }
+        if marker_matches {
+            if let Some(tip) = bookmark_tip {
+                base_rev = tip;
+            }
+        }
+        crate::jj::cleanup_workspace_retry(&jj, &store, worktree_path, &identity.workspace_name)
+            .map_err(|message| crate::git::worktree::SetupError::Spawn {
+                command: "jj workspace retry cleanup".to_string(),
+                message,
+            })?;
+    }
+
     crate::jj::add_workspace(&jj, &store, worktree_path, branch, &base_rev, None).map_err(
         |message| crate::git::worktree::SetupError::Spawn {
             command: "jj workspace add".to_string(),
@@ -88,6 +133,12 @@ pub(crate) fn prepare_worktree_for_job(
     if let Err(error) = crate::jj::write_project_root_marker(worktree_path, repo) {
         log::warn!("failed to write project root marker for {branch}: {error}");
     }
+    crate::jj::write_workspace_identity(worktree_path, identity).map_err(|message| {
+        crate::git::worktree::SetupError::Spawn {
+            command: "write managed workspace identity".to_string(),
+            message,
+        }
+    })?;
     setup_progress::emit(
         sink,
         job_id,
@@ -291,6 +342,7 @@ pub(crate) fn resolve_call_worktree_plan(
 pub(crate) fn ensure_ephemeral_task_worktree(
     orch: &Orchestrator,
     repo_path: &str,
+    project_id: &str,
     job_id: &str,
     issue_id: Option<String>,
     base_ref: &str,
@@ -309,6 +361,16 @@ pub(crate) fn ensure_ephemeral_task_worktree(
     let branch = format!("agent/{wt_dir}");
     let wt_path = worktrees_dir.join(&wt_dir);
 
+    let identity = crate::jj::WorkspaceIdentity::new(
+        job_id,
+        job_id,
+        project_id,
+        PathBuf::from(repo_path),
+        wt_path.clone(),
+        branch.clone(),
+        crate::jj::workspace_name_for_branch(&branch),
+        base_ref,
+    );
     let cancel = Arc::new(AtomicBool::new(false));
     let child_slot = Arc::new(Mutex::new(None));
     let sink = setup_progress::make_sink(orch, job_id, issue_id.clone());
@@ -318,6 +380,8 @@ pub(crate) fn ensure_ephemeral_task_worktree(
         &wt_path,
         &branch,
         base_ref,
+        &identity,
+        true,
         job_id,
         issue_id,
         &sink,

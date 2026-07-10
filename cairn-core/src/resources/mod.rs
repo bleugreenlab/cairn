@@ -8,6 +8,7 @@ mod agents;
 pub mod browsers;
 mod common;
 mod dev_instances;
+mod diff;
 mod files;
 mod issue;
 mod labels;

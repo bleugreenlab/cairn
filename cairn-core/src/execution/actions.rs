@@ -647,7 +647,9 @@ impl PrVcs {
 
     /// Push the job's bookmark to origin jj-side from the workspace.
     fn push(&self, worktree: &str) {
-        crate::jj::push_to_origin(&self.jj, Path::new(worktree), &self.branch);
+        if let Err(e) = crate::jj::push_to_origin(&self.jj, Path::new(worktree), &self.branch) {
+            log::warn!("jj push failed (PR action continues locally): {e}");
+        }
     }
 
     /// The branch HEAD commit recorded as the merge_request `head_sha`.

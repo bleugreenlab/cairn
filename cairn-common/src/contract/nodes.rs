@@ -197,19 +197,23 @@ pub(crate) const NODE_ARTIFACT_CONTRACT: ResourceContract =
         ],
     };
 
-pub(crate) const NODE_CHANGED_CONTRACT: ResourceContract = ResourceContract {
-    kind: ResourceKind::NodeChanged,
-    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/changed",
-    name: "Node changed files",
-    description: "Files changed by a specific execution node",
+pub(crate) const NODE_DIFF_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeDiff,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/diff",
+    name: "Node workspace diff",
+    description: "Layered view of a node's jj workspace change against its resolved base, including revisions, changed files, commits, patch, and validation without requiring git or jj knowledge; a delegated task's home-relative diff projects to its owning node",
     read_projections: &[
         ProjectionSpec {
-            key: "glob",
-            values: "PATTERN",
+            key: "view",
+            values: "commits|patch|check (absent = summary)",
         },
         ProjectionSpec {
-            key: "output_mode",
-            values: "files_with_matches|content|count",
+            key: "file",
+            values: "PATH (implies view=patch when view is absent)",
+        },
+        ProjectionSpec {
+            key: "glob",
+            values: "PATTERN (scope changed files or patch sections)",
         },
     ],
     related: NO_RELATED,

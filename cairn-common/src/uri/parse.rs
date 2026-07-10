@@ -291,8 +291,8 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 name: None,
             })
         }
-        [PROJECT_SCOPE, project, number, exec_seq, node_id, "changed"] => {
-            Some(CairnResource::NodeChanged {
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "diff"] => {
+            Some(CairnResource::NodeDiff {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,

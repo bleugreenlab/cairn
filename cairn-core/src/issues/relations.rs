@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use cairn_common::uri::{build_issue_uri, parse_uri, CairnResource};
 use cairn_db::turso::params;
@@ -26,6 +26,25 @@ pub struct DependencyRef {
     pub title: String,
     pub status: IssueStatus,
     pub met: bool,
+}
+
+fn issue_ref_from_row(
+    row: &cairn_db::turso::Row,
+    uri: String,
+    project_key: String,
+    offset: usize,
+) -> DbResult<IssueRef> {
+    Ok(IssueRef {
+        uri,
+        project_key,
+        issue_id: row.text(offset)?,
+        number: row.i64(offset + 1)? as i32,
+        title: row.text(offset + 2)?,
+        status: row
+            .text(offset + 3)?
+            .parse()
+            .unwrap_or(IssueStatus::Backlog),
+    })
 }
 
 pub fn canonicalize_issue_uri(value: &str) -> Result<String, String> {
@@ -59,6 +78,35 @@ pub async fn list_dependency_uris(
     let mut dependencies = Vec::new();
     while let Some(row) = rows.next().await? {
         dependencies.push(row.text(0)?);
+    }
+    Ok(dependencies)
+}
+
+pub(crate) async fn list_dependency_uris_for_issues(
+    conn: &cairn_db::turso::Connection,
+    issue_ids: &[String],
+) -> DbResult<HashMap<String, Vec<String>>> {
+    if issue_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let issue_ids_json = serde_json::to_string(issue_ids)
+        .map_err(|error| DbError::internal(format!("failed to serialize issue ids: {error}")))?;
+    let mut rows = conn
+        .query(
+            "SELECT issue_id, depends_on_uri
+             FROM issue_dependencies
+             WHERE issue_id IN (SELECT value FROM json_each(?1))
+             ORDER BY issue_id ASC, created_at ASC, depends_on_uri ASC",
+            params![issue_ids_json],
+        )
+        .await?;
+    let mut dependencies = HashMap::<String, Vec<String>>::new();
+    while let Some(row) = rows.next().await? {
+        dependencies
+            .entry(row.text(0)?)
+            .or_default()
+            .push(row.text(1)?);
     }
     Ok(dependencies)
 }
@@ -138,17 +186,76 @@ pub async fn resolve_issue_uri(
 
     rows.next()
         .await?
-        .map(|row| {
-            Ok(IssueRef {
-                uri: canonical.clone(),
-                project_key: project_key.clone(),
-                issue_id: row.text(0)?,
-                number: row.i64(1)? as i32,
-                title: row.text(2)?,
-                status: row.text(3)?.parse().unwrap_or(IssueStatus::Backlog),
-            })
-        })
+        .map(|row| issue_ref_from_row(&row, canonical.clone(), project_key.clone(), 0))
         .transpose()
+}
+
+pub(crate) async fn resolve_issue_uris(
+    conn: &cairn_db::turso::Connection,
+    uris: &[String],
+) -> DbResult<HashMap<String, IssueRef>> {
+    let mut requested = Vec::new();
+    let mut seen = HashSet::new();
+    for uri in uris {
+        let canonical = canonicalize_issue_uri(uri).map_err(DbError::Row)?;
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let Some(CairnResource::Issue { project, number }) = parse_uri(&canonical) else {
+            continue;
+        };
+        requested.push(serde_json::json!({
+            "uri": canonical,
+            "project_key": project.to_uppercase(),
+            "number": number,
+        }));
+    }
+    if requested.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let requested_json = serde_json::to_string(&requested).map_err(|error| {
+        DbError::internal(format!("failed to serialize dependency lookups: {error}"))
+    })?;
+    let mut rows = conn
+        .query(
+            "WITH requested AS (
+                 SELECT json_extract(value, '$.uri') AS uri,
+                        json_extract(value, '$.project_key') AS project_key,
+                        CAST(json_extract(value, '$.number') AS INTEGER) AS number
+                 FROM json_each(?1)
+             )
+             SELECT requested.uri, requested.project_key,
+                    i.id, i.number, i.title, i.status
+             FROM requested
+             JOIN projects p ON p.key = requested.project_key
+             JOIN issues i ON i.project_id = p.id AND i.number = requested.number",
+            params![requested_json],
+        )
+        .await?;
+    let mut resolved = HashMap::new();
+    while let Some(row) = rows.next().await? {
+        let uri = row.text(0)?;
+        let project_key = row.text(1)?;
+        resolved.insert(uri.clone(), issue_ref_from_row(&row, uri, project_key, 2)?);
+    }
+    Ok(resolved)
+}
+
+pub(crate) fn filter_unmet_dependencies_from_resolved(
+    uris: &[String],
+    resolved: &HashMap<String, IssueRef>,
+) -> DbResult<Vec<String>> {
+    let mut unmet = Vec::new();
+    for uri in uris {
+        let canonical = canonicalize_issue_uri(uri).map_err(DbError::Row)?;
+        match resolved.get(&canonical) {
+            Some(issue) if is_complete_status(&issue.status) => {}
+            Some(issue) => unmet.push(issue.uri.clone()),
+            None => unmet.push(canonical),
+        }
+    }
+    Ok(unmet)
 }
 
 pub async fn issue_uri_for_id(
@@ -436,15 +543,8 @@ pub async fn filter_unmet_dependencies(
     conn: &cairn_db::turso::Connection,
     uris: &[String],
 ) -> DbResult<Vec<String>> {
-    let mut unmet = Vec::new();
-    for uri in uris {
-        match resolve_issue_uri(conn, uri).await? {
-            Some(resolved) if is_complete_status(&resolved.status) => {}
-            Some(resolved) => unmet.push(resolved.uri),
-            None => unmet.push(canonicalize_issue_uri(uri).unwrap_or_else(|_| uri.clone())),
-        }
-    }
-    Ok(unmet)
+    let resolved = resolve_issue_uris(conn, uris).await?;
+    filter_unmet_dependencies_from_resolved(uris, &resolved)
 }
 #[cfg(test)]
 mod parent_tests {

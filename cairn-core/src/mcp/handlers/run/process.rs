@@ -1,16 +1,12 @@
 //! Process execution: spawn, stream, timeout, promote-to-terminal, MCP-call
-//! proxying, warm-search fast path, and checkpoint-result caching.
+//! proxying, warm-search shim injection, and checkpoint-result caching.
 
-use super::hygiene::expand_tilde;
 use super::output::{strip_streamable_tail, OutputTail};
 use super::sandbox_policy::build_run_sandbox_policy;
 use super::types::{
     ItemOutcome, McpCallSpec, PromotedTerminal, RunCompletePayload, RunOutputPayload, RunSpec,
 };
-use crate::mcp::handlers::search_translate::{
-    translate_search_command, PostFilter, TranslatedSearch, TranslatedSearchPipeline,
-};
-use crate::mcp::handlers::{normalize_command, search, terminal, RunContext};
+use crate::mcp::handlers::{normalize_command, terminal, RunContext};
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
@@ -19,7 +15,6 @@ use crate::storage::{LocalDb, RowExt};
 use portable_pty::CommandBuilder;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -172,16 +167,6 @@ pub(super) async fn run_one(
     };
 
     let timeout_ms = timeout.unwrap_or(120_000).min(600_000);
-
-    if let Some(command) = shell_command.as_deref() {
-        if !branch_scoped_run {
-            if let Some(outcome) =
-                try_run_warm_search(orch, run_context, cwd, header.clone(), command).await
-            {
-                return outcome;
-            }
-        }
-    }
 
     let mut exec = match execute_process(
         orch,
@@ -340,229 +325,6 @@ pub(super) async fn run_one(
         header,
         body,
         succeeded,
-        suspended: false,
-        images: Vec::new(),
-    }
-}
-
-async fn try_run_warm_search(
-    orch: &Orchestrator,
-    run_context: Option<&RunContext>,
-    cwd: &str,
-    header: String,
-    command: &str,
-) -> Option<ItemOutcome> {
-    let TranslatedSearchPipeline { search, post } = translate_search_command(command)?;
-    let worktree_raw = PathBuf::from(run_context?.worktree_path.as_ref()?);
-    let deny_read = orch.sandbox_deny_read();
-    match search {
-        TranslatedSearch::Grep {
-            pattern,
-            globs,
-            output_mode,
-            case_insensitive,
-            before_context,
-            after_context,
-            show_line_numbers,
-            max_per_file,
-            paths,
-        } => {
-            // Compile the tail-grep post-filters up front. An uncompilable pattern
-            // means we cannot faithfully serve the pipeline, so fall through to a
-            // real subprocess before doing any index work.
-            let compiled_post = compile_post_filters(&post)?;
-
-            // Empty `paths` = one whole-worktree query; otherwise one query per
-            // path argument, in argument order. If ANY path fails to resolve to a
-            // scope inside the run worktree (outside the worktree, a file target,
-            // or a cold index returning `None`), bail the WHOLE command — never
-            // serve a partial result set.
-            let query_paths: Vec<Option<String>> = if paths.is_empty() {
-                vec![None]
-            } else {
-                paths.into_iter().map(Some).collect()
-            };
-
-            let mut combined = String::new();
-            for path_arg in &query_paths {
-                let search_root = resolve_run_search_root(cwd, path_arg.as_deref());
-                let scope = search::resolve_worktree_scope(orch, &search_root, &worktree_raw)?;
-                let params = crate::worktree_search::WorktreeGrepParams {
-                    pattern: pattern.clone(),
-                    subdir: scope.subdir,
-                    globs: globs.clone(),
-                    max_per_file,
-                    output_mode: output_mode.clone(),
-                    case_insensitive,
-                    before_context,
-                    after_context,
-                    show_line_numbers,
-                };
-                let deny = deny_read.clone();
-                let body =
-                    tokio::task::spawn_blocking(move || scope.search.try_grep(&params, &deny))
-                        .await
-                        .ok()??;
-                let body = reprefix_search_body(&body, path_arg.as_deref());
-                if !body.is_empty() {
-                    if !combined.is_empty() {
-                        combined.push('\n');
-                    }
-                    combined.push_str(&body);
-                }
-            }
-
-            let combined = apply_post_filters(combined, &compiled_post);
-            let body = if compiled_post.is_empty() {
-                // Bare grep/rg: keep the warm read-projection contract of a
-                // friendly "No matches found" line for an empty head search.
-                search::finalize_grep_output(combined, &pattern, 0, None)
-            } else {
-                // A pipeline's stdout is exactly the post-filtered stream: an
-                // empty result — whether a filter emptied it or the head search
-                // matched nothing — is empty stdout, NOT the read-style sentence
-                // (`rg hit src | grep absent`, `... | head -0`). `head`/`tail`/
-                // `grep` already emit their lines in order, so the post-filtered
-                // body is final as-is.
-                combined
-            };
-            Some(warm_search_outcome(header, body))
-        }
-        TranslatedSearch::Files { globs, path } => {
-            // `--files` with post-filters is out of scope; fall through to a real
-            // subprocess rather than serve an unfiltered file list.
-            if !post.is_empty() {
-                return None;
-            }
-            let pattern = match globs.as_slice() {
-                [] => "**".to_string(),
-                [glob] if !glob.starts_with('!') => glob.clone(),
-                _ => return None,
-            };
-            let search_root = resolve_run_search_root(cwd, path.as_deref());
-            let scope = search::resolve_worktree_scope(orch, &search_root, &worktree_raw)?;
-            let subdir = scope.subdir.clone();
-            let paths = tokio::task::spawn_blocking(move || {
-                scope
-                    .search
-                    .try_glob(&pattern, subdir.as_deref(), &deny_read)
-            })
-            .await
-            .ok()??;
-            let body = paths
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            Some(warm_search_outcome(header, body))
-        }
-    }
-}
-
-/// A compiled tail-stage post-filter (its regex prebuilt) applied to warm-search
-/// output in order. See [`PostFilter`] for the parsed shapes.
-enum CompiledPost {
-    Head(usize),
-    Tail(usize),
-    Grep { re: regex::Regex, invert: bool },
-}
-
-/// Pre-compile every tail-grep regex. Returns `None` if any pattern fails to
-/// compile, so the whole warm path falls through to a real subprocess (the head
-/// grep validates its own pattern inside `try_grep`).
-fn compile_post_filters(post: &[PostFilter]) -> Option<Vec<CompiledPost>> {
-    post.iter()
-        .map(|filter| match filter {
-            PostFilter::Head(n) => Some(CompiledPost::Head(*n)),
-            PostFilter::Tail(n) => Some(CompiledPost::Tail(*n)),
-            PostFilter::Grep {
-                pattern,
-                invert,
-                case_insensitive,
-            } => {
-                let re = regex::RegexBuilder::new(pattern)
-                    .case_insensitive(*case_insensitive)
-                    .build()
-                    .ok()?;
-                Some(CompiledPost::Grep {
-                    re,
-                    invert: *invert,
-                })
-            }
-        })
-        .collect()
-}
-
-/// Apply the pipeline's tail transforms to the combined warm-search body in
-/// order, mirroring `head`/`tail`/`grep` semantics on the piped stream.
-fn apply_post_filters(body: String, post: &[CompiledPost]) -> String {
-    let mut lines: Vec<String> = if body.is_empty() {
-        Vec::new()
-    } else {
-        body.lines().map(str::to_string).collect()
-    };
-    for filter in post {
-        match filter {
-            CompiledPost::Head(n) => lines.truncate(*n),
-            CompiledPost::Tail(n) => {
-                if lines.len() > *n {
-                    lines = lines.split_off(lines.len() - *n);
-                }
-            }
-            CompiledPost::Grep { re, invert } => {
-                lines.retain(|line| re.is_match(line) ^ *invert);
-            }
-        }
-    }
-    lines.join("\n")
-}
-
-/// Re-prefix warm-index result lines with the path argument the way real
-/// `grep -rn`/`rg -n` print it. The warm index emits search-root-relative paths;
-/// a real recursive grep prefixes each line with the directory argument as given
-/// (trailing slash normalized). `--` context separators are left untouched.
-/// Whole-worktree queries (no path arg) already match real output, so pass through.
-fn reprefix_search_body(body: &str, path_arg: Option<&str>) -> String {
-    let Some(arg) = path_arg else {
-        return body.to_string();
-    };
-    let prefix = format!("{}/", arg.trim_end_matches('/'));
-    body.lines()
-        .map(|line| {
-            if line == "--" {
-                line.to_string()
-            } else {
-                format!("{prefix}{line}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn resolve_run_search_root(cwd: &str, path: Option<&str>) -> PathBuf {
-    match path {
-        Some(path) => {
-            let expanded = expand_tilde(path);
-            let path = Path::new(&expanded);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                Path::new(cwd).join(path)
-            }
-        }
-        None => PathBuf::from(cwd),
-    }
-}
-
-fn warm_search_outcome(header: String, mut body: String) -> ItemOutcome {
-    if !body.is_empty() {
-        body.push('\n');
-    }
-    body.push_str("[served from Cairn's warm search index, not a spawned process]");
-    ItemOutcome {
-        header: format!("{header} [warm index]"),
-        body,
-        succeeded: true,
         suspended: false,
         images: Vec::new(),
     }
@@ -815,41 +577,190 @@ pub(crate) async fn build_agent_spawn_config(
                 .env("GIT_COMMITTER_NAME", &name)
                 .env("GIT_COMMITTER_EMAIL", &email);
         }
-        // Point the command's temp-file handling at a per-job scratch dir so
-        // default tooling (mktemp, cargo, compilers, harness logs) writes
-        // scratch there with no agent awareness. The dir is a subpath of the
-        // system temp root, already in the sandbox writable set, so this takes
-        // no fence prompt — it just namespaces scratch per job (no cross-job
-        // collisions) and lets teardown reclaim it. TMP/TEMP cover the few
-        // tools that read those instead of TMPDIR.
-        let scratch = crate::scratch::ensure_job_scratch_dir(&ctx.job_id);
-        let scratch = scratch.to_string_lossy().to_string();
-        spawn_config = spawn_config
-            .env("TMPDIR", &scratch)
-            .env("TMP", &scratch)
-            .env("TEMP", &scratch);
-        // `cairn:~` shorthand resolution needs the job's canonical home URI.
-        // For a top-level node that's `.../{seq}/{segment}`; for a sub-task it
-        // nests under its parent as `.../{seq}/{parent}/task/{segment}`.
-        if let (Some(num), Some(seq)) = (ctx.issue_number, ctx.exec_seq) {
+        // `cairn:~` shorthand resolution and the readable per-node scratch name
+        // both use the job's canonical home URI. For a top-level node that's
+        // `.../{seq}/{segment}`; for a sub-task it nests under its parent as
+        // `.../{seq}/{parent}/task/{segment}`.
+        let home_uri = if let (Some(num), Some(seq)) = (ctx.issue_number, ctx.exec_seq) {
             if let Some(segment) =
                 crate::jobs::queries::node_uri_segment_for_job(&orch.db.local, &ctx.job_id).await
             {
                 let parent_segment =
                     crate::jobs::queries::parent_uri_segment_for_job(&orch.db.local, &ctx.job_id)
                         .await;
-                let home_uri = cairn_common::uri::build_job_base_uri(
+                Some(cairn_common::uri::build_job_base_uri(
                     &ctx.project_key,
                     num,
                     seq,
                     &segment,
                     parent_segment.as_deref(),
-                );
-                spawn_config = spawn_config.env("CAIRN_HOME_URI", &home_uri);
+                ))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        // Point the command's temp-file handling at a per-job scratch dir so
+        // default tooling (mktemp, cargo, compilers, harness logs) writes there
+        // with no agent awareness. TMP/TEMP cover tools that ignore TMPDIR.
+        let scratch = crate::scratch::ensure_job_scratch_dir(&ctx.job_id, home_uri.as_deref());
+        let scratch = scratch.to_string_lossy().to_string();
+        spawn_config = spawn_config
+            .env("TMPDIR", &scratch)
+            .env("TMP", &scratch)
+            .env("TEMP", &scratch);
+        if let Some(home_uri) = home_uri {
+            spawn_config = spawn_config.env("CAIRN_HOME_URI", &home_uri);
         }
     }
     spawn_config
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SearchCandidates {
+    rg: bool,
+    grep: bool,
+}
+
+fn apply_warm_search_shim(
+    orch: &Orchestrator,
+    mut config: SpawnConfig,
+    run_context: &RunContext,
+    command: &str,
+) -> SpawnConfig {
+    if !cfg!(unix) {
+        return config;
+    }
+    let candidates = search_candidates(command);
+    if !candidates.rg && !candidates.grep {
+        return config;
+    }
+
+    let real_rg = candidates
+        .rg
+        .then(|| crate::env::find_binary("rg"))
+        .transpose();
+    let real_grep = candidates
+        .grep
+        .then(|| crate::env::find_binary("grep"))
+        .transpose();
+    let (Ok(real_rg), Ok(real_grep)) = (real_rg, real_grep) else {
+        return config;
+    };
+    if let Some(path) = real_rg {
+        config = config.env("CAIRN_REAL_RG", &path);
+    }
+    if let Some(path) = real_grep {
+        config = config.env("CAIRN_REAL_GREP", &path);
+    }
+    config
+        .env("PATH", &crate::env::warm_search_shell_path())
+        .env(
+            "CAIRN_WARM_SEARCH_URL",
+            &format!(
+                "http://127.0.0.1:{}/api/warm-search",
+                orch.mcp_callback_port
+            ),
+        )
+        .env("CAIRN_RUN_ID", &run_context.run_id)
+}
+
+/// Find bare `rg`/`grep` words in executable position without interpreting the
+/// shell program. False negatives are intentional; PATH observability makes a
+/// false positive more costly than falling back to native execution.
+fn search_candidates(command: &str) -> SearchCandidates {
+    if command.contains("command -v")
+        || command.contains("command -V")
+        || command.contains("type ")
+        || command.contains("hash -t")
+        || command.contains("which ")
+        || command.contains("whereis ")
+        || command.contains("whence ")
+    {
+        return SearchCandidates::default();
+    }
+
+    let tokens = shell_candidate_tokens(command);
+    let mut candidates = SearchCandidates::default();
+    let mut command_start = true;
+    for token in tokens {
+        match token.as_str() {
+            ";" | "&&" | "||" | "|" | "(" | ")" | "{" | "}" => command_start = true,
+            "if" | "then" | "elif" | "while" | "until" | "do" | "!" if command_start => {}
+            "rg" if command_start => {
+                candidates.rg = true;
+                command_start = false;
+            }
+            "grep" if command_start => {
+                candidates.grep = true;
+                command_start = false;
+            }
+            word if command_start && word.contains('=') && !word.starts_with('=') => {}
+            _ => command_start = false,
+        }
+    }
+    candidates
+}
+
+fn shell_candidate_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut chars = command.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(ch) = chars.next() {
+        if single {
+            if ch == '\'' {
+                single = false;
+            }
+            continue;
+        }
+        if double {
+            if ch == '"' {
+                double = false;
+            } else if ch == '\\' {
+                let _ = chars.next();
+            }
+            continue;
+        }
+        match ch {
+            '\'' => single = true,
+            '"' => double = true,
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            '\n' | '\r' => {
+                if !word.is_empty() {
+                    tokens.push(std::mem::take(&mut word));
+                }
+                tokens.push(";".to_string());
+            }
+            c if c.is_whitespace() => {
+                if !word.is_empty() {
+                    tokens.push(std::mem::take(&mut word));
+                }
+            }
+            ';' | '(' | ')' | '{' | '}' | '|' | '&' => {
+                if !word.is_empty() {
+                    tokens.push(std::mem::take(&mut word));
+                }
+                let mut operator = ch.to_string();
+                if matches!(ch, '|' | '&') && chars.peek() == Some(&ch) {
+                    operator.push(chars.next().unwrap());
+                }
+                tokens.push(operator);
+            }
+            _ => word.push(ch),
+        }
+    }
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+    tokens
 }
 
 /// Spawn a process, stream its stdout/stderr, and wait with a timeout.
@@ -915,6 +826,11 @@ pub(super) async fn execute_process(
 
     let mut spawn_config =
         build_agent_spawn_config(orch, cwd, run_context, program, args, sandbox_policy).await;
+    if !branch_scoped_run {
+        if let (Some(ctx), Some(command)) = (run_context, shell_command) {
+            spawn_config = apply_warm_search_shim(orch, spawn_config, ctx, command);
+        }
+    }
 
     // Capture stdin only when the spec carries a payload to feed (today only
     // `uv run -`, whose script must arrive on stdin so uv can parse PEP 723
@@ -1458,92 +1374,51 @@ async fn get_job_checkpoint_command(db: &LocalDb, job_id: &str) -> Option<String
 mod tests {
     use super::*;
 
-    fn grep_filter(pattern: &str, invert: bool, case_insensitive: bool) -> CompiledPost {
-        let re = regex::RegexBuilder::new(pattern)
-            .case_insensitive(case_insensitive)
-            .build()
-            .unwrap();
-        CompiledPost::Grep { re, invert }
-    }
-
     #[test]
-    fn apply_post_filters_applies_grep_then_head_in_order() {
-        // `grep -v test | head -2`: drop the two `_test` lines first, then keep
-        // the first two survivors.
-        let body = [
-            "src/a.rs:1:hit",
-            "src/a_test.rs:2:hit",
-            "src/b.rs:3:hit",
-            "src/c.rs:4:hit",
-            "src/d.rs:5:hit",
-        ]
-        .join("\n");
-        let post = vec![grep_filter("test", true, false), CompiledPost::Head(2)];
+    fn warm_search_candidates_only_select_executable_positions() {
         assert_eq!(
-            apply_post_filters(body, &post),
-            "src/a.rs:1:hit\nsrc/b.rs:3:hit"
+            search_candidates("cd nested && rg needle ."),
+            SearchCandidates {
+                rg: true,
+                grep: false
+            }
+        );
+        assert_eq!(
+            search_candidates("echo heading; rg needle src | grep -v fixture | head -5"),
+            SearchCandidates {
+                rg: true,
+                grep: true
+            }
+        );
+        assert_eq!(
+            search_candidates("echo rg grep"),
+            SearchCandidates::default()
+        );
+        assert_eq!(
+            search_candidates("/usr/bin/rg needle ."),
+            SearchCandidates::default()
+        );
+        assert_eq!(
+            search_candidates("command -v rg"),
+            SearchCandidates::default()
+        );
+        assert_eq!(search_candidates("type rg"), SearchCandidates::default());
+        assert_eq!(
+            search_candidates("echo heading\nrg needle src"),
+            SearchCandidates {
+                rg: true,
+                grep: false
+            }
+        );
+        assert_eq!(
+            search_candidates("{ rg needle src; }"),
+            SearchCandidates {
+                rg: true,
+                grep: false
+            }
         );
     }
 
-    #[test]
-    fn apply_post_filters_tail_keeps_last_n() {
-        let body = ["a", "b", "c", "d"].join("\n");
-        assert_eq!(apply_post_filters(body, &[CompiledPost::Tail(2)]), "c\nd");
-    }
-
-    #[test]
-    fn reprefix_search_body_single_and_multi_path_shapes() {
-        // A path argument prefixes each result line, matching real `grep -rn X src`.
-        assert_eq!(
-            reprefix_search_body("a.rs:1:hit", Some("src")),
-            "src/a.rs:1:hit"
-        );
-        // Trailing slash is normalized to a single separator.
-        assert_eq!(
-            reprefix_search_body("ui/x.ts:2:hit", Some("packages/ui/src/")),
-            "packages/ui/src/ui/x.ts:2:hit"
-        );
-        // `--` context separators are never prefixed.
-        assert_eq!(
-            reprefix_search_body("a.rs:4-ctx\n--\na.rs:9:hit", Some("src")),
-            "src/a.rs:4-ctx\n--\nsrc/a.rs:9:hit"
-        );
-        // No path argument (whole-worktree) passes through unchanged.
-        assert_eq!(reprefix_search_body("a.rs:1:hit", None), "a.rs:1:hit");
-        assert_eq!(reprefix_search_body("", Some("src")), "");
-    }
-
-    #[test]
-    fn compile_post_filters_rejects_uncompilable_grep() {
-        // An unbalanced group is not a valid RE2 regex; the whole warm path bails.
-        assert!(compile_post_filters(&[PostFilter::Grep {
-            pattern: "(unbalanced".to_string(),
-            invert: false,
-            case_insensitive: false,
-        }])
-        .is_none());
-        assert!(compile_post_filters(&[PostFilter::Head(5)]).is_some());
-    }
-
-    #[test]
-    fn warm_search_outcome_marks_header_and_body() {
-        let outcome = warm_search_outcome("rg needle".to_string(), "src/lib.rs:needle".to_string());
-        assert_eq!(outcome.header, "rg needle [warm index]");
-        assert!(outcome.succeeded);
-        assert_eq!(
-            outcome.body,
-            "src/lib.rs:needle\n[served from Cairn's warm search index, not a spawned process]"
-        );
-    }
-
-    #[test]
-    fn warm_search_outcome_trailer_is_present_without_result_lines() {
-        let outcome = warm_search_outcome("rg absent".to_string(), String::new());
-        assert_eq!(
-            outcome.body,
-            "[served from Cairn's warm search index, not a spawned process]"
-        );
-    }
     #[test]
     fn strip_dev_instance_routing_env_marks_both_keys_for_removal() {
         let config = strip_dev_instance_routing_env(SpawnConfig::new("bash"));

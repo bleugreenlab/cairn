@@ -37,39 +37,143 @@ const TERMINAL_LOG_MAX_BYTES: u64 = 24 * 1024 * 1024;
 /// Bytes retained when a terminal log is compacted.
 const TERMINAL_LOG_KEEP_BYTES: u64 = 12 * 1024 * 1024;
 
-/// The scratch directory for a job: a stable subdir of the system temp root,
-/// keyed on the job id. Pure path construction — see [`ensure_job_scratch_dir`]
-/// to create it. Because it sits under `std::env::temp_dir()`, writes here are
-/// in the fence's writable set and never prompt.
-pub fn job_scratch_dir(job_id: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("cairn-scratch-{job_id}"))
+const SCRATCH_PREFIX: &str = "cairn-scratch-";
+const SCRATCH_NAME_MAX_BYTES: usize = 220;
+const SCRATCH_MAP_DIR: &str = ".cairn-scratch-jobs";
+
+fn legacy_job_scratch_dir(job_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("{SCRATCH_PREFIX}{job_id}"))
 }
 
-/// Ensure the job's scratch dir exists, returning its path. Best-effort: on a
-/// create failure the path is still returned (callers export it as `TMPDIR`
-/// regardless; a tool then falls back to its own default temp handling).
+fn encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' => encoded.push(byte as char),
+            // Preserve the URI's segment boundaries visibly without creating
+            // filesystem subdirectories. Literal dots and underscores are
+            // escaped below, so this mapping remains unambiguous.
+            b'/' => encoded.push('.'),
+            _ => encoded.push_str(&format!("_{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn scratch_map_path(job_id: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join(SCRATCH_MAP_DIR)
+        .join(encode_component(job_id))
+}
+
+fn mapped_job_scratch_dir(job_id: &str) -> Option<PathBuf> {
+    let name = std::fs::read_to_string(scratch_map_path(job_id)).ok()?;
+    let name = name.trim();
+    if !name.starts_with(SCRATCH_PREFIX)
+        || name.is_empty()
+        || std::path::Path::new(name).components().count() != 1
+    {
+        return None;
+    }
+    Some(std::env::temp_dir().join(name))
+}
+
+fn friendly_scratch_name(job_id: &str, home_uri: &str) -> String {
+    let uri_tail = home_uri.strip_prefix("cairn://p/").unwrap_or(home_uri);
+    let mut name = format!("{SCRATCH_PREFIX}{}", encode_component(uri_tail));
+    if name.len() > SCRATCH_NAME_MAX_BYTES {
+        let suffix: String = encode_component(job_id).chars().take(12).collect();
+        name.truncate(SCRATCH_NAME_MAX_BYTES - suffix.len() - 2);
+        name.push_str("--");
+        name.push_str(&suffix);
+    }
+    name
+}
+
+/// The scratch directory currently registered for a job. Session startup names
+/// it from the canonical node URI; the small temp-root registry lets command,
+/// terminal, and teardown paths recover that same directory from the internal
+/// job id. Legacy or not-yet-started jobs fall back to their UUID-keyed path.
+pub fn job_scratch_dir(job_id: &str) -> PathBuf {
+    mapped_job_scratch_dir(job_id).unwrap_or_else(|| legacy_job_scratch_dir(job_id))
+}
+
+/// Register and provision a readable scratch directory for a job. Supplying the
+/// node's canonical home URI produces names such as
+/// `cairn-scratch-CAIRN-2695-1-builder`; callers without URI context reuse an
+/// existing registration or retain the legacy job-id fallback.
+///
+/// Best-effort: on a create failure the path is still returned (callers export
+/// it as `TMPDIR` regardless; a tool then falls back to its own temp handling).
 /// Idempotent, so it is safe to call on every spawn and across resumes.
-pub fn ensure_job_scratch_dir(job_id: &str) -> PathBuf {
-    let dir = job_scratch_dir(job_id);
+pub fn ensure_job_scratch_dir(job_id: &str, home_uri: Option<&str>) -> PathBuf {
+    let dir = if let Some(home_uri) = home_uri {
+        let name = friendly_scratch_name(job_id, home_uri);
+        let friendly = std::env::temp_dir().join(&name);
+        let map_path = scratch_map_path(job_id);
+        let mapping_registered = map_path
+            .parent()
+            .and_then(|parent| std::fs::create_dir_all(parent).ok().map(|()| parent))
+            .and_then(|_| std::fs::write(&map_path, &name).ok())
+            .is_some();
+
+        if mapping_registered {
+            let legacy = legacy_job_scratch_dir(job_id);
+            if legacy.exists() && !friendly.exists() {
+                if let Err(e) = std::fs::rename(&legacy, &friendly) {
+                    log::warn!(
+                        "Failed to migrate job scratch dir {} to {}: {e}",
+                        legacy.display(),
+                        friendly.display()
+                    );
+                }
+            }
+            friendly
+        } else {
+            log::warn!(
+                "Failed to register readable scratch dir for job {job_id}; using legacy name"
+            );
+            legacy_job_scratch_dir(job_id)
+        }
+    } else {
+        job_scratch_dir(job_id)
+    };
+
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("Failed to create job scratch dir {}: {e}", dir.display());
     }
     dir
 }
 
-/// Remove a job's scratch dir (idempotent, best-effort). Called at worktree
-/// teardown for every job that referenced the torn-down worktree. A missing
-/// dir is success (the OS may have reaped it, or the job never spawned a
-/// command).
+/// Remove a job's registered scratch dir and legacy fallback (idempotent,
+/// best-effort). Called at worktree teardown for every job that referenced the
+/// torn-down worktree. A missing dir is success (the OS may have reaped it, or
+/// the job never spawned a command).
 pub fn remove_job_scratch_dir(job_id: &str) {
-    let dir = job_scratch_dir(job_id);
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => log::info!("Teardown: removed job scratch dir {}", dir.display()),
+    let mapped = mapped_job_scratch_dir(job_id);
+    let legacy = legacy_job_scratch_dir(job_id);
+    let mut dirs = Vec::with_capacity(2);
+    if let Some(dir) = mapped {
+        dirs.push(dir);
+    }
+    if !dirs.contains(&legacy) {
+        dirs.push(legacy);
+    }
+
+    for dir in dirs {
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => log::info!("Teardown: removed job scratch dir {}", dir.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "Teardown: failed to remove job scratch dir {}: {e}",
+                dir.display()
+            ),
+        }
+    }
+    match std::fs::remove_file(scratch_map_path(job_id)) {
+        Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!(
-            "Teardown: failed to remove job scratch dir {}: {e}",
-            dir.display()
-        ),
+        Err(e) => log::warn!("Failed to remove scratch-dir registration for job {job_id}: {e}"),
     }
 }
 
@@ -243,15 +347,58 @@ mod tests {
         // writable set — no fence widening required.
         assert!(a.starts_with(std::env::temp_dir()));
         assert!(a.to_string_lossy().contains("cairn-scratch-job-abc"));
-        // Distinct jobs get distinct dirs (collision avoidance across concurrent
-        // jobs).
+        // Distinct unregistered jobs retain distinct legacy fallbacks.
         assert_ne!(job_scratch_dir("job-abc"), job_scratch_dir("job-xyz"));
+    }
+
+    #[test]
+    fn node_uri_produces_a_readable_registered_name() {
+        let job_id = format!("test-{}", uuid::Uuid::new_v4());
+        let dir =
+            ensure_job_scratch_dir(&job_id, Some("cairn://p/CAIRN/2695/1/builder/task/review"));
+        assert_eq!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some("cairn-scratch-CAIRN.2695.1.builder.task.review")
+        );
+        assert_eq!(job_scratch_dir(&job_id), dir);
+        remove_job_scratch_dir(&job_id);
+        assert!(!dir.exists());
+        assert!(!scratch_map_path(&job_id).exists());
+    }
+
+    #[test]
+    fn uri_structure_remains_visible_and_stable_without_a_hash() {
+        let top_level = "cairn://p/CAIRN/2695/1/builder-task-review";
+        let task = "cairn://p/CAIRN/2695/1/builder/task/review";
+
+        let top_level_name = friendly_scratch_name("job-top", top_level);
+        let task_name = friendly_scratch_name("job-task", task);
+        assert_eq!(
+            top_level_name,
+            "cairn-scratch-CAIRN.2695.1.builder-task-review"
+        );
+        assert_eq!(task_name, "cairn-scratch-CAIRN.2695.1.builder.task.review");
+        assert_ne!(top_level_name, task_name);
+        assert_eq!(
+            friendly_scratch_name("another-job", top_level),
+            top_level_name
+        );
+        assert_eq!(friendly_scratch_name("another-job", task), task_name);
+    }
+
+    #[test]
+    fn unsafe_uri_bytes_are_encoded_into_one_path_component() {
+        let name = friendly_scratch_name("job-abc", "cairn://p/CAIRN/1/1/a b/%2F._2F");
+        assert_eq!(name, "cairn-scratch-CAIRN.1.1.a_20b._252F_2E_5F2F");
+        assert_eq!(std::path::Path::new(&name).components().count(), 1);
+        assert_ne!(encode_component("a/b"), encode_component("a.b"));
+        assert_ne!(encode_component("_2F"), encode_component("/"));
     }
 
     #[test]
     fn ensure_creates_and_remove_is_idempotent() {
         let job_id = format!("test-{}", uuid::Uuid::new_v4());
-        let dir = ensure_job_scratch_dir(&job_id);
+        let dir = ensure_job_scratch_dir(&job_id, None);
         assert!(dir.exists(), "ensure should create the dir");
         // A file inside survives until removal.
         std::fs::write(dir.join("scratch.log"), b"x").unwrap();

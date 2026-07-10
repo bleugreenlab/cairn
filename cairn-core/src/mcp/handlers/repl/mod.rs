@@ -210,7 +210,7 @@ pub async fn spawn_session(
     // Materialize the embedded eval-server into the per-job scratch dir (the
     // child's TMPDIR: fence-safe, outside the worktree so it can't trip the
     // worktree-restore machinery, and reclaimed at teardown).
-    let scratch = crate::scratch::ensure_job_scratch_dir(&run_context.job_id);
+    let scratch = crate::scratch::ensure_job_scratch_dir(&run_context.job_id, None);
     let (script_name, body) = match interpreter {
         ReplLang::Python => (format!("repl-{slug}.py"), PYTHON_EVAL_SERVER),
         ReplLang::Typescript => (format!("repl-{slug}.ts"), TYPESCRIPT_EVAL_SERVER),

@@ -176,8 +176,8 @@ pub fn build_node_artifact_uri_named(
     )
 }
 
-pub fn build_node_changed_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
-    build_node_subresource_uri(project, number, exec_seq, node_id, "changed")
+pub fn build_node_diff_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "diff")
 }
 
 pub fn build_node_terminal_uri(
@@ -817,12 +817,12 @@ impl CairnResource {
                 number,
                 exec_seq,
             } => build_issue_execution_uri(project, *number, *exec_seq),
-            Self::NodeChanged {
+            Self::NodeDiff {
                 project,
                 number,
                 exec_seq,
                 node_id,
-            } => build_node_changed_uri(project, *number, *exec_seq, node_id),
+            } => build_node_diff_uri(project, *number, *exec_seq, node_id),
             Self::ProjectTerminal { project, slug } => build_project_terminal_uri(project, slug),
             Self::ProjectBrowser { project, slug } => build_project_browser_uri(project, slug),
             Self::NodeSymbols {

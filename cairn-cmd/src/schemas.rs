@@ -110,7 +110,7 @@ impl schemars::JsonSchema for ChangeInput {
 /// `paths` is a non-empty list of self-contained target URIs. All per-target
 /// scoping (`offset`, `limit`, `glob`, `grep`, `issue_history`, `branch`) rides in each
 /// URI's query string (e.g. `file:x.rs?offset=10&limit=20`,
-/// `cairn://p/CAIRN/123/changed?grep=foo`). There is no top-level offset/limit:
+/// `cairn:~/diff?view=patch&file=src/lib.rs`). There is no top-level offset/limit:
 /// they are meaningless across N targets, and query-string scoping is the one
 /// canonical per-target mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

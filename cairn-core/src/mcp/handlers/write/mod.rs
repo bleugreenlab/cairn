@@ -355,6 +355,27 @@ async fn recover_stale_file_commit(
             emit_worktree_changed(orch, &request.cwd);
             Err(failure)
         }
+        Ok(CommitOutcome::LineageMismatch { seal_error: e2 }) => {
+            emit_worktree_changed(orch, &request.cwd);
+            let error = format!(
+                "{e2}. The re-applied edits were PRESERVED exactly; no discard was attempted."
+            );
+            Err(Box::new(IndexedFailure {
+                failure: ChangeFailure {
+                    index: first_file_change.index,
+                    target: first_file_change.item.target.clone(),
+                    mode: mode_name(first_file_change.item.mode).to_string(),
+                    kind: "file".to_string(),
+                    error: error.clone(),
+                },
+                commit: Some(CommitReport {
+                    status: "failed".to_string(),
+                    sha: None,
+                    pr_number: None,
+                    message: Some(error),
+                }),
+            }))
+        }
         Ok(CommitOutcome::ConflictedBranch { seal_error: e2 }) => {
             // The just-advanced base itself presents a conflicted bookmark tip:
             // preserve the edits (no discard) and surface the flatten guidance,
@@ -691,16 +712,71 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             .iter()
             .any(|item| matches!(target_family(&item.target), Ok(TargetFamily::File)))
     {
-        let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&request.cwd));
         let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
         let _guard = match store_lock.as_ref() {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        let context = match crate::mcp::vcs::prepare_managed_workspace(orch, request).await {
+            Ok(context) => context,
+            Err(error) => {
+                return serde_json::to_string(&empty_change_report(
+                    Vec::new(),
+                    vec![ChangeFailure {
+                        index: 0,
+                        target: payload
+                            .changes
+                            .first()
+                            .map(|c| c.target.clone())
+                            .unwrap_or_default(),
+                        mode: payload
+                            .changes
+                            .first()
+                            .map(|c| mode_name(c.mode))
+                            .unwrap_or("patch")
+                            .to_string(),
+                        kind: "file".to_string(),
+                        error,
+                    }],
+                    None,
+                    payload.atomic.unwrap_or(false),
+                    false,
+                ))
+                .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"));
+            }
+        };
+        let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
+            orch,
+            std::path::Path::new(&request.cwd),
+            context.as_ref(),
+        );
         if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&request.cwd)) {
-            log::warn!(
-                "pre-flight workspace reconcile (write) failed (continuing; seal-time stale arm remains the fallback): {e}"
-            );
+            if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) {
+                return serde_json::to_string(&empty_change_report(
+                    Vec::new(),
+                    vec![ChangeFailure {
+                        index: 0,
+                        target: payload
+                            .changes
+                            .first()
+                            .map(|c| c.target.clone())
+                            .unwrap_or_default(),
+                        mode: payload
+                            .changes
+                            .first()
+                            .map(|c| mode_name(c.mode))
+                            .unwrap_or("patch")
+                            .to_string(),
+                        kind: "file".to_string(),
+                        error: e,
+                    }],
+                    None,
+                    payload.atomic.unwrap_or(false),
+                    false,
+                ))
+                .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"));
+            }
+            log::warn!("pre-flight workspace reconcile (write) failed: {e}");
         }
     }
 
@@ -993,6 +1069,24 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         .await
         {
             Ok(CommitOutcome::Done(commit_report)) => commit = commit_report,
+            Ok(CommitOutcome::LineageMismatch { seal_error }) => {
+                let error = format!(
+                    "Applied file changes but the seal was refused: {seal_error}. The on-disk edits were PRESERVED exactly; no stale retry, update-stale, or discard was attempted."
+                );
+                failures.push(ChangeFailure {
+                    index: first_file_change.index,
+                    target: first_file_change.item.target.clone(),
+                    mode: mode_name(first_file_change.item.mode).to_string(),
+                    kind: "file".to_string(),
+                    error: error.clone(),
+                });
+                commit = Some(CommitReport {
+                    status: "failed".to_string(),
+                    sha: None,
+                    pr_number: None,
+                    message: Some(error),
+                });
+            }
             Ok(CommitOutcome::ConflictedBranch { seal_error }) => {
                 // The seal was refused because the branch bookmark tip carries a
                 // recorded conflict and `@` diverged from it — a deliberate
@@ -1620,8 +1714,217 @@ mod change_preview_tests {
             "error should mention replace_all, got: {}",
             err.failure.error
         );
+        assert!(
+            err.failure.error.contains("Match 1 — dup.txt:1:1-1")
+                && err.failure.error.contains("Match 2 — dup.txt:2:1-1")
+                && err.failure.error.contains("Match 3 — dup.txt:3:1-1"),
+            "error should list every matching location, got: {}",
+            err.failure.error
+        );
+        assert!(
+            err.failure.error.contains(">     1 | x"),
+            "error should include line-numbered excerpts, got: {}",
+            err.failure.error
+        );
         // prepare_file_changes never writes; the on-disk file is untouched.
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "x\nx\nx\n");
+    }
+
+    #[test]
+    fn prepare_file_changes_non_unique_excerpts_distinguish_similar_fixtures() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("equipment.txt");
+        std::fs::write(
+            &file,
+            "equipment: pump-a\n  document: manual-a\n  enabled: true\n  mode: primary\n\n\
+             equipment: pump-b\n  document: manual-b\n  enabled: true\n  mode: backup\n",
+        )
+        .unwrap();
+        let item = patch_item("file:equipment.txt", "  enabled: true", "  enabled: false");
+        let changes = vec![IndexedChange {
+            index: 0,
+            item: &item,
+        }];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for non-unique fixture field"),
+            Err(err) => err,
+        };
+        let diagnostic = err.failure.error;
+
+        assert!(diagnostic.contains("Match 1 — equipment.txt:3:1-15"));
+        assert!(diagnostic.contains("Match 2 — equipment.txt:8:1-15"));
+        assert!(diagnostic.contains("1 | equipment: pump-a"));
+        assert!(diagnostic.contains("2 |   document: manual-a"));
+        assert!(diagnostic.contains("6 | equipment: pump-b"));
+        assert!(diagnostic.contains("7 |   document: manual-b"));
+    }
+
+    #[test]
+    fn prepare_file_changes_non_unique_reports_multiline_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("ranges.txt");
+        std::fs::write(
+            &file,
+            "fixture a\nstart\nmiddle\nend\ntail a\nfixture b\nstart\nmiddle\nend\ntail b\n",
+        )
+        .unwrap();
+        let item = patch_item("file:ranges.txt", "start\nmiddle", "replacement");
+        let changes = vec![IndexedChange {
+            index: 0,
+            item: &item,
+        }];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for non-unique multiline text"),
+            Err(err) => err,
+        };
+        let diagnostic = err.failure.error;
+
+        assert!(diagnostic.contains("Match 1 — ranges.txt:2:1-3:6"));
+        assert!(diagnostic.contains("Match 2 — ranges.txt:7:1-8:6"));
+        assert!(diagnostic.contains(">     2 | start\n>     3 | middle"));
+        assert!(diagnostic.contains(">     7 | start\n>     8 | middle"));
+    }
+
+    #[test]
+    fn prepare_file_changes_non_unique_distinguishes_matches_on_one_long_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("one-line.txt");
+        let content = format!("{}needle{}needle\n", "a".repeat(220), "x".repeat(30));
+        std::fs::write(&file, content).unwrap();
+        let item = patch_item("file:one-line.txt", "needle", "changed");
+        let changes = vec![IndexedChange {
+            index: 0,
+            item: &item,
+        }];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for two matches on one line"),
+            Err(err) => err,
+        };
+        let diagnostic = err.failure.error;
+
+        assert!(diagnostic.contains("Match 1 — one-line.txt:1:221-226"));
+        assert!(diagnostic.contains("Match 2 — one-line.txt:1:257-262"));
+        let first_match = diagnostic
+            .split("Match 1 — one-line.txt:1:221-226\n")
+            .nth(1)
+            .and_then(|section| section.split("\n\nMatch 2 —").next())
+            .expect("first match excerpt");
+        let second_match = diagnostic
+            .split("Match 2 — one-line.txt:1:257-262\n")
+            .nth(1)
+            .expect("second match excerpt");
+        assert!(
+            second_match.contains("needle"),
+            "the centered excerpt must retain a late-line match: {diagnostic}"
+        );
+        let first_marker = first_match
+            .lines()
+            .find(|line| line.starts_with("        |"))
+            .expect("first focus marker");
+        let second_marker = second_match
+            .lines()
+            .find(|line| line.starts_with("        |"))
+            .expect("second focus marker");
+        assert_ne!(
+            first_marker, second_marker,
+            "focus markers must distinguish occurrences on the same rendered line"
+        );
+    }
+
+    #[test]
+    fn prepare_file_changes_non_unique_bounds_large_multiline_excerpts() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("large-block.txt");
+        let block = (1..=50)
+            .map(|index| format!("block line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!("fixture a\n{block}\ntail a\nfixture b\n{block}\ntail b\n");
+        std::fs::write(&file, content).unwrap();
+        let item = patch_item("file:large-block.txt", &block, "changed");
+        let changes = vec![IndexedChange {
+            index: 0,
+            item: &item,
+        }];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for repeated large multiline blocks"),
+            Err(err) => err,
+        };
+        let diagnostic = err.failure.error;
+
+        assert!(diagnostic.contains("Match 1 — large-block.txt:2:1-51:13"));
+        assert!(diagnostic.contains("Match 2 — large-block.txt:54:1-103:13"));
+        assert!(diagnostic.contains("lines omitted"));
+        assert!(diagnostic.contains("block line 01"));
+        assert!(diagnostic.contains("block line 50"));
+        assert!(
+            diagnostic.lines().count() < 30,
+            "each site should have a bounded excerpt: {diagnostic}"
+        );
+    }
+
+    #[test]
+    fn prepare_file_changes_non_unique_diagnostic_caps_and_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("many.txt");
+        let content = (1..=12)
+            .map(|index| format!("fixture {index}\nvalue: repeated\nend {index}\n"))
+            .collect::<String>();
+        std::fs::write(&file, content).unwrap();
+        let item = patch_item("file:many.txt", "value: repeated", "value: changed");
+        let changes = vec![IndexedChange {
+            index: 0,
+            item: &item,
+        }];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for a large non-unique match set"),
+            Err(err) => err,
+        };
+        let diagnostic = err.failure.error;
+
+        assert!(diagnostic.contains("showing 10 of 12"));
+        assert!(diagnostic.contains("Match 10 — many.txt:29:1-15"));
+        assert!(!diagnostic.contains("Match 11 —"));
+        assert!(diagnostic.contains("2 more matches omitted"));
+        assert!(diagnostic.contains("`file:many.txt?offset=29&limit=40`"));
+    }
+
+    #[test]
+    fn prepare_file_changes_in_flight_ambiguity_does_not_emit_stale_continuation_uri() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = (1..=12)
+            .map(|index| format!("fixture {index}\nvalue: repeated\nend {index}\n"))
+            .collect::<String>();
+        let create = content_item("file:created.txt", ChangeMode::Create, &content);
+        let patch = patch_item("file:created.txt", "value: repeated", "value: changed");
+        let changes = vec![
+            IndexedChange {
+                index: 0,
+                item: &create,
+            },
+            IndexedChange {
+                index: 1,
+                item: &patch,
+            },
+        ];
+
+        let err = match prepare_file_changes(temp.path(), &changes, false) {
+            Ok(_) => panic!("expected failure for ambiguous in-flight content"),
+            Err(err) => err,
+        };
+        let diagnostic = err.failure.error;
+
+        assert_eq!(err.failure.index, 1);
+        assert!(diagnostic.contains("showing 10 of 12"));
+        assert!(diagnostic.contains("in-flight snapshot"));
+        assert!(diagnostic.contains("Apply the preceding changes in a separate write"));
+        assert!(!diagnostic.contains("file:created.txt?offset="));
+        assert!(!temp.path().join("created.txt").exists());
     }
 
     #[test]

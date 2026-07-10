@@ -11,6 +11,52 @@ pub fn export_git(jj: &JjEnv, ws: &Path) -> Result<(), String> {
     jj.run(ws, &["git", "export"], "jj git export").map(|_| ())
 }
 
+/// Create a new local bookmark at an exact revision without snapshotting any
+/// workspace. Fails if the bookmark already exists.
+pub fn create_bookmark_at(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    revision: &str,
+) -> Result<(), String> {
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "create",
+            branch,
+            "-r",
+            revision,
+            "--ignore-working-copy",
+        ],
+        "jj bookmark create",
+    )
+    .map(|_| ())
+}
+
+/// Move an existing bookmark forward to an exact revision without snapshotting
+/// a workspace. Normal jj fast-forward safeguards remain in force.
+pub fn set_bookmark_at(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    revision: &str,
+) -> Result<(), String> {
+    jj.run(
+        store,
+        &[
+            "bookmark",
+            "set",
+            branch,
+            "-r",
+            revision,
+            "--ignore-working-copy",
+        ],
+        "jj bookmark set",
+    )
+    .map(|_| ())
+}
+
 /// Forward-map a possibly-rewritten commit to its current commit-id and stable
 /// change-id. jj's headline auto-rebase rewrites a commit's commit-id while its
 /// change-id stays stable, so a coordinate recorded before a rebase points at a
@@ -81,12 +127,12 @@ pub fn forward_resolve_commit(
     Some((change_id, current))
 }
 
-/// Push the workspace's bookmark to origin. Best-effort: logs and never fails,
-/// mirroring `mcp::git::push_to_origin`'s contract so a local/remoteless jj
-/// project never fails a seal. Skips empty/`main`/`master` branches (the same
-/// guard the git path uses). jj 0.42 auto-tracks a new bookmark on push, so the
-/// removed `--allow-new` flag is not passed; seals only advance the bookmark, so
-/// the push is a fast-forward and needs no force.
+/// Push the workspace's bookmark to origin. Callers choose whether publication
+/// is strict or best-effort by propagating or logging the returned error. Skips
+/// empty/`main`/`master` branches (the same guard the git path uses). jj 0.42
+/// auto-tracks a new bookmark on push, so the removed `--allow-new` flag is not
+/// passed; seals only advance the bookmark, so the push is a fast-forward and
+/// needs no force.
 ///
 /// `--ignore-working-copy`: a publish must never SNAPSHOT the live `@`. The
 /// bookmark already points at the sealed `@-`, so pushing needs no fresh
@@ -95,12 +141,12 @@ pub fn forward_resolve_commit(
 /// the workspace) into the working-copy commit, exactly the kind of working-copy
 /// mutation a concurrent store op can then wedge a later seal on. Matches
 /// `advance_workspace_onto` / `node_changed_files`, which pass it deliberately.
-pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) {
+pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) -> Result<(), String> {
     if branch.is_empty() || branch == "main" || branch == "master" {
         log::debug!("Skipping jj push for branch: {branch}");
-        return;
+        return Ok(());
     }
-    match jj.run(
+    jj.run(
         ws,
         &[
             "git",
@@ -112,10 +158,9 @@ pub fn push_to_origin(jj: &JjEnv, ws: &Path, branch: &str) {
             "--ignore-working-copy",
         ],
         "jj git push",
-    ) {
-        Ok(_) => log::info!("Pushed bookmark {branch} to origin (jj)"),
-        Err(e) => log::warn!("jj push failed (seal succeeded locally): {e}"),
-    }
+    )?;
+    log::info!("Pushed bookmark {branch} to origin (jj)");
+    Ok(())
 }
 
 /// Resolve a bookmark name to a commit id over the shared store, or `None` when

@@ -32,6 +32,79 @@ struct TreeEntry {
     is_tree: bool,
 }
 
+/// List commits on the first-parent chain from `base` (exclusive) to `tip`
+/// (inclusive), oldest first. Archived Git objects do not preserve jj change
+/// ids, so callers render that field as unavailable.
+pub fn list_range_commits(
+    store: &ObjectStore,
+    base_hex: &str,
+    tip_hex: &str,
+) -> Result<Vec<RangeCommit>, String> {
+    const CAP: usize = 100_000;
+    let base =
+        ObjectId::from_hex(base_hex.as_bytes()).map_err(|e| format!("invalid base sha: {e}"))?;
+    let mut current =
+        ObjectId::from_hex(tip_hex.as_bytes()).map_err(|e| format!("invalid tip sha: {e}"))?;
+    let mut commits = Vec::new();
+    while current != base && commits.len() < CAP {
+        let (kind, bytes) = store
+            .resolve_object(&current)
+            .ok_or_else(|| format!("missing commit {current}"))?;
+        if kind != ObjectKind::Commit {
+            return Err(format!("object {current} is not a commit"));
+        }
+        let iter = CommitRefIter::from_bytes(&bytes, HASH_KIND);
+        let author = iter
+            .author()
+            .map_err(|e| format!("decoding commit author: {e}"))?;
+        let author_name = String::from_utf8_lossy(author.name.as_ref())
+            .trim()
+            .to_string();
+        let author_email = String::from_utf8_lossy(author.email.as_ref())
+            .trim()
+            .to_string();
+        let timestamp = author.time().unwrap_or_default().seconds;
+        let message = iter
+            .message()
+            .map_err(|e| format!("decoding commit message: {e}"))?;
+        let summary = String::from_utf8_lossy(message)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        commits.push(RangeCommit {
+            sha: current.to_string(),
+            summary,
+            author: if author_email.is_empty() {
+                author_name
+            } else {
+                format!("{author_name} <{author_email}>")
+            },
+            timestamp,
+        });
+        let Some(parent) = iter.parent_ids().next() else {
+            return Err(format!(
+                "base {base} is not on tip {tip_hex}'s first-parent chain"
+            ));
+        };
+        current = parent;
+    }
+    if current != base {
+        return Err(format!("base {base} was not reached from tip {tip_hex}"));
+    }
+    commits.reverse();
+    Ok(commits)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeCommit {
+    pub sha: String,
+    pub summary: String,
+    pub author: String,
+    pub timestamp: i64,
+}
+
 enum ChangeKind {
     Add,
     Delete,
@@ -692,5 +765,25 @@ mod tests {
         let gone = by_path["gone.txt"];
         assert_eq!(gone.status, "removed");
         assert_eq!((gone.additions, gone.deletions), (0, 1));
+    }
+    #[test]
+    fn list_range_commits_returns_oldest_first_with_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        init_repo(dir);
+        write_file(dir, "a.txt", b"base\n");
+        let base = commit_all(dir, "base");
+        write_file(dir, "a.txt", b"one\n");
+        let first = commit_all(dir, "first change");
+        write_file(dir, "b.txt", b"two\n");
+        let tip = commit_all(dir, "second change");
+        let store = ObjectStore::new(Path::new(dir), None).unwrap();
+        let commits = list_range_commits(&store, &base, &tip).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].sha, first);
+        assert_eq!(commits[0].summary, "first change");
+        assert_eq!(commits[1].sha, tip);
+        assert_eq!(commits[1].summary, "second change");
+        assert!(!commits[0].author.is_empty());
     }
 }

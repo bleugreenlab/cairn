@@ -94,7 +94,10 @@ pub(crate) fn remove_worktree_robust(
         let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(repo_path));
         if crate::jj::is_jj_dir(&store) {
             let jj = crate::jj::JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
-            let _ = crate::jj::forget_workspace(&jj, &store, b);
+            let workspace_name = crate::jj::read_workspace_identity(wt_path)
+                .map(|identity| identity.workspace_name)
+                .unwrap_or_else(|| crate::jj::workspace_name_for_branch(b));
+            let _ = crate::jj::forget_workspace_name(&jj, &store, &workspace_name);
         }
     }
 

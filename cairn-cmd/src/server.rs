@@ -162,7 +162,7 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
 
 Targets (mix freely within one call):
 - File: `file:` (worktree root), `file:src/lib.rs` (worktree-relative), `file:/abs/path` (absolute / global)
-- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` plus collections `/issues`, `/messages`, `/changed`, `/references`, and `/references/NAME`. `cairn:~/...` resolves against the run home.
+- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` plus collections `/issues`, `/messages`, issue `/changed`, node `/diff`, `/references`, and `/references/NAME`. `cairn:~/...` resolves against the run home.
 - Web/PDF: `http(s)://...` URLs and local `.pdf` paths return markdown via the active web-fetch provider (raw capped markdown; no extraction prompt). The default built-in provider is a plain HTTP fetch (HTML→markdown); PDF extraction needs a configured provider such as `bmd`. Providers are configured in Settings → Web Services.
 - Web search: `cairn://websearch?q=QUERY` runs the query through the active web-search provider (configured in Settings → Web Services) and returns ranked results as markdown; everything after `q=` is the literal query, so spaces are fine.
 

@@ -6,10 +6,8 @@
 use super::common::{
     affordance_for_kind, find_query_value, reject_query_params, resolve_home_relative_resource_uri,
 };
-use super::files::{
-    read_issue_changed, read_issue_changed_projection, read_node_changed,
-    read_node_changed_projection,
-};
+use super::diff::read_node_diff;
+use super::files::{read_issue_changed, read_issue_changed_projection};
 use super::issue::{
     read_issue, read_issue_comment, read_issue_comments, read_issue_execution,
     read_issue_executions,
@@ -880,6 +878,20 @@ pub(crate) async fn produce_cairn_resource(
         }
     };
 
+    if split.identity == "cairn:~/workspace-recovery" {
+        let content = crate::mcp::vcs::workspace_recovery_status(orch, request).await;
+        return RenderedResource::line(
+            content,
+            Some(Affordance {
+                kind: SegmentKind::Resource,
+                block: "## Actions\n- rebind: write {target:\"cairn:~/workspace-recovery\", mode:\"patch\", payload:{action:\"rebind\"}}"
+                    .to_string(),
+            }),
+            None,
+            None,
+        );
+    }
+
     let identity =
         match resolve_home_relative_resource_uri(&orch.db, request, &split.identity).await {
             Ok(identity) => identity,
@@ -989,7 +1001,7 @@ pub(crate) async fn produce_cairn_resource(
     // materialized body rejects `glob`/`type`.
     let allow_glob = matches!(
         resource,
-        CairnResource::Changed { .. } | CairnResource::NodeChanged { .. }
+        CairnResource::Changed { .. } | CairnResource::NodeDiff { .. }
     );
     match crate::mcp::handlers::search::body_grep_payload(&split.params, allow_glob) {
         Err(error) => return RenderedResource::line(error, affordance, None, None),
@@ -1148,9 +1160,7 @@ pub(crate) async fn produce_cairn_resource(
     // window), and never re-window by `limit`.
     let renderer_owns_params = matches!(
         resource,
-        CairnResource::Changed { .. }
-            | CairnResource::NodeChanged { .. }
-            | CairnResource::NodeProgress { .. }
+        CairnResource::Changed { .. } | CairnResource::NodeProgress { .. }
     ) || matches!(resource, CairnResource::Project { .. })
         && find_query_value(&split.params, "search").is_some();
 
@@ -1590,19 +1600,12 @@ async fn render_resource_body(
                 read_issue_changed_projection(db, &project, number, &params).await
             }
         }
-        CairnResource::NodeChanged {
+        CairnResource::NodeDiff {
             project,
             number,
             exec_seq,
             node_id,
-        } => {
-            if params.is_empty() {
-                read_node_changed(orch, &project, number, exec_seq, &node_id).await
-            } else {
-                read_node_changed_projection(orch, &project, number, exec_seq, &node_id, &params)
-                    .await
-            }
-        }
+        } => read_node_diff(orch, &project, number, exec_seq, &node_id, &params).await,
         CairnResource::ProjectMessages { project } => {
             read_project_messages(db, &project, &params).await
         }

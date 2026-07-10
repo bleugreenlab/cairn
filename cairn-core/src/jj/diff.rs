@@ -21,6 +21,16 @@ pub struct GraphFileChange {
     pub deletions: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeCommit {
+    pub commit_id: String,
+    pub change_id: String,
+    pub description: String,
+    pub author: String,
+    pub timestamp: String,
+    pub working_copy: bool,
+}
+
 /// Cumulative changed files of a workspace against its recorded base, read from
 /// the live sealed jj graph rather than the side-channel `file_changes` cache.
 ///
@@ -53,16 +63,88 @@ pub fn node_changed_files(
     if !is_jj_dir(ws) {
         return None;
     }
+    node_range_patch(jj, ws, base_branch, base_commit).map(|patch| parse_git_diff(&patch))
+}
+
+/// Git-format cumulative patch for the node's effective `fork..@` range.
+pub fn node_range_patch(
+    jj: &JjEnv,
+    ws: &Path,
+    base_branch: Option<&str>,
+    base_commit: Option<&str>,
+) -> Option<String> {
+    if !is_jj_dir(ws) {
+        return None;
+    }
     let fork = resolve_node_fork_point(jj, ws, base_branch, base_commit)?;
     let revset = format!("{fork}..@");
-    let out = jj
+    jj.run(
+        ws,
+        &["diff", "--ignore-working-copy", "--git", "-r", &revset],
+        "jj diff --git (node range)",
+    )
+    .ok()
+}
+
+const RANGE_COMMIT_TEMPLATE: &str = "commit_id.short() ++ \"\\x1f\" ++ change_id.short() ++ \"\\x1f\" ++ description.first_line() ++ \"\\x1f\" ++ author.name() ++ \" <\" ++ author.email() ++ \">\" ++ \"\\x1f\" ++ author.timestamp() ++ \"\\x1f\" ++ if(empty, \"1\", \"0\") ++ \"\\n\"";
+
+/// Commits in `fork..@`, including a non-empty working-copy commit.
+pub fn range_commits(jj: &JjEnv, ws: &Path, fork: &str) -> Result<Vec<RangeCommit>, String> {
+    let working_copy_id = jj
         .run(
             ws,
-            &["diff", "--ignore-working-copy", "--git", "-r", &revset],
-            "jj diff --git (node changed)",
-        )
-        .ok()?;
-    Some(parse_git_diff(&out))
+            &[
+                "log",
+                "--ignore-working-copy",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id.short()",
+            ],
+            "jj log working copy id",
+        )?
+        .trim()
+        .to_string();
+    let revset = format!("{fork}..@");
+    let output = jj.run(
+        ws,
+        &[
+            "log",
+            "--ignore-working-copy",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            RANGE_COMMIT_TEMPLATE,
+        ],
+        "jj log node range commits",
+    )?;
+    Ok(parse_range_commits(&output, &working_copy_id))
+}
+
+fn parse_range_commits(output: &str, working_copy_id: &str) -> Vec<RangeCommit> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let commit_id = fields.next()?.trim().to_string();
+            let change_id = fields.next()?.trim().to_string();
+            let description = fields.next().unwrap_or_default().trim().to_string();
+            let author = fields.next().unwrap_or_default().trim().to_string();
+            let timestamp = fields.next().unwrap_or_default().trim().to_string();
+            let empty = fields.next().unwrap_or_default().trim() == "1";
+            let working_copy = commit_id == working_copy_id;
+            (!(commit_id.is_empty() || working_copy && empty)).then_some(RangeCommit {
+                commit_id,
+                change_id,
+                description,
+                author,
+                timestamp,
+                working_copy,
+            })
+        })
+        .collect()
 }
 
 /// Resolve the node's current effective fork point from the live jj graph.
@@ -316,4 +398,26 @@ fn unquote_diff_path(path: &str) -> String {
         .and_then(|p| p.strip_suffix('"'))
         .unwrap_or(trimmed)
         .to_string()
+}
+
+#[cfg(test)]
+mod range_commit_tests {
+    use super::*;
+
+    #[test]
+    fn range_commit_parser_labels_and_skips_empty_working_copy() {
+        let input = "abc123\u{1f}change1\u{1f}sealed\u{1f}A <a@b>\u{1f}2026-01-01\u{1f}0\nwc123\u{1f}change2\u{1f}\u{1f}A <a@b>\u{1f}2026-01-02\u{1f}1\n";
+        let commits = parse_range_commits(input, "wc123");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].commit_id, "abc123");
+        assert!(!commits[0].working_copy);
+    }
+
+    #[test]
+    fn range_commit_parser_keeps_dirty_working_copy() {
+        let input = "wc123\u{1f}change2\u{1f}work\u{1f}A <a@b>\u{1f}2026-01-02\u{1f}0\n";
+        let commits = parse_range_commits(input, "wc123");
+        assert_eq!(commits.len(), 1);
+        assert!(commits[0].working_copy);
+    }
 }

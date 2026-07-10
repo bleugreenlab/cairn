@@ -122,7 +122,7 @@ pub(super) fn discover_codex_models() -> Result<Vec<DiscoveredModel>, String> {
         .map_err(|e| format!("Failed to decode Codex model/list result: {}", e))?;
         let _ = child.kill();
         let _ = child.wait();
-        return Ok(result
+        let mut models: Vec<DiscoveredModel> = result
             .data
             .into_iter()
             .map(|model| DiscoveredModel {
@@ -148,7 +148,9 @@ pub(super) fn discover_codex_models() -> Result<Vec<DiscoveredModel>, String> {
                 router: false,
                 architecture_modality: None,
             })
-            .collect());
+            .collect();
+        merge_fallback_models(&mut models);
+        return Ok(models);
     }
 
     let stderr = child
@@ -170,4 +172,137 @@ pub(super) fn discover_codex_models() -> Result<Vec<DiscoveredModel>, String> {
             stderr.trim()
         )
     })
+}
+
+fn reasoning_effort(name: &str, description: &str) -> DiscoveredReasoningEffort {
+    DiscoveredReasoningEffort {
+        reasoning_effort: name.to_string(),
+        description: Some(description.to_string()),
+    }
+}
+
+fn fallback_model(
+    slug: &str,
+    default_effort: &str,
+    supported_reasoning_efforts: Vec<DiscoveredReasoningEffort>,
+) -> DiscoveredModel {
+    DiscoveredModel {
+        id: slug.to_string(),
+        model: slug.to_string(),
+        display_name: slug.to_string(),
+        description: None,
+        hidden: false,
+        // Never claim the default flag: Codex's own `model/list` owns which
+        // model is default, and Cairn pins the tier presets independently.
+        is_default: false,
+        default_reasoning_effort: Some(default_effort.to_string()),
+        supported_reasoning_efforts,
+        context_window: Some(372_000),
+        canonical_slug: None,
+        pricing: None,
+        supported_parameters: Vec::new(),
+        router: false,
+        architecture_modality: None,
+    }
+}
+
+/// Codex model slugs Cairn knows are selectable (they run via `codex -m <slug>`
+/// and back the default tier presets) but that the pinned `codex` CLI's
+/// `model/list` does not yet enumerate. Metadata mirrors Codex's own
+/// `models-manager/models.json`. Deduped against discovery by slug, so once the
+/// CLI reports them natively its entry wins and these are dropped.
+fn fallback_codex_models() -> Vec<DiscoveredModel> {
+    let base = || {
+        vec![
+            reasoning_effort("low", "Fast responses with lighter reasoning"),
+            reasoning_effort(
+                "medium",
+                "Balances speed and reasoning depth for everyday tasks",
+            ),
+            reasoning_effort("high", "Greater reasoning depth for complex problems"),
+            reasoning_effort("xhigh", "Extra high reasoning depth for complex problems"),
+            reasoning_effort("max", "Maximum reasoning depth for the hardest problems"),
+        ]
+    };
+    let with_ultra = || {
+        let mut efforts = base();
+        efforts.push(reasoning_effort(
+            "ultra",
+            "Maximum reasoning with automatic task delegation",
+        ));
+        efforts
+    };
+    vec![
+        fallback_model("gpt-5.6-sol", "low", with_ultra()),
+        fallback_model("gpt-5.6-terra", "medium", with_ultra()),
+        fallback_model("gpt-5.6-luna", "medium", base()),
+    ]
+}
+
+/// Prepend known-selectable Codex models the CLI hasn't enumerated yet, skipping
+/// any slug already present so a native discovery of the same model wins.
+fn merge_fallback_models(discovered: &mut Vec<DiscoveredModel>) {
+    let present: std::collections::HashSet<String> =
+        discovered.iter().map(|m| m.model.clone()).collect();
+    let mut missing: Vec<DiscoveredModel> = fallback_codex_models()
+        .into_iter()
+        .filter(|m| !present.contains(&m.model))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    missing.append(discovered);
+    *discovered = missing;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fallback_covers_the_three_5_6_models() {
+        let models = fallback_codex_models();
+        let slugs: Vec<&str> = models.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(slugs, ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
+
+        // Every fallback is visible and carries selectable reasoning efforts, so
+        // the effort control renders (an empty list hides it in the UI).
+        for model in &models {
+            assert!(!model.hidden);
+            assert!(!model.is_default);
+            assert!(!model.supported_reasoning_efforts.is_empty());
+        }
+
+        // Sol/terra expose `ultra`; luna does not (matches models.json).
+        let has_ultra = |m: &DiscoveredModel| {
+            m.supported_reasoning_efforts
+                .iter()
+                .any(|e| e.reasoning_effort == "ultra")
+        };
+        assert!(has_ultra(&models[0]));
+        assert!(has_ultra(&models[1]));
+        assert!(!has_ultra(&models[2]));
+    }
+
+    #[test]
+    fn merge_prepends_all_when_discovery_lacks_them() {
+        let mut discovered = vec![fallback_model("gpt-5.5", "high", vec![])];
+        merge_fallback_models(&mut discovered);
+        let slugs: Vec<&str> = discovered.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(
+            slugs,
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
+        );
+    }
+
+    #[test]
+    fn merge_skips_slugs_discovery_already_reports() {
+        // Once the CLI enumerates a 5.6 model, discovery's entry is authoritative
+        // and the fallback for that slug is dropped (no duplicate).
+        let mut discovered = vec![fallback_model("gpt-5.6-sol", "high", vec![])];
+        merge_fallback_models(&mut discovered);
+        let slugs: Vec<&str> = discovered.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(slugs, ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol"]);
+        assert_eq!(slugs.iter().filter(|s| **s == "gpt-5.6-sol").count(), 1);
+    }
 }

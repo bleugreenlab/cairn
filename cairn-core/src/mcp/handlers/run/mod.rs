@@ -195,7 +195,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // Resolve the worktree's VCS backend once (jj for a worktree; the read-only
     // NonWorktreeVcs for the project's live checkout) and capture the pre-batch
     // snapshot through it.
-    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, std::path::Path::new(&cwd));
     // Pre-flight staleness reconcile: heal a stale / behind-its-branch-tip working
     // copy BEFORE the batch runs, serialized on the same per-store jj lock the
     // base-advance reconcile and merge-fold hold, so it can never race a concurrent
@@ -203,15 +202,31 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     // here and reused by the post-batch commit barrier below. Best-effort: a
     // failure leaves the seal-time stale arm as the mid-batch fallback.
     let store_lock = crate::mcp::vcs::resolve_store_lock(orch, request).await;
+    let managed_context = {
+        let _guard = match store_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        match crate::mcp::vcs::prepare_managed_workspace(orch, request).await {
+            Ok(context) => context,
+            Err(error) => return run_envelope(error, Vec::new()),
+        }
+    };
+    let vcs = crate::mcp::vcs::resolve_managed_worktree_vcs(
+        orch,
+        std::path::Path::new(&cwd),
+        managed_context.as_ref(),
+    );
     {
         let _guard = match store_lock.as_ref() {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
         if let Err(e) = vcs.reconcile_workspace(std::path::Path::new(&cwd)) {
-            log::warn!(
-                "pre-flight workspace reconcile failed (continuing; seal-time stale arm remains the fallback): {e}"
-            );
+            if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) {
+                return run_envelope(e, Vec::new());
+            }
+            log::warn!("pre-flight workspace reconcile failed: {e}");
         }
     }
     // Capture the pre-batch snapshot whenever a no-`commit_msg` run could leave

@@ -1895,7 +1895,7 @@ pub fn start_agent_session(
             // would otherwise lazily create it). The same path is exported as
             // TMPDIR for each spawned command in `execute_process`.
             let scratch_dir = db_context.job_id.as_deref().map(|jid| {
-                crate::scratch::ensure_job_scratch_dir(jid)
+                crate::scratch::ensure_job_scratch_dir(jid, Some(&db_context.home_uri))
                     .to_string_lossy()
                     .to_string()
             });

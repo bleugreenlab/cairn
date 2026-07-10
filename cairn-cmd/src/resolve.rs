@@ -72,12 +72,16 @@ impl CairnCmd {
     }
 
     fn relativize_cairn_uri_for_display(&self, uri: &str) -> String {
-        let target_segments = match Self::canonical_uri_segments(uri) {
+        let split = match split_target_query(uri) {
+            Ok(split) => split,
+            Err(_) => return uri.to_string(),
+        };
+        let target_segments = match Self::canonical_uri_segments(&split.identity) {
             Ok(segments) => segments,
             Err(_) => return uri.to_string(),
         };
 
-        let mut best = uri.to_string();
+        let mut best = split.identity;
 
         if let Some(home_uri) = self.home_uri_string() {
             if let Ok(home_segments) = Self::canonical_uri_segments(&home_uri) {
@@ -91,7 +95,10 @@ impl CairnCmd {
             }
         }
 
-        best
+        match split.raw_query {
+            Some(query) if !query.is_empty() => format!("{best}?{query}"),
+            _ => best,
+        }
     }
 
     pub(crate) fn relativize_cairn_uris_in_text(&self, text: &str) -> String {
@@ -154,7 +161,12 @@ impl CairnCmd {
                         target
                     )
                 })?;
-            let resolved = Self::resolve_uri_reference(&home_uri, suffix)?;
+            let resolved = if suffix == "diff" {
+                Self::owning_node_diff_uri(&home_uri)
+                    .unwrap_or_else(|| format!("{}/diff", home_uri.trim_end_matches('/')))
+            } else {
+                Self::resolve_uri_reference(&home_uri, suffix)?
+            };
             return Ok(ResolvedTarget::CairnUri(resolved));
         }
 
@@ -254,6 +266,11 @@ impl CairnCmd {
         ]
         .iter()
         .any(|prefix| result.starts_with(prefix))
+    }
+
+    fn owning_node_diff_uri(home_uri: &str) -> Option<String> {
+        let (node_uri, task_name) = home_uri.rsplit_once("/task/")?;
+        (!task_name.is_empty() && !task_name.contains('/')).then(|| format!("{node_uri}/diff"))
     }
 
     fn resolve_uri_reference(base_uri: &str, reference: &str) -> Result<String, String> {
@@ -395,6 +412,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_pooled_task_home_diff_projects_to_owning_node() {
+        let mcp = create_test_mcp_with_home_uri(Some("cairn://p/CAIRN/2691/1/builder/task/review"));
+
+        assert_eq!(
+            mcp.resolve_read_target("cairn:~/diff").unwrap(),
+            "cairn://p/CAIRN/2691/1/builder/diff"
+        );
+        assert_eq!(
+            mcp.resolve_read_target("cairn:~/diff?view=check").unwrap(),
+            "cairn://p/CAIRN/2691/1/builder/diff?view=check"
+        );
+        assert_eq!(
+            mcp.resolve_read_target("cairn:~/messages").unwrap(),
+            "cairn://p/CAIRN/2691/1/builder/task/review/messages"
+        );
+    }
+
     // Pooled Codex path (CAIRN-2549): `cairn:~/` MUST NOT be expanded against
     // this process's home_uri (one shared cairn-cmd serves N call threads with
     // different homes); it is forwarded RAW for the host to expand from the
@@ -444,6 +479,24 @@ mod tests {
         assert_eq!(
             rewritten.changes.unwrap()[0].target.as_deref(),
             Some("cairn:~/return")
+        );
+    }
+
+    #[test]
+    fn test_relativize_cairn_uri_preserves_query_params() {
+        let mcp = create_test_mcp_with_home_uri(Some("cairn://p/CAIRN/1086/1/builder"));
+
+        assert_eq!(
+            mcp.relativize_cairn_uri_for_display(
+                "cairn://p/CAIRN/1086/1/builder/diff?view=patch&offset=20&limit=20"
+            ),
+            "cairn:~/diff?view=patch&offset=20&limit=20"
+        );
+        assert_eq!(
+            mcp.relativize_cairn_uris_in_text(
+                "continue: cairn://p/CAIRN/1086/1/builder/diff?view=patch&offset=20&limit=20"
+            ),
+            "continue: cairn:~/diff?view=patch&offset=20&limit=20"
         );
     }
 

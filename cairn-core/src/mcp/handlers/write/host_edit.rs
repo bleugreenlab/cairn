@@ -294,6 +294,11 @@ fn finish_commit(
 
     match result {
         Ok(commit) => Ok(commit.sha),
+        Err(seal_error) if crate::mcp::vcs::is_workspace_lineage_mismatch(&seal_error) => Err(
+            format!(
+                "{seal_error}. The on-disk edit was PRESERVED exactly; no stale retry or discard was attempted."
+            ),
+        ),
         Err(seal_error) => {
             // Restore worktree == HEAD before reporting failure, so the message's
             // "restored" claim is true and no uncommitted dirt is left behind.
@@ -433,7 +438,19 @@ pub async fn commit_user_file_edit(
     let author = orch
         .resolve_git_identity_for_project(project.as_ref().map(|p| p.project_id.as_str()))
         .map(|(name, email)| GitAuthor::new(name, email));
-    let vcs = crate::mcp::vcs::resolve_worktree_vcs(orch, worktree);
+    let recovery_request = cairn_common::protocol::CallbackRequest {
+        thread_id: None,
+        cwd: worktree_path.to_string(),
+        run_id: None,
+        tool: "host_edit".to_string(),
+        payload: serde_json::Value::Null,
+        tool_use_id: None,
+    };
+    let managed_context =
+        crate::mcp::vcs::prepare_managed_workspace(orch, &recovery_request).await?;
+    let vcs =
+        crate::mcp::vcs::resolve_managed_worktree_vcs(orch, worktree, managed_context.as_ref());
+    vcs.reconcile_workspace(worktree)?;
 
     // (6) Compute additions/deletions against the old on-disk content for the
     // file_changes record.
@@ -629,13 +646,19 @@ mod tests {
         OrchestratorBuilder::new(db_state, services, config_dir).build()
     }
 
-    async fn seed_project_job(db: &LocalDb, repo_path: &str, worktree_path: &str) {
+    async fn seed_project_job(
+        db: &LocalDb,
+        repo_path: &str,
+        worktree_path: &str,
+        branch: &str,
+        base_commit: &str,
+    ) {
         db.execute_script(&format!(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
               VALUES('p','w','Project','PROJ','{repo_path}',1,1);
-             INSERT INTO jobs(id, project_id, status, worktree_path, created_at, updated_at)
-              VALUES('j','p','running','{worktree_path}',1,1);
+             INSERT INTO jobs(id, project_id, status, worktree_path, branch, base_commit, created_at, updated_at)
+              VALUES('j','p','running','{worktree_path}','{branch}','{base_commit}',1,1);
              INSERT INTO runs(id, job_id, status, created_at, updated_at)
               VALUES('r','j','live',1,1);"
         ))
@@ -657,13 +680,32 @@ mod tests {
         let store = crate::jj::project_store_dir(&orch.config_dir, proj.path());
         crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
         let ws = wts.path().join("job");
-        crate::jj::add_workspace(&jj, &store, &ws, "agent/CAIRN-2061-builder-0", "main", None)
-            .unwrap();
+        let branch = "agent/CAIRN-2061-builder-0";
+        crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+        let base_commit = crate::jj::head_commit(&jj, &ws).unwrap();
+        crate::jj::write_base_marker(&ws, "main", &base_commit).unwrap();
+        crate::jj::write_project_root_marker(&ws, proj.path()).unwrap();
+        crate::jj::write_workspace_identity(
+            &ws,
+            &crate::jj::WorkspaceIdentity::new(
+                "j",
+                "j",
+                "p",
+                proj.path().to_path_buf(),
+                ws.clone(),
+                branch,
+                crate::jj::workspace_name_for_branch(branch),
+                base_commit.clone(),
+            ),
+        )
+        .unwrap();
         let ws_str = ws.to_string_lossy().to_string();
         seed_project_job(
             &orch.db.local,
             proj.path().to_string_lossy().as_ref(),
             &ws_str,
+            branch,
+            &base_commit,
         )
         .await;
         (orch, ws, ws_str)
@@ -1094,11 +1136,30 @@ mod tests {
         let branch = "agent/CAIRN-2061-builder-0";
         let ws = wts.path().join("job");
         crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+        let base_commit = crate::jj::head_commit(&jj, &ws).unwrap();
+        crate::jj::write_base_marker(&ws, "main", &base_commit).unwrap();
+        crate::jj::write_project_root_marker(&ws, proj.path()).unwrap();
+        crate::jj::write_workspace_identity(
+            &ws,
+            &crate::jj::WorkspaceIdentity::new(
+                "j",
+                "j",
+                "p",
+                proj.path().to_path_buf(),
+                ws.clone(),
+                branch,
+                crate::jj::workspace_name_for_branch(branch),
+                base_commit.clone(),
+            ),
+        )
+        .unwrap();
         let ws_str = ws.to_string_lossy().to_string();
         seed_project_job(
             &orch.db.local,
             proj.path().to_string_lossy().as_ref(),
             &ws_str,
+            branch,
+            &base_commit,
         )
         .await;
 

@@ -81,6 +81,15 @@ pub(super) fn run_commit_barrier(
                         // Tree was (or became) clean; already equals HEAD.
                         log::info!("run commit_msg given but nothing to commit: {}", e);
                     }
+                    Err(e) if crate::mcp::vcs::is_workspace_lineage_mismatch(&e) => {
+                        // Ownership changed after commands ran. Preserve every byte;
+                        // stale recovery and generic discard are forbidden here.
+                        worktree_changed = false;
+                        committed = false;
+                        message.push_str(&format!(
+                            "⚠️ Seal refused: {e}. The working copy was PRESERVED exactly; no discard or update-stale recovery was attempted."
+                        ));
+                    }
                     Err(e) if crate::jj::is_conflicted_branch_seal_error(&e) => {
                         // The seal was refused because the branch bookmark tip
                         // carries a recorded conflict and `@` has diverged from it
@@ -466,6 +475,21 @@ mod commit_barrier_tests {
             "the message points at the no-commit_msg flatten, not a futile retry: {}",
             out.message
         );
+    }
+
+    #[test]
+    fn commit_msg_lineage_mismatch_preserves_worktree() {
+        let vcs = FakeVcs::new().dirty(Ok(true)).seal(Err(format!(
+            "{} marker changed; recovery=cairn:~/workspace-recovery",
+            crate::mcp::vcs::WORKSPACE_LINEAGE_MISMATCH_PREFIX
+        )));
+        let out = run_commit_barrier(&vcs, wt(), Some("write"), true, None, None);
+        assert_eq!(vcs.seals(), 1);
+        assert_eq!(vcs.discards(), 0, "lineage mismatch must never discard");
+        assert!(!out.committed);
+        assert!(!out.worktree_changed);
+        assert!(out.message.contains("PRESERVED"));
+        assert!(out.message.contains("workspace-recovery"));
     }
 
     #[test]

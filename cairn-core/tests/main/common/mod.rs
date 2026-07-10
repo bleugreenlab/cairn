@@ -269,6 +269,8 @@ pub fn provision_jj_workspace(config_dir: &Path, project_repo: &Path, ws: &Path,
     jj::ensure_project_store(&jj, &store, project_repo).unwrap();
     let base = head_sha(project_repo);
     jj::add_workspace(&jj, &store, ws, branch, &base, None).unwrap();
+    jj::write_base_marker(ws, "main", &base).unwrap();
+    jj::write_project_root_marker(ws, project_repo).unwrap();
 }
 
 /// Drive `primary_ws` into the OP-LOG stale state that reproduces the commit
@@ -288,7 +290,14 @@ pub fn stale_sibling_advance(
 ) {
     let jj = JjEnv::resolve("jj", config_dir);
     let store = jj::project_store_dir(config_dir, project_repo);
-    let sibling_ws = primary_ws.parent().unwrap().join("sibling-advance-ws");
+    let primary_name = primary_ws
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("primary");
+    let sibling_ws = primary_ws
+        .parent()
+        .unwrap()
+        .join(format!("{primary_name}-sibling-advance-ws"));
     let sibling_branch = "agent/SIB-advance-0";
     let base = head_sha(project_repo);
     jj::add_workspace(&jj, &store, &sibling_ws, sibling_branch, &base, None).unwrap();

@@ -489,31 +489,33 @@ async fn create_issue_row(
                     .map_err(DbError::Row)?;
             }
 
-            load_issue_by_id(conn, &id).await.or_else(|_| {
-                Ok(Issue {
-                    id,
-                    project_id,
-                    number,
-                    title,
-                    description: description.unwrap_or_default(),
-                    status: IssueStatus::Backlog,
-                    progress: IssueProgress::Backlog,
-                    attention: IssueAttention::None,
-                    priority: 0,
-                    completed_at: None,
-                    dismissed_at: None,
-                    created_at: now as i64,
-                    updated_at: now as i64,
-                    backend_override: None,
-                    merged_at: None,
-                    closed_at: None,
-                    parent_issue_id,
-                    unmet_dependency_count: 0,
-                    depends_on: Vec::new(),
-                    unmet_depends_on: Vec::new(),
-                    labels: Vec::new(),
+            crate::issues::crud::load_conn(conn, &id)
+                .await
+                .or_else(|_| {
+                    Ok(Issue {
+                        id,
+                        project_id,
+                        number,
+                        title,
+                        description: description.unwrap_or_default(),
+                        status: IssueStatus::Backlog,
+                        progress: IssueProgress::Backlog,
+                        attention: IssueAttention::None,
+                        priority: 0,
+                        completed_at: None,
+                        dismissed_at: None,
+                        created_at: now as i64,
+                        updated_at: now as i64,
+                        backend_override: None,
+                        merged_at: None,
+                        closed_at: None,
+                        parent_issue_id,
+                        unmet_dependency_count: 0,
+                        depends_on: Vec::new(),
+                        unmet_depends_on: Vec::new(),
+                        labels: Vec::new(),
+                    })
                 })
-            })
         })
     })
     .await
@@ -657,7 +659,7 @@ async fn update_issue_row(
                 }
             }
 
-            load_issue_by_id(conn, &issue_id).await.map(Some)
+            crate::issues::crud::load_conn(conn, &issue_id).await.map(Some)
         })
     })
     .await
@@ -820,52 +822,6 @@ pub async fn handle_update_issue(orch: &Orchestrator, request: &McpCallbackReque
         Ok(result) => result,
         Err(error) => error,
     }
-}
-
-async fn load_issue_by_id(conn: &cairn_db::turso::Connection, issue_id: &str) -> DbResult<Issue> {
-    let mut rows = conn
-        .query(
-            "
-            SELECT id, project_id, number, title, description, status, progress,
-                   attention, priority, completed_at, dismissed_at, created_at,
-                   updated_at, model, merged_at, closed_at, parent_issue_id
-            FROM issues
-            WHERE id = ?1
-            ",
-            (issue_id,),
-        )
-        .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| DbError::Row(format!("issue not found: {}", issue_id)))?;
-
-    let depends_on = relations::list_dependency_uris(conn, issue_id).await?;
-    let unmet_depends_on = relations::filter_unmet_dependencies(conn, &depends_on).await?;
-
-    Ok(Issue {
-        id: row.text(0)?,
-        project_id: row.text(1)?,
-        number: row.i64(2)? as i32,
-        title: row.text(3)?,
-        description: row.opt_text(4)?.unwrap_or_default(),
-        status: row.text(5)?.parse().unwrap_or(IssueStatus::Backlog),
-        progress: row.text(6)?.parse().unwrap_or(IssueProgress::Backlog),
-        attention: row.text(7)?.parse().unwrap_or(IssueAttention::None),
-        priority: row.opt_i64(8)?.unwrap_or(0) as i32,
-        completed_at: row.opt_i64(9)?,
-        dismissed_at: row.opt_i64(10)?,
-        created_at: row.i64(11)?,
-        updated_at: row.i64(12)?,
-        backend_override: row.opt_text(13)?,
-        merged_at: row.opt_i64(14)?,
-        closed_at: row.opt_i64(15)?,
-        parent_issue_id: row.opt_text(16)?,
-        unmet_dependency_count: unmet_depends_on.len() as i64,
-        depends_on,
-        unmet_depends_on,
-        labels: attach::list_labels_for_issue(conn, issue_id).await?,
-    })
 }
 
 #[cfg(test)]

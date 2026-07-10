@@ -88,6 +88,28 @@ pub fn head_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
     )
 }
 
+pub fn working_copy_commit(jj: &JjEnv, ws: &Path) -> Result<String, String> {
+    jj.run(
+        ws,
+        &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+        "jj log -r @",
+    )
+}
+
+/// Graph proof used only after database/path/marker ownership coordinates agree.
+/// It proves the physical workspace's sealed head descends from the job's
+/// recorded base; it never establishes lineage on its own.
+pub fn revision_descends_from(jj: &JjEnv, store: &Path, revision: &str, ancestor: &str) -> bool {
+    let revset = format!("{ancestor}::{revision} & {revision}");
+    jj.run(
+        store,
+        &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        "jj ancestry proof",
+    )
+    .map(|out| !out.trim().is_empty())
+    .unwrap_or(false)
+}
+
 /// The git directory backing the shared jj store. `ensure_project_store` points
 /// the store's git backend at the project's existing `.git` via
 /// `jj git init --git-repo`, and `jj git root` reports that path from any

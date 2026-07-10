@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn db_internal(message: impl Into<String>) -> DbError {
+pub(crate) fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
 }
 
@@ -22,7 +22,7 @@ pub(super) fn session_from_row(row: &cairn_db::turso::Row) -> DbResult<Session> 
     })
 }
 
-pub(super) async fn load_job_conn(
+pub(crate) async fn load_job_conn(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Option<DbJob>> {

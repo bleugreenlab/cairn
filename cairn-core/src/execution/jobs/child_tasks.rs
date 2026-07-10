@@ -138,6 +138,7 @@ pub fn create_child_task(
                 let (path, branch) = super::worktrees::ensure_ephemeral_task_worktree(
                     orch,
                     &repo_path,
+                    &project_id,
                     &job_id,
                     issue_id.clone(),
                     &base_ref,
